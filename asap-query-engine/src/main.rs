@@ -299,7 +299,11 @@ async fn main() -> Result<()> {
             grpc_port: args.otel_grpc_port,
             http_port: args.otel_http_port,
         };
-        let receiver = OtlpReceiver::new(otel_config);
+        let receiver = OtlpReceiver::new(
+            otel_config,
+            store.clone(),
+            streaming_config.clone(),
+        );
         info!(
             "Starting OTLP receiver (gRPC port {}, HTTP port {})",
             args.otel_grpc_port, args.otel_http_port
