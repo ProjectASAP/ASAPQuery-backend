@@ -718,7 +718,9 @@ async fn handle_precompute_job(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    let time = if req.end > 0.0 { req.end } else {
+    let time = if req.end > 0.0 {
+        req.end
+    } else {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -761,9 +763,7 @@ async fn handle_health() -> &'static str {
 }
 
 /// Return list of metrics currently in the store.
-async fn handle_store_metrics(
-    State(state): State<AppState>,
-) -> axum::response::Response {
+async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
