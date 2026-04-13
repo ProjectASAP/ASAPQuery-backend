@@ -9,6 +9,7 @@ pub mod multiple_increase_accumulator;
 pub mod multiple_min_max_accumulator;
 pub mod multiple_sum_accumulator;
 pub mod set_aggregator_accumulator;
+pub mod sketch_envelope_accumulator;
 pub mod sum_accumulator;
 
 pub use count_min_sketch_accumulator::*;
@@ -22,4 +23,5 @@ pub use multiple_increase_accumulator::*;
 pub use multiple_min_max_accumulator::*;
 pub use multiple_sum_accumulator::*;
 pub use set_aggregator_accumulator::*;
+pub use sketch_envelope_accumulator::*;
 pub use sum_accumulator::*;
