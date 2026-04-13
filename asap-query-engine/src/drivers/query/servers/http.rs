@@ -91,6 +91,10 @@ impl HttpServer {
             .route(runtime_info_path, get(handle_runtime_info))
             .route(runtime_info_path, post(handle_runtime_info))
             .route("/metrics", get(handle_metrics))
+            // Controller integration endpoints
+            .route("/api/v1/precompute", post(handle_precompute_job))
+            .route("/api/v1/health", get(handle_health))
+            .route("/api/v1/store/metrics", get(handle_store_metrics))
             .with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
@@ -701,5 +705,108 @@ mod tests {
         println!("Response JSON: {response_json}");
 
         assert!(status.is_success() || status == reqwest::StatusCode::OK);
+    }
+}
+
+// ── Controller integration: PrecomputeJob execution ──────────────────────────
+
+/// Request body from DataCollector controller's PrecomputeJob.
+#[derive(serde::Deserialize)]
+struct PrecomputeJobRequest {
+    /// PromQL expression to evaluate against stored sketches.
+    query_expr: String,
+    /// Window granularity in seconds.
+    #[serde(default)]
+    granularity_secs: u64,
+    /// Start timestamp (unix seconds). 0 = use earliest available.
+    #[serde(default)]
+    start: f64,
+    /// End timestamp (unix seconds). 0 = use latest available.
+    #[serde(default)]
+    end: f64,
+}
+
+/// Execute a precompute job from the DataCollector controller.
+///
+/// POST /api/v1/precompute
+///
+/// The controller creates PrecomputeJobs when a query's upper sub-tree
+/// (e.g., TopK, HistogramQuantile) requires evaluation on merged sketches.
+/// This endpoint receives that job and runs it against the SimpleMapStore.
+async fn handle_precompute_job(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<PrecomputeJobRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let time = if req.end > 0.0 {
+        req.end
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+    };
+
+    info!(
+        query = %req.query_expr,
+        start = %req.start,
+        end = %req.end,
+        granularity_secs = %req.granularity_secs,
+        time = %time,
+        "Executing precompute job from controller"
+    );
+
+    match state.query_engine.handle_query_promql(req.query_expr, time) {
+        Some((key_by, result)) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "data": {
+                    "result_type": "precompute",
+                    "key_by": format!("{:?}", key_by),
+                    "result": format!("{:?}", result),
+                }
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        None => {
+            // Query not answerable by sketches — return 404 with hint
+            let body = serde_json::json!({
+                "status": "error",
+                "error": "query not answerable by stored sketches",
+                "hint": "ensure the metric has been ingested via OTLP/Kafka and a matching query_config exists"
+            });
+            (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+        }
+    }
+}
+
+/// Health check endpoint for DataCollector controller to verify backend is alive.
+async fn handle_health() -> &'static str {
+    "ok"
+}
+
+/// Return list of metrics currently in the store.
+async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    match state.store.get_earliest_timestamp_per_aggregation_id() {
+        Ok(timestamps) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "aggregation_count": timestamps.len(),
+                "earliest_timestamps": timestamps,
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("{}", e),
+            });
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
+        }
     }
 }
