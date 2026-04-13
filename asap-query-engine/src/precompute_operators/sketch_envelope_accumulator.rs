@@ -6,12 +6,12 @@
 //! the inner sketch type.
 
 use crate::data_model::{AggregateCore, KeyByLabelValues, SerializableToSink};
+use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use prost::Message;
 use serde_json::Value;
-use sketchlib_rust::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use promql_utilities::query_logics::enums::{AggregationType, Statistic};
 
 /// Accumulator that stores a serialized `SketchEnvelope` protobuf.
 ///
@@ -29,7 +29,9 @@ pub struct SketchEnvelopeAccumulator {
 impl SketchEnvelopeAccumulator {
     /// Create from raw protobuf bytes.  Decodes the envelope once to cache
     /// the sketch type; the full payload is kept for later use.
-    pub fn from_proto_bytes(payload: Vec<u8>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn from_proto_bytes(
+        payload: Vec<u8>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let sketch_type = match SketchEnvelope::decode(payload.as_slice()) {
             Ok(env) => match env.sketch_state {
                 Some(sketch_envelope::SketchState::CountMin(_)) => "CountMin".to_string(),
@@ -97,7 +99,7 @@ impl AggregateCore for SketchEnvelopeAccumulator {
     ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error + Send + Sync>> {
         if other.get_accumulator_type() != self.get_accumulator_type() {
             return Err(format!(
-                "Cannot merge SketchEnvelopeAccumulator with {}",
+                "Cannot merge SketchEnvelopeAccumulator with {:?}",
                 other.get_accumulator_type()
             )
             .into());
@@ -109,12 +111,27 @@ impl AggregateCore for SketchEnvelopeAccumulator {
         Ok(Box::new(self.clone()))
     }
 
-    fn get_accumulator_type(&self) -> &'static str {
-        "SketchEnvelopeAccumulator"
+    fn get_accumulator_type(&self) -> AggregationType {
+        // Opaque wrapper — report as the generic multi-subpopulation bucket.
+        // Direct dispatch is not supported; native sketch query path must
+        // decode the envelope and delegate to the correct accumulator.
+        AggregationType::MultipleSubpopulation
     }
 
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
         None
+    }
+
+    fn query_statistic(
+        &self,
+        _statistic: Statistic,
+        _key: &Option<KeyByLabelValues>,
+        _query_kwargs: &HashMap<String, String>,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        Err(
+            "SketchEnvelopeAccumulator: query_statistic not supported; decode envelope first"
+                .into(),
+        )
     }
 }
 
@@ -125,7 +142,10 @@ impl crate::data_model::MultipleSubpopulationAggregate for SketchEnvelopeAccumul
         _key: &KeyByLabelValues,
         _query_kwargs: Option<&HashMap<String, String>>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        Err("SketchEnvelopeAccumulator: direct query not supported; use native sketch query path".into())
+        Err(
+            "SketchEnvelopeAccumulator: direct query not supported; use native sketch query path"
+                .into(),
+        )
     }
 
     fn clone_boxed(&self) -> Box<dyn crate::data_model::MultipleSubpopulationAggregate> {

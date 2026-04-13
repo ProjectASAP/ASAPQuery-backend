@@ -27,11 +27,26 @@ impl Default for ControllerClientConfig {
     }
 }
 
-/// A plan fetched from the controller for a specific metric.
+/// Slim plan status returned by `GET /api/v1/plan/:metric`.
+///
+/// As of DataCollector main, the GET endpoint only returns the metric name,
+/// sketch type, and validity. Callers that need the richer plan (mode,
+/// aggregate_by, staged_plan, etc.) must use [`ControllerClient::create_plan`]
+/// which invokes `POST /api/v1/plan`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControllerPlanStatus {
+    pub metric: String,
+    pub sketch_type: String,
+    #[serde(default)]
+    pub valid_until: Option<String>,
+}
+
+/// Rich plan returned by `POST /api/v1/plan`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ControllerPlan {
     pub metric: String,
     pub sketch_type: String,
+    #[serde(default)]
     pub mode: String,
     #[serde(default)]
     pub aggregate_by: Vec<String>,
@@ -57,22 +72,25 @@ impl ControllerClient {
         }
     }
 
-    /// Fetch the plan for a specific metric from the controller.
+    /// Look up the current plan status for a specific metric.
     ///
-    /// Returns `None` if the controller has no plan for this metric.
-    pub async fn get_plan(&self, metric: &str) -> Option<ControllerPlan> {
+    /// Invokes `GET /api/v1/plan/:metric`. Returns `None` if the controller
+    /// has no plan for this metric (404) or is unreachable. The response is a
+    /// slim `{ metric, sketch_type, valid_until }` shape — for the full plan,
+    /// use [`Self::create_plan`].
+    pub async fn get_plan(&self, metric: &str) -> Option<ControllerPlanStatus> {
         let url = format!("{}/api/v1/plan/{}", self.config.base_url, metric);
 
         match self.http.get(&url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<ControllerPlan>().await {
+                    match resp.json::<ControllerPlanStatus>().await {
                         Ok(plan) => {
-                            info!(metric = %metric, sketch_type = %plan.sketch_type, "Fetched plan from controller");
+                            info!(metric = %metric, sketch_type = %plan.sketch_type, "Fetched plan status from controller");
                             Some(plan)
                         }
                         Err(e) => {
-                            warn!(metric = %metric, error = %e, "Failed to parse controller plan");
+                            warn!(metric = %metric, error = %e, "Failed to parse controller plan status");
                             None
                         }
                     }
@@ -87,7 +105,38 @@ impl ControllerClient {
         }
     }
 
-    /// Check if the controller is healthy.
+    /// Create or refresh a plan by posting a `QuerySpec` to the controller.
+    ///
+    /// Invokes `POST /api/v1/plan`. The `query_spec` is passed through as the
+    /// JSON body; refer to the DataCollector controller's `QuerySpec` type for
+    /// the exact schema. Returns the rich plan (mode, aggregate_by, staged
+    /// plan, delta decision, etc.) on success.
+    pub async fn create_plan(&self, query_spec: serde_json::Value) -> Option<ControllerPlan> {
+        let url = format!("{}/api/v1/plan", self.config.base_url);
+
+        match self.http.post(&url).json(&query_spec).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.json::<ControllerPlan>().await {
+                Ok(plan) => {
+                    info!(metric = %plan.metric, sketch_type = %plan.sketch_type, "Created plan via controller");
+                    Some(plan)
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to parse controller plan response");
+                    None
+                }
+            },
+            Ok(resp) => {
+                warn!(status = %resp.status(), "Controller rejected plan request");
+                None
+            }
+            Err(e) => {
+                warn!(url = %url, error = %e, "Controller unreachable");
+                None
+            }
+        }
+    }
+
+    /// Check if the controller is healthy by listing connected agents.
     pub async fn health_check(&self) -> bool {
         let url = format!("{}/api/v1/agents", self.config.base_url);
         match self.http.get(&url).send().await {
