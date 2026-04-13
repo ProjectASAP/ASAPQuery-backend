@@ -729,6 +729,9 @@ async fn handle_precompute_job(
 
     info!(
         query = %req.query_expr,
+        start = %req.start,
+        end = %req.end,
+        granularity_secs = %req.granularity_secs,
         time = %time,
         "Executing precompute job from controller"
     );
