@@ -293,31 +293,15 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Setup OTLP receiver
-    let otel_handle = if args.enable_otel_ingest {
-        let otel_config = OtlpReceiverConfig {
-            grpc_port: args.otel_grpc_port,
-            http_port: args.otel_http_port,
-        };
-        let receiver = OtlpReceiver::new(otel_config, store.clone(), streaming_config.clone());
-        info!(
-            "Starting OTLP receiver (gRPC port {}, HTTP port {})",
-            args.otel_grpc_port, args.otel_http_port
-        );
-        Some(tokio::spawn(async move {
-            if let Err(e) = receiver.run().await {
-                error!("OTLP receiver error: {}", e);
-            }
-        }))
-    } else {
-        None
-    };
-
     // Setup precompute engine (replaces standalone Prometheus remote write server)
-    // Automatically enable when using precompute streaming engine
+    // Automatically enable when using precompute streaming engine.
+    //
+    // NOTE: precompute is constructed BEFORE the OTLP receiver so the receiver
+    // can obtain an `Arc<IngestState>` handle and push OTLP metrics / sketches
+    // into the same worker pool (and not just write directly to the store).
     let enable_precompute =
         args.enable_prometheus_remote_write || args.streaming_engine == StreamingEngine::Precompute;
-    let precompute_handle = if enable_precompute {
+    let (precompute_handle, precompute_ingest_state) = if enable_precompute {
         let precompute_config = PrecomputeEngineConfig {
             num_workers: args.precompute_num_workers,
             ingest_port: args.prometheus_remote_write_port,
@@ -333,6 +317,7 @@ async fn main() -> Result<()> {
         let engine =
             PrecomputeEngine::new(precompute_config, streaming_config.clone(), output_sink);
         let worker_diagnostics = engine.diagnostics();
+        let ingest_state = engine.ingest_state();
         info!(
             "Starting precompute engine on port {}",
             args.prometheus_remote_write_port
@@ -344,17 +329,51 @@ async fn main() -> Result<()> {
             spawn_memory_diagnostics(diag_store, Some(worker_diagnostics)).await;
         });
 
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = engine.run().await {
                 error!("Precompute engine error: {}", e);
             }
-        }))
+        });
+        (Some(handle), Some(ingest_state))
     } else {
         // Even without precompute, log store diagnostics
         let diag_store = store.clone();
         tokio::spawn(async move {
             spawn_memory_diagnostics(diag_store, None).await;
         });
+        (None, None)
+    };
+
+    // Setup OTLP receiver (after precompute engine so it can share the ingest state)
+    let otel_handle = if args.enable_otel_ingest {
+        let otel_config = OtlpReceiverConfig {
+            grpc_port: args.otel_grpc_port,
+            http_port: args.otel_http_port,
+        };
+        let receiver = match precompute_ingest_state.clone() {
+            Some(ingest_state) => {
+                info!(
+                    "Starting OTLP receiver wired to precompute engine \
+                     (gRPC port {}, HTTP port {})",
+                    args.otel_grpc_port, args.otel_http_port
+                );
+                OtlpReceiver::with_ingest_state(otel_config, ingest_state)
+            }
+            None => {
+                info!(
+                    "Starting OTLP receiver in log-only mode \
+                     (precompute engine not enabled; gRPC port {}, HTTP port {})",
+                    args.otel_grpc_port, args.otel_http_port
+                );
+                OtlpReceiver::new(otel_config)
+            }
+        };
+        Some(tokio::spawn(async move {
+            if let Err(e) = receiver.run().await {
+                error!("OTLP receiver error: {}", e);
+            }
+        }))
+    } else {
         None
     };
 

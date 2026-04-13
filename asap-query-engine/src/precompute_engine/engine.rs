@@ -24,11 +24,17 @@ pub struct PrecomputeWorkerDiagnostics {
 /// The top-level precompute engine orchestrator.
 ///
 /// Creates worker threads, the series router, and the Axum ingest server.
+/// The ingest state (router + agg configs) is built eagerly in `new()` so
+/// that other ingest sources (e.g. OTLP) can hold a handle and push data
+/// into the same worker pool.
 pub struct PrecomputeEngine {
     config: PrecomputeEngineConfig,
-    streaming_config: Arc<StreamingConfig>,
     output_sink: Arc<dyn OutputSink>,
     diagnostics: Arc<PrecomputeWorkerDiagnostics>,
+    ingest_state: Arc<IngestState>,
+    agg_configs_map: HashMap<u64, Arc<AggregationConfig>>,
+    /// Worker receivers, one per worker. Taken by `run()` when spawning workers.
+    receivers: Vec<mpsc::Receiver<WorkerMessage>>,
 }
 
 impl PrecomputeEngine {
@@ -47,26 +53,10 @@ impl PrecomputeEngine {
             worker_group_counts,
             worker_watermarks,
         });
-        Self {
-            config,
-            streaming_config,
-            output_sink,
-            diagnostics,
-        }
-    }
 
-    /// Get a handle to worker diagnostics, readable even after `run()` starts.
-    pub fn diagnostics(&self) -> Arc<PrecomputeWorkerDiagnostics> {
-        self.diagnostics.clone()
-    }
-
-    /// Start the precompute engine. This spawns worker tasks and the HTTP
-    /// ingest server, then blocks until shutdown.
-    pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let num_workers = self.config.num_workers;
-        let channel_size = self.config.channel_buffer_size;
-
-        // Build MPSC channels for each worker
+        // Build MPSC channels for each worker up front.
+        let num_workers = config.num_workers;
+        let channel_size = config.channel_buffer_size;
         let mut senders = Vec::with_capacity(num_workers);
         let mut receivers = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
@@ -75,29 +65,66 @@ impl PrecomputeEngine {
             receivers.push(rx);
         }
 
-        // Build the router
+        // Build the router that owns the senders; it will be shared via IngestState.
         let router = SeriesRouter::new(senders);
 
-        // Build aggregation config map from streaming config, wrapping each config
-        // in Arc so all workers share one copy per aggregation (no N×M deep clones).
-        let agg_configs: HashMap<u64, Arc<AggregationConfig>> = self
-            .streaming_config
+        // Resolve all aggregation configs from the streaming config. Wrap each
+        // in Arc so workers can share one copy per aggregation.
+        let agg_configs_map: HashMap<u64, Arc<AggregationConfig>> = streaming_config
             .get_all_aggregation_configs()
             .iter()
             .map(|(&id, cfg)| (id, Arc::new(cfg.clone())))
             .collect();
+        let agg_configs_vec: Vec<Arc<AggregationConfig>> =
+            agg_configs_map.values().cloned().collect();
 
-        // Build a Vec<Arc<AggregationConfig>> for the ingest handler
-        let agg_configs_vec: Vec<Arc<AggregationConfig>> = agg_configs.values().cloned().collect();
+        // Ingest state holds the router and all configs; this is the single
+        // handle any ingest source uses to push work onto the worker pool.
+        let ingest_state = Arc::new(IngestState {
+            router,
+            samples_ingested: std::sync::atomic::AtomicU64::new(0),
+            agg_configs: agg_configs_vec,
+            pass_raw_samples: config.pass_raw_samples,
+        });
 
-        // Spawn workers
+        Self {
+            config,
+            output_sink,
+            diagnostics,
+            ingest_state,
+            agg_configs_map,
+            receivers,
+        }
+    }
+
+    /// Get a handle to worker diagnostics, readable even after `run()` starts.
+    pub fn diagnostics(&self) -> Arc<PrecomputeWorkerDiagnostics> {
+        self.diagnostics.clone()
+    }
+
+    /// Get a clonable handle to the shared ingest state. Other ingest sources
+    /// (OTLP, Kafka, etc.) call this before `run()` to push into the same
+    /// worker pool as the built-in Prometheus/VM HTTP server.
+    pub fn ingest_state(&self) -> Arc<IngestState> {
+        self.ingest_state.clone()
+    }
+
+    /// Start the precompute engine. This spawns worker tasks and the HTTP
+    /// ingest server, then blocks until shutdown.
+    pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let num_workers = self.config.num_workers;
+
+        // Take ownership of receivers (they can only be used once).
+        let receivers = std::mem::take(&mut self.receivers);
+
+        // Spawn workers.
         let mut worker_handles = Vec::with_capacity(num_workers);
         for (id, rx) in receivers.into_iter().enumerate() {
             let worker = Worker::new(
                 id,
                 rx,
                 self.output_sink.clone(),
-                agg_configs.clone(),
+                self.agg_configs_map.clone(),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: self.config.max_buffer_per_series,
                     allowed_lateness_ms: self.config.allowed_lateness_ms,
@@ -120,15 +147,9 @@ impl PrecomputeEngine {
             num_workers, self.config.ingest_port
         );
 
-        // Build the ingest state
-        let ingest_state = Arc::new(IngestState {
-            router,
-            samples_ingested: std::sync::atomic::AtomicU64::new(0),
-            agg_configs: agg_configs_vec,
-            pass_raw_samples: self.config.pass_raw_samples,
-        });
+        let ingest_state = self.ingest_state.clone();
 
-        // Start flush timer
+        // Start flush timer.
         let flush_state = ingest_state.clone();
         let flush_interval_ms = self.config.flush_interval_ms;
         tokio::spawn(async move {
@@ -143,7 +164,7 @@ impl PrecomputeEngine {
             }
         });
 
-        // Start the Axum HTTP server for ingest (Prometheus + VictoriaMetrics)
+        // Start the Axum HTTP server for ingest (Prometheus + VictoriaMetrics).
         let app = Router::new()
             .route("/api/v1/write", post(handle_prometheus_ingest))
             .route("/api/v1/import", post(handle_victoriametrics_ingest))
@@ -155,7 +176,7 @@ impl PrecomputeEngine {
         let listener = TcpListener::bind(&addr).await?;
         axum::serve(listener, app).await?;
 
-        // Wait for workers to finish (this only happens on shutdown)
+        // Wait for workers to finish (this only happens on shutdown).
         for handle in worker_handles {
             let _ = handle.await;
         }

@@ -10,13 +10,27 @@ use std::time::Instant;
 use tracing::warn;
 
 /// Shared state for the ingest HTTP handler.
-pub(crate) struct IngestState {
-    pub(crate) router: SeriesRouter,
-    pub(crate) samples_ingested: std::sync::atomic::AtomicU64,
+///
+/// Holds the worker router plus the aggregation configs needed for group-key
+/// extraction. A single instance is shared by the Prometheus/VictoriaMetrics
+/// HTTP ingest server and any other ingest source that wants to route into
+/// the same worker pool (e.g. the OTLP receiver).
+pub struct IngestState {
+    pub router: SeriesRouter,
+    pub samples_ingested: std::sync::atomic::AtomicU64,
     /// Aggregation configs for group-key extraction.
-    pub(crate) agg_configs: Vec<Arc<AggregationConfig>>,
+    pub agg_configs: Vec<Arc<AggregationConfig>>,
     /// When true, skip group-key extraction and pass raw samples through.
-    pub(crate) pass_raw_samples: bool,
+    pub pass_raw_samples: bool,
+}
+
+impl IngestState {
+    /// Extract the group key for a series key against a given aggregation
+    /// config. Re-exports the module-private helper so that out-of-module
+    /// ingest sources (e.g. OTLP) can reuse it.
+    pub fn extract_group_key_for(series_key: &str, config: &AggregationConfig) -> String {
+        extract_group_key(series_key, config)
+    }
 }
 
 /// Extract the group key (grouping label values joined by semicolons)
