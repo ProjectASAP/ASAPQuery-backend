@@ -1,11 +1,12 @@
+use crate::data_model::AggregateCore;
 use futures::future::try_join_all;
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use xxhash_rust::xxh64::xxh64;
 
 /// A message sent from the router to a worker.
-#[derive(Debug)]
 pub enum WorkerMessage {
     /// A batch of samples for the same series, routed by series key.
     /// Used in `pass_raw_samples` mode where no aggregation is needed.
@@ -28,10 +29,73 @@ pub enum WorkerMessage {
         samples: Vec<(String, i64, f64)>,
         ingest_received_at: Instant,
     },
+    /// A pre-built accumulator destined for a specific (agg_id, group_key)
+    /// pane. The worker merges it into that pane's existing accumulator
+    /// (or inserts it if the pane is empty) via `AggregateCore::merge_with`.
+    ///
+    /// Produced by ingest sources that deliver pre-aggregated sketches —
+    /// e.g. the OTLP receiver when DataCollector emits KLL / CountMin /
+    /// CountSketch payloads on a `SketchEnvelope`. Lets the precompute
+    /// engine perform further window-aligned aggregation on sketches the
+    /// same way it does on raw samples.
+    AccumulatorInput {
+        agg_id: u64,
+        /// Grouping label values joined by semicolons, matching the
+        /// format produced by `IngestState::extract_group_key_for`.
+        group_key: String,
+        /// Wall-clock timestamp the sketch refers to (millis since epoch).
+        /// Used to place the sketch into the correct pane.
+        timestamp_ms: i64,
+        /// The incoming accumulator to be merged into the pane.
+        accumulator: Box<dyn AggregateCore>,
+        ingest_received_at: Instant,
+    },
     /// Signal the worker to flush/check idle windows.
     Flush,
     /// Graceful shutdown.
     Shutdown,
+}
+
+impl fmt::Debug for WorkerMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RawSamples {
+                series_key,
+                samples,
+                ..
+            } => f
+                .debug_struct("RawSamples")
+                .field("series_key", series_key)
+                .field("sample_count", &samples.len())
+                .finish(),
+            Self::GroupSamples {
+                agg_id,
+                group_key,
+                samples,
+                ..
+            } => f
+                .debug_struct("GroupSamples")
+                .field("agg_id", agg_id)
+                .field("group_key", group_key)
+                .field("sample_count", &samples.len())
+                .finish(),
+            Self::AccumulatorInput {
+                agg_id,
+                group_key,
+                timestamp_ms,
+                accumulator,
+                ..
+            } => f
+                .debug_struct("AccumulatorInput")
+                .field("agg_id", agg_id)
+                .field("group_key", group_key)
+                .field("timestamp_ms", timestamp_ms)
+                .field("accumulator_type", &accumulator.type_name())
+                .finish(),
+            Self::Flush => f.write_str("Flush"),
+            Self::Shutdown => f.write_str("Shutdown"),
+        }
+    }
 }
 
 /// Routes incoming samples to one of N workers based on a consistent hash.
@@ -63,6 +127,9 @@ impl SeriesRouter {
         for msg in messages {
             let worker_idx = match &msg {
                 WorkerMessage::GroupSamples {
+                    agg_id, group_key, ..
+                } => self.worker_for_group(*agg_id, group_key),
+                WorkerMessage::AccumulatorInput {
                     agg_id, group_key, ..
                 } => self.worker_for_group(*agg_id, group_key),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),

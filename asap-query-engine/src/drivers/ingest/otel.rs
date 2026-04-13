@@ -1,13 +1,33 @@
 //! OTLP ingest driver.
 //!
-//! Accepts OTLP metrics via gRPC (4317) and HTTP (4318, POST /v1/metrics),
-//! parses ExportMetricsServiceRequest, logs counts at DEBUG, and leaves
-//! handoff to precompute engine as TODO.
+//! Accepts OTLP metrics via gRPC (4317) and HTTP (4318, POST /v1/metrics).
+//! Parses `ExportMetricsServiceRequest`, and — when wired to a precompute
+//! engine via [`OtlpReceiver::with_ingest_state`] — routes both raw metric
+//! points and pre-built sketches through the precompute engine's worker
+//! pool. The precompute engine then performs window-aligned aggregation
+//! per `StreamingConfig` and writes results to `SimpleMapStore`.
+//!
+//! Architectural flow:
+//! ```text
+//!   DataCollector OTel collector
+//!     → OTLP gRPC/HTTP (this receiver)
+//!     → precompute engine ingest router
+//!     → workers (per (agg_id, group_key) panes)
+//!     → StoreOutputSink → SimpleMapStore
+//!     → query engine
+//! ```
+//!
+//! Labels from the OTLP wire format are preserved all the way into
+//! `KeyByLabelValues` via the standard `series_key` → grouping-label
+//! extraction used by the Prometheus/VictoriaMetrics ingest paths.
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Arc;
 
+use crate::data_model::AggregateCore;
+use crate::precompute_engine::series_router::WorkerMessage;
+use crate::precompute_engine::IngestState;
+use crate::precompute_operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
 use flate2::read::GzDecoder;
@@ -18,12 +38,10 @@ use opentelemetry_proto::tonic::collector::metrics::v1::{
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use prost::Message;
+use std::sync::Arc;
+use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
-
-use crate::data_model::{KeyByLabelValues, PrecomputedOutput, StreamingConfig};
-use crate::precompute_operators::SketchEnvelopeAccumulator;
-use crate::stores::Store;
 
 /// Configuration for the OTLP receiver.
 #[derive(Debug, Clone)]
@@ -32,30 +50,39 @@ pub struct OtlpReceiverConfig {
     pub http_port: u16,
 }
 
-/// Shared state passed to both gRPC and HTTP handlers.
+/// Shared state accessible by both gRPC and HTTP handlers.
 #[derive(Clone)]
 struct OtlpSharedState {
-    store: Arc<dyn Store>,
-    streaming_config: Arc<StreamingConfig>,
+    /// Handle into the precompute engine's worker pool. When `Some`,
+    /// OTLP metrics and sketches are routed through the engine; when
+    /// `None` the receiver accepts data but only logs it (no storage).
+    ingest_state: Option<Arc<IngestState>>,
 }
 
 /// OTLP receiver that accepts metrics via gRPC and HTTP.
 pub struct OtlpReceiver {
     config: OtlpReceiverConfig,
-    store: Arc<dyn Store>,
-    streaming_config: Arc<StreamingConfig>,
+    ingest_state: Option<Arc<IngestState>>,
 }
 
 impl OtlpReceiver {
-    pub fn new(
-        config: OtlpReceiverConfig,
-        store: Arc<dyn Store>,
-        streaming_config: Arc<StreamingConfig>,
-    ) -> Self {
+    /// Construct a receiver without a backend. Metrics are parsed and
+    /// logged but not stored — useful for smoke-testing the OTLP pipe.
+    pub fn new(config: OtlpReceiverConfig) -> Self {
         Self {
             config,
-            store,
-            streaming_config,
+            ingest_state: None,
+        }
+    }
+
+    /// Construct a receiver wired to a precompute engine's ingest state.
+    /// Incoming metrics and sketches are routed through the engine's
+    /// worker pool, where they are merged into per-`(agg_id, group_key)`
+    /// panes and eventually emitted to the store.
+    pub fn with_ingest_state(config: OtlpReceiverConfig, ingest_state: Arc<IngestState>) -> Self {
+        Self {
+            config,
+            ingest_state: Some(ingest_state),
         }
     }
 
@@ -64,8 +91,7 @@ impl OtlpReceiver {
         let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.config.http_port));
 
         let shared = Arc::new(OtlpSharedState {
-            store: self.store.clone(),
-            streaming_config: self.streaming_config.clone(),
+            ingest_state: self.ingest_state.clone(),
         });
 
         let grpc_svc = MetricsServiceImpl {
@@ -78,7 +104,7 @@ impl OtlpReceiver {
 
         let app = Router::new()
             .route("/v1/metrics", post(handle_otlp_http))
-            .with_state(shared.clone());
+            .with_state(shared);
 
         let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
         let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
@@ -117,7 +143,10 @@ impl MetricsService for MetricsServiceImpl {
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         debug!("OTLP received request via gRPC");
         let req = request.into_inner();
-        process_otlp_request(&req, "gRPC", &self.shared);
+        process_otlp_request(&req, "gRPC");
+        if let Some(state) = &self.shared.ingest_state {
+            route_otlp_to_precompute(&req, state).await;
+        }
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success: None,
@@ -156,7 +185,10 @@ async fn handle_otlp_http(
             format!("Protobuf decode error: {}", e),
         )
     })?;
-    process_otlp_request(&req, "HTTP", &shared);
+    process_otlp_request(&req, "HTTP");
+    if let Some(state) = &shared.ingest_state {
+        route_otlp_to_precompute(&req, state).await;
+    }
     debug!("OTLP sending response via HTTP");
     Ok(Json(serde_json::json!({"rejected": 0})))
 }
@@ -170,15 +202,17 @@ pub struct MetricPoint {
     pub value: f64,
 }
 
-/// A parsed sketch data point: metric name, attribute key, raw payload bytes,
-/// timestamp in nanoseconds, and label map from the data point.
+/// A parsed sketch payload extracted from OTLP attributes. Carries the
+/// metric name, attribute name (identifies the sketch kind on the wire),
+/// labels (preserved from the OTLP DataPoint attributes + resource/scope),
+/// wire timestamp, and the opaque `SketchEnvelope` protobuf bytes.
 #[derive(Debug)]
 pub struct SketchPoint {
-    pub metric_name: String,
+    pub name: String,
     pub attr_name: String,
-    pub payload: Vec<u8>,
-    pub timestamp_nanos: u64,
     pub labels: HashMap<String, String>,
+    pub timestamp_nanos: u64,
+    pub payload: Vec<u8>,
 }
 
 type OtlpParseResult = (Vec<MetricPoint>, Vec<SketchPoint>);
@@ -242,31 +276,7 @@ fn log_sketch_envelope_type(attr_name: &str, payload: &[u8], metric_name: &str) 
     }
 }
 
-/// Build a reverse lookup from metric name -> aggregation_id using the
-/// streaming config.  Called once per request (configs are small).
-fn build_metric_to_aggregation_id(streaming_config: &StreamingConfig) -> HashMap<String, u64> {
-    let mut map = HashMap::new();
-    for (agg_id, config) in streaming_config.get_all_aggregation_configs() {
-        map.entry(config.metric.clone()).or_insert(*agg_id);
-    }
-    map
-}
-
-/// Stable hash of a metric name to use as aggregation_id when the metric is
-/// not found in the streaming config.  Uses the same FNV-1a 64-bit hash that
-/// other parts of the pipeline use for deterministic IDs.
-fn hash_metric_name(name: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn process_otlp_request(
-    request: &ExportMetricsServiceRequest,
-    transport: &str,
-    shared: &OtlpSharedState,
-) {
+fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) {
     let resource_count = request.resource_metrics.len();
     let total_points = otlp_to_record_count(request);
     if resource_count > 0 || total_points > 0 {
@@ -276,93 +286,18 @@ fn process_otlp_request(
         );
     }
 
-    let (points, sketch_points) = otlp_to_metric_points_and_sketches(request);
+    let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(request);
 
-    for sp in &sketch_points {
-        log_sketch_envelope_type(&sp.attr_name, &sp.payload, &sp.metric_name);
+    for sketch in &sketch_payloads {
+        log_sketch_envelope_type(&sketch.attr_name, &sketch.payload, &sketch.name);
     }
-    if !sketch_points.is_empty() {
+    if !sketch_payloads.is_empty() {
         debug!(
             "OTLP Sketch Payload Flow: received {} sketch payload(s), decoded successfully",
-            sketch_points.len()
+            sketch_payloads.len()
         );
     }
 
-    // --- Store sketch data into SimpleMapStore ---
-    if !sketch_points.is_empty() {
-        let metric_to_agg = build_metric_to_aggregation_id(&shared.streaming_config);
-        let mut batch: Vec<(PrecomputedOutput, Box<dyn crate::data_model::AggregateCore>)> =
-            Vec::with_capacity(sketch_points.len());
-
-        for sp in &sketch_points {
-            // Resolve aggregation_id: prefer streaming config, fall back to hash.
-            let aggregation_id = metric_to_agg
-                .get(&sp.metric_name)
-                .copied()
-                .unwrap_or_else(|| {
-                    let h = hash_metric_name(&sp.metric_name);
-                    warn!(
-                        "OTLP ingest: metric '{}' not found in streaming config, using hash {} as aggregation_id",
-                        sp.metric_name, h
-                    );
-                    h
-                });
-
-            // Convert nanoseconds to milliseconds for store timestamps.
-            let ts_ms = sp.timestamp_nanos / 1_000_000;
-
-            // Build KeyByLabelValues from the label map (sorted for determinism).
-            let mut sorted_labels: Vec<(&String, &String)> = sp.labels.iter().collect();
-            sorted_labels.sort_by_key(|(k, _)| *k);
-            let label_values: Vec<String> = sorted_labels
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-            let key = if label_values.is_empty() {
-                None
-            } else {
-                Some(KeyByLabelValues::new_with_labels(label_values))
-            };
-
-            let output = PrecomputedOutput::new(ts_ms, ts_ms, key, aggregation_id);
-
-            match SketchEnvelopeAccumulator::from_proto_bytes(sp.payload.clone()) {
-                Ok(accumulator) => {
-                    debug!(
-                        "OTLP ingest: storing sketch metric='{}' agg_id={} ts_ms={} type={}",
-                        sp.metric_name, aggregation_id, ts_ms, accumulator.sketch_type
-                    );
-                    batch.push((output, Box::new(accumulator)));
-                }
-                Err(e) => {
-                    error!(
-                        "OTLP ingest: failed to decode SketchEnvelope for metric '{}': {}",
-                        sp.metric_name, e
-                    );
-                }
-            }
-        }
-
-        if !batch.is_empty() {
-            let batch_len = batch.len();
-            match shared.store.insert_precomputed_output_batch(batch) {
-                Ok(_) => {
-                    info!(
-                        "OTLP ingest: stored {} sketch precompute(s) (transport={})",
-                        batch_len, transport
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "OTLP ingest: failed to insert sketch batch into store: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    // --- Log raw metric points (non-sketch) ---
     let mut by_series: HashMap<String, usize> = HashMap::new();
     for point in &points {
         let key = format_series_key(&point.name, &point.labels);
@@ -382,6 +317,176 @@ fn process_otlp_request(
             "OTLP parse example: {} {:?} @{}ns = {}",
             first.name, first.labels, first.timestamp_nanos, first.value
         );
+    }
+}
+
+/// Route parsed OTLP data through the precompute engine's worker pool.
+///
+/// Both raw metric points and pre-built sketch payloads are dispatched via
+/// `WorkerMessage::GroupSamples` / `WorkerMessage::AccumulatorInput`, with
+/// `(agg_id, group_key)` derived from the wire labels using the same logic
+/// as the Prometheus/VictoriaMetrics paths. This preserves full label
+/// semantics and lets the precompute engine perform config-driven window
+/// aggregation over both streams.
+///
+/// Metrics whose name does not match any aggregation in the streaming
+/// config are dropped with a debug log — the precompute engine only
+/// maintains state for configured metrics.
+async fn route_otlp_to_precompute(
+    request: &ExportMetricsServiceRequest,
+    ingest_state: &Arc<IngestState>,
+) {
+    let ingest_received_at = Instant::now();
+    let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(request);
+
+    // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
+    type GroupKey = (u64, String);
+    type SampleTuple = (String, i64, f64);
+    let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
+    let mut raw_matched = 0usize;
+    let mut raw_unmatched = 0usize;
+
+    for point in &points {
+        let series_key = format_series_key(&point.name, &point.labels);
+        let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
+        let mut matched = false;
+        for config in &ingest_state.agg_configs {
+            if config.metric != point.name
+                && config.spatial_filter_normalized != point.name
+                && config.spatial_filter != point.name
+            {
+                continue;
+            }
+            let group_key = IngestState::extract_group_key_for(&series_key, config);
+            by_group
+                .entry((config.aggregation_id, group_key))
+                .or_default()
+                .push((series_key.clone(), ts_ms, point.value));
+            matched = true;
+        }
+        if matched {
+            raw_matched += 1;
+        } else {
+            raw_unmatched += 1;
+        }
+    }
+
+    let raw_messages: Vec<WorkerMessage> = by_group
+        .into_iter()
+        .map(
+            |((agg_id, group_key), samples)| WorkerMessage::GroupSamples {
+                agg_id,
+                group_key,
+                samples,
+                ingest_received_at,
+            },
+        )
+        .collect();
+
+    if !raw_messages.is_empty() {
+        if let Err(e) = ingest_state
+            .router
+            .route_group_batch(raw_messages, ingest_received_at)
+            .await
+        {
+            warn!("OTLP raw-sample routing error: {}", e);
+        }
+    }
+
+    // Build AccumulatorInput messages for pre-built sketches.
+    // Each sketch payload carries a metric name that must match an
+    // aggregation config; labels come from the point's attributes. The
+    // payload is decoded enough to identify the sketch type for logging;
+    // the accumulator the worker receives is a conservative placeholder
+    // until per-variant `SketchEnvelope → concrete accumulator` decoders
+    // are wired up (see TODO below).
+    let mut sketch_messages: Vec<WorkerMessage> = Vec::new();
+    let mut sketch_matched = 0usize;
+    let mut sketch_unmatched = 0usize;
+    for point in &sketch_payloads {
+        let series_key = format_series_key(&point.name, &point.labels);
+        let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
+        let sketch_type = identify_sketch_type(&point.payload);
+        let mut matched = false;
+        for config in &ingest_state.agg_configs {
+            if config.metric != point.name
+                && config.spatial_filter_normalized != point.name
+                && config.spatial_filter != point.name
+            {
+                continue;
+            }
+            let group_key = IngestState::extract_group_key_for(&series_key, config);
+            // Wrap the raw SketchEnvelope bytes in a SketchEnvelopeAccumulator
+            // so the precompute engine receives the opaque sketch as-is. This
+            // preserves all sketch state end-to-end; per-variant decoding
+            // (e.g. CountMin → CountMinSketchAccumulator) can layer on top
+            // later without changing the routing contract.
+            let accumulator: Box<dyn AggregateCore> =
+                match SketchEnvelopeAccumulator::from_proto_bytes(point.payload.clone()) {
+                    Ok(acc) => Box::new(acc),
+                    Err(e) => {
+                        warn!(
+                            "OTLP sketch decode failed for metric='{}' attr='{}': {}",
+                            point.name, point.attr_name, e
+                        );
+                        continue;
+                    }
+                };
+            sketch_messages.push(WorkerMessage::AccumulatorInput {
+                agg_id: config.aggregation_id,
+                group_key,
+                timestamp_ms: ts_ms,
+                accumulator,
+                ingest_received_at,
+            });
+            matched = true;
+        }
+        if matched {
+            sketch_matched += 1;
+            debug!(
+                "OTLP sketch routed to precompute engine: metric='{}' attr='{}' type={} bytes={}",
+                point.name,
+                point.attr_name,
+                sketch_type,
+                point.payload.len()
+            );
+        } else {
+            sketch_unmatched += 1;
+        }
+    }
+
+    if !sketch_messages.is_empty() {
+        if let Err(e) = ingest_state
+            .router
+            .route_group_batch(sketch_messages, ingest_received_at)
+            .await
+        {
+            warn!("OTLP sketch routing error: {}", e);
+        }
+    }
+
+    if raw_unmatched > 0 || sketch_unmatched > 0 {
+        debug!(
+            "OTLP ingest: {} raw samples + {} sketches dropped (no matching aggregation config); \
+             {} raw + {} sketches routed to precompute engine",
+            raw_unmatched, sketch_unmatched, raw_matched, sketch_matched
+        );
+    }
+}
+
+/// Identify the concrete sketch type inside a `SketchEnvelope` payload,
+/// returning a human-readable name for logging. Returns `"Unknown"` if the
+/// payload does not decode or the `sketch_state` variant is unset.
+fn identify_sketch_type(payload: &[u8]) -> &'static str {
+    match SketchEnvelope::decode(payload) {
+        Ok(env) => match env.sketch_state {
+            Some(sketch_envelope::SketchState::Kll(_)) => "KLL",
+            Some(sketch_envelope::SketchState::CountMin(_)) => "CountMin",
+            Some(sketch_envelope::SketchState::CountSketch(_)) => "CountSketch",
+            Some(_) => "Other",
+            None => "Unknown",
+        },
+        Err(_) => "Unknown",
     }
 }
 
@@ -438,7 +543,7 @@ fn otlp_to_record_count(request: &ExportMetricsServiceRequest) -> usize {
 /// separately for Sketch Payload Flow processing.
 fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> OtlpParseResult {
     let mut points = Vec::new();
-    let mut sketch_points = Vec::new();
+    let mut sketch_payloads = Vec::new();
     for resource_metrics in &request.resource_metrics {
         let resource_attrs = resource_metrics
             .resource
@@ -471,13 +576,12 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             if let Some((attr_name, payload)) =
                                 get_sketch_payload_from_attrs(&dp.attributes)
                             {
-                                let labels = merge_point_attributes(&base_labels, &dp.attributes);
-                                sketch_points.push(SketchPoint {
-                                    metric_name: metric.name.clone(),
+                                sketch_payloads.push(SketchPoint {
+                                    name: metric.name.clone(),
                                     attr_name,
-                                    payload,
+                                    labels: merge_point_attributes(&base_labels, &dp.attributes),
                                     timestamp_nanos: dp.time_unix_nano,
-                                    labels,
+                                    payload,
                                 });
                                 continue;
                             }
@@ -496,13 +600,12 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             if let Some((attr_name, payload)) =
                                 get_sketch_payload_from_attrs(&dp.attributes)
                             {
-                                let labels = merge_point_attributes(&base_labels, &dp.attributes);
-                                sketch_points.push(SketchPoint {
-                                    metric_name: metric.name.clone(),
+                                sketch_payloads.push(SketchPoint {
+                                    name: metric.name.clone(),
                                     attr_name,
-                                    payload,
+                                    labels: merge_point_attributes(&base_labels, &dp.attributes),
                                     timestamp_nanos: dp.time_unix_nano,
-                                    labels,
+                                    payload,
                                 });
                                 continue;
                             }
@@ -521,13 +624,12 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             if let Some((attr_name, payload)) =
                                 get_sketch_payload_from_attrs(&dp.attributes)
                             {
-                                let labels = merge_point_attributes(&base_labels, &dp.attributes);
-                                sketch_points.push(SketchPoint {
-                                    metric_name: metric.name.clone(),
+                                sketch_payloads.push(SketchPoint {
+                                    name: metric.name.clone(),
                                     attr_name,
-                                    payload,
+                                    labels: merge_point_attributes(&base_labels, &dp.attributes),
                                     timestamp_nanos: dp.time_unix_nano,
-                                    labels,
+                                    payload,
                                 });
                                 continue;
                             }
@@ -553,13 +655,12 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             if let Some((attr_name, payload)) =
                                 get_sketch_payload_from_attrs(&dp.attributes)
                             {
-                                let labels = merge_point_attributes(&base_labels, &dp.attributes);
-                                sketch_points.push(SketchPoint {
-                                    metric_name: metric.name.clone(),
+                                sketch_payloads.push(SketchPoint {
+                                    name: metric.name.clone(),
                                     attr_name,
-                                    payload,
+                                    labels: merge_point_attributes(&base_labels, &dp.attributes),
                                     timestamp_nanos: dp.time_unix_nano,
-                                    labels,
+                                    payload,
                                 });
                                 continue;
                             }
@@ -585,13 +686,12 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             if let Some((attr_name, payload)) =
                                 get_sketch_payload_from_attrs(&dp.attributes)
                             {
-                                let labels = merge_point_attributes(&base_labels, &dp.attributes);
-                                sketch_points.push(SketchPoint {
-                                    metric_name: metric.name.clone(),
+                                sketch_payloads.push(SketchPoint {
+                                    name: metric.name.clone(),
                                     attr_name,
-                                    payload,
+                                    labels: merge_point_attributes(&base_labels, &dp.attributes),
                                     timestamp_nanos: dp.time_unix_nano,
-                                    labels,
+                                    payload,
                                 });
                                 continue;
                             }
@@ -615,7 +715,7 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
             }
         }
     }
-    (points, sketch_points)
+    (points, sketch_payloads)
 }
 
 fn merge_point_attributes(

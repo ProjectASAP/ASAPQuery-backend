@@ -23,8 +23,15 @@ use tracing::{debug, debug_span, info, warn};
 struct GroupState {
     config: Arc<AggregationConfig>,
     window_manager: WindowManager,
-    /// Active panes keyed by pane_start_ms.
+    /// Active panes for raw-sample accumulation, keyed by pane_start_ms.
     active_panes: BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
+    /// Active panes for pre-built accumulator inputs (e.g. OTLP-delivered
+    /// sketches), keyed by pane_start_ms. Each entry is the running merge
+    /// of every accumulator that landed in that pane's time range. Kept
+    /// separate from `active_panes` because sketches come in as opaque
+    /// `Box<dyn AggregateCore>` objects and do not share the updater
+    /// machinery used for incremental sample updates.
+    sketch_panes: BTreeMap<i64, Box<dyn AggregateCore>>,
     /// Per-group watermark: tracks the maximum timestamp seen across all
     /// series in this group on this worker.
     previous_watermark_ms: i64,
@@ -157,6 +164,38 @@ impl Worker {
                         "e2e: ingest->worker complete (raw)"
                     );
                 }
+                WorkerMessage::AccumulatorInput {
+                    agg_id,
+                    group_key,
+                    timestamp_ms,
+                    accumulator,
+                    ingest_received_at,
+                } => {
+                    let _span = debug_span!(
+                        "worker_process_accumulator",
+                        worker_id = self.id,
+                        agg_id,
+                        group = %group_key,
+                        timestamp_ms,
+                        accumulator_type = accumulator.type_name(),
+                    )
+                    .entered();
+                    if let Err(e) = self.process_accumulator_input(
+                        agg_id,
+                        &group_key,
+                        timestamp_ms,
+                        accumulator,
+                    ) {
+                        warn!(
+                            "Worker {} accumulator input error for ({}, {}): {}",
+                            self.id, agg_id, group_key, e
+                        );
+                    }
+                    debug!(
+                        e2e_latency_us = ingest_received_at.elapsed().as_micros() as u64,
+                        "e2e: ingest->worker complete (accumulator)"
+                    );
+                }
                 WorkerMessage::Flush => {
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} flush error: {}", self.id, e);
@@ -193,6 +232,7 @@ impl Worker {
                 window_manager: WindowManager::new(config.window_size, config.slide_interval),
                 config: Arc::clone(config),
                 active_panes: BTreeMap::new(),
+                sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
             };
             self.group_states.insert(key.clone(), gs);
@@ -337,6 +377,150 @@ impl Worker {
         Ok(())
     }
 
+    /// Process a pre-built accumulator (e.g. an OTLP-delivered sketch) for a
+    /// specific (agg_id, group_key) pane.
+    ///
+    /// The incoming accumulator is merged into `sketch_panes[pane_start]` via
+    /// `AggregateCore::merge_with`. If the pane is empty the accumulator is
+    /// installed as-is. If the pane's window has already closed, the late
+    /// data policy decides whether to drop it or forward it to the sink as
+    /// a standalone output so no data is silently lost.
+    ///
+    /// Unlike `process_group_samples`, this path does not touch
+    /// `active_panes` — sketches live in their own pane map and get merged
+    /// at window close (see `merge_sketch_panes_for_window`).
+    pub fn process_accumulator_input(
+        &mut self,
+        agg_id: u64,
+        group_key: &str,
+        timestamp_ms: i64,
+        incoming: Box<dyn AggregateCore>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let worker_id = self.id;
+        let allowed_lateness_ms = self.allowed_lateness_ms;
+        let late_data_policy = self.late_data_policy;
+
+        if self.get_or_create_group_state(agg_id, group_key).is_none() {
+            warn!(
+                "Worker {} skipping accumulator input for unknown agg_id={}, group_key={}",
+                self.id, agg_id, group_key
+            );
+            return Ok(());
+        }
+        let state = self
+            .group_states
+            .get_mut(&(agg_id, group_key.to_string()))
+            .unwrap();
+
+        let previous_wm = state.previous_watermark_ms;
+        let current_wm = if timestamp_ms > previous_wm {
+            timestamp_ms
+        } else {
+            previous_wm
+        };
+
+        let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
+
+        // Late-arrival check against the existing watermark.
+        let too_late = previous_wm != i64::MIN && timestamp_ms < previous_wm - allowed_lateness_ms;
+        let pane_start = state.window_manager.pane_start_for(timestamp_ms);
+        let pane_closed = !state.sketch_panes.contains_key(&pane_start)
+            && current_wm >= pane_start + state.window_manager.window_size_ms();
+
+        if too_late || pane_closed {
+            match late_data_policy {
+                LateDataPolicy::Drop => {
+                    debug!(
+                        "Worker {} dropping late accumulator input for group ({}, {}): ts={} watermark={}",
+                        worker_id, agg_id, group_key, timestamp_ms, previous_wm
+                    );
+                }
+                LateDataPolicy::ForwardToStore => {
+                    let window_start = pane_start;
+                    let window_end = pane_start + state.window_manager.window_size_ms();
+                    let key = build_group_key_label_values(group_key);
+                    let output = PrecomputedOutput::new(
+                        window_start as u64,
+                        window_end as u64,
+                        Some(key),
+                        agg_id,
+                    );
+                    emit_batch.push((output, incoming));
+                    debug!(
+                        "Forwarding late accumulator input to store for evicted pane [{}, {})",
+                        pane_start,
+                        pane_start + state.window_manager.slide_interval_ms()
+                    );
+                    self.output_sink.emit_batch(emit_batch)?;
+                }
+            }
+            return Ok(());
+        }
+
+        // Merge into the sketch pane covering this timestamp.
+        match state.sketch_panes.remove(&pane_start) {
+            Some(existing) => {
+                let merged = existing
+                    .merge_with(incoming.as_ref())
+                    .map_err(|e| format!("merge_with failed for pane {pane_start}: {e}"))?;
+                state.sketch_panes.insert(pane_start, merged);
+            }
+            None => {
+                state.sketch_panes.insert(pane_start, incoming);
+            }
+        }
+
+        // Check for closed windows and emit merged outputs.
+        let closed = state.window_manager.closed_windows(previous_wm, current_wm);
+        for window_start in &closed {
+            let (_, window_end) = state.window_manager.window_bounds(*window_start);
+            let pane_starts = state.window_manager.panes_for_window(*window_start);
+
+            // Emit from the raw-sample pane map (in case both sources are
+            // populated for the same group; rare but supported).
+            if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
+            {
+                let key = build_group_key_label_values(group_key);
+                let output = PrecomputedOutput::new(
+                    *window_start as u64,
+                    window_end as u64,
+                    Some(key),
+                    agg_id,
+                );
+                emit_batch.push((output, accumulator));
+            }
+
+            // Emit from the sketch pane map.
+            if let Some(accumulator) =
+                merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
+            {
+                let key = build_group_key_label_values(group_key);
+                let output = PrecomputedOutput::new(
+                    *window_start as u64,
+                    window_end as u64,
+                    Some(key),
+                    agg_id,
+                );
+                emit_batch.push((output, accumulator));
+            }
+        }
+
+        state.previous_watermark_ms = current_wm;
+
+        if !emit_batch.is_empty() {
+            debug!(
+                "Worker {} emitting {} sketch outputs for group ({}, {})",
+                worker_id,
+                emit_batch.len(),
+                agg_id,
+                group_key
+            );
+            self.output_sink.emit_batch(emit_batch)?;
+        }
+
+        Ok(())
+    }
+
     /// Raw fast-path: emit each sample as a standalone `SumAccumulator`.
     pub fn process_samples_raw(
         &self,
@@ -418,6 +602,19 @@ impl Worker {
 
                 if let Some(accumulator) =
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
+                {
+                    let key = build_group_key_label_values(group_key);
+                    let output = PrecomputedOutput::new(
+                        *window_start as u64,
+                        window_end as u64,
+                        Some(key),
+                        *agg_id,
+                    );
+                    emit_batch.push((output, accumulator));
+                }
+
+                if let Some(accumulator) =
+                    merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(group_key);
                     let output = PrecomputedOutput::new(
@@ -624,6 +821,38 @@ fn merge_panes_for_window(
             active_panes
                 .get(&ps)
                 .map(|updater| updater.snapshot_accumulator())
+        };
+
+        if let Some(acc) = pane_acc {
+            merged = Some(match merged {
+                None => acc,
+                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
+            });
+        }
+    }
+
+    merged
+}
+
+/// Merge pre-built accumulator panes for a window.
+///
+/// Equivalent to `merge_panes_for_window` but operating on the sketch pane
+/// map (`Box<dyn AggregateCore>` directly). The oldest pane is destructively
+/// taken (it will never be needed by a later window); subsequent panes are
+/// cloned so that still-open overlapping windows can still read them.
+fn merge_sketch_panes_for_window(
+    sketch_panes: &mut BTreeMap<i64, Box<dyn AggregateCore>>,
+    pane_starts: &[i64],
+) -> Option<Box<dyn AggregateCore>> {
+    let mut merged: Option<Box<dyn AggregateCore>> = None;
+
+    for (i, &ps) in pane_starts.iter().enumerate() {
+        let pane_acc: Option<Box<dyn AggregateCore>> = if i == 0 {
+            // Oldest pane: destructive take + evict
+            sketch_panes.remove(&ps)
+        } else {
+            // Shared pane: non-destructive clone
+            sketch_panes.get(&ps).map(|acc| acc.clone_boxed_core())
         };
 
         if let Some(acc) = pane_acc {
