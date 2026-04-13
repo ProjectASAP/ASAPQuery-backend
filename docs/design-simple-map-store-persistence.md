@@ -5,24 +5,37 @@
 `SimpleMapStore` (`asap-query-engine/src/stores/simple_map_store/`) is currently an
 in-memory-only store. Under long-running ingest it grows unboundedly: every sealed
 window for every `(aggregation_id, group_key)` is held in `DashMap<u64, RwLock<StoreKeyData>>`
-until `CleanupPolicy::CircularBuffer` rotates it out and drops it on the floor.
+until one of the three existing `CleanupPolicy` variants (`CircularBuffer`,
+`ReadBased`, `NoCleanup`) either rotates it out and drops it on the floor or does
+nothing at all.
 
-This creates two problems:
+All three of those variants are **destructive** — they delete data, they do not
+persist it. That creates two problems:
 
-1. **No memory bound.** A deployment has to either overprovision RAM or rely on
-   `CircularBuffer` to throw away data that may still be query-relevant.
+1. **No memory bound that preserves data.** A deployment has to either
+   overprovision RAM (`NoCleanup`), throw away potentially query-relevant data
+   (`CircularBuffer` / `ReadBased`), or tune per-agg `num_aggregates_to_retain`
+   values that don't correspond to any operator-meaningful quantity.
 2. **No durability.** Cold data (older than the query working set) still occupies
    RAM even though most queries hit only the last few minutes.
 
-We want a persistence layer that lets the store:
+We want `SimpleMapStore` to replace the existing cleanup-policy knob with a
+single persistence policy driven by **two** knobs, in priority order:
 
-- Honor a configurable memory budget for sketches.
-- Flush sealed windows older than a configurable timestamp threshold to disk.
-- Evict those flushed windows from memory when the budget is exceeded.
-- Serve queries transparently from memory + disk.
+1. **Primary — memory budget.** A configurable hard ceiling on in-memory sketch
+   bytes. When exceeded, the oldest sealed epochs flush to disk until usage is
+   back under a low-water mark. This is what actually bounds RAM in production.
+2. **Secondary — time watermark T.** A configurable "hot window." Any sealed
+   epoch whose end is older than `now - T` flushes to disk even if the store
+   is nowhere near the memory budget. This guarantees predictable durability
+   and a stable hot-set size under light load.
 
-Goals are scoped to a **single-node, single-process** store. Replication, sharding,
-compression, and query pushdown into segments are explicitly out of scope for v1.
+Flushed sketches are read back transparently at query time.
+
+Scope is **single-node, single-process**. Replication, sharding, compression,
+and query pushdown into segments are explicitly out of scope for v1. The three
+existing destructive `CleanupPolicy` variants are removed from `SimpleMapStore`
+(the enum stays in `asap_types` for any other store that still uses it).
 
 ---
 
@@ -39,8 +52,10 @@ compression, and query pushdown into segments are explicitly out of scope for v1
   (`per_key.rs:261`), holding only the per-agg-id `RwLock::write`.
 - Query hot path: `query_precomputed_output{,_exact}` iterates
   `current_epoch` + `sealed_epochs` under `RwLock::read`.
-- `CleanupPolicy` (`data_model/enums.rs`) already has a concept of dropping
-  old entries; persistence will become a fourth, non-destructive option.
+- `CleanupPolicy` (`asap_types::enums`) currently has three destructive variants
+  (`CircularBuffer`, `ReadBased`, `NoCleanup`); `SimpleMapStore` will stop
+  taking a `CleanupPolicy` at all and use the new persistence config instead.
+  The enum itself stays in `asap_types` for other stores.
 
 Key observation: **`current_epoch` is the only mutable region**. Sealed epochs are
 append-only until cleanup. That is exactly the right unit to flush.
@@ -135,56 +150,73 @@ estimate, not a hard guarantee — good enough to drive policy, and the alternat
 ### Configuration
 
 New struct, threaded through `PrecomputeEngineConfig` and loaded from the
-same YAML / controller channel as the existing streaming config:
+same YAML / controller channel as the existing streaming config. The two
+knobs match the priority order in the problem statement: **memory budget
+first, time watermark second**.
 
 ```rust
 pub struct SimpleMapStorePersistenceConfig {
-    pub enabled: bool,
-
-    // Memory budget (high watermark). When exceeded, background flusher
-    // evicts sealed epochs oldest-first until usage drops below
-    // `memory_low_watermark_bytes`.
+    // ---- Primary: memory budget ----
+    //
+    // High-water mark. When the store's tracked in-memory sketch bytes
+    // exceed this, the background flusher evicts sealed epochs
+    // oldest-first (globally, by epoch end_ms) until usage drops below
+    // `memory_low_watermark_bytes`. This is the knob that bounds RAM
+    // in production.
     pub memory_limit_bytes: usize,
     pub memory_low_watermark_bytes: usize,
-
-    // Time-based flush. Any sealed epoch whose end_ms is older than
-    // `now - flush_older_than_ms` is eligible to flush on the next tick,
-    // regardless of memory pressure. None disables time-based flushing.
-    pub flush_older_than_ms: Option<u64>,
-
-    // Cadence of the background flusher loop.
-    pub flush_interval_ms: u64,
-
-    // Root directory for segment files and manifest.
-    pub disk_path: PathBuf,
 
     // Hard ceiling. If memory usage reaches this *during* an insert
     // (flusher is falling behind), the insert path blocks on a condvar
     // until the flusher catches up. Set to memory_limit_bytes * 1.25
     // as a sensible default.
     pub hard_cap_bytes: usize,
+
+    // ---- Secondary: time watermark T ----
+    //
+    // Hot-window length. Any sealed epoch whose end_ms is older than
+    // `now - hot_window_ms` is flushed on the next flusher tick, even
+    // if the store is well under `memory_limit_bytes`. This guarantees
+    // durability and a predictable hot-set size under light ingest.
+    // None disables time-based flushing (not recommended — memory
+    // pressure alone will still work, but cold data will linger in RAM
+    // until something pushes it out).
+    pub hot_window_ms: Option<u64>,
+
+    // ---- Misc ----
+    pub flush_interval_ms: u64,   // cadence of the background flusher
+    pub disk_path: PathBuf,       // root dir for segments + manifest
 }
 ```
 
-Defaults keep `enabled = false` so existing deployments are unaffected until
-they opt in.
+`SimpleMapStorePerKey::new` now takes a `SimpleMapStorePersistenceConfig`
+instead of a `CleanupPolicy`. There is no "persistence disabled" escape
+hatch — this is now the only cleanup mechanism this store has. If someone
+wants the old in-memory-only behavior, they can set `hot_window_ms = None`
+and `memory_limit_bytes = usize::MAX`, which degenerates to "never flush."
 
-### Eviction policy
+### Eviction order
 
-v1 supports one policy — **oldest-sealed-epoch-first, globally ordered by
-epoch `end_ms`**. Rationale:
+There is only one ordering — **oldest-sealed-epoch-first, globally by epoch
+`end_ms`**. Both triggers (memory pressure and time watermark) pull from the
+same ordered view, so the flusher never has two disagreeing notions of "oldest."
+
+Rationale:
 
 - Matches the time-window access pattern: queries overwhelmingly target recent
-  windows.
-- Aligns with `flush_older_than_ms`: the same ordering drives both memory-pressure
-  flush and time-based flush.
-- Avoids cross-agg fairness debates that a `LargestAggFirst` policy would
-  invite; we can add more policies later behind an enum if needed.
+  windows, so evicting oldest is the lowest-regret choice.
+- Makes the two triggers composable: the memory-pressure pass and the
+  time-watermark pass are just two different stopping conditions on the same
+  iterator over `(agg_id, epoch) sorted by epoch.end_ms`.
+- Avoids cross-agg fairness debates (e.g., `LargestAggFirst`) that would
+  otherwise complicate v1; we can add more orderings later behind an enum if
+  it becomes necessary.
 
 ### Background flusher
 
 A dedicated Tokio task owned by the store, started in
-`SimpleMapStorePerKey::new` when persistence is enabled:
+`SimpleMapStorePerKey::new`. Each tick, it checks the primary trigger
+(memory) first, then the secondary trigger (time watermark):
 
 ```
 loop {
@@ -193,17 +225,29 @@ loop {
     let now = now_ms();
     let mut candidates = Vec::new();
 
-    // Phase 1: time-based — any sealed epoch older than watermark.
-    if let Some(max_age) = cfg.flush_older_than_ms {
-        candidates.extend(collect_epochs_older_than(now - max_age));
+    // Phase 1 (PRIMARY): memory budget.
+    // If we're over the high-water mark, pull oldest sealed epochs
+    // (by epoch.end_ms) until projected memory drops below the
+    // low-water mark. This is the knob that actually bounds RAM.
+    if mem_bytes_in_use.load() > cfg.memory_limit_bytes {
+        candidates.extend(collect_oldest_until_under_low_water(
+            cfg.memory_low_watermark_bytes,
+        ));
     }
 
-    // Phase 2: memory-pressure — if still over high-water after phase 1,
-    // keep pulling oldest sealed epochs until we would drop below
-    // memory_low_watermark_bytes.
-    if mem_bytes_in_use.load() > cfg.memory_limit_bytes {
-        candidates.extend(collect_oldest_until_under_low_water());
+    // Phase 2 (SECONDARY): time watermark T.
+    // Any sealed epoch older than `now - hot_window_ms` that wasn't
+    // already picked up in phase 1 is flushed here. Under light ingest,
+    // this is the only phase that runs and it keeps the hot set bounded
+    // by T × ingest rate regardless of the memory budget.
+    if let Some(hot_window) = cfg.hot_window_ms {
+        candidates.extend(collect_epochs_older_than(now - hot_window));
     }
+
+    // Dedup (phase 1 and phase 2 can pick the same epoch) and sort by
+    // epoch.end_ms ascending so we flush oldest first within the batch.
+    candidates.sort_unstable_by_key(|c| c.end_ms);
+    candidates.dedup();
 
     for (agg_id, epoch_id) in candidates {
         flush_and_evict(agg_id, epoch_id).await?;
@@ -212,6 +256,11 @@ loop {
     manifest.commit().await?;  // atomic rewrite after the batch
 }
 ```
+
+Under memory pressure, phase 1 dominates and phase 2 usually finds nothing
+left to do (the oldest epochs are already gone). Under light ingest, phase 1
+is a no-op and phase 2 does all the work. The two phases never fight because
+they pull from the same oldest-first ordering.
 
 `flush_and_evict` serializes the epoch *outside* the per-agg lock (the epoch is
 immutable once sealed, we can read the `Arc` without holding the write lock),
@@ -259,14 +308,25 @@ No new lock held across a fsync or disk I/O.
 
 ---
 
-## What this does **not** change
+## What this does **and does not** change
 
-- `CleanupPolicy::CircularBuffer` and `ReadBased` continue to exist and run. A
-  deployment can opt into persistence in addition to a cleanup policy; the
-  persistence flusher runs *before* `CircularBuffer` would drop data, so epochs
-  get a chance to survive on disk. If both policies fire on the same epoch,
-  `CircularBuffer` wins (cleanup is destructive, but that's the user's stated
-  intent when they configure it).
+Changes:
+
+- `SimpleMapStorePerKey::new` no longer takes a `CleanupPolicy`; it takes a
+  `SimpleMapStorePersistenceConfig`. The three destructive cleanup variants
+  (`CircularBuffer`, `ReadBased`, `NoCleanup`) are no longer wired into this
+  store at all. The code paths in `per_key.rs` that branch on
+  `CleanupPolicy` (`cleanup_old_aggregates`, `maybe_rotate_epoch`'s retention
+  logic) are deleted in favor of the flusher.
+- Call sites that construct `SimpleMapStore::new_with_strategy(..., cleanup_policy, ...)`
+  update to pass a `SimpleMapStorePersistenceConfig` instead. Main.rs and any
+  tests that construct the store directly will need to change.
+
+Does not change:
+
+- The `CleanupPolicy` enum itself stays in `asap_types` — other stores
+  (`promsketch_store`, legacy paths) may still reference it. This PR only
+  severs `SimpleMapStore`'s dependency on it.
 - `SimpleMapStoreGlobal` is intentionally left in-memory-only. Persistence
   targets `PerKey`, which is the production path. Adding it to `Global` is a
   small follow-up if anyone needs it.
@@ -280,25 +340,28 @@ No new lock held across a fsync or disk I/O.
 The PR this design doc accompanies will land in three commits on one branch so
 the pieces can be reviewed independently:
 
-1. **Sizing + config plumbing.** Add `approx_memory_bytes` to `AggregateCore`
-   and all concrete accumulators. Add `SimpleMapStorePersistenceConfig`. Track
-   `mem_bytes_in_use`. No disk I/O yet; expose the counter in
-   `StoreDiagnostics` so we can validate sizing in isolation.
+1. **Sizing + config plumbing + cleanup-policy removal.** Add
+   `approx_memory_bytes` to `AggregateCore` and all concrete accumulators.
+   Add `SimpleMapStorePersistenceConfig`. Track `mem_bytes_in_use`. Rip the
+   `CleanupPolicy` branches out of `per_key.rs` and update call sites. No
+   disk I/O yet — expose the memory counter in `StoreDiagnostics` so we can
+   validate sizing in isolation and be confident nothing else regressed.
 
 2. **Segment format, manifest, flusher.** Add `persistence/` submodule under
    `simple_map_store/` with segment encode/decode, manifest read/write,
-   background flusher task. Wire `flush_and_evict` into the per-key store.
-   Unit tests for round-trip, crash-after-segment-before-manifest, and orphan
-   sweep.
+   background flusher task (memory-first, then time-watermark). Wire
+   `flush_and_evict` into the per-key store. Unit tests for round-trip,
+   crash-after-segment-before-manifest, and orphan sweep.
 
 3. **Query path read-through + recovery.** Extend `query_precomputed_output`
    to consult the manifest and merge segment hits with in-memory hits. Add
    startup recovery. Integration test: ingest → flush → restart → query →
    same result as no-restart.
 
-Phases 1 and 2 are safe to merge independently because phase 2 is gated on
-`enabled = false` by default. Phase 3 is when persistence becomes observable
-to query results.
+Because phase 1 removes `CleanupPolicy` from this store, phase 1 is **not**
+independently mergeable without at least the memory-pressure path from
+phase 2 — otherwise the store has no bound on RAM. In practice phases 1 and
+2 land together; phase 3 can land separately once the write path is stable.
 
 ---
 
@@ -314,10 +377,11 @@ to query results.
    for segment writes, sync locks everywhere else. Flusher runs on a dedicated
    task, not a shared runtime, to avoid starving it under query load.
 
-3. **Should `flush_older_than_ms` live here or in the existing
-   `CleanupPolicy` enum?** It overlaps conceptually with `CircularBuffer`.
-   Proposal: keep it separate — `CleanupPolicy` is destructive, persistence
-   config is non-destructive. Confusing them in one knob would be worse.
+3. **Cold data retention on disk.** Once a sketch is on disk, it lives there
+   until the operator removes the directory. Do we want a third knob
+   `delete_older_than_ms = T2` (with `T2 >> hot_window_ms`) so disk is also
+   bounded? My lean: not in v1 — cold data is cheap and operators can manage
+   the directory, but add the knob as soon as anyone asks.
 
 4. **Per-agg-id flush fairness.** Oldest-global-first could starve small,
    slow-moving aggs during a burst on a hot agg. Acceptable for v1 since
