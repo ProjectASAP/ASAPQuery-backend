@@ -17,7 +17,11 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use super::persistence::{
-    self, cache::PartCache, flusher::FlusherHandle, manifest::Manifest, recovery,
+    self,
+    cache::PartCache,
+    flusher::FlusherHandle,
+    manifest::Manifest,
+    recovery,
     source::{EpochSnapshot, EpochSnapshotEntry, EpochSource, SealedEpochRef},
     PersistError, PersistResult, SimpleMapStorePersistenceConfig,
 };
@@ -329,11 +333,8 @@ impl SimpleMapStorePerKey {
             hard_cap_bytes,
         });
 
-        let flusher = FlusherHandle::start(
-            persistence_cfg,
-            Arc::clone(&manifest),
-            Arc::clone(&inner),
-        )?;
+        let flusher =
+            FlusherHandle::start(persistence_cfg, Arc::clone(&manifest), Arc::clone(&inner))?;
 
         Ok(Self {
             inner,
@@ -405,7 +406,12 @@ impl SimpleMapStorePerKey {
         // Skip destructive cleanup entirely — parts on disk are the
         // source of truth for cold data.
         if self.inner.persistence_enabled {
-            let _ = (num_aggregates_to_retain, metric, aggregation_id, read_count_threshold);
+            let _ = (
+                num_aggregates_to_retain,
+                metric,
+                aggregation_id,
+                read_count_threshold,
+            );
             return;
         }
 
@@ -695,17 +701,19 @@ impl SimpleMapStorePerKey {
                     );
                     continue;
                 };
-                let decoded =
-                    match accumulator_serde::deserialize_accumulator(&disk_entry.sketch_bytes, &sketch_type) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            warn!(
-                                "query_disk_parts: deserialize failed for {}: {}",
-                                disk_entry.sketch_type_name, e
-                            );
-                            continue;
-                        }
-                    };
+                let decoded = match accumulator_serde::deserialize_accumulator(
+                    &disk_entry.sketch_bytes,
+                    &sketch_type,
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(
+                            "query_disk_parts: deserialize failed for {}: {}",
+                            disk_entry.sketch_type_name, e
+                        );
+                        continue;
+                    }
+                };
                 let arc_acc: Arc<dyn AggregateCore> = Arc::from(decoded);
                 results
                     .entry(disk_entry.label.clone())

@@ -168,7 +168,6 @@ struct Args {
     // --persistence-* flags as the config. Forces LockStrategy::PerKey
     // regardless of --lock-strategy; the Global variant is
     // intentionally left in-memory-only.
-
     /// Enable the disk-backed persistence layer for SimpleMapStore
     #[arg(long)]
     persistence_enabled: bool,

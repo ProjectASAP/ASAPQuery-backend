@@ -118,10 +118,8 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
 mod tests {
     use super::*;
     use crate::data_model::KeyByLabelValues;
-    use crate::stores::simple_map_store::persistence::part::{PartWriter, part_dir_path};
-    use crate::stores::simple_map_store::persistence::source::{
-        EpochSnapshot, EpochSnapshotEntry,
-    };
+    use crate::stores::simple_map_store::persistence::part::{part_dir_path, PartWriter};
+    use crate::stores::simple_map_store::persistence::source::{EpochSnapshot, EpochSnapshotEntry};
     use tempfile::TempDir;
 
     fn dummy_snapshot() -> EpochSnapshot {
@@ -178,15 +176,16 @@ mod tests {
         let (manifest, _) = recover(tmp.path()).unwrap();
         let parts_root = parts_root(tmp.path());
         let part_dir = part_dir_path(&parts_root, 42);
-        let report_write =
-            PartWriter::write_part(&part_dir, 42, &[dummy_snapshot()]).unwrap();
+        let report_write = PartWriter::write_part(&part_dir, 42, &[dummy_snapshot()]).unwrap();
         manifest
-            .append_add(crate::stores::simple_map_store::persistence::manifest::PartEntry {
-                part_id: 42,
-                min_ts: report_write.min_ts,
-                max_ts: report_write.max_ts,
-                size_bytes: report_write.data_len + report_write.index_len,
-            })
+            .append_add(
+                crate::stores::simple_map_store::persistence::manifest::PartEntry {
+                    part_id: 42,
+                    min_ts: report_write.min_ts,
+                    max_ts: report_write.max_ts,
+                    size_bytes: report_write.data_len + report_write.index_len,
+                },
+            )
             .unwrap();
         drop(manifest);
 

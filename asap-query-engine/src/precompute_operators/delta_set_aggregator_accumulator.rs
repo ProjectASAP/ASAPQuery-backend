@@ -247,8 +247,7 @@ impl AggregateCore for DeltaSetAggregatorAccumulator {
     fn approx_memory_bytes(&self) -> usize {
         // Two HashSets of KeyByLabelValues.
         const BYTES_PER_ENTRY: usize = 96;
-        std::mem::size_of::<Self>()
-            + (self.added.len() + self.removed.len()) * BYTES_PER_ENTRY
+        std::mem::size_of::<Self>() + (self.added.len() + self.removed.len()) * BYTES_PER_ENTRY
     }
 
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {

@@ -254,7 +254,10 @@ impl Manifest {
         write_snapshot_atomic(&self.snapshot_path(), &live)?;
         // Truncate log.
         let log_path = self.log_path();
-        let f = OpenOptions::new().write(true).truncate(true).open(&log_path)?;
+        let f = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&log_path)?;
         f.sync_all()?;
         if let Ok(dir) = File::open(&self.disk_path) {
             let _ = dir.sync_all();

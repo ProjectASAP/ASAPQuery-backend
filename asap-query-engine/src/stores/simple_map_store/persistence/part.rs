@@ -188,7 +188,11 @@ impl PartWriter {
         for pe in &entries_plan {
             write_u32(&mut data_file, &mut data_crc, pe.label_bytes.len() as u32)?;
             write_u32(&mut data_file, &mut data_crc, pe.sketch_bytes.len() as u32)?;
-            write_u16(&mut data_file, &mut data_crc, pe.type_name_bytes.len() as u16)?;
+            write_u16(
+                &mut data_file,
+                &mut data_crc,
+                pe.type_name_bytes.len() as u16,
+            )?;
             write_u16(&mut data_file, &mut data_crc, 0)?; // _pad
             write_u32(&mut data_file, &mut data_crc, 0)?; // _pad
             write_padded(&mut data_file, &mut data_crc, &pe.label_bytes, 8)?;
@@ -199,7 +203,9 @@ impl PartWriter {
         data_file.write_all(&data_crc_val.to_le_bytes())?;
         data_file.write_all(&[0u8; 4])?; // pad
         data_file.flush()?;
-        let data_file = data_file.into_inner().map_err(|e| PersistError::Io(e.into_error()))?;
+        let data_file = data_file
+            .into_inner()
+            .map_err(|e| PersistError::Io(e.into_error()))?;
         data_file.sync_all()?;
         drop(data_file);
 
@@ -222,7 +228,9 @@ impl PartWriter {
         index_file.write_all(&index_crc_val.to_le_bytes())?;
         index_file.write_all(&[0u8; 4])?;
         index_file.flush()?;
-        let index_file = index_file.into_inner().map_err(|e| PersistError::Io(e.into_error()))?;
+        let index_file = index_file
+            .into_inner()
+            .map_err(|e| PersistError::Io(e.into_error()))?;
         index_file.sync_all()?;
         drop(index_file);
 
@@ -481,8 +489,7 @@ impl PartReader {
         // 36..40 reserved
         let data_len = u64::from_le_bytes(buf[40..48].try_into().unwrap());
         let index_len = u64::from_le_bytes(buf[48..56].try_into().unwrap());
-        let created_unix_secs =
-            u32::from_le_bytes(buf[56..60].try_into().unwrap()) as u64;
+        let created_unix_secs = u32::from_le_bytes(buf[56..60].try_into().unwrap()) as u64;
         let created_unix_ms = created_unix_secs * 1000;
         let crc_expected = u32::from_le_bytes(buf[60..64].try_into().unwrap());
         let crc_actual = crc32fast::hash(&buf[..60]);
@@ -511,18 +518,13 @@ impl PartReader {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let off = i * INDEX_ENTRY_SIZE;
-            let agg_id = u64::from_le_bytes(
-                self.index_mmap[off..off + 8].try_into().unwrap(),
-            );
-            let start_ts = u64::from_le_bytes(
-                self.index_mmap[off + 8..off + 16].try_into().unwrap(),
-            );
-            let end_ts = u64::from_le_bytes(
-                self.index_mmap[off + 16..off + 24].try_into().unwrap(),
-            );
-            let data_offset = u64::from_le_bytes(
-                self.index_mmap[off + 24..off + 32].try_into().unwrap(),
-            );
+            let agg_id = u64::from_le_bytes(self.index_mmap[off..off + 8].try_into().unwrap());
+            let start_ts =
+                u64::from_le_bytes(self.index_mmap[off + 8..off + 16].try_into().unwrap());
+            let end_ts =
+                u64::from_le_bytes(self.index_mmap[off + 16..off + 24].try_into().unwrap());
+            let data_offset =
+                u64::from_le_bytes(self.index_mmap[off + 24..off + 32].try_into().unwrap());
             out.push(IndexRecord {
                 agg_id,
                 start_ts,
@@ -543,8 +545,8 @@ impl PartReader {
                 "data.bin offset out of range".to_string(),
             ));
         }
-        let label_len = u32::from_le_bytes(self.data_mmap[off..off + 4].try_into().unwrap())
-            as usize;
+        let label_len =
+            u32::from_le_bytes(self.data_mmap[off..off + 4].try_into().unwrap()) as usize;
         let payload_len =
             u32::from_le_bytes(self.data_mmap[off + 4..off + 8].try_into().unwrap()) as usize;
         let type_name_len =
@@ -629,8 +631,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let part_dir = tmp.path().join("0000000000000001");
         let snap = make_snapshot();
-        let report =
-            PartWriter::write_part(&part_dir, 1, &[snap.clone()]).expect("write_part");
+        let report = PartWriter::write_part(&part_dir, 1, &[snap.clone()]).expect("write_part");
 
         assert_eq!(report.part_id, 1);
         assert_eq!(report.num_entries, 2);
