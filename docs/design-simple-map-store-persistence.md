@@ -64,84 +64,154 @@ append-only until cleanup. That is exactly the right unit to flush.
 
 ## Design
 
-### Unit of flush: the sealed epoch
+### Unit of flush vs. unit of file: the *part*
 
-A `SimpleMapStore` segment on disk corresponds to **one sealed epoch of one
-aggregation id**. Rationale:
+There are two granularities to separate cleanly:
 
-- Sealed epochs are immutable — safe to serialize without coordinating with writers.
-- The epoch already has a well-defined time range, which is exactly what range
-  queries want to filter on.
-- Flushing an epoch only requires the per-agg-id `RwLock::write` briefly — same
-  lock the insert path already uses, so no new contention class.
-- Recovery and query planning only need epoch-level metadata, not per-window.
+- **Unit of flush = sealed epoch.** Same as before. Sealed epochs are
+  immutable, have a well-defined time range, and can be spliced out of
+  `sealed_epochs` under a brief per-agg `RwLock::write`.
+- **Unit of file = *part*.** A part is **one flush tick's worth of sealed
+  epochs bundled into a single on-disk directory**, regardless of which
+  agg-id they came from. The flusher already assembles all the candidate
+  epochs for a tick before it touches the disk; instead of writing N
+  separate segment files and fsyncing each, it writes one part.
 
-The `current_epoch` is never flushed while hot. It becomes flushable the moment
-the rotator seals it.
+This is the same pattern every mainstream TSDB converges on — Prometheus
+blocks, InfluxDB TSM, VictoriaMetrics parts — for the same reasons:
+file count is bounded by flush ticks (not by individual epochs), metadata
+overhead is amortized across many entries, and compaction becomes a pure
+directory-level merge.
+
+The `current_epoch` is never flushed while hot. It becomes flushable the
+moment the rotator seals it, at which point it becomes a candidate for the
+next flush tick's part.
 
 ### Disk layout
 
 ```
 <disk_path>/
-├── manifest.json                 # authoritative index of all segments
-├── agg_00000042/
-│   ├── seg_0000000001.bin        # one sealed epoch, serialized
-│   ├── seg_0000000002.bin
-│   └── ...
-└── agg_00000043/
-    └── seg_0000000001.bin
+├── parts_manifest.log          # append-only log of part additions + deletions
+├── parts_manifest.snapshot     # periodic binary snapshot (compaction of the log)
+└── parts/
+    ├── 0000000001/             # part directory, name = monotonic part_id
+    │   ├── meta.bin            # fixed-size header: min_ts, max_ts, counts, crc
+    │   ├── data.bin            # all epoch payloads concatenated, 8-byte aligned
+    │   └── index.bin           # sorted array of entries, mmap-binary-search target
+    ├── 0000000002/
+    │   ├── meta.bin
+    │   ├── data.bin
+    │   └── index.bin
+    └── ...
 ```
 
-**Segment file format** (`seg_*.bin`). Every field is laid out so the whole
-file can be `mmap`ed and sketch payloads handed directly to
-`AggregateCore::deserialize_from_bytes` with zero copies:
+**Why parts instead of dir-per-agg with file-per-epoch:**
+
+- **File count scales with flush ticks, not with epochs.** On a 1-second
+  flush interval with 200 agg-ids and 1-minute windows, the old layout
+  produced ~288K files/day; the part layout produces ~86K files total
+  (one tick = three files: `meta.bin`, `data.bin`, `index.bin`). That is
+  the difference between "inode pressure is a real concern" and "we are
+  well within every filesystem's comfort zone."
+- **Metadata is amortized.** One `fallocate` + one `fdatasync` per
+  `data.bin` covers all epochs in the tick, rather than N separate
+  allocations and N separate fsyncs. Group-commit is now an intrinsic
+  property of the layout, not something the flusher has to arrange.
+- **Per-part in-file index.** Queries binary-search the part's `index.bin`
+  rather than linear-scanning a segment body. O(log N) per part instead
+  of O(N), and `index.bin` is mmap-friendly so the search is pure
+  pointer arithmetic with no syscalls.
+- **Aggs are interleaved inside a part, not segregated by directory.**
+  No wasted directories for low-traffic aggs; the in-part index handles
+  agg lookup cheaply.
+- **T2 retention is whole-directory.** Each part covers a tight time
+  range (roughly `flush_interval_ms`), so `delete_older_than_ms`
+  operates at part granularity — `rm -rf parts/000001234/` — instead of
+  touching shared files.
+- **Compaction fits naturally.** A background compactor can merge N
+  adjacent old parts into one larger part with the same on-disk shape.
+  Readers don't care because the parts_manifest gets updated atomically
+  and old part dirs get removed only after all in-flight readers are done.
+
+**Part file formats** (all little-endian, fixed layouts, mmap-friendly,
+8-byte aligned, written via `fallocate` + streaming CRC — same perf
+details that applied to segments, now applied to `data.bin`):
 
 ```
-[u32 magic][u16 version][u16 flags]
-[u64 epoch_id][u64 window_start_ms][u64 window_end_ms]
-[u32 num_entries][u32 _pad]                          // align to 8
-repeated num_entries times:
-  [u64 start_ts][u64 end_ts][u32 label_id][u8 agg_type][u24 _pad]
-  [u32 payload_len][u32 _pad]                        // align payload to 8
-  [payload_len bytes: serialize_to_bytes()]
-  [0..7 bytes: tail padding to 8-byte boundary]
-[u32 crc32 of body][u32 _pad]                        // trailer aligned
+meta.bin        (128 bytes, fixed)
+  [u32 magic][u16 version][u16 flags]
+  [u64 part_id][u64 min_ts][u64 max_ts]
+  [u32 num_entries][u32 num_aggs]
+  [u64 data_len][u64 index_len]
+  [u64 created_unix_ns]
+  [u32 _reserved; 6]
+  [u32 crc32 of the above]
+
+data.bin        (sum of padded payloads)
+  repeated num_entries times, in the order the index lists them:
+    [payload_len bytes: serialize_to_bytes()]
+    [0..7 bytes: tail padding to 8-byte boundary]
+
+index.bin       (32 bytes per entry, sorted by (agg_id, start_ms))
+  repeated num_entries times:
+    [u64 agg_id][u64 start_ms][u64 end_ms]
+    [u32 data_offset][u32 payload_len]
+  [u32 crc32 of the above][u32 _pad]
 ```
 
-Fixed-size header lets us mmap and binary-search by timestamp without parsing
-payloads. Body is a linear scan — v1 does not build an in-segment index because
-sealed epochs are small (bounded by window size × group count for a single agg).
+`index.bin` is the only file a query needs to traverse to locate entries
+inside a part. It is small (32 B × num_entries, typically tens of KB), is
+mmap'd on first access, and a binary search by `(agg_id, start_ms)` lands
+on the byte range inside `data.bin` with one pointer-arithmetic step and
+zero decode work.
 
-**Write-side perf details:**
+**Parts manifest: append-only log + periodic snapshot.**
 
-- Before writing, call `fallocate(fd, 0, 0, estimated_size)` to reserve
-  contiguous space and avoid ext4/xfs metadata churn under many-small-segments
-  workloads. `estimated_size` is `sum of approx_memory_bytes * 1.3` for a safe
-  upper bound; any slack is released via `ftruncate` at the end.
-- 8-byte alignment for every payload means a single `mmap` + pointer cast is
-  safe on every architecture Rust targets. Without alignment, ARM and
-  `MIRI`-style UB checks require a copy-to-aligned-buffer step.
-- The trailing CRC is computed streaming while we write the body, so we do not
-  re-read the file to compute it.
+The manifest is the one piece of global state on disk. The previous
+design had it as a JSON file rewritten on every flush tick — quadratic
+over the lifetime of the deployment. We replace it with the standard
+LSM-style pattern:
 
-**Manifest** (`manifest.json`):
+- **`parts_manifest.log`** is an append-only binary file. Each flush
+  tick appends one record (add-part or delete-part, both fixed-size).
+  Appending is a single `write + fdatasync` on a file whose size is
+  proportional to the number of *ticks*, not the number of parts that
+  have ever existed. Cheap and O(1) per tick.
+- **`parts_manifest.snapshot`** is a periodic binary snapshot of the
+  live set of parts, produced by replaying the log and emitting a flat
+  sorted array of `(part_id: u64, min_ts: u64, max_ts: u64, size: u64)`
+  = 32 bytes per live part. The snapshot is rewritten atomically (write
+  tmp → fsync → rename) whenever the log gets large relative to the
+  snapshot, and the log is truncated after. Snapshot + remaining log
+  is always the authoritative live state.
+- **On startup**, the store loads the snapshot (mmap + direct cast, no
+  parse), then replays any tail of the log added since the snapshot was
+  taken, then verifies every live part directory's `meta.bin` CRC.
+  Sweep orphan part dirs (present on disk but not in the replayed
+  state) and treat them as a mid-flush crash — delete them.
 
-```json
-{
-  "version": 1,
-  "segments": [
-    {"agg_id": 42, "epoch_id": 1, "path": "agg_00000042/seg_0000000001.bin",
-     "start_ms": 1_700_000_000_000, "end_ms": 1_700_000_060_000,
-     "num_entries": 120, "size_bytes": 48192}
-  ]
-}
-```
+Binary formats throughout mean parse time is effectively zero; the
+snapshot is "cast a byte slice to `&[PartEntry]`" — which works because
+we declared the layout 8-byte aligned and fixed-size.
 
-The manifest is the single source of truth for which segments exist and what
-ranges they cover. It is rewritten atomically (`write → fsync → rename`) after
-every flush batch. Individual segment files are written+fsynced before the
-manifest ever references them, so a crash mid-flush leaves orphan files that
-startup sweeps away — never a dangling manifest entry.
+**Durability ordering per flush tick** (the invariant a crash must not
+violate: no part is referenced in the manifest until its bytes are on
+disk):
+
+1. Assemble the tick's candidate epochs (in-memory, no I/O).
+2. `fallocate` the three files in `parts/<part_id>/`, stream payloads
+   into `data.bin`, stream index into `index.bin`, write `meta.bin`.
+3. `fdatasync` `data.bin`, `index.bin`, `meta.bin` (batched — one
+   syscall per file, not per entry).
+4. `fsync` the part directory itself.
+5. Append the add-part record to `parts_manifest.log` and `fdatasync`
+   the log.
+6. `fsync` `<disk_path>` (the root) so the log's size update is durable.
+
+A crash at any step before (5) leaves an orphan part directory that
+startup sweep deletes. A crash between (5) and (6) is fine — the log
+record is already durable via (5). After (6), the part is officially
+live and the flusher may evict the corresponding epochs from memory.
 
 ### Memory accounting
 
@@ -289,36 +359,88 @@ loop {
     // Dedup (phase 1 and phase 2 can pick the same epoch). Order is
     // already interleaved across aggs; no re-sort.
     candidates.dedup_by_key(|c| (c.agg_id, c.epoch_id));
+    if candidates.is_empty() { /* go straight to phase 3 below */ }
 
-    // ---- Group-commit the whole tick ----
-    let mut written: Vec<WrittenSegment> = Vec::new();
-    for epoch_ref in candidates {
-        let bytes = serialize_epoch(epoch_ref.arc.clone());
-        let path  = write_segment_no_fsync(&bytes, epoch_ref)?;
-        written.push(WrittenSegment { path, meta: epoch_ref.meta });
+    // ---- Build and persist one part for the whole tick ----
+    //
+    // All candidate epochs from this tick land in a single part directory
+    // under `parts/<part_id>/`. File count per tick is O(1) (three
+    // files) instead of O(num_candidates). This is where group-commit
+    // stops being something the flusher explicitly arranges and starts
+    // being an intrinsic property of the layout.
+    if !candidates.is_empty() {
+        let part_id = next_part_id();
+        let part_dir = cfg.disk_path.join("parts").join(fmt_part_id(part_id));
+
+        // (a) Clone each candidate's Arc<Epoch> under a brief read lock.
+        //     No serialization under any lock.
+        let snapshots: Vec<EpochSnapshot> = candidates
+            .iter()
+            .map(|c| snapshot_under_read_lock(c))
+            .collect();
+
+        // (b) Serialize to the three part files. data.bin is fallocate'd
+        //     to `sum(approx_memory_bytes) * 1.3`; index.bin is sized
+        //     exactly (32 B per entry). Both are 8-byte aligned and CRCs
+        //     are computed streaming.
+        let (data_len, index_len) = write_part_files(&part_dir, &snapshots)?;
+
+        // (c) Batched fdatasync of the three files + the part directory.
+        //     One syscall per file; no per-epoch fsync.
+        fdatasync_file(&part_dir.join("data.bin"))?;
+        fdatasync_file(&part_dir.join("index.bin"))?;
+        fdatasync_file(&part_dir.join("meta.bin"))?;
+        fsync_dir(&part_dir)?;
+
+        // (d) Append the add-part record to the manifest log and fsync it.
+        //     Single fixed-size append — no rewrite of existing state.
+        manifest.append_add_part(AddPartRecord {
+            part_id,
+            min_ts: snapshots.iter().map(|s| s.min_ts).min().unwrap(),
+            max_ts: snapshots.iter().map(|s| s.max_ts).max().unwrap(),
+            size_bytes: (data_len + index_len) as u64,
+        })?;
+        fsync_dir(&cfg.disk_path)?;  // log's size update is now durable
+
+        // (e) Now that the part is officially live, evict the source
+        //     epochs from memory. This is the only place we take the
+        //     per-agg write lock, and we take it O(1) times per epoch.
+        for snapshot in &snapshots {
+            splice_out_of_sealed_epochs(snapshot.agg_id, snapshot.epoch_id);
+            mem_bytes_in_use.fetch_sub(snapshot.approx_bytes);
+        }
+
+        // Maybe compact the manifest log into a fresh snapshot if the
+        // log has grown large relative to the current snapshot.
+        manifest.maybe_compact()?;
     }
-    fdatasync_all(&written)?;            // one batched fsync pass
-    manifest.rewrite_and_fsync(&written)?;
-    fsync_parent_dir(&cfg.disk_path)?;   // one dir fsync for the whole batch
 
-    // Now that segments are durable AND referenced by the manifest,
-    // evict them from memory.
-    for seg in &written {
-        splice_out_of_sealed_epochs(seg.meta);
-        mem_bytes_in_use.fetch_sub(seg.meta.approx_bytes);
-    }
-
-    // Phase 3 (disk retention sweep): delete segments older than T2.
+    // Phase 3 (disk retention sweep): delete whole parts older than T2.
+    //
+    // Because parts cover a tight time range (~flush_interval_ms), T2
+    // deletion operates at part-directory granularity — we rm -rf the
+    // whole thing rather than touching shared files.
     if let Some(ttl) = cfg.delete_older_than_ms {
         let cutoff = now.saturating_sub(ttl);
-        let expired = manifest.segments_older_than(cutoff);
-        for seg in expired {
-            manifest.remove(seg.id);
-            cache_tier2.invalidate(seg.id);  // drop any decoded copy
-            fs::remove_file(seg.path).ok();  // best-effort; orphan sweep on restart
+        let expired: Vec<PartId> = manifest
+            .live_parts()
+            .filter(|p| p.max_ts < cutoff)
+            .map(|p| p.part_id)
+            .collect();
+
+        for part_id in expired {
+            // Invalidate Tier-2 cache entries that reference this part,
+            // append a delete-part record to the log, then remove the dir.
+            cache_tier2.invalidate_part(part_id);
+            manifest.append_delete_part(part_id)?;
+            let part_dir = cfg.disk_path
+                .join("parts")
+                .join(fmt_part_id(part_id));
+            fs::remove_dir_all(part_dir).ok();  // orphan sweep on restart catches failures
         }
         if !expired.is_empty() {
-            manifest.rewrite_and_fsync(&[])?;
+            fdatasync_file(&manifest.log_path())?;
+            fsync_dir(&cfg.disk_path)?;
         }
     }
 }
@@ -327,51 +449,44 @@ loop {
 Under memory pressure, phase 1 dominates and phase 2 usually finds nothing
 left to do (the oldest epochs are already gone). Under light ingest, phase 1
 is a no-op and phase 2 does all the work. Phase 3 is independent and runs
-every tick regardless; it costs one manifest scan plus one `unlink` per
-expired segment.
+every tick regardless; it costs one manifest scan plus one `rm -rf` per
+expired part directory (usually zero).
 
-#### Group-commit fsync
+Group-commit is now **intrinsic to the layout**, not something the flusher
+has to explicitly arrange: one tick = one part = three `fdatasync`s + one
+dir fsync + one log append, independent of how many epochs the tick is
+flushing. The durability ordering is spelled out in the previous section
+("Durability ordering per flush tick").
 
-The pseudocode above batches all `fsync`/`fdatasync` calls for a tick into a
-single pass at the end, rather than `fsync`ing each segment inline. On
-spinning disks this is ~10× fewer head seeks per tick; on SSDs it is ~3–4×
-fewer syscalls. The cost is one temporarily-larger `written` vector and one
-extra `fsync_parent_dir` at the end — trivial relative to the saved I/O.
+The part-building loop above takes advantage of a property that matters a
+lot for the flusher design: **sealed epochs are append-only and frozen.**
+Once the rotator seals an epoch, no writer will ever touch its contents
+again — it is only read (by queries) or removed wholesale (by the
+flusher). That immutability is what lets the flusher stay completely off
+the critical path:
 
-Durability invariant remains the same: **no segment is referenced by the
-manifest until its bytes and the manifest itself are both `fsync`'d.** The
-group-commit ordering is (1) write all segment bodies, (2) `fdatasync` all
-of them, (3) rewrite + `fsync` manifest via the atomic `write → rename`
-dance, (4) `fsync` parent directory. A crash at any point leaves orphan
-segment files (cleaned by the startup sweep) but never a dangling manifest
-entry.
+1. Take the per-agg `RwLock::read` briefly, clone the `Arc<Epoch>` for
+   each candidate out of `sealed_epochs`, drop the lock. This is the
+   `snapshot_under_read_lock` step.
+2. Serialize all candidates into `data.bin` / `index.bin` / `meta.bin`,
+   fsync the three files and the part directory, and append to the
+   manifest log — **entirely outside any per-agg store lock**, on the
+   flusher's own thread. Nothing in the system is waiting on this I/O.
+   Inserts continue to land in `current_epoch`; queries continue to
+   read from the still-in-place `sealed_epochs` entries (and the cloned
+   `Arc`s keep bytes alive for any query that happens to hold a
+   reference already); the rotator continues to seal new epochs behind
+   us.
+3. Once the part is officially live in the manifest log, take each
+   per-agg `RwLock::write` briefly to splice the corresponding epoch
+   out of `sealed_epochs` and decrement `mem_bytes_in_use`. This is
+   O(1) per epoch — a `BTreeMap::remove` plus an atomic subtraction —
+   and is the only write lock the flusher holds per epoch.
 
-`flush_and_evict` takes advantage of a property that matters a lot for the
-flusher design: **sealed epochs are append-only and frozen.** Once the
-rotator seals an epoch, no writer will ever touch its contents again — it
-is only read (by queries) or removed wholesale (by the flusher). That
-immutability is what lets the flusher stay completely off the critical
-path:
-
-1. Take the per-agg `RwLock::read` briefly, clone the `Arc<Epoch>` for the
-   target epoch out of `sealed_epochs`, drop the lock.
-2. Serialize the epoch, write the segment file, and fsync — **entirely
-   outside any store lock**, on the flusher's own thread. Nothing in the
-   system is waiting on this I/O. Inserts continue to land in
-   `current_epoch`; queries continue to read from the still-in-place
-   `sealed_epochs` entry (and the cloned `Arc` keeps the bytes alive for
-   any query that happens to hold a reference already); the rotator
-   continues to seal new epochs behind us.
-3. Once the segment is durable and the manifest is updated, take the
-   per-agg `RwLock::write` briefly to splice the epoch out of
-   `sealed_epochs` and decrement `mem_bytes_in_use`. This is O(1) — a
-   `BTreeMap::remove` plus an atomic subtraction — and is the only lock
-   the flusher holds for more than a read snapshot.
-
-Because steps 2 and 3 are decoupled by the `Arc<Epoch>` clone, **no lock
-is ever held across disk I/O**, and the flusher never blocks anything on
-the insert or query path beyond the two brief lock acquisitions at the
-start and end.
+Because steps 2 and 3 are decoupled by the `Arc<Epoch>` clone from step
+1, **no per-agg lock is ever held across disk I/O**, and the flusher
+never blocks anything on the insert or query path beyond the two brief
+lock acquisitions at the start and end.
 
 #### Sync vs. async flush I/O — resolved
 
@@ -412,17 +527,41 @@ flag checked on each loop iteration.
 
 `query_precomputed_output` becomes a three-way merge:
 
-1. Read from `current_epoch + sealed_epochs` as today.
-2. Look up segments in the manifest whose `[start_ms, end_ms]` overlaps the
-   query range for this `agg_id`.
-3. For each matching segment, read the file (via the read-side segment cache
-   described below), decode entries whose window overlaps, and merge into the
-   result.
+1. Read from `current_epoch + sealed_epochs` as today (in-memory hits).
+2. Walk the parts_manifest's live-parts list for any `part.[min_ts,
+   max_ts]` that overlaps the query's time range. The manifest lives in
+   memory as a `Vec<PartEntry>` built from the snapshot + log replay at
+   startup, so this is a linear scan over a short list (tens of
+   thousands of entries in the worst case, all 32-byte records) — fast
+   and trivially parallel with inserts.
+3. For each overlapping part: fetch its `DecodedPart` from the Tier-2
+   segment cache (`moka::Cache<PartId, Arc<DecodedPart>>`). On miss,
+   `mmap` the part's `data.bin` and `index.bin`, wrap them in an
+   `Arc<DecodedPart>` (holding the mmap handles), and insert into the
+   cache. Then binary-search `index.bin` for `(agg_id, start_ms)`, walk
+   the matching entries forward while `start_ms <= query_end`, and for
+   each one hand the `&[u8]` slice of `data.bin` directly to
+   `AggregateCore::deserialize_from_bytes` with zero copies.
 
-Segment reads happen under a read lock on the manifest; they do **not** take any
-per-agg store lock, so they can run fully in parallel with inserts. Merging reuses
-the existing `TimestampedBucketsMap` + `AggregateCore::merge_with` that the
-in-memory query path already uses — no new merge logic.
+Part reads happen under a read lock on the parts_manifest vector; they
+do **not** take any per-agg store lock, so they run fully in parallel
+with inserts. Merging reuses the existing `TimestampedBucketsMap` +
+`AggregateCore::merge_with` that the in-memory query path already uses
+— no new merge logic.
+
+**Why this is fast:**
+
+- **One file open per part hit, not per entry.** Queries that span many
+  aggs inside a part still only pay one `mmap`'s worth of setup cost.
+- **Zero-copy deserialize.** The 8-byte alignment guarantee means
+  `&data.bin[offset..offset+len]` can be fed straight to the
+  sketch-specific decoder without a staging buffer.
+- **Binary search, not linear scan.** `index.bin` is sorted by
+  `(agg_id, start_ms)` and is a flat mmap'd array; `partition_point` is
+  a few cache lines of work.
+- **Page cache locality.** Adjacent entries for the same agg inside a
+  part are physically adjacent on disk, so a query over a time range
+  touches contiguous pages.
 
 ### Read-side segment cache (two-tier memory model)
 
@@ -448,18 +587,18 @@ read-side cache on top of the disk layer.
 sealed epoch that has not yet been flushed. Source of truth for recent
 data. Managed by the flusher described above.
 
-**Tier 2 — read-side segment cache (query-driven).** Bounded by a
-separate `segment_cache_bytes` budget. Contains decoded copies of segments
-pulled back from disk by the query path. Source of truth is always the
-segment file — the cache is a pure optimization, drop-anytime, never
-dirty. Managed by the query path, not the flusher.
+**Tier 2 — read-side part cache (query-driven).** Bounded by a separate
+`part_cache_bytes` budget. Contains mmap handles and decoded index views
+of parts pulled back from disk by the query path. Source of truth is
+always the part directory on disk — the cache is a pure optimization,
+drop-anytime, never dirty. Managed by the query path, not the flusher.
 
 ```rust
 pub struct SimpleMapStorePersistenceConfig {
     // ... existing fields ...
 
-    // Read-side segment cache. Bounded independently of
-    // `memory_limit_bytes`; this budget is for decoded segments the query
+    // Read-side part cache. Bounded independently of
+    // `memory_limit_bytes`; this budget is for decoded parts the query
     // path pulls back from disk, not for the authoritative hot set.
     //
     // Default: min(10% * memory_limit_bytes, 512 MiB).
@@ -469,7 +608,7 @@ pub struct SimpleMapStorePersistenceConfig {
     // entirely (every cold query pays disk I/O); a fixed absolute
     // default would be too small on big boxes and too large on small
     // ones, so the default scales with the write budget.
-    pub segment_cache_bytes: usize,
+    pub part_cache_bytes: usize,
 }
 ```
 
@@ -534,13 +673,25 @@ whole point of splitting the tiers.
 
 ### Recovery on startup
 
-1. Open `disk_path`, read `manifest.json`.
-2. For every referenced segment, stat the file and validate magic + CRC header.
-   Missing / corrupt segments are logged and removed from the manifest.
-3. Sweep `disk_path` for segment files not referenced in the manifest (orphans
-   from a mid-flush crash) and delete them.
-4. Build the in-memory segment index; do **not** load any sketches into RAM.
-   Cold data stays cold until a query asks for it.
+1. Open `disk_path`. If `parts_manifest.snapshot` exists, mmap it and
+   cast the bytes to `&[PartEntry]` (no parse — the layout is 8-byte
+   aligned and versioned in a small header). Otherwise, start with an
+   empty live set.
+2. Replay `parts_manifest.log` from the offset recorded in the
+   snapshot's footer, applying add-part and delete-part records to the
+   live set.
+3. For every live part, stat its directory, verify `meta.bin`'s magic,
+   version, and CRC. Parts whose directory is missing or whose
+   `meta.bin` fails verification are logged and removed from the live
+   set (and a delete-part record is appended to the log to make the
+   removal durable).
+4. Sweep `parts/` for directories not referenced in the live set
+   (orphans from a mid-flush crash before step 5 of the durability
+   ordering) and `rm -rf` them.
+5. Build the in-memory `Vec<PartEntry>` that the query path reads. Do
+   **not** mmap `data.bin` or `index.bin` eagerly — parts are mapped
+   lazily on first query hit and cached in Tier 2. Cold data stays
+   cold until a query asks for it.
 
 ### Concurrency summary
 
@@ -548,12 +699,14 @@ whole point of splitting the tiers.
 |-------------------|---------------------------------------------|
 | Insert            | per-agg `RwLock::write` (unchanged)         |
 | Query in-memory   | per-agg `RwLock::read` (unchanged)          |
-| Query disk        | manifest `RwLock::read` + segment-cache mutex |
-| Flush: serialize  | none (reads immutable sealed `Arc`)         |
-| Flush: evict      | per-agg `RwLock::write` (short, O(1) splice)|
-| Flush: commit     | manifest `RwLock::write` (short)            |
+| Query disk        | parts_manifest `RwLock::read` + moka cache internal |
+| Flush: snapshot   | per-agg `RwLock::read` (brief, per candidate) |
+| Flush: serialize  | none (operates on cloned `Arc<Epoch>`s)     |
+| Flush: commit log | parts_manifest `RwLock::write` (brief, append) |
+| Flush: evict      | per-agg `RwLock::write` (short, O(1) splice per epoch) |
+| T2 sweep          | parts_manifest `RwLock::write` (brief, delete records) |
 
-No new lock held across a fsync or disk I/O.
+No lock of any kind is held across a `fsync` or disk I/O.
 
 ---
 
@@ -596,22 +749,27 @@ the pieces can be reviewed independently:
    disk I/O yet — expose the memory counter in `StoreDiagnostics` so we can
    validate sizing in isolation and be confident nothing else regressed.
 
-2. **Segment format, manifest, flusher.** Add `persistence/` submodule under
-   `simple_map_store/` with segment encode/decode (8-byte aligned,
-   `fallocate`d, mmap-friendly), manifest read/write, background flusher
-   thread (memory-first, then time-watermark, then T2 retention sweep) with
-   group-commit fsync. Wire `flush_and_evict` into the per-key store. Unit
-   tests for round-trip, crash-after-segment-before-manifest, orphan sweep,
-   and T2 deletion.
+2. **Parts layout, manifest log, flusher.** Add `persistence/` submodule
+   under `simple_map_store/` with part encode/decode (`meta.bin` +
+   `data.bin` + `index.bin`, 8-byte aligned, `fallocate`'d, mmap-friendly),
+   parts_manifest log + snapshot read/write, background flusher thread
+   (memory-first, then time-watermark, then T2 retention sweep, one part
+   per tick, group-commit implicit in the layout). Wire part-building and
+   eviction into the per-key store. Unit tests for round-trip,
+   crash-before-log-append, crash-between-log-append-and-dir-fsync,
+   orphan-part sweep, and T2 whole-part deletion.
 
-3. **Query path read-through + recovery + Tier-2 cache.** Extend
-   `query_precomputed_output` to consult the manifest and merge segment hits
-   with in-memory hits. Wire a `moka` (or `mini-moka`) weight-bounded
-   segment cache sized to `min(10% * memory_limit_bytes, 512 MiB)` by
-   default, with hit/miss counters exported via `StoreDiagnostics`. Add
-   startup recovery. Integration test: ingest → flush → restart → query →
-   same result as no-restart, plus a scan-resistance test that confirms a
-   long-range query does not evict a separately-hot segment.
+3. **Query path read-through + recovery + Tier-2 part cache.** Extend
+   `query_precomputed_output` to walk the parts_manifest, binary-search
+   `index.bin` of overlapping parts, and zero-copy deserialize payloads
+   out of mmap'd `data.bin`. Wire a `moka` (or `mini-moka`)
+   weight-bounded part cache sized to
+   `min(10% * memory_limit_bytes, 512 MiB)` by default, keyed on
+   `PartId`, with hit/miss counters exported via `StoreDiagnostics`.
+   Add startup recovery (snapshot mmap + log replay + CRC verify +
+   orphan sweep). Integration test: ingest → flush → restart → query →
+   same result as no-restart, plus a scan-resistance test that confirms
+   a long-range query does not evict a separately-hot part.
 
 Because phase 1 removes `CleanupPolicy` from this store, phase 1 is **not**
 independently mergeable without at least the memory-pressure path from
@@ -634,8 +792,20 @@ each lives in the section it points to.
 | 4 | Per-agg-id flush fairness | **Round-robin across agg-ids, oldest-first within each agg** | Strict-global-oldest hammers one `RwLock` during a hot-agg burst and creates query-latency spikes on that one agg. Round-robin spreads lock acquisitions across different `RwLock`s for the same total work. See **Eviction order**. |
 | 5 | Default `segment_cache_bytes` | `min(10% * memory_limit_bytes, 512 MiB)` | A fixed 64 MiB default is too small on big boxes and too large on small ones; scaling with the write budget keeps the tier sensibly sized without requiring operator tuning on a fresh install. See **Configuration**. |
 | 6 | Tier-2 algorithm | **W-TinyLFU via `moka`** from day one, not plain LRU | LRU is scan-vulnerable — one long-range query evicts everything genuinely hot, which is exactly the TSDB dashboard access pattern. W-TinyLFU's admission filter rejects scan traffic and typically delivers 10–30% better hit rate at the same byte budget on skewed workloads, with a drop-in API and lower per-access CPU than LRU. See **Read-side segment cache**. |
+| 7 | Disk layout | **Parts** (one directory per flush tick containing `meta.bin` + `data.bin` + `index.bin`) with an **append-only `parts_manifest.log` + periodic binary snapshot**, not one file per sealed epoch with a JSON manifest | One-file-per-epoch produces hundreds of thousands of tiny files on a real deployment (inode pressure, readdir slowdown, per-file fsync floor). A JSON manifest rewritten each tick is quadratic over the deployment's lifetime. Parts bound file count to O(flush ticks), bundle all of a tick's epochs behind one fallocate + three fdatasyncs, push per-part indexing into a binary-searchable `index.bin`, and reduce the global manifest to an append-only log whose size is proportional to ticks, not epochs. This is the layout every mainstream TSDB converges on. See **Unit of flush vs. unit of file: the *part*** and **Disk layout**. |
 
 If any of these decisions turn out to be wrong under real traces, the
 affected sections are the natural point of revisiting — but none of them
 are "temporary v1 shortcuts we'll upgrade later." This is the target
 design.
+
+**Not resolved here, deliberately punted to v2:** background compaction
+of adjacent small parts into larger ones. The parts layout accommodates
+compaction cleanly (it's a pure directory-level merge with the same
+on-disk shape as a regular flush tick), but v1 ships without it. With
+T2 retention in place and a reasonable flush interval (seconds, not
+milliseconds), the number of live parts in v1 stays bounded at
+`T2 / flush_interval_ms` — a few tens of thousands at most, well within
+what a binary-searched `Vec<PartEntry>` handles with room to spare.
+Compaction becomes necessary only if we lower the flush interval
+significantly or extend T2 to very long horizons.
