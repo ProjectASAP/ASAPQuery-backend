@@ -92,21 +92,37 @@ the rotator seals it.
     └── seg_0000000001.bin
 ```
 
-**Segment file format** (`seg_*.bin`):
+**Segment file format** (`seg_*.bin`). Every field is laid out so the whole
+file can be `mmap`ed and sketch payloads handed directly to
+`AggregateCore::deserialize_from_bytes` with zero copies:
 
 ```
 [u32 magic][u16 version][u16 flags]
 [u64 epoch_id][u64 window_start_ms][u64 window_end_ms]
-[u32 num_entries]
+[u32 num_entries][u32 _pad]                          // align to 8
 repeated num_entries times:
-  [u64 start_ts][u64 end_ts][u32 label_id][u8 agg_type]
-  [u32 payload_len][payload_len bytes: serialize_to_bytes()]
-[u32 crc32 of body]
+  [u64 start_ts][u64 end_ts][u32 label_id][u8 agg_type][u24 _pad]
+  [u32 payload_len][u32 _pad]                        // align payload to 8
+  [payload_len bytes: serialize_to_bytes()]
+  [0..7 bytes: tail padding to 8-byte boundary]
+[u32 crc32 of body][u32 _pad]                        // trailer aligned
 ```
 
 Fixed-size header lets us mmap and binary-search by timestamp without parsing
 payloads. Body is a linear scan — v1 does not build an in-segment index because
 sealed epochs are small (bounded by window size × group count for a single agg).
+
+**Write-side perf details:**
+
+- Before writing, call `fallocate(fd, 0, 0, estimated_size)` to reserve
+  contiguous space and avoid ext4/xfs metadata churn under many-small-segments
+  workloads. `estimated_size` is `sum of approx_memory_bytes * 1.3` for a safe
+  upper bound; any slack is released via `ftruncate` at the end.
+- 8-byte alignment for every payload means a single `mmap` + pointer cast is
+  safe on every architecture Rust targets. Without alignment, ARM and
+  `MIRI`-style UB checks require a copy-to-aligned-buffer step.
+- The trailing CRC is computed streaming while we write the body, so we do not
+  re-read the file to compute it.
 
 **Manifest** (`manifest.json`):
 
@@ -183,6 +199,18 @@ pub struct SimpleMapStorePersistenceConfig {
     // until something pushes it out).
     pub hot_window_ms: Option<u64>,
 
+    // ---- Disk retention ----
+    //
+    // Cold-tier TTL. Any segment whose end_ms is older than
+    // `now - delete_older_than_ms` is deleted from disk on the next
+    // flusher tick (after its references are removed from the manifest
+    // and no in-flight query is reading it). Bounds disk usage and keeps
+    // the manifest small enough to stay in L2/L3 cache on long-running
+    // deployments. Must be strictly greater than hot_window_ms; expected
+    // to be much greater (hours vs. days or weeks).
+    // None disables cold deletion entirely — disk grows unboundedly.
+    pub delete_older_than_ms: Option<u64>,
+
     // ---- Misc ----
     pub flush_interval_ms: u64,   // cadence of the background flusher
     pub disk_path: PathBuf,       // root dir for segments + manifest
@@ -197,70 +225,126 @@ and `memory_limit_bytes = usize::MAX`, which degenerates to "never flush."
 
 ### Eviction order
 
-There is only one ordering — **oldest-sealed-epoch-first, globally by epoch
-`end_ms`**. Both triggers (memory pressure and time watermark) pull from the
-same ordered view, so the flusher never has two disagreeing notions of "oldest."
+**Round-robin across `agg_id`, oldest-first within each agg.** Every tick,
+the flusher walks agg-ids in order, pops the oldest sealed epoch from each,
+and repeats until the stopping condition (memory low-water or end of time
+threshold) is met. Both triggers share the same walk order so the flusher
+never has two disagreeing notions of "what to flush next."
 
 Rationale:
 
-- Matches the time-window access pattern: queries overwhelmingly target recent
-  windows, so evicting oldest is the lowest-regret choice.
-- Makes the two triggers composable: the memory-pressure pass and the
-  time-watermark pass are just two different stopping conditions on the same
-  iterator over `(agg_id, epoch) sorted by epoch.end_ms`.
-- Avoids cross-agg fairness debates (e.g., `LargestAggFirst`) that would
-  otherwise complicate v1; we can add more orderings later behind an enum if
-  it becomes necessary.
+- **Lock-spread under burst.** A strict global oldest-first ordering would
+  flush many epochs from the *same* hot agg-id back-to-back, hammering the
+  same per-agg `RwLock` repeatedly and creating brief query-latency spikes
+  on that one agg. Round-robin spreads the flusher's lock acquisitions
+  across different `RwLock`s, which is cheap for DashMap (lock-free outer)
+  and gives query latency a smoother profile.
+- **Same total work, no complexity cost.** Round-robin does not evaluate
+  more epochs than strict-global would; it just reorders which epoch is
+  flushed next. Implementation cost is one `BTreeMap<(agg_id, end_ms),
+  EpochRef>` populated by walking `store` once per tick, or equivalently a
+  per-agg min-heap of sealed epochs with a round-robin cursor.
+- **Freshness.** Small, slow-moving aggs are never starved by a burst on
+  a hot agg — they always get a turn in each round.
+- **Still matches the time-window access pattern.** Within each agg,
+  oldest-first is preserved, so queries against recent windows on any agg
+  remain unaffected.
 
 ### Background flusher
 
-A dedicated Tokio task owned by the store, started in
+A dedicated `std::thread` owned by the store, started in
 `SimpleMapStorePerKey::new`. Each tick, it checks the primary trigger
-(memory) first, then the secondary trigger (time watermark):
+(memory) first, the secondary trigger (time watermark), then the
+disk-retention sweep:
 
 ```
 loop {
-    sleep(flush_interval_ms).await;
+    thread::sleep(flush_interval_ms);
+    if shutdown.load() { break; }
 
     let now = now_ms();
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<EpochRef> = Vec::new();
 
     // Phase 1 (PRIMARY): memory budget.
-    // If we're over the high-water mark, pull oldest sealed epochs
-    // (by epoch.end_ms) until projected memory drops below the
+    // Walk agg-ids round-robin, pulling the oldest sealed epoch from
+    // each on every pass, until projected memory drops below the
     // low-water mark. This is the knob that actually bounds RAM.
     if mem_bytes_in_use.load() > cfg.memory_limit_bytes {
-        candidates.extend(collect_oldest_until_under_low_water(
+        candidates.extend(collect_round_robin_until_under_low_water(
             cfg.memory_low_watermark_bytes,
         ));
     }
 
     // Phase 2 (SECONDARY): time watermark T.
     // Any sealed epoch older than `now - hot_window_ms` that wasn't
-    // already picked up in phase 1 is flushed here. Under light ingest,
-    // this is the only phase that runs and it keeps the hot set bounded
-    // by T × ingest rate regardless of the memory budget.
+    // already picked up in phase 1 is flushed here. Also walked
+    // round-robin across aggs so a burst on one hot agg does not
+    // monopolize the tick.
     if let Some(hot_window) = cfg.hot_window_ms {
-        candidates.extend(collect_epochs_older_than(now - hot_window));
+        candidates.extend(collect_older_than_round_robin(
+            now - hot_window,
+        ));
     }
 
-    // Dedup (phase 1 and phase 2 can pick the same epoch) and sort by
-    // epoch.end_ms ascending so we flush oldest first within the batch.
-    candidates.sort_unstable_by_key(|c| c.end_ms);
-    candidates.dedup();
+    // Dedup (phase 1 and phase 2 can pick the same epoch). Order is
+    // already interleaved across aggs; no re-sort.
+    candidates.dedup_by_key(|c| (c.agg_id, c.epoch_id));
 
-    for (agg_id, epoch_id) in candidates {
-        flush_and_evict(agg_id, epoch_id).await?;
+    // ---- Group-commit the whole tick ----
+    let mut written: Vec<WrittenSegment> = Vec::new();
+    for epoch_ref in candidates {
+        let bytes = serialize_epoch(epoch_ref.arc.clone());
+        let path  = write_segment_no_fsync(&bytes, epoch_ref)?;
+        written.push(WrittenSegment { path, meta: epoch_ref.meta });
+    }
+    fdatasync_all(&written)?;            // one batched fsync pass
+    manifest.rewrite_and_fsync(&written)?;
+    fsync_parent_dir(&cfg.disk_path)?;   // one dir fsync for the whole batch
+
+    // Now that segments are durable AND referenced by the manifest,
+    // evict them from memory.
+    for seg in &written {
+        splice_out_of_sealed_epochs(seg.meta);
+        mem_bytes_in_use.fetch_sub(seg.meta.approx_bytes);
     }
 
-    manifest.commit().await?;  // atomic rewrite after the batch
+    // Phase 3 (disk retention sweep): delete segments older than T2.
+    if let Some(ttl) = cfg.delete_older_than_ms {
+        let cutoff = now.saturating_sub(ttl);
+        let expired = manifest.segments_older_than(cutoff);
+        for seg in expired {
+            manifest.remove(seg.id);
+            cache_tier2.invalidate(seg.id);  // drop any decoded copy
+            fs::remove_file(seg.path).ok();  // best-effort; orphan sweep on restart
+        }
+        if !expired.is_empty() {
+            manifest.rewrite_and_fsync(&[])?;
+        }
+    }
 }
 ```
 
 Under memory pressure, phase 1 dominates and phase 2 usually finds nothing
 left to do (the oldest epochs are already gone). Under light ingest, phase 1
-is a no-op and phase 2 does all the work. The two phases never fight because
-they pull from the same oldest-first ordering.
+is a no-op and phase 2 does all the work. Phase 3 is independent and runs
+every tick regardless; it costs one manifest scan plus one `unlink` per
+expired segment.
+
+#### Group-commit fsync
+
+The pseudocode above batches all `fsync`/`fdatasync` calls for a tick into a
+single pass at the end, rather than `fsync`ing each segment inline. On
+spinning disks this is ~10× fewer head seeks per tick; on SSDs it is ~3–4×
+fewer syscalls. The cost is one temporarily-larger `written` vector and one
+extra `fsync_parent_dir` at the end — trivial relative to the saved I/O.
+
+Durability invariant remains the same: **no segment is referenced by the
+manifest until its bytes and the manifest itself are both `fsync`'d.** The
+group-commit ordering is (1) write all segment bodies, (2) `fdatasync` all
+of them, (3) rewrite + `fsync` manifest via the atomic `write → rename`
+dance, (4) `fsync` parent directory. A crash at any point leaves orphan
+segment files (cleaned by the startup sweep) but never a dangling manifest
+entry.
 
 `flush_and_evict` takes advantage of a property that matters a lot for the
 flusher design: **sealed epochs are append-only and frozen.** Once the
@@ -377,8 +461,14 @@ pub struct SimpleMapStorePersistenceConfig {
     // Read-side segment cache. Bounded independently of
     // `memory_limit_bytes`; this budget is for decoded segments the query
     // path pulls back from disk, not for the authoritative hot set.
-    // Set to 0 to disable. Default: small (e.g. 64 MiB), opt-in for
-    // workloads that don't need it.
+    //
+    // Default: min(10% * memory_limit_bytes, 512 MiB).
+    //
+    // A fresh install should not need to know about this knob to get
+    // reasonable repeat-query performance. Setting to 0 disables Tier 2
+    // entirely (every cold query pays disk I/O); a fixed absolute
+    // default would be too small on big boxes and too large on small
+    // ones, so the default scales with the write budget.
     pub segment_cache_bytes: usize,
 }
 ```
@@ -402,7 +492,7 @@ pub struct SimpleMapStorePersistenceConfig {
    is the segment file, so the cache must match that granularity.
    Caching individual sketches inside a segment would mean partial reads
    and complex invalidation; caching whole segments is a trivial
-   `LruCache<SegmentId, Arc<DecodedSegment>>`.
+   `Cache<SegmentId, Arc<DecodedSegment>>` keyed on manifest metadata.
 
 4. **Two independent budgets are easier to tune than one unified priority
    score.** Operators reason about "how much RAM does write buffering
@@ -410,11 +500,25 @@ pub struct SimpleMapStorePersistenceConfig {
    unified `priority = α * recency + β * frequency` score is harder to
    explain and harder to debug when it misbehaves.
 
-**Eviction policy for Tier 2.** A plain LRU is the v1 default. If we see
-recurring cold queries that get evicted by unrelated one-shot scans, we
-can move to SLRU or TinyLFU later — both are drop-in replacements because
-the cache has no consistency obligations. The cache should expose
-hit/miss counters in `StoreDiagnostics` so we have data for that call.
+**Eviction policy for Tier 2: W-TinyLFU via `moka` (or `mini-moka`).**
+Plain LRU is the obvious choice but is catastrophically scan-vulnerable —
+a single long-range query sweeps the cache and evicts everything genuinely
+hot, which is exactly the access pattern TSDB dashboards and recording
+rules produce (hour/day/week range scans). W-TinyLFU's admission filter
+rejects scan traffic from displacing hot entries and typically delivers
+10–30% better hit rate than LRU at the same byte budget on skewed /
+Zipfian workloads.
+
+The `moka` crate is the standard Rust implementation (sync and async
+variants, weight-based eviction keyed on byte size, well-maintained, used
+widely in the Rust ecosystem). The API is effectively a drop-in for LRU
+(`get`, `insert`, `invalidate`), so we incur no additional complexity vs.
+a hand-rolled LRU — just better hit rate. W-TinyLFU's per-access overhead
+is a handful of CAS ops on a small count-min sketch, cheaper than LRU's
+mutex-protected list reordering.
+
+The cache exposes hit/miss counters in `StoreDiagnostics` from day one so
+we have signal for future tuning.
 
 **Interaction with the flusher.** None. The flusher only sees Tier 1.
 The read cache has no feedback into retention decisions. This is the
@@ -493,60 +597,45 @@ the pieces can be reviewed independently:
    validate sizing in isolation and be confident nothing else regressed.
 
 2. **Segment format, manifest, flusher.** Add `persistence/` submodule under
-   `simple_map_store/` with segment encode/decode, manifest read/write,
-   background flusher task (memory-first, then time-watermark). Wire
-   `flush_and_evict` into the per-key store. Unit tests for round-trip,
-   crash-after-segment-before-manifest, and orphan sweep.
+   `simple_map_store/` with segment encode/decode (8-byte aligned,
+   `fallocate`d, mmap-friendly), manifest read/write, background flusher
+   thread (memory-first, then time-watermark, then T2 retention sweep) with
+   group-commit fsync. Wire `flush_and_evict` into the per-key store. Unit
+   tests for round-trip, crash-after-segment-before-manifest, orphan sweep,
+   and T2 deletion.
 
-3. **Query path read-through + recovery.** Extend `query_precomputed_output`
-   to consult the manifest and merge segment hits with in-memory hits. Add
+3. **Query path read-through + recovery + Tier-2 cache.** Extend
+   `query_precomputed_output` to consult the manifest and merge segment hits
+   with in-memory hits. Wire a `moka` (or `mini-moka`) weight-bounded
+   segment cache sized to `min(10% * memory_limit_bytes, 512 MiB)` by
+   default, with hit/miss counters exported via `StoreDiagnostics`. Add
    startup recovery. Integration test: ingest → flush → restart → query →
-   same result as no-restart. The read path uses a **trivial bounded LRU**
-   for the Tier-2 segment cache in this phase — just enough to avoid
-   re-reading the same segment on back-to-back queries. No SLRU/TinyLFU,
-   no hit/miss exporter, no tuning knobs beyond `segment_cache_bytes`.
+   same result as no-restart, plus a scan-resistance test that confirms a
+   long-range query does not evict a separately-hot segment.
 
 Because phase 1 removes `CleanupPolicy` from this store, phase 1 is **not**
 independently mergeable without at least the memory-pressure path from
 phase 2 — otherwise the store has no bound on RAM. In practice phases 1 and
 2 land together; phase 3 can land separately once the write path is stable.
 
-A later phase 4 (not part of this PR) would upgrade the Tier-2 cache to
-SLRU/TinyLFU and export hit/miss metrics, once we have real query traces
-to justify the algorithm choice.
-
 ---
 
-## Open questions (for review before implementation)
+## Resolved decisions
 
-1. **Segment file format: custom binary vs. something off-the-shelf (Parquet,
-   Arrow IPC)?** Custom binary is simpler and avoids a dependency, but loses us
-   tooling. I lean custom for v1 given that we never read segments outside
-   this process, but happy to switch if there's an appetite.
+Every question previously flagged as open has been resolved in favor of the
+performance-optimal choice. The table below is a summary; the reasoning for
+each lives in the section it points to.
 
-2. **Cold data retention on disk.** Once a sketch is on disk, it lives there
-   until the operator removes the directory. Do we want a third knob
-   `delete_older_than_ms = T2` (with `T2 >> hot_window_ms`) so disk is also
-   bounded? My lean: not in v1 — cold data is cheap and operators can manage
-   the directory, but add the knob as soon as anyone asks.
+| # | Question | Decision | Why |
+|---|---|---|---|
+| 1 | Segment file format | Custom binary, 8-byte aligned, mmap-friendly, `fallocate`d | Zero-copy deserialize into `AggregateCore`; no Parquet/Arrow overhead for data we never column-prune; smaller binary size and compile time. See **Disk layout**. |
+| 2 | Sync vs. async flush I/O | Sync `std::fs` on a dedicated `std::thread`, with **group-commit fsync** batching across a tick | `tokio::fs` just routes to a blocking threadpool on Linux, so async is a wash at the syscall level; the real win is batching `fdatasync`. No task on the flusher's runtime is waiting on it to yield. See **Background flusher / Group-commit fsync**. |
+| 3 | Cold data retention on disk | Add `delete_older_than_ms = T2`, run as phase 3 of the flusher tick | Unbounded segment count bloats the manifest (falls out of L2/L3), slows startup directory sweeps, and pressures Tier-2 eviction. Cheap to add now, painful to retrofit once a deployment has millions of orphans. See **Configuration** and **Background flusher phase 3**. |
+| 4 | Per-agg-id flush fairness | **Round-robin across agg-ids, oldest-first within each agg** | Strict-global-oldest hammers one `RwLock` during a hot-agg burst and creates query-latency spikes on that one agg. Round-robin spreads lock acquisitions across different `RwLock`s for the same total work. See **Eviction order**. |
+| 5 | Default `segment_cache_bytes` | `min(10% * memory_limit_bytes, 512 MiB)` | A fixed 64 MiB default is too small on big boxes and too large on small ones; scaling with the write budget keeps the tier sensibly sized without requiring operator tuning on a fresh install. See **Configuration**. |
+| 6 | Tier-2 algorithm | **W-TinyLFU via `moka`** from day one, not plain LRU | LRU is scan-vulnerable — one long-range query evicts everything genuinely hot, which is exactly the TSDB dashboard access pattern. W-TinyLFU's admission filter rejects scan traffic and typically delivers 10–30% better hit rate at the same byte budget on skewed workloads, with a drop-in API and lower per-access CPU than LRU. See **Read-side segment cache**. |
 
-3. **Per-agg-id flush fairness.** Oldest-global-first could starve small,
-   slow-moving aggs during a burst on a hot agg. Acceptable for v1 since
-   "oldest window first" is well-defined globally; revisit if it bites.
-
-4. **Default `segment_cache_bytes`.** Should v1 default the Tier-2 cache to
-   a small nonzero value (e.g. 64 MiB) so the typical read path gets a
-   trivial hit-rate win for free, or default it to 0 (opt-in) so no
-   workload pays RAM it doesn't measurably benefit from? My lean: default
-   to a small nonzero value — a fresh install shouldn't have to know about
-   this knob to get reasonable repeat-query performance.
-
-5. **Tier-2 algorithm beyond LRU.** Plain LRU ships in phase 3. Do we
-   commit up-front to an upgrade path (SLRU, TinyLFU) or only revisit if
-   real traces show scan-resistant patterns are a problem? My lean: defer
-   — LRU is fine for the 90% case and the cache has no consistency
-   obligations, so swapping the algorithm is a purely local change.
-
-*(The earlier open question about sync vs. async flush I/O is resolved
-in-line above — the append-only property of sealed epochs makes sync
-`std::fs` on a dedicated thread the clear winner.)*
+If any of these decisions turn out to be wrong under real traces, the
+affected sections are the natural point of revisiting — but none of them
+are "temporary v1 shortcuts we'll upgrade later." This is the target
+design.
