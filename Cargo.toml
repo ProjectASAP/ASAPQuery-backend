@@ -5,6 +5,7 @@ members = [
     "asap-common/dependencies/rs/promql_utilities",
     "asap-common/dependencies/rs/sql_utilities",
     "asap-common/dependencies/rs/elastic_dsl_utilities",
+    "asap-common/dependencies/rs/asap_otel_proto",
     "asap-common/dependencies/rs/asap_types",
     "asap-common/dependencies/rs/datafusion_summary_library",
     "asap-common/tests/compare_matched_tokens/rust_tests",

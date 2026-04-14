@@ -1,0 +1,29 @@
+[package]
+name = "asap_otel_proto"
+version.workspace = true
+edition.workspace = true
+
+# Vendored Rust bindings for DataCollector's modified opentelemetry-proto.
+# See ../../../../docs/pipeline-query-catalog.md §5.4 for the reasoning.
+#
+# The .proto files in proto/opentelemetry/proto/ are copied verbatim from
+# DataCollector's opentelemetry-proto submodule and add first-class sketch
+# variants (DDSketch, KLLSketch, CountSketch, CountMinSketch, HLLSketch) to
+# the standard OTLP Metric.data oneof. To re-vendor when DataCollector
+# updates its proto schema, copy the four files referenced in build.rs
+# from the corresponding paths in the DataCollector worktree.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport", "codegen", "prost"] }
+
+[build-dependencies]
+prost-build = "0.13"
+tonic-build = { version = "0.12", features = ["prost"] }
+# Ship a modern protoc so the build does not depend on the host's system
+# protoc version. The system protoc on many distros is < 3.15 which
+# rejects proto3 `optional` keyword used in opentelemetry-proto.
+protoc-bin-vendored = "3"
