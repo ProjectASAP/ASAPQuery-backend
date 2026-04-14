@@ -28,15 +28,15 @@ use crate::data_model::AggregateCore;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::precompute_operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
-use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
-use axum::{body::Bytes, extract::State, routing::post, Json, Router};
-use flate2::read::GzDecoder;
-use opentelemetry_proto::tonic::collector::metrics::v1::{
+use asap_otel_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService, ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
 };
-use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
-use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
+use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+use flate2::read::GzDecoder;
 use prost::Message;
 use std::sync::Arc;
 use std::time::Instant;
@@ -98,7 +98,7 @@ impl OtlpReceiver {
             shared: shared.clone(),
         };
         let grpc_svc =
-            opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer::new(
+            asap_otel_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer::new(
                 grpc_svc,
             );
 
@@ -150,6 +150,10 @@ impl MetricsService for MetricsServiceImpl {
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
             partial_success: None,
+            // Modified-OTLP collector hands out stable series descriptors via
+            // this field; not yet wired (PR B will populate it when the
+            // backend learns to mint series_ids).
+            series_assignments: Vec::new(),
         }))
     }
 }
@@ -229,7 +233,7 @@ fn format_series_key(name: &str, labels: &HashMap<String, String>) -> String {
 }
 
 fn get_sketch_payload_from_attrs(
-    attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    attrs: &[asap_otel_proto::tonic::common::v1::KeyValue],
 ) -> Option<(String, Vec<u8>)> {
     for kv in attrs {
         match kv.key.as_str() {
@@ -501,7 +505,7 @@ fn otlp_to_record_count(request: &ExportMetricsServiceRequest) -> usize {
                     continue;
                 }
 
-                use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+                use asap_otel_proto::tonic::metrics::v1::metric::Data;
                 match &metric.data {
                     Some(Data::Gauge(g)) => count += g.data_points.len(),
                     Some(Data::Sum(s)) => count += s.data_points.len(),
@@ -530,6 +534,11 @@ fn otlp_to_record_count(request: &ExportMetricsServiceRequest) -> usize {
                             count += dp.quantile_values.len();
                         }
                     }
+                    Some(Data::Ddsketch(d)) => count += d.data_points.len(),
+                    Some(Data::Kllsketch(k)) => count += k.data_points.len(),
+                    Some(Data::Countsketch(c)) => count += c.data_points.len(),
+                    Some(Data::Countminsketch(c)) => count += c.data_points.len(),
+                    Some(Data::Hllsketch(h)) => count += h.data_points.len(),
                     None => {}
                 }
             }
@@ -569,7 +578,7 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
 
-                use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+                use asap_otel_proto::tonic::metrics::v1::metric::Data;
                 match &metric.data {
                     Some(Data::Gauge(g)) => {
                         for dp in &g.data_points {
@@ -710,6 +719,46 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             });
                         }
                     }
+                    // Modified-OTLP first-class sketch metric variants. PR A
+                    // vendors the proto and surfaces the new arms; PR B will
+                    // populate them with per-variant decoders that route via
+                    // WorkerMessage::AccumulatorInput. For now, drop with a
+                    // debug log so the metric is visible in the ingest path.
+                    Some(Data::Ddsketch(d)) => {
+                        debug!(
+                            "OTLP modified-proto Ddsketch received (metric={}, dps={}); decoder is PR B",
+                            metric.name,
+                            d.data_points.len()
+                        );
+                    }
+                    Some(Data::Kllsketch(k)) => {
+                        debug!(
+                            "OTLP modified-proto Kllsketch received (metric={}, dps={}); decoder is PR B",
+                            metric.name,
+                            k.data_points.len()
+                        );
+                    }
+                    Some(Data::Countsketch(c)) => {
+                        debug!(
+                            "OTLP modified-proto Countsketch received (metric={}, dps={}); decoder is PR B",
+                            metric.name,
+                            c.data_points.len()
+                        );
+                    }
+                    Some(Data::Countminsketch(c)) => {
+                        debug!(
+                            "OTLP modified-proto Countminsketch received (metric={}, dps={}); decoder is PR B",
+                            metric.name,
+                            c.data_points.len()
+                        );
+                    }
+                    Some(Data::Hllsketch(h)) => {
+                        debug!(
+                            "OTLP modified-proto Hllsketch received (metric={}, dps={}); decoder is PR B",
+                            metric.name,
+                            h.data_points.len()
+                        );
+                    }
                     None => {}
                 }
             }
@@ -720,7 +769,7 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
 
 fn merge_point_attributes(
     base: &HashMap<String, String>,
-    attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    attrs: &[asap_otel_proto::tonic::common::v1::KeyValue],
 ) -> HashMap<String, String> {
     let mut m = base.clone();
     for (k, v) in attributes_to_map(attrs) {
@@ -737,8 +786,8 @@ fn number_value_to_f64(v: &Option<NumberValue>) -> f64 {
     }
 }
 
-fn any_value_to_string(v: &opentelemetry_proto::tonic::common::v1::AnyValue) -> String {
-    use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+fn any_value_to_string(v: &asap_otel_proto::tonic::common::v1::AnyValue) -> String {
+    use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     match &v.value {
         Some(AnyValueVariant::StringValue(s)) => s.clone(),
         Some(AnyValueVariant::IntValue(i)) => i.to_string(),
@@ -750,7 +799,7 @@ fn any_value_to_string(v: &opentelemetry_proto::tonic::common::v1::AnyValue) -> 
 }
 
 fn attributes_to_map(
-    attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+    attrs: &[asap_otel_proto::tonic::common::v1::KeyValue],
 ) -> HashMap<String, String> {
     let mut m = HashMap::new();
     for kv in attrs {

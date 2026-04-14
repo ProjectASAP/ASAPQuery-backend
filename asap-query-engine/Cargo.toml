@@ -47,7 +47,11 @@ datafusion = "43"
 arrow = "53.4.1"
 futures = "0.3"
 prost = "0.13"
-opentelemetry-proto = { version = "0.28", features = ["gen-tonic", "gen-tonic-messages", "metrics"] }
+# Vendored modified opentelemetry-proto with first-class sketch metric
+# variants from DataCollector (DDSketch / KLLSketch / CountSketch /
+# CountMinSketch / HLLSketch). See docs/pipeline-query-catalog.md §5.4 in the
+# DataCollector repo for the rationale.
+asap_otel_proto = { path = "../asap-common/dependencies/rs/asap_otel_proto" }
 tonic = "0.12"
 tokio-stream = "0.1"
 snap = "1"
