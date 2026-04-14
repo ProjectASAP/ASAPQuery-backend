@@ -30,6 +30,18 @@ impl DDSketchAccumulator {
     }
 
     /// Decode from the modified OTLP wire format's
+    /// `DDSketchDataPoint.sketch` bytes when
+    /// `encoding = DDSKETCH_ENCODING_MSGPACK`. The bytes are the
+    /// MessagePack serialization of the cross-language sketch-core
+    /// `DdSketch` struct — PR I parity entrypoint.
+    pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: DdSketch::deserialize_msgpack(buffer)
+                .map_err(|e| format!("deserialize DdSketch msgpack: {e}"))?,
+        })
+    }
+
+    /// Decode from the modified OTLP wire format's
     /// `DDSketchDataPoint.sketch` bytes — the protobuf-encoded
     /// `asap_sketchlib::proto::sketchlib::DDSketchState` message that
     /// DataCollector's `ddsketchprocessor` emits when
@@ -205,5 +217,23 @@ mod tests {
         let dd = DDSketchAccumulator::new(0.01);
         let cs = CountSketchAccumulator::new(2, 3);
         assert!(dd.merge_with(&cs).is_err());
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_round_trip() {
+        let original = DdSketch::from_raw(0.01, vec![5, 10, 15, 20], -2, 50, 150.0, 0.25, 8.0);
+        let bytes = original.serialize_msgpack();
+        let acc = DDSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.inner.alpha, 0.01);
+        assert_eq!(acc.inner.store_counts, vec![5, 10, 15, 20]);
+        assert_eq!(acc.inner.store_offset, -2);
+        assert_eq!(acc.inner.count, 50);
+        assert_eq!(acc.inner.sum, 150.0);
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_rejects_garbage() {
+        let result = DDSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
+        assert!(result.is_err());
     }
 }

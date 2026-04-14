@@ -71,6 +71,21 @@ impl DatasketchesKLLAccumulator {
     }
 
     /// Decode from the modified OTLP wire format's
+    /// `KLLSketchDataPoint.sketch` bytes when
+    /// `encoding = KLL_SKETCH_ENCODING_MSGPACK`. The bytes are the
+    /// MessagePack serialization of the cross-language sketch-core
+    /// `KllSketch` struct — PR I parity entrypoint. Unlike the
+    /// `_ENCODING_PROTO` path (which does lossy statistical
+    /// reconstruction via `update()` replay), the msgpack path is a
+    /// bit-identical round-trip because sketch-core's `KllSketch`
+    /// serializes its full internal state to msgpack.
+    pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: KllSketch::deserialize_msgpack(buffer)?,
+        })
+    }
+
+    /// Decode from the modified OTLP wire format's
     /// `KLLSketchDataPoint.sketch` bytes — the protobuf-encoded
     /// `asap_sketchlib::proto::sketchlib::KllState` message that
     /// DataCollector's `kllprocessor` emits when

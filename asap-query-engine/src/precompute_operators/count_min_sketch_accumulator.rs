@@ -69,6 +69,18 @@ impl CountMinSketchAccumulator {
     }
 
     /// Decode from the modified OTLP wire format's
+    /// `CountMinSketchDataPoint.sketch` bytes when
+    /// `encoding = COUNT_MIN_SKETCH_ENCODING_MSGPACK`. The bytes are the
+    /// MessagePack serialization of the cross-language sketch-core
+    /// `CountMinSketch` wire struct (same format the legacy Arroyo path
+    /// uses — this method is the modified-OTLP entrypoint for PR I).
+    pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: CountMinSketch::deserialize_msgpack(buffer)?,
+        })
+    }
+
+    /// Decode from the modified OTLP wire format's
     /// `CountMinSketchDataPoint.sketch` bytes — i.e. the protobuf-encoded
     /// `asap_sketchlib::proto::sketchlib::CountMinState` message used by
     /// DataCollector's `countminsketchprocessor` when emitting via

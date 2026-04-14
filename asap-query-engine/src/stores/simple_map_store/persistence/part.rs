@@ -631,7 +631,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let part_dir = tmp.path().join("0000000000000001");
         let snap = make_snapshot();
-        let report = PartWriter::write_part(&part_dir, 1, &[snap.clone()]).expect("write_part");
+        let report =
+            PartWriter::write_part(&part_dir, 1, std::slice::from_ref(&snap)).expect("write_part");
 
         assert_eq!(report.part_id, 1);
         assert_eq!(report.num_entries, 2);
