@@ -160,6 +160,49 @@ struct Args {
     /// Query tracker: observation window in seconds before triggering planning
     #[arg(long, default_value = "100")]
     tracker_observation_window_secs: u64,
+
+    // ---- SimpleMapStore persistence ----
+    //
+    // When --persistence-enabled is set, the store is constructed via
+    // SimpleMapStore::with_persistence_per_key with the other
+    // --persistence-* flags as the config. Forces LockStrategy::PerKey
+    // regardless of --lock-strategy; the Global variant is
+    // intentionally left in-memory-only.
+
+    /// Enable the disk-backed persistence layer for SimpleMapStore
+    #[arg(long)]
+    persistence_enabled: bool,
+
+    /// Root directory for persistence (manifest + parts/). Required
+    /// when --persistence-enabled.
+    #[arg(long)]
+    persistence_dir: Option<String>,
+
+    /// Primary memory budget for in-memory sealed epochs, in MiB.
+    /// When exceeded, the background flusher evicts oldest-first.
+    #[arg(long, default_value = "2048")]
+    persistence_memory_limit_mb: usize,
+
+    /// Hot-window length in seconds. Any sealed epoch whose end_ts is
+    /// older than (now - this) is flushed on the next flusher tick,
+    /// regardless of memory pressure. 0 disables time-based flushing.
+    #[arg(long, default_value = "3600")]
+    persistence_hot_window_secs: u64,
+
+    /// Cold-tier TTL in seconds. Parts whose max_ts is older than
+    /// (now - this) are removed from disk on the next flusher tick.
+    /// 0 disables disk retention.
+    #[arg(long, default_value = "604800")]
+    persistence_delete_older_than_secs: u64,
+
+    /// Cadence of the background flusher loop, in milliseconds.
+    #[arg(long, default_value = "1000")]
+    persistence_flush_interval_ms: u64,
+
+    /// Tier-2 part-cache byte budget, in MiB. 0 disables the cache.
+    /// Defaults to `min(10% * memory_limit_mb, 512)`.
+    #[arg(long)]
+    persistence_part_cache_mb: Option<u64>,
 }
 
 #[tokio::main]
@@ -207,11 +250,67 @@ async fn main() -> Result<()> {
     // Get cleanup policy from inference config
     let cleanup_policy = inference_config.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
-    let store = Arc::new(SimpleMapStore::new_with_strategy(
-        streaming_config.clone(),
-        cleanup_policy,
-        args.lock_strategy,
-    ));
+    let store = if args.persistence_enabled {
+        use query_engine_rust::stores::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+        let disk_path = args
+            .persistence_dir
+            .clone()
+            .expect("--persistence-enabled requires --persistence-dir");
+        let memory_limit_bytes = args.persistence_memory_limit_mb * 1024 * 1024;
+        let hot_window_ms = if args.persistence_hot_window_secs == 0 {
+            None
+        } else {
+            Some(args.persistence_hot_window_secs * 1000)
+        };
+        let delete_older_than_ms = if args.persistence_delete_older_than_secs == 0 {
+            None
+        } else {
+            Some(args.persistence_delete_older_than_secs * 1000)
+        };
+        let part_cache_bytes = args
+            .persistence_part_cache_mb
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or_else(|| {
+                let ten_pct = (memory_limit_bytes / 10) as u64;
+                ten_pct.min(512 * 1024 * 1024)
+            });
+        let persistence_cfg = SimpleMapStorePersistenceConfig {
+            memory_limit_bytes,
+            memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
+            hard_cap_bytes: memory_limit_bytes * 125 / 100,
+            hot_window_ms,
+            delete_older_than_ms,
+            flush_interval: std::time::Duration::from_millis(args.persistence_flush_interval_ms),
+            disk_path: std::path::PathBuf::from(&disk_path),
+            part_cache_bytes,
+        };
+        info!(
+            "Persistence enabled: disk_path={}, memory_limit={} MiB, hot_window={:?} s, delete_older_than={:?} s, flush_interval={} ms, part_cache={} MiB",
+            disk_path,
+            args.persistence_memory_limit_mb,
+            persistence_cfg.hot_window_ms.map(|ms| ms / 1000),
+            persistence_cfg.delete_older_than_ms.map(|ms| ms / 1000),
+            args.persistence_flush_interval_ms,
+            persistence_cfg.part_cache_bytes / (1024 * 1024),
+        );
+        if !matches!(args.lock_strategy, LockStrategy::PerKey) {
+            info!("--persistence-enabled forces LockStrategy::PerKey (ignoring --lock-strategy)");
+        }
+        Arc::new(
+            SimpleMapStore::with_persistence_per_key(
+                streaming_config.clone(),
+                cleanup_policy,
+                persistence_cfg,
+            )
+            .expect("SimpleMapStore::with_persistence_per_key failed"),
+        )
+    } else {
+        Arc::new(SimpleMapStore::new_with_strategy(
+            streaming_config.clone(),
+            cleanup_policy,
+            args.lock_strategy,
+        ))
+    };
 
     // // Setup PromSketchStore (shared between engine and remote write server)
     // let promsketch_store = if args.enable_prometheus_remote_write {

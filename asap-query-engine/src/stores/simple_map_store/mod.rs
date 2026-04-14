@@ -65,6 +65,28 @@ impl SimpleMapStore {
             }
         }
     }
+
+    /// Persistence-enabled constructor. Always returns the `PerKey`
+    /// variant — persistence only targets per-key locking; the
+    /// `Global` variant is intentionally left in-memory-only.
+    ///
+    /// Runs recovery on the disk path, starts the background flusher
+    /// thread, and returns a store whose sealed epochs are flushed
+    /// to disk on memory / time pressure. Query paths transparently
+    /// read back from disk when in-memory state misses.
+    pub fn with_persistence_per_key(
+        streaming_config: Arc<StreamingConfig>,
+        cleanup_policy: CleanupPolicy,
+        persistence_cfg: persistence::SimpleMapStorePersistenceConfig,
+    ) -> persistence::PersistResult<Self> {
+        Ok(SimpleMapStore::PerKey(
+            SimpleMapStorePerKey::with_persistence(
+                streaming_config,
+                cleanup_policy,
+                persistence_cfg,
+            )?,
+        ))
+    }
 }
 
 #[async_trait::async_trait]
