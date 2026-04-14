@@ -278,6 +278,7 @@ pub enum AggregationType {
     SetAggregator,
     DeltaSetAggregator,
     HLL,
+    DDSketch,
     // ---------- legacy config wrapper names ----------
     SingleSubpopulation,
     MultipleSubpopulation,
@@ -300,6 +301,7 @@ impl AggregationType {
             AggregationType::SetAggregator => "SetAggregator",
             AggregationType::DeltaSetAggregator => "DeltaSetAggregator",
             AggregationType::HLL => "HLL",
+            AggregationType::DDSketch => "DDSketch",
             AggregationType::SingleSubpopulation => "SingleSubpopulation",
             AggregationType::MultipleSubpopulation => "MultipleSubpopulation",
         }
@@ -368,6 +370,7 @@ impl FromStr for AggregationType {
             "SetAggregator" => Ok(AggregationType::SetAggregator),
             "DeltaSetAggregator" => Ok(AggregationType::DeltaSetAggregator),
             "HLL" | "HyperLogLog" => Ok(AggregationType::HLL),
+            "DDSketch" | "DdSketch" => Ok(AggregationType::DDSketch),
             "SingleSubpopulation" => Ok(AggregationType::SingleSubpopulation),
             "MultipleSubpopulation" => Ok(AggregationType::MultipleSubpopulation),
             // Legacy accumulator-suffixed aliases

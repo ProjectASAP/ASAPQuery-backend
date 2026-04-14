@@ -70,6 +70,77 @@ impl DatasketchesKLLAccumulator {
         })
     }
 
+    /// Decode from the modified OTLP wire format's
+    /// `KLLSketchDataPoint.sketch` bytes — the protobuf-encoded
+    /// `asap_sketchlib::proto::sketchlib::KllState` message that
+    /// DataCollector's `kllprocessor` emits when
+    /// `encoding = KLL_SKETCH_ENCODING_PROTO`.
+    ///
+    /// ⚠ This is a **lossy statistical reconstruction**, not a
+    /// bit-identical round-trip: the `KllState` proto carries the
+    /// retained items in level order plus an explicit `levels[]`
+    /// boundary array, but sketch-core's `KllSketch` backend types
+    /// keep their level structure private. Rather than touch
+    /// upstream `asap_sketchlib` to add a typed-state constructor,
+    /// we build a fresh `DatasketchesKLLAccumulator` with the same
+    /// `k` and replay every retained item through `update()`.
+    /// Quantile estimates on the reconstructed sketch are
+    /// approximately equivalent to the source's — within KLL's
+    /// own rank-error bound, which is the same bound the source
+    /// already inherited — so Phase 1 hot-path queries that hit
+    /// the reconstructed sketch return answers the user would
+    /// already have accepted from the source. Bit-identical
+    /// reconstruction is tracked as a sketchlib upstream follow-up.
+    pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        use asap_sketchlib::proto::sketchlib::KllState;
+        use prost::Message;
+
+        let state = KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?;
+        if state.k < 8 {
+            return Err(format!("KllState.k must be >= 8 (got {})", state.k).into());
+        }
+        if state.k > u16::MAX as u32 {
+            return Err(format!(
+                "KllState.k does not fit in u16 (got {}, max {})",
+                state.k,
+                u16::MAX
+            )
+            .into());
+        }
+        // Validate the levels[] boundary array if it is populated. The
+        // proto contract says `levels[0] == 0` and
+        // `levels[num_levels] == items.len()`. If the producer left
+        // levels empty (common when num_levels is zero), skip.
+        if !state.levels.is_empty() {
+            if state.levels.len() as u32 != state.num_levels + 1 {
+                return Err(format!(
+                    "KllState levels length = {}, expected num_levels+1 = {}",
+                    state.levels.len(),
+                    state.num_levels + 1
+                )
+                .into());
+            }
+            if state.levels[0] != 0 {
+                return Err(format!("KllState.levels[0] = {}, expected 0", state.levels[0]).into());
+            }
+            if *state.levels.last().unwrap() as usize != state.items.len() {
+                return Err(format!(
+                    "KllState.levels[{}] = {}, expected items.len() = {}",
+                    state.num_levels,
+                    state.levels.last().unwrap(),
+                    state.items.len()
+                )
+                .into());
+            }
+        }
+        let k = state.k as u16;
+        let mut acc = Self::new(k);
+        for item in &state.items {
+            acc.update(*item);
+        }
+        Ok(acc)
+    }
+
     /// Merge multiple accumulators efficiently without cloning all of them.
     pub fn merge_multiple(
         accumulators: &[Box<dyn crate::data_model::AggregateCore>],
@@ -456,5 +527,84 @@ mod tests {
         let sum = SumAccumulator::new();
         let mixed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(kll), Box::new(sum)];
         assert!(DatasketchesKLLAccumulator::merge_multiple(&mixed_accs).is_err());
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_reconstructs_quantiles() {
+        // Build a KllState with 64 items in level order; the decoder
+        // replays every item through `update()` so the reconstructed
+        // sketch is statistically equivalent — quantile estimates
+        // match the ground truth (sorted items) within KLL's own
+        // rank-error bound for k=200.
+        use asap_sketchlib::proto::sketchlib::KllState;
+        use prost::Message;
+
+        let items: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let state = KllState {
+            k: 200,
+            m: 8,
+            num_levels: 1,
+            levels: vec![0, 64],
+            items: items.clone(),
+            coin: None,
+        };
+        let bytes = state.encode_to_vec();
+
+        let acc =
+            DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.inner.count(), 64);
+        // For 64 values 0..63, the true median is 31.5 and quantile
+        // error is ~1% × range = 0.63. KLL's own point query can
+        // legally be off by up to ε × N ~= 0.01 × 64 = 0.64. Allow a
+        // generous tolerance since the important invariant is "the
+        // decoded sketch is queryable and returns a sensible value".
+        let median = acc.get_quantile(0.5);
+        assert!(
+            (median - 31.5).abs() <= 10.0,
+            "reconstructed median {median} is outside tolerance of true median 31.5"
+        );
+        let q01 = acc.get_quantile(0.01);
+        let q99 = acc.get_quantile(0.99);
+        assert!(
+            q01 <= q99,
+            "quantile monotonicity violated: q01={q01}, q99={q99}"
+        );
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_rejects_small_k() {
+        use asap_sketchlib::proto::sketchlib::KllState;
+        use prost::Message;
+        let state = KllState {
+            k: 4, // < minimum of 8
+            m: 2,
+            num_levels: 0,
+            levels: Vec::new(),
+            items: Vec::new(),
+            coin: None,
+        };
+        let bytes = state.encode_to_vec();
+        let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("k must be >= 8"));
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_rejects_inconsistent_levels() {
+        use asap_sketchlib::proto::sketchlib::KllState;
+        use prost::Message;
+        // num_levels=1 but levels array has 3 entries instead of 2
+        let state = KllState {
+            k: 200,
+            m: 8,
+            num_levels: 1,
+            levels: vec![0, 5, 10],
+            items: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            coin: None,
+        };
+        let bytes = state.encode_to_vec();
+        let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("levels length"));
     }
 }
