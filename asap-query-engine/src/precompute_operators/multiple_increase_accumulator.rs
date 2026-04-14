@@ -282,6 +282,13 @@ impl AggregateCore for MultipleIncreaseAccumulator {
         AggregationType::MultipleIncrease
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // HashMap<Key, IncreaseAccumulator>. IncreaseAccumulator is ~64 B,
+        // per-entry key/overhead is ~96 B.
+        const BYTES_PER_ENTRY: usize = 160;
+        std::mem::size_of::<Self>() + self.increases.len() * BYTES_PER_ENTRY
+    }
+
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
         Some(self.increases.keys().cloned().collect())
     }

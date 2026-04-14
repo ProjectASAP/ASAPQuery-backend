@@ -230,6 +230,13 @@ impl AggregateCore for MultipleSumAccumulator {
         AggregationType::MultipleSum
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // HashMap<KeyByLabelValues, f64>. Label strings dominate; use a
+        // conservative per-entry estimate plus HashMap overhead.
+        const BYTES_PER_ENTRY: usize = 96;
+        std::mem::size_of::<Self>() + self.sums.len() * BYTES_PER_ENTRY
+    }
+
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
         Some(self.sums.keys().cloned().collect())
     }

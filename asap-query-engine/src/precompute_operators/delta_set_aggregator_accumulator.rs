@@ -244,6 +244,13 @@ impl AggregateCore for DeltaSetAggregatorAccumulator {
         AggregationType::DeltaSetAggregator
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // Two HashSets of KeyByLabelValues.
+        const BYTES_PER_ENTRY: usize = 96;
+        std::mem::size_of::<Self>()
+            + (self.added.len() + self.removed.len()) * BYTES_PER_ENTRY
+    }
+
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
         if !self.removed.is_empty() {
             panic!("DeltaSetAggregatorAccumulator does not support get_keys when removed items are present");

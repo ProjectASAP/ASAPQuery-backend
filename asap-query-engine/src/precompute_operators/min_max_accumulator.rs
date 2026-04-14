@@ -184,6 +184,11 @@ impl AggregateCore for MinMaxAccumulator {
         AggregationType::MinMax
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // f64 + small sub_type String.
+        std::mem::size_of::<Self>() + self.sub_type.capacity()
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }
