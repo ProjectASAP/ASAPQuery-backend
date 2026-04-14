@@ -44,6 +44,20 @@ pub trait AggregateCore: SerializableToSink + Send + Sync {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Approximate in-memory byte footprint of this accumulator.
+    ///
+    /// Used by the `SimpleMapStore` persistence layer to drive its
+    /// memory-pressure trigger. Not required to be exact — the flusher
+    /// only needs rough proportionality. The default is a conservative
+    /// 4 KiB constant; concrete types should override it with a
+    /// type-aware estimate (e.g. KLL: `k * 8` plus overhead).
+    ///
+    /// Implementors must not call `serialize_to_bytes` here — this is
+    /// on the insert hot path.
+    fn approx_memory_bytes(&self) -> usize {
+        4096
+    }
 }
 
 /// Trait for accumulators that support a single subpopulation

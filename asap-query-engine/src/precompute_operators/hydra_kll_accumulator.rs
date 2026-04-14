@@ -113,6 +113,13 @@ impl AggregateCore for HydraKllSketchAccumulator {
         AggregationType::HydraKLL
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // HydraKLL is a row*col grid of KLL sketches; typical instances
+        // are on the order of tens of KiB. 32 KiB is a conservative
+        // per-instance default.
+        32 * 1024
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }

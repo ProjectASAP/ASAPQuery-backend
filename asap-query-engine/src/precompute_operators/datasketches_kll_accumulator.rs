@@ -197,6 +197,12 @@ impl AggregateCore for DatasketchesKLLAccumulator {
         AggregationType::DatasketchesKLL
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // KLL with default k=200 holds ~2*k items (~3 KiB). Round up
+        // for overhead.
+        4 * 1024
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }

@@ -24,10 +24,17 @@ use super::persistence::{
 
 type StoreKey = u64; // aggregation_id
 
-/// Coarse per-sketch memory estimate used by the persistence flusher's
-/// memory-pressure trigger. Not accurate — v1 just multiplies the
-/// entry count by this constant. Per-type sizing is a follow-up.
-const APPROX_BYTES_PER_SKETCH: usize = 4096;
+/// Sum the `AggregateCore::approx_memory_bytes()` of every entry in a
+/// sealed epoch. Cheap — each impl is supposed to be O(1) or at worst
+/// O(entries_inside_the_sketch), and this is only called at rotate +
+/// evict time, not on the insert hot path.
+fn epoch_approx_bytes(epoch: &SealedEpoch) -> usize {
+    epoch
+        .entries
+        .iter()
+        .map(|(_, _, agg)| agg.approx_memory_bytes())
+        .sum()
+}
 
 /// Fallback epoch capacity used when `num_aggregates_to_retain` is not
 /// set in the streaming config but persistence is enabled. Without it
@@ -209,10 +216,12 @@ pub struct PerKeyInner {
     /// * `mem_bytes_sealed` is maintained as flusher input.
     persistence_enabled: bool,
 
-    /// Approximate sum of sketch bytes in sealed epochs across all
-    /// agg-ids. Updated on rotate (adds) and evict (subtracts).
-    /// Drives the flusher's memory-pressure trigger. Coarse — see
-    /// `APPROX_BYTES_PER_SKETCH`.
+    /// Approximate sum of sketch bytes across all sealed epochs
+    /// currently held in memory. Incremented on insert by the sum of
+    /// each item's `AggregateCore::approx_memory_bytes()`, decremented
+    /// on evict by the same. Drives the flusher's memory-pressure
+    /// trigger. Approximate — per-type estimates are not guaranteed
+    /// accurate, only proportional.
     mem_bytes_sealed: AtomicUsize,
 }
 
@@ -503,7 +512,17 @@ impl SimpleMapStorePerKey {
             data.configure_epochs(effective_retention);
         }
 
-        let entries_added = items.len();
+        // Sum the real per-accumulator byte estimate up front. Summing
+        // happens before the loop consumes `items`; each
+        // `approx_memory_bytes` call is O(1) or a cheap field read on
+        // all overriding impls, so this adds at most a handful of
+        // arithmetic ops per batch item.
+        let batch_approx_bytes: usize = if persistence_enabled {
+            items.iter().map(|(_, a)| a.approx_memory_bytes()).sum()
+        } else {
+            0
+        };
+
         for (output, precompute) in items {
             let timestamp_range = (output.start_timestamp, output.end_timestamp);
             let metric_id: MetricID = data.intern.intern(output.key);
@@ -524,14 +543,16 @@ impl SimpleMapStorePerKey {
         }
 
         if persistence_enabled {
-            // Best-effort memory accounting: attribute the batch's
-            // entries to sealed-epoch bytes. This over-counts (current
-            // epoch entries are included) but the flusher is
-            // conservative anyway.
-            self.inner.mem_bytes_sealed.fetch_add(
-                entries_added * APPROX_BYTES_PER_SKETCH,
-                Ordering::Relaxed,
-            );
+            // Tracked bytes are the sum of each accumulator's own
+            // `approx_memory_bytes()`. The counter conceptually
+            // represents "bytes in sealed epochs"; in practice we
+            // charge them to the store as soon as they arrive
+            // (current_epoch is included) because the rotator will
+            // seal them soon anyway and the flusher's trigger is
+            // conservative.
+            self.inner
+                .mem_bytes_sealed
+                .fetch_add(batch_approx_bytes, Ordering::Relaxed);
         }
 
         if aggregation_config.aggregation_type != AggregationType::DeltaSetAggregator {
@@ -925,7 +946,7 @@ impl EpochSource for PerKeyInner {
                         agg_id,
                         epoch_id: *epoch_id,
                         end_ts: max_end,
-                        approx_bytes: epoch.entries.len() * APPROX_BYTES_PER_SKETCH,
+                        approx_bytes: epoch_approx_bytes(epoch),
                     });
                 }
             }
@@ -968,7 +989,7 @@ impl EpochSource for PerKeyInner {
         }
 
         let (min_ts, max_ts) = epoch.time_bounds().unwrap_or((0, 0));
-        let approx_bytes = epoch.entries.len() * APPROX_BYTES_PER_SKETCH;
+        let approx_bytes = epoch_approx_bytes(epoch);
 
         Ok(Some(EpochSnapshot {
             agg_id,
@@ -992,7 +1013,7 @@ impl EpochSource for PerKeyInner {
             }
         };
         if let Some(epoch) = data.sealed_epochs.remove(&epoch_id) {
-            let freed = epoch.entries.len() * APPROX_BYTES_PER_SKETCH;
+            let freed = epoch_approx_bytes(&epoch);
             self.mem_bytes_sealed.fetch_sub(freed, Ordering::Relaxed);
             // Also purge the epoch's windows from read_counts so they
             // don't leak.

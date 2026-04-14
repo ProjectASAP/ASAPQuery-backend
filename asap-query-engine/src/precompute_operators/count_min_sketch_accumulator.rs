@@ -280,6 +280,13 @@ impl AggregateCore for CountMinSketchAccumulator {
         AggregationType::CountMinSketch
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // Conservative constant for the CountMinSketch counter matrix.
+        // Real per-instance sizing would require exposing rows/cols on
+        // the inner sketch; 16 KiB is a reasonable v1 default.
+        16 * 1024
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }

@@ -118,6 +118,11 @@ impl AggregateCore for SumAccumulator {
         AggregationType::Sum
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // Single f64 + struct overhead.
+        std::mem::size_of::<Self>()
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }

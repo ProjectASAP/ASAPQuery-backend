@@ -179,6 +179,13 @@ impl AggregateCore for SetAggregatorAccumulator {
         AggregationType::SetAggregator
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // HashSet<KeyByLabelValues>; per-entry cost is label strings
+        // plus HashSet overhead.
+        const BYTES_PER_ENTRY: usize = 96;
+        std::mem::size_of::<Self>() + self.added.len() * BYTES_PER_ENTRY
+    }
+
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
         Some(self.added.iter().cloned().collect())
     }
