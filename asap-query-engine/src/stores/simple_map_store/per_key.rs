@@ -347,6 +347,21 @@ impl SimpleMapStorePerKey {
         })
     }
 
+    /// Total number of times the insert hot path has blocked on
+    /// flusher back-pressure (i.e. observed sealed memory at or above
+    /// `hard_cap_bytes` and entered `wait_for_memory_under`'s wait
+    /// loop). Returns 0 when persistence is disabled. Monotonic.
+    ///
+    /// Used as a timing-independent signal in back-pressure tests —
+    /// wall-clock thresholds are flaky on fast CI runners where a
+    /// flush tick completes in under a millisecond.
+    pub fn back_pressure_wait_count(&self) -> u64 {
+        match self.persistence.as_ref() {
+            Some(state) => state.flusher.back_pressure_wait_count(),
+            None => 0,
+        }
+    }
+
     /// Collect diagnostic info about store contents.
     pub fn diagnostic_info(&self) -> super::StoreDiagnostics {
         use super::{AggregationDiagnostic, StoreDiagnostics};

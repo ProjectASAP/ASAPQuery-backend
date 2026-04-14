@@ -202,17 +202,21 @@ fn construct_and_drop_shuts_flusher_cleanly() {
 
 #[test]
 fn hard_cap_back_pressure_blocks_inserts_until_flusher_drains() {
-    // Construct a store with a very small hard cap and a flusher that
-    // is deliberately slow (long flush interval). The first few
-    // inserts will push mem_bytes_sealed past the cap; subsequent
-    // inserts must block in `wait_for_memory_under` until the flusher
-    // evicts a sealed epoch.
+    // Construct a store with a very small hard cap and a flusher
+    // whose tick interval is long enough that at least one insert
+    // will catch the cap before a tick has time to drain it. The
+    // first few inserts push mem_bytes_sealed past the cap; any
+    // subsequent insert that arrives while mem_bytes_sealed is still
+    // at or above the cap enters `wait_for_memory_under`'s blocking
+    // wait loop, which increments a dedicated counter.
     //
-    // Test strategy: measure wall-clock time of an insert that we
-    // *know* will hit the cap. If back-pressure is wired up, it
-    // must be longer than the flusher's tick interval (because it
-    // waits at least one tick for the condvar notify). If it's not
-    // wired up, the insert returns in a handful of microseconds.
+    // We assert on that counter rather than on wall-clock timing.
+    // A previous version of this test measured the slowest insert
+    // and required it to be ≥3 ms, but on fast CI runners a flush
+    // tick completes in well under a millisecond, so the slow path
+    // would run and fully drain before any 3 ms threshold tripped —
+    // leaving the assertion flaky even though back-pressure was
+    // firing correctly. The counter is a timing-independent signal.
 
     let dir = TempDir::new().unwrap();
     let cfg = make_streaming_config(1);
@@ -224,8 +228,9 @@ fn hard_cap_back_pressure_blocks_inserts_until_flusher_drains() {
         hard_cap_bytes: 640,
         hot_window_ms: Some(0),
         delete_older_than_ms: None,
-        // Flusher tick is 200ms — long enough that a blocking insert
-        // is clearly distinguishable from a non-blocking one.
+        // Flusher tick is 200ms — long enough that at least one
+        // insert inside the 200-iteration loop can race ahead of
+        // the flusher and observe the cap.
         flush_interval: Duration::from_millis(200),
         disk_path: dir.path().to_path_buf(),
         part_cache_bytes: 0,
@@ -234,41 +239,25 @@ fn hard_cap_back_pressure_blocks_inserts_until_flusher_drains() {
         .expect("with_persistence");
 
     // Push well past the cap — 200 items × ~16 bytes each, vs. a
-    // 640-byte cap — so the insert path is forced to block on the
-    // flusher's condvar at least once. num_aggregates_to_retain=2
-    // means every 2 distinct windows triggers a seal, so sealed
-    // epochs accumulate fast.
-    //
-    // A normal insert on the hot path returns in <1 ms; anything
-    // ≥3 ms unambiguously indicates a condvar wait fired. We also
-    // capture the median as a baseline to make the assertion
-    // message informative when it fails.
-    let mut elapsed_all: Vec<Duration> = Vec::with_capacity(200);
+    // 640-byte cap. num_aggregates_to_retain=2 means every 2 distinct
+    // windows triggers a seal, so sealed epochs accumulate fast.
     for i in 0..200u64 {
         let start = i * 1_000;
         let end = start + 1_000;
         let batch = vec![sum_entry(1, start, end, i as f64)];
-        let t = Instant::now();
         store
             .insert_precomputed_output_batch(batch)
             .expect("insert");
-        elapsed_all.push(t.elapsed());
     }
-    let mut sorted = elapsed_all.clone();
-    sorted.sort();
-    let median = sorted[sorted.len() / 2];
-    let max = *sorted.last().unwrap();
-    let slow_count = sorted
-        .iter()
-        .filter(|d| **d >= Duration::from_millis(3))
-        .count();
+
+    let back_pressure_waits = store.back_pressure_wait_count();
     assert!(
-        slow_count > 0,
-        "expected ≥1 insert to block on back-pressure; all 200 returned fast \
-         (median={:?}, max={:?}, slow≥3ms count={})",
-        median,
-        max,
-        slow_count
+        back_pressure_waits > 0,
+        "expected ≥1 insert to enter the back-pressure wait loop; \
+         wait_count={} (cap={}, 200 inserts × ~16B vs. 640B cap \
+         should force at least one observed over-cap)",
+        back_pressure_waits,
+        640,
     );
 
     // Sanity: after the loop, wait a bit and confirm the flusher
