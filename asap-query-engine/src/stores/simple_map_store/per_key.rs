@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use super::persistence::{
@@ -41,6 +41,14 @@ fn epoch_approx_bytes(epoch: &SealedEpoch) -> usize {
 /// the rotator never seals the current epoch and nothing is ever
 /// flushable.
 const PERSISTENCE_DEFAULT_EPOCH_CAPACITY: usize = 1024;
+
+/// Maximum time an insert batch will wait on the flusher's pressure
+/// condvar when `mem_bytes_sealed` has exceeded `hard_cap_bytes`. 30
+/// seconds is long enough that a healthy flusher always makes it
+/// through a single tick, but short enough that a stuck flusher
+/// degrades gracefully (logged warning + continued insert) rather
+/// than hanging the ingest thread forever.
+const INSERT_BACK_PRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-aggregation_id data protected by RwLock
 struct StoreKeyData {
@@ -223,6 +231,13 @@ pub struct PerKeyInner {
     /// trigger. Approximate — per-type estimates are not guaranteed
     /// accurate, only proportional.
     mem_bytes_sealed: AtomicUsize,
+
+    /// Hard memory ceiling. When `mem_bytes_sealed` reaches this,
+    /// `insert_precomputed_output_batch` blocks on the flusher's
+    /// `pressure_cv` until the flusher catches up — the v1
+    /// mechanism for bounding RAM under sustained overload. Set to
+    /// `usize::MAX` by the in-memory-only constructor (no blocking).
+    hard_cap_bytes: usize,
 }
 
 /// Persistence-related state owned by the outer store. Dropping this
@@ -230,9 +245,10 @@ pub struct PerKeyInner {
 struct PersistenceState {
     manifest: Arc<Manifest>,
     cache: PartCache,
-    /// Held so `Drop` stops the thread. Not accessed directly after
-    /// construction.
-    _flusher: FlusherHandle,
+    /// Owned by the store. Dropping it shuts the thread down; the
+    /// insert path also calls `wait_for_memory_under` on it when the
+    /// hard cap is hit.
+    flusher: FlusherHandle,
     #[allow(dead_code)]
     parts_root: PathBuf,
 }
@@ -259,6 +275,7 @@ impl SimpleMapStorePerKey {
                 cleanup_policy,
                 persistence_enabled: false,
                 mem_bytes_sealed: AtomicUsize::new(0),
+                hard_cap_bytes: usize::MAX,
             }),
             persistence: None,
         }
@@ -295,6 +312,11 @@ impl SimpleMapStorePerKey {
         let parts_root = persistence::flusher::parts_root(&persistence_cfg.disk_path);
         let cache = PartCache::new(parts_root.clone(), persistence_cfg.part_cache_bytes);
 
+        // Capture hard_cap before `persistence_cfg` is moved into the
+        // flusher; PerKeyInner needs it for back-pressure enforcement
+        // on the insert path.
+        let hard_cap_bytes = persistence_cfg.hard_cap_bytes;
+
         let inner = Arc::new(PerKeyInner {
             store: DashMap::new(),
             earliest_timestamps: DashMap::new(),
@@ -304,6 +326,7 @@ impl SimpleMapStorePerKey {
             cleanup_policy,
             persistence_enabled: true,
             mem_bytes_sealed: AtomicUsize::new(0),
+            hard_cap_bytes,
         });
 
         let flusher = FlusherHandle::start(
@@ -317,7 +340,7 @@ impl SimpleMapStorePerKey {
             persistence: Some(PersistenceState {
                 manifest,
                 cache,
-                _flusher: flusher,
+                flusher,
                 parts_root,
             }),
         })
@@ -410,6 +433,42 @@ impl SimpleMapStorePerKey {
         let metric_key = metric.to_string();
         let inserted_delta = items.len() as u64;
         let persistence_enabled = self.inner.persistence_enabled;
+
+        // ---- Back-pressure (persistence only) ----
+        //
+        // If sealed memory has reached the hard cap, block the insert
+        // on the flusher's pressure condvar until the flusher makes
+        // progress. This has to happen BEFORE we take the per-agg
+        // RwLock::write so unrelated queries on the same agg aren't
+        // stalled by the wait. The wait is bounded so a stuck flusher
+        // logs-and-degrades rather than deadlocking the ingest path.
+        //
+        // Uses Ordering::Acquire on the load so the check synchronizes
+        // with the flusher's Relaxed decrements on evict — we might
+        // see stale values, but the wait loop re-checks after every
+        // notify_all anyway.
+        if persistence_enabled {
+            if let Some(state) = self.persistence.as_ref() {
+                let cap = self.inner.hard_cap_bytes;
+                let current = self.inner.mem_bytes_sealed.load(Ordering::Acquire);
+                if current >= cap {
+                    let ok = state.flusher.wait_for_memory_under(
+                        &self.inner.mem_bytes_sealed,
+                        cap,
+                        INSERT_BACK_PRESSURE_TIMEOUT,
+                    );
+                    if !ok {
+                        warn!(
+                            "insert back-pressure timed out for agg_id {}: \
+                             mem={} bytes, hard_cap={}, proceeding anyway",
+                            aggregation_id,
+                            self.inner.mem_bytes_sealed.load(Ordering::Relaxed),
+                            cap
+                        );
+                    }
+                }
+            }
+        }
 
         // Opt 4: compute batch minimum timestamp before acquiring any lock.
         let batch_min_ts = items
@@ -666,7 +725,7 @@ impl Drop for SimpleMapStorePerKey {
         // ref count hits zero, guaranteeing the flusher cannot observe
         // a half-destroyed store.
         if let Some(mut state) = self.persistence.take() {
-            state._flusher.shutdown();
+            state.flusher.shutdown();
         }
     }
 }

@@ -201,3 +201,87 @@ fn construct_and_drop_shuts_flusher_cleanly() {
     // Dropping the store should not deadlock or panic.
     drop(store);
 }
+
+#[test]
+fn hard_cap_back_pressure_blocks_inserts_until_flusher_drains() {
+    // Construct a store with a very small hard cap and a flusher that
+    // is deliberately slow (long flush interval). The first few
+    // inserts will push mem_bytes_sealed past the cap; subsequent
+    // inserts must block in `wait_for_memory_under` until the flusher
+    // evicts a sealed epoch.
+    //
+    // Test strategy: measure wall-clock time of an insert that we
+    // *know* will hit the cap. If back-pressure is wired up, it
+    // must be longer than the flusher's tick interval (because it
+    // waits at least one tick for the condvar notify). If it's not
+    // wired up, the insert returns in a handful of microseconds.
+
+    let dir = TempDir::new().unwrap();
+    let cfg = make_streaming_config(1);
+    let persistence = SimpleMapStorePersistenceConfig {
+        // Very small memory limit — a few hundred bytes — so the
+        // insert path hits the cap after the first handful of items.
+        memory_limit_bytes: 512,
+        memory_low_watermark_bytes: 256,
+        hard_cap_bytes: 640,
+        hot_window_ms: Some(0),
+        delete_older_than_ms: None,
+        // Flusher tick is 200ms — long enough that a blocking insert
+        // is clearly distinguishable from a non-blocking one.
+        flush_interval: Duration::from_millis(200),
+        disk_path: dir.path().to_path_buf(),
+        part_cache_bytes: 0,
+    };
+    let store =
+        SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+            .expect("with_persistence");
+
+    // Push well past the cap — 200 items × ~16 bytes each, vs. a
+    // 640-byte cap — so the insert path is forced to block on the
+    // flusher's condvar at least once. num_aggregates_to_retain=2
+    // means every 2 distinct windows triggers a seal, so sealed
+    // epochs accumulate fast.
+    //
+    // A normal insert on the hot path returns in <1 ms; anything
+    // ≥3 ms unambiguously indicates a condvar wait fired. We also
+    // capture the median as a baseline to make the assertion
+    // message informative when it fails.
+    let mut elapsed_all: Vec<Duration> = Vec::with_capacity(200);
+    for i in 0..200u64 {
+        let start = i * 1_000;
+        let end = start + 1_000;
+        let batch = vec![sum_entry(1, start, end, i as f64)];
+        let t = Instant::now();
+        store
+            .insert_precomputed_output_batch(batch)
+            .expect("insert");
+        elapsed_all.push(t.elapsed());
+    }
+    let mut sorted = elapsed_all.clone();
+    sorted.sort();
+    let median = sorted[sorted.len() / 2];
+    let max = *sorted.last().unwrap();
+    let slow_count = sorted
+        .iter()
+        .filter(|d| **d >= Duration::from_millis(3))
+        .count();
+    assert!(
+        slow_count > 0,
+        "expected ≥1 insert to block on back-pressure; all 200 returned fast \
+         (median={:?}, max={:?}, slow≥3ms count={})",
+        median,
+        max,
+        slow_count
+    );
+
+    // Sanity: after the loop, wait a bit and confirm the flusher
+    // made progress.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let diag = store.diagnostic_info();
+        if diag.total_time_map_entries <= 4 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
