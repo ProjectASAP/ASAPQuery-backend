@@ -24,6 +24,7 @@ clap.workspace = true
 chrono.workspace = true
 promql-parser.workspace = true
 tokio.workspace = true
+arc-swap.workspace = true
 
 # Crate-specific (keep version pinned here)
 form_urlencoded = "1.2"

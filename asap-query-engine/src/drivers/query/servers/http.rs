@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::engines::SimpleEngine;
@@ -32,6 +32,9 @@ pub struct HttpServer {
     query_engine: Arc<SimpleEngine>,
     store: Arc<dyn Store>,
     query_tracker: Option<Arc<QueryTracker>>,
+    /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
+    /// is not wired up by the caller (unit tests, legacy binaries).
+    hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ struct AppState {
     query_tracker: Option<Arc<QueryTracker>>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
+    hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
 }
 
 impl HttpServer {
@@ -56,7 +60,20 @@ impl HttpServer {
             query_engine,
             store,
             query_tracker,
+            hot_reload_config: None,
         }
+    }
+
+    /// Attach a `HotReloadStreamingConfig` handle so the
+    /// `GET/POST /api/v1/streaming-config` endpoints can read and
+    /// swap the currently active config. Without this handle the
+    /// endpoints return `503 Service Unavailable`.
+    pub fn with_hot_reload_config(
+        mut self,
+        handle: crate::data_model::HotReloadStreamingConfig,
+    ) -> Self {
+        self.hot_reload_config = Some(handle);
+        self
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -79,6 +96,7 @@ impl HttpServer {
             query_tracker: self.query_tracker,
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
+            hot_reload_config: self.hot_reload_config,
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -95,6 +113,10 @@ impl HttpServer {
             .route("/api/v1/precompute", post(handle_precompute_job))
             .route("/api/v1/health", get(handle_health))
             .route("/api/v1/store/metrics", get(handle_store_metrics))
+            .route(
+                "/api/v1/streaming-config",
+                get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
             .with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
@@ -121,6 +143,7 @@ impl HttpServer {
             query_tracker: self.query_tracker.clone(),
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
+            hot_reload_config: self.hot_reload_config.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -131,6 +154,10 @@ impl HttpServer {
             .route(range_query_endpoint, get(handle_range_query))
             .route(range_query_endpoint, post(handle_range_query_post))
             .route(runtime_info_path, get(handle_runtime_info))
+            .route(
+                "/api/v1/streaming-config",
+                get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
             .with_state(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -601,13 +628,19 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_model::{InferenceConfig, StreamingConfig};
+    use crate::data_model::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
     use crate::engines::SimpleEngine;
     use crate::stores::simple_map_store::SimpleMapStore;
     use reqwest::Client;
     use std::sync::Arc;
 
     async fn setup_test_server() -> u16 {
+        setup_test_server_with_hot_reload(None).await
+    }
+
+    async fn setup_test_server_with_hot_reload(
+        hot_reload: Option<HotReloadStreamingConfig>,
+    ) -> u16 {
         let adapter_config = AdapterConfig::prometheus_promql(
             "http://127.0.0.1:9999".to_string(), // Unused for this test
             false,                               // forward_unsupported_queries
@@ -637,7 +670,10 @@ mod tests {
             crate::data_model::QueryLanguage::promql,
         ));
 
-        let server = HttpServer::new(config, query_engine, store, None);
+        let mut server = HttpServer::new(config, query_engine, store, None);
+        if let Some(handle) = hot_reload {
+            server = server.with_hot_reload_config(handle);
+        }
         server
             .start_test_server()
             .await
@@ -705,6 +741,158 @@ mod tests {
         println!("Response JSON: {response_json}");
 
         assert!(status.is_success() || status == reqwest::StatusCode::OK);
+    }
+
+    // ── StreamingConfig hot-reload (PR E) ────────────────────────────────
+
+    /// POST a YAML streaming-config and verify the active state via
+    /// GET reflects the swap. Covers the full round-trip through
+    /// `HttpServer::with_hot_reload_config`, the POST parse+swap, and
+    /// the GET snapshot emission.
+    #[tokio::test]
+    async fn test_streaming_config_hot_reload_round_trip() {
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload.clone())).await;
+        let client = Client::new();
+
+        // Initial GET: empty config, 0 entries.
+        let initial = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .send()
+            .await
+            .expect("GET failed");
+        assert!(initial.status().is_success());
+        let initial_body: serde_json::Value = initial.json().await.unwrap();
+        assert_eq!(initial_body["aggregation_count"], 0);
+
+        // POST a new config with two aggregation_ids. The YAML shape
+        // matches what `StreamingConfig::from_yaml_data` parses — see
+        // `asap-common/dependencies/rs/asap_types/src/streaming_config.rs`
+        // and the sample files in `asap-tools/execution-utilities/`.
+        let new_config_yaml = r#"
+aggregations:
+  - aggregationId: 101
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: cpu_usage
+    labels:
+      grouping: [host]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+  - aggregationId: 102
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: mem_usage
+    labels:
+      grouping: [host, region]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 120
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let post_resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(new_config_yaml.to_string())
+            .send()
+            .await
+            .expect("POST failed");
+        let post_status = post_resp.status();
+        let post_body: serde_json::Value = post_resp.json().await.unwrap();
+        assert!(
+            post_status.is_success(),
+            "POST returned {post_status}: {post_body}"
+        );
+        assert_eq!(post_body["status"], "success");
+        assert_eq!(post_body["new_aggregation_count"], 2);
+        let added = post_body["agg_ids_added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            added,
+            std::collections::HashSet::from([101u64, 102u64]),
+            "expected both ids in added set"
+        );
+
+        // GET again: should reflect the two new ids.
+        let after = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .send()
+            .await
+            .expect("GET after swap failed");
+        assert!(after.status().is_success());
+        let after_body: serde_json::Value = after.json().await.unwrap();
+        assert_eq!(after_body["aggregation_count"], 2);
+
+        // The underlying HotReloadStreamingConfig handle (cloned into
+        // the server at setup) also reflects the swap — proving that
+        // downstream consumers that re-snapshot would see the new
+        // state.
+        let direct_snap = hot_reload.snapshot();
+        assert_eq!(direct_snap.aggregation_configs.len(), 2);
+        assert!(direct_snap.aggregation_configs.contains_key(&101));
+        assert!(direct_snap.aggregation_configs.contains_key(&102));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_config_hot_reload_missing_handle_503() {
+        // setup_test_server() passes `None` for hot_reload → both
+        // endpoints should return 503 with a clear error message.
+        let server_port = setup_test_server().await;
+        let client = Client::new();
+
+        let get_resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        let post_resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .body("anything")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_config_hot_reload_rejects_bad_yaml() {
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
+        let client = Client::new();
+
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .body("not: : : valid: yaml: :")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "error");
     }
 }
 
@@ -809,4 +997,113 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
         }
     }
+}
+
+// ─── StreamingConfig hot-reload (PR E) ───────────────────────────────────
+//
+// `GET /api/v1/streaming-config`  — return the currently active config
+//                                   as JSON (debug / verification).
+// `POST /api/v1/streaming-config` — accept a YAML body, parse, and
+//                                   atomically swap via ArcSwap.
+//
+// Phase 1 scope: the swap only takes effect for new readers that
+// snapshot after the swap. `SimpleEngine`, the ingest router, and
+// in-flight precompute workers all hold startup snapshots today and
+// ignore the swap until they are rebuilt — see the module doc on
+// `HotReloadStreamingConfig` for the full contract. Tests POST a new
+// config and verify it via the GET endpoint; controller integration
+// and per-query re-snapshot are phase 2.
+
+async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(handle) = state.hot_reload_config else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    let snap = handle.snapshot();
+    let body = serde_json::json!({
+        "status": "success",
+        "aggregation_count": snap.aggregation_configs.len(),
+        "aggregation_ids": snap.aggregation_configs.keys().copied().collect::<Vec<_>>(),
+        "streaming_config": &*snap,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+async fn handle_post_streaming_config(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::collections::HashSet;
+
+    let Some(handle) = state.hot_reload_config else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+
+    let yaml_text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("request body is not valid UTF-8: {e}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    let yaml_value: serde_yaml::Value = match serde_yaml::from_str(yaml_text) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("YAML parse error: {e}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    let new_config =
+        match asap_types::streaming_config::StreamingConfig::from_yaml_data(&yaml_value, None) {
+            Ok(c) => c,
+            Err(e) => {
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error": format!("StreamingConfig build error: {e}"),
+                });
+                return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+            }
+        };
+
+    let new_ids: HashSet<u64> = new_config.aggregation_configs.keys().copied().collect();
+    let old_arc = handle.swap(new_config);
+    let old_ids: HashSet<u64> = old_arc.aggregation_configs.keys().copied().collect();
+    let added: Vec<u64> = new_ids.difference(&old_ids).copied().collect();
+    let removed: Vec<u64> = old_ids.difference(&new_ids).copied().collect();
+
+    if !removed.is_empty() {
+        warn!(
+            "streaming-config hot-reload removed agg_ids {:?} — any in-flight \
+             precompute worker groups for these ids will continue with their \
+             construction-time config until they close naturally (phase 1 \
+             limitation; see HotReloadStreamingConfig module doc)",
+            removed
+        );
+    }
+
+    let body = serde_json::json!({
+        "status": "success",
+        "agg_ids_added": added,
+        "agg_ids_removed": removed,
+        "new_aggregation_count": new_ids.len(),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
