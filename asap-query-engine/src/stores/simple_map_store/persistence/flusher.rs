@@ -267,7 +267,11 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     if let Some(hot) = cfg.hot_window_ms {
         let cutoff = now.saturating_sub(hot);
         for r in &all {
-            if r.end_ts < cutoff && !selected.iter().any(|s| s.agg_id == r.agg_id && s.epoch_id == r.epoch_id) {
+            if r.end_ts < cutoff
+                && !selected
+                    .iter()
+                    .any(|s| s.agg_id == r.agg_id && s.epoch_id == r.epoch_id)
+            {
                 selected.push(*r);
             }
         }
@@ -305,8 +309,7 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
             let part_id = shared.next_part_id.fetch_add(1, Ordering::Relaxed);
             let part_dir = part_dir_path(&parts_root(&cfg.disk_path), part_id);
             let entries_total: usize = snapshots.iter().map(|s| s.len()).sum();
-            let size_bytes_estimate: u64 =
-                snapshots.iter().map(|s| s.approx_bytes as u64).sum();
+            let size_bytes_estimate: u64 = snapshots.iter().map(|s| s.approx_bytes as u64).sum();
 
             let report = PartWriter::write_part(&part_dir, part_id, &snapshots)?;
             shared.manifest.append_add(PartEntry {
@@ -398,9 +401,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::data_model::KeyByLabelValues;
-    use crate::stores::simple_map_store::persistence::source::{
-        EpochSnapshot, EpochSnapshotEntry,
-    };
+    use crate::stores::simple_map_store::persistence::source::{EpochSnapshot, EpochSnapshotEntry};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tempfile::TempDir;

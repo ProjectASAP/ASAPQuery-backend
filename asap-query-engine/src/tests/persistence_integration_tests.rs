@@ -92,9 +92,8 @@ fn with_persistence_flushes_sealed_epochs_to_disk() {
     // older than now-0 = now, so flush immediately on next tick."
     let persistence = persistence_cfg(&dir, Some(0));
 
-    let store =
-        SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
-            .expect("with_persistence");
+    let store = SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+        .expect("with_persistence");
 
     // Insert several windows so the rotator seals at least one epoch.
     // num_aggregates_to_retain = 2, so windows 3 will roll the epoch.
@@ -134,7 +133,8 @@ fn with_persistence_flushes_sealed_epochs_to_disk() {
         .unwrap();
     let total: usize = res.values().map(|v| v.len()).sum();
     assert_eq!(
-        total, 4,
+        total,
+        4,
         "expected 4 buckets across in-memory + disk; got {} (buckets: {:?})",
         total,
         res.values()
@@ -148,9 +148,8 @@ fn query_read_through_merges_memory_and_disk_ranges() {
     let dir = TempDir::new().unwrap();
     let cfg = make_streaming_config(42);
     let persistence = persistence_cfg(&dir, Some(0));
-    let store =
-        SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
-            .expect("with_persistence");
+    let store = SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+        .expect("with_persistence");
 
     // Insert 6 windows — more than enough to guarantee the rotator
     // seals multiple epochs.
@@ -195,9 +194,8 @@ fn construct_and_drop_shuts_flusher_cleanly() {
     let dir = TempDir::new().unwrap();
     let cfg = make_streaming_config(1);
     let persistence = persistence_cfg(&dir, None);
-    let store =
-        SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
-            .expect("with_persistence");
+    let store = SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+        .expect("with_persistence");
     // Dropping the store should not deadlock or panic.
     drop(store);
 }
@@ -232,9 +230,8 @@ fn hard_cap_back_pressure_blocks_inserts_until_flusher_drains() {
         disk_path: dir.path().to_path_buf(),
         part_cache_bytes: 0,
     };
-    let store =
-        SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
-            .expect("with_persistence");
+    let store = SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+        .expect("with_persistence");
 
     // Push well past the cap — 200 items × ~16 bytes each, vs. a
     // 640-byte cap — so the insert path is forced to block on the

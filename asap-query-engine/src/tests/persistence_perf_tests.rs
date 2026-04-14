@@ -158,10 +158,7 @@ fn insert_throughput_in_memory_vs_persistent() {
 
     // -- baseline: in-memory, NoCleanup --
     {
-        let store = SimpleMapStorePerKey::new(
-            streaming_config(1, None),
-            CleanupPolicy::NoCleanup,
-        );
+        let store = SimpleMapStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
         let items = gen_items(1, N);
         let d = insert_all(&store, items, BATCH);
         println!(
@@ -244,10 +241,7 @@ fn query_latency_memory_only_vs_disk_through() {
 
     // -- in-memory baseline --
     {
-        let store = SimpleMapStorePerKey::new(
-            streaming_config(1, None),
-            CleanupPolicy::NoCleanup,
-        );
+        let store = SimpleMapStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
         let items = gen_items(1, POPULATE);
         insert_all(&store, items, 1_000);
 
@@ -258,12 +252,7 @@ fn query_latency_memory_only_vs_disk_through() {
     // -- disk read-through (everything flushed) --
     {
         let tmp = TempDir::new().unwrap();
-        let cfg = persistence_cfg(
-            &tmp,
-            4 * 1024 * 1024,
-            Some(0),
-            Duration::from_millis(10),
-        );
+        let cfg = persistence_cfg(&tmp, 4 * 1024 * 1024, Some(0), Duration::from_millis(10));
         let store = SimpleMapStorePerKey::with_persistence(
             streaming_config(1, Some(256)),
             CleanupPolicy::NoCleanup,
@@ -460,12 +449,7 @@ fn memory_bound_adherence_under_overload() {
     );
 
     let tmp = TempDir::new().unwrap();
-    let cfg = persistence_cfg(
-        &tmp,
-        LIMIT_BYTES,
-        Some(0),
-        Duration::from_millis(10),
-    );
+    let cfg = persistence_cfg(&tmp, LIMIT_BYTES, Some(0), Duration::from_millis(10));
     let store = SimpleMapStorePerKey::with_persistence(
         streaming_config(1, Some(128)),
         CleanupPolicy::NoCleanup,
@@ -495,12 +479,7 @@ fn memory_bound_adherence_under_overload() {
     }
     let final_tracked = store.diagnostic_info().total_sketch_bytes;
 
-    println!(
-        "  inserted {} items in {:?} ({})",
-        N,
-        d,
-        fmt_rate(N, d)
-    );
+    println!("  inserted {} items in {:?} ({})", N, d, fmt_rate(N, d));
     println!(
         "  peak tracked: {} KiB  (high-water = {} KiB, ratio = {:.2}x)",
         peak_tracked / 1024,

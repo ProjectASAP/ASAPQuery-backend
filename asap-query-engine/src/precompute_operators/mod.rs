@@ -1,7 +1,10 @@
 pub mod count_min_sketch_accumulator;
 pub mod count_min_sketch_with_heap_accumulator;
+pub mod count_sketch_accumulator;
 pub mod datasketches_kll_accumulator;
+pub mod dd_sketch_accumulator;
 pub mod delta_set_aggregator_accumulator;
+pub mod hll_sketch_accumulator;
 pub mod hydra_kll_accumulator;
 pub mod increase_accumulator;
 pub mod min_max_accumulator;
@@ -14,8 +17,11 @@ pub mod sum_accumulator;
 
 pub use count_min_sketch_accumulator::*;
 pub use count_min_sketch_with_heap_accumulator::*;
+pub use count_sketch_accumulator::*;
 pub use datasketches_kll_accumulator::*;
+pub use dd_sketch_accumulator::*;
 pub use delta_set_aggregator_accumulator::*;
+pub use hll_sketch_accumulator::*;
 pub use hydra_kll_accumulator::*;
 pub use increase_accumulator::*;
 pub use min_max_accumulator::*;

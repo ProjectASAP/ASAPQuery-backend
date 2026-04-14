@@ -273,10 +273,12 @@ pub enum AggregationType {
     HydraKLL,
     CountMinSketch,
     CountMinSketchWithHeap,
+    CountSketch,
     // ---------- cardinality / set tracking ----------
     SetAggregator,
     DeltaSetAggregator,
     HLL,
+    DDSketch,
     // ---------- legacy config wrapper names ----------
     SingleSubpopulation,
     MultipleSubpopulation,
@@ -295,9 +297,11 @@ impl AggregationType {
             AggregationType::HydraKLL => "HydraKLL",
             AggregationType::CountMinSketch => "CountMinSketch",
             AggregationType::CountMinSketchWithHeap => "CountMinSketchWithHeap",
+            AggregationType::CountSketch => "CountSketch",
             AggregationType::SetAggregator => "SetAggregator",
             AggregationType::DeltaSetAggregator => "DeltaSetAggregator",
             AggregationType::HLL => "HLL",
+            AggregationType::DDSketch => "DDSketch",
             AggregationType::SingleSubpopulation => "SingleSubpopulation",
             AggregationType::MultipleSubpopulation => "MultipleSubpopulation",
         }
@@ -313,6 +317,7 @@ impl AggregationType {
                 | AggregationType::MultipleMinMax
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
+                | AggregationType::CountSketch
                 | AggregationType::HydraKLL
         )
     }
@@ -326,6 +331,7 @@ impl AggregationType {
                 | AggregationType::MultipleIncrease
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
+                | AggregationType::CountSketch
         )
     }
 
@@ -360,9 +366,11 @@ impl FromStr for AggregationType {
             "HydraKLL" => Ok(AggregationType::HydraKLL),
             "CountMinSketch" => Ok(AggregationType::CountMinSketch),
             "CountMinSketchWithHeap" => Ok(AggregationType::CountMinSketchWithHeap),
+            "CountSketch" => Ok(AggregationType::CountSketch),
             "SetAggregator" => Ok(AggregationType::SetAggregator),
             "DeltaSetAggregator" => Ok(AggregationType::DeltaSetAggregator),
             "HLL" | "HyperLogLog" => Ok(AggregationType::HLL),
+            "DDSketch" | "DdSketch" => Ok(AggregationType::DDSketch),
             "SingleSubpopulation" => Ok(AggregationType::SingleSubpopulation),
             "MultipleSubpopulation" => Ok(AggregationType::MultipleSubpopulation),
             // Legacy accumulator-suffixed aliases
@@ -384,6 +392,9 @@ impl FromStr for AggregationType {
                 Ok(AggregationType::CountMinSketch)
             }
             "CountMinSketchWithHeapAccumulator" => Ok(AggregationType::CountMinSketchWithHeap),
+            "CountSketchAccumulator" | "CS" | "cs" | "count_sketch" => {
+                Ok(AggregationType::CountSketch)
+            }
             "SetAggregatorAccumulator" => Ok(AggregationType::SetAggregator),
             "DeltaSetAggregatorAccumulator" => Ok(AggregationType::DeltaSetAggregator),
             _ => Err(format!("Unknown aggregation type: '{s}'")),

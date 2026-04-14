@@ -242,9 +242,7 @@ impl AggregateCore for MultipleMinMaxAccumulator {
 
     fn approx_memory_bytes(&self) -> usize {
         const BYTES_PER_ENTRY: usize = 96;
-        std::mem::size_of::<Self>()
-            + self.values.len() * BYTES_PER_ENTRY
-            + self.sub_type.capacity()
+        std::mem::size_of::<Self>() + self.values.len() * BYTES_PER_ENTRY + self.sub_type.capacity()
     }
 
     fn get_keys(&self) -> Option<Vec<KeyByLabelValues>> {
