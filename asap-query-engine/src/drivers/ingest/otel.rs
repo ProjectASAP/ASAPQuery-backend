@@ -696,7 +696,7 @@ fn decode_modified_otlp_sketch_bytes(
     encoding: i32,
     bytes: &[u8],
 ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
-    use crate::precompute_operators::CountMinSketchAccumulator;
+    use crate::precompute_operators::{CountMinSketchAccumulator, CountSketchAccumulator};
 
     // The encoding value is the raw i32 from the proto enum. We only
     // accept ENCODING_PROTO (= 1) for now; ENCODING_PROTO_DELTA (= 2)
@@ -719,13 +719,15 @@ fn decode_modified_otlp_sketch_bytes(
             let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
             Ok(Box::new(acc))
         }
-        SketchKind::Kll | SketchKind::DdSketch | SketchKind::CountSketch | SketchKind::Hll => {
-            Err(format!(
-                "modified-OTLP sketch decoder for {kind:?} not yet implemented \
-             (tracked in PR C, task #8)"
-            )
-            .into())
+        SketchKind::CountSketch => {
+            let acc = CountSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
+            Ok(Box::new(acc))
         }
+        SketchKind::Kll | SketchKind::DdSketch | SketchKind::Hll => Err(format!(
+            "modified-OTLP sketch decoder for {kind:?} not yet implemented \
+             (tracked in the per-sketch PR C follow-ups, task #8)"
+        )
+        .into()),
     }
 }
 
