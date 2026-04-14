@@ -262,11 +262,67 @@ left to do (the oldest epochs are already gone). Under light ingest, phase 1
 is a no-op and phase 2 does all the work. The two phases never fight because
 they pull from the same oldest-first ordering.
 
-`flush_and_evict` serializes the epoch *outside* the per-agg lock (the epoch is
-immutable once sealed, we can read the `Arc` without holding the write lock),
-fsyncs the segment file, then takes the per-agg `RwLock::write` only to splice
-the epoch out of `sealed_epochs` and decrement `mem_bytes_in_use`. This keeps
-flush off the insert/query critical path.
+`flush_and_evict` takes advantage of a property that matters a lot for the
+flusher design: **sealed epochs are append-only and frozen.** Once the
+rotator seals an epoch, no writer will ever touch its contents again — it
+is only read (by queries) or removed wholesale (by the flusher). That
+immutability is what lets the flusher stay completely off the critical
+path:
+
+1. Take the per-agg `RwLock::read` briefly, clone the `Arc<Epoch>` for the
+   target epoch out of `sealed_epochs`, drop the lock.
+2. Serialize the epoch, write the segment file, and fsync — **entirely
+   outside any store lock**, on the flusher's own thread. Nothing in the
+   system is waiting on this I/O. Inserts continue to land in
+   `current_epoch`; queries continue to read from the still-in-place
+   `sealed_epochs` entry (and the cloned `Arc` keeps the bytes alive for
+   any query that happens to hold a reference already); the rotator
+   continues to seal new epochs behind us.
+3. Once the segment is durable and the manifest is updated, take the
+   per-agg `RwLock::write` briefly to splice the epoch out of
+   `sealed_epochs` and decrement `mem_bytes_in_use`. This is O(1) — a
+   `BTreeMap::remove` plus an atomic subtraction — and is the only lock
+   the flusher holds for more than a read snapshot.
+
+Because steps 2 and 3 are decoupled by the `Arc<Epoch>` clone, **no lock
+is ever held across disk I/O**, and the flusher never blocks anything on
+the insert or query path beyond the two brief lock acquisitions at the
+start and end.
+
+#### Sync vs. async flush I/O — resolved
+
+The previous revision left this as an open question. With the append-only
+property made explicit, the answer is clear: **plain `std::fs` on a
+dedicated `std::thread` is what we ship.** No `tokio::fs`, no Tokio
+runtime for the flusher.
+
+The only argument for async I/O would be "we need to yield the thread
+while `fsync` is in flight so some other task on the same runtime can
+make progress" — and there is no such other task. The flusher thread has
+exactly one job — flush — and blocking it on `write` + `fsync` is fine
+because:
+
+- **Inserts never wait on the flusher.** Inserts land in `current_epoch`
+  with no coordination with flush state; memory accounting is an atomic,
+  not a lock. The flusher and the insert path only share the per-agg
+  `RwLock`, and the flusher only holds it during the two brief windows
+  above.
+- **Queries never wait on the flusher.** In-memory reads take the per-agg
+  `RwLock::read`, which contends with the flusher only during those same
+  brief windows; disk reads go through the manifest lock, which is
+  independent.
+- **Back-pressure is the right answer to a slow disk.** If the flusher
+  genuinely cannot keep up and memory hits `hard_cap_bytes`, the insert
+  path blocks on a condvar until the flusher catches up. That is the
+  correct behavior regardless of whether the I/O underneath is sync or
+  async — making it async would not let more inserts through, it would
+  just change which thread was parked.
+
+Sync I/O keeps the store out of Tokio's executor entirely, keeps stack
+traces readable, and eliminates a class of "why is my future not making
+progress" failure modes. The flusher thread is `std::thread::spawn`'d in
+`SimpleMapStorePerKey::new` and joined in `close`, with a `shutdown`
+flag checked on each loop iteration.
 
 ### Query path
 
@@ -468,30 +524,29 @@ to justify the algorithm choice.
    tooling. I lean custom for v1 given that we never read segments outside
    this process, but happy to switch if there's an appetite.
 
-2. **Async vs. sync flush I/O.** The rest of the store is sync (`RwLock`,
-   `DashMap`), but the flusher task is naturally async. Proposal: `tokio::fs`
-   for segment writes, sync locks everywhere else. Flusher runs on a dedicated
-   task, not a shared runtime, to avoid starving it under query load.
-
-3. **Cold data retention on disk.** Once a sketch is on disk, it lives there
+2. **Cold data retention on disk.** Once a sketch is on disk, it lives there
    until the operator removes the directory. Do we want a third knob
    `delete_older_than_ms = T2` (with `T2 >> hot_window_ms`) so disk is also
    bounded? My lean: not in v1 — cold data is cheap and operators can manage
    the directory, but add the knob as soon as anyone asks.
 
-4. **Per-agg-id flush fairness.** Oldest-global-first could starve small,
+3. **Per-agg-id flush fairness.** Oldest-global-first could starve small,
    slow-moving aggs during a burst on a hot agg. Acceptable for v1 since
    "oldest window first" is well-defined globally; revisit if it bites.
 
-5. **Default `segment_cache_bytes`.** Should v1 default the Tier-2 cache to
+4. **Default `segment_cache_bytes`.** Should v1 default the Tier-2 cache to
    a small nonzero value (e.g. 64 MiB) so the typical read path gets a
    trivial hit-rate win for free, or default it to 0 (opt-in) so no
    workload pays RAM it doesn't measurably benefit from? My lean: default
    to a small nonzero value — a fresh install shouldn't have to know about
    this knob to get reasonable repeat-query performance.
 
-6. **Tier-2 algorithm beyond LRU.** Plain LRU ships in phase 3. Do we
+5. **Tier-2 algorithm beyond LRU.** Plain LRU ships in phase 3. Do we
    commit up-front to an upgrade path (SLRU, TinyLFU) or only revisit if
    real traces show scan-resistant patterns are a problem? My lean: defer
    — LRU is fine for the 90% case and the cache has no consistency
    obligations, so swapping the algorithm is a purely local change.
+
+*(The earlier open question about sync vs. async flush I/O is resolved
+in-line above — the append-only property of sealed epochs makes sync
+`std::fs` on a dedicated thread the clear winner.)*
