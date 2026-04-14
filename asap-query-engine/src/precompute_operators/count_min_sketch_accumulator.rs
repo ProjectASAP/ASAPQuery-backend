@@ -68,6 +68,77 @@ impl CountMinSketchAccumulator {
         })
     }
 
+    /// Decode from the modified OTLP wire format's
+    /// `CountMinSketchDataPoint.sketch` bytes — i.e. the protobuf-encoded
+    /// `asap_sketchlib::proto::sketchlib::CountMinState` message used by
+    /// DataCollector's `countminsketchprocessor` when emitting via
+    /// `Metric.data = CountMinSketch{…}` with
+    /// `encoding = COUNT_MIN_SKETCH_ENCODING_PROTO`.
+    ///
+    /// The resulting accumulator is constructed via
+    /// `CountMinSketch::from_legacy_matrix` after reshaping the flat
+    /// `counts_int` / `counts_float` field into a `Vec<Vec<f64>>`.
+    pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use prost::Message;
+
+        let state =
+            CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?;
+        let rows = state.rows as usize;
+        let cols = state.cols as usize;
+        if rows == 0 || cols == 0 {
+            return Err(format!("CountMinState has zero dims (rows={rows}, cols={cols})").into());
+        }
+        let expected_len = rows * cols;
+        let counter_type = CounterType::try_from(state.counter_type).map_err(|_| {
+            format!(
+                "CountMinState has unknown counter_type tag {}",
+                state.counter_type
+            )
+        })?;
+        let flat: Vec<f64> = match counter_type {
+            CounterType::Int32 | CounterType::Int64 => {
+                if state.counts_int.len() != expected_len {
+                    return Err(format!(
+                        "CountMinState counts_int has {} entries, expected rows*cols = {}",
+                        state.counts_int.len(),
+                        expected_len
+                    )
+                    .into());
+                }
+                state.counts_int.iter().map(|&v| v as f64).collect()
+            }
+            CounterType::Float64 => {
+                if state.counts_float.len() != expected_len {
+                    return Err(format!(
+                        "CountMinState counts_float has {} entries, expected rows*cols = {}",
+                        state.counts_float.len(),
+                        expected_len
+                    )
+                    .into());
+                }
+                state.counts_float.clone()
+            }
+            // INT128 stores (hi, lo) pairs and would have 2 * rows * cols
+            // entries in counts_int; defer to PR C if a producer ever uses it.
+            other => {
+                return Err(format!(
+                    "CountMinState counter_type {other:?} not yet supported \
+                     (PR C will extend coverage)"
+                )
+                .into());
+            }
+        };
+        let mut matrix = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let start = r * cols;
+            matrix.push(flat[start..start + cols].to_vec());
+        }
+        Ok(Self {
+            inner: CountMinSketch::from_legacy_matrix(matrix, rows, cols),
+        })
+    }
+
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         if buffer.len() < 8 {
             return Err("Buffer too short for row_num and col_num".into());
@@ -465,5 +536,101 @@ mod tests {
         let sum = SumAccumulator::new();
         let mixed_accs: Vec<Box<dyn AggregateCore>> = vec![Box::new(cms), Box::new(sum)];
         assert!(CountMinSketchAccumulator::merge_multiple(&mixed_accs).is_err());
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_int64() {
+        // Hand-build a CountMinState proto with INT64 counters and verify
+        // round-tripping through from_sketchlib_proto_bytes yields the same
+        // matrix that the modified-OTLP wire format would carry.
+        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use prost::Message;
+
+        let rows = 2u32;
+        let cols = 3u32;
+        // Row-major: row 0 = [1,2,3], row 1 = [4,5,6]
+        let counts_int: Vec<i64> = vec![1, 2, 3, 4, 5, 6];
+        let state = CountMinState {
+            rows,
+            cols,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: counts_int.clone(),
+            counts_float: Vec::new(),
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let bytes = state.encode_to_vec();
+
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        let matrix = acc.inner.sketch();
+        assert_eq!(matrix.len(), rows as usize);
+        assert_eq!(matrix[0], vec![1.0, 2.0, 3.0]);
+        assert_eq!(matrix[1], vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_float64() {
+        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use prost::Message;
+
+        let state = CountMinState {
+            rows: 2,
+            cols: 2,
+            counter_type: CounterType::Float64 as i32,
+            counts_int: Vec::new(),
+            counts_float: vec![1.5, 2.5, 3.5, 4.5],
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let bytes = state.encode_to_vec();
+
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        let matrix = acc.inner.sketch();
+        assert_eq!(matrix[0], vec![1.5, 2.5]);
+        assert_eq!(matrix[1], vec![3.5, 4.5]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_dimension_mismatch() {
+        // counts_int has 5 entries but rows*cols = 6 → expect error
+        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use prost::Message;
+
+        let state = CountMinState {
+            rows: 2,
+            cols: 3,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: vec![1, 2, 3, 4, 5],
+            counts_float: Vec::new(),
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let bytes = state.encode_to_vec();
+
+        let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("counts_int"),
+            "error should mention counts_int dim mismatch"
+        );
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_zero_dims_rejected() {
+        use asap_sketchlib::proto::sketchlib::CountMinState;
+        use prost::Message;
+
+        let state = CountMinState::default();
+        let bytes = state.encode_to_vec();
+
+        let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("zero dims"));
     }
 }
