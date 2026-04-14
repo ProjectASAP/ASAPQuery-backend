@@ -2,6 +2,7 @@ mod common;
 pub mod global;
 pub mod legacy;
 pub mod per_key;
+pub mod persistence;
 
 use crate::data_model::{
     AggregateCore, CleanupPolicy, LockStrategy, PrecomputedOutput, StreamingConfig,
@@ -63,6 +64,28 @@ impl SimpleMapStore {
                 SimpleMapStore::PerKey(SimpleMapStorePerKey::new(streaming_config, cleanup_policy))
             }
         }
+    }
+
+    /// Persistence-enabled constructor. Always returns the `PerKey`
+    /// variant — persistence only targets per-key locking; the
+    /// `Global` variant is intentionally left in-memory-only.
+    ///
+    /// Runs recovery on the disk path, starts the background flusher
+    /// thread, and returns a store whose sealed epochs are flushed
+    /// to disk on memory / time pressure. Query paths transparently
+    /// read back from disk when in-memory state misses.
+    pub fn with_persistence_per_key(
+        streaming_config: Arc<StreamingConfig>,
+        cleanup_policy: CleanupPolicy,
+        persistence_cfg: persistence::SimpleMapStorePersistenceConfig,
+    ) -> persistence::PersistResult<Self> {
+        Ok(SimpleMapStore::PerKey(
+            SimpleMapStorePerKey::with_persistence(
+                streaming_config,
+                cleanup_policy,
+                persistence_cfg,
+            )?,
+        ))
     }
 }
 

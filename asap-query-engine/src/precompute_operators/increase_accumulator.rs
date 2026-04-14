@@ -245,6 +245,11 @@ impl AggregateCore for IncreaseAccumulator {
         AggregationType::Increase
     }
 
+    fn approx_memory_bytes(&self) -> usize {
+        // Two Measurements + two i64s. Measurements are a few f64 fields.
+        std::mem::size_of::<Self>()
+    }
+
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
         None
     }
