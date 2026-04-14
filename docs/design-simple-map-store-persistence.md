@@ -275,13 +275,102 @@ flush off the insert/query critical path.
 1. Read from `current_epoch + sealed_epochs` as today.
 2. Look up segments in the manifest whose `[start_ms, end_ms]` overlaps the
    query range for this `agg_id`.
-3. For each matching segment, read the file (cached via an `lru::LruCache<SegmentId, Arc<SegmentBuf>>`),
-   decode entries whose window overlaps, and merge into the result.
+3. For each matching segment, read the file (via the read-side segment cache
+   described below), decode entries whose window overlaps, and merge into the
+   result.
 
 Segment reads happen under a read lock on the manifest; they do **not** take any
 per-agg store lock, so they can run fully in parallel with inserts. Merging reuses
 the existing `TimestampedBucketsMap` + `AggregateCore::merge_with` that the
 in-memory query path already uses — no new merge logic.
+
+### Read-side segment cache (two-tier memory model)
+
+So far the flusher treats "is this sketch in RAM?" as a pure function of
+*write* state — time of ingest and write-side memory pressure. That is the
+right default for a TSDB, because recency dominates query patterns, but it
+leaves one real gap: **cold-but-repeatedly-queried** segments. Think of a
+dashboard that scans "last Tuesday's incident" every time the on-call opens
+it, or a recording rule that re-reads a fixed 24h historical range every
+minute. Those queries touch segments that the time watermark has correctly
+decided are cold, and under the design so far they pay full disk I/O on
+every hit.
+
+The answer is **not** to let query frequency feed back into the flusher
+policy. Doing that would couple write-path retention to read load, break
+the monotonic "once cold, stays cold" invariant the flusher relies on, and
+introduce unbounded-memory failure modes when a query sweeps everything.
+The answer is a **second, separate memory tier** that exists purely as a
+read-side cache on top of the disk layer.
+
+**Tier 1 — authoritative hot (write-driven).** Bounded by
+`memory_limit_bytes` + `hot_window_ms`. Contains `current_epoch` and any
+sealed epoch that has not yet been flushed. Source of truth for recent
+data. Managed by the flusher described above.
+
+**Tier 2 — read-side segment cache (query-driven).** Bounded by a
+separate `segment_cache_bytes` budget. Contains decoded copies of segments
+pulled back from disk by the query path. Source of truth is always the
+segment file — the cache is a pure optimization, drop-anytime, never
+dirty. Managed by the query path, not the flusher.
+
+```rust
+pub struct SimpleMapStorePersistenceConfig {
+    // ... existing fields ...
+
+    // Read-side segment cache. Bounded independently of
+    // `memory_limit_bytes`; this budget is for decoded segments the query
+    // path pulls back from disk, not for the authoritative hot set.
+    // Set to 0 to disable. Default: small (e.g. 64 MiB), opt-in for
+    // workloads that don't need it.
+    pub segment_cache_bytes: usize,
+}
+```
+
+**Why a TSDB specifically benefits from this shape:**
+
+1. **Recency and query frequency overlap ~90%.** Tier 1 already catches
+   everything a "rate over last 5m" workload wants pinned. The cache
+   only earns its budget on the residual workload — dashboards on fixed
+   old ranges, recording rules over long horizons. Making it a separate,
+   sized-independently tier means we can ship a small default (or zero)
+   and only budget it up for workloads that measurably need it.
+
+2. **Monotonic tiering.** Once a sealed epoch is flushed, it stays on
+   disk. A query may cache a decoded copy in Tier 2, but the flusher
+   never "un-flushes" it back into Tier 1. This preserves the property
+   that Tier 1 is purely a function of write state — which is what makes
+   the flusher simple enough to implement correctly.
+
+3. **Segment granularity, not sketch granularity.** The unit of disk I/O
+   is the segment file, so the cache must match that granularity.
+   Caching individual sketches inside a segment would mean partial reads
+   and complex invalidation; caching whole segments is a trivial
+   `LruCache<SegmentId, Arc<DecodedSegment>>`.
+
+4. **Two independent budgets are easier to tune than one unified priority
+   score.** Operators reason about "how much RAM does write buffering
+   need?" and "how much RAM does read caching need?" separately. A
+   unified `priority = α * recency + β * frequency` score is harder to
+   explain and harder to debug when it misbehaves.
+
+**Eviction policy for Tier 2.** A plain LRU is the v1 default. If we see
+recurring cold queries that get evicted by unrelated one-shot scans, we
+can move to SLRU or TinyLFU later — both are drop-in replacements because
+the cache has no consistency obligations. The cache should expose
+hit/miss counters in `StoreDiagnostics` so we have data for that call.
+
+**Interaction with the flusher.** None. The flusher only sees Tier 1.
+The read cache has no feedback into retention decisions. This is the
+whole point of splitting the tiers.
+
+**What this deliberately does not do:**
+
+- No pinning of individual sketches in Tier 1 based on read counts. The
+  existing `read_counts` field on `StoreKeyData` becomes purely diagnostic
+  for this store — it does not veto flushes.
+- No promotion from Tier 2 back into Tier 1. Once cold, stays cold.
+- No partial-segment loading. Segments are cached whole or not at all.
 
 ### Recovery on startup
 
@@ -356,12 +445,19 @@ the pieces can be reviewed independently:
 3. **Query path read-through + recovery.** Extend `query_precomputed_output`
    to consult the manifest and merge segment hits with in-memory hits. Add
    startup recovery. Integration test: ingest → flush → restart → query →
-   same result as no-restart.
+   same result as no-restart. The read path uses a **trivial bounded LRU**
+   for the Tier-2 segment cache in this phase — just enough to avoid
+   re-reading the same segment on back-to-back queries. No SLRU/TinyLFU,
+   no hit/miss exporter, no tuning knobs beyond `segment_cache_bytes`.
 
 Because phase 1 removes `CleanupPolicy` from this store, phase 1 is **not**
 independently mergeable without at least the memory-pressure path from
 phase 2 — otherwise the store has no bound on RAM. In practice phases 1 and
 2 land together; phase 3 can land separately once the write path is stable.
+
+A later phase 4 (not part of this PR) would upgrade the Tier-2 cache to
+SLRU/TinyLFU and export hit/miss metrics, once we have real query traces
+to justify the algorithm choice.
 
 ---
 
@@ -386,3 +482,16 @@ phase 2 — otherwise the store has no bound on RAM. In practice phases 1 and
 4. **Per-agg-id flush fairness.** Oldest-global-first could starve small,
    slow-moving aggs during a burst on a hot agg. Acceptable for v1 since
    "oldest window first" is well-defined globally; revisit if it bites.
+
+5. **Default `segment_cache_bytes`.** Should v1 default the Tier-2 cache to
+   a small nonzero value (e.g. 64 MiB) so the typical read path gets a
+   trivial hit-rate win for free, or default it to 0 (opt-in) so no
+   workload pays RAM it doesn't measurably benefit from? My lean: default
+   to a small nonzero value — a fresh install shouldn't have to know about
+   this knob to get reasonable repeat-query performance.
+
+6. **Tier-2 algorithm beyond LRU.** Plain LRU ships in phase 3. Do we
+   commit up-front to an upgrade path (SLRU, TinyLFU) or only revisit if
+   real traces show scan-resistant patterns are a problem? My lean: defer
+   — LRU is fine for the 90% case and the cache has no consistency
+   obligations, so swapping the algorithm is a purely local change.
