@@ -146,6 +146,7 @@ impl MetricsService for MetricsServiceImpl {
         process_otlp_request(&req, "gRPC");
         if let Some(state) = &self.shared.ingest_state {
             route_otlp_to_precompute(&req, state).await;
+            route_modified_otlp_sketches_to_precompute(&req, state).await;
         }
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -192,6 +193,7 @@ async fn handle_otlp_http(
     process_otlp_request(&req, "HTTP");
     if let Some(state) = &shared.ingest_state {
         route_otlp_to_precompute(&req, state).await;
+        route_modified_otlp_sketches_to_precompute(&req, state).await;
     }
     debug!("OTLP sending response via HTTP");
     Ok(Json(serde_json::json!({"rejected": 0})))
@@ -475,6 +477,255 @@ async fn route_otlp_to_precompute(
              {} raw + {} sketches routed to precompute engine",
             raw_unmatched, sketch_unmatched, raw_matched, sketch_matched
         );
+    }
+}
+
+/// Walk the modified-OTLP first-class sketch metric variants
+/// (`DDSketch` / `KLLSketch` / `CountSketch` / `CountMinSketch` /
+/// `HLLSketch` on `Metric.data` tags 13–17) and dispatch each
+/// `*SketchDataPoint` through the precompute engine via
+/// `WorkerMessage::AccumulatorInput`.
+///
+/// Per-variant decoding of the typed `sketch` bytes is delegated to
+/// `decode_modified_otlp_sketch_bytes`, which in turn calls into the
+/// matching concrete accumulator's `from_sketchlib_proto_bytes`
+/// constructor when one exists. Variants without a concrete decoder
+/// today (KLL / DDSketch / CountSketch / HLL) fall through to the
+/// §5.2 fallback path so the user still gets a correct answer; PR C
+/// (task #8) will close those decoder gaps.
+async fn route_modified_otlp_sketches_to_precompute(
+    request: &ExportMetricsServiceRequest,
+    ingest_state: &Arc<IngestState>,
+) {
+    use asap_otel_proto::tonic::metrics::v1::metric::Data;
+
+    let ingest_received_at = Instant::now();
+    let mut messages: Vec<WorkerMessage> = Vec::new();
+    let mut routed = 0usize;
+    let mut decoded_failed = 0usize;
+    let mut unconfigured = 0usize;
+
+    for resource_metrics in &request.resource_metrics {
+        let resource_attrs = resource_metrics
+            .resource
+            .as_ref()
+            .map(|r| attributes_to_map(&r.attributes))
+            .unwrap_or_default();
+
+        for scope_metrics in &resource_metrics.scope_metrics {
+            let scope_attrs = scope_metrics
+                .scope
+                .as_ref()
+                .map(|s| attributes_to_map(&s.attributes))
+                .unwrap_or_default();
+
+            for metric in &scope_metrics.metrics {
+                if metric.name.is_empty() {
+                    continue;
+                }
+
+                let base_labels: HashMap<String, String> = scope_attrs
+                    .iter()
+                    .chain(resource_attrs.iter())
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+
+                // Each branch yields an iterator-like slice of (kind, attrs,
+                // time_unix_nano, sketch_bytes, encoding_i32) tuples. We
+                // then route each tuple through the same dispatcher.
+                let dps: Vec<ModifiedOtlpSketchDp> = match &metric.data {
+                    Some(Data::Ddsketch(d)) => d
+                        .data_points
+                        .iter()
+                        .map(|dp| ModifiedOtlpSketchDp {
+                            kind: SketchKind::DdSketch,
+                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                            time_unix_nano: dp.time_unix_nano,
+                            sketch: dp.sketch.clone(),
+                            encoding: dp.encoding,
+                        })
+                        .collect(),
+                    Some(Data::Kllsketch(k)) => k
+                        .data_points
+                        .iter()
+                        .map(|dp| ModifiedOtlpSketchDp {
+                            kind: SketchKind::Kll,
+                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                            time_unix_nano: dp.time_unix_nano,
+                            sketch: dp.sketch.clone(),
+                            encoding: dp.encoding,
+                        })
+                        .collect(),
+                    Some(Data::Countsketch(c)) => c
+                        .data_points
+                        .iter()
+                        .map(|dp| ModifiedOtlpSketchDp {
+                            kind: SketchKind::CountSketch,
+                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                            time_unix_nano: dp.time_unix_nano,
+                            sketch: dp.sketch.clone(),
+                            encoding: dp.encoding,
+                        })
+                        .collect(),
+                    Some(Data::Countminsketch(c)) => c
+                        .data_points
+                        .iter()
+                        .map(|dp| ModifiedOtlpSketchDp {
+                            kind: SketchKind::CountMin,
+                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                            time_unix_nano: dp.time_unix_nano,
+                            sketch: dp.sketch.clone(),
+                            encoding: dp.encoding,
+                        })
+                        .collect(),
+                    Some(Data::Hllsketch(h)) => h
+                        .data_points
+                        .iter()
+                        .map(|dp| ModifiedOtlpSketchDp {
+                            kind: SketchKind::Hll,
+                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                            time_unix_nano: dp.time_unix_nano,
+                            sketch: dp.sketch.clone(),
+                            encoding: dp.encoding,
+                        })
+                        .collect(),
+                    _ => continue,
+                };
+
+                for dp in dps {
+                    let series_key = format_series_key(&metric.name, &dp.attrs);
+                    let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
+
+                    let accumulator: Box<dyn AggregateCore> =
+                        match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
+                            Ok(acc) => acc,
+                            Err(e) => {
+                                decoded_failed += 1;
+                                debug!(
+                                "OTLP modified-proto sketch decode failed (metric={}, kind={:?}, encoding={}, bytes={}): {} — falling through to §5.2 fallback",
+                                metric.name,
+                                dp.kind,
+                                dp.encoding,
+                                dp.sketch.len(),
+                                e
+                            );
+                                continue;
+                            }
+                        };
+
+                    let mut matched_any = false;
+                    for config in &ingest_state.agg_configs {
+                        if config.metric != metric.name
+                            && config.spatial_filter_normalized != metric.name
+                            && config.spatial_filter != metric.name
+                        {
+                            continue;
+                        }
+                        let group_key = IngestState::extract_group_key_for(&series_key, config);
+                        messages.push(WorkerMessage::AccumulatorInput {
+                            agg_id: config.aggregation_id,
+                            group_key,
+                            timestamp_ms: ts_ms,
+                            accumulator: accumulator.clone_boxed_core(),
+                            ingest_received_at,
+                        });
+                        matched_any = true;
+                    }
+                    if matched_any {
+                        routed += 1;
+                    } else {
+                        unconfigured += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if !messages.is_empty() {
+        if let Err(e) = ingest_state
+            .router
+            .route_group_batch(messages, ingest_received_at)
+            .await
+        {
+            warn!("OTLP modified-proto sketch routing error: {}", e);
+        }
+    }
+
+    if routed + decoded_failed + unconfigured > 0 {
+        debug!(
+            "OTLP modified-proto sketch ingest: {} routed, {} decode-failed (fallback), {} unconfigured",
+            routed, decoded_failed, unconfigured
+        );
+    }
+}
+
+/// Sketch family carried by a modified-OTLP `*SketchDataPoint`. Used by
+/// the encoding dispatcher in `decode_modified_otlp_sketch_bytes`.
+#[derive(Debug, Clone, Copy)]
+enum SketchKind {
+    DdSketch,
+    Kll,
+    CountSketch,
+    CountMin,
+    Hll,
+}
+
+/// A single modified-OTLP sketch data point flattened across the five
+/// per-variant data-point types so the routing loop can treat them
+/// uniformly.
+struct ModifiedOtlpSketchDp {
+    kind: SketchKind,
+    attrs: HashMap<String, String>,
+    time_unix_nano: u64,
+    sketch: Vec<u8>,
+    encoding: i32,
+}
+
+/// Decode the typed `sketch` bytes from a modified-OTLP
+/// `*SketchDataPoint` into a concrete `AggregateCore`.
+///
+/// Dispatches on the `(SketchKind, encoding)` pair. For each
+/// `(kind, _ENCODING_PROTO)` pair we call the matching accumulator's
+/// `from_sketchlib_proto_bytes` constructor. Variants without a
+/// constructor today return `Err`; the caller falls through to §5.2
+/// fallback so the user still gets a correct answer. Per-variant
+/// decoders are tracked in PR C (task #8) and PR I (task #14, for
+/// `_ENCODING_MSGPACK` parity).
+fn decode_modified_otlp_sketch_bytes(
+    kind: SketchKind,
+    encoding: i32,
+    bytes: &[u8],
+) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
+    use crate::precompute_operators::CountMinSketchAccumulator;
+
+    // The encoding value is the raw i32 from the proto enum. We only
+    // accept ENCODING_PROTO (= 1) for now; ENCODING_PROTO_DELTA (= 2)
+    // and ENCODING_MSGPACK / ENCODING_MSGPACK_DELTA (PR I) are routed
+    // to a "not yet implemented" Err so the caller falls through to
+    // the §5.2 fallback.
+    const ENCODING_PROTO: i32 = 1;
+
+    if encoding != ENCODING_PROTO {
+        return Err(format!(
+            "modified-OTLP sketch encoding {encoding} not yet supported \
+             (only ENCODING_PROTO = 1 is wired today; deltas tracked in PR C, \
+             msgpack tracked in PR I)"
+        )
+        .into());
+    }
+
+    match kind {
+        SketchKind::CountMin => {
+            let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
+            Ok(Box::new(acc))
+        }
+        SketchKind::Kll | SketchKind::DdSketch | SketchKind::CountSketch | SketchKind::Hll => {
+            Err(format!(
+                "modified-OTLP sketch decoder for {kind:?} not yet implemented \
+             (tracked in PR C, task #8)"
+            )
+            .into())
+        }
     }
 }
 
