@@ -142,6 +142,150 @@ impl ControllerClient for HttpControllerClient {
     }
 }
 
+/// Map a capability-miss signal onto the DataCollector controller's
+/// `POST /api/v1/plan` endpoint. The DC controller expects a
+/// `QuerySpec`, not the generic `CapabilityMissPayload` that
+/// [`HttpControllerClient`] sends — so this adapter translates on the
+/// wire, keeping both sides agnostic of each other's internal shapes.
+///
+/// ## Translation rules
+///
+/// - `QueryRequirements.metric` → `QuerySpec.metric_name`
+/// - `QueryRequirements.grouping_labels.labels` → `QuerySpec.group_by_labels`
+/// - `QueryRequirements.data_range_ms` → `QuerySpec.time_window` (duration
+///   string like `"60s"`; falls back to `"60s"` when the query has no
+///   historical range, e.g. instant queries)
+/// - `QueryRequirements.statistics` → `QuerySpec.aggregations`, mapped
+///   via [`statistic_to_dc_aggregation`]
+/// - `QuerySpec.accuracy_sla` is filled from
+///   [`DcControllerConfig::accuracy_sla`] (default `0.95`)
+///
+/// ## What the DC controller does with the call
+///
+/// `handle_plan` runs cost-model planning, writes the resulting plan
+/// into its plan store, and — if any agent/backend collectors are
+/// attached via OpAMP — pushes their updated YAML config through the
+/// OpAMP server. For Stage B verification this means: the backend's
+/// fire-and-forget call will cause the controller to generate a new
+/// `StagedPlan` visible via `GET /api/v1/plan/:metric` within ms.
+pub struct DcControllerClient {
+    endpoint: String,
+    http: reqwest::Client,
+    config: DcControllerConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct DcControllerConfig {
+    /// Accuracy SLA passed through to the DC controller's cost model.
+    /// `[0.0, 1.0]`; DC rejects values outside this range.
+    pub accuracy_sla: f64,
+    /// Default `time_window` string when a `QueryRequirements` has no
+    /// `data_range_ms` set (e.g. instant queries).
+    pub default_time_window: String,
+}
+
+impl Default for DcControllerConfig {
+    fn default() -> Self {
+        Self {
+            accuracy_sla: 0.95,
+            default_time_window: "60s".to_string(),
+        }
+    }
+}
+
+impl DcControllerClient {
+    pub fn new(endpoint: String) -> Self {
+        Self::with_config(endpoint, DcControllerConfig::default())
+    }
+
+    pub fn with_config(endpoint: String, config: DcControllerConfig) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            endpoint,
+            http,
+            config,
+        }
+    }
+
+    pub fn with_http(endpoint: String, http: reqwest::Client) -> Self {
+        Self {
+            endpoint,
+            http,
+            config: DcControllerConfig::default(),
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Build the DC-flavoured `QuerySpec` JSON body. Exposed for tests.
+    pub(crate) fn build_query_spec(&self, requirements: &QueryRequirements) -> serde_json::Value {
+        let aggregations: Vec<String> = requirements
+            .statistics
+            .iter()
+            .map(statistic_to_dc_aggregation)
+            .collect();
+        let time_window = match requirements.data_range_ms {
+            Some(ms) if ms > 0 => format!("{}ms", ms),
+            _ => self.config.default_time_window.clone(),
+        };
+        serde_json::json!({
+            "metric_name": requirements.metric,
+            "group_by_labels": requirements.grouping_labels.labels,
+            "aggregations": aggregations,
+            "time_window": time_window,
+            "accuracy_sla": self.config.accuracy_sla,
+        })
+    }
+}
+
+/// Map a backend `Statistic` variant onto one of DC's accepted
+/// aggregation type strings: `"quantile"`, `"cardinality"`, or
+/// `"frequency"`. Anything count-like collapses to `"frequency"`
+/// (which picks one of the CMS/CS sketches), `DistinctCount`-like
+/// collapses to `"cardinality"` (HLL), and quantile-like collapses to
+/// `"quantile"` (KLL/DDSketch).
+fn statistic_to_dc_aggregation(stat: &promql_utilities::query_logics::enums::Statistic) -> String {
+    use promql_utilities::query_logics::enums::Statistic::*;
+    match stat {
+        Quantile => "quantile".to_string(),
+        Cardinality => "cardinality".to_string(),
+        // Count / Sum / Increase / Rate / Min / Max / Topk all map to
+        // "frequency", which in DC's planner picks one of the
+        // CountMin / CountSketch family.
+        Count | Sum | Increase | Rate | Min | Max | Topk => "frequency".to_string(),
+    }
+}
+
+#[async_trait]
+impl ControllerClient for DcControllerClient {
+    async fn notify_capability_miss(&self, requirements: &QueryRequirements) -> Result<(), String> {
+        let body = self.build_query_spec(requirements);
+        debug!(
+            "DC capability-miss notification → {}: body={}",
+            self.endpoint, body
+        );
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("DC controller POST send error: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "DC controller returned {} for /api/v1/plan",
+                resp.status()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Fire-and-forget helper used by the query hot path. Spawns the
 /// notification on the current tokio runtime so the query return
 /// path is not blocked on network I/O. Does nothing when
@@ -333,5 +477,124 @@ mod tests {
         assert_eq!(payload["metric"], "http_requests_total");
         assert_eq!(payload["statistics"], serde_json::json!(["Sum"]));
         assert_eq!(payload["data_range_ms"], 60_000);
+    }
+
+    // ------------------------------------------------------------------
+    // DcControllerClient tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dc_build_query_spec_projects_statistics_to_aggregations() {
+        let client = DcControllerClient::new("http://unused/api/v1/plan".to_string());
+        let req = test_requirements();
+        let body = client.build_query_spec(&req);
+        assert_eq!(body["metric_name"], "http_requests_total");
+        assert_eq!(body["aggregations"], serde_json::json!(["frequency"]));
+        assert_eq!(body["group_by_labels"], serde_json::json!(["service"]));
+        assert_eq!(body["time_window"], "60000ms");
+        assert_eq!(body["accuracy_sla"], 0.95);
+    }
+
+    #[test]
+    fn dc_build_query_spec_defaults_time_window_for_instant_query() {
+        let client = DcControllerClient::new("http://unused/api/v1/plan".to_string());
+        let mut req = test_requirements();
+        req.data_range_ms = None;
+        let body = client.build_query_spec(&req);
+        assert_eq!(body["time_window"], "60s");
+    }
+
+    #[test]
+    fn dc_build_query_spec_maps_quantile_statistic() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let client = DcControllerClient::new("http://unused/api/v1/plan".to_string());
+        let mut req = test_requirements();
+        req.statistics = vec![Statistic::Quantile];
+        let body = client.build_query_spec(&req);
+        assert_eq!(body["aggregations"], serde_json::json!(["quantile"]));
+    }
+
+    #[test]
+    fn dc_build_query_spec_maps_cardinality_statistic() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let client = DcControllerClient::new("http://unused/api/v1/plan".to_string());
+        let mut req = test_requirements();
+        req.statistics = vec![Statistic::Cardinality];
+        let body = client.build_query_spec(&req);
+        assert_eq!(body["aggregations"], serde_json::json!(["cardinality"]));
+    }
+
+    #[tokio::test]
+    async fn dc_client_round_trips_against_mock_plan_endpoint() {
+        // Mock the DC /api/v1/plan endpoint, capture the body, and
+        // assert every QuerySpec field is present and shaped the way
+        // DC's analyzer expects.
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::Arc as StdArc;
+        #[derive(Clone)]
+        struct SharedSink(StdArc<Mutex<Vec<serde_json::Value>>>);
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let sink_clone = sink.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/plan",
+                post(
+                    |State(sink): State<SharedSink>, body: axum::body::Bytes| async move {
+                        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        sink.0.lock().unwrap().push(v);
+                        axum::http::StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(sink_clone);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = DcControllerClient::new(format!("http://{addr}/api/v1/plan"));
+        client
+            .notify_capability_miss(&test_requirements())
+            .await
+            .expect("notify ok");
+
+        let received = sink.0.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        let body = &received[0];
+        assert_eq!(body["metric_name"], "http_requests_total");
+        assert_eq!(body["aggregations"], serde_json::json!(["frequency"]));
+        assert_eq!(body["group_by_labels"], serde_json::json!(["service"]));
+        assert_eq!(body["time_window"], "60000ms");
+        assert_eq!(body["accuracy_sla"], 0.95);
+    }
+
+    #[tokio::test]
+    async fn dc_client_reports_non_success_status() {
+        use axum::routing::post;
+        use axum::Router;
+        let app = Router::new().route(
+            "/api/v1/plan",
+            post(|| async {
+                (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid accuracy_sla",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = DcControllerClient::new(format!("http://{addr}/api/v1/plan"));
+        let result = client.notify_capability_miss(&test_requirements()).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("422"));
     }
 }
