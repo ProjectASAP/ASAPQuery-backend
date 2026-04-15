@@ -45,6 +45,13 @@ pub(crate) struct FlusherShared {
     /// the flusher when it finishes a tick.
     pub pressure_cv: Condvar,
     pub pressure_mutex: Mutex<()>,
+    /// Monotonic counter of how many times `wait_for_memory_under`
+    /// has entered its blocking wait loop because `mem_counter >= cap`.
+    /// Incremented exactly once per back-pressure-triggered call; used
+    /// as a timing-independent signal in tests (wall-clock thresholds
+    /// are flaky on fast CI runners where a flush tick completes in
+    /// <1 ms).
+    pub back_pressure_wait_count: AtomicU64,
 }
 
 impl FlusherHandle {
@@ -75,6 +82,7 @@ impl FlusherHandle {
             shutdown: AtomicBool::new(false),
             pressure_cv: Condvar::new(),
             pressure_mutex: Mutex::new(()),
+            back_pressure_wait_count: AtomicU64::new(0),
         });
 
         let shared_for_thread = Arc::clone(&shared);
@@ -129,6 +137,14 @@ impl FlusherHandle {
         if mem_counter.load(Ordering::Relaxed) < cap {
             return true;
         }
+        // Slow path: the cap was crossed and we are about to block.
+        // Bump a counter so tests can assert that back-pressure fired
+        // without relying on wall-clock thresholds (the actual wait is
+        // ≤1 flush tick, which is sub-millisecond on fast CI runners
+        // and makes wall-clock-based signals flaky).
+        self.inner
+            .back_pressure_wait_count
+            .fetch_add(1, Ordering::Relaxed);
         // Kick the flusher once so it tries to drain right now instead
         // of waiting for its own interval tick.
         self.inner.pressure_cv.notify_all();
@@ -161,6 +177,14 @@ impl FlusherHandle {
     /// Access to the manifest for the query read-through path.
     pub fn manifest(&self) -> Arc<Manifest> {
         Arc::clone(&self.inner.manifest)
+    }
+
+    /// Total number of times the insert hot path has entered
+    /// `wait_for_memory_under`'s blocking wait loop (i.e. observed
+    /// sealed memory at or above `hard_cap_bytes`). Monotonic counter,
+    /// used by back-pressure tests as a timing-independent signal.
+    pub fn back_pressure_wait_count(&self) -> u64 {
+        self.inner.back_pressure_wait_count.load(Ordering::Relaxed)
     }
 
     pub fn disk_path(&self) -> &std::path::Path {

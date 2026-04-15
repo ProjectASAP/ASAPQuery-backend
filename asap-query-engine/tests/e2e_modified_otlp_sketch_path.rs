@@ -1081,3 +1081,161 @@ async fn e2e_hll_sketch_modified_otlp_path() {
     assert_eq!(hll_acc.inner.precision, precision);
     assert_eq!(hll_acc.inner.registers, registers);
 }
+
+// ─── MessagePack encoding path (PR I) ────────────────────────────────────
+//
+// Smoke test for `encoding = COUNT_MIN_SKETCH_ENCODING_MSGPACK`. The
+// dispatcher should recognize the new `MSGPACK = 3` tag and route to
+// `CountMinSketchAccumulator::from_msgpack_bytes`, which deserializes
+// the cross-language sketch-core msgpack wire format. The other four
+// sketch variants go through the same dispatcher branch, so one smoke
+// test is sufficient for dispatcher coverage — per-variant msgpack
+// round-trips are validated in the accumulator unit tests.
+
+fn build_count_min_msgpack_export_request(
+    metric_name: &str,
+    service_label: &str,
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+) -> ExportMetricsServiceRequest {
+    let dp = CountMinSketchDataPoint {
+        attributes: vec![KeyValue {
+            key: "service".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(service_label.to_string())),
+            }),
+        }],
+        start_time_unix_nano: 0,
+        time_unix_nano,
+        sample_count: 0,
+        sketch: sketch_bytes,
+        encoding: CountMinSketchEncoding::Msgpack as i32,
+        rows: 0,
+        cols: 0,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Countminsketch(CountMinSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
+    let agg_id = 47u64;
+    let metric_name = "http_requests_msgpack";
+    let service_label = "auth";
+    let window_secs = 1u64;
+    let rows = 2u32;
+    let cols = 4u32;
+
+    let precompute_port = 19550u16;
+    let otlp_grpc_port = 19551u16;
+    let otlp_http_port = 19552u16;
+
+    let cms_config = make_count_min_agg_config(
+        agg_id,
+        metric_name,
+        window_secs,
+        vec!["service"],
+        rows as usize,
+        cols as usize,
+    );
+    let mut agg_map = HashMap::new();
+    agg_map.insert(agg_id, cms_config);
+    let streaming_config = Arc::new(StreamingConfig::new(agg_map));
+
+    let sink = Arc::new(CapturingOutputSink::new());
+    let engine = PrecomputeEngine::new(
+        engine_config(precompute_port),
+        streaming_config,
+        sink.clone(),
+    );
+    let ingest_state = engine.ingest_state();
+
+    tokio::spawn(async move {
+        let _ = engine.run().await;
+    });
+
+    let otlp_receiver = OtlpReceiver::with_ingest_state(
+        OtlpReceiverConfig {
+            grpc_port: otlp_grpc_port,
+            http_port: otlp_http_port,
+        },
+        ingest_state,
+    );
+    tokio::spawn(async move {
+        let _ = otlp_receiver.run().await;
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
+
+    // Build a known sketch in sketch-core and serialize with msgpack — this
+    // is what the Go producer (sketchlib-go) will emit once PR I's matching
+    // Go-side work lands.
+    let mut cms = sketch_core::count_min::CountMinSketch::new(rows as usize, cols as usize);
+    cms.update("user_a", 1.0);
+    cms.update("user_b", 1.0);
+    cms.update("user_a", 1.0);
+    let sketch_bytes = cms.serialize_msgpack();
+
+    let client = reqwest::Client::new();
+    let req = build_count_min_msgpack_export_request(
+        metric_name,
+        service_label,
+        100_000_000,
+        sketch_bytes,
+    );
+    post_otlp_http(&client, otlp_http_port, req).await;
+
+    // Watermark advance using an empty msgpack sketch.
+    let empty = sketch_core::count_min::CountMinSketch::new(rows as usize, cols as usize);
+    let watermark_req = build_count_min_msgpack_export_request(
+        metric_name,
+        service_label,
+        2_000_000_000,
+        empty.serialize_msgpack(),
+    );
+    post_otlp_http(&client, otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(800)).await;
+
+    let captured = sink.drain();
+    assert!(!captured.is_empty(), "expected at least one output");
+
+    let (window0_output, window0_acc_box) = captured
+        .iter()
+        .find(|(out, _)| out.start_timestamp == 0)
+        .expect("no captured output for window 0");
+
+    assert_eq!(window0_output.aggregation_id, agg_id);
+
+    let cms_acc = window0_acc_box
+        .as_any()
+        .downcast_ref::<CountMinSketchAccumulator>()
+        .expect("captured accumulator should be CountMinSketchAccumulator");
+
+    // user_a was updated twice → query_key("user_a") should estimate ≥ 2.
+    assert!(
+        cms_acc.inner.query_key("user_a") >= 2.0,
+        "CountMinSketch msgpack round-trip should preserve user_a count (got {})",
+        cms_acc.inner.query_key("user_a")
+    );
+}

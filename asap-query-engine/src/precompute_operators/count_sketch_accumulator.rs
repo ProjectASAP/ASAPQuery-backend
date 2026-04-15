@@ -38,6 +38,18 @@ impl CountSketchAccumulator {
     }
 
     /// Decode from the modified OTLP wire format's
+    /// `CountSketchDataPoint.sketch` bytes when
+    /// `encoding = COUNT_SKETCH_ENCODING_MSGPACK`. The bytes are the
+    /// MessagePack serialization of the cross-language sketch-core
+    /// `CountSketch` struct — PR I parity entrypoint.
+    pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: CountSketch::deserialize_msgpack(buffer)
+                .map_err(|e| format!("deserialize CountSketch msgpack: {e}"))?,
+        })
+    }
+
+    /// Decode from the modified OTLP wire format's
     /// `CountSketchDataPoint.sketch` bytes — the protobuf-encoded
     /// `asap_sketchlib::proto::sketchlib::CountSketchState` message
     /// that DataCollector's `countsketchprocessor` emits when
@@ -299,6 +311,26 @@ mod tests {
         let cs = CountSketchAccumulator::new(2, 3);
         let cms = CountMinSketchAccumulator::new(2, 3);
         let result = cs.merge_with(&cms);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_round_trip() {
+        let original = CountSketch::from_legacy_matrix(
+            vec![vec![1.0, -2.0, 3.0], vec![-4.0, 5.0, -6.0]],
+            2,
+            3,
+        );
+        let bytes = original.serialize_msgpack();
+        let acc = CountSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.inner.row_num, 2);
+        assert_eq!(acc.inner.col_num, 3);
+        assert_eq!(acc.inner.sketch(), original.sketch());
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_rejects_garbage() {
+        let result = CountSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
         assert!(result.is_err());
     }
 }

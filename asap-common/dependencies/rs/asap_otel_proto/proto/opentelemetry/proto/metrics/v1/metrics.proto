@@ -384,6 +384,11 @@ enum DDSketchEncoding {
   // github.com/DataDog/sketches-go/ddsketch/pb/sketchpb.DDSketch message.
   DDSKETCH_ENCODING_PROTO = 1;
   DDSKETCH_ENCODING_PROTO_DELTA = 2;
+  // DDSKETCH_ENCODING_MSGPACK indicates the sketch bytes are the MessagePack
+  // serialization of the cross-language sketch-core `DdSketch` struct
+  // (rmp_serde encoding on Rust, matching struct on Go via sketchlib-go).
+  DDSKETCH_ENCODING_MSGPACK = 3;
+  DDSKETCH_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // KLLSketch represents the type of a metric that encodes measurements using the KLL quantile sketch.
@@ -415,6 +420,10 @@ message KLLSketchDataPoint {
 enum KLLSketchEncoding {
   KLL_SKETCH_ENCODING_UNSPECIFIED = 0;
   KLL_SKETCH_ENCODING_PROTO = 1;
+  // KLL_SKETCH_ENCODING_MSGPACK indicates the sketch bytes are the MessagePack
+  // serialization of the cross-language sketch-core `KllSketch` struct.
+  KLL_SKETCH_ENCODING_MSGPACK = 3;
+  KLL_SKETCH_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // CountSketch represents the type of a metric that encodes frequency estimations using CountSketch.
@@ -446,6 +455,10 @@ enum CountSketchEncoding {
   COUNT_SKETCH_ENCODING_UNSPECIFIED = 0;
   COUNT_SKETCH_ENCODING_PROTO = 1;
   COUNT_SKETCH_ENCODING_DELTA = 2;
+  // COUNT_SKETCH_ENCODING_MSGPACK indicates the sketch bytes are the MessagePack
+  // serialization of the cross-language sketch-core `CountSketch` struct.
+  COUNT_SKETCH_ENCODING_MSGPACK = 3;
+  COUNT_SKETCH_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // CountMinSketch represents the type of a metric encoding frequency estimations using CountMinSketch.
@@ -477,6 +490,11 @@ enum CountMinSketchEncoding {
   COUNT_MIN_SKETCH_ENCODING_UNSPECIFIED = 0;
   COUNT_MIN_SKETCH_ENCODING_PROTO = 1;
   COUNT_MIN_SKETCH_ENCODING_DELTA = 2;
+  // COUNT_MIN_SKETCH_ENCODING_MSGPACK indicates the sketch bytes are the
+  // MessagePack serialization of the cross-language sketch-core
+  // `CountMinSketch` wire struct.
+  COUNT_MIN_SKETCH_ENCODING_MSGPACK = 3;
+  COUNT_MIN_SKETCH_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // HLLSketch represents the type of a metric that encodes cardinality estimations using HyperLogLog.
@@ -508,6 +526,11 @@ enum HLLSketchEncoding {
   HLL_SKETCH_ENCODING_UNSPECIFIED = 0;
   HLL_SKETCH_ENCODING_PROTO = 1;
   HLL_SKETCH_ENCODING_DELTA = 2;
+  // HLL_SKETCH_ENCODING_MSGPACK indicates the sketch bytes are the
+  // MessagePack serialization of the cross-language sketch-core
+  // `HllSketch` struct (registers + variant + precision + HIP state).
+  HLL_SKETCH_ENCODING_MSGPACK = 3;
+  HLL_SKETCH_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // AggregationTemporality defines how a metric aggregator reports aggregated

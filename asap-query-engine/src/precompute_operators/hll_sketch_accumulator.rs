@@ -30,6 +30,18 @@ impl HllSketchAccumulator {
     }
 
     /// Decode from the modified OTLP wire format's
+    /// `HLLSketchDataPoint.sketch` bytes when
+    /// `encoding = HLL_SKETCH_ENCODING_MSGPACK`. The bytes are the
+    /// MessagePack serialization of the cross-language sketch-core
+    /// `HllSketch` struct — PR I parity entrypoint.
+    pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: HllSketch::deserialize_msgpack(buffer)
+                .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?,
+        })
+    }
+
+    /// Decode from the modified OTLP wire format's
     /// `HLLSketchDataPoint.sketch` bytes — the protobuf-encoded
     /// `asap_sketchlib::proto::sketchlib::HyperLogLogState` message
     /// that DataCollector's `hllprocessor` emits when
@@ -257,5 +269,29 @@ mod tests {
         let hll = HllSketchAccumulator::new(HllVariant::Regular, 2);
         let cs = CountSketchAccumulator::new(2, 3);
         assert!(hll.merge_with(&cs).is_err());
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_round_trip() {
+        let original = HllSketch::from_raw(
+            HllVariant::Hip,
+            3,
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            1.5,
+            2.5,
+            42.0,
+        );
+        let bytes = original.serialize_msgpack();
+        let acc = HllSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.inner.variant, HllVariant::Hip);
+        assert_eq!(acc.inner.precision, 3);
+        assert_eq!(acc.inner.registers, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(acc.inner.hip_kxq0, 1.5);
+    }
+
+    #[test]
+    fn test_from_msgpack_bytes_rejects_garbage() {
+        let result = HllSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
+        assert!(result.is_err());
     }
 }

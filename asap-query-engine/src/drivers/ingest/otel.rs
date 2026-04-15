@@ -701,43 +701,57 @@ fn decode_modified_otlp_sketch_bytes(
         DatasketchesKLLAccumulator, HllSketchAccumulator,
     };
 
-    // The encoding value is the raw i32 from the proto enum. We only
-    // accept ENCODING_PROTO (= 1) for now; ENCODING_PROTO_DELTA (= 2)
-    // and ENCODING_MSGPACK / ENCODING_MSGPACK_DELTA (PR I) are routed
-    // to a "not yet implemented" Err so the caller falls through to
-    // the §5.2 fallback.
+    // The encoding value is the raw i32 from the per-sketch encoding
+    // enum. All five sketch variants share the same wire tag layout for
+    // tags 1–4, so we can match on one set of constants here:
+    //
+    //   1  — ENCODING_PROTO          (PR B / PR C: sketchlib proto-encoded)
+    //   2  — ENCODING_PROTO_DELTA    (delta transmission; deferred — falls
+    //                                 through to §5.2 fallback)
+    //   3  — ENCODING_MSGPACK        (PR I: cross-language sketch-core
+    //                                 msgpack wire format — this dispatcher)
+    //   4  — ENCODING_MSGPACK_DELTA  (deferred same as PROTO_DELTA)
     const ENCODING_PROTO: i32 = 1;
+    const ENCODING_MSGPACK: i32 = 3;
 
-    if encoding != ENCODING_PROTO {
-        return Err(format!(
+    match encoding {
+        ENCODING_PROTO => match kind {
+            SketchKind::CountMin => Ok(Box::new(
+                CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
+            SketchKind::CountSketch => Ok(Box::new(
+                CountSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
+            SketchKind::Kll => Ok(Box::new(
+                DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
+            )),
+            SketchKind::DdSketch => Ok(Box::new(DDSketchAccumulator::from_sketchlib_proto_bytes(
+                bytes,
+            )?)),
+            SketchKind::Hll => Ok(Box::new(HllSketchAccumulator::from_sketchlib_proto_bytes(
+                bytes,
+            )?)),
+        },
+        ENCODING_MSGPACK => match kind {
+            SketchKind::CountMin => Ok(Box::new(CountMinSketchAccumulator::from_msgpack_bytes(
+                bytes,
+            )?)),
+            SketchKind::CountSketch => {
+                Ok(Box::new(CountSketchAccumulator::from_msgpack_bytes(bytes)?))
+            }
+            SketchKind::Kll => Ok(Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(
+                bytes,
+            )?)),
+            SketchKind::DdSketch => Ok(Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes)?)),
+            SketchKind::Hll => Ok(Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes)?)),
+        },
+        _ => Err(format!(
             "modified-OTLP sketch encoding {encoding} not yet supported \
-             (only ENCODING_PROTO = 1 is wired today; deltas tracked in PR C, \
-             msgpack tracked in PR I)"
+             (PROTO = 1 and MSGPACK = 3 are wired; PROTO_DELTA = 2 and \
+             MSGPACK_DELTA = 4 are deferred — caller falls through to §5.2 \
+             fallback)"
         )
-        .into());
-    }
-
-    match kind {
-        SketchKind::CountMin => {
-            let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
-            Ok(Box::new(acc))
-        }
-        SketchKind::CountSketch => {
-            let acc = CountSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
-            Ok(Box::new(acc))
-        }
-        SketchKind::Kll => {
-            let acc = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?;
-            Ok(Box::new(acc))
-        }
-        SketchKind::DdSketch => {
-            let acc = DDSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
-            Ok(Box::new(acc))
-        }
-        SketchKind::Hll => {
-            let acc = HllSketchAccumulator::from_sketchlib_proto_bytes(bytes)?;
-            Ok(Box::new(acc))
-        }
+        .into()),
     }
 }
 
