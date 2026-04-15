@@ -1,6 +1,7 @@
 pub mod aggregation_config;
 pub mod aggregation_reference;
 pub mod enums;
+pub mod hot_reload_config;
 pub mod inference_config;
 pub mod key_by_label_values;
 pub mod measurement;
@@ -13,6 +14,7 @@ pub mod traits;
 pub use aggregation_config::*;
 pub use aggregation_reference::*;
 pub use enums::*;
+pub use hot_reload_config::*;
 pub use inference_config::*;
 pub use key_by_label_values::*;
 pub use measurement::*;

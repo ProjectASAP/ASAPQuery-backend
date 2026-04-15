@@ -245,6 +245,16 @@ async fn main() -> Result<()> {
     );
     info!("Streaming config: {:?}", streaming_config);
 
+    // Wrap the streaming config in a hot-reload handle so the HTTP
+    // server's `/api/v1/streaming-config` endpoints can swap it at
+    // runtime (PR E phase 1). Existing consumers downstream
+    // (SimpleEngine, PrecomputeEngine, Store) still take their
+    // startup snapshot; hot-reload currently only affects the
+    // control-plane GET/POST endpoint. Phase 2 will extend the swap
+    // to query execution and ingest routing.
+    let hot_reload_config =
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config.clone());
+
     // Setup store (equivalent to Python's SimpleMapStore())
     // Get cleanup policy from inference config
     let cleanup_policy = inference_config.cleanup_policy;
@@ -528,7 +538,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    let server = HttpServer::new(http_config, engine, store, query_tracker);
+    let server = HttpServer::new(http_config, engine, store, query_tracker)
+        .with_hot_reload_config(hot_reload_config);
     info!("Starting HTTP server on port {}", args.http_port);
 
     // Wait for shutdown signal
