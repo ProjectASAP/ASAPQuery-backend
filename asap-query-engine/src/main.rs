@@ -350,13 +350,17 @@ async fn main() -> Result<()> {
     //     None
     // };
 
-    // Setup query engine
+    // Setup query engine. SimpleEngine shares the same
+    // HotReloadStreamingConfig handle as the HTTP server, so a POST
+    // to /api/v1/streaming-config is observable by the next query
+    // (PR E phase 2). Without sharing the handle, SimpleEngine
+    // would take a one-time snapshot at construction and ignore
+    // subsequent swaps.
     let engine = {
-        let mut engine = SimpleEngine::new(
+        let mut engine = SimpleEngine::new_with_hot_reload(
             store.clone(),
-            // promsketch_store.clone(),
             inference_config,
-            streaming_config.clone(),
+            hot_reload_config.clone(),
             args.prometheus_scrape_interval,
             args.query_language,
         );
