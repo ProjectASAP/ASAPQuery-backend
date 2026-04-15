@@ -91,11 +91,36 @@ impl CountMinSketchAccumulator {
     /// `CountMinSketch::from_legacy_matrix` after reshaping the flat
     /// `counts_int` / `counts_float` field into a `Vec<Vec<f64>>`.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
         use prost::Message;
 
-        let state =
-            CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?;
+        // DataCollector's countminsketchprocessor wraps the state in a
+        // `SketchEnvelope{count_min: CountMinState}` via
+        // `SerializePortableFO` + `proto.Marshal`. Try decoding as envelope
+        // first, fall back to bare `CountMinState` for callers (e.g. unit
+        // tests) that encode the state directly.
+        let state = match SketchEnvelope::decode(buffer) {
+            Ok(env) => match env.sketch_state {
+                Some(sketch_envelope::SketchState::CountMin(st)) => st,
+                Some(other) => {
+                    return Err(format!(
+                        "SketchEnvelope contains non-CountMin sketch: {:?}",
+                        std::mem::discriminant(&other)
+                    )
+                    .into());
+                }
+                // Envelope decoded but was empty (e.g. the buffer is a
+                // bare CountMinState that happened to parse as a default
+                // envelope). Fall through to bare decode.
+                None => CountMinState::decode(buffer)
+                    .map_err(|e| format!("decode CountMinState: {e}"))?,
+            },
+            Err(_) => {
+                CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?
+            }
+        };
         let rows = state.rows as usize;
         let cols = state.cols as usize;
         if rows == 0 || cols == 0 {
@@ -587,6 +612,61 @@ mod tests {
         assert_eq!(matrix.len(), rows as usize);
         assert_eq!(matrix[0], vec![1.0, 2.0, 3.0]);
         assert_eq!(matrix[1], vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrapped() {
+        // Mirrors what DataCollector's countminsketchprocessor emits:
+        // the state is wrapped in a `SketchEnvelope{count_min: ...}`
+        // via sketchlib-go's `SerializePortableFO` + `proto.Marshal`.
+        // Before the fix, the Rust decoder decoded the envelope bytes as
+        // a bare CountMinState, which produced "invalid wire type"
+        // errors on field `cols` and silently fell through to §5.2.
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
+        use prost::Message;
+
+        let state = CountMinState {
+            rows: 2,
+            cols: 3,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: vec![7, 8, 9, 10, 11, 12],
+            counts_float: Vec::new(),
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("envelope-wrapped decode should succeed");
+        let matrix = acc.inner.sketch();
+        assert_eq!(matrix[0], vec![7.0, 8.0, 9.0]);
+        assert_eq!(matrix[1], vec![10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
+        // An envelope carrying a non-CountMin sketch should be rejected
+        // with a clear error rather than silently producing garbage.
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+
+        let kll = KllState::default();
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(kll)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "wrong-sketch envelope should error");
     }
 
     #[test]
