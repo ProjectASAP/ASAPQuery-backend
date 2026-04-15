@@ -143,6 +143,12 @@ pub struct SimpleEngine {
     prometheus_scrape_interval: u64,
     controller_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>,
     query_language: QueryLanguage,
+    /// Optional `ControllerClient` used to notify the DataCollector
+    /// controller when a query hits a capability miss
+    /// (`find_compatible_aggregation` returns `None`). When `None`,
+    /// misses fall through to the §5.2 fallback silently, matching
+    /// pre-PR-G behavior. Set via `with_controller_client`.
+    controller_client: Option<Arc<dyn crate::drivers::query::controller_client::ControllerClient>>,
 }
 
 impl SimpleEngine {
@@ -294,7 +300,43 @@ impl SimpleEngine {
             prometheus_scrape_interval,
             controller_patterns,
             query_language,
+            controller_client: None,
         }
+    }
+
+    /// Attach a `ControllerClient` so capability misses fire a
+    /// fire-and-forget notification to the DataCollector controller.
+    /// Builder-style method — takes self by value and returns it so
+    /// construction in `main.rs` chains neatly. Without this call,
+    /// capability misses fall through to the §5.2 fallback silently,
+    /// matching pre-PR-G behavior.
+    pub fn with_controller_client(
+        mut self,
+        client: Arc<dyn crate::drivers::query::controller_client::ControllerClient>,
+    ) -> Self {
+        self.controller_client = Some(client);
+        self
+    }
+
+    /// Look up a compatible aggregation for the given requirements,
+    /// and if none exists, fire a capability-miss notification to
+    /// the controller (fire-and-forget, does not block the query).
+    /// Wraps the plain `streaming_config.find_compatible_aggregation`
+    /// with the PR G telemetry call-out.
+    fn find_compatible_aggregation_with_miss_notify(
+        &self,
+        requirements: &QueryRequirements,
+    ) -> Option<AggregationIdInfo> {
+        let result = self
+            .streaming_config
+            .find_compatible_aggregation(requirements);
+        if result.is_none() {
+            crate::drivers::query::controller_client::spawn_capability_miss_notify(
+                &self.controller_client,
+                requirements,
+            );
+        }
+        result
     }
 
     /// Convert query timestamp (seconds) to data timestamp (milliseconds)
@@ -1977,8 +2019,7 @@ impl SimpleEngine {
         } else {
             warn!("No query_config entry for SQL query. Attempting capability-based matching.");
             let requirements = self.build_query_requirements_sql(&match_result, query_pattern_type);
-            self.streaming_config
-                .find_compatible_aggregation(&requirements)?
+            self.find_compatible_aggregation_with_miss_notify(&requirements)?
         };
 
         let metric = &match_result.outer_data()?.metric;
@@ -2128,8 +2169,7 @@ impl SimpleEngine {
                 );
             let requirements =
                 self.build_query_requirements_sql(match_result, QueryPatternType::OnlyTemporal);
-            self.streaming_config
-                .find_compatible_aggregation(&requirements)?
+            self.find_compatible_aggregation_with_miss_notify(&requirements)?
         };
         let metric = &match_result.outer_data()?.metric;
 
@@ -2754,8 +2794,7 @@ impl SimpleEngine {
             );
             let requirements =
                 self.build_query_requirements_promql(&match_result, query_pattern_type);
-            self.streaming_config
-                .find_compatible_aggregation(&requirements)?
+            self.find_compatible_aggregation_with_miss_notify(&requirements)?
         };
 
         let result = self.build_promql_execution_context_tail(

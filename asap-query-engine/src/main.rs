@@ -53,6 +53,16 @@ struct Args {
     #[arg(long, default_value = "http://localhost:9090")]
     prometheus_server: String,
 
+    /// DataCollector controller endpoint for capability-miss
+    /// notifications (PR G). When set, `SimpleEngine` fires a
+    /// fire-and-forget POST to this URL every time a query can't
+    /// find a compatible stored aggregation, so the controller
+    /// can generate a new sketch plan. When unset (default),
+    /// capability misses fall through to the §5.2 fallback silently.
+    /// Example: `http://controller.svc:8080/api/v1/plan`
+    #[arg(long)]
+    controller_endpoint: Option<String>,
+
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
     forward_unsupported_queries: bool,
@@ -341,14 +351,36 @@ async fn main() -> Result<()> {
     // };
 
     // Setup query engine
-    let engine = Arc::new(SimpleEngine::new(
-        store.clone(),
-        // promsketch_store.clone(),
-        inference_config,
-        streaming_config.clone(),
-        args.prometheus_scrape_interval,
-        args.query_language,
-    ));
+    let engine = {
+        let mut engine = SimpleEngine::new(
+            store.clone(),
+            // promsketch_store.clone(),
+            inference_config,
+            streaming_config.clone(),
+            args.prometheus_scrape_interval,
+            args.query_language,
+        );
+        if let Some(controller_endpoint) = args.controller_endpoint.as_ref() {
+            info!(
+                "Capability-miss notifications enabled → {}",
+                controller_endpoint
+            );
+            let client: Arc<
+                dyn query_engine_rust::drivers::query::controller_client::ControllerClient,
+            > = Arc::new(
+                query_engine_rust::drivers::query::controller_client::HttpControllerClient::new(
+                    controller_endpoint.clone(),
+                ),
+            );
+            engine = engine.with_controller_client(client);
+        } else {
+            info!(
+                "Capability-miss notifications disabled \
+                 (pass --controller-endpoint=<url> to enable)"
+            );
+        }
+        Arc::new(engine)
+    };
 
     // Setup Kafka consumer (only when not using precompute engine as the streaming backend)
     let kafka_handle = if args.streaming_engine == StreamingEngine::Precompute {
