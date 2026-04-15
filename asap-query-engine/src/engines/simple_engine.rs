@@ -139,7 +139,16 @@ pub struct SimpleEngine {
     store: Arc<dyn Store>,
     // promsketch_store: Option<Arc<PromSketchStore>>,
     inference_config: InferenceConfig,
-    streaming_config: Arc<StreamingConfig>,
+    /// Hot-reloadable `StreamingConfig` handle. Internal read sites
+    /// call `Self::streaming_config_snapshot()` which re-snapshots
+    /// from this handle, so runtime swaps pushed through PR #10's
+    /// `POST /api/v1/streaming-config` endpoint take effect on the
+    /// **next** query without restarting the binary (PR E phase 2).
+    /// Clones of `HotReloadStreamingConfig` share the same
+    /// underlying `ArcSwap`, so when `main.rs` hands the same handle
+    /// to both `SimpleEngine` and `HttpServer::with_hot_reload_config`,
+    /// a POST is immediately visible to the next query.
+    streaming_config_source: crate::data_model::HotReloadStreamingConfig,
     prometheus_scrape_interval: u64,
     controller_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>,
     query_language: QueryLanguage,
@@ -152,11 +161,39 @@ pub struct SimpleEngine {
 }
 
 impl SimpleEngine {
+    /// Construct a `SimpleEngine` with a static `Arc<StreamingConfig>`.
+    /// Wraps the config in a fresh `HotReloadStreamingConfig` internally
+    /// — callers that need to share the hot-reload handle with the HTTP
+    /// server should use `new_with_hot_reload` instead so a POST to
+    /// `/api/v1/streaming-config` is visible to both. The `_static`
+    /// variant stays as the simple entry point for tests, binaries,
+    /// and legacy callers that don't own a `HotReloadStreamingConfig`.
     pub fn new(
         store: Arc<dyn Store>,
         // promsketch_store: Option<Arc<PromSketchStore>>,
         inference_config: InferenceConfig,
         streaming_config: Arc<StreamingConfig>,
+        prometheus_scrape_interval: u64,
+        query_language: QueryLanguage,
+    ) -> Self {
+        let hot_reload = crate::data_model::HotReloadStreamingConfig::from_arc(streaming_config);
+        Self::new_with_hot_reload(
+            store,
+            inference_config,
+            hot_reload,
+            prometheus_scrape_interval,
+            query_language,
+        )
+    }
+
+    /// Construct a `SimpleEngine` that shares a `HotReloadStreamingConfig`
+    /// handle with another holder (typically the HTTP server). This is
+    /// the constructor `main.rs` should call so `POST /api/v1/streaming-config`
+    /// is observable by the next query.
+    pub fn new_with_hot_reload(
+        store: Arc<dyn Store>,
+        inference_config: InferenceConfig,
+        streaming_config_source: crate::data_model::HotReloadStreamingConfig,
         prometheus_scrape_interval: u64,
         query_language: QueryLanguage,
     ) -> Self {
@@ -296,12 +333,28 @@ impl SimpleEngine {
             store,
             // promsketch_store,
             inference_config,
-            streaming_config,
+            streaming_config_source,
             prometheus_scrape_interval,
             controller_patterns,
             query_language,
             controller_client: None,
         }
+    }
+
+    /// Take a fresh snapshot of the current `StreamingConfig`. Each
+    /// call observes whatever was most recently pushed through PR #10's
+    /// `POST /api/v1/streaming-config` endpoint. The returned `Arc`
+    /// is stable for the caller's lifetime — a concurrent swap
+    /// produces a new `Arc` and leaves the one returned here alone.
+    ///
+    /// Internal read sites inside `SimpleEngine` bind this once per
+    /// logical unit of work (typically per query-handler invocation
+    /// or per helper call) and use the local Arc for the duration,
+    /// so references into the underlying `StreamingConfig` stay
+    /// valid and a single query sees internally-consistent config
+    /// fields even if a concurrent swap lands mid-query.
+    pub fn streaming_config_snapshot(&self) -> Arc<StreamingConfig> {
+        self.streaming_config_source.snapshot()
     }
 
     /// Attach a `ControllerClient` so capability misses fire a
@@ -327,9 +380,8 @@ impl SimpleEngine {
         &self,
         requirements: &QueryRequirements,
     ) -> Option<AggregationIdInfo> {
-        let result = self
-            .streaming_config
-            .find_compatible_aggregation(requirements);
+        let streaming_config = self.streaming_config_snapshot();
+        let result = streaming_config.find_compatible_aggregation(requirements);
         if result.is_none() {
             crate::drivers::query::controller_client::spawn_capability_miss_notify(
                 &self.controller_client,
@@ -619,9 +671,11 @@ impl SimpleEngine {
                 (0, end_timestamp)
             }
             AggregationType::SetAggregator => {
-                // Latest window only
+                // Latest window only. `.map(|c| c.window_size * 1000)`
+                // copies out a u64 so the snapshot only needs to live
+                // for the duration of the expression.
                 let window_size = self
-                    .streaming_config
+                    .streaming_config_snapshot()
                     .get_aggregation_config(agg_info.aggregation_id_for_key)
                     .map(|config| config.window_size * 1000)
                     .ok_or_else(|| {
@@ -653,9 +707,13 @@ impl SimpleEngine {
         timestamps: &QueryTimestamps,
         agg_info: &AggregationIdInfo,
     ) -> Result<StoreQueryPlan, String> {
+        // Bind a single snapshot of the streaming config for this
+        // helper's entire execution. `aggregation_config_for_value`
+        // is a borrow that outlives the initial expression, so the
+        // Arc it borrows from must outlive this scope.
+        let streaming_config = self.streaming_config_snapshot();
         // Get aggregation config for value to determine window type
-        let aggregation_config_for_value = self
-            .streaming_config
+        let aggregation_config_for_value = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_value)
             .ok_or_else(|| {
                 format!(
@@ -1246,14 +1304,13 @@ impl SimpleEngine {
         let do_merge = query_pattern_type == QueryPatternType::OnlyTemporal
             || query_pattern_type == QueryPatternType::OneTemporalOneSpatial;
 
-        let grouping_labels = self
-            .streaming_config
+        let streaming_config = self.streaming_config_snapshot();
+        let grouping_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_value)
             .map(|config| config.grouping_labels.clone())
             .unwrap_or_else(|| query_output_labels.clone());
 
-        let aggregated_labels = self
-            .streaming_config
+        let aggregated_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_key)
             .map(|config| config.aggregated_labels.clone())
             .unwrap_or_else(KeyByLabelNames::empty);
@@ -1418,7 +1475,7 @@ impl SimpleEngine {
                 let step_ms = (step * 1000.0) as u64;
 
                 let tumbling_window_ms = self
-                    .streaming_config
+                    .streaming_config_snapshot()
                     .get_aggregation_config(base_context.agg_info.aggregation_id_for_value)
                     .map(|c| c.window_size * 1000)?;
 
@@ -1742,10 +1799,10 @@ impl SimpleEngine {
         let mut aggregation_type_for_key: Option<AggregationType> = None;
         let mut aggregation_type_for_value: Option<AggregationType> = None;
 
+        let streaming_config = self.streaming_config_snapshot();
         if query_config_aggregations.len() == 2 {
             for aggregation in query_config_aggregations {
-                let aggregation_type = self
-                    .streaming_config
+                let aggregation_type = streaming_config
                     .get_aggregation_config(aggregation.aggregation_id)
                     .map(|config| config.aggregation_type)
                     .ok_or_else(|| {
@@ -1781,8 +1838,7 @@ impl SimpleEngine {
         } else {
             // Single aggregation: key and value share the same aggregation
             let id = query_config_aggregations[0].aggregation_id;
-            let agg_type = self
-                .streaming_config
+            let agg_type = streaming_config
                 .get_aggregation_config(id)
                 .map(|config| config.aggregation_type)
                 .ok_or_else(|| format!("No streaming config for aggregation_id {id}"))?;
@@ -2075,14 +2131,13 @@ impl SimpleEngine {
             })
             .ok()?;
 
-        let grouping_labels = self
-            .streaming_config
+        let streaming_config = self.streaming_config_snapshot();
+        let grouping_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_value)
             .map(|config| config.grouping_labels.clone())
             .unwrap_or_else(|| metadata.query_output_labels.clone());
 
-        let aggregated_labels = self
-            .streaming_config
+        let aggregated_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_key)
             .map(|config| config.aggregated_labels.clone())
             .unwrap_or_else(KeyByLabelNames::empty);
@@ -2258,14 +2313,13 @@ impl SimpleEngine {
             })
             .ok()?;
 
-        let grouping_labels = self
-            .streaming_config
+        let streaming_config = self.streaming_config_snapshot();
+        let grouping_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_value)
             .map(|config| config.grouping_labels.clone())
             .unwrap_or_else(|| query_metadata.query_output_labels.clone());
 
-        let aggregated_labels = self
-            .streaming_config
+        let aggregated_labels = streaming_config
             .get_aggregation_config(agg_info.aggregation_id_for_key)
             .map(|config| config.aggregated_labels.clone())
             .unwrap_or_else(KeyByLabelNames::empty);
@@ -3107,7 +3161,7 @@ impl SimpleEngine {
 
         // Get window size
         let tumbling_window_ms = self
-            .streaming_config
+            .streaming_config_snapshot()
             .get_aggregation_config(base_context.agg_info.aggregation_id_for_value)
             .map(|config| config.window_size * 1000)?;
 
@@ -4541,4 +4595,146 @@ mod sketch_query_tests {
     //         engine.handle_sketch_range_query_promql("rate(mymetric[100s])", 0.01, 0.1, 0.01);
     //     assert!(result.is_none());
     // }
+}
+
+// ─── PR E phase 2: per-query re-snapshot tests ─────────────────────────
+#[cfg(test)]
+mod hot_reload_phase2_tests {
+    use super::*;
+    use crate::data_model::{
+        AggregationType, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, QueryLanguage,
+        StreamingConfig, WindowType,
+    };
+    use crate::stores::simple_map_store::SimpleMapStore;
+    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+
+    fn dummy_agg(id: u64, metric: &str) -> crate::data_model::AggregationConfig {
+        crate::data_model::AggregationConfig::new(
+            id,
+            AggregationType::Sum,
+            String::new(),
+            std::collections::HashMap::new(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            60,
+            60,
+            WindowType::Tumbling,
+            String::new(),
+            metric.to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn cfg_with_agg(id: u64, metric: &str) -> StreamingConfig {
+        let mut map = std::collections::HashMap::new();
+        map.insert(id, dummy_agg(id, metric));
+        StreamingConfig::new(map)
+    }
+
+    fn build_engine(handle: HotReloadStreamingConfig) -> SimpleEngine {
+        let streaming_config = Arc::new(StreamingConfig::default());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_config,
+            CleanupPolicy::NoCleanup,
+        ));
+        let inference_config =
+            InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
+        SimpleEngine::new_with_hot_reload(
+            store,
+            inference_config,
+            handle,
+            15000,
+            QueryLanguage::promql,
+        )
+    }
+
+    #[test]
+    fn streaming_config_snapshot_starts_at_initial_config() {
+        let handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let engine = build_engine(handle);
+        let snap = engine.streaming_config_snapshot();
+        assert_eq!(snap.aggregation_configs.len(), 1);
+        assert!(snap.aggregation_configs.contains_key(&101));
+    }
+
+    #[test]
+    fn streaming_config_snapshot_observes_post_construction_swap() {
+        // Core of PR E phase 2: once the engine is built, swapping
+        // the shared HotReloadStreamingConfig handle must take
+        // effect on the next snapshot call — this is the guarantee
+        // that makes POST /api/v1/streaming-config actually useful
+        // for query-time behavior.
+        let handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let engine = build_engine(handle.clone());
+
+        // Initial snapshot: id 101 only.
+        let snap_before = engine.streaming_config_snapshot();
+        assert_eq!(snap_before.aggregation_configs.len(), 1);
+        assert!(snap_before.aggregation_configs.contains_key(&101));
+        assert!(!snap_before.aggregation_configs.contains_key(&202));
+
+        // Simulate a controller push via `HotReloadStreamingConfig::swap`.
+        // Clones of the handle share the same underlying ArcSwap, so a
+        // swap on `handle` is observable through the engine's stored
+        // clone.
+        handle.swap(cfg_with_agg(202, "metric_b"));
+
+        // Next snapshot: id 202, id 101 gone. This is exactly what a
+        // POST-push-then-query sequence must produce.
+        let snap_after = engine.streaming_config_snapshot();
+        assert_eq!(snap_after.aggregation_configs.len(), 1);
+        assert!(snap_after.aggregation_configs.contains_key(&202));
+        assert!(!snap_after.aggregation_configs.contains_key(&101));
+
+        // The old snapshot is still internally consistent — it's a
+        // separate Arc that was cheap-cloned before the swap and
+        // continues to reflect the pre-swap state. This matches the
+        // per-query-entry-snapshot contract: a query that started
+        // before the swap sees old config for its entire execution.
+        assert!(snap_before.aggregation_configs.contains_key(&101));
+    }
+
+    #[test]
+    fn legacy_new_constructor_is_independent_of_external_handle() {
+        // The legacy `SimpleEngine::new` path wraps the provided
+        // Arc<StreamingConfig> in a FRESH HotReloadStreamingConfig
+        // internally, so external swaps must NOT leak in. This is
+        // the behavior tests and binaries that don't own a shared
+        // handle depend on.
+        let external_handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let streaming_config = external_handle.snapshot();
+
+        let store = Arc::new(SimpleMapStore::new(
+            Arc::clone(&streaming_config),
+            CleanupPolicy::NoCleanup,
+        ));
+        let inference_config =
+            InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
+        let engine = SimpleEngine::new(
+            store,
+            inference_config,
+            streaming_config,
+            15000,
+            QueryLanguage::promql,
+        );
+
+        // External swap should NOT be visible inside the engine — the
+        // legacy constructor snapshotted the initial Arc into its own
+        // fresh hot-reload wrapper.
+        external_handle.swap(cfg_with_agg(999, "metric_swapped"));
+
+        let engine_snap = engine.streaming_config_snapshot();
+        assert_eq!(engine_snap.aggregation_configs.len(), 1);
+        assert!(
+            engine_snap.aggregation_configs.contains_key(&101),
+            "legacy `new` constructor should pin the initial config, \
+             external swaps to unrelated handles must not leak in"
+        );
+        assert!(!engine_snap.aggregation_configs.contains_key(&999));
+    }
 }
