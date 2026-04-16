@@ -345,6 +345,11 @@ async fn route_otlp_to_precompute(
     let ingest_received_at = Instant::now();
     let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(request);
 
+    // Snapshot the latest agg_configs from the hot-reload handle so
+    // new aggregations are visible without restart.
+    let snap = ingest_state.config_snapshot();
+    let agg_configs = snap.get_all_aggregation_configs();
+
     // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
     type GroupKey = (u64, String);
     type SampleTuple = (String, i64, f64);
@@ -356,7 +361,7 @@ async fn route_otlp_to_precompute(
         let series_key = format_series_key(&point.name, &point.labels);
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
         let mut matched = false;
-        for config in &ingest_state.agg_configs {
+        for config in agg_configs.values() {
             if config.metric != point.name
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
@@ -414,7 +419,7 @@ async fn route_otlp_to_precompute(
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
         let sketch_type = identify_sketch_type(&point.payload);
         let mut matched = false;
-        for config in &ingest_state.agg_configs {
+        for config in agg_configs.values() {
             if config.metric != point.name
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
@@ -500,6 +505,8 @@ async fn route_modified_otlp_sketches_to_precompute(
     use asap_otel_proto::tonic::metrics::v1::metric::Data;
 
     let ingest_received_at = Instant::now();
+    let snap = ingest_state.config_snapshot();
+    let agg_configs = snap.get_all_aggregation_configs();
     let mut messages: Vec<WorkerMessage> = Vec::new();
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
@@ -614,7 +621,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         };
 
                     let mut matched_any = false;
-                    for config in &ingest_state.agg_configs {
+                    for config in agg_configs.values() {
                         if config.metric != metric.name
                             && config.spatial_filter_normalized != metric.name
                             && config.spatial_filter != metric.name

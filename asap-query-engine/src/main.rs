@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
         };
         let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
         let engine =
-            PrecomputeEngine::new(precompute_config, streaming_config.clone(), output_sink);
+            PrecomputeEngine::new(precompute_config, hot_reload_config.clone(), output_sink);
         let worker_diagnostics = engine.diagnostics();
         let ingest_state = engine.ingest_state();
         info!(

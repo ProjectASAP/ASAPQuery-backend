@@ -1,3 +1,4 @@
+use crate::data_model::HotReloadStreamingConfig;
 use crate::drivers::ingest::prometheus_remote_write::decode_prometheus_remote_write;
 use crate::drivers::ingest::victoriametrics_remote_write::decode_victoriametrics_remote_write;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
@@ -18,10 +19,26 @@ use tracing::warn;
 pub struct IngestState {
     pub router: SeriesRouter,
     pub samples_ingested: std::sync::atomic::AtomicU64,
-    /// Aggregation configs for group-key extraction.
-    pub agg_configs: Vec<Arc<AggregationConfig>>,
+    /// Hot-reloadable streaming config. On each ingest batch, the
+    /// router snapshots the latest config to derive agg_configs.
+    /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
+    pub hot_reload_config: HotReloadStreamingConfig,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
+}
+
+impl IngestState {
+    /// Snapshot the current streaming config from the hot-reload
+    /// handle. Called at the start of each ingest batch so new
+    /// configs from a `POST /api/v1/streaming-config` swap are
+    /// visible immediately without restart.
+    ///
+    /// Returns the shared `Arc<StreamingConfig>` — no cloning of
+    /// individual AggregationConfig objects, just an atomic refcount
+    /// increment (~5ns).
+    pub fn config_snapshot(&self) -> Arc<crate::data_model::StreamingConfig> {
+        self.hot_reload_config.snapshot()
+    }
 }
 
 impl IngestState {
@@ -95,6 +112,12 @@ async fn route_decoded_samples(
     // Group-by mode: for each sample, find matching agg configs and group by
     // (agg_id, group_key). This is the equivalent of Arroyo's GROUP BY.
     //
+    // Snapshot the latest config from the hot-reload handle at the
+    // start of each batch, so config swaps are visible immediately.
+    // This is a single Arc refcount bump (~5ns), not a clone.
+    let snap = state.config_snapshot();
+    let agg_configs = snap.get_all_aggregation_configs();
+
     // Key: (agg_id, group_key) → Vec<(series_key, timestamp_ms, value)>
     type GroupKey = (u64, String);
     type SampleTuple = (String, i64, f64);
@@ -102,7 +125,7 @@ async fn route_decoded_samples(
 
     for s in &samples {
         let metric_name = extract_metric_name(&s.labels);
-        for config in &state.agg_configs {
+        for config in agg_configs.values() {
             if config.metric != metric_name
                 && config.spatial_filter_normalized != metric_name
                 && config.spatial_filter != metric_name

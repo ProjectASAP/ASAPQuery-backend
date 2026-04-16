@@ -1,4 +1,6 @@
-use crate::data_model::{AggregateCore, KeyByLabelValues, PrecomputedOutput};
+use crate::data_model::{
+    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
+};
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
@@ -58,8 +60,10 @@ pub struct Worker {
     output_sink: Arc<dyn OutputSink>,
     /// Map from (agg_id, group_key) to per-group state.
     group_states: HashMap<(u64, String), GroupState>,
-    /// Aggregation configs, keyed by aggregation_id.
-    agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+    /// Hot-reload handle — workers read config directly from ArcSwap
+    /// instead of holding a local copy. All components see the same
+    /// config at the same time.
+    hot_reload: HotReloadStreamingConfig,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -83,7 +87,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+        hot_reload: HotReloadStreamingConfig,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -101,7 +105,7 @@ impl Worker {
             receiver,
             output_sink,
             group_states: HashMap::new(),
-            agg_configs,
+            hot_reload,
             allowed_lateness_ms,
             pass_raw_samples,
             raw_mode_aggregation_id,
@@ -200,6 +204,11 @@ impl Worker {
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} flush error: {}", self.id, e);
                     }
+                    // Evict orphaned GroupStates whose agg_id has been
+                    // removed from the config. Panes that still have
+                    // data are kept until they drain (flush_all already
+                    // closed their windows); empty ones are freed.
+                    self.evict_orphaned_groups();
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
@@ -219,6 +228,9 @@ impl Worker {
     }
 
     /// Get or create the GroupState for a (agg_id, group_key) pair.
+    /// Reads config directly from the `HotReloadStreamingConfig`
+    /// ArcSwap handle, so new agg_ids from a config swap are visible
+    /// immediately — no message passing, no delay.
     /// Returns None if agg_id has no matching config.
     fn get_or_create_group_state(
         &mut self,
@@ -227,10 +239,12 @@ impl Worker {
     ) -> Option<&mut GroupState> {
         let key = (agg_id, group_key.to_string());
         if !self.group_states.contains_key(&key) {
-            let config = self.agg_configs.get(&agg_id)?;
+            let snap = self.hot_reload.snapshot();
+            let cfg = snap.get_aggregation_config(agg_id)?;
+            let config = Arc::new(cfg.clone());
             let gs = GroupState {
                 window_manager: WindowManager::new(config.window_size, config.slide_interval),
-                config: Arc::clone(config),
+                config,
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
@@ -556,6 +570,40 @@ impl Worker {
     /// 2. Publish it for cross-worker reads
     /// 3. Compute global watermark = min(all worker watermarks)
     /// 4. Advance idle groups to the global watermark, closing due windows
+    ///
+    /// Remove GroupStates whose agg_id is no longer in the current
+    /// config (i.e. the controller removed the aggregation). Groups
+    /// with non-empty panes are kept until flush_all closes their
+    /// windows; once both pane maps are empty, the GroupState shell
+    /// is freed.
+    fn evict_orphaned_groups(&mut self) {
+        let snap = self.hot_reload.snapshot();
+        let before = self.group_states.len();
+        self.group_states.retain(|&(agg_id, _), gs| {
+            if snap.contains(agg_id) {
+                return true; // still in config, keep
+            }
+            // Not in config — keep only if there's residual data
+            // that flush_all hasn't drained yet.
+            let has_data = !gs.active_panes.is_empty() || !gs.sketch_panes.is_empty();
+            if !has_data {
+                debug!("evicting orphaned group (agg_id={})", agg_id);
+            }
+            has_data
+        });
+        let after = self.group_states.len();
+        if before != after {
+            info!(
+                "Worker {} evicted {} orphaned groups ({} → {})",
+                self.id,
+                before - after,
+                before,
+                after
+            );
+            self.group_count.store(after, Ordering::Relaxed);
+        }
+    }
+
     fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.pass_raw_samples {
             return Ok(());
