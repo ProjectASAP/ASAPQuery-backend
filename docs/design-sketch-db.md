@@ -10,7 +10,8 @@ controller workload and a query engine sharing it don't step on each other?"
 
 **Companion docs:**
 - [`design-simple-map-store-persistence.md`](design-simple-map-store-persistence.md) — the current LSM-style parts-based persistence layer this builds on
-- [DataCollector#153 pipeline query catalog](https://github.com/ProjectASAP/DataCollector/pull/153) — the pipeline-level dual-lane architecture (sketch lane + Gorilla/S3 archive lane) that this design depends on
+- [`promsketch-integration.md`](../asap-query-engine/docs/promsketch-integration.md) — the PromSketch subsystem, retrospectively positioned by this doc as Tier 1 of the sketch DB (see §4.1)
+- [DataCollector#153 pipeline query catalog](https://github.com/ProjectASAP/DataCollector/pull/153) — the pipeline-level dual-path architecture (sketch path + exact-DB path) that this design depends on
 
 ---
 
@@ -30,10 +31,17 @@ enough for "write sketches, read them back by id." It is no longer enough once:
 
 What's needed is a storage engine that treats sketches as first-class typed
 values with per-type merge semantics, tracks schema per aggregation across
-time, and supports refreshing itself from the archive when the schema
-changes. In database terms: the sketches are **materialized views** over
-the Gorilla/S3 archive; the store is a materialized-view engine specialized
-for sketch types.
+time, and supports refreshing itself from the exact-DB base relation when
+the schema changes. In database terms: the sketches are **materialized
+views** over raw sample data; the store is a materialized-view engine
+specialized for sketch types.
+
+The **exact DB** (the base relation the MVs are materialized over) may be
+implemented by any long-term raw-sample store: S3 with Gorilla compression,
+Prometheus / VictoriaMetrics via remote-write, ClickHouse, or any other
+backend the deployment picks. The design treats it as a pluggable reader
+behind a single interface — the sketch DB doesn't care which backend is
+actually holding the raw bytes.
 
 ---
 
@@ -74,23 +82,24 @@ Read off the `AggregationConfig` fields:
 | `window_size` + `slide_interval` | `time_bucket(…)` + windowing |
 | `spatial_filter` | extra `WHERE` clause conditions |
 
-The base relation being materialized over is the stream of raw samples —
-from the live agent stream in the normal case, and from the Gorilla/S3
-archive when the view is being refreshed (§9).
+The base relation being materialized over is the stream of raw samples.
+Incremental maintenance (§8) reads them from the live agent stream as
+they arrive. Refresh (§10) reads them from the exact DB (whichever
+backend is configured — S3/Gorilla, Prometheus, ClickHouse, etc.).
 
 ### 2.2 What a materialized view framing buys us
 
 | Classical MV concept | Sketch DB counterpart |
 |---|---|
 | View definition | `AggregationConfig` |
-| Base relation | Raw sample stream (agent ingest + archive) |
-| Materialization | `SketchEntry` rows in `SimpleMapStore` |
-| View maintenance strategy | §8 (incremental) + §9 (refresh) |
-| Schema evolution | §5 per-`agg_id` lifecycle, §6 schema timeline |
+| Base relation | Raw sample stream; exact DB for historical replay |
+| Materialization | `SketchEntry` rows across Tier 1 / Tier 2 storage (§4.1) |
+| View maintenance strategy | §8 (incremental) + §10 (refresh) |
+| Schema evolution | §6 per-`agg_id` lifecycle, §7 schema timeline |
 | `DROP MATERIALIZED VIEW` | Retirement + expiry |
-| `REFRESH MATERIALIZED VIEW` | Backfill job from archive |
-| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §10 controller APIs |
-| Index on the MV for faster queries | Label postings index (§4.3), typed aux columns (§4.1) |
+| `REFRESH MATERIALIZED VIEW` | Backfill job from exact DB |
+| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §12 controller APIs |
+| Index on the MV for faster queries | Label postings index (§5.3), typed aux columns (§5.1) |
 
 The rest of this doc splits into two halves, mirroring the two standard
 MV maintenance strategies:
@@ -100,7 +109,7 @@ MV maintenance strategies:
   engine already does today; the doc describes how it extends cleanly
   into a sketch-DB-aware design.
 - **§9. Refreshable view maintenance** — the backfill service, which
-  rebuilds the MV for a time range from the base relation (the archive).
+  rebuilds the MV for a time range from the base relation (the exact DB).
   This is the piece that makes schema evolution painless.
 
 Both strategies write to the same physical store and the same per-`agg_id`
@@ -161,9 +170,13 @@ MV framing is established:
 4. **Typed auxiliary columns.** `count`, `sum`, `min`, `max` are stored
    alongside the sketch bytes, not inside them. Queries that only need
    these scalar stats never pay the sketch deserialization cost.
-5. **Archive is the source of truth.** Sketches are rebuildable from
-   the Gorilla/S3 archive. The store supports explicit backfill from
-   archive into any `agg_id` for any time range.
+5. **Exact DB is the source of truth.** Sketches are rebuildable from
+   the exact-DB base relation (whichever backend is configured — S3 +
+   Gorilla, Prometheus, ClickHouse, VictoriaMetrics, etc.). The store
+   supports explicit backfill from the exact DB into any `agg_id` for
+   any time range. The exact DB is the same storage that also serves
+   the query-engine fallback path when a query cannot be answered from
+   sketches.
 6. **Monotonic, non-reused `aggregation_id`s.** A reconfigure that
    changes parameters is always "retire old id + create new id", never
    "mutate in place." This is a contract on the controller; the store
@@ -193,18 +206,20 @@ MV framing is established:
              │  └────────────────────────────────────────┘    │
              │                                                  │
              │  ┌────────────────────────────────────────┐    │
-             │  │ Per-agg_id storage                      │    │
+             │  │ Per-agg_id storage (multi-tier)         │    │
+             │  │   Tier 1: PromSketch (in-mem EH)        │    │
+             │  │   Tier 2: precompute + LSM parts        │    │
              │  │   pinned schema (type, params, group)   │    │
-             │  │   LSM parts with semantic compaction    │    │
-             │  │   label posting index                    │    │
-             │  │   typed aux columns                      │    │
+             │  │   semantic compaction within a tier     │    │
+             │  │   label posting index, typed aux cols   │    │
              │  └────────────────────────────────────────┘    │
              │                                                  │
              │  ┌────────────────────────────────────────┐    │
-             │  │ Backfill service                        │    │
-             │  │   reads raw from Gorilla/S3 archive     │    │
+             │  │ Backfill / REFRESH service              │    │
+             │  │   reads raw from exact DB (pluggable:   │    │
+             │  │     S3+Gorilla / Prometheus / CH / VM)  │    │
              │  │   rebuilds sketches per (agg_id, window)│    │
-             │  │   writes to per-agg_id storage          │    │
+             │  │   writes to per-agg_id tier storage     │    │
              │  └────────────────────────────────────────┘    │
              │                                                  │
              │  ┌────────────────────────────────────────┐    │
@@ -225,6 +240,62 @@ MV framing is established:
              │    outputs                                       │
              └─────────────────────────────────────────────────┘
 ```
+
+### 4.1 Storage tiers
+
+The sketch DB is one logical entity with multiple physical storage
+tiers. PromSketch and the precompute + LSM store are **not separate
+systems** — they are tiers of the same sketch DB. Which tier an
+`agg_id` lives on is part of its `AggSchema`, configurable by the
+controller.
+
+| Tier | Implementation | Retention | Query latency | Use case |
+|---|---|---|---|---|
+| **Tier 1** | PromSketch — in-memory exponential histograms over raw samples | seconds to minutes (bounded by memory) | sub-millisecond | live dashboards, quick-refresh panels, alerts |
+| **Tier 2** | Precompute engine + `SimpleMapStore` LSM parts (memory + disk) | minutes to weeks (bounded by `persistence_delete_older_than_secs`) | milliseconds | most production queries, longer-horizon analysis |
+| **Exact DB** | S3 + Gorilla / Prometheus / VictoriaMetrics / ClickHouse | months+ (configurable, bounded by raw storage cost) | seconds to tens of seconds | fallback for uncovered queries, base relation for refresh |
+
+**Tier selection per `agg_id`.** A metric's `AggregationConfig` carries
+a `tier` field: `Tier1Only`, `Tier2Only`, or `Both`. `Both` means
+incremental maintenance writes to both tiers — Tier 1 for freshness,
+Tier 2 for long retention. Query engine picks per-query based on the
+query's time range and SLA.
+
+**Tier promotion / demotion on reconfigure.** The controller can
+upgrade an `agg_id` from Tier 1 to Tier 2 as the workload justifies
+the long retention cost. Schema-wise this is a regular reconfigure
+(retire old id, create new id with new tier), and the Tier 2 backfill
+path (§10) reads from the exact DB to populate history.
+
+**The exact DB is not a tier.** It's the base relation every tier
+materializes from. It's shown alongside the tiers in the table
+because the query engine's fallback path also reads from it, so
+operationally it looks like a third storage layer. But conceptually
+it is "not sketch DB" — it holds raw samples, not sketches.
+
+### 4.2 Why this framing
+
+Before this framing: PromSketch (`stores/promsketch_store/`) and the
+precompute-backed `SimpleMapStore` looked like two independent
+sketch systems that the query engine had to route between. They had
+overlapping but different semantics (incremental MV in both cases, but
+different schema, different retention model, different hot-reload
+story).
+
+Unifying them as tiers of one DB means:
+
+- One schema lifecycle (§6) covers both tiers; a tier upgrade is a
+  regular reconfigure.
+- One controller API surface (§12) exposes stats across tiers.
+- One refresh path (§10) can write to either tier.
+- The query engine's routing logic (§7.3 per-segment dispatch) picks
+  tier by the same mechanism it picks `agg_id` — the schema timeline
+  already carries everything needed.
+
+The two tiers' internal storage formats differ (EH-backed arrays vs
+LSM parts), and that's fine — the sketch DB abstracts over them
+through a common tier-backend trait. Internally each tier keeps its
+own implementation details.
 
 ---
 
@@ -261,7 +332,7 @@ enum EntryOrigin {
     /// Written by the live ingest path — precompute worker flushed a
     /// window close.
     Native,
-    /// Written by the backfill service from archive raw data. The
+    /// Written by the backfill service from exact-DB raw data. The
     /// job_id lets the system correlate with the BackfillJob that
     /// produced it (for re-runs, debugging, idempotency).
     Backfilled { job_id: u64 },
@@ -660,14 +731,14 @@ entries by `(agg_id, group_key)` and merges only within that.
 Where §8 describes how the MV is maintained as new base data arrives,
 this section describes how the MV is **re-materialized** from the base
 relation on demand. In SQL terms: `REFRESH MATERIALIZED VIEW agg_17
-FOR PERIOD (now - 24h, now) FROM s3_archive`.
+FOR PERIOD (now - 24h, now) FROM exact_db`.
 
 ### 10.1 The core insight
 
-Because the archive lane keeps raw data losslessly, we can rebuild any
-sketch for any time range from the archive. A reconfigure that breaks
-query continuity in the sketch tier can be followed by a backfill that
-restores it.
+The exact DB holds raw samples losslessly over its configured
+retention. Any sketch for any time range within that retention can be
+rebuilt from it. A reconfigure that breaks query continuity in the
+sketch tier can be followed by a backfill that restores it.
 
 ```
 Time →      T=0         T=upgrade-horizon        T=upgrade              now
@@ -679,13 +750,14 @@ id=1        [═══════ native (CMS256) ═════════�
 id=17        │                 [▒▒▒▒ backfilled ▒▒▒▒▒▒][══ native (KLL200) ══]
              │                 │                      │                  │
              │                 └── REFRESH reads from  │                  │
-             │                     archive for this    │                  │
+             │                     exact DB for this   │                  │
              │                     interval            │                  │
              │                 │                      │                  │
              ▼                 ▼                      ▼                  ▼
-           ═══════════════ Archive (Gorilla / S3) ═══════════════════════
-           (lossless base relation; feeds both the incremental path for
-            live samples and the refresh path for the backfilled interval)
+           ═══════════════ Exact DB (base relation) ══════════════════════
+           (lossless raw samples — S3+Gorilla / Prometheus / CH / VM / …
+            feeds the refresh path for the backfilled interval and the
+            query engine's fallback for any query sketches can't answer)
 ```
 
 Reading the diagram:
@@ -699,7 +771,7 @@ Reading the diagram:
   every window close after `T=upgrade` emits a KLL(200) row with
   `origin = Native`.
 - **id=17 (backfilled portion)** is the refresh output (§10.1–10.5):
-  a backfill job reads raw samples from the archive for
+  a backfill job reads raw samples from the exact DB for
   `[T=upgrade - horizon, T=upgrade)`, rebuilds KLL rows per
   `(group_key, window)`, and writes them to id=17 with
   `origin = Backfilled { job_id }`.
@@ -723,11 +795,21 @@ struct BackfillJob {
     windows_total: u64,
 }
 
+/// Every variant reads raw samples for the requested metric and time
+/// range and feeds them to the sketch builder. The DB picks a concrete
+/// reader at job-dispatch time based on what the deployment has
+/// configured as its exact DB. All variants implement a common
+/// `RawSampleReader` trait internally so the rest of the backfill
+/// code is source-agnostic.
 enum BackfillSource {
-    /// Read raw samples from Gorilla-compressed S3 parts.
-    S3Archive { bucket: String, prefix: String },
-    /// Read raw samples from the exact backend DB.
-    ExactDB { url: String },
+    /// Gorilla-compressed files in S3 / MinIO / GCS, produced by
+    /// DataCollector's gorillacol + S3 Files exporter.
+    S3Gorilla { bucket: String, prefix: String },
+    /// Prometheus (or VictoriaMetrics / Thanos / Cortex) via the
+    /// HTTP range-query API.
+    Prometheus { url: String },
+    /// ClickHouse via native HTTP / SQL.
+    ClickHouse { url: String, table: String },
     /// Rebuild from a different sketch (rare; only when types are
     /// compatible and the source sketch is lossless w.r.t. the target).
     /// Used for lossless schema widenings, e.g. CMS(256) → CMS(2048).
@@ -788,10 +870,11 @@ the sketch construction must be deterministic. That means:
   paths.
 - The KLL / DDSketch sampling decisions must be deterministic from
   the input sample order. This constrains how raw samples are read
-  from archive — they must be replayed in the same order they were
-  ingested live.
-- Archive writes from DataCollector therefore need to preserve ingest
-  order within a window.
+  from the exact DB — they must be replayed in the same order they
+  were ingested live.
+- Exact-DB writes from the live data plane therefore need to preserve
+  ingest order within a window (whether the exact DB is S3+Gorilla,
+  Prometheus, or any other backend).
 
 This is an invariant the Gorilla processor / S3 exporter must
 guarantee. Not hard, but it has to be designed in.
@@ -806,15 +889,15 @@ situation.
 |---|---|---|
 | Steady-state live ingest | Incremental (§8) | O(1) per sample, no scan of base relation |
 | New `agg_id` created, no historical need | Incremental only | Nothing to refresh from |
-| New `agg_id` created, need query continuity across the reconfigure | Incremental **+** Refresh from archive over the query horizon | Incremental covers \[now, future\]; refresh covers \[now-horizon, now\] |
+| New `agg_id` created, need query continuity across the reconfigure | Incremental **+** Refresh from exact DB over the query horizon | Incremental covers \[now, future\]; refresh covers \[now-horizon, now\] |
 | Recovery from a store corruption or a bug in past sketch builds | Refresh | MV is known wrong; rebuild authoritatively from base |
-| Onboarding a metric with historical raw data already in archive | Refresh only (until catches up), then Incremental | Much cheaper than streaming a week of archive through the live ingest path |
+| Onboarding a metric with historical raw data already in the exact DB | Refresh only (until catches up), then Incremental | Much cheaper than streaming a week of historical data through the live ingest path |
 | Metric with very low query rate, reconfigure | Incremental only, fall back to exact DB for historical queries | Refresh cost > fallback cost at low QPS |
 
 The controller decides by comparing estimated costs:
 
 ```
-cost_of_refresh = archive_bytes_to_scan * s3_read_$
+cost_of_refresh = exact_db_bytes_to_scan * read_$_per_byte
                 + cpu_seconds * cpu_$
 cost_of_fallback = expected_queries_to_exact_DB_during_retention
                  * query_latency * query_$
@@ -874,7 +957,7 @@ T=swap+Δ:
             POST /api/v1/db/backfill {
               agg_id: 17,
               time_range: (swap - query_horizon, swap),
-              source: S3Archive,
+              source: S3Gorilla, // or Prometheus, ClickHouse — whichever backs the exact DB
               priority: High,
             }
          Backfill service reads raw from S3, rebuilds KLL per window
@@ -1084,7 +1167,7 @@ described here. In PR #16:
   design.
 - There is no backfill; once a new agg_id is created, its historical
   coverage grows from zero in real time. The user's intuition that
-  backfill from archive is the right answer is captured here as the
+  backfill from the exact DB is the right answer is captured here as the
   eventual design target but is not implemented yet.
 - The storage layer still treats everything by `(agg_id, window,
   group_key)` — no sketch-aware compaction, no typed aux columns, no
@@ -1109,12 +1192,14 @@ program of work.
    with exponential backoff; if persistent failure, proceed without
    the backfilled range (query engine falls back for that subrange).
 
-3. **How much archive retention is needed?** Archive retention must
-   be ≥ the longest `backfill horizon` the controller ever requests,
-   which is the longest query range users will issue that spans a
-   reconfigure. If archive retention is 7 days and queries never look
-   back more than 24h, that's fine. Needs to be tracked as a
-   deployment-level configuration.
+3. **How much exact-DB retention is needed?** Exact-DB retention
+   must be ≥ the longest `backfill horizon` the controller ever
+   requests, which is the longest query range users will issue that
+   spans a reconfigure. If exact-DB retention is 7 days and queries
+   never look back more than 24h, that's fine. Needs to be tracked
+   as a deployment-level configuration — and the controller should
+   reject any upgrade plan whose backfill horizon exceeds current
+   exact-DB retention.
 
 4. **Can an in-progress backfill be query-visible with partial
    coverage?** Proposal: yes — `Coverage::BackfillInProgress` is a
@@ -1129,12 +1214,11 @@ program of work.
    (Phase 7) needs a new on-disk structure and will require a new
    part version.
 
-6. **Relationship to PromSketch?** PromSketch (the exponential-
-   histogram-based in-memory sketch store) serves a different tier
-   (live queries against raw samples). The sketch DB described here
-   serves precomputed materialized sketches. The query engine's
-   routing logic picks between them: PromSketch for recent fine-grained
-   live queries, sketch DB for long-horizon precomputed queries,
-   exact fallback for anything else. All three should share the
-   schema-timeline / backfill concepts so that the controller can
-   reason about them uniformly.
+6. **Relationship to PromSketch?** *(Resolved — see §4.1.)*
+   PromSketch is **Tier 1** of the sketch DB, not a parallel system.
+   It's an in-memory EH-backed storage backend specialized for
+   short-retention sub-millisecond queries. Tier 2 is the
+   precompute + LSM parts store for longer retention. The two share
+   one schema lifecycle, one controller API surface, one refresh
+   path, and one query-engine routing layer. The controller picks
+   per-`agg_id` whether to materialize into Tier 1, Tier 2, or both.
