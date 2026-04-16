@@ -670,18 +670,39 @@ query continuity in the sketch tier can be followed by a backfill that
 restores it.
 
 ```
-T=0        T=upgrade                       now
-│          │                                │
-├──── id=1 (CMS256) data ────────┤          ← existing sketch data
-│          │                                │
-│          ├──── id=17 (KLL200) native ─┤  ← new sketch data from live ingest
-│          │                                │
-│    ┌─────┴────── backfill ──────┐         ← rebuild id=17 from archive
-│    │     │                       │         for [T=upgrade - horizon, T=upgrade]
-│    │     │                       │
-│    ↓     ↓                       ↓
-Archive (Gorilla / S3)
+Time →      T=0         T=upgrade-horizon        T=upgrade              now
+             │                 │                      │                  │
+             │                 │                      │                  │
+id=1        [═══════ native (CMS256) ══════════════════]                 │
+             │                 │                      │                  │
+             │                 │                      │                  │
+id=17        │                 [▒▒▒▒ backfilled ▒▒▒▒▒▒][══ native (KLL200) ══]
+             │                 │                      │                  │
+             │                 └── REFRESH reads from  │                  │
+             │                     archive for this    │                  │
+             │                     interval            │                  │
+             │                 │                      │                  │
+             ▼                 ▼                      ▼                  ▼
+           ═══════════════ Archive (Gorilla / S3) ═══════════════════════
+           (lossless base relation; feeds both the incremental path for
+            live samples and the refresh path for the backfilled interval)
 ```
+
+Reading the diagram:
+- **id=1** was the pre-upgrade `AggregationConfig` (CMS with width=256).
+  It keeps its existing data across the upgrade; IngestState stops
+  writing to it at `T=upgrade`. Its rows are still query-visible until
+  `persistence_delete_older_than_secs` elapses, but they are not used
+  for post-upgrade queries (the schema timeline in §7 routes queries
+  to id=17 after the swap).
+- **id=17 (native portion)** is live incremental MV maintenance (§8):
+  every window close after `T=upgrade` emits a KLL(200) row with
+  `origin = Native`.
+- **id=17 (backfilled portion)** is the refresh output (§10.1–10.5):
+  a backfill job reads raw samples from the archive for
+  `[T=upgrade - horizon, T=upgrade)`, rebuilds KLL rows per
+  `(group_key, window)`, and writes them to id=17 with
+  `origin = Backfilled { job_id }`.
 
 After backfill, id=17 covers the full query horizon. The user's query
 "last 24h" is fully served from a single sketch, with a consistent
