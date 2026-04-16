@@ -1,5 +1,5 @@
 use crate::data_model::{
-    AggregateCore, AggregationType, MergeableAccumulator, SerializableToSink,
+    AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
 use base64::{engine::general_purpose, Engine as _};
@@ -287,6 +287,21 @@ impl AggregateCore for DatasketchesKLLAccumulator {
         // KLL with default k=200 holds ~2*k items (~3 KiB). Round up
         // for overhead.
         4 * 1024
+    }
+
+    fn aux_stats(&self) -> AuxStats {
+        // KLL natively tracks `count` (n, samples observed). min/max
+        // are available from the underlying sketch but only via a
+        // O(k) quantile extraction at quantile=0/1, which is not
+        // a cheap trait-method call. sum is not retained by KLL.
+        //
+        // Surface only count here; follow-up PR may add min/max via a
+        // dedicated accessor on sketch-core. `sum_over_time` queries
+        // on KLL fall back to query_statistic as they do today.
+        AuxStats {
+            count: Some(self.inner.count()),
+            ..AuxStats::empty()
+        }
     }
 
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
@@ -627,5 +642,27 @@ mod tests {
         let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("levels length"));
+    }
+
+    #[test]
+    fn aux_stats_exposes_count_via_kll_n() {
+        let mut acc = DatasketchesKLLAccumulator::new(200);
+        for i in 0..50 {
+            acc.update(i as f64);
+        }
+        let aux = acc.aux_stats();
+        assert_eq!(aux.count, Some(50));
+        // KLL doesn't natively expose min/max cheaply and doesn't
+        // track sum at all — those fields must be None so callers
+        // fall through to query_statistic.
+        assert_eq!(aux.sum, None);
+        assert_eq!(aux.min, None);
+        assert_eq!(aux.max, None);
+    }
+
+    #[test]
+    fn aux_stats_empty_kll_has_zero_count() {
+        let acc = DatasketchesKLLAccumulator::new(200);
+        assert_eq!(acc.aux_stats().count, Some(0));
     }
 }
