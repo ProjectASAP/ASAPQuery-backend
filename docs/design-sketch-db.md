@@ -156,6 +156,7 @@ MV framing is established:
 - §16 Implementation phases
 - §17 Relationship to the hot-reload PR
 - §18 Open questions
+- §19 Appendix: performance envelope vs Prometheus / VictoriaMetrics
 
 ### 3.1 Principles
 
@@ -1606,3 +1607,169 @@ program of work.
     maintenance with distributed writers requires consensus on
     window boundaries, which is a separate design effort. For
     now: single-writer, use a DR replica as fallback.
+
+---
+
+## 19. Appendix: performance envelope vs Prometheus / VictoriaMetrics
+
+This section estimates the performance of the sketch DB relative to
+Prometheus and VictoriaMetrics on representative queries. Numbers are
+**order-of-magnitude estimates** derived from published benchmarks and
+sketch complexity bounds, not measurements from this codebase. They
+motivate which workloads the design targets and which it explicitly
+does not.
+
+### 19.1 Reference workload
+
+A realistic production scenario that stresses TSDB scanning:
+
+- **10,000 hosts × 10 services = 100,000 time series**
+- **100 ms scrape interval → 10 samples/sec/series**
+- **Total ingest: 1 M samples/sec**
+- **1 hour of data: 3.6 B samples** (one metric), or **54 B samples**
+  if the metric is exposed as a Prometheus histogram with 15 bucket
+  time series
+- **1 day: 86.4 B samples** (plain) or **1.3 T samples** (histograms)
+
+The 100 ms scrape is not extreme for targeted high-frequency workloads
+(NCCL GPU collective metrics, network packet counters, HFT, 5G radio
+metrics). Standard 15 s / 30 s scrape regimes produce lower pressure
+but the same relative shape.
+
+Baseline TSDB scan throughput used below:
+- Prometheus: ~1 M samples/sec/core
+- VictoriaMetrics: ~10 M samples/sec/core (published)
+
+Sketch DB costs:
+- KLL merge: ~1 μs per merge
+- CMS merge: ~microseconds (size-bounded)
+- HLL register OR: ~μs
+- Quantile / cardinality compute: microseconds post-merge
+
+### 19.2 Per-query-type estimates
+
+| Query | Workload | Prom | VM | Sketch DB Tier 2 | Sketch DB Tier 1 |
+|---|---|---|---|---|---|
+| **p99 quantile, 1h, by service** (`histogram_quantile` style) | 1.5 M bucket series, 54 B samples involved in full scan | **Infeasible cold** (15 core-hours) — requires recording rules | **~6 min on 16 cores** cold; 10–60 s with cache | **~1 ms** (600 KLL merges) | **< 1 ms** (EH lookup) |
+| **Top-K over 10 M customers, 1h** | 10 M series × 3600 × 10 = 360 B samples | **Not possible** | **15–60 min** or OOM | **~5–10 ms** (60 CMS+heap merges) | N/A |
+| **Cardinality / count_distinct, 1d** | 10 M series enumerated | **Not possible** | **10–60 min** or OOM | **< 1 ms** (HLL estimate) | **< 1 ms** |
+| **Low-card short-range** (`rate({service="auth"}[5m])`) | 3,000 samples | ~10 ms | ~2–5 ms | ~2 ms | ~1 ms |
+| **Multi-sub-window dashboard** (p99 @ 1m / 5m / 15m / 1h on same series) | 4 independent scans | 4× single-panel (seconds to minutes) | 4× single-panel | 4× independent part scans | **1× — shared EH** |
+| **Point read** of one specific series at one point in time | 1 chunk | ~5–10 ms | ~2–5 ms | **Not supported** → falls back to exact DB (+ ~0.5 ms routing) | Not supported |
+| **Exact count** (`count_over_time({customer="X"}[1d])`) | varies | Exact, seconds | Exact, sub-second | **Approximate** (CMS, ε ≈ 10⁻³) in ~10 ms | N/A |
+
+Columns where Sketch DB is "not supported" are where the design
+explicitly defers to the exact DB — point reads and exact queries are
+the job of the exact DB that also serves as the base relation (§2.1,
+§10.1).
+
+### 19.3 Why sketch DB wins grow with scrape rate
+
+The key observation that justifies treating 100 ms scrape as the
+benchmark case:
+
+- **TSDB scan cost scales linearly** with sample count, which scales
+  linearly with scrape rate. 600× higher scrape rate → 600× more work
+  for every aggregate query.
+- **Sketch DB cost scales with sketch parameters, not sample count.**
+  A KLL over 10⁶ samples and a KLL over 10⁹ samples have the same
+  serialized size and the same quantile-query cost. At 100 ms scrape
+  the ratio widens by roughly the scrape-rate ratio.
+
+At 1 min scrape, the p99 dashboard query is **3 s on Prom vs 1 ms
+sketch** — 1,000× speedup. At 100 ms scrape, the same query becomes
+**30 min → infeasible on Prom vs 1 ms sketch** — the ratio goes to
+infinity because the TSDB falls off a cliff that the sketch DB
+doesn't see.
+
+### 19.4 Storage cost
+
+Sketch size depends on sketch parameters, not on input sample count —
+this is the most important property for high-scrape-rate deployments.
+
+| Storage object | 1 min scrape (100K series, 7 days) | 100 ms scrape (100K series, 7 days) |
+|---|---|---|
+| Prom/VM raw samples, compressed | ~100 GB | **~60 TB** |
+| Sketch DB Tier 2, `grouping_labels = [service]`, 1 min windows | ~50 GB | **~50 GB** *(unchanged)* |
+| Sketch DB Tier 2 + semantic compaction to 1 h windows | ~5 GB | **~5 GB** *(unchanged)* |
+| Sketch DB Tier 1 (PromSketch), 5 min retention | ~100 MB | **~100 MB** *(unchanged)* |
+
+Storage cost ratio vs TSDB goes from **~2×** at 1 min scrape to
+**~10,000×** at 100 ms scrape. Break-even — the scrape rate at which
+sketch DB becomes cheaper than TSDB in storage alone — is somewhere
+around 10–30 s scrape depending on sketch parameters and grouping.
+Above that, sketch DB is strictly cheaper; below that, TSDB is.
+
+### 19.5 Qualitative shift: from "faster" to "feasible"
+
+The quantitative speedups above hide a more important shift. At high
+scrape rates, a subset of queries becomes **impossible** on TSDB:
+
+| Query | 1 min scrape | 100 ms scrape |
+|---|---|---|
+| p99 dashboard over 1 h, 100 K series | Prom 3 s (tight) / VM 500 ms | Prom **30 min or OOM** / VM **6 min cold** |
+| Top-K over 10 M customers | Prom **already infeasible** / VM 30 s | Prom impossible / VM **1–2 hours or OOM** |
+| `count_distinct` over 1 day | Prom infeasible / VM 5–30 s | Prom infeasible / VM **OOM** |
+
+Sketch DB stays at **< 10 ms** for all of these regardless of scrape
+rate. So at 100 ms scrape the sketch DB is not "an optimization" — it
+is the **only way** to serve these queries interactively.
+
+### 19.6 Where TSDB still wins
+
+The sketch DB intentionally does not replace TSDB for:
+
+- **Point reads** of a single time series at a specific timestamp —
+  TSDB chunk reads are already sub-millisecond; sketch DB adds routing
+  overhead with no benefit.
+- **Exact numerical answers** (financial reconciliation, regulatory
+  reporting, billing ground truth) — sketches are approximate by
+  design; the exact DB must serve these.
+- **Ad-hoc exploration** of arbitrary label dimensions — sketches
+  only answer along the `grouping_labels` they were built for. A query
+  on an unplanned dimension falls through to the exact DB.
+- **Low query rate** (few queries per day against a given metric) —
+  the pre-computation cost of maintaining sketches is not amortized.
+  The controller's cost model should decline to materialize a sketch
+  for such metrics.
+
+### 19.7 Cost-model break-even
+
+Very rough formula the controller can use to decide whether a metric
+is worth sketching:
+
+```
+sketch_value = query_rate
+             × avg_series_covered_per_query
+             × (tsdb_query_latency − sketch_query_latency)
+             × retention_days
+sketch_cost  = agent_cpu_for_sketching
+             + backend_memory_for_live_sketches
+             + backend_storage_for_parts
+             + controller_planning_overhead
+
+materialize_if: sketch_value > sketch_cost
+```
+
+For high-QPS dashboard metrics with high cardinality, `sketch_value`
+easily dominates. For cold metrics or exact-required metrics, it does
+not and the controller should leave them on the exact-DB path only.
+
+### 19.8 Summary
+
+| Dimension | Sketch DB advantage at 100 ms scrape |
+|---|---|
+| Aggregate queries (quantile, top-K, cardinality) | **10³–10⁶×** faster, often enabling queries TSDB can't serve |
+| Storage for high-QPS metrics with grouping | **~10⁴× smaller** than raw TSDB |
+| Short-window live queries with many sub-windows | **100–1000×** via Tier 1 EH locality |
+| Agent → backend bandwidth | **~10–100×** via edge sketching |
+| Point reads, exact queries, ad-hoc exploration | **0 or negative** — sketch DB defers to exact DB |
+| Low-QPS / cold metrics | **Negative** — cost of materialization exceeds saving |
+
+The sketch DB is therefore best understood as an **accelerator** over
+the exact DB rather than a replacement: it carries the 90 % of query
+traffic that fits its design pattern at orders-of-magnitude lower
+cost, and relies on the exact DB for the remaining 10 % where
+sketching has no advantage. This dual-role architecture is why the
+exact DB is modeled as both the refresh source (§10) and the query
+fallback target (§7.3) — the same storage serving two purposes.
