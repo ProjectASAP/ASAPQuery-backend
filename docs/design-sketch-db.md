@@ -98,7 +98,7 @@ backend is configured — S3/Gorilla, Prometheus, ClickHouse, etc.).
 | Schema evolution | §6 per-`agg_id` lifecycle, §7 schema timeline |
 | `DROP MATERIALIZED VIEW` | Retirement + expiry |
 | `REFRESH MATERIALIZED VIEW` | Backfill job from exact DB |
-| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §12 controller APIs |
+| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §15 controller APIs |
 | Index on the MV for faster queries | Label postings index (§5.3), typed aux columns (§5.1) |
 
 The rest of this doc splits into two halves, mirroring the two standard
@@ -141,18 +141,21 @@ The section numbers below apply to the rest of the document after the
 MV framing is established:
 
 - §3 Design principles
-- §4 Architecture
+- §4 Architecture (§4.1 storage tiers)
 - §5 Storage schema
 - §6 Per-`agg_id` schema and its lifetime
 - §7 Schema timeline
 - §8 Incremental view maintenance (live ingest)
 - §9 Semantic compaction
 - §10 Refreshable view maintenance (backfill)
-- §11 Full reconfigure workflow
-- §12 API surface
-- §13 Implementation phases
-- §14 Relationship to the hot-reload PR
-- §15 Open questions
+- §11 Admission control and isolation
+- §12 Observability and debugging
+- §13 Rollout and migration
+- §14 Full reconfigure workflow
+- §15 API surface
+- §16 Implementation phases
+- §17 Relationship to the hot-reload PR
+- §18 Open questions
 
 ### 3.1 Principles
 
@@ -286,7 +289,7 @@ Unifying them as tiers of one DB means:
 
 - One schema lifecycle (§6) covers both tiers; a tier upgrade is a
   regular reconfigure.
-- One controller API surface (§12) exposes stats across tiers.
+- One controller API surface (§15) exposes stats across tiers.
 - One refresh path (§10) can write to either tier.
 - The query engine's routing logic (§7.3 per-segment dispatch) picks
   tier by the same mechanism it picks `agg_id` — the schema timeline
@@ -904,7 +907,7 @@ cost_of_fallback = expected_queries_to_exact_DB_during_retention
 if cost_of_fallback > cost_of_refresh: trigger refresh
 ```
 
-The `/api/v1/db/cost_estimate` endpoint (§12) is what the controller
+The `/api/v1/db/cost_estimate` endpoint (§15) is what the controller
 asks to get each side of this inequality.
 
 ### 10.7 Relationship to classical MV refresh
@@ -936,7 +939,311 @@ BackfillInProgress), and the query engine handles the split per
 
 ---
 
-## 11. The full reconfigure workflow
+## 11. Admission control and isolation
+
+The sections above treat the sketch DB as if memory, CPU, and I/O were
+unbounded. Production deployments are the opposite — a noisy agg_id
+must not be able to starve others. This section enumerates what has to
+be in place for tier storage and backfill to be production-safe.
+
+### 11.1 Per-`agg_id` quotas
+
+Each `AggSchema` carries quota limits that the store enforces at write
+time:
+
+```rust
+struct AggQuotas {
+    max_group_states: u64,     // hard cap on distinct (agg_id, group_key) pairs
+    max_bytes_in_memory: u64,  // hard cap on live sketch bytes (Tier 1 + Tier 2 memtable)
+    max_write_qps: u32,        // write-rate limit (token bucket)
+}
+```
+
+Today's `persistence_memory_limit_mb` is a **global** cap; the design
+moves it to per-agg so one misconfigured high-cardinality agg can't
+evict everyone else's hot windows.
+
+### 11.2 What happens when quotas are hit
+
+Policy is per-agg, set by the controller:
+
+| Policy | Semantics | When to use |
+|---|---|---|
+| `Reject` | New group writes return error; existing groups continue | Exact-correctness metrics; controller can react by upgrading quota or retiring the agg |
+| `EvictLRU` | Least-recently-written group is dropped to make room | Dashboard metrics; losing old groups is acceptable |
+| `Downsample` | Reduce sketch resolution in-place (e.g. halve CMS width) | When accuracy can degrade but coverage must continue |
+| `Backpressure` | Return a retry-after signal to the ingest source | Coordinates with upstream — DataCollector can slow its emit cadence |
+
+The write barrier (`is_writable`) extends to check quota, not just
+schema existence.
+
+### 11.3 High-cardinality GroupState idle eviction
+
+Even within a quota, stale `GroupState` shells accumulate. A
+`group_by=[user_id]` agg might see a user once then never again; the
+current code keeps that empty GroupState forever.
+
+Proposal: after every flush tick, evict `GroupState` entries whose
+`previous_watermark_ms` is older than `idle_timeout` and whose pane
+maps are empty. Next write to that `(agg_id, group_key)` recreates
+a fresh state.
+
+```rust
+fn evict_idle_groups(&mut self, now_ms: i64) {
+    let idle_cutoff = now_ms - self.idle_timeout_ms;
+    self.group_states.retain(|_, gs| {
+        !gs.active_panes.is_empty()
+         || !gs.sketch_panes.is_empty()
+         || gs.previous_watermark_ms > idle_cutoff
+    });
+}
+```
+
+This is cheap (one HashMap scan per flush tick) and orthogonal to
+the `evict_orphaned_groups` introduced in PR #16.
+
+### 11.4 Live vs backfill isolation
+
+§10.3 already covers separate worker pools. Additional requirements:
+
+- **CPU share**: live ingest has hard latency SLA; backfill is
+  latency-tolerant. Use OS priority or a cgroup per pool, not just
+  thread count.
+- **Exact-DB rate limiting**: a backfill job that scans 24h of
+  Prometheus data can hit the Prom server hard enough to degrade
+  live ingest (if both use the same Prom). Backfill reader must
+  implement a configurable bytes/sec ceiling.
+- **Backfill concurrency ceiling**: total concurrent backfill jobs
+  across all aggs, not just per-agg. 100 simultaneously-upgrading
+  metrics = 100 backfill jobs = potential write storm.
+
+### 11.5 Global reservations
+
+Some resources are inherently shared and need a global allocator:
+
+- **Memory budget** for Tier 2 memtable + cache: 80% for live ingest,
+  20% reserved for backfill (tunable). Backfill blocked if its
+  share is full.
+- **Disk budget** for Tier 2 parts: a high-water mark triggers
+  accelerated TTL sweep or refuses new writes.
+- **Exact-DB read budget**: per-deployment cap on bytes-per-second
+  read from the exact DB across all backfill jobs.
+
+These are hard caps. The controller treats them as signals for
+planning (e.g. don't plan a backfill if the exact-DB read budget is
+saturated by other ongoing jobs).
+
+---
+
+## 12. Observability and debugging
+
+A storage engine without visibility is unusable in production. This
+section enumerates what must be observable and through what surface.
+
+### 12.1 Metrics (Prometheus endpoint)
+
+The sketch DB exposes a `/metrics` endpoint with per-agg_id labels:
+
+```
+sketch_db_writes_total{agg_id, tier, origin}
+sketch_db_query_latency_seconds{agg_id, statistic}    (histogram)
+sketch_db_query_coverage_ratio{agg_id}                 (fraction served from sketch)
+sketch_db_parts_total{agg_id, level}
+sketch_db_bytes_stored{agg_id, tier}
+sketch_db_group_states{agg_id, worker_id}
+sketch_db_compaction_lag_seconds{agg_id}
+sketch_db_backfill_duration_seconds{agg_id}            (histogram)
+sketch_db_backfill_bytes_read_total{agg_id, source}
+sketch_db_quota_exceeded_total{agg_id, policy}
+sketch_db_schema_transitions_total{from_status, to_status}
+```
+
+These feed both the Prometheus operator dashboard and the
+controller's `/api/v1/db/stats/*` endpoints (the controller reads
+aggregates across metrics; operators want per-instance detail).
+
+### 12.2 Distributed tracing
+
+A query from user → query engine → sketch DB → tier storage →
+possibly exact-DB fallback crosses multiple components. Trace
+context (W3C Trace Context) propagates on each hop:
+
+```
+Span: http_query (query engine entry)
+  └─ Span: find_schema_timeline
+  └─ Span: per_segment_dispatch
+       ├─ Span: tier1_query (PromSketch)
+       └─ Span: tier2_query (SimpleMapStore)
+            ├─ Span: part_scan
+            └─ Span: sketch_merge
+  └─ Span: combine_statistic
+```
+
+OpenTelemetry exporter → any OTLP-compatible backend. The backend's
+own ingest path is the natural target so the traces land alongside
+the metrics.
+
+### 12.3 Structured audit log
+
+Lifecycle events are logged at INFO with structured fields:
+
+```json
+{"event": "schema_create",      "agg_id": 17, "metric": "latency", "sketch_type": "KLL", "params": {...}}
+{"event": "schema_retire",      "agg_id": 1,  "retired_at": "...", "expires_at": "..."}
+{"event": "config_swap",        "added": [17], "removed": [1], "by": "controller-a"}
+{"event": "backfill_start",     "job_id": 5,  "agg_id": 17, "time_range": [...], "source": "S3Gorilla"}
+{"event": "backfill_complete",  "job_id": 5,  "windows_done": 8640, "duration_s": 47.2}
+{"event": "quota_exceeded",     "agg_id": 42, "policy": "EvictLRU", "evicted_group": "..."}
+{"event": "orphan_eviction",    "worker_id": 3, "agg_id": 1, "evicted_count": 1248}
+```
+
+This log is the forensic ground truth when something looks weird in
+metrics.
+
+### 12.4 Debug APIs
+
+For on-call inspection:
+
+```
+GET /api/v1/db/debug/entry/{agg_id}/{group_key}/{window_start}
+  → raw SketchEntry (schema-validated)
+
+GET /api/v1/db/debug/coverage_map/{agg_id}
+  → full list of (range, Coverage) for this agg
+     (shows Native / Backfilled / BackfillInProgress / Missing)
+
+GET /api/v1/db/debug/parts/{agg_id}
+  → list of parts for this agg with (level, min_ts, max_ts, bytes)
+
+GET /api/v1/db/debug/backfill_diff
+  body: { agg_id, time_range }
+  → compare what's in the store vs what a refresh from the exact DB
+    would produce, without actually writing. Useful for catching
+    drift between incremental and refresh paths.
+```
+
+The last one is particularly valuable — if live and refresh disagree,
+the diff tells you which segments and by how much.
+
+### 12.5 Query plan explain
+
+Similar to `EXPLAIN` in SQL:
+
+```
+POST /api/v1/query?explain=true
+  body: { metric, range, statistic }
+  → {
+      timeline_segments: [(agg_id, time_range, tier)],
+      coverage_per_segment: [...],
+      merge_plan: [...],
+      fallback_segments: [...],
+      estimated_latency_ms: ...,
+    }
+```
+
+Operators and the controller use this to understand why a query
+went where it went.
+
+---
+
+## 13. Rollout and migration
+
+Every phase in §16 (implementation phases) crosses a live deployment.
+This section lists the invariants that let each phase roll out
+incrementally without breaking existing users.
+
+### 13.1 Feature flags
+
+Each phase gets a feature flag, off by default:
+
+```rust
+struct SketchDbFeatures {
+    typed_aux_columns_enabled: bool,    // Phase 1
+    schema_barrier_enabled: bool,        // Phase 2
+    metric_routing_enabled: bool,        // Phase 3
+    semantic_compaction_enabled: bool,   // Phase 4
+    backfill_enabled: bool,              // Phase 5
+    metadata_apis_enabled: bool,         // Phase 6
+    postings_index_enabled: bool,        // Phase 7
+}
+```
+
+Flipping a flag takes effect on the next write or query; no restart.
+A flag-off rollback is always safe — the old code paths stay compiled
+in and active when the corresponding flag is disabled.
+
+### 13.2 Shadow mode
+
+For Phases 1, 3, and 5 specifically, the new path can run in shadow:
+compute the new answer alongside the old, diff the two, log
+discrepancies, but return the old answer. Runs in production with
+zero risk until enough confidence to flip the flag.
+
+```rust
+let old = old_path.query_range(...);
+if features.shadow_mode_enabled {
+    let new = new_path.query_range(...);
+    metrics.shadow_diff(old, new);  // histogram of abs error
+}
+old
+```
+
+Shadow mode is also how we **validate Phase 5's deterministic
+rebuild claim**: continuously compare a backfill output against live
+incremental output for the same metric and assert the sketches are
+within-accuracy equivalent.
+
+### 13.3 Part format versioning
+
+Phases 1, 2, 4, 7 change the on-disk part format. Each introduces a
+`format_version: u16` field in the part header:
+
+```
+v1: count/sum/min/max as inline aux columns (Phase 1)
+v2: + schema metadata + origin tag (Phase 2)
+v3: + level metadata (Phase 4)
+v4: + label postings section (Phase 7)
+```
+
+Readers dispatch on version. For forward compat: unknown fields in
+a future version's part are skipped (protobuf-style). For backward
+compat: at least two consecutive major versions are readable; older
+parts age out via normal TTL.
+
+### 13.4 Migration of existing deployments
+
+**Schema bootstrap at Phase 2 rollout**: existing deployments don't
+have `AggSchema` records. First startup after the upgrade:
+
+1. Read current `StreamingConfig`.
+2. For each `agg_id` in config, create an `AggSchema` with
+   `created_at = now`, `status = Active`.
+3. Persist to the schema store.
+
+**Historical part interpretation**: old parts don't have origin tags.
+Treat missing origin as `Native` (conservative — old data was never
+backfilled).
+
+**Coverage reconstruction** (at Phase 5 rollout): on startup, scan
+existing parts per agg to populate the initial Coverage map. Slower
+startup but one-time.
+
+### 13.5 Rollback strategy
+
+Each phase must be independently rollback-safe:
+
+- **Forward flag off → backward compat** is the baseline: the new
+  code doesn't run, old code still works.
+- **Backward compat of persisted state**: if Phase 2 created schema
+  records and Phase 2 then gets rolled back, the schema records
+  remain on disk but are ignored. They don't corrupt the old path.
+- **Phased-format parts stay readable** after rollback: a v2 part
+  written while Phase 2 was on is still readable by v1-only code
+  (the v2-specific fields are skipped).
+
+---
+
+## 14. The full reconfigure workflow
 
 ```
 T=0:     Config = {1: CMS(256)}
@@ -999,7 +1306,7 @@ wherever it left off by reading `/api/v1/db/schemas`.
 
 ---
 
-## 12. API surface
+## 15. API surface
 
 ### 10.1 Query-engine-facing API
 
@@ -1104,7 +1411,7 @@ can run cost-based optimization with real observations.
 
 ---
 
-## 13. Implementation phases
+## 16. Implementation phases
 
 This design is intentionally larger than one PR. Suggested rollout:
 
@@ -1147,7 +1454,7 @@ else builds on them. Phases 4–7 are optimizations.
 
 ---
 
-## 14. Relationship to the hot-reload PR (PR #16)
+## 17. Relationship to the hot-reload PR (PR #16)
 
 PR #16 gets the runtime-reload machinery right: `ArcSwap` is shared,
 all consumers read the current config at the same instant, orphaned
@@ -1179,7 +1486,7 @@ program of work.
 
 ---
 
-## 15. Open questions
+## 18. Open questions
 
 1. **Where do backfill-source hash seeds live?** To make Backfilled
    sketches byte-identical to what live ingest would have produced,
@@ -1222,3 +1529,62 @@ program of work.
    one schema lifecycle, one controller API surface, one refresh
    path, and one query-engine routing layer. The controller picks
    per-`agg_id` whether to materialize into Tier 1, Tier 2, or both.
+
+7. **Agent clock skew.** `time_unix_nano` on every sample is
+   agent-local. Agents with skewed clocks produce windows that don't
+   align across agents; cross-agent merge silently blends samples
+   that fall into different "real" time buckets. Worse, skew is
+   frozen into both live sketches and exact-DB data, so even refresh
+   doesn't fix it. Open questions: should the backend reject or
+   correct samples with timestamps too far from wall clock? Should
+   skew be surfaced as per-agent metadata the controller can see?
+   Probably a hard NTP-sync requirement on agents with metrics
+   exposing skew per agent.
+
+8. **Controller state and HA.** The monotonic `aggregation_id`
+   counter has to live somewhere that survives controller restarts.
+   Options: controller persists its own state (requires a DB for
+   the controller); controller reads `max(agg_id)` from backend's
+   `/api/v1/db/schemas` at startup (simple but needs CAS for
+   multi-controller-replica HA to avoid two controllers allocating
+   the same id). Also: who wins if two controllers disagree on
+   what the current `StreamingConfig` should be? Leader election
+   or backend-side CAS is needed before HA is viable. This is out
+   of scope for the sketch DB itself but affects the design
+   contract.
+
+9. **Timezone semantics for window boundaries.** All internal code
+   uses Unix epoch. User PromQL queries like
+   `quantile_over_time(m[1d]) by (day)` have an implicit "what is
+   a day?" — strict 24h vs calendar day with DST transitions. The
+   invariant in this design: **windows are Unix-epoch fixed
+   intervals**, no calendar alignment. If a UI needs calendar-aware
+   bucketing, it does so at the query-engine layer by aligning
+   query start times to local midnight.
+
+10. **PII / information leak via sketches and metadata.** CMS +
+    heap implicitly exposes high-frequency label values (e.g.
+    topk users). HLL cardinality is a sensitive metric in
+    privacy-regulated contexts. The
+    `/api/v1/db/debug/entry/*` APIs return raw sketch bytes that
+    a skilled user might mine. Open: do we need per-metric PII
+    tags that disable some debug APIs or redact label values in
+    TopK output? Probably deferred until multi-tenancy is needed.
+
+11. **Multi-tenancy.** The design assumes a single trust domain
+    (one operator, one set of metrics). In a shared deployment:
+    per-tenant quotas, per-tenant access control on
+    `/api/v1/db/*` endpoints, per-tenant archive buckets, per-
+    tenant billing. All doable but substantial work. Keeping
+    single-tenant is a reasonable v1; the design should not
+    preclude later multi-tenancy (specifically, `AggSchema`
+    should be extensible with a `tenant_id` field without a
+    format migration).
+
+12. **Replication and cross-region HA.** Currently the sketch DB
+    is single-writer. Read replicas (hot standby that ingests
+    the WAL of new parts) are straightforward. Multi-writer
+    (active-active across regions) is not — incremental MV
+    maintenance with distributed writers requires consensus on
+    window boundaries, which is a separate design effort. For
+    now: single-writer, use a DR replica as fallback.
