@@ -18,6 +18,14 @@ use query_engine_rust::{
     SimpleMapStore, StoreOutputSink,
 };
 
+/// Wire protocol selector for `--controller-endpoint`. See the flag
+/// doc in `Args` for semantics.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ControllerProtocolCli {
+    Generic,
+    Datacollector,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -62,6 +70,14 @@ struct Args {
     /// Example: `http://controller.svc:8080/api/v1/plan`
     #[arg(long)]
     controller_endpoint: Option<String>,
+
+    /// Wire protocol for `--controller-endpoint`. `generic` (default)
+    /// POSTs the backend-native `CapabilityMissPayload` and expects a
+    /// controller with a matching endpoint; `datacollector` translates
+    /// each notification into a DC `QuerySpec` and POSTs to the DC
+    /// controller's `/api/v1/plan`.
+    #[arg(long, value_enum, default_value = "generic")]
+    controller_protocol: ControllerProtocolCli,
 
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
@@ -366,16 +382,23 @@ async fn main() -> Result<()> {
         );
         if let Some(controller_endpoint) = args.controller_endpoint.as_ref() {
             info!(
-                "Capability-miss notifications enabled → {}",
-                controller_endpoint
+                "Capability-miss notifications enabled → {} (protocol={:?})",
+                controller_endpoint, args.controller_protocol
             );
             let client: Arc<
                 dyn query_engine_rust::drivers::query::controller_client::ControllerClient,
-            > = Arc::new(
-                query_engine_rust::drivers::query::controller_client::HttpControllerClient::new(
-                    controller_endpoint.clone(),
+            > = match args.controller_protocol {
+                ControllerProtocolCli::Generic => Arc::new(
+                    query_engine_rust::drivers::query::controller_client::HttpControllerClient::new(
+                        controller_endpoint.clone(),
+                    ),
                 ),
-            );
+                ControllerProtocolCli::Datacollector => Arc::new(
+                    query_engine_rust::drivers::query::controller_client::DcControllerClient::new(
+                        controller_endpoint.clone(),
+                    ),
+                ),
+            };
             engine = engine.with_controller_client(client);
         } else {
             info!(
