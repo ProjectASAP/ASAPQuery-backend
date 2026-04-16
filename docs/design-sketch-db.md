@@ -32,12 +32,120 @@ What's needed is a storage engine that treats sketches as first-class typed
 values with per-type merge semantics, tracks schema per aggregation across
 time, and supports refreshing itself from the archive when the schema
 changes. In database terms: the sketches are **materialized views** over
-the Gorilla/S3 archive; the store is a refreshable-MV engine specialized
+the Gorilla/S3 archive; the store is a materialized-view engine specialized
 for sketch types.
 
 ---
 
-## 2. Design principles
+## 2. Sketches as materialized views
+
+This section makes the materialized-view framing explicit, because every
+later section in this doc is easier to reason about if you have the
+classical database analogy in mind.
+
+### 2.1 The view definition
+
+An `AggregationConfig` is a materialized-view *definition*. Expanded:
+
+```sql
+-- Pseudocode for an AggregationConfig that computes a CMS over a metric
+CREATE MATERIALIZED VIEW agg_17 AS
+  SELECT
+      time_bucket(INTERVAL '60 s', ts)        AS window_start,
+      host                                    AS grouping_key,
+      cms_build(value, rows => 3, cols => 1024) AS sketch,
+      count(value)                            AS count,
+      sum(value)                              AS sum,
+      min(value)                              AS min,
+      max(value)                              AS max
+  FROM   raw_samples
+  WHERE  metric = 'latency'
+  GROUP BY 1, 2;
+```
+
+Read off the `AggregationConfig` fields:
+
+| Config field | SQL analog |
+|---|---|
+| `metric` | `WHERE metric = …` in the view definition |
+| `aggregation_type` + `parameters` | the aggregation function (`cms_build(…)`) |
+| `grouping_labels` | `GROUP BY` columns |
+| `aggregated_labels` | the inner keyed dimension of multi-subpopulation aggregators |
+| `window_size` + `slide_interval` | `time_bucket(…)` + windowing |
+| `spatial_filter` | extra `WHERE` clause conditions |
+
+The base relation being materialized over is the stream of raw samples —
+from the live agent stream in the normal case, and from the Gorilla/S3
+archive when the view is being refreshed (§9).
+
+### 2.2 What a materialized view framing buys us
+
+| Classical MV concept | Sketch DB counterpart |
+|---|---|
+| View definition | `AggregationConfig` |
+| Base relation | Raw sample stream (agent ingest + archive) |
+| Materialization | `SketchEntry` rows in `SimpleMapStore` |
+| View maintenance strategy | §8 (incremental) + §9 (refresh) |
+| Schema evolution | §5 per-`agg_id` lifecycle, §6 schema timeline |
+| `DROP MATERIALIZED VIEW` | Retirement + expiry |
+| `REFRESH MATERIALIZED VIEW` | Backfill job from archive |
+| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §10 controller APIs |
+| Index on the MV for faster queries | Label postings index (§4.3), typed aux columns (§4.1) |
+
+The rest of this doc splits into two halves, mirroring the two standard
+MV maintenance strategies:
+
+- **§8. Incremental view maintenance** — the live ingest path, which
+  updates the MV as new samples arrive. This is what the precompute
+  engine already does today; the doc describes how it extends cleanly
+  into a sketch-DB-aware design.
+- **§9. Refreshable view maintenance** — the backfill service, which
+  rebuilds the MV for a time range from the base relation (the archive).
+  This is the piece that makes schema evolution painless.
+
+Both strategies write to the same physical store and the same per-`agg_id`
+namespace. The controller chooses between them based on workload and
+reconfigure cost (§9.5).
+
+### 2.3 Why not just one strategy?
+
+- **Incremental-only** is the status quo. It's cheap (per-sample update
+  cost) but it has no way to handle reconfigure: once the view
+  definition changes, old data in the MV is under the old schema and
+  new data is under the new schema, with a discontinuity at the swap
+  point. Sketches of different types or parameters can't be merged.
+- **Refresh-only** would work but is wasteful. Rebuilding the MV from
+  raw samples at every ingest would throw away the per-sample
+  incremental cost advantage that's the whole point of having
+  agent-side sketching.
+
+Both together: incremental handles the steady state (99% of the time)
+cheaply; refresh handles the rare reconfigure moment. This matches how
+real warehouses deploy MVs — you never choose one maintenance strategy
+forever, you choose per-view and per-situation.
+
+---
+
+## 3. Design principles (numbering scheme for the rest of the doc)
+
+The section numbers below apply to the rest of the document after the
+MV framing is established:
+
+- §3 Design principles
+- §4 Architecture
+- §5 Storage schema
+- §6 Per-`agg_id` schema and its lifetime
+- §7 Schema timeline
+- §8 Incremental view maintenance (live ingest)
+- §9 Semantic compaction
+- §10 Refreshable view maintenance (backfill)
+- §11 Full reconfigure workflow
+- §12 API surface
+- §13 Implementation phases
+- §14 Relationship to the hot-reload PR
+- §15 Open questions
+
+### 3.1 Principles
 
 1. **Per-`aggregation_id` namespace isolation.** Each `agg_id` is its own
    logical namespace with a pinned schema (sketch type, parameters,
@@ -63,7 +171,7 @@ for sketch types.
 
 ---
 
-## 3. Architecture
+## 4. Architecture
 
 ```
              ┌─────────────────────────────────────────────────┐
@@ -120,7 +228,7 @@ for sketch types.
 
 ---
 
-## 4. Storage schema
+## 5. Storage schema
 
 ### 4.1 Per-entry record
 
@@ -201,7 +309,7 @@ lookup.
 
 ---
 
-## 5. Per-`agg_id` schema and its lifetime
+## 6. Per-`agg_id` schema and its lifetime
 
 ### 5.1 `AggSchema` — the pinned metadata
 
@@ -282,7 +390,7 @@ drop the batch.
 
 ---
 
-## 6. Schema timeline — the key to query continuity
+## 7. Schema timeline — the key to query continuity
 
 ### 6.1 What it is
 
@@ -368,9 +476,140 @@ schema-change artifact.
 
 ---
 
-## 7. Semantic compaction
+## 8. Incremental view maintenance — the live ingest path
 
-### 7.1 Level = temporal resolution
+This is the MV maintenance strategy that the precompute engine already
+implements today. The doc is just making explicit what the design is
+and what additions are needed to fit cleanly into the sketch DB.
+
+### 8.1 What "incremental" means for a sketch MV
+
+Each newly-arriving sample (or pre-built short-window sketch from a
+DataCollector processor) is folded into the MV by **merging into the
+accumulator of the matching `(agg_id, group_key, window_start)`**.
+This is exactly the semantics of incremental MV maintenance: the
+change to the base relation (one new sample) propagates to the view
+(one accumulator update) without re-materializing the view.
+
+The key invariant that makes this tractable for sketches is that every
+sketch type the pipeline supports is **mergeable** — the merge
+operation is associative and commutative (modulo accuracy bounds for
+probabilistic sketches), so the MV can be maintained by folding new
+data into open accumulators regardless of order.
+
+### 8.2 The pipeline
+
+```
+ raw sample / pre-built sketch arrives
+             │
+             ▼
+┌────────────────────────────────┐
+│ IngestState                    │
+│   match by metric name         │
+│   snapshot current StreamingConfig │   ← ArcSwap read, ~5ns
+│   for each matching agg_id:    │
+│     build (agg_id, group_key)  │
+│     route to Worker            │
+└─────────┬──────────────────────┘
+          ▼
+┌────────────────────────────────┐
+│ Worker                         │
+│   get_or_create_group_state    │
+│     reads schema from ArcSwap  │
+│     builds Accumulator per the │
+│     MV's view definition       │
+│   accumulate_one(sample)       │    ← incremental update
+│     or merge_with(sketch)      │    ← associative fold
+└─────────┬──────────────────────┘
+          ▼
+┌────────────────────────────────┐
+│ Window close                   │
+│   emit PrecomputedOutput       │
+│   write SketchEntry to store   │
+│     with origin = Native       │
+└────────────────────────────────┘
+```
+
+Every step is O(1) per incoming sample (or O(sketch_size) per
+incoming pre-built sketch). There is no scan of the base relation,
+no re-materialization — pure incremental update.
+
+### 8.3 Window close = MV row emission
+
+The MV model clarifies what "flushing a window" means: it's the
+*emission of an MV row*. The window manager determines when the row
+is finalized; once finalized, the row is immutable in the store and
+subject to further transformation only by semantic compaction (§9)
+or by the full-refresh path (§10) replacing it. The MV row carries:
+
+- The grouping key values (matches the MV's `GROUP BY` columns)
+- The window bounds (matches `time_bucket(…)`)
+- The aggregated sketch (the `agg_fn(…)` output)
+- The typed aux columns `count`/`sum`/`min`/`max` (covering pre-aggregated
+  scalar queries without touching the sketch)
+- `origin: Native` (distinguishes from Refresh-produced rows; see §10)
+
+### 8.4 Watermark and lateness policy
+
+Incremental MV maintenance against a streaming base relation has the
+classical late-data problem: a sample arrives whose timestamp places
+it in a window that has already been flushed. The current
+`allowed_lateness_ms` and `LateDataPolicy` knobs implement a bounded
+out-of-orderness policy: samples up to `watermark - allowed_lateness`
+fold into open accumulators; older samples trigger the configured
+policy (`Drop` or `ForwardToStore`).
+
+In MV terms, this is the trade-off between "eventual MV consistency
+with late-arriving base data" and "bounded MV commit latency." The
+default (`Drop`) chooses bounded latency; `ForwardToStore` chooses
+eventual consistency. A real sketch DB should surface this trade-off
+as per-`AggSchema` policy rather than a global knob — some MVs need
+strict correctness (financial / regulatory), some tolerate drops
+(dashboards).
+
+### 8.5 Interaction with reconfigure
+
+Because the worker's schema lookup (in `get_or_create_group_state`)
+reads the current `StreamingConfig` from ArcSwap on each
+first-time-seen `(agg_id, group_key)` pair, the incremental path
+transparently picks up newly-created `agg_id`s the moment they are
+added to the config. This is what PR #16 delivers.
+
+What the incremental path **cannot** do alone is fill in the MV
+retroactively — once a window is closed under agg_id=1, it will never
+be populated under agg_id=17, even if agg_id=17's view definition
+would have produced a different row for that window. Populating the
+new `agg_id` for historical windows is the job of the full-refresh
+path (§10).
+
+### 8.6 What's missing for a sketch-DB-grade incremental path
+
+Most of the infrastructure is already there via the precompute
+engine. The sketch-DB additions on top of it:
+
+- **Typed aux columns** (§5.1) on every flushed entry, not just the
+  sketch bytes. Already trivial to add; the processors already have
+  `count`/`sum`/`min`/`max` in the typed OTLP fields.
+- **`origin: Native` / `origin: Backfilled { job_id }` provenance
+  tagging** to distinguish rows produced by incremental maintenance
+  from rows produced by refresh. Needed to reason about coverage
+  (§10.4) and for idempotent re-runs.
+- **Schema-validating write barrier** (§6.3) enforcing that the
+  incoming write matches the target `agg_id`'s pinned schema. Today
+  the write path implicitly trusts the router; the sketch DB makes
+  the schema contract explicit at store entry.
+- **Per-`agg_id` label postings update** as new group_key values
+  appear (§5.3). Trivial — incremental update to a Roaring bitmap
+  per first-seen group_key.
+
+None of these change the fundamental data flow; they make the
+incremental MV maintenance contract observable and enforceable.
+
+---
+
+## 9. Semantic compaction
+
+### 9.1 Level = temporal resolution
 
 ```
 Level 0:  10s windows   (live ingest writes here)
@@ -389,7 +628,7 @@ Query cost scales with level: "last 1h" reads a level-2 entry; "last
 30 days" reads 30 level-4 entries. The coarsest level is bounded by
 `retention`.
 
-### 7.2 Compaction policy per `AggStatus`
+### 9.2 Compaction policy per `AggStatus`
 
 ```rust
 fn compaction_policy(schema: &AggSchema) -> Policy {
@@ -408,7 +647,7 @@ queries), but once an agg is within hours of expiry, compacting it
 further is wasted CPU. We gracefully unwind compaction as retirement
 approaches.
 
-### 7.3 No cross-`agg_id` compaction, ever
+### 9.3 No cross-`agg_id` compaction, ever
 
 This is a hard invariant. Different agg_ids have different schemas and
 their sketches are not generally mergeable. Compaction always groups
@@ -416,9 +655,14 @@ entries by `(agg_id, group_key)` and merges only within that.
 
 ---
 
-## 8. Backfill — treating sketches as refreshable views
+## 10. Refreshable view maintenance — the backfill path
 
-### 8.1 The core insight
+Where §8 describes how the MV is maintained as new base data arrives,
+this section describes how the MV is **re-materialized** from the base
+relation on demand. In SQL terms: `REFRESH MATERIALIZED VIEW agg_17
+FOR PERIOD (now - 24h, now) FROM s3_archive`.
+
+### 10.1 The core insight
 
 Because the archive lane keeps raw data losslessly, we can rebuild any
 sketch for any time range from the archive. A reconfigure that breaks
@@ -443,7 +687,7 @@ After backfill, id=17 covers the full query horizon. The user's query
 "last 24h" is fully served from a single sketch, with a consistent
 schema.
 
-### 8.2 Backfill job model
+### 10.2 Backfill job model — a REFRESH transaction
 
 ```rust
 struct BackfillJob {
@@ -478,7 +722,7 @@ enum BackfillStatus {
 }
 ```
 
-### 8.3 Backfill is a separate worker pool
+### 10.3 Refresh is a separate worker pool
 
 Live ingest and backfill must not starve each other:
 
@@ -494,7 +738,7 @@ but via a distinct `write_backfilled_window()` entry point that
 bypasses `WindowManager` (the window is already closed, we're just
 populating it).
 
-### 8.4 Coverage tracking
+### 10.4 Coverage tracking
 
 ```rust
 enum Coverage {
@@ -513,7 +757,7 @@ fn coverage(&self, agg_id: u64, range: (u64, u64)) -> Coverage
 Cached in memory keyed by `agg_id`, updated as Native writes land and
 as Backfill jobs complete.
 
-### 8.5 Deterministic rebuild
+### 10.5 Deterministic rebuild
 
 For backfill to produce "the same sketch we would have built live,"
 the sketch construction must be deterministic. That means:
@@ -531,9 +775,64 @@ the sketch construction must be deterministic. That means:
 This is an invariant the Gorilla processor / S3 exporter must
 guarantee. Not hard, but it has to be designed in.
 
+### 10.6 When to use incremental vs refresh
+
+The two maintenance strategies (§8, §10) are not alternatives — they
+cover different situations and the controller should pick per
+situation.
+
+| Situation | Strategy | Why |
+|---|---|---|
+| Steady-state live ingest | Incremental (§8) | O(1) per sample, no scan of base relation |
+| New `agg_id` created, no historical need | Incremental only | Nothing to refresh from |
+| New `agg_id` created, need query continuity across the reconfigure | Incremental **+** Refresh from archive over the query horizon | Incremental covers \[now, future\]; refresh covers \[now-horizon, now\] |
+| Recovery from a store corruption or a bug in past sketch builds | Refresh | MV is known wrong; rebuild authoritatively from base |
+| Onboarding a metric with historical raw data already in archive | Refresh only (until catches up), then Incremental | Much cheaper than streaming a week of archive through the live ingest path |
+| Metric with very low query rate, reconfigure | Incremental only, fall back to exact DB for historical queries | Refresh cost > fallback cost at low QPS |
+
+The controller decides by comparing estimated costs:
+
+```
+cost_of_refresh = archive_bytes_to_scan * s3_read_$
+                + cpu_seconds * cpu_$
+cost_of_fallback = expected_queries_to_exact_DB_during_retention
+                 * query_latency * query_$
+if cost_of_fallback > cost_of_refresh: trigger refresh
+```
+
+The `/api/v1/db/cost_estimate` endpoint (§12) is what the controller
+asks to get each side of this inequality.
+
+### 10.7 Relationship to classical MV refresh
+
+Warehouses have two common refresh modes:
+
+- **`REFRESH MATERIALIZED VIEW` (blocking)** — the MV is locked, its
+  contents replaced, readers wait. Not viable here: the MV is being
+  actively queried by dashboards.
+- **`REFRESH MATERIALIZED VIEW CONCURRENTLY`** — rebuild into a
+  shadow table, atomic swap when done. Readers see the old version
+  until the swap.
+
+This design is closer to the *concurrent* model, with a twist:
+refresh is scoped to a time range, not the whole MV. Until a refresh
+job completes, the query engine serves the covered portion from the
+not-yet-refreshed state (which may be a different `agg_id`, or may
+be partial `Native` coverage) and the uncovered portion via
+fallback. After the swap (marking the range as `BackfillComplete`),
+queries transparently start reading the refreshed data.
+
+Unlike a warehouse's `CONCURRENTLY REFRESH`, the refresh here is
+**incremental per window**, not all-or-nothing per MV. A job writing
+24 hours of backfilled KLL entries can mark each 10-second window
+complete independently. Queries that straddle the in-progress
+boundary see a split coverage map (some windows Complete, some
+BackfillInProgress), and the query engine handles the split per
+§7.3's per-segment dispatch.
+
 ---
 
-## 9. The full reconfigure workflow
+## 11. The full reconfigure workflow
 
 ```
 T=0:     Config = {1: CMS(256)}
@@ -596,7 +895,7 @@ wherever it left off by reading `/api/v1/db/schemas`.
 
 ---
 
-## 10. API surface
+## 12. API surface
 
 ### 10.1 Query-engine-facing API
 
@@ -701,7 +1000,7 @@ can run cost-based optimization with real observations.
 
 ---
 
-## 11. Implementation phases
+## 13. Implementation phases
 
 This design is intentionally larger than one PR. Suggested rollout:
 
@@ -744,7 +1043,7 @@ else builds on them. Phases 4–7 are optimizations.
 
 ---
 
-## 12. Relationship to the hot-reload PR (PR #16)
+## 14. Relationship to the hot-reload PR (PR #16)
 
 PR #16 gets the runtime-reload machinery right: `ArcSwap` is shared,
 all consumers read the current config at the same instant, orphaned
@@ -776,7 +1075,7 @@ program of work.
 
 ---
 
-## 13. Open questions
+## 15. Open questions
 
 1. **Where do backfill-source hash seeds live?** To make Backfilled
    sketches byte-identical to what live ingest would have produced,
