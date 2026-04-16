@@ -1,37 +1,79 @@
 //! Hot-reloadable `StreamingConfig` state.
 //!
 //! Wraps a shared `StreamingConfig` in `arc_swap::ArcSwap` so an
-//! external controller (or a test harness) can push a new config at
-//! runtime via `POST /api/v1/streaming-config` without restarting the
-//! query engine binary. Phase 1 of the StreamingConfig hot-reload
-//! effort (ASAPQuery PR E).
+//! external controller can push a new config at runtime via
+//! `POST /api/v1/streaming-config` without restarting the query
+//! engine binary.
 //!
-//! ## Contract (phase 1)
+//! ## How the pieces see the swap
 //!
-//! * **Writes** — atomic via `ArcSwap::store`. The write side is
-//!   lock-free; readers that hold a stale snapshot finish their work
-//!   with the old config and drop it when the last reference goes
-//!   out of scope (standard `Arc` refcounting).
-//! * **Reads for query execution** — `SimpleEngine` takes a long-lived
-//!   startup snapshot today and does not yet re-snapshot per query.
-//!   That is tracked as a **phase 2** follow-up; see the "What's NOT
-//!   hot-reloaded yet" section of the PR description.
-//! * **Reads for the control plane** — the `GET /api/v1/streaming-config`
-//!   debug endpoint always reflects the latest swapped config, so
-//!   integration tests and operators can verify a push landed.
-//! * **In-flight worker state** — precompute workers hold per-`(agg_id,
-//!   group_key)` `GroupState` objects whose `Arc<AggregationConfig>`
-//!   was cloned at group creation time. Those in-flight windows
-//!   continue with their construction-time config and flush normally;
-//!   new groups created after the swap pick up the new config. This
-//!   yields correct semantics for the common controller use case
-//!   (adding a new agg_id, or adjusting parameters that only take
-//!   effect on the next window) without draining open windows.
+//! All three readers share clones of the same `HotReloadStreamingConfig`
+//! handle (internally `Arc<ArcSwap<StreamingConfig>>`), so they
+//! observe the swap at the same instant:
 //!
-//! Removing an `agg_id` mid-window is the one case where phase 1 is
-//! visibly incomplete — existing groups for that id continue ingesting
-//! until they close naturally. The `POST` handler logs a warning when
-//! a swap removes agg_ids that currently have live state.
+//! * **Writes** — atomic via `ArcSwap::store`. Lock-free; readers that
+//!   hold a stale snapshot finish their work with the old config and
+//!   drop it when the last reference goes out of scope.
+//! * **SimpleEngine** — re-snapshots per query
+//!   (`streaming_config_snapshot()`). New aggregations are
+//!   query-matchable immediately after the swap lands.
+//! * **IngestState** — re-snapshots per ingest batch
+//!   (`config_snapshot()`). New aggregations start receiving data on
+//!   the next batch.
+//! * **Precompute workers** — read the handle directly in
+//!   `get_or_create_group_state()`. No message passing, no polling;
+//!   new agg_ids are visible the moment a worker tries to create a
+//!   `GroupState` for them.
+//!
+//! ## Config-upgrade contract for the controller
+//!
+//! The recommended way for a controller to upgrade a metric's sketch
+//! parameters (or aggregation type) is **monotonic, non-reused
+//! `aggregation_id`s plus time-based retention**:
+//!
+//! 1. Controller decides to upgrade, e.g. `CMS(width=256)` →
+//!    `CMS(width=1024)` for `test_metric`.
+//! 2. Controller allocates a **new** `aggregation_id` (never reused),
+//!    e.g. the old id was 1, the new id is 17.
+//! 3. Controller POSTs a new `StreamingConfig` where the old id is
+//!    **removed** and the new id is **added**:
+//!    - before: `{1: CMS(width=256)}`
+//!    - after:  `{17: CMS(width=1024)}`
+//! 4. What happens on the backend, with zero additional code:
+//!    - `IngestState` stops routing data to agg_id 1 and starts
+//!      routing to agg_id 17 (metric-name match unchanged).
+//!    - Workers evict the now-orphaned `GroupState` entries for
+//!      agg_id 1 after their last windows drain
+//!      (`evict_orphaned_groups`).
+//!    - New `GroupState` entries for agg_id 17 are created on
+//!      demand, with the new `CMS(width=1024)` parameters.
+//!    - Store entries under agg_id 1 are **not deleted** on the
+//!      config swap; they persist until `persistence_delete_older_than_secs`
+//!      retention elapses, at which point the persistence layer's
+//!      time-based TTL sweep drops the corresponding parts.
+//! 5. Query semantics during the transition:
+//!    - Before the swap: `SimpleEngine` matches against agg_id 1.
+//!    - After the swap: `SimpleEngine` matches against agg_id 17.
+//!      Historical data in the store under agg_id 1 is not joined
+//!      into the answer; the new sketch warms up from zero.
+//!    - Callers that need query continuity across parameter changes
+//!      should implement an overlap period at the controller (keep
+//!      both ids in the config long enough for the new id to accrue
+//!      enough history) — this is a controller-side concern, not a
+//!      backend one.
+//!
+//! ## What the contract requires from the controller
+//!
+//! * Assign `aggregation_id`s from a monotonically-increasing counter.
+//! * Never reuse an `aggregation_id` after it has been removed from
+//!   a `StreamingConfig` push.
+//! * Rely on the backend's `persistence_delete_older_than_secs` for
+//!   store cleanup — do not try to explicitly delete old agg_id data.
+//!
+//! Violating "never reuse" is safe in terms of correctness (the
+//! backend creates a fresh `GroupState` either way), but it can
+//! produce confusing store states where data under the same agg_id
+//! spans multiple parameter generations.
 
 use std::sync::Arc;
 
