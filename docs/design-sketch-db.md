@@ -252,11 +252,20 @@ systems** — they are tiers of the same sketch DB. Which tier an
 `agg_id` lives on is part of its `AggSchema`, configurable by the
 controller.
 
-| Tier | Implementation | Retention | Query latency | Use case |
-|---|---|---|---|---|
-| **Tier 1** | PromSketch — in-memory exponential histograms over raw samples | seconds to minutes (bounded by memory) | sub-millisecond | live dashboards, quick-refresh panels, alerts |
-| **Tier 2** | Precompute engine + `SimpleMapStore` LSM parts (memory + disk) | minutes to weeks (bounded by `persistence_delete_older_than_secs`) | milliseconds | most production queries, longer-horizon analysis |
-| **Exact DB** | S3 + Gorilla / Prometheus / VictoriaMetrics / ClickHouse | months+ (configurable, bounded by raw storage cost) | seconds to tens of seconds | fallback for uncovered queries, base relation for refresh |
+| Tier | Implementation | Compaction mechanism | Retention | Query latency | Use case |
+|---|---|---|---|---|---|
+| **Tier 1** | PromSketch — in-memory EH-backed sketches over raw samples | **Continuous temporal compaction via the EH bucket structure itself** — fine-grained buckets for recent data, exponentially coarser buckets for older data, merged in place as windows age | seconds to minutes (bounded by memory) | sub-millisecond | live dashboards, alerts; **especially good when many sub-window queries target the same series** — e.g. a dashboard that asks for p50/p95/p99 over 1m, 5m, 15m, 1h all against the same metric. Tier 1 serves all of them from one EH structure with no redundant storage; Tier 2 would store one pre-merged sketch per (agg_id, window) and either duplicate the series across multiple agg_ids or rely on read-time merge. |
+| **Tier 2** | Precompute engine + `SimpleMapStore` LSM parts (memory + disk) | **Batched semantic compaction** via LSM levels — §9 — N entries at level L merged into one at level L+1 at a coarser window | minutes to weeks (bounded by `persistence_delete_older_than_secs`) | milliseconds | most production queries, longer-horizon analysis |
+| **Exact DB** | S3 + Gorilla / Prometheus / VictoriaMetrics / ClickHouse | Storage-native compression (Gorilla / columnar); no sketch-level merging | months+ (configurable, bounded by raw storage cost) | seconds to tens of seconds | fallback for uncovered queries, base relation for refresh |
+
+The two sketch tiers implement the **same abstract concept** — "reduce
+temporal resolution over time while preserving sketch-accuracy
+bounds" — but at different points along a latency/complexity curve.
+Tier 1 does it continuously in memory via EH bucket merges as windows
+age; Tier 2 does it in background compaction with explicit LSM levels.
+The controller picks per-`agg_id` which mechanism matches the
+workload: sub-ms live queries with short retention → Tier 1; weeks of
+queryable history → Tier 2; both → both.
 
 **Tier selection per `agg_id`.** A metric's `AggregationConfig` carries
 a `tier` field: `Tier1Only`, `Tier2Only`, or `Both`. `Both` means
@@ -682,6 +691,15 @@ incremental MV maintenance contract observable and enforceable.
 ---
 
 ## 9. Semantic compaction
+
+This section describes **Tier 2's** semantic compaction — the
+batched, LSM-level merge process that runs on disk-backed parts.
+Tier 1 (PromSketch) implements the *same concept* differently:
+continuous in-memory EH bucket merging, done inline as windows age,
+without an explicit level structure. Tier 1 is especially effective
+when the same series is queried over many different sub-windows
+(§4.1) because the EH lets every such query reuse the same in-memory
+structure. The rest of this section is Tier 2 specific.
 
 ### 9.1 Level = temporal resolution
 
