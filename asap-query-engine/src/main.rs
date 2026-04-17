@@ -187,6 +187,14 @@ struct Args {
     #[arg(long)]
     schema_persist_path: Option<std::path::PathBuf>,
 
+    /// Optional path where the backfill job registry persists across
+    /// restarts (sketch DB Phase 5g). When set, every job state
+    /// transition rewrites this file atomically, so operators see
+    /// recent backfill history even after a backend restart.
+    /// Memory-only by default.
+    #[arg(long)]
+    backfill_persist_path: Option<std::path::PathBuf>,
+
     /// Enable automatic query tracking and planning
     #[arg(long)]
     enable_query_tracker: bool,
@@ -636,7 +644,16 @@ async fn main() -> Result<()> {
     // Jobs stay `Queued` until 5e wires the worker — intentional
     // shadow-mode behaviour that lets operators validate the
     // controller's REFRESH dispatch logic before workers exist.
-    let backfill_registry = Arc::new(query_engine_rust::stores::sketch_db::BackfillRegistry::new());
+    // Phase 5g: when `--backfill-persist-path` is set, the registry
+    // loads prior job records from disk and rewrites the file on
+    // every state transition. When unset, the registry is
+    // memory-only and restart wipes job history.
+    let backfill_registry = Arc::new(match args.backfill_persist_path.as_ref() {
+        Some(path) => {
+            query_engine_rust::stores::sketch_db::BackfillRegistry::load_or_new(path.clone())
+        }
+        None => query_engine_rust::stores::sketch_db::BackfillRegistry::new(),
+    });
     server = server.with_backfill_registry(backfill_registry);
     info!("Starting HTTP server on port {}", args.http_port);
 
