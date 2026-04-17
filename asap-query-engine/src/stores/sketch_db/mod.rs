@@ -8,13 +8,18 @@
 //! * `schema` — per-`agg_id` `AggSchema` with `Active` / `Retired` /
 //!   `Expired` lifecycle, plus the `SchemaRegistry` that the ingest path
 //!   consults via `is_writable(agg_id)` (the §6.3 write-side barrier).
+//!   Also exposes the §7 metric timeline (`timeline_for_metric`) which
+//!   the query path uses to dispatch per-segment across reconfigure
+//!   boundaries.
 //!
-//! Phase 2a (this commit) adds only the in-memory schema registry derived
-//! from the current `StreamingConfig`. Schemas are recreated on process
-//! restart from the same config; there is no separate persistence yet.
-//! That comes in Phase 2b along with the HTTP `POST /api/v1/streaming-config`
-//! swap-diff handler that explicitly creates and retires schemas.
+//! Phase 2a added only the in-memory schema registry derived from the
+//! current `StreamingConfig`; Phase 2b wired the
+//! `POST /api/v1/streaming-config` swap handler to drive reconciliation
+//! explicitly. Phase 3a (this commit) adds the §7 schema-timeline read
+//! API — derived on-demand from registry state — so the query engine
+//! can stitch results across schema changes (Phase 3b wires that
+//! dispatch).
 
 pub mod schema;
 
-pub use schema::{AggSchema, AggStatus, SchemaRegistry};
+pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
