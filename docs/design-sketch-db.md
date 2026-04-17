@@ -157,6 +157,9 @@ MV framing is established:
 - §17 Relationship to the hot-reload PR
 - §18 Open questions
 - §19 Appendix: performance envelope vs Prometheus / VictoriaMetrics
+  (incl. §19.9 theoretical accuracy bounds, §19.10 merge propagation)
+- §20 Sketch profiler library (CPU / memory / accuracy / latency /
+  throughput measurement infrastructure — separate library)
 
 ### 3.1 Principles
 
@@ -471,6 +474,74 @@ This is the authoritative "no writes after retirement" guarantee.
 Even if a slow in-flight ingest batch routes stale data to the
 retired agg_id, the store rejects it. Workers log the rejection and
 drop the batch.
+
+### 6.4 Accuracy profile is part of the schema
+
+Every sketch type has a **mathematically proven** error bound that
+depends only on its parameters and the sketch family — not on the
+input data. This means as soon as the controller commits to an
+`AggregationConfig`, the resulting MV's accuracy guarantees are
+fixed and known. The schema metadata captures this:
+
+```rust
+struct AggSchema {
+    // ... fields from §6.1 ...
+
+    /// Error bound this MV can serve, derived purely from
+    /// sketch_type + parameters. Cached on AggSchema creation so
+    /// the query path can return it without recomputation.
+    accuracy_profile: AccuracyProfile,
+}
+
+struct AccuracyProfile {
+    /// Per-statistic answerability: which statistics this sketch
+    /// can answer at all, and what the error bound is for each.
+    per_statistic: HashMap<Statistic, ErrorBound>,
+    /// Probability the bound holds (1 - δ for CMS, asymptotic 95%
+    /// for KLL/HLL/DDSketch unless overridden, 1.0 for typed aux
+    /// scalars).
+    confidence: f64,
+    /// What happens to the bound when N entries of this sketch are
+    /// merged. Some sketch families preserve the bound on merge
+    /// (CMS cell-wise sum, HLL register OR, KLL level merge with
+    /// modest overhead); others widen it.
+    merge_propagation: MergePropagation,
+}
+
+enum ErrorBound {
+    /// Symmetric: |estimate − true| ≤ delta with prob ≥ confidence
+    AbsoluteSymmetric { delta_fn: BoundFn },
+    /// One-sided over-estimator (CMS): true ≤ estimate ≤ true + δ
+    OneSidedOver { delta_fn: BoundFn },
+    /// Multiplicative: |estimate − true| / true ≤ ε
+    Relative { epsilon: f64 },
+    /// Standard error: σ for normal approximation; UI picks z
+    /// (e.g. 1.96 for 95% CI, 2.58 for 99%)
+    StandardError { sigma_fn: BoundFn },
+    /// Rank error (KLL): the returned quantile's true rank is
+    /// within `epsilon` of the requested rank, with prob ≥ conf
+    Rank { epsilon: f64 },
+    /// Exact — typed aux columns (count/sum/min/max), no error
+    Exact,
+}
+
+/// Functions that compute an absolute error from per-window data
+/// (e.g. CMS frequency: δ = ε·||x||₁ depends on total mass in window).
+type BoundFn = Box<dyn Fn(WindowStats) -> f64>;
+```
+
+The actual ε / δ / σ formulas per sketch family are listed in §19.5
+(theoretical bounds appendix). The point of putting them on
+`AggSchema` is so the controller can reason about
+"does this sketch satisfy my query's accuracy SLA?" at plan time —
+and the query path can return the bound to the user without
+recomputation.
+
+This also ties into PromSketch (Tier 1) and Tier 2 having different
+accuracy profiles for the same metric: a Tier 1 PromSketch over
+recent samples might use a smaller-K KLL than the Tier 2 long-term
+storage. The query engine can prefer Tier 1 for queries whose SLA
+permits the looser bound, and Tier 2 for tighter SLA.
 
 ---
 
@@ -1362,25 +1433,72 @@ fn scan(
 ) -> impl Iterator<Item = SketchEntry>;
 ```
 
-`QueryResult`:
+`QueryResult` carries the **estimate**, an **error bound**, the
+**confidence** with which the bound holds, and **provenance** about
+what data sources produced the answer. This is a first-class part of
+the query contract, not an optional debug field — sketches are
+approximate by design and the cost of returning the bound alongside
+the value is essentially zero.
 
 ```rust
-enum QueryResult {
+struct QueryResult {
+    /// The point estimate.
+    estimate: ResultValue,
+    /// Mathematically-derived error bound for `estimate`. See §6.4
+    /// for the AccuracyProfile that produces this and §19.5 for the
+    /// per-sketch-type formulas.
+    error_bound: ErrorBound,
+    /// Probability the bound holds. CMS uses (1 - δ); KLL/DDSketch
+    /// use the asymptotic confidence implied by their parameters
+    /// (default ~95%); HLL likewise; typed aux columns are 1.0
+    /// (exact). Cross-segment combinations multiply or take the min
+    /// depending on independence assumptions (§19.6).
+    confidence: f64,
+    /// Where the answer came from — sketch family used, how many
+    /// entries were merged, whether any segment was backfilled,
+    /// whether any segment fell back to the exact DB.
+    provenance: Provenance,
+}
+
+enum ResultValue {
     /// Single value (Count, Quantile, Sum, Min, Max, Cardinality).
-    Scalar { value: f64, covered: Coverage },
+    Scalar(f64),
     /// Time series — per-window value.
-    Series { points: Vec<(u64, f64)>, covered: Coverage },
+    Series(Vec<(u64, f64)>),
     /// TopK and similar multi-value answers.
-    Vector { entries: Vec<(String, f64)>, covered: Coverage },
+    Vector(Vec<(String, f64)>),
     /// Some or all of the requested range could not be served from
     /// sketches. Caller decides whether to fall back.
     Partial {
-        served: QueryResult,
+        served: Box<ResultValue>,
         missing: Vec<(u64, u64)>,
         reason: PartialReason,
     },
 }
+
+struct Provenance {
+    sketch_types: Vec<SketchType>,    // single entry if homogeneous
+    windows_merged: u32,               // how many stored entries the answer aggregated
+    segments_combined: u32,            // schema-timeline segments crossed
+    backfilled_segments: u32,          // 0 = no historical refresh
+    fallback_segments: u32,            // 0 = all from sketch DB
+    archive_authoritative: bool,       // true if sketches were rebuilt from archive
+}
 ```
+
+The `ErrorBound` enum mirrors §6.4 and is consumed without
+recomputation — `AccuracyProfile.per_statistic[stat]` returns the
+right variant directly.
+
+**Why every result carries this**: it lets clients (dashboards,
+alerts, downstream systems) make informed decisions: an alert can
+require `confidence ≥ 0.99` before firing; a dashboard can render
+error bars without doing a second query; a downstream consumer can
+decide to refetch from the exact DB if the bound is too wide for
+its use case.
+
+**Cost**: an extra ~50 bytes per query response. Computation is
+O(1) per query. Negligible compared to the actual sketch merge.
 
 ### 10.2 Controller-facing API
 
@@ -1773,3 +1891,249 @@ cost, and relies on the exact DB for the remaining 10 % where
 sketching has no advantage. This dual-role architecture is why the
 exact DB is modeled as both the refresh source (§10) and the query
 fallback target (§7.3) — the same storage serving two purposes.
+
+### 19.9 Theoretical accuracy bounds per sketch type
+
+These are the formulas every `AccuracyProfile` (§6.4) is derived
+from. They are mathematical guarantees from the sketch's defining
+papers, not empirical estimates — given parameters and a sketch
+type, the controller and the query path know the bound exactly.
+
+| Sketch | Parameters | Statistic answered | Error bound | Confidence |
+|---|---|---|---|---|
+| **CountMin (CMS)** | width `w`, depth `d` | point frequency `f̂` | `0 ≤ f̂ − f ≤ ε · ‖x‖₁` with `ε = e/w` | `1 − δ`, `δ = e^(−d)` |
+| **CountSketch** | width `w`, depth `d` | unbiased frequency | `|f̂ − f| ≤ √(‖x‖₂² / w)` (one-σ) | asymptotic ~68 % at 1σ, ~95 % at 2σ |
+| **CMS + heap** | `w, d, k` | top-k by count | top-k items returned exactly when their true count exceeds `(k+1)`-th item by ≥ `ε‖x‖₁` | `1 − δ` |
+| **KLL** | `K` (default 200) | quantile rank | rank error ≤ `c / √K` (c ≈ 1) | asymptotic ~99 % at default K |
+| **DDSketch** | relative accuracy `α` | quantile value | `\|q̂ − q\| / q ≤ α` | deterministic if backing store is unbounded; bounded variants degrade gracefully |
+| **HLL** | `m = 2^p` registers | distinct count | std error `σ ≈ 1.04 / √m` | asymptotic ~95 % at 2σ |
+| **UnivMon** | levels `L`, base sketch | many statistics polymorphically | inherits from the layer-`L` base sketch's bound | per-layer |
+| **Typed aux columns** (count/sum/min/max) | n/a | their respective scalar | exact (no sketch involved) | 1.0 |
+
+These formulas are encoded in `AccuracyProfile::per_statistic` as
+`ErrorBound` variants. The query path returns them directly without
+runtime computation.
+
+### 19.10 Merge error propagation
+
+When N entries of the same sketch type are merged (the common case
+for range queries), the resulting bound depends on the sketch
+family's algebraic properties:
+
+| Sketch family | Merge type | Bound after merge |
+|---|---|---|
+| **CMS** | cell-wise sum | `ε` unchanged; `‖x‖₁` grows to the merged stream's L1 norm — bound stays the same shape |
+| **CountSketch** | cell-wise sum | `σ` unchanged on the merged distribution; bound preserved |
+| **HLL** | register-wise max | bound preserved exactly; merge is the natural set-OR of the underlying multisets |
+| **KLL** | level-by-level | bound preserved with small overhead (≤ 2 % typically); merging N KLLs with `K = 200` still gives ~1 % rank error |
+| **DDSketch** | bucket-wise sum | relative `α` preserved exactly |
+| **Typed aux** | additive (sum/count) or extremum (min/max) | exact |
+
+So the answer to "what is the bound after merging 60 KLL sketches
+covering the last 1 hour?" is **the same bound as a single KLL** —
+this is a designed property of mergeable sketches and is a major
+reason to prefer them over non-mergeable approximations.
+
+**Cross-segment combinations** (when the schema timeline crosses
+a reconfigure boundary, §7.3) are different — segments may use
+different sketch types or parameters, so the combined bound is the
+**worst** of any per-segment bound, with confidence multiplied:
+
+```
+combined_bound      = max(seg.bound for seg in segments)
+combined_confidence = ∏(seg.confidence for seg in segments)
+```
+
+The `Provenance.segments_combined` field surfaces this so callers
+know the answer is composite. For non-additive statistics (Quantile,
+TopK) crossing a sketch-type boundary, the result is `Partial` with
+the un-mergeable segments listed in `missing` — the user sees that
+the answer covers only the segments where it could be computed, not
+a silently-wrong combination.
+
+---
+
+## 20. Sketch profiler library
+
+The accuracy bounds in §19.9 are mathematical guarantees, but the
+**operational characteristics** (CPU, memory, latency, throughput)
+of every sketch type are **measured**, not derived. Different
+implementations of the same sketch family — sketchlib-rust vs
+sketchlib-go, branch A vs branch B of either, different parameter
+choices — have different real-world behaviour even when the
+theoretical accuracy is identical. The controller's cost model
+(§15.2 `/api/v1/db/cost_estimate`, §10.6 incremental-vs-refresh
+decision) needs real measurements to plan well.
+
+This section describes a separate library — the **Sketch Profiler**
+— that is shared across the sketch DB, sketchlib-rust, sketchlib-go,
+and the controller. It is not part of the sketch DB itself; it is the
+measurement substrate the sketch DB and the controller both consume.
+
+### 20.1 What it measures
+
+For every `(sketch_type, parameters, sketchlib_version, hardware
+profile)` tuple, the profiler collects:
+
+| Metric | Definition | Use |
+|---|---|---|
+| **CPU per insert** | nanoseconds per `update(value)` call | agent CPU budget; admission control quotas (§11.1 `max_write_qps`) |
+| **CPU per merge** | nanoseconds per `merge_with(other)` call | compaction cost (§9), refresh cost (§10.3), query merge cost (§7.3) |
+| **CPU per estimate** | nanoseconds per `query_statistic(stat)` call | query latency (§19.2) |
+| **Memory per accumulator** | bytes resident, including allocator overhead | admission-control `max_bytes_in_memory`; storage-cost estimate |
+| **Wire size, serialized** | bytes after `serialize_to_bytes` (proto / msgpack) | agent → backend bandwidth (§4 of DataCollector#153); backend → store |
+| **Empirical accuracy** | measured `\|estimate − ground_truth\|` on synthetic and real workloads | validates §19.9 theoretical bounds; flags regressions if a sketch implementation drifts from theory |
+| **Insert throughput** | samples/sec/core sustainable before backpressure | agent CPU sizing |
+| **Merge throughput** | merges/sec/core | compaction sizing |
+| **Cold-start cost** | first-insert latency (allocator + JIT warmup) | cold-query SLA |
+
+These are collected per sketch type, per parameter set, and per
+target architecture (x86_64 vs arm64 vs the agent's actual CPU
+model). The profiler stores results in a published catalogue that
+the controller reads at planning time and the operator inspects
+when picking parameters for a new aggregation.
+
+### 20.2 How it runs
+
+The profiler is a standalone binary in its own crate
+(tentatively `sketch-profiler/`). It supports three modes:
+
+- **Calibration** — runs all sketch types × a parameter grid against
+  synthetic distributions (uniform, zipf, normal, heavy-tailed) plus
+  a few real-world snapshots. Produces a baseline catalogue. Run
+  once per sketchlib release, or whenever a sketch implementation
+  changes. CI integration: a PR that touches sketchlib must include
+  a re-run that shows no significant regression.
+- **Drift watch** — runs in production as a low-priority sidecar
+  task. Periodically samples a small subset of sketch types and
+  parameters, compares against the catalogue. Alerts if measured
+  CPU/memory/accuracy diverges by more than a threshold from the
+  catalogue value (catches sketchlib version mismatches, hardware
+  changes, allocator regressions).
+- **What-if** — given a `(sketch_type, parameters, expected_qps,
+  expected_cardinality)` tuple, returns predicted CPU/memory/latency
+  numbers. The controller calls this at plan time. It also takes a
+  query workload as input and returns the predicted `query_latency`
+  per statistic.
+
+### 20.3 Catalogue format
+
+```rust
+struct ProfilerCatalogue {
+    /// Identity of the run that produced this catalogue.
+    sketchlib_versions: HashMap<Lang, String>,  // {Rust: "0.4.2", Go: "0.4.0"}
+    hardware: HardwareProfile,
+    measured_at: DateTime,
+
+    /// One entry per (sketch_type, parameter set) tuple.
+    entries: Vec<ProfilerEntry>,
+}
+
+struct ProfilerEntry {
+    sketch_type: SketchType,
+    parameters: HashMap<String, Value>,
+
+    /// Operational characteristics
+    cpu_per_insert_ns: f64,
+    cpu_per_merge_ns: f64,
+    cpu_per_estimate_ns: HashMap<Statistic, f64>,
+    memory_bytes: usize,
+    wire_size_bytes: WireSize,         // {proto: u64, msgpack: u64, msgpack_delta: u64}
+    insert_throughput_per_core: f64,
+    merge_throughput_per_core: f64,
+    cold_start_us: f64,
+
+    /// Empirical accuracy under various distributions; cross-checked
+    /// against the theoretical AccuracyProfile from §19.9.
+    measured_error: HashMap<DistributionShape, EmpiricalError>,
+
+    /// Which workload shapes this entry was tested against. Used to
+    /// scope the validity of the measurement.
+    tested_workloads: Vec<WorkloadShape>,
+}
+```
+
+### 20.4 How the controller uses it
+
+The controller's planner (mentioned at §15.2) replaces hand-coded
+constants and crude formulas with calls into the profiler:
+
+```
+Old: cost_model.estimate_size(CMS, width=1024, depth=5) → "12 KB"
+                                                          ^ hand-coded constant
+
+New: profiler.lookup(CMS, width=1024, depth=5)
+       → ProfilerEntry { memory_bytes: 12_512, wire_size_bytes: …,
+                         cpu_per_insert_ns: 47.3, … }
+```
+
+This makes cost-based plan selection actually correct: when a plan
+chooses CMS over CountSketch for a frequency query, the choice
+reflects measured costs on the target hardware, not extrapolated
+big-O.
+
+The Pareto frontier endpoint (§15.2 `/api/v1/db/cost_estimate`) is
+fully driven by the profiler — every (parameter, accuracy, cost)
+point on the frontier is a real measurement, and the recommended
+parameter set is the one that minimises operator-weighted cost
+under the user's accuracy SLA.
+
+### 20.5 How the sketch DB uses it
+
+- **Admission control quotas** (§11.1) are sized by reading the
+  profiler's `memory_bytes` and `insert_throughput_per_core` and
+  multiplying by the deployment's available headroom.
+- **Compaction policy** (§9) uses `cpu_per_merge_ns` to decide how
+  many entries can be compacted per tick within the configured CPU
+  budget.
+- **Backfill scheduling** (§10.3) uses the profiler's insert/merge
+  throughput to estimate job duration before launching.
+
+### 20.6 Cross-repo placement and ownership
+
+The profiler is **shared infrastructure** because it has no value
+unless it covers all sketch implementations the system uses:
+
+- **`sketch-profiler/` crate** — workspace member of ASAPQuery-backend.
+  Owns the catalogue format, the calibration / drift / what-if
+  drivers, the catalogue serializer.
+- **sketchlib-rust** — exposes a `Bench` trait or similar so the
+  profiler can call `update / merge / estimate` uniformly across
+  sketch types.
+- **sketchlib-go** — same story for Go-side measurements (matters
+  for agent-side sketching where the Go implementation runs).
+- **DataCollector controller** — reads the published catalogue and
+  feeds it into the planner; does not run measurements itself.
+
+A published catalogue (e.g. JSON in the sketchlib release artifacts)
+is the contract between sketchlib releases and the controller. When
+sketchlib bumps a version, the catalogue updates, and the controller
+picks up new cost numbers without code changes.
+
+### 20.7 Why this is a separate library, not part of the sketch DB
+
+Three reasons:
+
+1. **Scope**: the profiler measures sketches in isolation, not in the
+   context of the storage engine. It belongs alongside sketchlib,
+   not the sketch DB.
+2. **Reuse**: the controller, the operator's parameter-tuning UI,
+   the sketchlib CI all need it; only one of those is the sketch DB.
+3. **Cadence**: the catalogue updates on sketchlib releases (low
+   frequency); the sketch DB ships independently. Different release
+   cadences imply different repos / different versioning.
+
+### 20.8 Status
+
+This library does not exist yet. It is called out here because:
+
+- §6.4 `AccuracyProfile.merge_propagation` and §15 `Provenance` need
+  numbers that are most credibly produced by the profiler, not
+  hand-derived;
+- §11.1 quotas, §15.2 cost-estimate, and §16 implementation phases
+  all reference "what the profiler will provide";
+- treating it as a separate concern with its own design surface
+  prevents this doc from sprawling further into measurement
+  infrastructure that doesn't belong here.
+
+A separate design doc (`design-sketch-profiler.md`) will follow.
