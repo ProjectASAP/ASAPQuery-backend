@@ -145,6 +145,7 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
+            .route("/api/v1/db/schemas", get(handle_get_schemas))
             .with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
@@ -187,6 +188,7 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
+            .route("/api/v1/db/schemas", get(handle_get_schemas))
             .with_state(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1122,6 +1124,146 @@ aggregations:
         assert_eq!(body["schemas_created"].as_array().unwrap().len(), 0);
         assert_eq!(body["schemas_retired"].as_array().unwrap().len(), 0);
     }
+
+    #[tokio::test]
+    async fn test_get_schemas_returns_active_and_retired_with_status_filter() {
+        use crate::stores::sketch_db::SchemaRegistry;
+
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let schemas = Arc::new(SchemaRegistry::empty());
+        let server_port =
+            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
+                .await;
+        let client = Client::new();
+
+        // Push an initial config with two aggregations; then swap to
+        // one, retiring the other. Exercises Active + Retired side by
+        // side in the response.
+        let yaml_two = r#"
+aggregations:
+  - aggregationId: 1
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: m1
+    labels: { grouping: [], rollup: [], aggregated: [] }
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+  - aggregationId: 2
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: m2
+    labels: { grouping: [], rollup: [], aggregated: [] }
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(yaml_two.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // Retire agg 2 by pushing a config with only agg 1.
+        let yaml_one = r#"
+aggregations:
+  - aggregationId: 1
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: m1
+    labels: { grouping: [], rollup: [], aggregated: [] }
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(yaml_one.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+
+        // GET /api/v1/db/schemas (no filter = all).
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/db/schemas"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["count"], 2);
+        let entries = body["schemas"].as_array().unwrap();
+        // Sorted by agg_id — first is active, second is retired.
+        assert_eq!(entries[0]["agg_id"], 1);
+        assert_eq!(entries[0]["status"], "active");
+        assert_eq!(entries[0]["metric_name"], "m1");
+        assert!(entries[0]["retired_at_ms"].is_null());
+        assert_eq!(entries[1]["agg_id"], 2);
+        assert_eq!(entries[1]["status"], "retired");
+        assert!(entries[1]["retired_at_ms"].is_u64());
+
+        // Filter: active only.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/schemas?status=active"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["schemas"][0]["agg_id"], 1);
+
+        // Filter: retired only.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/schemas?status=retired"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["schemas"][0]["agg_id"], 2);
+
+        // Bogus filter → 400.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/schemas?status=junk"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_schemas_without_registry_returns_503() {
+        // No schema registry attached → 503.
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
+        let client = Client::new();
+
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/db/schemas"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -1354,4 +1496,74 @@ async fn handle_post_streaming_config(
         "schemas_retired": schema_retired,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// §15.2 of the sketch DB design: expose the `SchemaRegistry` over
+/// HTTP so operators and the controller can inspect agg lifecycle
+/// state without attaching a debugger. Filter by `?status=` —
+/// `active` / `retired` / `expired` / `all` (default `all`).
+async fn handle_get_schemas(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::stores::sketch_db::AggStatus;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(schemas) = state.schemas else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "schema registry not attached; backend was built without HttpServer::with_schemas",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+
+    let filter = params.get("status").map(String::as_str).unwrap_or("all");
+    let statuses: &[AggStatus] = match filter {
+        "active" => &[AggStatus::Active],
+        "retired" => &[AggStatus::Retired],
+        "expired" => &[AggStatus::Expired],
+        "all" => &[AggStatus::Active, AggStatus::Retired, AggStatus::Expired],
+        other => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!(
+                    "unknown status filter '{other}'; expected one of active|retired|expired|all",
+                ),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for status in statuses {
+        for s in schemas.list_by_status(*status) {
+            entries.push(serde_json::json!({
+                "agg_id": s.agg_id,
+                "metric_name": s.metric_name,
+                "status": status_str(*status),
+                "created_at_ms": s.created_at_ms,
+                "retired_at_ms": s.retired_at_ms,
+                "expires_at_ms": s.expires_at_ms,
+                "aggregation_type": format!("{:?}", s.config.aggregation_type),
+            }));
+        }
+    }
+    entries.sort_by_key(|v| v.get("agg_id").and_then(|x| x.as_u64()).unwrap_or(0));
+
+    let body = serde_json::json!({
+        "status": "success",
+        "count": entries.len(),
+        "schemas": entries,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+fn status_str(s: crate::stores::sketch_db::AggStatus) -> &'static str {
+    use crate::stores::sketch_db::AggStatus;
+    match s {
+        AggStatus::Active => "active",
+        AggStatus::Retired => "retired",
+        AggStatus::Expired => "expired",
+    }
 }
