@@ -107,10 +107,29 @@ impl DatasketchesKLLAccumulator {
     /// already have accepted from the source. Bit-identical
     /// reconstruction is tracked as a sketchlib upstream follow-up.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::KllState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
         use prost::Message;
 
-        let state = KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?;
+        // DataCollector's kllprocessor wraps the state in a
+        // `SketchEnvelope{kll: KllState}` via sketchlib-go's
+        // `SerializePortableFO` + `proto.Marshal`. Try envelope first,
+        // fall back to bare `KllState` for callers (e.g. unit tests)
+        // that encode the state directly. Mirrors the PR #14 fix on
+        // `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
+        let state = match SketchEnvelope::decode(buffer) {
+            Ok(env) => match env.sketch_state {
+                Some(sketch_envelope::SketchState::Kll(st)) => st,
+                Some(other) => {
+                    return Err(format!(
+                        "SketchEnvelope contains non-KLL sketch: {:?}",
+                        std::mem::discriminant(&other)
+                    )
+                    .into());
+                }
+                None => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
+            },
+            Err(_) => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
+        };
         if state.k < 8 {
             return Err(format!("KllState.k must be >= 8 (got {})", state.k).into());
         }
@@ -605,6 +624,51 @@ mod tests {
             q01 <= q99,
             "quantile monotonicity violated: q01={q01}, q99={q99}"
         );
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrapped() {
+        // Mirrors what DataCollector's kllprocessor emits: the state
+        // wrapped in a `SketchEnvelope{kll: ...}` via sketchlib-go's
+        // `SerializePortableFO` + `proto.Marshal`.
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+
+        let items: Vec<f64> = (0..64).map(|i| i as f64).collect();
+        let state = KllState {
+            k: 200,
+            m: 8,
+            num_levels: 1,
+            levels: vec![0, 64],
+            items,
+            coin: None,
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let acc = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("envelope-wrapped decode should succeed");
+        assert_eq!(acc.inner.count(), 64);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, CountMinState, SketchEnvelope};
+        use prost::Message;
+
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(
+                CountMinState::default(),
+            )),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "wrong-sketch envelope should error");
     }
 
     #[test]

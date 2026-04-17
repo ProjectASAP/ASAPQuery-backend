@@ -61,11 +61,34 @@ impl CountSketchAccumulator {
     /// `CountSketch::from_legacy_matrix` after reshaping the flat
     /// `counts_int` / `counts_float` field into a `Vec<Vec<f64>>`.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::{CountSketchState, CounterType};
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountSketchState, CounterType, SketchEnvelope,
+        };
         use prost::Message;
 
-        let state = CountSketchState::decode(buffer)
-            .map_err(|e| format!("decode CountSketchState: {e}"))?;
+        // DataCollector's countsketchprocessor wraps the state in a
+        // `SketchEnvelope{count_sketch: CountSketchState}` via
+        // sketchlib-go's `SerializePortableFO` + `proto.Marshal`. Try
+        // decoding as envelope first, fall back to bare
+        // `CountSketchState` for callers (e.g. unit tests) that
+        // encode the state directly. Mirrors the PR #14 fix on
+        // `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
+        let state = match SketchEnvelope::decode(buffer) {
+            Ok(env) => match env.sketch_state {
+                Some(sketch_envelope::SketchState::CountSketch(st)) => st,
+                Some(other) => {
+                    return Err(format!(
+                        "SketchEnvelope contains non-CountSketch sketch: {:?}",
+                        std::mem::discriminant(&other)
+                    )
+                    .into());
+                }
+                None => CountSketchState::decode(buffer)
+                    .map_err(|e| format!("decode CountSketchState: {e}"))?,
+            },
+            Err(_) => CountSketchState::decode(buffer)
+                .map_err(|e| format!("decode CountSketchState: {e}"))?,
+        };
         let rows = state.rows as usize;
         let cols = state.cols as usize;
         if rows == 0 || cols == 0 {
@@ -239,6 +262,55 @@ mod tests {
         let matrix = acc.inner.sketch();
         assert_eq!(matrix[0], vec![1.0, -2.0, 3.0]);
         assert_eq!(matrix[1], vec![-4.0, 5.0, -6.0]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrapped() {
+        // Mirrors what DataCollector's countsketchprocessor emits:
+        // the state wrapped in a `SketchEnvelope{count_sketch: ...}`
+        // via sketchlib-go's `SerializePortableFO` + `proto.Marshal`.
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountSketchState, CounterType, SketchEnvelope,
+        };
+        use prost::Message;
+
+        let state = CountSketchState {
+            rows: 2,
+            cols: 3,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: vec![1, -2, 3, -4, 5, -6],
+            counts_float: Vec::new(),
+            ..Default::default()
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::CountSketch(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let acc = CountSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("envelope-wrapped decode should succeed");
+        let matrix = acc.inner.sketch();
+        assert_eq!(matrix[0], vec![1.0, -2.0, 3.0]);
+        assert_eq!(matrix[1], vec![-4.0, 5.0, -6.0]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
+        // An envelope carrying a non-CountSketch sketch should be
+        // rejected with a clear error rather than silently producing
+        // garbage.
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(KllState::default())),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let result = CountSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "wrong-sketch envelope should error");
     }
 
     #[test]

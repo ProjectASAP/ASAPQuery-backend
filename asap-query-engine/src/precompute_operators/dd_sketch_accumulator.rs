@@ -47,11 +47,32 @@ impl DDSketchAccumulator {
     /// DataCollector's `ddsketchprocessor` emits when
     /// `encoding = DD_SKETCH_ENCODING_PROTO`.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
         use prost::Message;
 
-        let state =
-            DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?;
+        // DataCollector's ddsketchprocessor wraps the state in a
+        // `SketchEnvelope{ddsketch: DdSketchState}` via sketchlib-go's
+        // `SerializePortableFO` + `proto.Marshal`. Try envelope first,
+        // fall back to bare `DdSketchState` for callers (e.g. unit
+        // tests) that encode the state directly. Mirrors the PR #14
+        // fix on `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
+        let state = match SketchEnvelope::decode(buffer) {
+            Ok(env) => match env.sketch_state {
+                Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
+                Some(other) => {
+                    return Err(format!(
+                        "SketchEnvelope contains non-DDSketch sketch: {:?}",
+                        std::mem::discriminant(&other)
+                    )
+                    .into());
+                }
+                None => DdSketchState::decode(buffer)
+                    .map_err(|e| format!("decode DDSketchState: {e}"))?,
+            },
+            Err(_) => {
+                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
+            }
+        };
         if !(state.alpha > 0.0 && state.alpha < 1.0) {
             return Err(format!(
                 "DDSketchState alpha {} out of range (expected 0 < alpha < 1)",
@@ -191,6 +212,50 @@ mod tests {
         let result = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("alpha"));
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrapped() {
+        // Mirrors what DataCollector's ddsketchprocessor emits: the
+        // state wrapped in a `SketchEnvelope{ddsketch: ...}` via
+        // sketchlib-go's `SerializePortableFO` + `proto.Marshal`.
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
+        use prost::Message;
+
+        let state = DdSketchState {
+            alpha: 0.01,
+            store_counts: vec![1, 2, 3, 4],
+            store_offset: -2,
+            count: 10,
+            sum: 50.0,
+            min: 1.0,
+            max: 4.0,
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("envelope-wrapped decode should succeed");
+        assert_eq!(acc.inner.alpha, 0.01);
+        assert_eq!(acc.inner.count, 10);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(KllState::default())),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let result = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "wrong-sketch envelope should error");
     }
 
     #[test]
