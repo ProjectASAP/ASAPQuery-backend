@@ -146,6 +146,7 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
+            .route("/api/v1/db/timeline", get(handle_get_timeline))
             .with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
@@ -189,6 +190,7 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
+            .route("/api/v1/db/timeline", get(handle_get_timeline))
             .with_state(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1264,6 +1266,138 @@ aggregations:
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    #[tokio::test]
+    async fn test_get_timeline_returns_segments_after_reconfigure() {
+        use crate::stores::sketch_db::SchemaRegistry;
+
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let schemas = Arc::new(SchemaRegistry::empty());
+        let server_port =
+            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
+                .await;
+        let client = Client::new();
+
+        // Push initial config with agg 1 on metric "m". Then swap to
+        // a config with agg 2 on the same metric — registry should
+        // show timeline with agg 1 retired + agg 2 active.
+        let post = |yaml: &str| {
+            let yaml = yaml.to_string();
+            let client = client.clone();
+            async move {
+                client
+                    .post(format!(
+                        "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+                    ))
+                    .header("content-type", "application/x-yaml")
+                    .body(yaml)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        let yaml = |id: u64| {
+            format!(
+                r#"
+aggregations:
+  - aggregationId: {id}
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: m
+    labels: {{ grouping: [], rollup: [], aggregated: [] }}
+    parameters: {{}}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#
+            )
+        };
+        assert!(post(&yaml(1)).await.status().is_success());
+        // Wait >1ms so the retire timestamp is strictly after agg 1's
+        // creation; otherwise agg 1's ownership interval is zero-width
+        // at ms resolution and timeline correctly skips it.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(post(&yaml(2)).await.status().is_success());
+
+        // The ms range is effectively wall-clock; use [0, u64 far
+        // future] to guarantee both segments fall in range.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/timeline?metric=m&start_ms=0&end_ms=99999999999999"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["metric"], "m");
+        // Two segments: retired agg 1 + active agg 2.
+        assert_eq!(body["count"], 2);
+        let segs = body["segments"].as_array().unwrap();
+        assert_eq!(segs[0]["agg_id"], 1);
+        assert_eq!(segs[0]["status"], "retired");
+        assert_eq!(segs[0]["coverage"], "sketch");
+        assert_eq!(segs[1]["agg_id"], 2);
+        assert_eq!(segs[1]["status"], "active");
+    }
+
+    #[tokio::test]
+    async fn test_get_timeline_missing_param_returns_400() {
+        use crate::stores::sketch_db::SchemaRegistry;
+
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let schemas = Arc::new(SchemaRegistry::empty());
+        let server_port =
+            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
+                .await;
+        let client = Client::new();
+
+        // No metric param → 400.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/timeline?start_ms=0&end_ms=100"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Missing start_ms.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/timeline?metric=m&end_ms=100"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Non-numeric start_ms.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/timeline?metric=m&start_ms=abc&end_ms=100"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_get_timeline_without_registry_returns_503() {
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/timeline?metric=m&start_ms=0&end_ms=100"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -1566,4 +1700,99 @@ fn status_str(s: crate::stores::sketch_db::AggStatus) -> &'static str {
         AggStatus::Retired => "retired",
         AggStatus::Expired => "expired",
     }
+}
+
+fn coverage_str(c: crate::stores::sketch_db::TimelineCoverage) -> &'static str {
+    use crate::stores::sketch_db::TimelineCoverage;
+    match c {
+        TimelineCoverage::Sketch => "sketch",
+        TimelineCoverage::Purged => "purged",
+    }
+}
+
+/// §7 / §15.3 of the sketch DB design: expose the schema timeline
+/// for a given metric over an `[start_ms, end_ms]` window. Useful
+/// for debugging "which agg served this slice of history?" questions
+/// without attaching a debugger, and for external tools that want
+/// to reproduce the engine's per-segment dispatch.
+///
+/// Required query params:
+///   `metric`    — metric name (string).
+///   `start_ms`  — inclusive lower bound (u64 millis).
+///   `end_ms`    — inclusive upper bound (u64 millis).
+async fn handle_get_timeline(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(schemas) = state.schemas else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "schema registry not attached; backend was built without HttpServer::with_schemas",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+
+    let Some(metric) = params.get("metric") else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "missing required query parameter 'metric'",
+        });
+        return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+    };
+
+    let parse_u64 = |key: &str| -> Result<u64, Box<axum::response::Response>> {
+        match params.get(key) {
+            Some(s) => s.parse::<u64>().map_err(|e| {
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error": format!("query parameter '{key}' is not a valid u64: {e}"),
+                });
+                Box::new((StatusCode::BAD_REQUEST, axum::Json(body)).into_response())
+            }),
+            None => {
+                let body = serde_json::json!({
+                    "status": "error",
+                    "error": format!("missing required query parameter '{key}'"),
+                });
+                Err(Box::new(
+                    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response(),
+                ))
+            }
+        }
+    };
+    let start_ms = match parse_u64("start_ms") {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let end_ms = match parse_u64("end_ms") {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+
+    let segments = schemas.timeline_for_metric(metric, start_ms, end_ms);
+    let entries: Vec<serde_json::Value> = segments
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "agg_id": s.agg_id,
+                "start_ms": s.start_ms,
+                "end_ms": s.end_ms,
+                "status": status_str(s.status),
+                "coverage": coverage_str(s.coverage),
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "status": "success",
+        "metric": metric,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "count": entries.len(),
+        "segments": entries,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
