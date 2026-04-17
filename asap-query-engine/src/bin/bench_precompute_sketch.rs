@@ -175,7 +175,11 @@ async fn start_engine(
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
     };
-    let engine = PrecomputeEngine::new(config, streaming_config, sink);
+    let engine = PrecomputeEngine::new(
+        config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        sink,
+    );
     tokio::spawn(async move {
         if let Err(err) = engine.run().await {
             eprintln!("precompute engine on port {port} failed: {err}");

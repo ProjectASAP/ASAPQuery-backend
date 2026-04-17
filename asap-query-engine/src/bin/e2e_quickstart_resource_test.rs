@@ -235,7 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         late_data_policy: LateDataPolicy::Drop,
     };
     let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
-    let engine = PrecomputeEngine::new(engine_config, streaming_config, output_sink);
+    let engine = PrecomputeEngine::new(
+        engine_config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        output_sink,
+    );
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             eprintln!("Precompute engine error: {e}");

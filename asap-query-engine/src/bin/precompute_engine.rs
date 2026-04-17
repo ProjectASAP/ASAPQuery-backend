@@ -227,7 +227,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
 
     // Build and run the engine
-    let engine = PrecomputeEngine::new(engine_config, streaming_config, output_sink);
+    let engine = PrecomputeEngine::new(
+        engine_config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        output_sink,
+    );
 
     info!("Starting precompute engine...");
     engine.run().await?;

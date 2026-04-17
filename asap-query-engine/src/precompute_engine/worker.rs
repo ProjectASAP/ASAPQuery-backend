@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     fn make_worker(
-        agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+        agg_configs: HashMap<u64, AggregationConfig>,
         sink: Arc<CapturingOutputSink>,
         pass_raw: bool,
         raw_agg_id: u64,
@@ -1042,7 +1042,7 @@ mod tests {
             0,
             rx,
             sink,
-            agg_configs,
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -1056,10 +1056,17 @@ mod tests {
         )
     }
 
-    fn arc_configs(
+    /// Build a fresh `HotReloadStreamingConfig` from a map of agg_id
+    /// → AggregationConfig. Worker::new takes this handle instead of
+    /// the old `HashMap<u64, Arc<AggregationConfig>>`. Tests use this
+    /// helper instead of constructing the handle inline at every
+    /// callsite.
+    fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> HashMap<u64, Arc<AggregationConfig>> {
-        configs.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
+    ) -> crate::data_model::HotReloadStreamingConfig {
+        crate::data_model::HotReloadStreamingConfig::new(crate::data_model::StreamingConfig::new(
+            configs,
+        ))
     }
 
     /// Helper to make GroupSamples from simple (ts, val) pairs for a single series.
@@ -1122,13 +1129,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Samples in window [0, 10000ms): sum should be 1+2+3=6.
         // All go to the same group (agg_id=1, group_key="")
@@ -1188,13 +1189,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Two different series, same group (agg_id=1, group_key="")
         // Both feed into the same accumulator
@@ -1253,13 +1248,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Group "constant" gets samples
         worker
@@ -1329,13 +1318,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Three different series all in group "constant" — all feed one KLL
         worker
@@ -1410,13 +1393,7 @@ mod tests {
         agg_configs.insert(2, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Sample at t=15000ms → goes to pane 10000ms
         worker
@@ -1478,13 +1455,7 @@ mod tests {
         agg_configs.insert(3, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Both series go to the SAME group (group_key="" since grouping is empty).
         // The host label is extracted as the aggregated key inside the accumulator.
@@ -1555,7 +1526,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1635,7 +1606,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1732,7 +1703,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1837,7 +1808,7 @@ mod tests {
             0,
             rx,
             sink.clone(),
-            arc_configs(agg_configs),
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -1889,7 +1860,7 @@ mod tests {
             0,
             rx,
             sink.clone(),
-            arc_configs(agg_configs),
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 15_000,
@@ -1965,7 +1936,7 @@ aggregations:
 
         assert!(streaming_config.contains(10));
 
-        let agg_configs = arc_configs(streaming_config.get_all_aggregation_configs().clone());
+        let agg_configs = streaming_config.get_all_aggregation_configs().clone();
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
@@ -2065,7 +2036,7 @@ aggregations:
             0,
             vec![],
         );
-        let agg_configs = arc_configs(HashMap::from([(1, config)]));
+        let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
@@ -2118,7 +2089,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2145,7 +2116,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2176,7 +2147,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2207,7 +2178,7 @@ aggregations:
             0,
             vec![],
         );
-        let agg_configs = arc_configs(HashMap::from([(1, config)]));
+        let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let wm = Arc::new(AtomicI64::new(i64::MIN));
         let all = vec![wm.clone()];
@@ -2216,7 +2187,7 @@ aggregations:
             0,
             rx,
             sink,
-            agg_configs,
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
