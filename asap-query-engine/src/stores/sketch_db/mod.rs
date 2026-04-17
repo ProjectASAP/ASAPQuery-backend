@@ -29,7 +29,11 @@
 //!   query path (5f).
 
 pub mod backfill;
+pub mod raw_sample_reader;
 pub mod schema;
 
 pub use backfill::{BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage};
+pub use raw_sample_reader::{
+    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
+};
 pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
