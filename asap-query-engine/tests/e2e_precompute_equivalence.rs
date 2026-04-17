@@ -191,7 +191,11 @@ async fn e2e_kll_output_matches_arroyo() {
     let streaming_config = Arc::new(StreamingConfig::new(agg_map.clone()));
 
     let sink = Arc::new(CapturingOutputSink::new());
-    let engine = PrecomputeEngine::new(engine_config(port), streaming_config, sink.clone());
+    let engine = PrecomputeEngine::new(
+        engine_config(port),
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        sink.clone(),
+    );
     tokio::spawn(async move {
         let _ = engine.run().await;
     });
@@ -305,7 +309,11 @@ async fn e2e_multiple_sum_output_matches_arroyo() {
     let streaming_config = Arc::new(StreamingConfig::new(agg_map.clone()));
 
     let sink = Arc::new(CapturingOutputSink::new());
-    let engine = PrecomputeEngine::new(engine_config(port), streaming_config, sink.clone());
+    let engine = PrecomputeEngine::new(
+        engine_config(port),
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        sink.clone(),
+    );
     tokio::spawn(async move {
         let _ = engine.run().await;
     });

@@ -1,4 +1,4 @@
-use crate::data_model::StreamingConfig;
+use crate::data_model::HotReloadStreamingConfig;
 use crate::precompute_engine::config::PrecomputeEngineConfig;
 use crate::precompute_engine::ingest_handler::{
     handle_prometheus_ingest, handle_victoriametrics_ingest, IngestState,
@@ -6,9 +6,7 @@ use crate::precompute_engine::ingest_handler::{
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{Worker, WorkerRuntimeConfig};
-use asap_types::aggregation_config::AggregationConfig;
 use axum::{routing::post, Router};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -24,15 +22,15 @@ pub struct PrecomputeWorkerDiagnostics {
 /// The top-level precompute engine orchestrator.
 ///
 /// Creates worker threads, the series router, and the Axum ingest server.
-/// The ingest state (router + agg configs) is built eagerly in `new()` so
-/// that other ingest sources (e.g. OTLP) can hold a handle and push data
+/// The ingest state (router + hot-reload handle) is built eagerly in `new()`
+/// so that other ingest sources (e.g. OTLP) can hold a handle and push data
 /// into the same worker pool.
 pub struct PrecomputeEngine {
     config: PrecomputeEngineConfig,
     output_sink: Arc<dyn OutputSink>,
     diagnostics: Arc<PrecomputeWorkerDiagnostics>,
     ingest_state: Arc<IngestState>,
-    agg_configs_map: HashMap<u64, Arc<AggregationConfig>>,
+    hot_reload_config: HotReloadStreamingConfig,
     /// Worker receivers, one per worker. Taken by `run()` when spawning workers.
     receivers: Vec<mpsc::Receiver<WorkerMessage>>,
 }
@@ -40,7 +38,7 @@ pub struct PrecomputeEngine {
 impl PrecomputeEngine {
     pub fn new(
         config: PrecomputeEngineConfig,
-        streaming_config: Arc<StreamingConfig>,
+        hot_reload_config: HotReloadStreamingConfig,
         output_sink: Arc<dyn OutputSink>,
     ) -> Self {
         let worker_group_counts = (0..config.num_workers)
@@ -68,22 +66,13 @@ impl PrecomputeEngine {
         // Build the router that owns the senders; it will be shared via IngestState.
         let router = SeriesRouter::new(senders);
 
-        // Resolve all aggregation configs from the streaming config. Wrap each
-        // in Arc so workers can share one copy per aggregation.
-        let agg_configs_map: HashMap<u64, Arc<AggregationConfig>> = streaming_config
-            .get_all_aggregation_configs()
-            .iter()
-            .map(|(&id, cfg)| (id, Arc::new(cfg.clone())))
-            .collect();
-        let agg_configs_vec: Vec<Arc<AggregationConfig>> =
-            agg_configs_map.values().cloned().collect();
-
-        // Ingest state holds the router and all configs; this is the single
-        // handle any ingest source uses to push work onto the worker pool.
+        // Ingest state holds the hot-reload handle — it re-snapshots
+        // agg_configs on each ingest batch, so new aggregations from
+        // a config swap are visible immediately.
         let ingest_state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
-            agg_configs: agg_configs_vec,
+            hot_reload_config: hot_reload_config.clone(),
             pass_raw_samples: config.pass_raw_samples,
         });
 
@@ -92,7 +81,7 @@ impl PrecomputeEngine {
             output_sink,
             diagnostics,
             ingest_state,
-            agg_configs_map,
+            hot_reload_config,
             receivers,
         }
     }
@@ -117,14 +106,16 @@ impl PrecomputeEngine {
         // Take ownership of receivers (they can only be used once).
         let receivers = std::mem::take(&mut self.receivers);
 
-        // Spawn workers.
+        // Spawn workers. Each worker holds a clone of the hot-reload
+        // handle and reads config directly from ArcSwap — no
+        // ConfigReload messages needed.
         let mut worker_handles = Vec::with_capacity(num_workers);
         for (id, rx) in receivers.into_iter().enumerate() {
             let worker = Worker::new(
                 id,
                 rx,
                 self.output_sink.clone(),
-                self.agg_configs_map.clone(),
+                self.hot_reload_config.clone(),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: self.config.max_buffer_per_series,
                     allowed_lateness_ms: self.config.allowed_lateness_ms,
@@ -149,7 +140,7 @@ impl PrecomputeEngine {
 
         let ingest_state = self.ingest_state.clone();
 
-        // Start flush timer.
+        // Start flush timer — pure flush, no config polling.
         let flush_state = ingest_state.clone();
         let flush_interval_ms = self.config.flush_interval_ms;
         tokio::spawn(async move {

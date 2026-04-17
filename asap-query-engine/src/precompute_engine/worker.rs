@@ -1,4 +1,6 @@
-use crate::data_model::{AggregateCore, KeyByLabelValues, PrecomputedOutput};
+use crate::data_model::{
+    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
+};
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
@@ -58,8 +60,10 @@ pub struct Worker {
     output_sink: Arc<dyn OutputSink>,
     /// Map from (agg_id, group_key) to per-group state.
     group_states: HashMap<(u64, String), GroupState>,
-    /// Aggregation configs, keyed by aggregation_id.
-    agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+    /// Hot-reload handle — workers read config directly from ArcSwap
+    /// instead of holding a local copy. All components see the same
+    /// config at the same time.
+    hot_reload: HotReloadStreamingConfig,
     /// Allowed lateness in ms.
     allowed_lateness_ms: i64,
     /// When true, skip aggregation and pass raw samples through.
@@ -83,7 +87,7 @@ impl Worker {
         id: usize,
         receiver: mpsc::Receiver<WorkerMessage>,
         output_sink: Arc<dyn OutputSink>,
-        agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+        hot_reload: HotReloadStreamingConfig,
         runtime_config: WorkerRuntimeConfig,
         group_count: Arc<AtomicUsize>,
         worker_watermark: Arc<AtomicI64>,
@@ -101,7 +105,7 @@ impl Worker {
             receiver,
             output_sink,
             group_states: HashMap::new(),
-            agg_configs,
+            hot_reload,
             allowed_lateness_ms,
             pass_raw_samples,
             raw_mode_aggregation_id,
@@ -200,6 +204,11 @@ impl Worker {
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} flush error: {}", self.id, e);
                     }
+                    // Evict orphaned GroupStates whose agg_id has been
+                    // removed from the config. Panes that still have
+                    // data are kept until they drain (flush_all already
+                    // closed their windows); empty ones are freed.
+                    self.evict_orphaned_groups();
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
@@ -219,6 +228,9 @@ impl Worker {
     }
 
     /// Get or create the GroupState for a (agg_id, group_key) pair.
+    /// Reads config directly from the `HotReloadStreamingConfig`
+    /// ArcSwap handle, so new agg_ids from a config swap are visible
+    /// immediately — no message passing, no delay.
     /// Returns None if agg_id has no matching config.
     fn get_or_create_group_state(
         &mut self,
@@ -227,10 +239,12 @@ impl Worker {
     ) -> Option<&mut GroupState> {
         let key = (agg_id, group_key.to_string());
         if !self.group_states.contains_key(&key) {
-            let config = self.agg_configs.get(&agg_id)?;
+            let snap = self.hot_reload.snapshot();
+            let cfg = snap.get_aggregation_config(agg_id)?;
+            let config = Arc::new(cfg.clone());
             let gs = GroupState {
                 window_manager: WindowManager::new(config.window_size, config.slide_interval),
-                config: Arc::clone(config),
+                config,
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
@@ -556,6 +570,40 @@ impl Worker {
     /// 2. Publish it for cross-worker reads
     /// 3. Compute global watermark = min(all worker watermarks)
     /// 4. Advance idle groups to the global watermark, closing due windows
+    ///
+    /// Remove GroupStates whose agg_id is no longer in the current
+    /// config (i.e. the controller removed the aggregation). Groups
+    /// with non-empty panes are kept until flush_all closes their
+    /// windows; once both pane maps are empty, the GroupState shell
+    /// is freed.
+    fn evict_orphaned_groups(&mut self) {
+        let snap = self.hot_reload.snapshot();
+        let before = self.group_states.len();
+        self.group_states.retain(|&(agg_id, _), gs| {
+            if snap.contains(agg_id) {
+                return true; // still in config, keep
+            }
+            // Not in config — keep only if there's residual data
+            // that flush_all hasn't drained yet.
+            let has_data = !gs.active_panes.is_empty() || !gs.sketch_panes.is_empty();
+            if !has_data {
+                debug!("evicting orphaned group (agg_id={})", agg_id);
+            }
+            has_data
+        });
+        let after = self.group_states.len();
+        if before != after {
+            info!(
+                "Worker {} evicted {} orphaned groups ({} → {})",
+                self.id,
+                before - after,
+                before,
+                after
+            );
+            self.group_count.store(after, Ordering::Relaxed);
+        }
+    }
+
     fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.pass_raw_samples {
             return Ok(());
@@ -982,7 +1030,7 @@ mod tests {
     }
 
     fn make_worker(
-        agg_configs: HashMap<u64, Arc<AggregationConfig>>,
+        agg_configs: HashMap<u64, AggregationConfig>,
         sink: Arc<CapturingOutputSink>,
         pass_raw: bool,
         raw_agg_id: u64,
@@ -994,7 +1042,7 @@ mod tests {
             0,
             rx,
             sink,
-            agg_configs,
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -1008,10 +1056,17 @@ mod tests {
         )
     }
 
-    fn arc_configs(
+    /// Build a fresh `HotReloadStreamingConfig` from a map of agg_id
+    /// → AggregationConfig. Worker::new takes this handle instead of
+    /// the old `HashMap<u64, Arc<AggregationConfig>>`. Tests use this
+    /// helper instead of constructing the handle inline at every
+    /// callsite.
+    fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> HashMap<u64, Arc<AggregationConfig>> {
-        configs.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
+    ) -> crate::data_model::HotReloadStreamingConfig {
+        crate::data_model::HotReloadStreamingConfig::new(crate::data_model::StreamingConfig::new(
+            configs,
+        ))
     }
 
     /// Helper to make GroupSamples from simple (ts, val) pairs for a single series.
@@ -1074,13 +1129,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Samples in window [0, 10000ms): sum should be 1+2+3=6.
         // All go to the same group (agg_id=1, group_key="")
@@ -1140,13 +1189,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Two different series, same group (agg_id=1, group_key="")
         // Both feed into the same accumulator
@@ -1205,13 +1248,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Group "constant" gets samples
         worker
@@ -1281,13 +1318,7 @@ mod tests {
         agg_configs.insert(1, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Three different series all in group "constant" — all feed one KLL
         worker
@@ -1362,13 +1393,7 @@ mod tests {
         agg_configs.insert(2, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Sample at t=15000ms → goes to pane 10000ms
         worker
@@ -1430,13 +1455,7 @@ mod tests {
         agg_configs.insert(3, config);
 
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker(
-            arc_configs(agg_configs),
-            sink.clone(),
-            false,
-            0,
-            LateDataPolicy::Drop,
-        );
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Both series go to the SAME group (group_key="" since grouping is empty).
         // The host label is extracted as the aggregated key inside the accumulator.
@@ -1507,7 +1526,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1587,7 +1606,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1684,7 +1703,7 @@ mod tests {
 
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(
-            arc_configs(agg_configs.clone()),
+            agg_configs.clone(),
             sink.clone(),
             false,
             0,
@@ -1789,7 +1808,7 @@ mod tests {
             0,
             rx,
             sink.clone(),
-            arc_configs(agg_configs),
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -1841,7 +1860,7 @@ mod tests {
             0,
             rx,
             sink.clone(),
-            arc_configs(agg_configs),
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 15_000,
@@ -1917,7 +1936,7 @@ aggregations:
 
         assert!(streaming_config.contains(10));
 
-        let agg_configs = arc_configs(streaming_config.get_all_aggregation_configs().clone());
+        let agg_configs = streaming_config.get_all_aggregation_configs().clone();
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
@@ -2017,7 +2036,7 @@ aggregations:
             0,
             vec![],
         );
-        let agg_configs = arc_configs(HashMap::from([(1, config)]));
+        let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
@@ -2070,7 +2089,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2097,7 +2116,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2128,7 +2147,7 @@ aggregations:
             0,
             rx,
             Arc::new(CapturingOutputSink::new()),
-            HashMap::new(),
+            make_hot_reload(HashMap::new()),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,
@@ -2159,7 +2178,7 @@ aggregations:
             0,
             vec![],
         );
-        let agg_configs = arc_configs(HashMap::from([(1, config)]));
+        let agg_configs = HashMap::from([(1, config)]);
         let sink = Arc::new(CapturingOutputSink::new());
         let wm = Arc::new(AtomicI64::new(i64::MIN));
         let all = vec![wm.clone()];
@@ -2168,7 +2187,7 @@ aggregations:
             0,
             rx,
             sink,
-            agg_configs,
+            make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,

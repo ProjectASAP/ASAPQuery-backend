@@ -152,7 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         late_data_policy: LateDataPolicy::Drop,
     };
     let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
-    let engine = PrecomputeEngine::new(engine_config, streaming_config.clone(), output_sink);
+    let engine = PrecomputeEngine::new(
+        engine_config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config.clone()),
+        output_sink,
+    );
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             eprintln!("Precompute engine error: {e}");
@@ -292,7 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         late_data_policy: LateDataPolicy::Drop,
     };
     let raw_sink = Arc::new(RawPassthroughSink::new(store.clone()));
-    let raw_engine = PrecomputeEngine::new(raw_engine_config, streaming_config.clone(), raw_sink);
+    let raw_engine = PrecomputeEngine::new(
+        raw_engine_config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config.clone()),
+        raw_sink,
+    );
     tokio::spawn(async move {
         if let Err(e) = raw_engine.run().await {
             eprintln!("Raw precompute engine error: {e}");
@@ -639,7 +647,11 @@ async fn run_single_bench(
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
     };
-    let engine = PrecomputeEngine::new(engine_config, streaming_config, noop_sink.clone());
+    let engine = PrecomputeEngine::new(
+        engine_config,
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        noop_sink.clone(),
+    );
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             eprintln!("Bench engine error: {e}");
