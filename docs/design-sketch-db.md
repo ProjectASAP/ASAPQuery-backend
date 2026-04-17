@@ -11,6 +11,7 @@ controller workload and a query engine sharing it don't step on each other?"
 **Companion docs:**
 - [`design-simple-map-store-persistence.md`](design-simple-map-store-persistence.md) — the current LSM-style parts-based persistence layer this builds on
 - [`promsketch-integration.md`](../asap-query-engine/docs/promsketch-integration.md) — the PromSketch subsystem, retrospectively positioned by this doc as Tier 1 of the sketch DB (see §4.1)
+- [`adding-a-new-sketch.md`](adding-a-new-sketch.md) — cross-repo recipe for extending the supported sketch list (sketchlib + DataCollector + backend + controller + docs)
 - [DataCollector#153 pipeline query catalog](https://github.com/ProjectASAP/DataCollector/pull/153) — the pipeline-level dual-path architecture (sketch path + exact-DB path) that this design depends on
 
 ---
