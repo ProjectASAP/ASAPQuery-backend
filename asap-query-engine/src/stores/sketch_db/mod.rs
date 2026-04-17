@@ -29,10 +29,12 @@
 //!   query path (5f).
 
 pub mod backfill;
+pub mod backfill_worker;
 pub mod raw_sample_reader;
 pub mod schema;
 
 pub use backfill::{BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage};
+pub use backfill_worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
 pub use raw_sample_reader::{
     LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
 };
