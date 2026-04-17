@@ -41,6 +41,11 @@ pub struct HttpServer {
     /// handler still swaps the config but doesn't drive schema
     /// lifecycle transitions.
     schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
+    /// Backfill registry (sketch DB §10). `None` until Phase 5e
+    /// wires a worker pool; in the interim, jobs created via the
+    /// HTTP endpoints stay `Queued` and are visible via the list
+    /// endpoint — useful shadow-mode testing before workers exist.
+    backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
 }
 
 #[derive(Clone)]
@@ -59,6 +64,8 @@ struct AppState {
     /// the swap handler leaves the registry alone (legacy
     /// per-batch reconcile still works).
     schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
+    /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
+    backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
 }
 
 impl HttpServer {
@@ -75,6 +82,7 @@ impl HttpServer {
             query_tracker,
             hot_reload_config: None,
             schemas: None,
+            backfill: None,
         }
     }
 
@@ -103,6 +111,19 @@ impl HttpServer {
         self
     }
 
+    /// Attach a `BackfillRegistry` so the `/api/v1/db/backfill`
+    /// HTTP endpoints (Phase 5d) can create and inspect jobs. Jobs
+    /// stay `Queued` until Phase 5e's worker pool is wired; the
+    /// endpoints are still useful for shadow-mode validation of the
+    /// controller's REFRESH dispatch logic.
+    pub fn with_backfill_registry(
+        mut self,
+        registry: Arc<crate::stores::sketch_db::BackfillRegistry>,
+    ) -> Self {
+        self.backfill = Some(registry);
+        self
+    }
+
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create adapter using factory
         let adapter = create_http_adapter(self.config.adapter_config.clone());
@@ -125,6 +146,7 @@ impl HttpServer {
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
             schemas: self.schemas.clone(),
+            backfill: self.backfill.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -147,6 +169,12 @@ impl HttpServer {
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route("/api/v1/db/timeline", get(handle_get_timeline))
+            .route("/api/v1/db/backfill", post(handle_post_backfill_job))
+            .route("/api/v1/db/backfill/jobs", get(handle_get_backfill_jobs))
+            .route(
+                "/api/v1/db/backfill/jobs/:job_id",
+                get(handle_get_backfill_job).delete(handle_delete_backfill_job),
+            )
             .with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
@@ -175,6 +203,7 @@ impl HttpServer {
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
             schemas: self.schemas.clone(),
+            backfill: self.backfill.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -191,6 +220,12 @@ impl HttpServer {
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route("/api/v1/db/timeline", get(handle_get_timeline))
+            .route("/api/v1/db/backfill", post(handle_post_backfill_job))
+            .route("/api/v1/db/backfill/jobs", get(handle_get_backfill_jobs))
+            .route(
+                "/api/v1/db/backfill/jobs/:job_id",
+                get(handle_get_backfill_job).delete(handle_delete_backfill_job),
+            )
             .with_state(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1398,6 +1433,237 @@ aggregations:
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     }
+
+    // ─── Phase 5d: backfill HTTP endpoint tests ─────────────────────────────
+
+    async fn setup_test_server_with_backfill(
+        registry: Arc<crate::stores::sketch_db::BackfillRegistry>,
+    ) -> u16 {
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        let streaming_config = Arc::new(StreamingConfig::default());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_config.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_config.clone(),
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let server =
+            HttpServer::new(config, query_engine, store, None).with_backfill_registry(registry);
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
+    }
+
+    #[tokio::test]
+    async fn test_backfill_full_lifecycle_through_http() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let server_port = setup_test_server_with_backfill(registry.clone()).await;
+        let client = Client::new();
+
+        // POST creates a Queued job.
+        let req = serde_json::json!({
+            "agg_id": 42,
+            "start_ms": 100,
+            "end_ms": 500,
+            "source": { "Prometheus": { "url": "http://prom.local" } },
+            "windows_total": 4,
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let job_id = body["job_id"].as_u64().expect("job_id in response");
+        assert_eq!(body["status"], "success");
+
+        // GET /jobs/:id returns the queued job.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs/{job_id}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["job"]["status"], "queued");
+        assert_eq!(body["job"]["agg_id"], 42);
+        assert_eq!(body["job"]["start_ms"], 100);
+        assert_eq!(body["job"]["windows_total"], 4);
+        assert_eq!(body["job"]["progress"], 0.0);
+
+        // GET /jobs (no filter) lists all.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1);
+
+        // Filter by status=queued → 1.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs?status=queued"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1);
+
+        // Filter by status=running → 0.
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs?status=running"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 0);
+
+        // DELETE cancels the job.
+        let resp = client
+            .delete(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs/{job_id}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        assert_eq!(
+            registry.get(job_id).unwrap().status,
+            crate::stores::sketch_db::BackfillStatus::Cancelled
+        );
+
+        // Second DELETE on already-cancelled job → 409 Conflict.
+        let resp = client
+            .delete(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs/{job_id}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_post_rejects_inverted_range() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let server_port = setup_test_server_with_backfill(registry).await;
+        let client = Client::new();
+
+        let req = serde_json::json!({
+            "agg_id": 1,
+            "start_ms": 500,
+            "end_ms": 100,
+            "source": { "Prometheus": { "url": "http://prom.local" } },
+            "windows_total": 1,
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_get_unknown_job_returns_404() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let server_port = setup_test_server_with_backfill(registry).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs/9999"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_endpoints_503_without_registry() {
+        // Build a server with NO backfill registry attached — every
+        // backfill endpoint should 503.
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
+        let client = Client::new();
+
+        for (method, path) in [
+            ("GET", "/api/v1/db/backfill/jobs"),
+            ("GET", "/api/v1/db/backfill/jobs/1"),
+        ] {
+            let resp = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("http://127.0.0.1:{server_port}{path}"),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path}"
+            );
+        }
+
+        // POST also.
+        let req = serde_json::json!({
+            "agg_id": 1,
+            "start_ms": 0,
+            "end_ms": 10,
+            "source": { "Prometheus": { "url": "x" } },
+            "windows_total": 1,
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_backfill_list_bogus_status_returns_400() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let server_port = setup_test_server_with_backfill(registry).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/backfill/jobs?status=junk"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -1793,6 +2059,211 @@ async fn handle_get_timeline(
         "end_ms": end_ms,
         "count": entries.len(),
         "segments": entries,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+// ─── §10 / §15 backfill API ──────────────────────────────────────────────────
+
+/// Request body for `POST /api/v1/db/backfill`.
+#[derive(serde::Deserialize)]
+struct CreateBackfillJobRequest {
+    agg_id: u64,
+    start_ms: u64,
+    end_ms: u64,
+    source: crate::stores::sketch_db::BackfillSource,
+    windows_total: u64,
+}
+
+fn backfill_status_str(s: &crate::stores::sketch_db::BackfillStatus) -> &'static str {
+    use crate::stores::sketch_db::BackfillStatus;
+    match s {
+        BackfillStatus::Queued => "queued",
+        BackfillStatus::Running => "running",
+        BackfillStatus::Complete => "complete",
+        BackfillStatus::Failed => "failed",
+        BackfillStatus::Cancelled => "cancelled",
+    }
+}
+
+fn backfill_job_to_json(job: &crate::stores::sketch_db::BackfillJob) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job.job_id,
+        "agg_id": job.agg_id,
+        "start_ms": job.time_range.0,
+        "end_ms": job.time_range.1,
+        "source": job.source,
+        "status": backfill_status_str(&job.status),
+        "progress": job.progress(),
+        "windows_done": job.windows_done,
+        "windows_total": job.windows_total,
+        "created_at_ms": job.created_at_ms,
+        "started_at_ms": job.started_at_ms,
+        "completed_at_ms": job.completed_at_ms,
+        "error_message": job.error_message,
+    })
+}
+
+fn service_unavailable_no_backfill() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body = serde_json::json!({
+        "status": "error",
+        "error": "backfill registry not attached; backend was built without HttpServer::with_backfill_registry",
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
+}
+
+/// `POST /api/v1/db/backfill` — create a queued backfill job. Returns
+/// 201 with `{job_id}` on success; 400 on bad body (malformed JSON
+/// or inverted range); 503 when no registry is attached.
+async fn handle_post_backfill_job(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(registry) = state.backfill else {
+        return service_unavailable_no_backfill();
+    };
+
+    let req: CreateBackfillJobRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("invalid request body: {e}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    if req.start_ms >= req.end_ms {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": format!(
+                "start_ms {} must be < end_ms {}",
+                req.start_ms, req.end_ms
+            ),
+        });
+        return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+    }
+
+    let job_id = registry.create(
+        req.agg_id,
+        (req.start_ms, req.end_ms),
+        req.source,
+        req.windows_total,
+    );
+    let body = serde_json::json!({
+        "status": "success",
+        "job_id": job_id,
+    });
+    (StatusCode::CREATED, axum::Json(body)).into_response()
+}
+
+/// `GET /api/v1/db/backfill/jobs` — list all jobs with optional
+/// `?status=queued|running|complete|failed|cancelled|all` filter.
+async fn handle_get_backfill_jobs(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use crate::stores::sketch_db::BackfillStatus;
+    use axum::response::IntoResponse;
+
+    let Some(registry) = state.backfill else {
+        return service_unavailable_no_backfill();
+    };
+
+    let filter = params.get("status").map(String::as_str).unwrap_or("all");
+    let jobs = match filter {
+        "queued" => registry.list_by_status(&BackfillStatus::Queued),
+        "running" => registry.list_by_status(&BackfillStatus::Running),
+        "complete" => registry.list_by_status(&BackfillStatus::Complete),
+        "failed" => registry.list_by_status(&BackfillStatus::Failed),
+        "cancelled" => registry.list_by_status(&BackfillStatus::Cancelled),
+        "all" => registry.list(),
+        other => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!(
+                    "unknown status filter '{other}'; expected one of queued|running|complete|failed|cancelled|all",
+                ),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    let mut entries: Vec<serde_json::Value> = jobs.iter().map(backfill_job_to_json).collect();
+    entries.sort_by_key(|v| v.get("job_id").and_then(|x| x.as_u64()).unwrap_or(0));
+
+    let body = serde_json::json!({
+        "status": "success",
+        "count": entries.len(),
+        "jobs": entries,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// `GET /api/v1/db/backfill/jobs/:job_id` — detail of a single job.
+/// Returns 404 if not found, 503 if no registry.
+async fn handle_get_backfill_job(
+    State(state): State<AppState>,
+    axum::extract::Path(job_id): axum::extract::Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(registry) = state.backfill else {
+        return service_unavailable_no_backfill();
+    };
+    match registry.get(job_id) {
+        Some(job) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "job": backfill_job_to_json(&job),
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        None => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("job_id {job_id} not found"),
+            });
+            (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+        }
+    }
+}
+
+/// `DELETE /api/v1/db/backfill/jobs/:job_id` — cancel the job if
+/// non-terminal. Returns 200 on success, 404 if unknown, 409 if
+/// the job is already terminal, 503 if no registry.
+async fn handle_delete_backfill_job(
+    State(state): State<AppState>,
+    axum::extract::Path(job_id): axum::extract::Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(registry) = state.backfill else {
+        return service_unavailable_no_backfill();
+    };
+    let Some(job) = registry.get(job_id) else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": format!("job_id {job_id} not found"),
+        });
+        return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+    };
+    if job.status.is_terminal() {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": format!(
+                "job {job_id} already {}, cannot cancel",
+                backfill_status_str(&job.status)
+            ),
+        });
+        return (StatusCode::CONFLICT, axum::Json(body)).into_response();
+    }
+    registry.cancel(job_id);
+    let body = serde_json::json!({
+        "status": "success",
+        "job_id": job_id,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
