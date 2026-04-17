@@ -179,6 +179,14 @@ struct Args {
     #[arg(long, default_value = "10000")]
     precompute_channel_buffer_size: usize,
 
+    /// Optional path where the schema registry persists per-`agg_id`
+    /// lifecycle state (created_at / retired_at / expires_at) across
+    /// restarts (sketch DB Phase 2c). When unset, the registry is
+    /// memory-only and the §7 schema timeline loses all pre-restart
+    /// history.
+    #[arg(long)]
+    schema_persist_path: Option<std::path::PathBuf>,
+
     /// Enable automatic query tracking and planning
     #[arg(long)]
     enable_query_tracker: bool,
@@ -482,6 +490,7 @@ async fn main() -> Result<()> {
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
             late_data_policy: LateDataPolicy::Drop,
+            schema_persist_path: args.schema_persist_path.clone(),
         };
         let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
         let engine =

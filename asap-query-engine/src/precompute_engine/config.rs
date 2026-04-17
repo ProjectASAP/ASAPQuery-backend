@@ -32,6 +32,15 @@ pub struct PrecomputeEngineConfig {
     pub raw_mode_aggregation_id: u64,
     /// Policy for handling late samples that arrive after their window has closed.
     pub late_data_policy: LateDataPolicy,
+    /// Optional path where the `SchemaRegistry` persists per-`agg_id`
+    /// lifecycle state across restarts (sketch DB Phase 2c). When
+    /// set, the registry loads prior `created_at_ms` / `retired_at_ms`
+    /// timestamps from the file on startup and atomically rewrites
+    /// the file after every config-driven reconcile. When `None`,
+    /// the registry is memory-only and the §7 timeline reflects only
+    /// post-restart history.
+    #[serde(default)]
+    pub schema_persist_path: Option<std::path::PathBuf>,
 }
 
 impl Default for PrecomputeEngineConfig {
@@ -46,6 +55,7 @@ impl Default for PrecomputeEngineConfig {
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
             late_data_policy: LateDataPolicy::Drop,
+            schema_persist_path: None,
         }
     }
 }

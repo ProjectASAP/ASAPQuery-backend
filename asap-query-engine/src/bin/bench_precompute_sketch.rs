@@ -174,6 +174,7 @@ async fn start_engine(
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
+        schema_persist_path: None,
     };
     let engine = PrecomputeEngine::new(
         config,
