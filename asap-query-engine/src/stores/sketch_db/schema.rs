@@ -34,7 +34,7 @@
 //!   snapshot at construction; reconciled event-driven by the
 //!   `POST /api/v1/streaming-config` swap handler (Phase 2b).
 //!
-//! Phase 3a (this commit) adds the §7 **schema timeline** read API:
+//! Phase 3a added the §7 **schema timeline** read API:
 //!
 //! * `TimelineSegment` + `TimelineCoverage` types.
 //! * `SchemaRegistry::timeline_for_metric(metric, t1_ms, t2_ms)`
@@ -42,16 +42,24 @@
 //!   `[t1, t2]` for a given metric. Derived on-demand from registry
 //!   state — no separate index to keep consistent.
 //!
-//! Phase 3b will wire this into `SimpleEngine`'s query entry points
-//! so metric-range queries transparently stitch across reconfigure
-//! boundaries instead of seeing a data cliff at the moment of the
-//! schema change.
+//! Phase 3b lands the combiner used by the query engine to stitch
+//! per-segment scalars into a single result (see
+//! `crate::engines::timeline_dispatch`); Phase 3b-2 will wire that
+//! combiner into the PromQL dispatch.
+//!
+//! Phase 2c (this commit) adds **on-disk schema persistence**:
+//!
+//! * `SchemaRegistry::load_or_new_from_config(path, &StreamingConfig)`
+//!   reads a JSON snapshot if present (preserving `created_at_ms` /
+//!   `retired_at_ms` / `expires_at_ms`) and reconciles against the
+//!   live config.
+//! * After every `reconcile` call the registry rewrites the snapshot
+//!   atomically (`path.tmp` + rename). Best-effort: I/O errors are
+//!   logged but never block a reconcile.
+//! * `PrecomputeEngineConfig::schema_persist_path` surfaces this as a
+//!   CLI-flag-able option; `--schema-persist-path` on `main.rs`.
 //!
 //! ## Out of scope here
-//!
-//! * On-disk schema persistence — schemas are rebuilt from
-//!   `StreamingConfig` on startup. Phase 2c closes this gap; until
-//!   then the timeline reflects only the *post-restart* history.
 //! * `AccuracyProfile` derivation — §6.4 in the design doc; the hook
 //!   is here as `accuracy_profile()` that returns a stub today and
 //!   will be filled in once the sketch types' theoretical bounds are
@@ -62,10 +70,13 @@
 //!   approaches — §9.2 of the design.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asap_types::aggregation_config::AggregationConfig;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 use crate::data_model::StreamingConfig;
 
@@ -87,7 +98,7 @@ pub enum AggStatus {
 /// Per-`aggregation_id` schema metadata. One entry per agg in the
 /// registry; lifecycle transitions update `retired_at` and `expires_at`
 /// rather than mutating any other field.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggSchema {
     pub agg_id: u64,
     pub metric_name: String,
@@ -180,6 +191,17 @@ pub struct SchemaRegistry {
     /// Retired. Tunable per-deployment; Phase 2b will let the
     /// controller override it per-agg via `AggregationConfig`.
     retirement_retention: Duration,
+    /// Optional on-disk path where the registry snapshots itself
+    /// after every `reconcile` call (Phase 2c). Set via
+    /// `with_persistence`. When `None`, the registry lives only in
+    /// memory and the timeline loses pre-restart history — which is
+    /// the pre-Phase-2c behaviour.
+    ///
+    /// Persistence is best-effort: I/O errors are logged but never
+    /// block a reconcile. The worst case is a stale snapshot on
+    /// disk, which will itself be rewritten by the next successful
+    /// reconcile.
+    persist_path: Option<PathBuf>,
 }
 
 impl SchemaRegistry {
@@ -198,6 +220,146 @@ impl SchemaRegistry {
         Self {
             schemas: RwLock::new(schemas),
             retirement_retention: DEFAULT_RETIREMENT_RETENTION,
+            persist_path: None,
+        }
+    }
+
+    /// Enable on-disk persistence at `path`. After this call every
+    /// `reconcile` snapshots the registry atomically (tmp + rename)
+    /// to `path`. If the file already exists, prefer
+    /// [`Self::load_or_new_from_config`] over this builder so
+    /// previously-persisted lifecycle timestamps are recovered
+    /// instead of silently overwritten.
+    ///
+    /// I/O errors on save are logged as warnings but never fail a
+    /// reconcile — the registry is always authoritative in memory.
+    pub fn with_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        self.persist_path = Some(path.into());
+        self
+    }
+
+    /// Build a registry that recovers prior lifecycle history from
+    /// `path` (if it exists) and then reconciles against the current
+    /// `StreamingConfig`. The right way to construct a registry in
+    /// production code.
+    ///
+    /// Load semantics:
+    /// * If `path` does not exist: behaves like
+    ///   `from_streaming_config(config).with_persistence(path)`
+    ///   followed by an explicit save, so the next restart has
+    ///   something to read.
+    /// * If `path` exists and parses: load every persisted schema
+    ///   verbatim (preserving `created_at_ms` / `retired_at_ms` /
+    ///   `expires_at_ms`), then reconcile against `config` — new ids
+    ///   in the config become Active, ids present only on disk get
+    ///   retired if they weren't already.
+    /// * If `path` exists but can't be parsed: log a warning and
+    ///   fall back to the non-persisted path, preserving forward
+    ///   progress over historical accuracy.
+    pub fn load_or_new_from_config(path: impl Into<PathBuf>, config: &StreamingConfig) -> Self {
+        let path = path.into();
+        let mut registry = match Self::load_from_disk(&path) {
+            Ok(Some(registry)) => {
+                debug!(
+                    "Loaded {} persisted schema(s) from {}",
+                    registry.schemas.read().map(|m| m.len()).unwrap_or(0),
+                    path.display()
+                );
+                registry
+            }
+            Ok(None) => Self::from_streaming_config(config),
+            Err(e) => {
+                warn!(
+                    "Failed to load schema registry from {}: {e}. Starting fresh.",
+                    path.display()
+                );
+                Self::from_streaming_config(config)
+            }
+        };
+        registry.persist_path = Some(path);
+        // Reconcile so the loaded state is refreshed against the
+        // currently-authoritative config (new ids added, removed ids
+        // retired). Also triggers an initial save so the snapshot on
+        // disk reflects post-reconcile state.
+        let _ = registry.reconcile(config);
+        registry
+    }
+
+    /// Read a registry snapshot from disk. Returns `Ok(None)` if the
+    /// file doesn't exist (first-run case), `Ok(Some(_))` if it
+    /// parsed, and `Err` on I/O or parse failure.
+    fn load_from_disk(path: &Path) -> Result<Option<Self>, std::io::Error> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let snap: PersistedSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if snap.version != PERSIST_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported schema-registry persist format version {} (expected {})",
+                    snap.version, PERSIST_FORMAT_VERSION
+                ),
+            ));
+        }
+        let mut map = HashMap::with_capacity(snap.schemas.len());
+        for s in snap.schemas {
+            map.insert(s.agg_id, s);
+        }
+        Ok(Some(Self {
+            schemas: RwLock::new(map),
+            retirement_retention: DEFAULT_RETIREMENT_RETENTION,
+            persist_path: None,
+        }))
+    }
+
+    /// Snapshot all current schemas to `persist_path` atomically
+    /// (write `path.tmp`, then rename over `path`). Called at the
+    /// tail of `reconcile`. No-op when no `persist_path` is set.
+    fn save_to_disk_if_persistent(&self) {
+        let Some(path) = self.persist_path.as_ref() else {
+            return;
+        };
+        let schemas: Vec<AggSchema> = match self.schemas.read() {
+            Ok(m) => m.values().cloned().collect(),
+            Err(e) => {
+                warn!("Schema registry lock poisoned; skipping persist: {e}");
+                return;
+            }
+        };
+        let snap = PersistedSnapshot {
+            version: PERSIST_FORMAT_VERSION,
+            schemas,
+        };
+        let bytes = match serde_json::to_vec_pretty(&snap) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to serialise schema registry: {e}");
+                return;
+            }
+        };
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            warn!(
+                "Failed to write schema registry tmp file {}: {e}",
+                tmp.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(
+                "Failed to rename schema registry {} → {}: {e}",
+                tmp.display(),
+                path.display()
+            );
         }
     }
 
@@ -207,6 +369,7 @@ impl SchemaRegistry {
         Self {
             schemas: RwLock::new(HashMap::new()),
             retirement_retention: DEFAULT_RETIREMENT_RETENTION,
+            persist_path: None,
         }
     }
 
@@ -297,7 +460,13 @@ impl SchemaRegistry {
             }
         }
 
-        ReconcileSummary { added, retired }
+        // Drop the write lock BEFORE persisting — save_to_disk_if_persistent
+        // takes a read lock, so holding the write one would deadlock on
+        // a single-threaded runtime.
+        drop(map);
+        let summary = ReconcileSummary { added, retired };
+        self.save_to_disk_if_persistent();
+        summary
     }
 
     /// §7 schema timeline — the key to query continuity across
@@ -423,6 +592,23 @@ impl SchemaRegistry {
             map.insert(schema.agg_id, schema);
         }
     }
+}
+
+/// On-disk JSON format version for the persisted schema registry.
+/// Bumped whenever the shape of [`PersistedSnapshot`] or [`AggSchema`]
+/// changes incompatibly; loads with a different version are rejected
+/// rather than silently coerced, so partial upgrades don't corrupt
+/// the timeline's pre-restart history.
+pub const PERSIST_FORMAT_VERSION: u32 = 1;
+
+/// Top-level structure written to disk by [`SchemaRegistry`] when
+/// `persist_path` is set. Tagged with [`PERSIST_FORMAT_VERSION`] so
+/// future schema evolution can refuse to load incompatible files
+/// instead of silently losing data.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    version: u32,
+    schemas: Vec<AggSchema>,
 }
 
 /// Summary of a single `reconcile` call. Surfaced so the HTTP swap
@@ -834,5 +1020,117 @@ mod tests {
         assert_eq!(straddle[0].end_ms, 100);
         assert_eq!(straddle[1].agg_id, 2);
         assert_eq!(straddle[1].start_ms, 200);
+    }
+
+    // --- Phase 2c: on-disk persistence tests ---
+
+    #[test]
+    fn persistence_roundtrip_preserves_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+
+        let cfg = make_streaming_config(&[1, 2]);
+        let registry = SchemaRegistry::load_or_new_from_config(&path, &cfg);
+        assert!(registry.is_writable(1));
+        assert!(registry.is_writable(2));
+
+        // Retire agg 2 and persist.
+        let cfg_only_1 = make_streaming_config(&[1]);
+        let _ = registry.reconcile(&cfg_only_1);
+        let retired_at_before = registry.get(2).unwrap().retired_at_ms;
+        assert!(retired_at_before.is_some());
+
+        // Drop registry, simulate a restart by loading from the same
+        // file. The retirement timestamp for agg 2 must survive.
+        drop(registry);
+        let reloaded = SchemaRegistry::load_or_new_from_config(&path, &cfg_only_1);
+        let reloaded_2 = reloaded.get(2).expect("agg 2 reloaded");
+        assert_eq!(reloaded_2.status(), AggStatus::Retired);
+        assert_eq!(reloaded_2.retired_at_ms, retired_at_before);
+        // agg 1 is still active after reconcile.
+        assert!(reloaded.is_writable(1));
+    }
+
+    #[test]
+    fn load_or_new_from_config_creates_file_on_first_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        assert!(!path.exists());
+
+        let cfg = make_streaming_config(&[7]);
+        let _ = SchemaRegistry::load_or_new_from_config(&path, &cfg);
+        assert!(path.exists(), "persist file should be written on first run");
+
+        // File should be valid JSON containing agg_id=7.
+        let bytes = std::fs::read(&path).unwrap();
+        let snap: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snap["version"], 1);
+        let schemas = snap["schemas"].as_array().unwrap();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0]["agg_id"], 7);
+    }
+
+    #[test]
+    fn load_or_new_from_config_reconciles_against_fresh_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+
+        // First run: persist two ids.
+        let cfg_two = make_streaming_config(&[1, 2]);
+        drop(SchemaRegistry::load_or_new_from_config(&path, &cfg_two));
+
+        // Second run: config now only has id 3 (a restart with a
+        // new streaming-config). The loaded 1 and 2 should be
+        // retired; 3 should be active.
+        let cfg_three_only = make_streaming_config(&[3]);
+        let r = SchemaRegistry::load_or_new_from_config(&path, &cfg_three_only);
+        assert_eq!(r.get(1).unwrap().status(), AggStatus::Retired);
+        assert_eq!(r.get(2).unwrap().status(), AggStatus::Retired);
+        assert!(r.is_writable(3));
+    }
+
+    #[test]
+    fn corrupt_persist_file_falls_back_to_fresh_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        std::fs::write(&path, b"this is not json").unwrap();
+
+        let cfg = make_streaming_config(&[42]);
+        let r = SchemaRegistry::load_or_new_from_config(&path, &cfg);
+        assert!(r.is_writable(42));
+        // Previous known ids on disk were bogus; reloaded file must
+        // now be valid (reconcile writes a fresh snapshot over the
+        // corrupt one).
+        let bytes = std::fs::read(&path).unwrap();
+        let snap: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snap["version"], 1);
+    }
+
+    #[test]
+    fn unsupported_persist_version_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schemas.json");
+        let snap = serde_json::json!({"version": 999, "schemas": []});
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        // Falls back to from_streaming_config then reconciles and
+        // overwrites with the current version.
+        let cfg = make_streaming_config(&[1]);
+        let r = SchemaRegistry::load_or_new_from_config(&path, &cfg);
+        assert!(r.is_writable(1));
+        let bytes = std::fs::read(&path).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(got["version"], 1);
+    }
+
+    #[test]
+    fn persist_without_path_does_not_write_anywhere() {
+        // Regression: ensure the non-persistent path is unaffected —
+        // no file created under the test's tempdir on reconcile.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("should_not_exist.json");
+        let registry = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        let _ = registry.reconcile(&make_streaming_config(&[2]));
+        assert!(!path.exists());
     }
 }

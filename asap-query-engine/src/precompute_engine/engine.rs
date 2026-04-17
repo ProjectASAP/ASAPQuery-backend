@@ -77,11 +77,15 @@ impl PrecomputeEngine {
         // reconciliation onto the HTTP swap handler so it's
         // event-driven instead of per-batch.
         let initial_snapshot = hot_reload_config.snapshot();
-        let schemas = Arc::new(
-            crate::stores::sketch_db::SchemaRegistry::from_streaming_config(
+        let schemas = Arc::new(match config.schema_persist_path.as_ref() {
+            Some(path) => crate::stores::sketch_db::SchemaRegistry::load_or_new_from_config(
+                path.clone(),
                 initial_snapshot.as_ref(),
             ),
-        );
+            None => crate::stores::sketch_db::SchemaRegistry::from_streaming_config(
+                initial_snapshot.as_ref(),
+            ),
+        });
         let ingest_state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),

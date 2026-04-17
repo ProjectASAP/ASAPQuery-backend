@@ -150,6 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
+        schema_persist_path: None,
     };
     let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
     let engine = PrecomputeEngine::new(
@@ -294,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pass_raw_samples: true,
         raw_mode_aggregation_id: raw_agg_id,
         late_data_policy: LateDataPolicy::Drop,
+        schema_persist_path: None,
     };
     let raw_sink = Arc::new(RawPassthroughSink::new(store.clone()));
     let raw_engine = PrecomputeEngine::new(
@@ -646,6 +648,7 @@ async fn run_single_bench(
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
+        schema_persist_path: None,
     };
     let engine = PrecomputeEngine::new(
         engine_config,

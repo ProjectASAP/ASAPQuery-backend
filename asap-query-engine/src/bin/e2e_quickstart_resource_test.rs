@@ -233,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
+        schema_persist_path: None,
     };
     let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
     let engine = PrecomputeEngine::new(

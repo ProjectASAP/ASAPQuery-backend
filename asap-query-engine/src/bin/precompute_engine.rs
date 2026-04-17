@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pass_raw_samples: args.pass_raw_samples,
         raw_mode_aggregation_id: args.raw_mode_aggregation_id,
         late_data_policy: args.late_data_policy,
+        schema_persist_path: None,
     };
 
     // Create the output sink (writes directly to the store)
