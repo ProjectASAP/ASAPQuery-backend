@@ -48,11 +48,13 @@
 //!   (analogous to schema persistence in Phase 2c).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
 
 /// Source of raw samples a backfill job reads from. The DB picks a
 /// concrete reader at job-dispatch time based on deployment config
@@ -224,18 +226,45 @@ pub enum Coverage {
 ///   Complete / Failed / Cancelled, further transitions are
 ///   rejected with `false` return.
 ///
-/// ## Phase 5a scope
+/// ## Persistence (Phase 5g)
 ///
-/// Registry is purely in-memory. Phase 5g will add persistence
-/// mirroring Phase 2c's pattern so restart doesn't lose
-/// in-flight-job records. For now, a backend restart during an
-/// active backfill means the worker pool loses the job — in Phase
-/// 5c the worker will be written so losing an in-flight job at
-/// restart is safe (nothing is half-written because writes are
-/// per-window atomic).
+/// Opt-in via [`Self::with_persistence`] or the
+/// [`Self::load_or_new`] constructor. When set, the registry
+/// atomically rewrites the snapshot to `persist_path` (write tmp +
+/// rename) after every status transition — `create`, `start`,
+/// `mark_complete`, `mark_failed`, `cancel`, `evict_old_terminal`.
+/// `tick_progress` is deliberately **not** persisted: workers can
+/// tick many times per second, and losing the last few ticks
+/// across a restart is harmless (Phase 5e's worker will re-derive
+/// `windows_done` from whatever the store already has when it
+/// picks a Running job back up).
+///
+/// I/O errors on save are logged and dropped — the registry is
+/// always authoritative in memory. Corrupt files on load are
+/// logged and the registry falls back to empty, matching Phase
+/// 2c's semantics.
 pub struct BackfillRegistry {
     jobs: RwLock<HashMap<u64, BackfillJob>>,
     next_job_id: AtomicU64,
+    /// Optional on-disk snapshot path. Set via `with_persistence`.
+    persist_path: Option<PathBuf>,
+}
+
+/// On-disk format version for the persisted backfill registry.
+/// Bumped on any incompatible change to [`BackfillJob`] or
+/// [`PersistedSnapshot`]; version mismatch on load is treated as
+/// a corrupt file (registry starts empty, next save rewrites the
+/// current version).
+pub const PERSIST_FORMAT_VERSION: u32 = 1;
+
+/// Top-level structure written by `persist_path`. Captures the
+/// current `next_job_id` alongside the jobs so a restart doesn't
+/// accidentally reuse a previously-allocated id.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    version: u32,
+    next_job_id: u64,
+    jobs: Vec<BackfillJob>,
 }
 
 impl Default for BackfillRegistry {
@@ -249,6 +278,130 @@ impl BackfillRegistry {
         Self {
             jobs: RwLock::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
+            persist_path: None,
+        }
+    }
+
+    /// Enable on-disk persistence at `path`. Every status transition
+    /// from here on atomically rewrites the snapshot. Prefer
+    /// [`Self::load_or_new`] over this builder if the file already
+    /// exists and you want to recover its contents.
+    pub fn with_persistence(mut self, path: impl Into<PathBuf>) -> Self {
+        self.persist_path = Some(path.into());
+        self
+    }
+
+    /// Build a registry that recovers prior job records from `path`
+    /// (if it exists) and then enables persistence at the same path.
+    /// The right way to construct a registry in production code.
+    ///
+    /// Load semantics:
+    /// * File does not exist → fresh empty registry; first transition
+    ///   writes the snapshot so the next restart has something to
+    ///   read.
+    /// * File exists and parses → load all jobs verbatim, restore
+    ///   `next_job_id` so IDs don't collide with persisted ones.
+    /// * File exists but is corrupt / wrong version → log warning,
+    ///   fall back to empty registry. Forward progress over
+    ///   historical accuracy, matching Phase 2c's schema-registry
+    ///   behaviour.
+    pub fn load_or_new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let mut registry = match Self::load_from_disk(&path) {
+            Ok(Some(r)) => {
+                debug!(
+                    "Loaded {} persisted backfill job(s) from {}",
+                    r.jobs.read().map(|m| m.len()).unwrap_or(0),
+                    path.display()
+                );
+                r
+            }
+            Ok(None) => Self::new(),
+            Err(e) => {
+                warn!(
+                    "Failed to load backfill registry from {}: {e}. Starting fresh.",
+                    path.display()
+                );
+                Self::new()
+            }
+        };
+        registry.persist_path = Some(path);
+        // Write an initial snapshot so a first-run file exists even
+        // before any job transitions happen.
+        registry.save_to_disk_if_persistent();
+        registry
+    }
+
+    fn load_from_disk(path: &Path) -> Result<Option<Self>, std::io::Error> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let snap: PersistedSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if snap.version != PERSIST_FORMAT_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported backfill persist format version {} (expected {})",
+                    snap.version, PERSIST_FORMAT_VERSION
+                ),
+            ));
+        }
+        let mut map = HashMap::with_capacity(snap.jobs.len());
+        for job in snap.jobs {
+            map.insert(job.job_id, job);
+        }
+        Ok(Some(Self {
+            jobs: RwLock::new(map),
+            next_job_id: AtomicU64::new(snap.next_job_id.max(1)),
+            persist_path: None,
+        }))
+    }
+
+    fn save_to_disk_if_persistent(&self) {
+        let Some(path) = self.persist_path.as_ref() else {
+            return;
+        };
+        let jobs: Vec<BackfillJob> = match self.jobs.read() {
+            Ok(m) => m.values().cloned().collect(),
+            Err(e) => {
+                warn!("Backfill registry lock poisoned; skipping persist: {e}");
+                return;
+            }
+        };
+        let snap = PersistedSnapshot {
+            version: PERSIST_FORMAT_VERSION,
+            next_job_id: self.next_job_id.load(Ordering::Relaxed),
+            jobs,
+        };
+        let bytes = match serde_json::to_vec_pretty(&snap) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to serialise backfill registry: {e}");
+                return;
+            }
+        };
+        let tmp = path.with_extension("tmp");
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = std::fs::write(&tmp, &bytes) {
+            warn!(
+                "Failed to write backfill registry tmp file {}: {e}",
+                tmp.display()
+            );
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(
+                "Failed to rename backfill registry {} → {}: {e}",
+                tmp.display(),
+                path.display()
+            );
         }
     }
 
@@ -278,6 +431,7 @@ impl BackfillRegistry {
         if let Ok(mut map) = self.jobs.write() {
             map.insert(job_id, job);
         }
+        self.save_to_disk_if_persistent();
         job_id
     }
 
@@ -325,6 +479,8 @@ impl BackfillRegistry {
         }
         job.status = BackfillStatus::Running;
         job.started_at_ms = Some(now_ms());
+        drop(map);
+        self.save_to_disk_if_persistent();
         true
     }
 
@@ -371,6 +527,8 @@ impl BackfillRegistry {
         }
         job.status = BackfillStatus::Cancelled;
         job.completed_at_ms = Some(now_ms());
+        drop(map);
+        self.save_to_disk_if_persistent();
         true
     }
 
@@ -390,6 +548,8 @@ impl BackfillRegistry {
         if error.is_some() {
             job.error_message = error;
         }
+        drop(map);
+        self.save_to_disk_if_persistent();
         true
     }
 
@@ -412,7 +572,12 @@ impl BackfillRegistry {
         map.retain(|_, job| {
             !(job.status.is_terminal() && job.completed_at_ms.map(|t| t <= cutoff).unwrap_or(false))
         });
-        before - map.len()
+        let evicted = before - map.len();
+        drop(map);
+        if evicted > 0 {
+            self.save_to_disk_if_persistent();
+        }
+        evicted
     }
 }
 
@@ -667,5 +832,149 @@ mod tests {
         assert!(BackfillStatus::Complete.is_terminal());
         assert!(BackfillStatus::Failed.is_terminal());
         assert!(BackfillStatus::Cancelled.is_terminal());
+    }
+
+    // ─── Phase 5g: persistence tests ───────────────────────────────
+
+    #[test]
+    fn persistence_roundtrip_preserves_job_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+
+        let r = BackfillRegistry::load_or_new(&path);
+        let id = r.create(42, (100, 200), prom_source(), 4);
+        r.start(id);
+        r.mark_complete(id);
+
+        let before = r.get(id).unwrap();
+        drop(r);
+
+        // Simulate a restart.
+        let reloaded = BackfillRegistry::load_or_new(&path);
+        let after = reloaded.get(id).expect("job survived restart");
+        assert_eq!(after.status, BackfillStatus::Complete);
+        assert_eq!(after.agg_id, 42);
+        assert_eq!(after.time_range, (100, 200));
+        assert_eq!(after.windows_total, 4);
+        assert_eq!(after.started_at_ms, before.started_at_ms);
+        assert_eq!(after.completed_at_ms, before.completed_at_ms);
+    }
+
+    #[test]
+    fn persistence_preserves_next_job_id_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+
+        let r = BackfillRegistry::load_or_new(&path);
+        let first = r.create(1, (0, 10), prom_source(), 1);
+        let second = r.create(1, (10, 20), prom_source(), 1);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        drop(r);
+
+        // Restart: next id should be 3, not 1, so we don't collide
+        // with the persisted job_id=2.
+        let reloaded = BackfillRegistry::load_or_new(&path);
+        let third = reloaded.create(1, (20, 30), prom_source(), 1);
+        assert_eq!(third, 3);
+    }
+
+    #[test]
+    fn persistence_writes_file_on_create_even_when_empty_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+        assert!(!path.exists());
+
+        let r = BackfillRegistry::load_or_new(&path);
+        // load_or_new writes an initial empty snapshot so the file
+        // always exists after construction.
+        assert!(path.exists());
+        let _ = r.create(1, (0, 10), prom_source(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let snap: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snap["version"], 1);
+        assert_eq!(snap["jobs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn persistence_survives_cancel_and_fail_transitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+
+        let r = BackfillRegistry::load_or_new(&path);
+        let cancelled = r.create(1, (0, 10), prom_source(), 1);
+        r.cancel(cancelled);
+        let failed = r.create(1, (10, 20), prom_source(), 1);
+        r.start(failed);
+        r.mark_failed(failed, "boom");
+        drop(r);
+
+        let reloaded = BackfillRegistry::load_or_new(&path);
+        assert_eq!(
+            reloaded.get(cancelled).unwrap().status,
+            BackfillStatus::Cancelled
+        );
+        let j = reloaded.get(failed).unwrap();
+        assert_eq!(j.status, BackfillStatus::Failed);
+        assert_eq!(j.error_message.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn persistence_evict_rewrites_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+
+        let r = BackfillRegistry::load_or_new(&path);
+        let done = r.create(1, (0, 10), prom_source(), 1);
+        r.start(done);
+        r.mark_complete(done);
+        let live = r.create(1, (10, 20), prom_source(), 1);
+        // Evict everything terminal right now.
+        let evicted = r.evict_old_terminal(0);
+        assert_eq!(evicted, 1);
+
+        let reloaded = BackfillRegistry::load_or_new(&path);
+        assert!(reloaded.get(done).is_none());
+        assert!(reloaded.get(live).is_some());
+    }
+
+    #[test]
+    fn corrupt_persist_file_falls_back_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+        std::fs::write(&path, b"this is not json").unwrap();
+
+        let r = BackfillRegistry::load_or_new(&path);
+        assert!(r.list().is_empty());
+        // Next create should succeed and write a fresh valid snapshot.
+        let id = r.create(1, (0, 10), prom_source(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let snap: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snap["version"], 1);
+        assert_eq!(snap["jobs"][0]["job_id"], id);
+    }
+
+    #[test]
+    fn unsupported_persist_version_is_rejected_and_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backfill.json");
+        let snap = serde_json::json!({"version": 999, "next_job_id": 1, "jobs": []});
+        std::fs::write(&path, serde_json::to_vec(&snap).unwrap()).unwrap();
+
+        let r = BackfillRegistry::load_or_new(&path);
+        let _ = r.create(1, (0, 10), prom_source(), 1);
+        // File has been rewritten with the current version.
+        let bytes = std::fs::read(&path).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(got["version"], 1);
+    }
+
+    #[test]
+    fn non_persistent_registry_writes_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("should_not_exist.json");
+        let r = BackfillRegistry::new();
+        let _ = r.create(1, (0, 10), prom_source(), 1);
+        assert!(!path.exists());
     }
 }
