@@ -47,11 +47,33 @@ impl HllSketchAccumulator {
     /// that DataCollector's `hllprocessor` emits when
     /// `encoding = HLL_SKETCH_ENCODING_PROTO`.
     pub fn from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoVariant, HyperLogLogState};
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
         use prost::Message;
 
-        let state = HyperLogLogState::decode(buffer)
-            .map_err(|e| format!("decode HyperLogLogState: {e}"))?;
+        // DataCollector's hllprocessor wraps the state in a
+        // `SketchEnvelope{hll: HyperLogLogState}` via sketchlib-go's
+        // `SerializePortableFO` + `proto.Marshal`. Try envelope first,
+        // fall back to bare `HyperLogLogState` for callers (e.g. unit
+        // tests) that encode the state directly. Mirrors the PR #14
+        // fix on `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
+        let state = match SketchEnvelope::decode(buffer) {
+            Ok(env) => match env.sketch_state {
+                Some(sketch_envelope::SketchState::Hll(st)) => st,
+                Some(other) => {
+                    return Err(format!(
+                        "SketchEnvelope contains non-HLL sketch: {:?}",
+                        std::mem::discriminant(&other)
+                    )
+                    .into());
+                }
+                None => HyperLogLogState::decode(buffer)
+                    .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+            },
+            Err(_) => HyperLogLogState::decode(buffer)
+                .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+        };
         if state.precision == 0 || state.precision > 20 {
             return Err(format!(
                 "HyperLogLogState precision {} out of range (expected 1..=20)",
@@ -218,6 +240,51 @@ mod tests {
         assert_eq!(acc.inner.hip_kxq0, 1.5);
         assert_eq!(acc.inner.hip_kxq1, 2.5);
         assert_eq!(acc.inner.hip_est, 42.0);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrapped() {
+        // Mirrors what DataCollector's hllprocessor emits: the state
+        // wrapped in a `SketchEnvelope{hll: ...}` via sketchlib-go's
+        // `SerializePortableFO` + `proto.Marshal`.
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use prost::Message;
+
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: 2,
+            registers: vec![1, 2, 3, 4],
+            hip_kxq0: 0.0,
+            hip_kxq1: 0.0,
+            hip_est: 0.0,
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let acc = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("envelope-wrapped decode should succeed");
+        assert_eq!(acc.inner.variant, HllVariant::Regular);
+        assert_eq!(acc.inner.registers, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_envelope_wrong_sketch_type() {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(KllState::default())),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+
+        let result = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "wrong-sketch envelope should error");
     }
 
     #[test]
