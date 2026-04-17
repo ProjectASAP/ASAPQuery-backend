@@ -21,28 +21,43 @@
 //!    `AccuracyProfile` (§6.4) so the query path can return error bounds
 //!    without recomputation.
 //!
-//! ## Phase 2a scope (what this file covers)
+//! ## What this file covers
+//!
+//! Phase 2a added the lifecycle + registry:
 //!
 //! * `AggSchema` struct with the lifecycle fields populated from
 //!   `AggregationConfig` + a `created_at` timestamp.
 //! * `AggStatus` enum: `Active` / `Retired` / `Expired`, derived from
 //!   `retired_at` and `expires_at` plus the wall clock.
-//! * `SchemaRegistry` — an in-memory map keyed by `agg_id` that the ingest
-//!   path consults. Built from the current `StreamingConfig` snapshot at
-//!   construction; refreshed in lockstep with the hot-reload `ArcSwap`
-//!   (Phase 2b will diff old vs new and explicitly retire removed ids;
-//!   for now any id missing from the snapshot is treated as Retired with
-//!   a default retention).
+//! * `SchemaRegistry` — an in-memory map keyed by `agg_id` that the
+//!   ingest path consults. Built from the current `StreamingConfig`
+//!   snapshot at construction; reconciled event-driven by the
+//!   `POST /api/v1/streaming-config` swap handler (Phase 2b).
 //!
-//! ## Out of scope here (Phase 2b and beyond)
+//! Phase 3a (this commit) adds the §7 **schema timeline** read API:
+//!
+//! * `TimelineSegment` + `TimelineCoverage` types.
+//! * `SchemaRegistry::timeline_for_metric(metric, t1_ms, t2_ms)`
+//!   returning the non-overlapping, time-ordered segments that cover
+//!   `[t1, t2]` for a given metric. Derived on-demand from registry
+//!   state — no separate index to keep consistent.
+//!
+//! Phase 3b will wire this into `SimpleEngine`'s query entry points
+//! so metric-range queries transparently stitch across reconfigure
+//! boundaries instead of seeing a data cliff at the moment of the
+//! schema change.
+//!
+//! ## Out of scope here
 //!
 //! * On-disk schema persistence — schemas are rebuilt from
-//!   `StreamingConfig` on startup. This is intentionally deferred so this
-//!   PR has zero on-disk format change.
-//! * `AccuracyProfile` derivation — §6.4 in the design doc; the hook is
-//!   here as `accuracy_profile()` that returns a stub today and will be
-//!   filled in once the sketch types' theoretical bounds are vendored.
-//! * HTTP swap-diff that creates/retires schemas explicitly — Phase 2b.
+//!   `StreamingConfig` on startup. Phase 2c closes this gap; until
+//!   then the timeline reflects only the *post-restart* history.
+//! * `AccuracyProfile` derivation — §6.4 in the design doc; the hook
+//!   is here as `accuracy_profile()` that returns a stub today and
+//!   will be filled in once the sketch types' theoretical bounds are
+//!   vendored.
+//! * `combine_statistic()` and `PartialResult` for cross-segment
+//!   result stitching — Phase 3b.
 //! * Compaction policy that reads `AggStatus` to throttle as expiry
 //!   approaches — §9.2 of the design.
 
@@ -285,12 +300,128 @@ impl SchemaRegistry {
         ReconcileSummary { added, retired }
     }
 
+    /// §7 schema timeline — the key to query continuity across
+    /// reconfigure boundaries. Returns the ordered list of
+    /// `(agg_id, clipped_range)` segments that cover `[t1_ms, t2_ms]`
+    /// for the given metric.
+    ///
+    /// ## Semantics
+    ///
+    /// For each metric, the registry holds zero or more `AggSchema`
+    /// entries. Each one owns the metric starting at its
+    /// `created_at_ms` until the next schema for the same metric
+    /// appears (or forever if it's the current active one). A retired
+    /// schema's ownership ends at its `retired_at_ms` if no successor
+    /// exists; otherwise at the successor's `created_at_ms`. An
+    /// expired schema still appears in the timeline for reads
+    /// targeting the pre-expiry window — the caller decides whether
+    /// to read through `TimelineCoverage` below.
+    ///
+    /// By construction the resulting segments are **non-overlapping**
+    /// and ordered by `start_ms`. Gaps in time (e.g. the metric had
+    /// no schema at that moment) do **not** produce segments — the
+    /// caller sees a coverage hole and can fall back to the exact
+    /// DB per §7.3.
+    ///
+    /// ## Current limitations (Phase 3a scope)
+    ///
+    /// * `created_at_ms` is currently the wall-clock at which the
+    ///   backend first observed the schema, not necessarily when the
+    ///   first datapoint was written. After a restart without on-disk
+    ///   schema persistence (Phase 2c) the timeline reflects only the
+    ///   *post-restart* history. This is the right-edge-of-time
+    ///   behaviour the precompute engine already had pre-Phase-3;
+    ///   Phase 2c closes this gap.
+    /// * All segments are returned, including those whose schema is
+    ///   `Expired`. The caller inspects `TimelineSegment::status` to
+    ///   decide whether data is still readable.
+    ///
+    /// ## Cost
+    ///
+    /// Linear in the number of schemas for the given metric (one
+    /// pass to collect + sort). For the metric counts typical of
+    /// sketch DB deployments (dozens of metrics × a handful of
+    /// schemas each) this is well under a microsecond. Phase 3b's
+    /// query path will call this once per `query_metric()` so the
+    /// cost is amortised across the query.
+    pub fn timeline_for_metric(
+        &self,
+        metric: &str,
+        t1_ms: u64,
+        t2_ms: u64,
+    ) -> Vec<TimelineSegment> {
+        if t1_ms > t2_ms {
+            return Vec::new();
+        }
+        let map = match self.schemas.read() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+
+        // Collect schemas for this metric, sorted by their start
+        // (== created_at_ms). This is the authoritative ordering;
+        // agg_id alone isn't monotonic across metrics.
+        let mut entries: Vec<&AggSchema> =
+            map.values().filter(|s| s.metric_name == metric).collect();
+        entries.sort_by_key(|s| (s.created_at_ms, s.agg_id));
+
+        // Each schema owns `[created_at_ms, own_end)` where `own_end`
+        // is the earlier of (a) the next schema's `created_at_ms`
+        // and (b) this schema's own `retired_at_ms`. If neither
+        // bounds the schema it owns up to `u64::MAX` (open-ended
+        // — the currently Active one). When a gap exists between
+        // one schema's `retired_at_ms` and the next's
+        // `created_at_ms`, this leaves the gap *unowned* — callers
+        // see zero segments there and fall back to the exact DB
+        // per §7.3.
+        let mut segments = Vec::with_capacity(entries.len());
+        for (i, schema) in entries.iter().enumerate() {
+            let own_start = schema.created_at_ms;
+            let successor_start = entries.get(i + 1).map(|n| n.created_at_ms);
+            let own_end = match (successor_start, schema.retired_at_ms) {
+                (Some(s), Some(r)) => s.min(r),
+                (Some(s), None) => s,
+                (None, Some(r)) => r,
+                (None, None) => u64::MAX,
+            };
+
+            // Clip to the query range.
+            let clipped_start = own_start.max(t1_ms);
+            // Treat t2 as inclusive (caller passes a closed range).
+            let clipped_end = own_end.min(t2_ms.saturating_add(1));
+            if clipped_start >= clipped_end {
+                continue;
+            }
+
+            segments.push(TimelineSegment {
+                agg_id: schema.agg_id,
+                start_ms: clipped_start,
+                end_ms: clipped_end,
+                status: schema.status(),
+                coverage: coverage_for(schema, own_start, own_end),
+            });
+        }
+
+        segments
+    }
+
     /// Override the default retirement retention. Test-only for now;
     /// production tunable will land in Phase 2b's controller-facing
     /// API.
     #[cfg(test)]
     pub fn set_retention_for_testing(&mut self, retention: Duration) {
         self.retirement_retention = retention;
+    }
+
+    /// Insert a schema with caller-supplied timestamps, replacing any
+    /// existing entry for the same `agg_id`. Used by the timeline
+    /// tests so they can assert against deterministic time ranges
+    /// instead of wall-clock-derived ones.
+    #[cfg(test)]
+    pub fn insert_raw_for_testing(&self, schema: AggSchema) {
+        if let Ok(mut map) = self.schemas.write() {
+            map.insert(schema.agg_id, schema);
+        }
     }
 }
 
@@ -300,6 +431,53 @@ impl SchemaRegistry {
 pub struct ReconcileSummary {
     pub added: Vec<u64>,
     pub retired: Vec<u64>,
+}
+
+/// A single `(agg_id, clipped_range)` segment returned by
+/// [`SchemaRegistry::timeline_for_metric`]. Ranges are half-open:
+/// inclusive `start_ms`, exclusive `end_ms`. Segments are guaranteed
+/// non-overlapping and ordered by `start_ms` by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSegment {
+    pub agg_id: u64,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Lifecycle state of the owning schema at the moment the
+    /// timeline was computed. The query path uses this to decide
+    /// whether to read from the sketch (`Active` / `Retired`) or
+    /// fall back to the exact DB (`Expired`).
+    pub status: AggStatus,
+    /// Whether data is expected to be present for this segment.
+    /// Distinct from `status` — a `Retired` schema still has its
+    /// data but a segment that falls entirely past the schema's
+    /// expiry is `Purged` even if `status` is still `Retired` at the
+    /// moment of the call.
+    pub coverage: TimelineCoverage,
+}
+
+/// Coarse classification of whether a [`TimelineSegment`]'s data is
+/// expected to be readable from the sketch store. §7.3 of the design
+/// doc lays out the full state machine; Phase 3a exposes the two
+/// states we can determine purely from schema metadata. Phase 3b /
+/// Phase 5 (backfill) will extend this with `BackfillInProgress` and
+/// with finer-grained per-window coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineCoverage {
+    /// Data is (or was) written by the live ingest path and the
+    /// schema has not been expired. The query engine should read
+    /// from the sketch store.
+    Sketch,
+    /// The schema has been expired and its data purged (or is
+    /// eligible for purge). The query engine should fall back to
+    /// the exact DB for this segment per §7.3.
+    Purged,
+}
+
+fn coverage_for(schema: &AggSchema, _own_start: u64, _own_end: u64) -> TimelineCoverage {
+    match schema.status() {
+        AggStatus::Expired => TimelineCoverage::Purged,
+        AggStatus::Active | AggStatus::Retired => TimelineCoverage::Sketch,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -453,5 +631,208 @@ mod tests {
         let _ = r.reconcile(&make_streaming_config(&[]));
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(r.get(1).unwrap().status(), AggStatus::Expired);
+    }
+
+    // --- §7 timeline tests (Phase 3a) ---
+
+    /// Build a schema with explicit timestamps, bypassing the
+    /// wall-clock path. `metric_override` defaults to `metric_{id}`
+    /// to keep parity with `make_config` but lets us pin multiple
+    /// agg_ids to the same metric for timeline scenarios.
+    fn fixed_schema(
+        agg_id: u64,
+        metric: &str,
+        created_at_ms: u64,
+        retired_at_ms: Option<u64>,
+        expires_at_ms: Option<u64>,
+    ) -> AggSchema {
+        let mut cfg = make_config(agg_id);
+        cfg.metric = metric.to_string();
+        AggSchema {
+            agg_id,
+            metric_name: metric.to_string(),
+            config: cfg,
+            created_at_ms,
+            retired_at_ms,
+            expires_at_ms,
+        }
+    }
+
+    #[test]
+    fn timeline_empty_for_unknown_metric() {
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 1_000, None, None));
+        let segs = r.timeline_for_metric("qps", 0, 10_000);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn timeline_single_active_spans_query_range() {
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 1_000, None, None));
+        let segs = r.timeline_for_metric("latency", 2_000, 5_000);
+        assert_eq!(segs.len(), 1);
+        let s = &segs[0];
+        assert_eq!(s.agg_id, 1);
+        // Active → open-ended → clipped to [t1, t2+1).
+        assert_eq!(s.start_ms, 2_000);
+        assert_eq!(s.end_ms, 5_001);
+        assert_eq!(s.status, AggStatus::Active);
+        assert_eq!(s.coverage, TimelineCoverage::Sketch);
+    }
+
+    #[test]
+    fn timeline_two_segments_reconfigure_mid_range() {
+        // agg 1 owns [1_000, 10_000); agg 2 takes over at 10_000.
+        // Use a far-future expiry so agg 1 stays Retired (not Expired)
+        // against the wall clock at test time.
+        let far_future = 32_503_680_000_000_u64; // ~year 3000 in ms.
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(
+            1,
+            "latency",
+            1_000,
+            Some(10_000),
+            Some(far_future),
+        ));
+        r.insert_raw_for_testing(fixed_schema(2, "latency", 10_000, None, None));
+
+        let segs = r.timeline_for_metric("latency", 5_000, 15_000);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].agg_id, 1);
+        assert_eq!(segs[0].start_ms, 5_000);
+        assert_eq!(segs[0].end_ms, 10_000);
+        assert_eq!(segs[0].status, AggStatus::Retired);
+        assert_eq!(segs[0].coverage, TimelineCoverage::Sketch);
+
+        assert_eq!(segs[1].agg_id, 2);
+        assert_eq!(segs[1].start_ms, 10_000);
+        assert_eq!(segs[1].end_ms, 15_001);
+        assert_eq!(segs[1].status, AggStatus::Active);
+    }
+
+    #[test]
+    fn timeline_excludes_segments_outside_query_range() {
+        let far_future = 32_503_680_000_000_u64;
+        let r = SchemaRegistry::empty();
+        // agg 1: [1_000, 10_000) — before query range.
+        r.insert_raw_for_testing(fixed_schema(
+            1,
+            "latency",
+            1_000,
+            Some(10_000),
+            Some(far_future),
+        ));
+        // agg 2: [10_000, ∞) — active.
+        r.insert_raw_for_testing(fixed_schema(2, "latency", 10_000, None, None));
+
+        let segs = r.timeline_for_metric("latency", 20_000, 30_000);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].agg_id, 2);
+        assert_eq!(segs[0].start_ms, 20_000);
+        assert_eq!(segs[0].end_ms, 30_001);
+    }
+
+    #[test]
+    fn timeline_expired_segment_marked_purged() {
+        // agg 1 retired + already past expiry (expires_at in the past).
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 1_000, Some(2_000), Some(3_000)));
+        let segs = r.timeline_for_metric("latency", 500, 2_500);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].agg_id, 1);
+        assert_eq!(segs[0].status, AggStatus::Expired);
+        assert_eq!(segs[0].coverage, TimelineCoverage::Purged);
+    }
+
+    #[test]
+    fn timeline_retired_without_successor_ends_at_retirement() {
+        // agg 1 retired at 10_000; retention not yet elapsed.
+        // Expiry well in the future (year 3000 in ms).
+        let far_future = 32_503_680_000_000_u64;
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(
+            1,
+            "latency",
+            1_000,
+            Some(10_000),
+            Some(far_future),
+        ));
+        // Query range extends past retirement; retired-without-successor
+        // means ownership ends at retired_at, not open-ended.
+        let segs = r.timeline_for_metric("latency", 5_000, 20_000);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].end_ms, 10_000);
+        assert_eq!(segs[0].status, AggStatus::Retired);
+        assert_eq!(segs[0].coverage, TimelineCoverage::Sketch);
+    }
+
+    #[test]
+    fn timeline_segments_are_non_overlapping_even_with_many_schemas() {
+        // Three schemas in sequence for the same metric.
+        let far_future = 32_503_680_000_000_u64;
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 0, Some(100), Some(far_future)));
+        r.insert_raw_for_testing(fixed_schema(2, "latency", 100, Some(200), Some(far_future)));
+        r.insert_raw_for_testing(fixed_schema(3, "latency", 200, None, None));
+
+        let segs = r.timeline_for_metric("latency", 0, 300);
+        assert_eq!(segs.len(), 3);
+        // Verify ordering + non-overlap.
+        let mut last_end = 0;
+        for s in &segs {
+            assert!(s.start_ms >= last_end, "segments overlap: {:?}", segs);
+            assert!(s.end_ms > s.start_ms);
+            last_end = s.end_ms;
+        }
+        assert_eq!(
+            segs.iter().map(|s| s.agg_id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn timeline_ignores_other_metrics() {
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 1_000, None, None));
+        r.insert_raw_for_testing(fixed_schema(2, "qps", 1_000, None, None));
+        let segs = r.timeline_for_metric("latency", 2_000, 5_000);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].agg_id, 1);
+    }
+
+    #[test]
+    fn timeline_inverted_range_returns_empty() {
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 0, None, None));
+        let segs = r.timeline_for_metric("latency", 5_000, 1_000);
+        assert!(segs.is_empty());
+    }
+
+    #[test]
+    fn timeline_gap_between_schemas_produces_no_segment_in_gap() {
+        // A metric whose coverage has a gap: agg 1 retired at 100,
+        // agg 2 doesn't appear until 200. Queries hitting the gap
+        // [100, 200) see zero segments — caller's cue to fall back
+        // to the exact DB per §7.3 coverage hole handling.
+        let far_future = 32_503_680_000_000_u64;
+        let r = SchemaRegistry::empty();
+        r.insert_raw_for_testing(fixed_schema(1, "latency", 0, Some(100), Some(far_future)));
+        r.insert_raw_for_testing(fixed_schema(2, "latency", 200, None, None));
+
+        let gap_segs = r.timeline_for_metric("latency", 120, 180);
+        assert!(
+            gap_segs.is_empty(),
+            "query fully inside the gap should see no segments: got {gap_segs:?}"
+        );
+
+        // Range straddling the gap: should return both surrounding
+        // segments, each clipped, with no third segment for the gap.
+        let straddle = r.timeline_for_metric("latency", 50, 250);
+        assert_eq!(straddle.len(), 2);
+        assert_eq!(straddle[0].agg_id, 1);
+        assert_eq!(straddle[0].end_ms, 100);
+        assert_eq!(straddle[1].agg_id, 2);
+        assert_eq!(straddle[1].start_ms, 200);
     }
 }
