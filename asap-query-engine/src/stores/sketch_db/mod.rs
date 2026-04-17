@@ -12,14 +12,24 @@
 //!   the query path uses to dispatch per-segment across reconfigure
 //!   boundaries.
 //!
-//! Phase 2a added only the in-memory schema registry derived from the
-//! current `StreamingConfig`; Phase 2b wired the
-//! `POST /api/v1/streaming-config` swap handler to drive reconciliation
-//! explicitly. Phase 3a (this commit) adds the §7 schema-timeline read
-//! API — derived on-demand from registry state — so the query engine
-//! can stitch results across schema changes (Phase 3b wires that
-//! dispatch).
+//! Earlier phases: 2a added the in-memory schema registry; 2b wired
+//! the `POST /api/v1/streaming-config` swap handler to drive
+//! reconciliation explicitly; 2c added on-disk persistence; 3a added
+//! the §7 schema-timeline read API; 3b added the cross-schema
+//! combiner (`crate::engines::timeline_dispatch`).
+//!
+//! * `backfill` — §10 of the design. `BackfillJob` lifecycle types
+//!   (`BackfillSource`, `BackfillStatus`, `Coverage`) plus an
+//!   in-memory `BackfillRegistry` that the controller pushes jobs
+//!   into and the worker pool drains. Phase 5a (this commit) lands
+//!   the data types and registry only — no I/O, no workers, no
+//!   HTTP. Follow-up phases add the `RawSampleReader` trait
+//!   (5b), the worker pool (5c), HTTP trigger / list endpoints (5d),
+//!   real rebuild logic (5e), and coverage integration with the
+//!   query path (5f).
 
+pub mod backfill;
 pub mod schema;
 
+pub use backfill::{BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage};
 pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
