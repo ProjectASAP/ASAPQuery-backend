@@ -3,6 +3,7 @@ use crate::drivers::ingest::prometheus_remote_write::decode_prometheus_remote_wr
 use crate::drivers::ingest::victoriametrics_remote_write::decode_victoriametrics_remote_write;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{extract_metric_name, parse_labels_from_series_key};
+use crate::stores::sketch_db::SchemaRegistry;
 use asap_types::aggregation_config::AggregationConfig;
 use axum::{body::Bytes, extract::State, http::StatusCode};
 use std::collections::HashMap;
@@ -23,6 +24,14 @@ pub struct IngestState {
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
     pub hot_reload_config: HotReloadStreamingConfig,
+    /// Per-`agg_id` schema registry — Phase 2a of the sketch DB design
+    /// (`docs/design-sketch-db.md` §6). The ingest path consults
+    /// `is_writable(agg_id)` before routing data so writes targeted at
+    /// retired or expired aggregations are rejected at the boundary.
+    /// The registry is reconciled against `hot_reload_config` on each
+    /// ingest batch (cheap HashMap diff) so newly-added agg_ids are
+    /// visible immediately.
+    pub schemas: Arc<SchemaRegistry>,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
 }
@@ -118,6 +127,14 @@ async fn route_decoded_samples(
     let snap = state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
 
+    // Reconcile the schema registry against the snapshot (Phase 2a of
+    // the sketch DB design — `docs/design-sketch-db.md` §6). New
+    // agg_ids in the snapshot become Active schemas; agg_ids removed
+    // from the snapshot transition to Retired (the §6.3 write barrier
+    // then rejects further writes to them). Reconcile is a HashMap
+    // diff against the registry's current state — cheap.
+    let _summary = state.schemas.reconcile(&snap);
+
     // Key: (agg_id, group_key) → Vec<(series_key, timestamp_ms, value)>
     type GroupKey = (u64, String);
     type SampleTuple = (String, i64, f64);
@@ -130,6 +147,13 @@ async fn route_decoded_samples(
                 && config.spatial_filter_normalized != metric_name
                 && config.spatial_filter != metric_name
             {
+                continue;
+            }
+            // §6.3 write-side schema barrier: silently skip retired or
+            // expired aggs even if they're still in the snapshot for some
+            // reason. This is the authoritative "no writes after
+            // retirement" guarantee.
+            if !state.schemas.is_writable(config.aggregation_id) {
                 continue;
             }
             let group_key = extract_group_key(&s.labels, config);
