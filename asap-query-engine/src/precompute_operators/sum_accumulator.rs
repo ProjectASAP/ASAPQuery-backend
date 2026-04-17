@@ -1,5 +1,5 @@
 use crate::data_model::{
-    AggregateCore, AggregationType, MergeableAccumulator, SerializableToSink,
+    AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
 };
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,15 @@ impl AggregateCore for SumAccumulator {
     fn approx_memory_bytes(&self) -> usize {
         // Single f64 + struct overhead.
         std::mem::size_of::<Self>()
+    }
+
+    fn aux_stats(&self) -> AuxStats {
+        // SumAccumulator tracks exactly one scalar — the sum.
+        // Count/min/max aren't retained by this type.
+        AuxStats {
+            sum: Some(self.sum),
+            ..AuxStats::empty()
+        }
     }
 
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
@@ -272,5 +281,25 @@ mod tests {
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
 
         assert_eq!(acc.type_name(), "SumAccumulator");
+    }
+
+    #[test]
+    fn aux_stats_exposes_sum_only() {
+        let acc = SumAccumulator::with_sum(123.5);
+        let aux = acc.aux_stats();
+        assert_eq!(aux.sum, Some(123.5));
+        assert_eq!(aux.count, None);
+        assert_eq!(aux.min, None);
+        assert_eq!(aux.max, None);
+    }
+
+    #[test]
+    fn aux_stats_try_answer_on_sum_statistic() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let acc = SumAccumulator::with_sum(42.0);
+        // Sum statistic is covered by aux without deserialising.
+        assert_eq!(acc.aux_stats().try_answer(Statistic::Sum), Some(42.0));
+        // Count is not tracked by SumAccumulator.
+        assert_eq!(acc.aux_stats().try_answer(Statistic::Count), None);
     }
 }

@@ -1,5 +1,5 @@
 use crate::data_model::{
-    AggregateCore, AggregationType, MergeableAccumulator, SerializableToSink,
+    AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
 };
 use serde::{Deserialize, Serialize};
@@ -187,6 +187,28 @@ impl AggregateCore for MinMaxAccumulator {
     fn approx_memory_bytes(&self) -> usize {
         // f64 + small sub_type String.
         std::mem::size_of::<Self>() + self.sub_type.capacity()
+    }
+
+    fn aux_stats(&self) -> AuxStats {
+        // A single MinMaxAccumulator instance holds either a min
+        // or a max depending on sub_type — never both. Surface it
+        // in the matching aux field so `min_over_time` / `max_over_time`
+        // queries can read it without deserialising the accumulator.
+        //
+        // Sentinel values (±∞ from `new_min()` / `new_max()`) are
+        // surfaced as-is; the query engine already handles those as
+        // "no data yet" the same way it does today via `query_statistic`.
+        match self.sub_type.as_str() {
+            "min" => AuxStats {
+                min: Some(self.value),
+                ..AuxStats::empty()
+            },
+            "max" => AuxStats {
+                max: Some(self.value),
+                ..AuxStats::empty()
+            },
+            _ => AuxStats::empty(),
+        }
     }
 
     fn get_keys(&self) -> Option<Vec<crate::KeyByLabelValues>> {
@@ -401,5 +423,34 @@ mod tests {
         assert_eq!(acc.query(Statistic::Max, None).unwrap(), 42.0);
         assert!(acc.query(Statistic::Min, None).is_err());
         assert_eq!(acc.type_name(), "MinMaxAccumulator");
+    }
+
+    #[test]
+    fn aux_stats_min_variant_exposes_min_only() {
+        let acc = MinMaxAccumulator::with_value(3.5, "min".to_string());
+        let aux = acc.aux_stats();
+        assert_eq!(aux.min, Some(3.5));
+        assert_eq!(aux.max, None);
+        assert_eq!(aux.count, None);
+        assert_eq!(aux.sum, None);
+    }
+
+    #[test]
+    fn aux_stats_max_variant_exposes_max_only() {
+        let acc = MinMaxAccumulator::with_value(99.0, "max".to_string());
+        let aux = acc.aux_stats();
+        assert_eq!(aux.max, Some(99.0));
+        assert_eq!(aux.min, None);
+    }
+
+    #[test]
+    fn aux_stats_try_answer_on_min_max() {
+        let m = MinMaxAccumulator::with_value(7.0, "min".to_string());
+        assert_eq!(m.aux_stats().try_answer(Statistic::Min), Some(7.0));
+        assert_eq!(m.aux_stats().try_answer(Statistic::Max), None); // not tracked
+
+        let x = MinMaxAccumulator::with_value(7.0, "max".to_string());
+        assert_eq!(x.aux_stats().try_answer(Statistic::Max), Some(7.0));
+        assert_eq!(x.aux_stats().try_answer(Statistic::Min), None);
     }
 }

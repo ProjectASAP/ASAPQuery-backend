@@ -64,7 +64,10 @@ pub fn infer_queries(
 
     for (_query_str, mut variants) in by_query {
         // Sort descending by count so [0] is the most frequent variant.
-        variants.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        // `sort_by_key` with the negated length would overflow for i64; use
+        // `sort_by` reversed via Reverse to keep clippy happy under
+        // `clippy::unnecessary_sort_by` (rust 1.95+).
+        variants.sort_by_key(|v| std::cmp::Reverse(v.1.len()));
 
         if variants.len() > 1 {
             tracing::warn!(
