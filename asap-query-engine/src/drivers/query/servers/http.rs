@@ -35,6 +35,12 @@ pub struct HttpServer {
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
+    /// Per-`agg_id` schema registry (sketch DB §6). `None` when the
+    /// caller hasn't wired the precompute engine into the HTTP
+    /// server — in that case the `POST /api/v1/streaming-config`
+    /// handler still swaps the config but doesn't drive schema
+    /// lifecycle transitions.
+    schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
 }
 
 #[derive(Clone)]
@@ -46,6 +52,13 @@ struct AppState {
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
+    /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
+    /// `POST /api/v1/streaming-config` to call `schemas.reconcile()`
+    /// on every swap so schema lifecycle transitions happen
+    /// event-driven instead of on every ingest batch. When absent,
+    /// the swap handler leaves the registry alone (legacy
+    /// per-batch reconcile still works).
+    schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
 }
 
 impl HttpServer {
@@ -61,6 +74,7 @@ impl HttpServer {
             store,
             query_tracker,
             hot_reload_config: None,
+            schemas: None,
         }
     }
 
@@ -73,6 +87,19 @@ impl HttpServer {
         handle: crate::data_model::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
+        self
+    }
+
+    /// Attach the `SchemaRegistry` that the precompute engine's
+    /// `IngestState` also holds. When attached, the
+    /// `POST /api/v1/streaming-config` handler calls
+    /// `schemas.reconcile(new_config)` after the ArcSwap store, so
+    /// schema lifecycle transitions (§6 of the sketch DB design) are
+    /// event-driven rather than per-ingest-batch. Without the handle
+    /// the registry still gets reconciled on the next ingest batch,
+    /// just less promptly.
+    pub fn with_schemas(mut self, schemas: Arc<crate::stores::sketch_db::SchemaRegistry>) -> Self {
+        self.schemas = Some(schemas);
         self
     }
 
@@ -96,7 +123,8 @@ impl HttpServer {
             query_tracker: self.query_tracker,
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
-            hot_reload_config: self.hot_reload_config,
+            hot_reload_config: self.hot_reload_config.clone(),
+            schemas: self.schemas.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -144,6 +172,7 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
+            schemas: self.schemas.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -894,6 +923,205 @@ aggregations:
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "error");
     }
+
+    /// Set up a test server with both a hot-reload handle AND a schema
+    /// registry attached. Proves the Phase 2b wiring: a swap through
+    /// the HTTP handler drives schema lifecycle transitions
+    /// event-driven (sketch DB design §6).
+    async fn setup_test_server_with_hot_reload_and_schemas(
+        hot_reload: HotReloadStreamingConfig,
+        schemas: Arc<crate::stores::sketch_db::SchemaRegistry>,
+    ) -> u16 {
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        let streaming_config = Arc::new(StreamingConfig::default());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_config.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_config.clone(),
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let server = HttpServer::new(config, query_engine, store, None)
+            .with_hot_reload_config(hot_reload)
+            .with_schemas(schemas);
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
+    }
+
+    #[tokio::test]
+    async fn test_streaming_config_swap_drives_schema_reconcile() {
+        use crate::stores::sketch_db::{AggStatus, SchemaRegistry};
+
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let schemas = Arc::new(SchemaRegistry::empty());
+        let server_port =
+            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
+                .await;
+        let client = Client::new();
+
+        // Empty registry at start.
+        assert!(!schemas.is_writable(101));
+        assert!(!schemas.is_writable(202));
+
+        // POST a config with two agg_ids — the handler should swap
+        // the config AND reconcile the registry.
+        let yaml = r#"
+aggregations:
+  - aggregationId: 101
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: cpu_usage
+    labels:
+      grouping: [host]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+  - aggregationId: 202
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: mem_usage
+    labels:
+      grouping: [host]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(yaml.to_string())
+            .send()
+            .await
+            .expect("POST failed");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        // The new field from Phase 2b.
+        let created = body["schemas_created"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            created,
+            std::collections::HashSet::from([101u64, 202u64]),
+            "expected both agg_ids in schemas_created"
+        );
+
+        // Registry now has Active schemas for both ids.
+        assert!(schemas.is_writable(101));
+        assert!(schemas.is_writable(202));
+        assert_eq!(schemas.get(101).unwrap().status(), AggStatus::Active);
+        assert_eq!(schemas.get(202).unwrap().status(), AggStatus::Active);
+
+        // Swap to a config that removes 101. Schema 101 should be
+        // Retired (§6.3 barrier: is_writable(101) now false).
+        let yaml2 = r#"
+aggregations:
+  - aggregationId: 202
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: mem_usage
+    labels:
+      grouping: [host]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let resp2 = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(yaml2.to_string())
+            .send()
+            .await
+            .expect("POST failed");
+        let body2: serde_json::Value = resp2.json().await.unwrap();
+        let retired = body2["schemas_retired"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(retired, vec![101u64]);
+
+        assert!(
+            !schemas.is_writable(101),
+            "101 retired, should be unwritable"
+        );
+        assert!(schemas.is_writable(202), "202 still active");
+        assert_eq!(schemas.get(101).unwrap().status(), AggStatus::Retired);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_config_swap_without_schemas_still_succeeds() {
+        // If the HttpServer isn't wired with a schema registry, the
+        // swap handler still works — it just omits schemas_created
+        // and schemas_retired from the response.
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
+        let client = Client::new();
+
+        let yaml = r#"
+aggregations:
+  - aggregationId: 42
+    aggregationType: Sum
+    aggregationSubType: ''
+    metric: m
+    labels:
+      grouping: []
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 60
+    windowType: tumbling
+    spatialFilter: ''
+"#;
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
+            ))
+            .header("content-type", "application/x-yaml")
+            .body(yaml.to_string())
+            .send()
+            .await
+            .expect("POST failed");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        // Without a registry, the arrays are empty (not missing).
+        assert_eq!(body["schemas_created"].as_array().unwrap().len(), 0);
+        assert_eq!(body["schemas_retired"].as_array().unwrap().len(), 0);
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -1099,11 +1327,31 @@ async fn handle_post_streaming_config(
         );
     }
 
+    // Phase 2b of the sketch DB design (docs/design-sketch-db.md §6):
+    // drive schema lifecycle transitions event-driven from the swap
+    // handler instead of running on every ingest batch. When attached,
+    // the SchemaRegistry's reconcile adds new agg_ids as Active
+    // schemas and retires removed agg_ids (scheduling their data for
+    // expiry after the retirement retention).
+    //
+    // If `schemas` isn't attached (tests, legacy deployments), the
+    // per-batch reconcile in IngestState still handles it — just
+    // with up to one batch worth of latency.
+    let (schema_added, schema_retired) = if let Some(schemas) = &state.schemas {
+        let snap = handle.snapshot();
+        let summary = schemas.reconcile(snap.as_ref());
+        (summary.added, summary.retired)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     let body = serde_json::json!({
         "status": "success",
         "agg_ids_added": added,
         "agg_ids_removed": removed,
         "new_aggregation_count": new_ids.len(),
+        "schemas_created": schema_added,
+        "schemas_retired": schema_retired,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }

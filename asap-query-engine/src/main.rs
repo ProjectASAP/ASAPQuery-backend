@@ -597,8 +597,17 @@ async fn main() -> Result<()> {
         None
     };
 
-    let server = HttpServer::new(http_config, engine, store, query_tracker)
+    // Forward the precompute engine's schema registry to the HTTP
+    // server so `POST /api/v1/streaming-config` can drive schema
+    // lifecycle transitions event-driven (Phase 2b of the sketch DB
+    // design, §6). When precompute isn't enabled, the registry is
+    // absent and the swap handler no-ops on schema reconciliation
+    // (legacy per-batch reconcile in ingest still works).
+    let mut server = HttpServer::new(http_config, engine, store, query_tracker)
         .with_hot_reload_config(hot_reload_config);
+    if let Some(ingest_state) = precompute_ingest_state.as_ref() {
+        server = server.with_schemas(ingest_state.schemas.clone());
+    }
     info!("Starting HTTP server on port {}", args.http_port);
 
     // Wait for shutdown signal
