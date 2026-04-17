@@ -349,6 +349,9 @@ async fn route_otlp_to_precompute(
     // new aggregations are visible without restart.
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
+    // Reconcile schema registry against the snapshot — Phase 2a of
+    // the sketch DB design (`docs/design-sketch-db.md` §6).
+    let _ = ingest_state.schemas.reconcile(&snap);
 
     // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
     type GroupKey = (u64, String);
@@ -366,6 +369,10 @@ async fn route_otlp_to_precompute(
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
             {
+                continue;
+            }
+            // §6.3 write-side schema barrier — see ingest_handler.rs.
+            if !ingest_state.schemas.is_writable(config.aggregation_id) {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -424,6 +431,10 @@ async fn route_otlp_to_precompute(
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
             {
+                continue;
+            }
+            // §6.3 write-side schema barrier — see ingest_handler.rs.
+            if !ingest_state.schemas.is_writable(config.aggregation_id) {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -507,6 +518,9 @@ async fn route_modified_otlp_sketches_to_precompute(
     let ingest_received_at = Instant::now();
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
+    // Reconcile schema registry against the snapshot — Phase 2a of
+    // the sketch DB design (`docs/design-sketch-db.md` §6).
+    let _ = ingest_state.schemas.reconcile(&snap);
     let mut messages: Vec<WorkerMessage> = Vec::new();
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
@@ -626,6 +640,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                             && config.spatial_filter_normalized != metric.name
                             && config.spatial_filter != metric.name
                         {
+                            continue;
+                        }
+                        // §6.3 write-side schema barrier — see ingest_handler.rs.
+                        if !ingest_state.schemas.is_writable(config.aggregation_id) {
                             continue;
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
