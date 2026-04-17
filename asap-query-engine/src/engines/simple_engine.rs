@@ -158,6 +158,17 @@ pub struct SimpleEngine {
     /// misses fall through to the §5.2 fallback silently, matching
     /// pre-PR-G behavior. Set via `with_controller_client`.
     controller_client: Option<Arc<dyn crate::drivers::query::controller_client::ControllerClient>>,
+    /// Per-`agg_id` schema registry used for §7 schema-timeline
+    /// dispatch (`docs/design-sketch-db.md`). In Phase 3b this is
+    /// stored for future query-path wiring; the combiner lives in
+    /// [`crate::engines::timeline_dispatch`] and the lookup primitive
+    /// is already exposed on [`crate::stores::sketch_db::SchemaRegistry`].
+    ///
+    /// Defaults to an empty registry so pre-Phase-3 call-sites keep
+    /// compiling. Production wire-up (`main.rs`) uses
+    /// [`Self::with_schema_registry`] to share the same registry the
+    /// ingest path is reconciling.
+    schema_registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
 }
 
 impl SimpleEngine {
@@ -338,6 +349,7 @@ impl SimpleEngine {
             controller_patterns,
             query_language,
             controller_client: None,
+            schema_registry: Arc::new(crate::stores::sketch_db::SchemaRegistry::empty()),
         }
     }
 
@@ -369,6 +381,36 @@ impl SimpleEngine {
     ) -> Self {
         self.controller_client = Some(client);
         self
+    }
+
+    /// Attach the shared `SchemaRegistry` the ingest path is
+    /// reconciling so queries can resolve the §7 schema timeline for
+    /// a metric. Typically called from `main.rs` with the same
+    /// `Arc<SchemaRegistry>` held by `IngestState::schemas` and the
+    /// HTTP streaming-config swap handler so all three observe the
+    /// same lifecycle transitions.
+    pub fn with_schema_registry(
+        mut self,
+        registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
+    ) -> Self {
+        self.schema_registry = registry;
+        self
+    }
+
+    /// Resolve the §7 schema timeline for a metric over a query range.
+    /// Thin delegate to `SchemaRegistry::timeline_for_metric` so the
+    /// engine's own query-path code does not need to reach into the
+    /// store module to build a timeline (and so tests for the
+    /// dispatch wiring — Phase 3b-2 — can mock by swapping the
+    /// registry rather than monkey-patching the engine).
+    pub fn timeline_for_query(
+        &self,
+        metric: &str,
+        t1_ms: u64,
+        t2_ms: u64,
+    ) -> Vec<crate::stores::sketch_db::TimelineSegment> {
+        self.schema_registry
+            .timeline_for_metric(metric, t1_ms, t2_ms)
     }
 
     /// Look up a compatible aggregation for the given requirements,

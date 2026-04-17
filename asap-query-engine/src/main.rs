@@ -372,7 +372,7 @@ async fn main() -> Result<()> {
     // (PR E phase 2). Without sharing the handle, SimpleEngine
     // would take a one-time snapshot at construction and ignore
     // subsequent swaps.
-    let engine = {
+    let mut engine = {
         let mut engine = SimpleEngine::new_with_hot_reload(
             store.clone(),
             inference_config,
@@ -406,7 +406,10 @@ async fn main() -> Result<()> {
                  (pass --controller-endpoint=<url> to enable)"
             );
         }
-        Arc::new(engine)
+        // `Arc::new(engine)` is deferred until after the precompute
+        // engine is constructed so we can hand the same `SchemaRegistry`
+        // (§7 timeline source) to both via `with_schema_registry`.
+        engine
     };
 
     // Setup Kafka consumer (only when not using precompute engine as the streaming backend)
@@ -510,6 +513,16 @@ async fn main() -> Result<()> {
         });
         (None, None)
     };
+
+    // Hand the precompute engine's `SchemaRegistry` to the query
+    // engine so both observe the same §7 timeline (design-sketch-db.md
+    // §6 / §7). When precompute isn't enabled the engine keeps its
+    // default empty registry — queries that need the timeline will
+    // simply see no segments and fall through to the legacy path.
+    if let Some(ingest_state) = precompute_ingest_state.as_ref() {
+        engine = engine.with_schema_registry(ingest_state.schemas.clone());
+    }
+    let engine = Arc::new(engine);
 
     // Setup OTLP receiver (after precompute engine so it can share the ingest state)
     let otel_handle = if args.enable_otel_ingest {
