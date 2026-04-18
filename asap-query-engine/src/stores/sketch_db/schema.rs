@@ -179,10 +179,14 @@ impl AggSchema {
     }
 }
 
-/// Default retention for retired schemas — one hour. A future
-/// `AggregationConfig` field could let the controller override this
-/// per-agg; for Phase 2a a single global default is enough.
-pub const DEFAULT_RETIREMENT_RETENTION: Duration = Duration::from_secs(3600);
+/// Default retention for a retired schema before eviction.
+/// 24 hours — covers dashboards / ad-hoc queries that may still
+/// reference the old agg_id mid-reconfigure. Shorter than the
+/// typical SimpleMapStore data retention (7d+) so schema eviction
+/// runs first, freeing space cleanly without fighting per-record
+/// retention. Override via `SchemaRegistry::set_retention_for_testing`
+/// or the CLI flag plumbed through `SchemaEvictionService`.
+pub const DEFAULT_RETIREMENT_RETENTION: Duration = Duration::from_secs(24 * 3600);
 
 /// In-memory registry of `AggSchema` keyed by `aggregation_id`.
 ///
@@ -404,6 +408,26 @@ impl SchemaRegistry {
         self.schemas.read().ok()?.get(&agg_id).cloned()
     }
 
+    /// Remove a schema record from the registry. Used by
+    /// `SchemaEvictionService` after it's dropped the agg's data
+    /// from the store. Returns the removed schema if it existed,
+    /// `None` if the agg_id was already absent (idempotent).
+    ///
+    /// Triggers a `save_to_disk_if_persistent` so restart behaviour
+    /// stays consistent (an evicted agg won't reappear on restart
+    /// from a stale persisted snapshot).
+    pub fn remove_schema(&self, agg_id: u64) -> Option<AggSchema> {
+        let removed = if let Ok(mut map) = self.schemas.write() {
+            map.remove(&agg_id)
+        } else {
+            None
+        };
+        if removed.is_some() {
+            self.save_to_disk_if_persistent();
+        }
+        removed
+    }
+
     /// Iterate (clones) all schemas matching a status filter. Used by
     /// the controller-facing `/api/v1/db/schemas?status=…` endpoint
     /// (§15.2 of the design).
@@ -585,9 +609,28 @@ impl SchemaRegistry {
         segments
     }
 
-    /// Override the default retirement retention. Test-only for now;
-    /// production tunable will land in Phase 2b's controller-facing
-    /// API.
+    /// Override the retirement retention. Plumbed through from
+    /// `SchemaEvictionService` at startup so deployments can pick
+    /// a retention that's ≤ their SimpleMapStore
+    /// `persistence_delete_older_than` (see module-level doc on
+    /// retention ordering).
+    ///
+    /// Takes `&mut self` because registry construction patterns
+    /// already produce a mutable local before wrapping in `Arc`.
+    /// Once wrapped, retention is immutable.
+    pub fn set_retention(&mut self, retention: Duration) {
+        self.retirement_retention = retention;
+    }
+
+    /// Expose the current retirement retention so the eviction
+    /// service can log it + diff it against the data-retention
+    /// config at startup.
+    pub fn retirement_retention(&self) -> Duration {
+        self.retirement_retention
+    }
+
+    /// Test-only alias for `set_retention`; kept as a separate
+    /// name so pre-Phase-5h test call sites don't need renaming.
     #[cfg(test)]
     pub fn set_retention_for_testing(&mut self, retention: Duration) {
         self.retirement_retention = retention;
