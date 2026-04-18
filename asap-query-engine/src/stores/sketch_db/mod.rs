@@ -28,6 +28,7 @@
 //!   real rebuild logic (5e), and coverage integration with the
 //!   query path (5f).
 
+pub mod accuracy;
 pub mod backfill;
 pub mod backfill_processor;
 pub mod backfill_service;
@@ -38,6 +39,7 @@ pub mod raw_sample_reader;
 pub mod schema;
 pub mod simple_map_store;
 
+pub use accuracy::{AccuracyKind, AccuracyProfile};
 pub use backfill::{
     BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage, CreateError,
 };

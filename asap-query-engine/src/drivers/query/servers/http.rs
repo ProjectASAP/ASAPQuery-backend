@@ -1251,6 +1251,15 @@ aggregations:
         assert_eq!(entries[1]["agg_id"], 2);
         assert_eq!(entries[1]["status"], "retired");
         assert!(entries[1]["retired_at_ms"].is_u64());
+        // Phase 6.4: accuracy_profile present on every schema. Sum
+        // is exact → ε = δ = 0, kind = "exact".
+        for e in entries {
+            let ap = &e["accuracy_profile"];
+            assert!(ap.is_object(), "accuracy_profile should be an object");
+            assert_eq!(ap["kind"], "exact", "Sum agg → exact");
+            assert_eq!(ap["epsilon"], 0.0);
+            assert_eq!(ap["delta"], 0.0);
+        }
 
         // Filter: active only.
         let resp = client
@@ -1938,6 +1947,7 @@ async fn handle_get_schemas(
     let mut entries: Vec<serde_json::Value> = Vec::new();
     for status in statuses {
         for s in schemas.list_by_status(*status) {
+            let accuracy = s.accuracy_profile();
             entries.push(serde_json::json!({
                 "agg_id": s.agg_id,
                 "metric_name": s.metric_name,
@@ -1946,6 +1956,7 @@ async fn handle_get_schemas(
                 "retired_at_ms": s.retired_at_ms,
                 "expires_at_ms": s.expires_at_ms,
                 "aggregation_type": format!("{:?}", s.config.aggregation_type),
+                "accuracy_profile": accuracy,
             }));
         }
     }
