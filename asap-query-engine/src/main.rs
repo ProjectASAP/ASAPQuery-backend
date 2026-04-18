@@ -207,6 +207,26 @@ struct Args {
     #[arg(long)]
     enable_backfill_worker: bool,
 
+    /// Spawn the Phase 5 schema eviction service. Periodically
+    /// scans the schema registry for `Expired` schemas, cancels
+    /// any in-flight backfill jobs targeting them, and drops the
+    /// agg_id's data from the store. Requires the schema registry
+    /// (same precompute-engine dependency as --enable-backfill-worker).
+    #[arg(long)]
+    enable_schema_eviction: bool,
+
+    /// Poll interval for the schema eviction service, in seconds.
+    /// Default 300s (5 minutes) — eviction is not latency-sensitive.
+    #[arg(long, default_value = "300")]
+    schema_eviction_poll_secs: u64,
+
+    /// When true, the eviction service logs what it would drop but
+    /// doesn't actually call `drop_agg_id` / `remove_schema`. Use
+    /// to validate a new retention value before letting it delete
+    /// anything.
+    #[arg(long)]
+    schema_eviction_dry_run: bool,
+
     /// Enable automatic query tracking and planning
     #[arg(long)]
     enable_query_tracker: bool,
@@ -703,6 +723,51 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Phase 5: schema eviction service. On every poll interval,
+    // scans the schema registry for `Expired` schemas, cancels any
+    // in-flight backfills targeting them, and drops the agg_id's
+    // data from the store. Complements the age-based data retention
+    // in SimpleMapStore — see `SchemaEvictionService` module doc for
+    // the ordering rationale.
+    let schema_eviction_handle = if let (true, Some(ingest_state)) = (
+        args.enable_schema_eviction,
+        precompute_ingest_state.as_ref(),
+    ) {
+        let data_retention_opt = if args.persistence_delete_older_than_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(
+                args.persistence_delete_older_than_secs,
+            ))
+        };
+        query_engine_rust::stores::sketch_db::warn_if_retention_inverted(
+            data_retention_opt,
+            ingest_state.schemas.retirement_retention(),
+        );
+        let svc = query_engine_rust::stores::sketch_db::SchemaEvictionService::new(
+            ingest_state.schemas.clone(),
+            backfill_registry.clone(),
+            store.clone(),
+            query_engine_rust::stores::sketch_db::SchemaEvictionConfig {
+                poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
+                dry_run: args.schema_eviction_dry_run,
+            },
+        );
+        info!(
+            poll_secs = args.schema_eviction_poll_secs,
+            dry_run = args.schema_eviction_dry_run,
+            "Spawning SchemaEvictionService"
+        );
+        Some(svc.spawn())
+    } else {
+        if args.enable_schema_eviction {
+            warn!(
+                "--enable-schema-eviction set but precompute engine isn't enabled; eviction service NOT spawned"
+            );
+        }
+        None
+    };
+
     info!("Starting HTTP server on port {}", args.http_port);
 
     // Wait for shutdown signal
@@ -720,6 +785,11 @@ async fn main() -> Result<()> {
     // Cleanup - gracefully shutdown background tasks
     if let Some(handle) = backfill_service_handle {
         info!("Shutting down backfill service...");
+        handle.shutdown().await;
+    }
+
+    if let Some(handle) = schema_eviction_handle {
+        info!("Shutting down schema eviction service...");
         handle.shutdown().await;
     }
 

@@ -37,6 +37,7 @@ pub mod backfill_worker;
 pub mod prometheus_reader;
 pub mod raw_sample_reader;
 pub mod schema;
+pub mod schema_eviction;
 pub mod simple_map_store;
 
 pub use accuracy::{AccuracyKind, AccuracyProfile};
@@ -55,4 +56,7 @@ pub use raw_sample_reader::{
     LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
 };
 pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
+pub use schema_eviction::{
+    warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
+};
 pub use simple_map_store::SimpleMapStore;
