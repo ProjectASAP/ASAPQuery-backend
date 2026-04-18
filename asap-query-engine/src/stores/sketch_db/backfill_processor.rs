@@ -574,6 +574,7 @@ mod tests {
                 (0, created + 1),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
+                None,
             )
             .expect_err("overlap should be rejected");
         match err {
@@ -599,6 +600,7 @@ mod tests {
                 (0, created),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
+                None,
             )
             .expect("boundary-touching range should be accepted");
         assert!(registry.get(job_id).is_some());
@@ -618,8 +620,102 @@ mod tests {
                 (0, 100),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
+                None,
             )
             .expect_err("unknown agg should be rejected");
         assert!(matches!(err, CreateError::UnknownAgg { agg_id: 999 }));
+    }
+
+    /// Retention guard: requesting a start_ms older than the store's
+    /// data-retention horizon is rejected. Method B from the design
+    /// discussion — fail fast at creation rather than let the backfill
+    /// write windows the retention sweep will immediately delete.
+    #[test]
+    fn create_checked_rejects_start_older_than_data_retention() {
+        use super::super::CreateError;
+        let cfg = sum_config(1, "m", vec![]);
+        let streaming = streaming_config_with(cfg);
+        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+        let registry = BackfillRegistry::new();
+        // Schema's created_at_ms is now_ms(), so data retention of
+        // 1 hour with `start_ms = 0` means we're requesting data
+        // from the epoch — way outside retention.
+        let err = registry
+            .create_checked(
+                &schemas,
+                1,
+                (0, 1_000),
+                BackfillSource::Prometheus { url: "x".into() },
+                1,
+                Some(3_600_000), // 1 hour
+            )
+            .expect_err("out-of-retention should be rejected");
+        match err {
+            CreateError::OutOfRetention {
+                agg_id,
+                requested_start_ms,
+                earliest_retained_ms,
+            } => {
+                assert_eq!(agg_id, 1);
+                assert_eq!(requested_start_ms, 0);
+                assert!(earliest_retained_ms > 0);
+            }
+            other => panic!("expected OutOfRetention, got {other:?}"),
+        }
+    }
+
+    /// `data_retention_ms = None` skips the retention check entirely —
+    /// lets tests and retention-disabled deployments bypass.
+    #[test]
+    fn create_checked_none_retention_skips_check() {
+        let cfg = sum_config(1, "m", vec![]);
+        let streaming = streaming_config_with(cfg);
+        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+        let created = schemas.get(1).unwrap().created_at_ms;
+        let registry = BackfillRegistry::new();
+        // start_ms = 0 would normally fail any realistic retention
+        // window, but None skips the check.
+        let job_id = registry
+            .create_checked(
+                &schemas,
+                1,
+                (0, created),
+                BackfillSource::Prometheus { url: "x".into() },
+                1,
+                None,
+            )
+            .expect("None retention → accepted");
+        assert!(registry.get(job_id).is_some());
+    }
+
+    /// Within-retention start is accepted even when a retention is
+    /// configured. Guards against off-by-one at the boundary.
+    #[test]
+    fn create_checked_accepts_start_within_retention() {
+        let cfg = sum_config(1, "m", vec![]);
+        let streaming = streaming_config_with(cfg);
+        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+        let registry = BackfillRegistry::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let retention = 3_600_000_u64; // 1h
+                                       // start_ms = now - 30 min: well within 1h retention.
+        let start = now.saturating_sub(1_800_000);
+        let created = schemas.get(1).unwrap().created_at_ms;
+        // Clip end to the schema boundary so time-disjoint passes.
+        let end = created.min(now);
+        let job_id = registry
+            .create_checked(
+                &schemas,
+                1,
+                (start, end),
+                BackfillSource::Prometheus { url: "x".into() },
+                1,
+                Some(retention),
+            )
+            .expect("within-retention start should be accepted");
+        assert!(registry.get(job_id).is_some());
     }
 }
