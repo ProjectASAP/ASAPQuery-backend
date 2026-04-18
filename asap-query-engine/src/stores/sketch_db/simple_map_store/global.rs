@@ -695,4 +695,34 @@ impl Store for SimpleMapStoreGlobal {
         info!("SimpleMapStoreGlobal closed");
         Ok(())
     }
+
+    fn drop_agg_id(&self, agg_id: u64) -> StoreResult<usize> {
+        let mut data = self.lock.lock().unwrap();
+        // Count windows before eviction so callers get an accurate
+        // "records dropped" number, useful for audit logging.
+        let evicted = data
+            .stores
+            .get(&agg_id)
+            .map(|per_key| {
+                per_key.current_epoch.len()
+                    + per_key
+                        .sealed_epochs
+                        .values()
+                        .map(|e| e.entries.len())
+                        .sum::<usize>()
+            })
+            .unwrap_or(0);
+        data.stores.remove(&agg_id);
+        data.read_counts.remove(&agg_id);
+        data.earliest_timestamp_per_aggregation_id.remove(&agg_id);
+        // `metrics` and `items_inserted` are keyed by metric name,
+        // not agg_id, so we don't touch them — other agg_ids for the
+        // same metric (e.g. historical schemas) may still exist.
+        info!(
+            agg_id,
+            evicted_windows = evicted,
+            "SimpleMapStoreGlobal::drop_agg_id"
+        );
+        Ok(evicted)
+    }
 }
