@@ -680,6 +680,106 @@ impl BackfillRegistry {
             .unwrap_or_default()
     }
 
+    /// §10.4 coverage classification for `(agg_id, range)`.
+    ///
+    /// Walks the registry's jobs for `agg_id` and classifies
+    /// `range` (half-open `[start_ms, end_ms)`) as:
+    ///
+    /// * [`Coverage::Complete`] — every ms in the range is covered
+    ///   by at least one `Complete` job's written-window list.
+    /// * [`Coverage::BackfillInProgress`] — at least one `Running`
+    ///   job overlaps the range, and we can't prove Complete
+    ///   coverage. Returns the job's current progress so the
+    ///   caller can decide whether to wait or fall back.
+    /// * [`Coverage::Missing`] — no Complete coverage, no Running
+    ///   coverage. Caller should fall back to the exact DB per
+    ///   §7.3.
+    ///
+    /// ## Scope
+    ///
+    /// This method looks ONLY at backfill state. It does **not**
+    /// know about live ingest — callers that want the full
+    /// `[Coverage of `range`] = backfill + live` picture should
+    /// split the query range at the target agg's `created_at_ms`
+    /// first (§10.5 time-disjoint) and ask this method only about
+    /// the `[start, created_at)` historical portion. The live
+    /// `[created_at, end)` portion is always `Complete` by
+    /// definition of the live ingest path.
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. Collect every window from every `Complete` job for
+    ///    `agg_id` into a flat list.
+    /// 2. Sort + merge overlapping intervals into a coverage set.
+    /// 3. Check if `range` is fully inside the coverage set —
+    ///    if so, return `Complete`.
+    /// 4. Otherwise, check `Running` jobs: if one exists whose
+    ///    `time_range` overlaps `range`, return
+    ///    `BackfillInProgress { job_id, pct }` with that job's
+    ///    current progress.
+    /// 5. Otherwise return `Missing`.
+    ///
+    /// Cost: linear in the total windows written by jobs for
+    /// `agg_id`. For a 24h backfill with 1-minute windows that's
+    /// 1440 windows — a trivial walk. If a single agg accumulates
+    /// thousands of jobs with millions of windows each, this will
+    /// want caching — deferred until the profile says so.
+    pub fn coverage(&self, agg_id: u64, range: (u64, u64)) -> Coverage {
+        if range.0 >= range.1 {
+            // Empty / inverted range: treat as trivially complete.
+            // Saves the caller an `is_empty` branch at every site.
+            return Coverage::Complete;
+        }
+
+        // Snapshot jobs + written windows. Clone both so we don't
+        // hold locks across the interval-merge logic.
+        let jobs: Vec<BackfillJob> = self
+            .jobs
+            .read()
+            .map(|m| m.values().filter(|j| j.agg_id == agg_id).cloned().collect())
+            .unwrap_or_default();
+        let written: HashMap<u64, Vec<WrittenWindow>> = self
+            .written_windows
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+
+        // Step 1+2: collect and merge Complete-job windows.
+        let mut complete_ranges: Vec<(u64, u64)> = Vec::new();
+        for job in &jobs {
+            if !matches!(job.status, BackfillStatus::Complete) {
+                continue;
+            }
+            if let Some(windows) = written.get(&job.job_id) {
+                for &(wagg, wrange) in windows {
+                    if wagg == agg_id {
+                        complete_ranges.push(wrange);
+                    }
+                }
+            }
+        }
+        if range_covered_by(range, &complete_ranges) {
+            return Coverage::Complete;
+        }
+
+        // Step 4: any Running job overlapping range?
+        for job in &jobs {
+            if !matches!(job.status, BackfillStatus::Running) {
+                continue;
+            }
+            let (s, e) = job.time_range;
+            let overlaps = s < range.1 && e > range.0;
+            if overlaps {
+                return Coverage::BackfillInProgress {
+                    job_id: job.job_id,
+                    pct: job.progress(),
+                };
+            }
+        }
+
+        Coverage::Missing
+    }
+
     /// Remove any terminal job older than `older_than_ms`. Used by
     /// the eventual retention sweep; returns the number of jobs
     /// evicted. Non-terminal jobs are never evicted.
@@ -706,6 +806,39 @@ impl BackfillRegistry {
         }
         evicted
     }
+}
+
+/// Merge `ranges` into a sorted non-overlapping list and check
+/// whether the half-open `[target.0, target.1)` is fully covered.
+/// Does not mutate `ranges`. Empty `ranges` → `false` for any
+/// non-empty `target`. Exposed at module scope so the unit tests
+/// can exercise the interval math independently of the registry.
+fn range_covered_by(target: (u64, u64), ranges: &[(u64, u64)]) -> bool {
+    if target.0 >= target.1 {
+        return true;
+    }
+    let mut sorted: Vec<(u64, u64)> = ranges.iter().filter(|(a, b)| a < b).copied().collect();
+    if sorted.is_empty() {
+        return false;
+    }
+    sorted.sort_unstable();
+    // Walk left-to-right, merging overlapping/adjacent spans and
+    // checking that the merged span covers `target` monotonically.
+    let mut cursor = target.0;
+    for (start, end) in sorted {
+        if start > cursor {
+            // Gap between where we'd need coverage and the next
+            // span's start — short-circuit.
+            return false;
+        }
+        if end > cursor {
+            cursor = end;
+        }
+        if cursor >= target.1 {
+            return true;
+        }
+    }
+    cursor >= target.1
 }
 
 fn now_ms() -> u64 {
@@ -1103,5 +1236,157 @@ mod tests {
         let r = BackfillRegistry::new();
         let _ = r.create(1, (0, 10), prom_source(), 1);
         assert!(!path.exists());
+    }
+
+    // ─── Phase 5f: coverage() tests ─────────────────────────────
+
+    #[test]
+    fn range_covered_by_empty_ranges_is_false() {
+        assert!(!range_covered_by((0, 100), &[]));
+    }
+
+    #[test]
+    fn range_covered_by_single_spanning_range() {
+        assert!(range_covered_by((10, 50), &[(0, 100)]));
+    }
+
+    #[test]
+    fn range_covered_by_merges_adjacent_and_overlapping() {
+        assert!(range_covered_by((0, 30), &[(0, 10), (10, 20), (15, 30)]));
+        assert!(range_covered_by((5, 25), &[(0, 10), (10, 20), (20, 30)]));
+    }
+
+    #[test]
+    fn range_covered_by_gap_is_false() {
+        assert!(!range_covered_by((0, 30), &[(0, 10), (20, 30)]));
+    }
+
+    #[test]
+    fn range_covered_by_empty_target_is_trivially_true() {
+        assert!(range_covered_by((10, 10), &[]));
+    }
+
+    #[test]
+    fn coverage_missing_when_no_jobs() {
+        let r = BackfillRegistry::new();
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Missing);
+    }
+
+    #[test]
+    fn coverage_missing_when_only_other_agg_has_jobs() {
+        let r = BackfillRegistry::new();
+        let job_id = r.create(2, (0, 100), prom_source(), 1);
+        r.start(job_id);
+        r.record_window_written(job_id, 2, (0, 100));
+        r.mark_complete(job_id);
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Missing);
+    }
+
+    #[test]
+    fn coverage_complete_when_one_job_covers_full_range() {
+        let r = BackfillRegistry::new();
+        let job_id = r.create(1, (0, 100), prom_source(), 1);
+        r.start(job_id);
+        r.record_window_written(job_id, 1, (0, 100));
+        r.mark_complete(job_id);
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Complete);
+    }
+
+    #[test]
+    fn coverage_complete_when_merged_windows_cover_range() {
+        let r = BackfillRegistry::new();
+        let job_id = r.create(1, (0, 100), prom_source(), 10);
+        r.start(job_id);
+        // Write 10 adjacent windows, each 10ms.
+        for i in 0..10 {
+            r.record_window_written(job_id, 1, (i * 10, (i + 1) * 10));
+        }
+        r.mark_complete(job_id);
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Complete);
+        // Subrange query is also Complete.
+        assert_eq!(r.coverage(1, (25, 75)), Coverage::Complete);
+    }
+
+    #[test]
+    fn coverage_partial_from_completed_job_is_not_complete() {
+        let r = BackfillRegistry::new();
+        let job_id = r.create(1, (0, 100), prom_source(), 1);
+        r.start(job_id);
+        // Only part of the range was written before the job somehow
+        // got marked Complete (shouldn't happen, but defensive).
+        r.record_window_written(job_id, 1, (0, 50));
+        r.mark_complete(job_id);
+        // Full range isn't covered → Missing (no Running job).
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Missing);
+        // But the covered sub-range IS complete.
+        assert_eq!(r.coverage(1, (0, 50)), Coverage::Complete);
+    }
+
+    #[test]
+    fn coverage_running_overlap_reports_in_progress_with_pct() {
+        let r = BackfillRegistry::new();
+        let job_id = r.create(1, (0, 100), prom_source(), 10);
+        r.start(job_id);
+        r.tick_progress(job_id);
+        r.tick_progress(job_id);
+        // 2 of 10 ticked → 20% progress.
+        match r.coverage(1, (0, 100)) {
+            Coverage::BackfillInProgress { job_id: id, pct } => {
+                assert_eq!(id, job_id);
+                assert!((pct - 0.2).abs() < 1e-9, "pct = {pct}");
+            }
+            other => panic!("expected BackfillInProgress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coverage_complete_takes_precedence_over_running() {
+        // A Complete job covers the range fully; a later Running
+        // job (say for a retry / adjacent range) exists too. The
+        // coverage should still be Complete — Complete is the
+        // best classification we can give.
+        let r = BackfillRegistry::new();
+        let complete = r.create(1, (0, 100), prom_source(), 1);
+        r.start(complete);
+        r.record_window_written(complete, 1, (0, 100));
+        r.mark_complete(complete);
+
+        let running = r.create(1, (50, 150), prom_source(), 5);
+        r.start(running);
+
+        // Query inside the Complete range → Complete wins.
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Complete);
+        // Query extending into the Running job's range → not fully
+        // complete, Running overlaps → InProgress.
+        match r.coverage(1, (50, 150)) {
+            Coverage::BackfillInProgress { .. } => {}
+            other => panic!("expected InProgress for (50, 150), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coverage_cancelled_and_failed_jobs_do_not_contribute() {
+        let r = BackfillRegistry::new();
+        // Cancelled job: even though some windows were written
+        // before cancellation, they are not counted as coverage
+        // because the job didn't complete cleanly.
+        let cancelled = r.create(1, (0, 50), prom_source(), 5);
+        r.start(cancelled);
+        r.record_window_written(cancelled, 1, (0, 50));
+        r.cancel(cancelled);
+        // Failed job: same treatment.
+        let failed = r.create(1, (50, 100), prom_source(), 5);
+        r.start(failed);
+        r.record_window_written(failed, 1, (50, 100));
+        r.mark_failed(failed, "simulated");
+
+        assert_eq!(r.coverage(1, (0, 100)), Coverage::Missing);
+    }
+
+    #[test]
+    fn coverage_empty_range_is_trivially_complete() {
+        let r = BackfillRegistry::new();
+        assert_eq!(r.coverage(1, (42, 42)), Coverage::Complete);
+        assert_eq!(r.coverage(1, (50, 10)), Coverage::Complete);
     }
 }
