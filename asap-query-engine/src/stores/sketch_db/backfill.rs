@@ -294,6 +294,21 @@ pub enum CreateError {
         requested_end_ms: u64,
         created_at_ms: u64,
     },
+    /// The requested `start_ms` is older than the `SimpleMapStore`
+    /// data-retention horizon — any windows the backfill writes
+    /// at that range would immediately be evicted by the
+    /// retention sweep. Method B from the design discussion: fail
+    /// fast at job creation rather than silently letting the
+    /// backfill produce windows that get wiped.
+    ///
+    /// `earliest_retained_ms` is `now - persistence_delete_older_than_ms`,
+    /// i.e. the smallest timestamp that would still survive
+    /// retention at creation time.
+    OutOfRetention {
+        agg_id: u64,
+        requested_start_ms: u64,
+        earliest_retained_ms: u64,
+    },
 }
 
 impl std::fmt::Display for CreateError {
@@ -310,6 +325,16 @@ impl std::fmt::Display for CreateError {
                 f,
                 "backfill end_ms {requested_end_ms} > agg {agg_id} created_at_ms {created_at_ms}; \
                  live ingest already owns [{created_at_ms}, ∞), refuse to race"
+            ),
+            Self::OutOfRetention {
+                agg_id,
+                requested_start_ms,
+                earliest_retained_ms,
+            } => write!(
+                f,
+                "backfill start_ms {requested_start_ms} for agg {agg_id} is older than the store's \
+                 earliest_retained_ms {earliest_retained_ms}; any written windows would be evicted \
+                 by retention — extend persistence_delete_older_than before creating this job"
             ),
         }
     }
@@ -497,17 +522,23 @@ impl BackfillRegistry {
         job_id
     }
 
-    /// Create a job with the §10.5 time-disjoint invariant enforced:
-    /// `time_range.1` must be `<= agg_id`'s `created_at_ms` in the
-    /// schema registry, so backfill writes never race live writes
-    /// on the same `(agg_id, window)` pair. See the module doc for
-    /// why disjoint-by-construction beats locking.
+    /// Create a job with all §10.5 invariants enforced:
     ///
-    /// Returns `Err(CreateError::Overlap { created_at_ms })` if the
-    /// requested `end_ms` is strictly after the agg's creation
-    /// time, and `Err(CreateError::UnknownAgg)` if the agg_id isn't
-    /// in the schema registry at all (a backfill can't target an
-    /// aggregation the backend doesn't know about).
+    /// * **Known agg**: `schemas.get(agg_id)` must return `Some`.
+    /// * **Time-disjoint**: `time_range.1 <= schema.created_at_ms`
+    ///   so backfill writes don't race live writes on the same
+    ///   `(agg_id, window)` pair.
+    /// * **Within data retention** (if `data_retention_ms` is
+    ///   provided): `time_range.0 >= now - data_retention_ms`.
+    ///   Method B from the design discussion — fail fast instead
+    ///   of letting the backfill produce windows that the
+    ///   SimpleMapStore retention sweep would immediately evict.
+    ///   Pass `None` to skip the check (tests, or deployments
+    ///   where retention is disabled).
+    ///
+    /// Errors map to distinct [`CreateError`] variants so the
+    /// controller-facing HTTP endpoint can return specific 404 /
+    /// 409 / 400 statuses.
     pub fn create_checked(
         &self,
         schemas: &super::SchemaRegistry,
@@ -515,6 +546,7 @@ impl BackfillRegistry {
         time_range: (u64, u64),
         source: BackfillSource,
         windows_total: u64,
+        data_retention_ms: Option<u64>,
     ) -> Result<u64, CreateError> {
         let schema = match schemas.get(agg_id) {
             Some(s) => s,
@@ -529,6 +561,20 @@ impl BackfillRegistry {
                 requested_end_ms: time_range.1,
                 created_at_ms: schema.created_at_ms,
             });
+        }
+        // Data-retention check (Method B): if the store would
+        // immediately evict the windows this job would write,
+        // reject up-front with a clear message rather than
+        // silently wasting CPU + I/O.
+        if let Some(retention_ms) = data_retention_ms {
+            let earliest_retained_ms = now_ms().saturating_sub(retention_ms);
+            if time_range.0 < earliest_retained_ms {
+                return Err(CreateError::OutOfRetention {
+                    agg_id,
+                    requested_start_ms: time_range.0,
+                    earliest_retained_ms,
+                });
+            }
         }
         Ok(self.create(agg_id, time_range, source, windows_total))
     }
