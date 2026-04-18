@@ -7,17 +7,47 @@ use tracing::error;
 use crate::data_model::traits::SerializableToSink;
 use crate::data_model::{AggregationType, KeyByLabelValues, StreamingConfig};
 
+/// §5.1 provenance tag on every precompute record: did this window
+/// come from live ingest or was it materialised by a backfill job?
+///
+/// `Native` is the default (pre-existing records on disk deserialise
+/// to `Native` via `#[serde(default)]`), so the tag is
+/// forward-compatible with older on-disk formats.
+///
+/// Phase 5f-b / eviction / audit logs consult this tag to distinguish
+/// live vs backfilled windows at read / cleanup time without having
+/// to join against `BackfillRegistry::windows_written_by`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Origin {
+    /// Emitted by the live ingest pipeline (PrecomputeEngine workers
+    /// closing a window). The common case.
+    #[default]
+    Native,
+    /// Materialised by a backfill job. The tag carries the `job_id`
+    /// so operators can trace back to the specific REFRESH run that
+    /// produced this window (`GET /api/v1/db/backfill/jobs/:id`).
+    Backfilled { job_id: u64 },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputedOutput {
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub key: Option<KeyByLabelValues>,
     pub aggregation_id: u64,
+    /// §5.1 provenance tag. `#[serde(default)]` on read means old
+    /// records without the field deserialise as `Native`, preserving
+    /// behaviour for anything persisted before Phase 5.1.
+    #[serde(default)]
+    pub origin: Origin,
     // pub config: AggregationConfig,
     // Note: precompute will be handled separately as it's a trait object
 }
 
 impl PrecomputedOutput {
+    /// Construct a `Native` precompute — the default used by the
+    /// live ingest pipeline. Existing callers keep their signature
+    /// untouched; `origin` defaults to `Origin::Native`.
     pub fn new(
         start_timestamp: u64,
         end_timestamp: u64,
@@ -31,7 +61,28 @@ impl PrecomputedOutput {
             end_timestamp,
             key,
             aggregation_id,
+            origin: Origin::Native,
             // config,
+        }
+    }
+
+    /// Construct a `Backfilled { job_id }` precompute. Called by
+    /// the Phase 5e `BackfillWindowProcessor` so each backfilled
+    /// window carries its provenance back to the originating
+    /// `BackfillJob`.
+    pub fn new_backfilled(
+        start_timestamp: u64,
+        end_timestamp: u64,
+        key: Option<KeyByLabelValues>,
+        aggregation_id: u64,
+        job_id: u64,
+    ) -> Self {
+        Self {
+            start_timestamp,
+            end_timestamp,
+            key,
+            aggregation_id,
+            origin: Origin::Backfilled { job_id },
         }
     }
 
@@ -200,6 +251,7 @@ impl PrecomputedOutput {
             end_timestamp,
             key,
             aggregation_id,
+            origin: Origin::Native,
         };
 
         // data["precompute"] has been compressed using the following logic
@@ -612,3 +664,69 @@ impl SerializableToSink for PrecomputedOutput {
 //         assert_eq!(deserialized_accumulator.sum, 42.5);
 //     }
 // }
+
+// ─── §5.1 Origin tag tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod origin_tests {
+    use super::*;
+
+    #[test]
+    fn default_origin_is_native() {
+        assert_eq!(Origin::default(), Origin::Native);
+    }
+
+    #[test]
+    fn new_constructor_produces_native_origin() {
+        let out = PrecomputedOutput::new(0, 100, None, 1);
+        assert_eq!(out.origin, Origin::Native);
+    }
+
+    #[test]
+    fn new_backfilled_constructor_carries_job_id() {
+        let out = PrecomputedOutput::new_backfilled(0, 100, None, 1, 42);
+        assert_eq!(out.origin, Origin::Backfilled { job_id: 42 });
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_native() {
+        let out = PrecomputedOutput::new(10, 20, None, 7);
+        let json = serde_json::to_string(&out).unwrap();
+        let back: PrecomputedOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, Origin::Native);
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_backfilled_job_id() {
+        let out = PrecomputedOutput::new_backfilled(10, 20, None, 7, 99);
+        let json = serde_json::to_string(&out).unwrap();
+        let back: PrecomputedOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin, Origin::Backfilled { job_id: 99 });
+    }
+
+    /// Forward-compat guard: old on-disk records without the
+    /// `origin` field must deserialise as `Native`, not fail with
+    /// "missing field". Matters because Phase 2c persisted schemas
+    /// and older precompute records predate §5.1.
+    #[test]
+    fn old_serialized_record_without_origin_deserialises_as_native() {
+        let old_json = r#"{
+            "start_timestamp": 100,
+            "end_timestamp": 200,
+            "key": null,
+            "aggregation_id": 3
+        }"#;
+        let out: PrecomputedOutput = serde_json::from_str(old_json).unwrap();
+        assert_eq!(out.origin, Origin::Native);
+        assert_eq!(out.aggregation_id, 3);
+    }
+
+    #[test]
+    fn origin_variants_are_not_equal() {
+        assert_ne!(Origin::Native, Origin::Backfilled { job_id: 1 });
+        assert_ne!(
+            Origin::Backfilled { job_id: 1 },
+            Origin::Backfilled { job_id: 2 }
+        );
+    }
+}
