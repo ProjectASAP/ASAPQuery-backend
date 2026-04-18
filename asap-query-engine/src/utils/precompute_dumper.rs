@@ -162,6 +162,7 @@ mod tests {
             end_timestamp: 2000,
             key: None,
             aggregation_id: 1,
+            origin: Default::default(),
         };
 
         // Dump the precompute

@@ -220,11 +220,12 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::data_model::PrecomputedOutput::new(
+            let output = crate::data_model::PrecomputedOutput::new_backfilled(
                 window_range.0,
                 window_range.1,
                 key,
                 agg_id,
+                self.job_id,
             );
             batch.push((output, accumulator));
         }
