@@ -33,6 +33,7 @@ pub mod backfill_processor;
 pub mod backfill_service;
 pub mod backfill_window_builder;
 pub mod backfill_worker;
+pub mod prometheus_reader;
 pub mod raw_sample_reader;
 pub mod schema;
 pub mod simple_map_store;
@@ -42,11 +43,12 @@ pub use backfill::{
 };
 pub use backfill_processor::BackfillWindowProcessor;
 pub use backfill_service::{
-    noop_reader_factory, BackfillService, BackfillServiceConfig, BackfillServiceHandle,
-    ReaderFactory,
+    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
+    BackfillServiceHandle, ReaderFactory,
 };
 pub use backfill_window_builder::build_backfilled_accumulator;
 pub use backfill_worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
+pub use prometheus_reader::PrometheusReader;
 pub use raw_sample_reader::{
     LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
 };
