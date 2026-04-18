@@ -166,6 +166,17 @@ impl AggSchema {
     pub fn is_writable(&self) -> bool {
         matches!(self.status(), AggStatus::Active)
     }
+
+    /// §6.4 accuracy profile: theoretical error / confidence bound
+    /// of any query answer computed from this schema's sketch,
+    /// derived from `config.aggregation_type` + `config.parameters`.
+    /// Exposed so HTTP endpoints and future `QueryResult`
+    /// enrichment can return "±ε with probability 1 - δ" as a
+    /// first-class answer attribute, instead of the user having to
+    /// rederive the bound from the sketch literature.
+    pub fn accuracy_profile(&self) -> super::accuracy::AccuracyProfile {
+        super::accuracy::AccuracyProfile::derive(&self.config)
+    }
 }
 
 /// Default retention for retired schemas — one hour. A future
