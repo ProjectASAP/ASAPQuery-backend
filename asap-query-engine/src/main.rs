@@ -687,11 +687,11 @@ async fn main() -> Result<()> {
             schemas,
             store.clone(),
             hot_reload_config.clone(),
-            query_engine_rust::stores::sketch_db::noop_reader_factory(),
+            query_engine_rust::stores::sketch_db::default_reader_factory(),
             query_engine_rust::stores::sketch_db::BackfillServiceConfig::default(),
         );
         info!(
-            "Spawning BackfillService drain loop (reader factory: noop — jobs will fail fast until a real factory is wired)"
+            "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/ClickHouse/OtherSketch fail fast)"
         );
         Some(service.spawn())
     } else {
