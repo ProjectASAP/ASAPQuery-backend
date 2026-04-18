@@ -2817,10 +2817,73 @@ impl SimpleEngine {
         time: f64,
     ) -> Option<QueryExecutionContext> {
         let query_time = Self::convert_query_time_to_data_time(time);
+        let (query_pattern_type, match_result) = self.parse_and_match_promql(&query)?;
+        debug!("Found matching query config for: {}", query);
 
-        // Parse PromQL AST using promql-parser crate
+        let query_context_start_time = Instant::now();
+
+        // Resolve aggregation: try pre-configured query_configs first,
+        // fall back to capability matching.
+        let agg_info = self.resolve_agg_info_promql(&query, &match_result, query_pattern_type)?;
+
+        let result = self.build_promql_execution_context_tail(
+            &match_result,
+            query_pattern_type,
+            query_time,
+            agg_info,
+        );
+
+        let query_context_duration = query_context_start_time.elapsed();
+        debug!(
+            "[LATENCY] Query context build: {:.2}ms",
+            query_context_duration.as_secs_f64() * 1000.0
+        );
+
+        result
+    }
+
+    /// Like `build_query_execution_context_promql`, but skips the
+    /// auto-resolution of the `agg_id` and forces the provided
+    /// `forced_agg_id` instead. The same parse + pattern-match
+    /// pipeline runs; only the "which aggregation covers this
+    /// query" step is replaced.
+    ///
+    /// Phase 3b-2-a (refactor) — the caller for this entry point is
+    /// Phase 3b-2-b's per-segment dispatch: for each
+    /// `TimelineSegment` returned by
+    /// [`crate::stores::sketch_db::SchemaRegistry::timeline_for_metric`],
+    /// the dispatch builds a context targeting that segment's
+    /// `agg_id`, executes it against the clipped segment range,
+    /// collects the scalar, and combines across segments via
+    /// [`crate::engines::timeline_dispatch::combine_statistic`].
+    ///
+    /// Returns `None` when the query can't be parsed / pattern-matched,
+    /// or when `forced_agg_id` isn't in the current `StreamingConfig`.
+    pub fn build_query_execution_context_promql_for_agg_id(
+        &self,
+        query: String,
+        time: f64,
+        forced_agg_id: u64,
+    ) -> Option<QueryExecutionContext> {
+        let query_time = Self::convert_query_time_to_data_time(time);
+        let (query_pattern_type, match_result) = self.parse_and_match_promql(&query)?;
+        let agg_info = self.agg_info_from_forced_id(forced_agg_id)?;
+        self.build_promql_execution_context_tail(
+            &match_result,
+            query_pattern_type,
+            query_time,
+            agg_info,
+        )
+    }
+
+    /// Shared phase-1 of PromQL context construction: parse the
+    /// query string, run it against every registered pattern, and
+    /// return the matched `(QueryPatternType, PromQLMatchResult)`.
+    /// Centralised so the auto-resolution and forced-agg-id entry
+    /// points share identical parse semantics.
+    fn parse_and_match_promql(&self, query: &str) -> Option<(QueryPatternType, PromQLMatchResult)> {
         let parse_start_time = Instant::now();
-        let ast = match promql_parser::parser::parse(&query) {
+        let ast = match promql_parser::parser::parse(query) {
             Ok(ast) => {
                 let parse_duration = parse_start_time.elapsed();
                 debug!(
@@ -2856,57 +2919,76 @@ impl SimpleEngine {
             }
         }
 
-        let (query_pattern_type, match_result) = match found_match {
+        match found_match {
             Some((pt, result)) => {
                 let pattern_match_duration = pattern_match_start_time.elapsed();
                 debug!(
                     "Pattern matching took: {:.2}ms",
                     pattern_match_duration.as_secs_f64() * 1000.0
                 );
-                (pt, result)
+                Some((pt, result))
             }
             None => {
                 warn!("No matching pattern found for query: {}", query);
-                return None;
+                None
             }
-        };
+        }
+    }
 
-        debug!("Found matching query config for: {}", query);
-
-        let query_context_start_time = Instant::now();
-
-        // Resolve aggregation: try pre-configured query_configs first, fall back to capability matching.
-        let agg_info: AggregationIdInfo = if let Some(config) = self.find_query_config(&query) {
+    /// Resolve which aggregation covers a PromQL query: try the
+    /// `QueryConfig` exact-string match first, then fall back to
+    /// capability-based matching (with controller miss-notification
+    /// if wired). Extracted from `build_query_execution_context_promql`
+    /// so the Phase 3b-2-b per-segment dispatch can choose NOT to
+    /// auto-resolve (it has a forced agg_id from the timeline).
+    fn resolve_agg_info_promql(
+        &self,
+        query: &str,
+        match_result: &PromQLMatchResult,
+        query_pattern_type: QueryPatternType,
+    ) -> Option<AggregationIdInfo> {
+        if let Some(config) = self.find_query_config(query) {
             self.get_aggregation_id_info(config)
                 .map_err(|e| {
                     warn!("{}", e);
                     e
                 })
-                .ok()?
+                .ok()
         } else {
             warn!(
                 "No query_config entry for PromQL query '{}'. Attempting capability-based matching.",
                 query
             );
             let requirements =
-                self.build_query_requirements_promql(&match_result, query_pattern_type);
-            self.find_compatible_aggregation_with_miss_notify(&requirements)?
-        };
+                self.build_query_requirements_promql(match_result, query_pattern_type);
+            self.find_compatible_aggregation_with_miss_notify(&requirements)
+        }
+    }
 
-        let result = self.build_promql_execution_context_tail(
-            &match_result,
-            query_pattern_type,
-            query_time,
-            agg_info,
-        );
-
-        let query_context_duration = query_context_start_time.elapsed();
-        debug!(
-            "[LATENCY] Query context build: {:.2}ms",
-            query_context_duration.as_secs_f64() * 1000.0
-        );
-
-        result
+    /// Build an `AggregationIdInfo` from a single forced `agg_id`,
+    /// for the Phase 3b-2-b per-segment dispatch. Uses the same
+    /// "one agg covers both key and value" shape as the single-
+    /// aggregation branch in `get_aggregation_id_info` (line
+    /// ~1881), so downstream dispatch treats this agg identically
+    /// to a single-aggregation `QueryConfig` match.
+    ///
+    /// Returns `None` if the agg_id isn't in the current
+    /// `StreamingConfig` — either a stale controller posted a
+    /// backfill for a removed agg, or the timeline contains a
+    /// retired entry whose config was evicted. Either way the
+    /// per-segment dispatch will skip this segment as
+    /// non-answerable.
+    fn agg_info_from_forced_id(&self, agg_id: u64) -> Option<AggregationIdInfo> {
+        let streaming_config = self.streaming_config_snapshot();
+        let agg_type = streaming_config
+            .get_aggregation_config(agg_id)
+            .map(|c| c.aggregation_type)?;
+        Some(AggregationIdInfo {
+            aggregation_id_for_key: agg_id,
+            aggregation_id_for_value: agg_id,
+            aggregation_type_for_key: agg_type,
+            aggregation_type_for_value: agg_type,
+        })
     }
 
     /// Merge precomputed outputs (extracts buckets from timestamped data)
@@ -5340,6 +5422,129 @@ mod aux_pushdown_tests {
                 .query_precompute_for_statistic(&max_acc, &Statistic::Max, &None, &HashMap::new())
                 .unwrap(),
             99.0
+        );
+    }
+}
+
+// ── Phase 3b-2-a: build_query_execution_context_promql_for_agg_id tests ──
+
+#[cfg(test)]
+mod forced_agg_id_tests {
+    use super::*;
+    use crate::precompute_operators::sum_accumulator::SumAccumulator;
+    use crate::tests::test_utilities::engine_factories::create_engine_single_pop;
+
+    /// Sanity: the refactored auto-resolve path still produces a
+    /// valid context for a simple sum_over_time query — ensures
+    /// the `parse_and_match_promql` / `resolve_agg_info_promql`
+    /// extraction hasn't broken existing behaviour.
+    #[test]
+    fn auto_resolve_still_works_after_refactor() {
+        let data = vec![(
+            Some(vec!["host-a".to_string()]),
+            Box::new(SumAccumulator::with_sum(10.0)) as Box<dyn AggregateCore>,
+        )];
+        let query = "sum_over_time(http_requests[60s])";
+        let engine = create_engine_single_pop(
+            "http_requests",
+            AggregationType::Sum,
+            vec!["host"],
+            data,
+            query,
+        );
+        let ctx = engine.build_query_execution_context_promql(query.to_string(), 1000.0);
+        assert!(ctx.is_some(), "auto-resolve should yield a context");
+    }
+
+    /// The new forced-agg-id entry point produces a context when
+    /// the forced `agg_id` matches the one the auto-resolver
+    /// would have picked. Basic smoke test; §7 timeline dispatch
+    /// tests in Phase 3b-2-b will exercise it against multiple
+    /// agg_ids.
+    #[test]
+    fn forced_agg_id_produces_context_for_known_id() {
+        let data = vec![(
+            Some(vec!["host-a".to_string()]),
+            Box::new(SumAccumulator::with_sum(10.0)) as Box<dyn AggregateCore>,
+        )];
+        let query = "sum_over_time(http_requests[60s])";
+        let engine = create_engine_single_pop(
+            "http_requests",
+            AggregationType::Sum,
+            vec!["host"],
+            data,
+            query,
+        );
+        let ctx = engine.build_query_execution_context_promql_for_agg_id(
+            query.to_string(),
+            1000.0,
+            1, // `create_engine_single_pop` wires agg_id=1
+        );
+        assert!(ctx.is_some(), "forced valid agg_id should yield a context");
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.agg_info.aggregation_id_for_value, 1);
+        assert_eq!(ctx.agg_info.aggregation_id_for_key, 1);
+    }
+
+    /// Unknown `agg_id` returns `None` without panicking or
+    /// polluting the auto-resolver state. Phase 3b-2-b relies on
+    /// this to gracefully skip timeline segments whose agg_id
+    /// disappeared from the StreamingConfig mid-query.
+    #[test]
+    fn forced_agg_id_returns_none_for_unknown_id() {
+        let data = vec![(
+            Some(vec!["host-a".to_string()]),
+            Box::new(SumAccumulator::with_sum(10.0)) as Box<dyn AggregateCore>,
+        )];
+        let query = "sum_over_time(http_requests[60s])";
+        let engine = create_engine_single_pop(
+            "http_requests",
+            AggregationType::Sum,
+            vec!["host"],
+            data,
+            query,
+        );
+        let ctx = engine.build_query_execution_context_promql_for_agg_id(
+            query.to_string(),
+            1000.0,
+            9999, // not in StreamingConfig
+        );
+        assert!(ctx.is_none(), "unknown agg_id → None");
+    }
+
+    /// Forced and auto-resolved contexts should be observably
+    /// equivalent for the common one-agg case (where the
+    /// auto-resolver would have picked the same id). The
+    /// invariant that matters for Phase 3b-2-b: dispatching
+    /// through the forced path against the single covering
+    /// segment yields the same answer as the existing path.
+    #[test]
+    fn forced_and_auto_resolve_produce_same_agg_info_for_single_agg() {
+        let data = vec![(
+            Some(vec!["host-a".to_string()]),
+            Box::new(SumAccumulator::with_sum(10.0)) as Box<dyn AggregateCore>,
+        )];
+        let query = "sum_over_time(http_requests[60s])";
+        let engine = create_engine_single_pop(
+            "http_requests",
+            AggregationType::Sum,
+            vec!["host"],
+            data,
+            query,
+        );
+        let auto = engine
+            .build_query_execution_context_promql(query.to_string(), 1000.0)
+            .unwrap();
+        let forced = engine
+            .build_query_execution_context_promql_for_agg_id(query.to_string(), 1000.0, 1)
+            .unwrap();
+        assert_eq!(
+            auto.agg_info.aggregation_id_for_value,
+            forced.agg_info.aggregation_id_for_value
+        );
+        assert_eq!(
+            auto.agg_info.aggregation_type_for_value,
+            forced.agg_info.aggregation_type_for_value
         );
     }
 }
