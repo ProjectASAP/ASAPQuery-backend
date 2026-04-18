@@ -57,6 +57,33 @@ pub trait Store: Send + Sync {
 
     /// Close the store and clean up resources
     fn close(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Drop every precompute record whose `aggregation_id` equals
+    /// `agg_id`, regardless of window or subpopulation key. Used by
+    /// the §6-driven `SchemaEvictionService` to reclaim space when
+    /// a retired schema passes its `expires_at_ms`.
+    ///
+    /// Returns the number of records removed (best-effort — a store
+    /// that can't easily count still returns 0 and logs, never
+    /// fails).
+    ///
+    /// Contract:
+    /// * Must be idempotent — calling on an unknown `agg_id` is a
+    ///   no-op that returns `Ok(0)`.
+    /// * Must be atomic AT LEAST with respect to concurrent reads
+    ///   for the same agg_id: a reader either sees all of the
+    ///   pre-drop records or none, not a half-dropped state. Stores
+    ///   backed by a single RwLock get this for free; stores with
+    ///   finer-grained locking may need to grab a global lock
+    ///   briefly.
+    /// * Does NOT touch any registry (backfill, schema); the caller
+    ///   is responsible for post-drop cleanup of those.
+    ///
+    /// Default impl returns `Ok(0)` so existing stores stay
+    /// compiling — the impl must override to actually delete.
+    fn drop_agg_id(&self, _agg_id: u64) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(0)
+    }
 }
 
 /// Result type for store operations

@@ -1008,6 +1008,40 @@ impl Store for SimpleMapStorePerKey {
         info!("SimpleMapStorePerKey closed");
         Ok(())
     }
+
+    fn drop_agg_id(&self, agg_id: u64) -> StoreResult<usize> {
+        // Count windows before eviction for the return value. Grab
+        // the shard's read lock to snapshot the count, then upgrade
+        // to a removal. DashMap::remove is atomic on the key — no
+        // global lock needed, so a concurrent insert for a
+        // different agg_id keeps running unblocked.
+        let evicted = match self.inner.store.get(&agg_id) {
+            Some(entry) => {
+                let data = entry.value().read().unwrap();
+                let count = data.current_epoch.len()
+                    + data
+                        .sealed_epochs
+                        .values()
+                        .map(|e| e.entries.len())
+                        .sum::<usize>();
+                drop(data);
+                drop(entry);
+                count
+            }
+            None => 0,
+        };
+        self.inner.store.remove(&agg_id);
+        self.inner.earliest_timestamps.remove(&agg_id);
+        // `metrics` and `items_inserted` are keyed by metric name,
+        // not agg_id, so we don't touch them — other agg_ids under
+        // the same metric stay live.
+        info!(
+            agg_id,
+            evicted_windows = evicted,
+            "SimpleMapStorePerKey::drop_agg_id"
+        );
+        Ok(evicted)
+    }
 }
 
 // =================================================================
