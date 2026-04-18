@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Create the store
     let store: Arc<dyn query_engine_rust::stores::Store> = if args.persistence_enabled {
-        use query_engine_rust::stores::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+        use query_engine_rust::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()

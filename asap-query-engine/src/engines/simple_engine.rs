@@ -4667,7 +4667,7 @@ mod hot_reload_phase2_tests {
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, QueryLanguage,
         StreamingConfig, WindowType,
     };
-    use crate::stores::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
     fn dummy_agg(id: u64, metric: &str) -> crate::data_model::AggregationConfig {
@@ -4829,7 +4829,7 @@ mod e2e_feedback_loop_tests {
         StreamingConfig, WindowType,
     };
     use crate::drivers::query::controller_client::ControllerClient;
-    use crate::stores::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use async_trait::async_trait;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use promql_utilities::query_logics::enums::Statistic;
@@ -5233,7 +5233,7 @@ mod aux_pushdown_tests {
             CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, PromQLSchema, QueryLanguage,
             SchemaConfig, StreamingConfig,
         };
-        use crate::stores::simple_map_store::SimpleMapStore;
+        use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 
         let ic = InferenceConfig {
             schema: SchemaConfig::PromQL(PromQLSchema {

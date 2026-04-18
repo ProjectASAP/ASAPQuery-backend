@@ -31,7 +31,7 @@ use query_engine_rust::data_model::{
     WindowType,
 };
 use query_engine_rust::precompute_operators::{DatasketchesKLLAccumulator, SumAccumulator};
-use query_engine_rust::stores::simple_map_store::legacy::{
+use query_engine_rust::stores::sketch_db::simple_map_store::legacy::{
     LegacySimpleMapStoreGlobal, LegacySimpleMapStorePerKey,
 };
 use query_engine_rust::stores::Store;

@@ -268,8 +268,8 @@ pub fn noop_reader_factory() -> ReaderFactory {
 mod tests {
     use super::*;
     use crate::data_model::StreamingConfig;
-    use crate::stores::simple_map_store::SimpleMapStore;
     use crate::stores::sketch_db::raw_sample_reader::{MockRawSampleReader, RawSample};
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;

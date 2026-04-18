@@ -12,7 +12,7 @@ use crate::data_model::{
 };
 use crate::engines::query_result::InstantVectorElement;
 use crate::engines::simple_engine::SimpleEngine;
-use crate::stores::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 use crate::stores::Store;
 use crate::AggregateCore;
 use promql_utilities::data_model::KeyByLabelNames;

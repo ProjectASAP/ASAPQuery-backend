@@ -12,7 +12,7 @@ use crate::data_model::{
 use crate::engines::simple_engine::SimpleEngine;
 use crate::precompute_operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_operators::sum_accumulator::SumAccumulator;
-use crate::stores::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 use crate::stores::traits::Store;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;

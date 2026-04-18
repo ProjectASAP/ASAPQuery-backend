@@ -16,8 +16,8 @@ use crate::data_model::{
     AggregationType, CleanupPolicy, PrecomputedOutput, StreamingConfig, WindowType,
 };
 use crate::precompute_operators::SumAccumulator;
-use crate::stores::simple_map_store::per_key::SimpleMapStorePerKey;
-use crate::stores::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+use crate::stores::sketch_db::simple_map_store::per_key::SimpleMapStorePerKey;
+use crate::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
 use crate::stores::Store;
 use crate::{AggregateCore, AggregationConfig};
 

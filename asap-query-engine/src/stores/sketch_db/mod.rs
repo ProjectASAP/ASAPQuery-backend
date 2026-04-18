@@ -35,6 +35,7 @@ pub mod backfill_window_builder;
 pub mod backfill_worker;
 pub mod raw_sample_reader;
 pub mod schema;
+pub mod simple_map_store;
 
 pub use backfill::{
     BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage, CreateError,
@@ -50,3 +51,4 @@ pub use raw_sample_reader::{
     LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
 };
 pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
+pub use simple_map_store::SimpleMapStore;
