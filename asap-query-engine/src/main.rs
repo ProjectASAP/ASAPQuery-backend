@@ -3,7 +3,7 @@ use query_engine_rust::data_model::QueryLanguage;
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use sketch_core::config::{self, ImplMode};
 
@@ -194,6 +194,18 @@ struct Args {
     /// Memory-only by default.
     #[arg(long)]
     backfill_persist_path: Option<std::path::PathBuf>,
+
+    /// Spawn the Phase 5e backfill drain loop. When off (default),
+    /// queued backfill jobs stay `Queued` forever — shadow-mode
+    /// for controller REFRESH dispatch validation. When on, a
+    /// background task picks up queued jobs and runs them through
+    /// `BackfillWindowProcessor` (real sketch rebuild + store
+    /// writes). Requires `--enable-prometheus-remote-write` or
+    /// `--streaming-engine=precompute` so the schema registry is
+    /// available; otherwise a warning is logged and the service
+    /// stays down.
+    #[arg(long)]
+    enable_backfill_worker: bool,
 
     /// Enable automatic query tracking and planning
     #[arg(long)]
@@ -633,8 +645,8 @@ async fn main() -> Result<()> {
     // design, §6). When precompute isn't enabled, the registry is
     // absent and the swap handler no-ops on schema reconciliation
     // (legacy per-batch reconcile in ingest still works).
-    let mut server = HttpServer::new(http_config, engine, store, query_tracker)
-        .with_hot_reload_config(hot_reload_config);
+    let mut server = HttpServer::new(http_config, engine, store.clone(), query_tracker)
+        .with_hot_reload_config(hot_reload_config.clone());
     if let Some(ingest_state) = precompute_ingest_state.as_ref() {
         server = server.with_schemas(ingest_state.schemas.clone());
     }
@@ -654,7 +666,43 @@ async fn main() -> Result<()> {
         }
         None => query_engine_rust::stores::sketch_db::BackfillRegistry::new(),
     });
-    server = server.with_backfill_registry(backfill_registry);
+    server = server.with_backfill_registry(backfill_registry.clone());
+
+    // Phase 5e: spawn the backfill drain service if requested. When
+    // enabled with `--enable-backfill-worker`, the service picks
+    // up queued jobs and runs them through a
+    // `BackfillWindowProcessor` (real sketch rebuild + store
+    // writes). Without a reader factory configured (Phase 5h), all
+    // production `BackfillSource` variants fail fast with a clear
+    // "no reader" error — still a step up from the old shadow
+    // mode, since the controller now gets signal that its REFRESH
+    // dispatch was received but not executable.
+    let backfill_service_handle = if let (true, Some(ingest_state)) = (
+        args.enable_backfill_worker,
+        precompute_ingest_state.as_ref(),
+    ) {
+        let schemas = ingest_state.schemas.clone();
+        let service = query_engine_rust::stores::sketch_db::BackfillService::new(
+            backfill_registry.clone(),
+            schemas,
+            store.clone(),
+            hot_reload_config.clone(),
+            query_engine_rust::stores::sketch_db::noop_reader_factory(),
+            query_engine_rust::stores::sketch_db::BackfillServiceConfig::default(),
+        );
+        info!(
+            "Spawning BackfillService drain loop (reader factory: noop — jobs will fail fast until a real factory is wired)"
+        );
+        Some(service.spawn())
+    } else {
+        if args.enable_backfill_worker {
+            warn!(
+                "--enable-backfill-worker was set but precompute engine isn't enabled; backfill service NOT spawned (it needs the schema registry)"
+            );
+        }
+        None
+    };
+
     info!("Starting HTTP server on port {}", args.http_port);
 
     // Wait for shutdown signal
@@ -670,6 +718,11 @@ async fn main() -> Result<()> {
     }
 
     // Cleanup - gracefully shutdown background tasks
+    if let Some(handle) = backfill_service_handle {
+        info!("Shutting down backfill service...");
+        handle.shutdown().await;
+    }
+
     if let Some(handle) = kafka_handle {
         info!("Shutting down Kafka consumer...");
         handle.abort();

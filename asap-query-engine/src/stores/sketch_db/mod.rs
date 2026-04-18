@@ -29,11 +29,22 @@
 //!   query path (5f).
 
 pub mod backfill;
+pub mod backfill_processor;
+pub mod backfill_service;
+pub mod backfill_window_builder;
 pub mod backfill_worker;
 pub mod raw_sample_reader;
 pub mod schema;
 
-pub use backfill::{BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage};
+pub use backfill::{
+    BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage, CreateError,
+};
+pub use backfill_processor::BackfillWindowProcessor;
+pub use backfill_service::{
+    noop_reader_factory, BackfillService, BackfillServiceConfig, BackfillServiceHandle,
+    ReaderFactory,
+};
+pub use backfill_window_builder::build_backfilled_accumulator;
 pub use backfill_worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
 pub use raw_sample_reader::{
     LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,

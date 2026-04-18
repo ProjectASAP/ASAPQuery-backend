@@ -248,7 +248,27 @@ pub struct BackfillRegistry {
     next_job_id: AtomicU64,
     /// Optional on-disk snapshot path. Set via `with_persistence`.
     persist_path: Option<PathBuf>,
+    /// Per-`job_id` list of [`WrittenWindow`] entries that
+    /// the corresponding backfill actually wrote to the store.
+    /// Phase 5e populates this via `record_window_written`;
+    /// Phase 5f's coverage tracker reads it to distinguish
+    /// `Backfilled` from `Missing` coverage for a given range.
+    ///
+    /// Kept separately from `jobs` so writes don't have to pay the
+    /// cost of cloning the whole job on every window — only the
+    /// provenance list grows.
+    ///
+    /// Not persisted to disk in Phase 5e. Phase 5g persistence
+    /// covered job lifecycle but not written-windows; if restart
+    /// recovery of the provenance list becomes necessary, it'll be
+    /// a Phase 5g-2 extension.
+    written_windows: RwLock<HashMap<u64, Vec<WrittenWindow>>>,
 }
+
+/// A single `(agg_id, window_range)` record of a window written by
+/// a backfill job. Phase 5f's coverage tracker reads these lists
+/// to distinguish `Backfilled { job_id }` coverage from `Missing`.
+pub type WrittenWindow = (u64, (u64, u64));
 
 /// On-disk format version for the persisted backfill registry.
 /// Bumped on any incompatible change to [`BackfillJob`] or
@@ -256,6 +276,46 @@ pub struct BackfillRegistry {
 /// a corrupt file (registry starts empty, next save rewrites the
 /// current version).
 pub const PERSIST_FORMAT_VERSION: u32 = 1;
+
+/// Errors returned by [`BackfillRegistry::create_checked`]. Exists
+/// so the controller-facing HTTP endpoint can render distinct
+/// 400 vs 404 vs 409 depending on which invariant was violated,
+/// rather than swallowing the detail in a string.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CreateError {
+    /// The `agg_id` isn't known to the schema registry. Caller
+    /// probably has a stale config or a typo.
+    UnknownAgg { agg_id: u64 },
+    /// The requested `end_ms` extends past the agg's
+    /// `created_at_ms`, which would put the backfill in conflict
+    /// with live ingest. §10.5 time-disjoint invariant.
+    Overlap {
+        agg_id: u64,
+        requested_end_ms: u64,
+        created_at_ms: u64,
+    },
+}
+
+impl std::fmt::Display for CreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownAgg { agg_id } => {
+                write!(f, "unknown agg_id {agg_id} (not in schema registry)")
+            }
+            Self::Overlap {
+                agg_id,
+                requested_end_ms,
+                created_at_ms,
+            } => write!(
+                f,
+                "backfill end_ms {requested_end_ms} > agg {agg_id} created_at_ms {created_at_ms}; \
+                 live ingest already owns [{created_at_ms}, ∞), refuse to race"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CreateError {}
 
 /// Top-level structure written by `persist_path`. Captures the
 /// current `next_job_id` alongside the jobs so a restart doesn't
@@ -279,6 +339,7 @@ impl BackfillRegistry {
             jobs: RwLock::new(HashMap::new()),
             next_job_id: AtomicU64::new(1),
             persist_path: None,
+            written_windows: RwLock::new(HashMap::new()),
         }
     }
 
@@ -357,6 +418,7 @@ impl BackfillRegistry {
             jobs: RwLock::new(map),
             next_job_id: AtomicU64::new(snap.next_job_id.max(1)),
             persist_path: None,
+            written_windows: RwLock::new(HashMap::new()),
         }))
     }
 
@@ -433,6 +495,42 @@ impl BackfillRegistry {
         }
         self.save_to_disk_if_persistent();
         job_id
+    }
+
+    /// Create a job with the §10.5 time-disjoint invariant enforced:
+    /// `time_range.1` must be `<= agg_id`'s `created_at_ms` in the
+    /// schema registry, so backfill writes never race live writes
+    /// on the same `(agg_id, window)` pair. See the module doc for
+    /// why disjoint-by-construction beats locking.
+    ///
+    /// Returns `Err(CreateError::Overlap { created_at_ms })` if the
+    /// requested `end_ms` is strictly after the agg's creation
+    /// time, and `Err(CreateError::UnknownAgg)` if the agg_id isn't
+    /// in the schema registry at all (a backfill can't target an
+    /// aggregation the backend doesn't know about).
+    pub fn create_checked(
+        &self,
+        schemas: &super::SchemaRegistry,
+        agg_id: u64,
+        time_range: (u64, u64),
+        source: BackfillSource,
+        windows_total: u64,
+    ) -> Result<u64, CreateError> {
+        let schema = match schemas.get(agg_id) {
+            Some(s) => s,
+            None => return Err(CreateError::UnknownAgg { agg_id }),
+        };
+        // Time-disjoint invariant: live ingest writes `[created_at, ∞)`
+        // so backfill must stay strictly inside `[0, created_at)` or
+        // touch the boundary exactly.
+        if time_range.1 > schema.created_at_ms {
+            return Err(CreateError::Overlap {
+                agg_id,
+                requested_end_ms: time_range.1,
+                created_at_ms: schema.created_at_ms,
+            });
+        }
+        Ok(self.create(agg_id, time_range, source, windows_total))
     }
 
     pub fn get(&self, job_id: u64) -> Option<BackfillJob> {
@@ -551,6 +649,35 @@ impl BackfillRegistry {
         drop(map);
         self.save_to_disk_if_persistent();
         true
+    }
+
+    /// Record that job `job_id` wrote a backfilled window at
+    /// `(agg_id, window_range)`. Called by Phase 5e's
+    /// `BackfillWindowProcessor` after a successful per-window
+    /// write to the store — this is how the registry knows which
+    /// `(agg_id, range)` pairs have been backfilled, which Phase
+    /// 5f's coverage tracker uses to distinguish `Backfilled` from
+    /// `Missing` coverage.
+    ///
+    /// Idempotent: recording the same `(job_id, agg_id, range)`
+    /// twice appends duplicate entries. Callers shouldn't do that,
+    /// but the registry doesn't police it — de-duplication is a
+    /// Phase 5f concern.
+    pub fn record_window_written(&self, job_id: u64, agg_id: u64, window_range: (u64, u64)) {
+        if let Ok(mut map) = self.written_windows.write() {
+            map.entry(job_id).or_default().push((agg_id, window_range));
+        }
+    }
+
+    /// All `(agg_id, window_range)` pairs written by `job_id`.
+    /// Empty (or missing) list means either the job hasn't started
+    /// writing yet or was cancelled before any window completed.
+    pub fn windows_written_by(&self, job_id: u64) -> Vec<WrittenWindow> {
+        self.written_windows
+            .read()
+            .ok()
+            .and_then(|m| m.get(&job_id).cloned())
+            .unwrap_or_default()
     }
 
     /// Remove any terminal job older than `older_than_ms`. Used by
