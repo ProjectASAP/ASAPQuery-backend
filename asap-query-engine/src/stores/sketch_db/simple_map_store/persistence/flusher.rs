@@ -425,7 +425,9 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::data_model::KeyByLabelValues;
-    use crate::stores::simple_map_store::persistence::source::{EpochSnapshot, EpochSnapshotEntry};
+    use crate::stores::sketch_db::simple_map_store::persistence::source::{
+        EpochSnapshot, EpochSnapshotEntry,
+    };
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tempfile::TempDir;

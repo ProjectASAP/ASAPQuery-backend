@@ -3,7 +3,7 @@ use crate::data_model::{CleanupPolicy, InferenceConfig, QueryLanguage, Streaming
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::engines::SimpleEngine;
-use crate::stores::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;

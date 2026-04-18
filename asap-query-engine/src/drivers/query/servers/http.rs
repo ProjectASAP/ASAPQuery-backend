@@ -698,7 +698,7 @@ mod tests {
     use super::*;
     use crate::data_model::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
     use crate::engines::SimpleEngine;
-    use crate::stores::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use reqwest::Client;
     use std::sync::Arc;
 

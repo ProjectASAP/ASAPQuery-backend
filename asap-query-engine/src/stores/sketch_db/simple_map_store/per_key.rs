@@ -3,7 +3,7 @@ use crate::data_model::{
     StreamingConfig,
 };
 use crate::engines::physical::accumulator_serde;
-use crate::stores::simple_map_store::common::{
+use crate::stores::sketch_db::simple_map_store::common::{
     EpochID, InternTable, MetricBucketMap, MetricID, MutableEpoch, SealedEpoch, TimestampRange,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};

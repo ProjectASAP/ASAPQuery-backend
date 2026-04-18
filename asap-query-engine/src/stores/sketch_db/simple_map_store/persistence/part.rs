@@ -594,7 +594,7 @@ fn map_file(path: &Path) -> PersistResult<Mmap> {
 mod tests {
     use super::*;
     use crate::data_model::KeyByLabelValues;
-    use crate::stores::simple_map_store::persistence::source::EpochSnapshotEntry;
+    use crate::stores::sketch_db::simple_map_store::persistence::source::EpochSnapshotEntry;
     use tempfile::TempDir;
 
     fn make_snapshot() -> EpochSnapshot {

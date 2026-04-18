@@ -260,10 +260,10 @@ impl WindowProcessor for BackfillWindowProcessor {
 mod tests {
     use super::*;
     use crate::data_model::StreamingConfig;
-    use crate::stores::simple_map_store::SimpleMapStore;
     use crate::stores::sketch_db::backfill::BackfillSource;
     use crate::stores::sketch_db::backfill_worker::BackfillWorker;
     use crate::stores::sketch_db::raw_sample_reader::{LabelFilter, MockRawSampleReader};
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;

@@ -10,7 +10,7 @@ mod tests {
         QueryConfig, QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
     };
     use crate::engines::simple_engine::SimpleEngine;
-    use crate::stores::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use promql_utilities::data_model::KeyByLabelNames;
     use sql_utilities::sqlhelper::{SQLSchema, Table};
     use std::collections::{HashMap, HashSet};

@@ -314,7 +314,7 @@ async fn main() -> Result<()> {
     let cleanup_policy = inference_config.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let store = if args.persistence_enabled {
-        use query_engine_rust::stores::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+        use query_engine_rust::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()
