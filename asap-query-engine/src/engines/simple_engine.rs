@@ -2725,6 +2725,21 @@ impl SimpleEngine {
             }
         }
 
+        // Phase 3b-2-b: try the §7 schema-timeline dispatch first.
+        // Returns Some only when the query's [t1, t2] range crosses a
+        // reconfigure boundary AND the statistic is combinable. In
+        // every other case (single-schema range, non-combinable
+        // statistic, unparseable query) it returns None and we fall
+        // through to the default single-agg path below.
+        if let Some(result) = self.try_handle_query_promql_via_timeline(&query, time) {
+            let total_query_duration = query_start_time.elapsed();
+            debug!(
+                "Timeline-dispatch query handling took: {:.2}ms",
+                total_query_duration.as_secs_f64() * 1000.0
+            );
+            return Some(result);
+        }
+
         let context = self.build_query_execution_context_promql(query, time)?;
 
         debug!(
@@ -2989,6 +3004,184 @@ impl SimpleEngine {
             aggregation_type_for_key: agg_type,
             aggregation_type_for_value: agg_type,
         })
+    }
+
+    /// Phase 3b-2-b: per-segment dispatch across the §7 schema
+    /// timeline for combinable statistics.
+    ///
+    /// Returns `Some(result)` when:
+    /// * `SchemaRegistry::timeline_for_metric` yields two or more
+    ///   segments for the query's metric within its time range
+    ///   (i.e. the query spans a reconfigure boundary), AND
+    /// * the query's statistic is one of Count / Sum / Min / Max,
+    ///   which `timeline_dispatch::combine_statistic` can stitch
+    ///   cleanly at the scalar level.
+    ///
+    /// Returns `None` otherwise (single-schema range, non-combinable
+    /// statistic, unparseable query, unresolved probe aggregation).
+    /// The caller falls back to the default single-agg path — that
+    /// path is still correct whenever the timeline doesn't actually
+    /// span a boundary. Non-combinable statistics (quantile / topk /
+    /// cardinality / rate / increase) are routed through the
+    /// default path here too; PR B2 will surface
+    /// [`crate::engines::timeline_dispatch::CombinedResult::Partial`]
+    /// to the HTTP response so users can see "covered" + "missing"
+    /// segments explicitly instead of the single-agg data cliff.
+    ///
+    /// Delivers the user-visible Phase 3 outcome documented in
+    /// `docs/design-sketch-db.md` §7: queries spanning a reconfigure
+    /// boundary no longer see a data cliff for additive statistics.
+    fn try_handle_query_promql_via_timeline(
+        &self,
+        query: &str,
+        time: f64,
+    ) -> Option<(KeyByLabelNames, QueryResult)> {
+        use crate::engines::timeline_dispatch::{combine_statistic, CombinedResult, SegmentValue};
+        use crate::stores::sketch_db::{TimelineCoverage, TimelineSegment};
+
+        // Phase 1: shared pipeline with the default path — parse,
+        // pattern-match, auto-resolve a "probe" agg. We reuse the
+        // probe context purely to read the derived (metric name,
+        // query time range, statistic) triple that timeline dispatch
+        // needs. The probe agg itself is NOT used for execution in
+        // the multi-segment branch.
+        let (query_pattern_type, match_result) = self.parse_and_match_promql(query)?;
+        let metric_name = match_result.get_metric_name()?;
+        let probe_agg_info =
+            self.resolve_agg_info_promql(query, &match_result, query_pattern_type)?;
+        let query_time = Self::convert_query_time_to_data_time(time);
+        let probe_context = self.build_promql_execution_context_tail(
+            &match_result,
+            query_pattern_type,
+            query_time,
+            probe_agg_info,
+        )?;
+
+        let stat = probe_context.metadata.statistic_to_compute;
+        let t1 = probe_context.store_plan.values_query.start_timestamp;
+        let t2 = probe_context.store_plan.values_query.end_timestamp;
+
+        // Phase 2: resolve the schema timeline over [t1, t2] for this
+        // metric. Zero or one segments means the default single-agg
+        // path is already correct; bail out and let the caller use
+        // it.
+        let segments = self.timeline_for_query(&metric_name, t1, t2);
+        if segments.len() < 2 {
+            return None;
+        }
+
+        // Phase 3: only activate for combinable statistics. See the
+        // module doc on `timeline_dispatch` §7.3 combinability table.
+        if !matches!(
+            stat,
+            Statistic::Count | Statistic::Sum | Statistic::Min | Statistic::Max
+        ) {
+            return None;
+        }
+
+        debug!(
+            metric = %metric_name,
+            segments = segments.len(),
+            t1,
+            t2,
+            statistic = ?stat,
+            "Phase 3 timeline dispatch: evaluating per-segment"
+        );
+
+        // Phase 4: per-segment evaluation. Each segment's agg_id
+        // evaluates the same query clipped to the segment's
+        // [start_ms, end_ms]. `Purged` segments (TimelineCoverage)
+        // or missing configs are collected into `unresolved` so the
+        // combiner can surface them.
+        let mut per_group: HashMap<Option<KeyByLabelValues>, Vec<SegmentValue>> = HashMap::new();
+        let mut unresolved: Vec<TimelineSegment> = Vec::new();
+
+        for segment in &segments {
+            if matches!(segment.coverage, TimelineCoverage::Purged) {
+                unresolved.push(segment.clone());
+                continue;
+            }
+            let mut ctx = match self.build_query_execution_context_promql_for_agg_id(
+                query.to_string(),
+                time,
+                segment.agg_id,
+            ) {
+                Some(c) => c,
+                None => {
+                    // agg_id no longer in the current StreamingConfig
+                    // (e.g. controller pushed a swap that dropped
+                    // this entry between timeline resolution and
+                    // dispatch). Classify as unresolved.
+                    unresolved.push(segment.clone());
+                    continue;
+                }
+            };
+
+            // Clip the segment's [start, end) onto the store plan so
+            // the per-segment query reads only its own time slice.
+            ctx.store_plan.values_query.start_timestamp = segment.start_ms;
+            ctx.store_plan.values_query.end_timestamp = segment.end_ms;
+            if let Some(ref mut keys_q) = ctx.store_plan.keys_query {
+                keys_q.start_timestamp = segment.start_ms;
+                keys_q.end_timestamp = segment.end_ms;
+            }
+
+            let per_segment_results = match self.execute_query_pipeline(&ctx, true) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        agg_id = segment.agg_id,
+                        start_ms = segment.start_ms,
+                        end_ms = segment.end_ms,
+                        "Timeline segment execution failed: {}",
+                        e
+                    );
+                    unresolved.push(segment.clone());
+                    continue;
+                }
+            };
+
+            for el in per_segment_results {
+                per_group
+                    .entry(Some(el.labels))
+                    .or_default()
+                    .push(SegmentValue {
+                        segment: segment.clone(),
+                        value: el.value,
+                    });
+            }
+        }
+
+        // Phase 5: per-group combine. Group-by label-tuple so the
+        // combiner folds per-segment scalars into one final scalar
+        // per group. Groups that only appear in `unresolved` (no
+        // segment ever produced a value for them) are skipped.
+        let mut output: Vec<InstantVectorElement> = Vec::new();
+        for (label_key, segment_values) in per_group {
+            match combine_statistic(stat, &segment_values, &unresolved) {
+                CombinedResult::Full(v) => {
+                    output.push(InstantVectorElement::new(label_key.unwrap_or_default(), v));
+                }
+                CombinedResult::Partial {
+                    covered: Some(v), ..
+                } => {
+                    // Best-effort: emit `covered` for combinable
+                    // stats so the user sees the partial sum. PR B2
+                    // will add a first-class Partial response surface
+                    // carrying the `missing` list.
+                    output.push(InstantVectorElement::new(label_key.unwrap_or_default(), v));
+                }
+                CombinedResult::Partial { covered: None, .. } => {
+                    // No segment produced a value for this group —
+                    // drop it rather than emit a misleading 0.
+                }
+            }
+        }
+
+        Some((
+            probe_context.metadata.query_output_labels,
+            QueryResult::vector(output, probe_context.query_time),
+        ))
     }
 
     /// Merge precomputed outputs (extracts buckets from timestamped data)
