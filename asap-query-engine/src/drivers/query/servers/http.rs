@@ -46,6 +46,13 @@ pub struct HttpServer {
     /// HTTP endpoints stay `Queued` and are visible via the list
     /// endpoint — useful shadow-mode testing before workers exist.
     backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
+    /// SimpleMapStore data-retention horizon in millis, mirroring
+    /// `--persistence-delete-older-than-secs` at the CLI. Used by the
+    /// `POST /api/v1/db/backfill` handler to gate job creation via
+    /// `BackfillRegistry::create_checked` (§10.5 Method B). `None`
+    /// disables the retention precheck — the handler still enforces
+    /// the §10.5 time-disjoint invariant.
+    data_retention_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -66,6 +73,8 @@ struct AppState {
     schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
     backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
+    /// See `HttpServer::data_retention_ms`.
+    data_retention_ms: Option<u64>,
 }
 
 impl HttpServer {
@@ -83,6 +92,7 @@ impl HttpServer {
             hot_reload_config: None,
             schemas: None,
             backfill: None,
+            data_retention_ms: None,
         }
     }
 
@@ -124,6 +134,17 @@ impl HttpServer {
         self
     }
 
+    /// Declare the SimpleMapStore data-retention horizon (the value of
+    /// `--persistence-delete-older-than-secs` * 1000). When set, the
+    /// `POST /api/v1/db/backfill` handler runs `create_checked` with
+    /// this bound, so jobs that would write windows older than the
+    /// retention horizon are rejected up-front instead of being
+    /// silently evicted right after write (§10.5 Method B).
+    pub fn with_data_retention_ms(mut self, data_retention_ms: u64) -> Self {
+        self.data_retention_ms = Some(data_retention_ms);
+        self
+    }
+
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Create adapter using factory
         let adapter = create_http_adapter(self.config.adapter_config.clone());
@@ -147,6 +168,7 @@ impl HttpServer {
             hot_reload_config: self.hot_reload_config.clone(),
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
+            data_retention_ms: self.data_retention_ms,
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -212,6 +234,7 @@ impl HttpServer {
             hot_reload_config: self.hot_reload_config.clone(),
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
+            data_retention_ms: self.data_retention_ms,
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -1461,8 +1484,14 @@ aggregations:
 
     // ─── Phase 5d: backfill HTTP endpoint tests ─────────────────────────────
 
-    async fn setup_test_server_with_backfill(
+    /// Build a test server wired with a backfill registry and a
+    /// `SchemaRegistry` that pre-registers the listed `agg_ids` as
+    /// Active. `POST /api/v1/db/backfill` runs `create_checked`, which
+    /// requires both registries — tests that hit that endpoint must
+    /// populate the schema side here.
+    async fn setup_test_server_with_backfill_and_schemas(
         registry: Arc<crate::stores::sketch_db::BackfillRegistry>,
+        active_agg_ids: &[u64],
     ) -> u16 {
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -1487,8 +1516,40 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let server =
-            HttpServer::new(config, query_engine, store, None).with_backfill_registry(registry);
+        let schemas = {
+            use asap_types::aggregation_config::AggregationConfig;
+            use asap_types::enums::{AggregationType, WindowType};
+            use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+            let mut map: std::collections::HashMap<u64, AggregationConfig> =
+                std::collections::HashMap::new();
+            for agg_id in active_agg_ids {
+                let cfg = AggregationConfig::new(
+                    *agg_id,
+                    AggregationType::CountMinSketch,
+                    String::new(),
+                    std::collections::HashMap::new(),
+                    KeyByLabelNames::empty(),
+                    KeyByLabelNames::empty(),
+                    KeyByLabelNames::empty(),
+                    String::new(),
+                    60,
+                    60,
+                    WindowType::Tumbling,
+                    String::new(),
+                    format!("metric_{agg_id}"),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                map.insert(*agg_id, cfg);
+            }
+            let sc = StreamingConfig::new(map);
+            Arc::new(crate::stores::sketch_db::SchemaRegistry::from_streaming_config(&sc))
+        };
+        let server = HttpServer::new(config, query_engine, store, None)
+            .with_backfill_registry(registry)
+            .with_schemas(schemas);
         server
             .start_test_server()
             .await
@@ -1498,7 +1559,8 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_full_lifecycle_through_http() {
         let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill(registry.clone()).await;
+        let server_port =
+            setup_test_server_with_backfill_and_schemas(registry.clone(), &[42]).await;
         let client = Client::new();
 
         // POST creates a Queued job.
@@ -1597,7 +1659,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_post_rejects_inverted_range() {
         let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill(registry).await;
+        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[1]).await;
         let client = Client::new();
 
         let req = serde_json::json!({
@@ -1619,7 +1681,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_get_unknown_job_returns_404() {
         let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill(registry).await;
+        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
         let client = Client::new();
         let resp = client
             .get(format!(
@@ -1678,7 +1740,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_list_bogus_status_returns_400() {
         let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill(registry).await;
+        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
         let client = Client::new();
         let resp = client
             .get(format!(
@@ -1688,6 +1750,64 @@ aggregations:
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    // §10.5: create_checked invariants surfacing through HTTP.
+
+    #[tokio::test]
+    async fn test_backfill_post_unknown_agg_returns_404() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        // Empty schema registry — agg_id 42 is unknown.
+        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
+        let client = Client::new();
+        let req = serde_json::json!({
+            "agg_id": 42,
+            "start_ms": 100,
+            "end_ms": 500,
+            "source": { "Prometheus": { "url": "http://prom.local" } },
+            "windows_total": 1,
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "error");
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown agg_id 42"));
+    }
+
+    #[tokio::test]
+    async fn test_backfill_post_overlap_with_live_ingest_returns_409() {
+        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        // Schema registered at `now` — any `end_ms` > created_at_ms
+        // overlaps live ingest.
+        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[7]).await;
+        let client = Client::new();
+        let future_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 3_600_000;
+        let req = serde_json::json!({
+            "agg_id": 7,
+            "start_ms": 0,
+            "end_ms": future_ms,
+            "source": { "Prometheus": { "url": "http://prom.local" } },
+            "windows_total": 1,
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     }
 }
 
@@ -2212,17 +2332,34 @@ fn service_unavailable_no_backfill() -> axum::response::Response {
     (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
 }
 
-/// `POST /api/v1/db/backfill` — create a queued backfill job. Returns
-/// 201 with `{job_id}` on success; 400 on bad body (malformed JSON
-/// or inverted range); 503 when no registry is attached.
+/// `POST /api/v1/db/backfill` — create a queued backfill job.
+///
+/// Validates the request against the §10.5 invariants via
+/// `BackfillRegistry::create_checked`:
+/// * `agg_id` must be known to the schema registry → 404 on miss.
+/// * `end_ms` must not extend past the agg's `created_at_ms` (no
+///   race against live ingest) → 409 on overlap.
+/// * `start_ms` must be within the SimpleMapStore data-retention
+///   window when one is configured (Method B) → 409 on stale range.
+///
+/// 400 on malformed body / inverted range; 503 when no registry or
+/// schema registry is attached.
 async fn handle_post_backfill_job(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    use crate::stores::sketch_db::CreateError;
     use axum::response::IntoResponse;
 
     let Some(registry) = state.backfill else {
         return service_unavailable_no_backfill();
+    };
+    let Some(schemas) = state.schemas else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "schema registry not attached; backfill retention check requires HttpServer::with_schemas",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
     let req: CreateBackfillJobRequest = match serde_json::from_slice(&body) {
@@ -2246,17 +2383,36 @@ async fn handle_post_backfill_job(
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
 
-    let job_id = registry.create(
+    match registry.create_checked(
+        &schemas,
         req.agg_id,
         (req.start_ms, req.end_ms),
         req.source,
         req.windows_total,
-    );
-    let body = serde_json::json!({
-        "status": "success",
-        "job_id": job_id,
-    });
-    (StatusCode::CREATED, axum::Json(body)).into_response()
+        state.data_retention_ms,
+    ) {
+        Ok(job_id) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "job_id": job_id,
+            });
+            (StatusCode::CREATED, axum::Json(body)).into_response()
+        }
+        Err(e @ CreateError::UnknownAgg { .. }) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+            });
+            (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+        }
+        Err(e @ (CreateError::Overlap { .. } | CreateError::OutOfRetention { .. })) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": e.to_string(),
+            });
+            (StatusCode::CONFLICT, axum::Json(body)).into_response()
+        }
+    }
 }
 
 /// `GET /api/v1/db/backfill/jobs` — list all jobs with optional
