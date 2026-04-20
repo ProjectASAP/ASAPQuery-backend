@@ -3007,30 +3007,38 @@ impl SimpleEngine {
     }
 
     /// Phase 3b-2-b: per-segment dispatch across the §7 schema
-    /// timeline for combinable statistics.
+    /// timeline.
     ///
-    /// Returns `Some(result)` when:
-    /// * `SchemaRegistry::timeline_for_metric` yields two or more
-    ///   segments for the query's metric within its time range
-    ///   (i.e. the query spans a reconfigure boundary), AND
-    /// * the query's statistic is one of Count / Sum / Min / Max,
-    ///   which `timeline_dispatch::combine_statistic` can stitch
-    ///   cleanly at the scalar level.
+    /// Returns `Some(result)` when `SchemaRegistry::timeline_for_metric`
+    /// yields two or more segments for the query's metric within its
+    /// time range (i.e. the query spans a reconfigure boundary).
+    /// Returns `None` otherwise (single-schema range, unparseable
+    /// query, unresolved probe aggregation) so the caller falls back
+    /// to the default single-agg path — that path is still correct
+    /// whenever the timeline doesn't actually span a boundary.
     ///
-    /// Returns `None` otherwise (single-schema range, non-combinable
-    /// statistic, unparseable query, unresolved probe aggregation).
-    /// The caller falls back to the default single-agg path — that
-    /// path is still correct whenever the timeline doesn't actually
-    /// span a boundary. Non-combinable statistics (quantile / topk /
-    /// cardinality / rate / increase) are routed through the
-    /// default path here too; PR B2 will surface
-    /// [`crate::engines::timeline_dispatch::CombinedResult::Partial`]
-    /// to the HTTP response so users can see "covered" + "missing"
-    /// segments explicitly instead of the single-agg data cliff.
+    /// ## Combinable vs non-combinable statistics
+    ///
+    /// For combinable scalar statistics (Count / Sum / Min / Max)
+    /// every segment contributes and the result is a clean `Full`
+    /// value the user can trust without caveat.
+    ///
+    /// For non-combinable statistics (Quantile / Topk / Cardinality /
+    /// Rate / Increase) — or for any combinable run that includes a
+    /// `Purged` / config-missing segment — `combine_statistic`
+    /// returns `Partial`. This method surfaces Partial on the
+    /// Prometheus HTTP response's `warnings` field: the top-level
+    /// result carries whatever combinable prefix we could compute
+    /// (for additive stats) or an empty vector (for non-combinable),
+    /// plus one or more `warnings` strings explaining the schema
+    /// boundary, the dropped groups, and the unresolved segments.
     ///
     /// Delivers the user-visible Phase 3 outcome documented in
     /// `docs/design-sketch-db.md` §7: queries spanning a reconfigure
-    /// boundary no longer see a data cliff for additive statistics.
+    /// boundary no longer see a silent data cliff — additive stats
+    /// get the combined answer, and non-combinable stats get an
+    /// explicit Partial notice instead of the arbitrary single-agg
+    /// single-segment result.
     fn try_handle_query_promql_via_timeline(
         &self,
         query: &str,
@@ -3067,15 +3075,6 @@ impl SimpleEngine {
         // it.
         let segments = self.timeline_for_query(&metric_name, t1, t2);
         if segments.len() < 2 {
-            return None;
-        }
-
-        // Phase 3: only activate for combinable statistics. See the
-        // module doc on `timeline_dispatch` §7.3 combinability table.
-        if !matches!(
-            stat,
-            Statistic::Count | Statistic::Sum | Statistic::Min | Statistic::Max
-        ) {
             return None;
         }
 
@@ -3156,7 +3155,14 @@ impl SimpleEngine {
         // combiner folds per-segment scalars into one final scalar
         // per group. Groups that only appear in `unresolved` (no
         // segment ever produced a value for them) are skipped.
+        //
+        // `any_partial` tracks whether any group came back non-`Full`
+        // — drives the Prometheus `warnings` surface below so the
+        // caller sees "this answer is partial" explicitly instead of
+        // a silent cliff.
         let mut output: Vec<InstantVectorElement> = Vec::new();
+        let mut any_partial = false;
+        let mut groups_with_no_value = 0usize;
         for (label_key, segment_values) in per_group {
             match combine_statistic(stat, &segment_values, &unresolved) {
                 CombinedResult::Full(v) => {
@@ -3165,22 +3171,68 @@ impl SimpleEngine {
                 CombinedResult::Partial {
                     covered: Some(v), ..
                 } => {
-                    // Best-effort: emit `covered` for combinable
-                    // stats so the user sees the partial sum. PR B2
-                    // will add a first-class Partial response surface
-                    // carrying the `missing` list.
+                    // Emit `covered` for combinable stats so the user
+                    // sees the partial sum. The warning below tells
+                    // them not to trust the scalar as a full range
+                    // answer.
                     output.push(InstantVectorElement::new(label_key.unwrap_or_default(), v));
+                    any_partial = true;
                 }
                 CombinedResult::Partial { covered: None, .. } => {
-                    // No segment produced a value for this group —
-                    // drop it rather than emit a misleading 0.
+                    // Non-combinable stat (quantile / topk / rate /
+                    // increase / cardinality) OR a group the
+                    // combiner couldn't reduce. Drop the group —
+                    // there is no meaningful scalar to show — but
+                    // flag the whole response partial.
+                    any_partial = true;
+                    groups_with_no_value += 1;
                 }
             }
         }
 
+        // Phase 6: build Prometheus `warnings` when the combiner
+        // returned any Partial. One line summarising the schema
+        // boundary, plus up-to-three per-segment lines with agg_id
+        // + clipped range so operators can correlate against the
+        // `GET /api/v1/db/timeline` surface. We cap at three to
+        // keep responses bounded; the full set is still inspectable
+        // via the timeline endpoint.
+        let warnings = if any_partial {
+            let mut w = Vec::with_capacity(2 + unresolved.len().min(3));
+            w.push(format!(
+                "partial result: query spans {} schemas for metric '{}' over [{}, {}] and the requested statistic {:?} is not cleanly combinable across schema boundaries — see `GET /api/v1/db/timeline?metric={}&start_ms={}&end_ms={}` for the full segment map",
+                segments.len(),
+                metric_name,
+                t1,
+                t2,
+                stat,
+                metric_name,
+                t1,
+                t2,
+            ));
+            if groups_with_no_value > 0 {
+                w.push(format!(
+                    "{} group(s) dropped because no segment could answer the statistic",
+                    groups_with_no_value,
+                ));
+            }
+            for seg in unresolved.iter().take(3) {
+                w.push(format!(
+                    "segment agg_id={} [{}, {}) status={:?} coverage={:?} unresolved",
+                    seg.agg_id, seg.start_ms, seg.end_ms, seg.status, seg.coverage,
+                ));
+            }
+            if unresolved.len() > 3 {
+                w.push(format!("... and {} more", unresolved.len() - 3));
+            }
+            w
+        } else {
+            Vec::new()
+        };
+
         Some((
             probe_context.metadata.query_output_labels,
-            QueryResult::vector(output, probe_context.query_time),
+            QueryResult::vector_with_warnings(output, probe_context.query_time, warnings),
         ))
     }
 

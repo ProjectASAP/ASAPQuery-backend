@@ -19,11 +19,47 @@ impl QueryResult {
     }
 
     pub fn vector(values: Vec<InstantVectorElement>, timestamp: u64) -> Self {
-        QueryResult::Vector(InstantVector { values, timestamp })
+        QueryResult::Vector(InstantVector {
+            values,
+            timestamp,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Phase 3b-2-b: construct an instant vector with a non-empty
+    /// warnings list. Used by the timeline dispatcher when the query
+    /// spans a reconfigure boundary and one or more segments could
+    /// not contribute to the answer (non-combinable statistic, purged
+    /// data, or agg_id removed from config mid-flight). Prometheus's
+    /// native JSON surface carries these back to the caller via the
+    /// top-level `warnings` field, matching the upstream contract.
+    pub fn vector_with_warnings(
+        values: Vec<InstantVectorElement>,
+        timestamp: u64,
+        warnings: Vec<String>,
+    ) -> Self {
+        QueryResult::Vector(InstantVector {
+            values,
+            timestamp,
+            warnings,
+        })
     }
 
     pub fn matrix(values: Vec<RangeVectorElement>) -> Self {
-        QueryResult::Matrix(RangeVector { values })
+        QueryResult::Matrix(RangeVector {
+            values,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Accumulated per-result warnings. Empty for single-schema
+    /// queries; populated by the §7 timeline dispatcher when a query
+    /// spans a reconfigure boundary.
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            QueryResult::Vector(iv) => &iv.warnings,
+            QueryResult::Matrix(m) => &m.warnings,
+        }
     }
 }
 
@@ -32,6 +68,15 @@ impl QueryResult {
 pub struct InstantVector {
     pub values: Vec<InstantVectorElement>,
     pub timestamp: u64,
+    /// Non-error advisories attached to this result, surfaced on
+    /// Prometheus's top-level `warnings` field. Empty for
+    /// single-schema queries; populated by the Phase 3b-2-b timeline
+    /// dispatcher when one or more segments produced a
+    /// [`crate::engines::timeline_dispatch::CombinedResult::Partial`]
+    /// (non-combinable statistic, purged coverage, or agg_id
+    /// missing from the current config).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +95,9 @@ impl InstantVectorElement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeVector {
     pub values: Vec<RangeVectorElement>,
+    /// See [`InstantVector::warnings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Individual element in a range vector
@@ -234,5 +282,41 @@ mod tests {
         let sample = Sample::new(12345, 99.9);
         assert_eq!(sample.timestamp, 12345);
         assert_eq!(sample.value, 99.9);
+    }
+
+    #[test]
+    fn vector_without_warnings_returns_empty_slice_and_omits_field_in_json() {
+        let labels = create_test_labels();
+        let el = InstantVectorElement::new(labels, 1.0);
+        let qr = QueryResult::vector(vec![el], 100);
+        assert!(qr.warnings().is_empty());
+        let json = serde_json::to_string(&qr).unwrap();
+        assert!(
+            !json.contains("\"warnings\""),
+            "default-empty warnings must be skip-serialised for wire compatibility"
+        );
+    }
+
+    #[test]
+    fn vector_with_warnings_round_trips_through_serde() {
+        let labels = create_test_labels();
+        let el = InstantVectorElement::new(labels, 1.0);
+        let warnings = vec!["partial result: 2 schemas".to_string()];
+        let qr = QueryResult::vector_with_warnings(vec![el], 100, warnings.clone());
+        assert_eq!(qr.warnings(), warnings.as_slice());
+
+        let json = serde_json::to_string(&qr).unwrap();
+        assert!(json.contains("\"warnings\""));
+        let back: QueryResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.warnings(), warnings.as_slice());
+    }
+
+    #[test]
+    fn matrix_warnings_default_empty_and_skip_serialised() {
+        let el = RangeVectorElement::new(create_test_labels());
+        let qr = QueryResult::matrix(vec![el]);
+        assert!(qr.warnings().is_empty());
+        let json = serde_json::to_string(&qr).unwrap();
+        assert!(!json.contains("\"warnings\""));
     }
 }
