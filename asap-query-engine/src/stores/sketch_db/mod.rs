@@ -34,6 +34,7 @@ pub mod backfill_processor;
 pub mod backfill_service;
 pub mod backfill_window_builder;
 pub mod backfill_worker;
+pub mod metrics;
 pub mod prometheus_reader;
 pub mod raw_sample_reader;
 pub mod schema;
