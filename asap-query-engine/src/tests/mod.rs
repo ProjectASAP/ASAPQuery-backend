@@ -3,6 +3,7 @@ pub mod clickhouse_forwarding_tests;
 pub mod datafusion;
 pub mod elastic_dsl_query_tests;
 pub mod elastic_forwarding_tests;
+pub mod persist_format_versioning_tests;
 pub mod persistence_integration_tests;
 pub mod persistence_perf_tests;
 pub mod prometheus_forwarding_tests;
