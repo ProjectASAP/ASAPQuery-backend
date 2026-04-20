@@ -24,6 +24,13 @@ pub struct PrometheusResponse {
     pub error_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Non-error advisories — maps to Prometheus's top-level
+    /// `warnings: []` field. Phase 3b-2-b uses this to surface
+    /// partial results from the §7 schema-timeline dispatcher
+    /// (query spans a reconfigure boundary with a non-combinable
+    /// statistic or a Purged segment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl PrometheusResponse {
@@ -33,6 +40,19 @@ impl PrometheusResponse {
             data: Some(data),
             error_type: None,
             error: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// `success` + a non-empty `warnings` list attached. Used by the
+    /// query adapters when the engine returned a `CombinedResult::Partial`.
+    pub fn success_with_warnings(data: Value, warnings: Vec<String>) -> Self {
+        Self {
+            status: "success".to_string(),
+            data: Some(data),
+            error_type: None,
+            error: None,
+            warnings,
         }
     }
 
@@ -42,6 +62,7 @@ impl PrometheusResponse {
             data: None,
             error_type: Some(error_type.to_string()),
             error: Some(error.to_string()),
+            warnings: Vec::new(),
         }
     }
 }
@@ -200,7 +221,15 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        let response = PrometheusResponse::success(prometheus_data);
+        // Thread through any Phase 3 timeline-dispatch warnings so
+        // they land on the top-level `warnings` field, matching
+        // Prometheus's native API.
+        let warnings = result.query_result.warnings().to_vec();
+        let response = if warnings.is_empty() {
+            PrometheusResponse::success(prometheus_data)
+        } else {
+            PrometheusResponse::success_with_warnings(prometheus_data, warnings)
+        };
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
 
@@ -215,7 +244,12 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
             error!("Failed to convert range result: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        let response = PrometheusResponse::success(prometheus_data);
+        let warnings = result.warnings().to_vec();
+        let response = if warnings.is_empty() {
+            PrometheusResponse::success(prometheus_data)
+        } else {
+            PrometheusResponse::success_with_warnings(prometheus_data, warnings)
+        };
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
 
@@ -511,5 +545,35 @@ mod tests {
         assert!(result.is_ok());
         let parsed = result.unwrap();
         assert_eq!(parsed.query, "sum(metric)");
+    }
+
+    #[test]
+    fn success_response_without_warnings_omits_field() {
+        let r = PrometheusResponse::success(json!({"resultType": "vector", "result": []}));
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"status\":\"success\""));
+        assert!(
+            !s.contains("\"warnings\""),
+            "empty warnings must be skip-serialised for wire compatibility"
+        );
+    }
+
+    #[test]
+    fn success_response_with_warnings_serialises_the_top_level_field() {
+        // This is the Phase 3b-2-b contract: a Partial result coming
+        // out of the §7 timeline dispatcher lands on Prometheus's
+        // native `warnings: []` field at the top of the response,
+        // matching upstream behaviour for warning-carrying queries.
+        let r = PrometheusResponse::success_with_warnings(
+            json!({"resultType": "vector", "result": []}),
+            vec![
+                "partial result: query spans 2 schemas".to_string(),
+                "1 group(s) dropped".to_string(),
+            ],
+        );
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"warnings\":["));
+        assert!(s.contains("partial result: query spans 2 schemas"));
+        assert!(s.contains("1 group(s) dropped"));
     }
 }
