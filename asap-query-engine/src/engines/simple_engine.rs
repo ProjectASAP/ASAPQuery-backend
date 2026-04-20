@@ -159,13 +159,15 @@ pub struct SimpleEngine {
     /// pre-PR-G behavior. Set via `with_controller_client`.
     controller_client: Option<Arc<dyn crate::drivers::query::controller_client::ControllerClient>>,
     /// Per-`agg_id` schema registry used for §7 schema-timeline
-    /// dispatch (`docs/design-sketch-db.md`). In Phase 3b this is
-    /// stored for future query-path wiring; the combiner lives in
+    /// dispatch (`docs/design-sketch-db.md`). The combiner lives in
     /// [`crate::engines::timeline_dispatch`] and the lookup primitive
-    /// is already exposed on [`crate::stores::sketch_db::SchemaRegistry`].
+    /// is exposed on [`crate::stores::sketch_db::SchemaRegistry`];
+    /// the engine consults the registry on every query to resolve
+    /// which agg_id owns each sub-range of the query's time window.
     ///
-    /// Defaults to an empty registry so pre-Phase-3 call-sites keep
-    /// compiling. Production wire-up (`main.rs`) uses
+    /// Defaults to an empty registry so call-sites that don't
+    /// participate in schema-timeline dispatch keep compiling.
+    /// Production wire-up (`main.rs`) uses
     /// [`Self::with_schema_registry`] to share the same registry the
     /// ingest path is reconciling.
     schema_registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
@@ -400,9 +402,9 @@ impl SimpleEngine {
     /// Resolve the §7 schema timeline for a metric over a query range.
     /// Thin delegate to `SchemaRegistry::timeline_for_metric` so the
     /// engine's own query-path code does not need to reach into the
-    /// store module to build a timeline (and so tests for the
-    /// dispatch wiring — Phase 3b-2 — can mock by swapping the
-    /// registry rather than monkey-patching the engine).
+    /// store module to build a timeline (and so dispatch-wiring
+    /// tests can mock by swapping the registry rather than
+    /// monkey-patching the engine).
     pub fn timeline_for_query(
         &self,
         metric: &str,
@@ -2725,12 +2727,12 @@ impl SimpleEngine {
             }
         }
 
-        // Phase 3b-2-b: try the §7 schema-timeline dispatch first.
-        // Returns Some only when the query's [t1, t2] range crosses a
-        // reconfigure boundary AND the statistic is combinable. In
-        // every other case (single-schema range, non-combinable
-        // statistic, unparseable query) it returns None and we fall
-        // through to the default single-agg path below.
+        // Try the §7 schema-timeline dispatch first. Returns Some
+        // only when the query's [t1, t2] range crosses a
+        // reconfigure boundary (i.e. two or more agg_ids own pieces
+        // of the range). In every other case (single-schema range,
+        // unparseable query) it returns None and we fall through
+        // to the default single-agg path below.
         if let Some(result) = self.try_handle_query_promql_via_timeline(&query, time) {
             let total_query_duration = query_start_time.elapsed();
             debug!(
@@ -2863,8 +2865,8 @@ impl SimpleEngine {
     /// pipeline runs; only the "which aggregation covers this
     /// query" step is replaced.
     ///
-    /// Phase 3b-2-a (refactor) — the caller for this entry point is
-    /// Phase 3b-2-b's per-segment dispatch: for each
+    /// Caller: the per-segment dispatch in
+    /// [`Self::try_handle_query_promql_via_timeline`]. For each
     /// `TimelineSegment` returned by
     /// [`crate::stores::sketch_db::SchemaRegistry::timeline_for_metric`],
     /// the dispatch builds a context targeting that segment's
@@ -2954,7 +2956,7 @@ impl SimpleEngine {
     /// `QueryConfig` exact-string match first, then fall back to
     /// capability-based matching (with controller miss-notification
     /// if wired). Extracted from `build_query_execution_context_promql`
-    /// so the Phase 3b-2-b per-segment dispatch can choose NOT to
+    /// so the per-segment timeline dispatch can choose NOT to
     /// auto-resolve (it has a forced agg_id from the timeline).
     fn resolve_agg_info_promql(
         &self,
@@ -2981,7 +2983,7 @@ impl SimpleEngine {
     }
 
     /// Build an `AggregationIdInfo` from a single forced `agg_id`,
-    /// for the Phase 3b-2-b per-segment dispatch. Uses the same
+    /// for the per-segment timeline dispatch. Uses the same
     /// "one agg covers both key and value" shape as the single-
     /// aggregation branch in `get_aggregation_id_info` (line
     /// ~1881), so downstream dispatch treats this agg identically
@@ -3006,8 +3008,7 @@ impl SimpleEngine {
         })
     }
 
-    /// Phase 3b-2-b: per-segment dispatch across the §7 schema
-    /// timeline.
+    /// Per-segment dispatch across the §7 schema timeline.
     ///
     /// Returns `Some(result)` when `SchemaRegistry::timeline_for_metric`
     /// yields two or more segments for the query's metric within its
@@ -3033,7 +3034,7 @@ impl SimpleEngine {
     /// plus one or more `warnings` strings explaining the schema
     /// boundary, the dropped groups, and the unresolved segments.
     ///
-    /// Delivers the user-visible Phase 3 outcome documented in
+    /// Delivers the user-visible outcome documented in
     /// `docs/design-sketch-db.md` §7: queries spanning a reconfigure
     /// boundary no longer see a silent data cliff — additive stats
     /// get the combined answer, and non-combinable stats get an
@@ -3084,7 +3085,7 @@ impl SimpleEngine {
             t1,
             t2,
             statistic = ?stat,
-            "Phase 3 timeline dispatch: evaluating per-segment"
+            "schema-timeline dispatch: evaluating per-segment"
         );
 
         // Phase 4: per-segment evaluation. Each segment's agg_id
@@ -3140,6 +3141,11 @@ impl SimpleEngine {
                 }
             };
 
+            debug!(
+                agg_id = segment.agg_id,
+                count = per_segment_results.len(),
+                "schema-timeline dispatch: segment produced results"
+            );
             for el in per_segment_results {
                 per_group
                     .entry(Some(el.labels))
@@ -3150,6 +3156,11 @@ impl SimpleEngine {
                     });
             }
         }
+        debug!(
+            groups = per_group.len(),
+            unresolved = unresolved.len(),
+            "schema-timeline dispatch: about to combine"
+        );
 
         // Phase 5: per-group combine. Group-by label-tuple so the
         // combiner folds per-segment scalars into one final scalar
@@ -5671,7 +5682,7 @@ mod aux_pushdown_tests {
     }
 }
 
-// ── Phase 3b-2-a: build_query_execution_context_promql_for_agg_id tests ──
+// ── build_query_execution_context_promql_for_agg_id (forced-agg) tests ──
 
 #[cfg(test)]
 mod forced_agg_id_tests {
@@ -5704,7 +5715,7 @@ mod forced_agg_id_tests {
     /// The new forced-agg-id entry point produces a context when
     /// the forced `agg_id` matches the one the auto-resolver
     /// would have picked. Basic smoke test; §7 timeline dispatch
-    /// tests in Phase 3b-2-b will exercise it against multiple
+    /// per-segment timeline dispatch tests exercise it against multiple
     /// agg_ids.
     #[test]
     fn forced_agg_id_produces_context_for_known_id() {
@@ -5732,7 +5743,7 @@ mod forced_agg_id_tests {
     }
 
     /// Unknown `agg_id` returns `None` without panicking or
-    /// polluting the auto-resolver state. Phase 3b-2-b relies on
+    /// polluting the auto-resolver state. Per-segment timeline dispatch relies on
     /// this to gracefully skip timeline segments whose agg_id
     /// disappeared from the StreamingConfig mid-query.
     #[test]
@@ -5760,7 +5771,7 @@ mod forced_agg_id_tests {
     /// Forced and auto-resolved contexts should be observably
     /// equivalent for the common one-agg case (where the
     /// auto-resolver would have picked the same id). The
-    /// invariant that matters for Phase 3b-2-b: dispatching
+    /// invariant that matters for per-segment timeline dispatch: dispatching
     /// through the forced path against the single covering
     /// segment yields the same answer as the existing path.
     #[test]

@@ -32,9 +32,9 @@
 //! * `SchemaRegistry` — an in-memory map keyed by `agg_id` that the
 //!   ingest path consults. Built from the current `StreamingConfig`
 //!   snapshot at construction; reconciled event-driven by the
-//!   `POST /api/v1/streaming-config` swap handler (Phase 2b).
+//!   `POST /api/v1/streaming-config` swap handler.
 //!
-//! Phase 3a added the §7 **schema timeline** read API:
+//! **§7 schema timeline read API:**
 //!
 //! * `TimelineSegment` + `TimelineCoverage` types.
 //! * `SchemaRegistry::timeline_for_metric(metric, t1_ms, t2_ms)`
@@ -42,12 +42,11 @@
 //!   `[t1, t2]` for a given metric. Derived on-demand from registry
 //!   state — no separate index to keep consistent.
 //!
-//! Phase 3b lands the combiner used by the query engine to stitch
-//! per-segment scalars into a single result (see
-//! `crate::engines::timeline_dispatch`); Phase 3b-2 will wire that
-//! combiner into the PromQL dispatch.
+//! The query engine stitches per-segment scalars into a single
+//! result via the combiner in `crate::engines::timeline_dispatch`,
+//! wired through `SimpleEngine::try_handle_query_promql_via_timeline`.
 //!
-//! Phase 2c (this commit) adds **on-disk schema persistence**:
+//! **On-disk schema persistence:**
 //!
 //! * `SchemaRegistry::load_or_new_from_config(path, &StreamingConfig)`
 //!   reads a JSON snapshot if present (preserving `created_at_ms` /
@@ -65,7 +64,7 @@
 //!   will be filled in once the sketch types' theoretical bounds are
 //!   vendored.
 //! * `combine_statistic()` and `PartialResult` for cross-segment
-//!   result stitching — Phase 3b.
+//!   result stitching — see `crate::engines::timeline_dispatch`.
 //! * Compaction policy that reads `AggStatus` to throttle as expiry
 //!   approaches — §9.2 of the design.
 
@@ -571,15 +570,15 @@ impl SchemaRegistry {
     /// caller sees a coverage hole and can fall back to the exact
     /// DB per §7.3.
     ///
-    /// ## Current limitations (Phase 3a scope)
+    /// ## Current limitations
     ///
     /// * `created_at_ms` is currently the wall-clock at which the
     ///   backend first observed the schema, not necessarily when the
-    ///   first datapoint was written. After a restart without on-disk
-    ///   schema persistence (Phase 2c) the timeline reflects only the
-    ///   *post-restart* history. This is the right-edge-of-time
-    ///   behaviour the precompute engine already had pre-Phase-3;
-    ///   Phase 2c closes this gap.
+    ///   first datapoint was written. Without on-disk schema
+    ///   persistence, the timeline reflects only the *post-restart*
+    ///   history — matching the right-edge-of-time behaviour the
+    ///   precompute engine had before the timeline read API existed.
+    ///   On-disk schema persistence closes that gap.
     /// * All segments are returned, including those whose schema is
     ///   `Expired`. The caller inspects `TimelineSegment::status` to
     ///   decide whether data is still readable.
@@ -589,9 +588,9 @@ impl SchemaRegistry {
     /// Linear in the number of schemas for the given metric (one
     /// pass to collect + sort). For the metric counts typical of
     /// sketch DB deployments (dozens of metrics × a handful of
-    /// schemas each) this is well under a microsecond. Phase 3b's
-    /// query path will call this once per `query_metric()` so the
-    /// cost is amortised across the query.
+    /// schemas each) this is well under a microsecond. The query
+    /// path calls this once per query, so the cost is amortised
+    /// across the query.
     pub fn timeline_for_metric(
         &self,
         metric: &str,
@@ -741,10 +740,11 @@ pub struct TimelineSegment {
 
 /// Coarse classification of whether a [`TimelineSegment`]'s data is
 /// expected to be readable from the sketch store. §7.3 of the design
-/// doc lays out the full state machine; Phase 3a exposes the two
-/// states we can determine purely from schema metadata. Phase 3b /
-/// Phase 5 (backfill) will extend this with `BackfillInProgress` and
-/// with finer-grained per-window coverage.
+/// doc lays out the full state machine; this enum exposes the two
+/// states we can determine purely from schema metadata. Follow-up
+/// work (cross-segment stitching, backfill coverage) will extend
+/// this with `BackfillInProgress` and finer-grained per-window
+/// coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimelineCoverage {
     /// Data is (or was) written by the live ingest path and the
@@ -917,7 +917,7 @@ mod tests {
         assert_eq!(r.get(1).unwrap().status(), AggStatus::Expired);
     }
 
-    // --- §7 timeline tests (Phase 3a) ---
+    // --- §7 timeline_for_metric tests ---
 
     /// Build a schema with explicit timestamps, bypassing the
     /// wall-clock path. `metric_override` defaults to `metric_{id}`
