@@ -670,6 +670,9 @@ async fn main() -> Result<()> {
     if let Some(ingest_state) = precompute_ingest_state.as_ref() {
         server = server.with_schemas(ingest_state.schemas.clone());
     }
+    if args.persistence_delete_older_than_secs > 0 {
+        server = server.with_data_retention_ms(args.persistence_delete_older_than_secs * 1000);
+    }
     // Backfill registry (sketch DB §10). A single `Arc` lives in
     // `main` so the HTTP endpoints (Phase 5d) can inspect / cancel
     // jobs and the upcoming worker pool (Phase 5e) can drain them.
