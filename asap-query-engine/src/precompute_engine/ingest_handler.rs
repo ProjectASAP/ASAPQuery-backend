@@ -182,6 +182,14 @@ pub(crate) async fn route_decoded_samples(
         state
             .samples_blocked_by_schema_barrier
             .fetch_add(total_dropped, std::sync::atomic::Ordering::Relaxed);
+        // Also bump the Prometheus counter (per-agg label) so the
+        // drop rate is scrapable from /metrics without enabling debug
+        // logs in production.
+        for (agg_id, count) in &dropped_by_barrier {
+            crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+                .with_label_values(&[&agg_id.to_string()])
+                .inc_by(*count as f64);
+        }
         debug!(
             total_dropped,
             by_agg_id = ?dropped_by_barrier,
@@ -405,6 +413,42 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "samples for unrelated metrics must not count as barrier drops"
+        );
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// Prometheus CounterVec is process-global via `lazy_static`, so
+    /// we key on a unique agg_id (9001) to get a fresh baseline that
+    /// no other test in the process has touched.
+    #[tokio::test]
+    async fn barrier_prom_counter_increments_per_agg_label() {
+        let (state, drain) = setup_state(9001, "metric_prom_test").await;
+        let label = "9001";
+        let baseline = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+            .with_label_values(&[label])
+            .get();
+
+        assert!(state.schemas.force_expire(9001).is_some());
+
+        let _ = route_decoded_samples(
+            &state,
+            vec![
+                sample("metric_prom_test", 100, 1.0),
+                sample("metric_prom_test", 200, 2.0),
+                sample("metric_prom_test", 300, 3.0),
+                sample("metric_prom_test", 400, 4.0),
+            ],
+            std::time::Instant::now(),
+        )
+        .await;
+
+        let after = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+            .with_label_values(&[label])
+            .get();
+        assert!(
+            (after - baseline - 4.0).abs() < f64::EPSILON,
+            "prom counter for agg_id={label} should have advanced by 4; baseline={baseline}, after={after}"
         );
         drop(state);
         let _ = drain.await;
