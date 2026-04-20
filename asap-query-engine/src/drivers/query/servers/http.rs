@@ -168,6 +168,14 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
+            .route(
+                "/api/v1/db/schemas/:agg_id/retire",
+                post(handle_post_schema_retire),
+            )
+            .route(
+                "/api/v1/db/schemas/:agg_id/expire",
+                post(handle_post_schema_expire),
+            )
             .route("/api/v1/db/timeline", get(handle_get_timeline))
             .route("/api/v1/db/backfill", post(handle_post_backfill_job))
             .route("/api/v1/db/backfill/jobs", get(handle_get_backfill_jobs))
@@ -219,6 +227,14 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
+            .route(
+                "/api/v1/db/schemas/:agg_id/retire",
+                post(handle_post_schema_retire),
+            )
+            .route(
+                "/api/v1/db/schemas/:agg_id/expire",
+                post(handle_post_schema_expire),
+            )
             .route("/api/v1/db/timeline", get(handle_get_timeline))
             .route("/api/v1/db/backfill", post(handle_post_backfill_job))
             .route("/api/v1/db/backfill/jobs", get(handle_get_backfill_jobs))
@@ -1947,17 +1963,7 @@ async fn handle_get_schemas(
     let mut entries: Vec<serde_json::Value> = Vec::new();
     for status in statuses {
         for s in schemas.list_by_status(*status) {
-            let accuracy = s.accuracy_profile();
-            entries.push(serde_json::json!({
-                "agg_id": s.agg_id,
-                "metric_name": s.metric_name,
-                "status": status_str(*status),
-                "created_at_ms": s.created_at_ms,
-                "retired_at_ms": s.retired_at_ms,
-                "expires_at_ms": s.expires_at_ms,
-                "aggregation_type": format!("{:?}", s.config.aggregation_type),
-                "accuracy_profile": accuracy,
-            }));
+            entries.push(schema_to_json(&s));
         }
     }
     entries.sort_by_key(|v| v.get("agg_id").and_then(|x| x.as_u64()).unwrap_or(0));
@@ -1976,6 +1982,88 @@ fn status_str(s: crate::stores::sketch_db::AggStatus) -> &'static str {
         AggStatus::Active => "active",
         AggStatus::Retired => "retired",
         AggStatus::Expired => "expired",
+    }
+}
+
+fn schema_to_json(s: &crate::stores::sketch_db::AggSchema) -> serde_json::Value {
+    serde_json::json!({
+        "agg_id": s.agg_id,
+        "metric_name": s.metric_name,
+        "status": status_str(s.status()),
+        "created_at_ms": s.created_at_ms,
+        "retired_at_ms": s.retired_at_ms,
+        "expires_at_ms": s.expires_at_ms,
+        "aggregation_type": format!("{:?}", s.config.aggregation_type),
+        "accuracy_profile": s.accuracy_profile(),
+    })
+}
+
+/// `POST /api/v1/db/schemas/:agg_id/retire` — manually transition an
+/// Active schema to Retired (kicking off the retirement retention
+/// clock). Idempotent: already-Retired or Expired schemas return 200
+/// with their current state unchanged. Returns 404 if the agg_id is
+/// unknown, 503 if no registry is attached.
+async fn handle_post_schema_retire(
+    State(state): State<AppState>,
+    axum::extract::Path(agg_id): axum::extract::Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(schemas) = state.schemas else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "schema registry not attached",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    match schemas.force_retire(agg_id) {
+        Some(schema) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "schema": schema_to_json(&schema),
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        None => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("agg_id {agg_id} not found"),
+            });
+            (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+        }
+    }
+}
+
+/// `POST /api/v1/db/schemas/:agg_id/expire` — manually transition a
+/// schema to Expired immediately. The next `SchemaEvictionService`
+/// tick drops the agg's data + removes the schema. Idempotent;
+/// 404 if the agg_id is unknown, 503 if no registry is attached.
+async fn handle_post_schema_expire(
+    State(state): State<AppState>,
+    axum::extract::Path(agg_id): axum::extract::Path<u64>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(schemas) = state.schemas else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "schema registry not attached",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    match schemas.force_expire(agg_id) {
+        Some(schema) => {
+            let body = serde_json::json!({
+                "status": "success",
+                "schema": schema_to_json(&schema),
+            });
+            (StatusCode::OK, axum::Json(body)).into_response()
+        }
+        None => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("agg_id {agg_id} not found"),
+            });
+            (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
+        }
     }
 }
 
