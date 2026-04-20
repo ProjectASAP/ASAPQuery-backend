@@ -26,10 +26,10 @@ impl QueryResult {
         })
     }
 
-    /// Phase 3b-2-b: construct an instant vector with a non-empty
-    /// warnings list. Used by the timeline dispatcher when the query
-    /// spans a reconfigure boundary and one or more segments could
-    /// not contribute to the answer (non-combinable statistic, purged
+    /// Construct an instant vector with a non-empty warnings list.
+    /// Used by the schema-timeline dispatcher when the query spans
+    /// a reconfigure boundary and one or more segments could not
+    /// contribute to the answer (non-combinable statistic, purged
     /// data, or agg_id removed from config mid-flight). Prometheus's
     /// native JSON surface carries these back to the caller via the
     /// top-level `warnings` field, matching the upstream contract.
@@ -70,7 +70,7 @@ pub struct InstantVector {
     pub timestamp: u64,
     /// Non-error advisories attached to this result, surfaced on
     /// Prometheus's top-level `warnings` field. Empty for
-    /// single-schema queries; populated by the Phase 3b-2-b timeline
+    /// single-schema queries; populated by the schema-timeline
     /// dispatcher when one or more segments produced a
     /// [`crate::engines::timeline_dispatch::CombinedResult::Partial`]
     /// (non-combinable statistic, purged coverage, or agg_id

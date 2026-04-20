@@ -7,6 +7,7 @@ pub mod persistence_integration_tests;
 pub mod persistence_perf_tests;
 pub mod prometheus_forwarding_tests;
 pub mod query_equivalence_tests;
+pub mod schema_timeline_dispatch_tests;
 pub mod sql_pattern_matching_tests;
 pub mod store_correctness_tests;
 pub mod trait_design_tests;

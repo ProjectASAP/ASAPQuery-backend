@@ -25,10 +25,10 @@ pub struct PrometheusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Non-error advisories — maps to Prometheus's top-level
-    /// `warnings: []` field. Phase 3b-2-b uses this to surface
-    /// partial results from the §7 schema-timeline dispatcher
-    /// (query spans a reconfigure boundary with a non-combinable
-    /// statistic or a Purged segment).
+    /// `warnings: []` field. The schema-timeline dispatcher uses
+    /// this to surface partial results when a query spans a
+    /// reconfigure boundary with a non-combinable statistic or a
+    /// Purged segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -221,8 +221,8 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        // Thread through any Phase 3 timeline-dispatch warnings so
-        // they land on the top-level `warnings` field, matching
+        // Thread through any schema-timeline dispatcher warnings
+        // so they land on the top-level `warnings` field, matching
         // Prometheus's native API.
         let warnings = result.query_result.warnings().to_vec();
         let response = if warnings.is_empty() {
@@ -560,9 +560,9 @@ mod tests {
 
     #[test]
     fn success_response_with_warnings_serialises_the_top_level_field() {
-        // This is the Phase 3b-2-b contract: a Partial result coming
-        // out of the §7 timeline dispatcher lands on Prometheus's
-        // native `warnings: []` field at the top of the response,
+        // Contract: a Partial result coming out of the §7
+        // schema-timeline dispatcher lands on Prometheus's native
+        // `warnings: []` field at the top of the response,
         // matching upstream behaviour for warning-carrying queries.
         let r = PrometheusResponse::success_with_warnings(
             json!({"resultType": "vector", "result": []}),

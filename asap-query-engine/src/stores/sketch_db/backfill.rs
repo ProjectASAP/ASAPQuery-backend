@@ -10,8 +10,9 @@
 //! agg_id — say the operator widens a CMS from 256 to 2048, or swaps
 //! in KLL200 on top of a metric that previously had only CMS — the new
 //! agg has zero history. Queries spanning the reconfigure boundary
-//! either see a data cliff (which Phase 3's schema timeline at least
-//! surfaces honestly) or have to fall back to the exact DB.
+//! either see a data cliff (which the §7 schema timeline surfaces
+//! honestly via `Partial` results + `warnings`) or have to fall
+//! back to the exact DB.
 //!
 //! Backfill closes that gap: a `BackfillJob` reads raw samples from
 //! the exact DB for a `(agg_id, time_range)` window, rebuilds the

@@ -17,10 +17,10 @@
 //! * decide fallback policy for `Purged` segments (the caller does
 //!   that before calling here).
 //!
-//! Phase 3b-2 will wire this into
-//! `SimpleEngine::build_query_execution_context_promql`; this PR
-//! (Phase 3b) lands the primitive and its correctness tests so that
-//! wiring is a pure plumbing change.
+//! The query engine wires this primitive into
+//! `SimpleEngine::try_handle_query_promql_via_timeline`, which
+//! runs the per-segment evaluation loop and feeds the scalars back
+//! through `combine_statistic`.
 //!
 //! ## Statistic combinability
 //!
