@@ -89,6 +89,7 @@ impl PrecomputeEngine {
         let ingest_state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
             hot_reload_config: hot_reload_config.clone(),
             schemas,
             pass_raw_samples: config.pass_raw_samples,
