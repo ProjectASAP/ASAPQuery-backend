@@ -9,7 +9,7 @@ use axum::{body::Bytes, extract::State, http::StatusCode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Shared state for the ingest HTTP handler.
 ///
@@ -20,6 +20,13 @@ use tracing::warn;
 pub struct IngestState {
     pub router: SeriesRouter,
     pub samples_ingested: std::sync::atomic::AtomicU64,
+    /// §6.3 observability counter — per-sample-per-agg-config drops
+    /// caused by a non-Active schema for a matching agg. Incremented
+    /// exactly when the barrier fires, so a non-zero reading proves
+    /// the barrier is wired. One sample can contribute more than one
+    /// drop when multiple agg configs match the metric and one (or
+    /// more) of them is retired/expired.
+    pub samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64,
     /// Hot-reloadable streaming config. On each ingest batch, the
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
@@ -75,7 +82,7 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
 }
 
 /// Shared logic: group decoded samples by (agg_id, group_key) and route to workers.
-async fn route_decoded_samples(
+pub(crate) async fn route_decoded_samples(
     state: &IngestState,
     samples: Vec<crate::drivers::ingest::prometheus_remote_write::DecodedSample>,
     ingest_received_at: Instant,
@@ -140,6 +147,11 @@ async fn route_decoded_samples(
     type SampleTuple = (String, i64, f64);
     let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
 
+    // Per-batch drop tally for the §6.3 barrier. Aggregated here and
+    // flushed once at the end of the batch so a hot ingest path doesn't
+    // spam one log line per sample.
+    let mut dropped_by_barrier: HashMap<u64, u64> = HashMap::new();
+
     for s in &samples {
         let metric_name = extract_metric_name(&s.labels);
         for config in agg_configs.values() {
@@ -154,6 +166,7 @@ async fn route_decoded_samples(
             // reason. This is the authoritative "no writes after
             // retirement" guarantee.
             if !state.schemas.is_writable(config.aggregation_id) {
+                *dropped_by_barrier.entry(config.aggregation_id).or_default() += 1;
                 continue;
             }
             let group_key = extract_group_key(&s.labels, config);
@@ -162,6 +175,18 @@ async fn route_decoded_samples(
                 .or_default()
                 .push((s.labels.clone(), s.timestamp_ms, s.value));
         }
+    }
+
+    if !dropped_by_barrier.is_empty() {
+        let total_dropped: u64 = dropped_by_barrier.values().sum();
+        state
+            .samples_blocked_by_schema_barrier
+            .fetch_add(total_dropped, std::sync::atomic::Ordering::Relaxed);
+        debug!(
+            total_dropped,
+            by_agg_id = ?dropped_by_barrier,
+            "§6.3 write barrier dropped samples (agg is retired/expired)"
+        );
     }
 
     let messages: Vec<WorkerMessage> = by_group
@@ -218,4 +243,170 @@ pub(crate) async fn handle_victoriametrics_ingest(
         }
     };
     route_decoded_samples(&state, samples, ingest_received_at).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_model::StreamingConfig;
+    use crate::drivers::ingest::prometheus_remote_write::DecodedSample;
+    use crate::precompute_engine::series_router::SeriesRouter;
+    use crate::stores::sketch_db::SchemaRegistry;
+    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::enums::{AggregationType, WindowType};
+    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn make_config(agg_id: u64, metric: &str) -> AggregationConfig {
+        AggregationConfig::new(
+            agg_id,
+            AggregationType::CountMinSketch,
+            String::new(),
+            std::collections::HashMap::new(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            60,
+            60,
+            WindowType::Tumbling,
+            String::new(),
+            metric.to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn sample(metric: &str, ts: i64, val: f64) -> DecodedSample {
+        DecodedSample {
+            labels: metric.to_string(),
+            timestamp_ms: ts,
+            value: val,
+        }
+    }
+
+    /// Set up an `IngestState` with one Active agg for `metric` and a
+    /// draining worker channel. The drain task keeps the router
+    /// channel empty so `route_group_batch` never blocks on capacity.
+    async fn setup_state(
+        agg_id: u64,
+        metric: &str,
+    ) -> (Arc<IngestState>, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let router = SeriesRouter::new(vec![tx]);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(agg_id, make_config(agg_id, metric));
+        let streaming = StreamingConfig::new(map);
+        let hot_reload = crate::data_model::HotReloadStreamingConfig::new(streaming.clone());
+
+        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+
+        let state = Arc::new(IngestState {
+            router,
+            samples_ingested: std::sync::atomic::AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
+            hot_reload_config: hot_reload,
+            schemas,
+            pass_raw_samples: false,
+        });
+
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        (state, drain)
+    }
+
+    #[tokio::test]
+    async fn barrier_counter_stays_zero_when_schema_is_active() {
+        let (state, drain) = setup_state(1, "metric_1").await;
+        let _ = route_decoded_samples(
+            &state,
+            vec![sample("metric_1", 100, 1.0), sample("metric_1", 200, 2.0)],
+            std::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(
+            state
+                .samples_blocked_by_schema_barrier
+                .load(Ordering::Relaxed),
+            0,
+            "barrier must not fire for an Active schema"
+        );
+        drop(state);
+        let _ = drain.await;
+    }
+
+    #[tokio::test]
+    async fn barrier_counter_increments_after_force_expire() {
+        let (state, drain) = setup_state(1, "metric_1").await;
+
+        // Baseline: Active schema, barrier idle.
+        let _ = route_decoded_samples(
+            &state,
+            vec![sample("metric_1", 100, 1.0)],
+            std::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(
+            state
+                .samples_blocked_by_schema_barrier
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Flip the schema to Expired via the #42 manual endpoint.
+        assert!(state.schemas.force_expire(1).is_some());
+
+        // Second batch: every matching sample gets barrier-dropped.
+        let _ = route_decoded_samples(
+            &state,
+            vec![
+                sample("metric_1", 300, 3.0),
+                sample("metric_1", 400, 4.0),
+                sample("metric_1", 500, 5.0),
+            ],
+            std::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(
+            state
+                .samples_blocked_by_schema_barrier
+                .load(Ordering::Relaxed),
+            3,
+            "three post-expire samples must be dropped by the §6.3 barrier"
+        );
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// Samples for metrics that don't match any agg must not count as
+    /// barrier drops — the barrier only fires on (matching metric) ×
+    /// (non-Active agg).
+    #[tokio::test]
+    async fn barrier_counter_ignores_non_matching_metrics() {
+        let (state, drain) = setup_state(1, "metric_1").await;
+        assert!(state.schemas.force_expire(1).is_some());
+
+        let _ = route_decoded_samples(
+            &state,
+            vec![
+                sample("other_metric", 100, 1.0),
+                sample("yet_another", 200, 2.0),
+            ],
+            std::time::Instant::now(),
+        )
+        .await;
+        assert_eq!(
+            state
+                .samples_blocked_by_schema_barrier
+                .load(Ordering::Relaxed),
+            0,
+            "samples for unrelated metrics must not count as barrier drops"
+        );
+        drop(state);
+        let _ = drain.await;
+    }
 }
