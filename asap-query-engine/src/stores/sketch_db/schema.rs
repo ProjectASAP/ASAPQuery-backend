@@ -428,6 +428,50 @@ impl SchemaRegistry {
         removed
     }
 
+    /// Force a specific `agg_id` into `Retired` status, starting the
+    /// configured retirement retention clock. Idempotent — re-retiring
+    /// a Retired or Expired schema is a no-op and returns `Some(schema)`
+    /// reflecting the current (unchanged) state. Returns `None` if
+    /// the `agg_id` is unknown.
+    ///
+    /// Intended for operator / debug-endpoint use so the eviction path
+    /// can be driven without waiting for a `StreamingConfig` swap to
+    /// drop the agg.
+    pub fn force_retire(&self, agg_id: u64) -> Option<AggSchema> {
+        let retention = self.retirement_retention;
+        let updated = {
+            let mut map = self.schemas.write().ok()?;
+            let schema = map.get_mut(&agg_id)?;
+            if matches!(schema.status(), AggStatus::Active) {
+                schema.retire(retention);
+            }
+            schema.clone()
+        };
+        self.save_to_disk_if_persistent();
+        Some(updated)
+    }
+
+    /// Force a specific `agg_id` into `Expired` status immediately by
+    /// setting both `retired_at_ms` and `expires_at_ms` to now. The
+    /// next `SchemaEvictionService` tick will drop its data and
+    /// remove the schema. Returns the new state, or `None` if the
+    /// `agg_id` is unknown.
+    ///
+    /// Intended for operator / debug-endpoint use so eviction can be
+    /// observed in e2e tests without waiting out retirement retention.
+    pub fn force_expire(&self, agg_id: u64) -> Option<AggSchema> {
+        let updated = {
+            let mut map = self.schemas.write().ok()?;
+            let schema = map.get_mut(&agg_id)?;
+            let now = now_ms();
+            schema.retired_at_ms = Some(now);
+            schema.expires_at_ms = Some(now);
+            schema.clone()
+        };
+        self.save_to_disk_if_persistent();
+        Some(updated)
+    }
+
     /// Iterate (clones) all schemas matching a status filter. Used by
     /// the controller-facing `/api/v1/db/schemas?status=…` endpoint
     /// (§15.2 of the design).
@@ -1186,5 +1230,49 @@ mod tests {
         let registry = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
         let _ = registry.reconcile(&make_streaming_config(&[2]));
         assert!(!path.exists());
+    }
+
+    // --- manual retire / expire endpoints (debug/operator surface) ---
+
+    #[test]
+    fn force_retire_active_transitions_to_retired() {
+        let r = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        assert_eq!(r.get(1).unwrap().status(), AggStatus::Active);
+        let out = r.force_retire(1).expect("should return new state");
+        assert_eq!(out.status(), AggStatus::Retired);
+        assert!(out.retired_at_ms.is_some());
+        assert!(out.expires_at_ms.is_some());
+        assert_eq!(r.get(1).unwrap().status(), AggStatus::Retired);
+    }
+
+    #[test]
+    fn force_retire_is_idempotent_on_retired() {
+        let r = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        let first = r.force_retire(1).unwrap();
+        let first_exp = first.expires_at_ms;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = r.force_retire(1).unwrap();
+        assert_eq!(second.expires_at_ms, first_exp);
+    }
+
+    #[test]
+    fn force_retire_unknown_returns_none() {
+        let r = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        assert!(r.force_retire(999).is_none());
+    }
+
+    #[test]
+    fn force_expire_active_transitions_to_expired() {
+        let r = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        assert_eq!(r.get(1).unwrap().status(), AggStatus::Active);
+        let out = r.force_expire(1).expect("should return new state");
+        assert_eq!(out.status(), AggStatus::Expired);
+        assert_eq!(r.get(1).unwrap().status(), AggStatus::Expired);
+    }
+
+    #[test]
+    fn force_expire_unknown_returns_none() {
+        let r = SchemaRegistry::from_streaming_config(&make_streaming_config(&[1]));
+        assert!(r.force_expire(999).is_none());
     }
 }
