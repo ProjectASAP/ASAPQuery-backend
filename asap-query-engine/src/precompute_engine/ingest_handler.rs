@@ -64,6 +64,22 @@ impl IngestState {
     pub fn extract_group_key_for(series_key: &str, config: &AggregationConfig) -> String {
         extract_group_key(series_key, config)
     }
+
+    /// Record a §6.3 write-side barrier drop. Updates the in-process
+    /// `samples_blocked_by_schema_barrier` atomic and the Prometheus
+    /// `queryengine_ingest_samples_blocked_by_schema_barrier_total`
+    /// counter, both keyed by `agg_id`. Called by every ingest path
+    /// (Prometheus remote-write, VictoriaMetrics remote-write,
+    /// OTLP raw points, OTLP sketch envelopes, OTLP modified-proto
+    /// sketches) so the drop rate observable on `/metrics` is a
+    /// single number regardless of which driver is active.
+    pub fn record_barrier_drop(&self, agg_id: u64, count: u64) {
+        self.samples_blocked_by_schema_barrier
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+            .with_label_values(&[&agg_id.to_string()])
+            .inc_by(count as f64);
+    }
 }
 
 /// Extract the group key (grouping label values joined by semicolons)
@@ -179,16 +195,8 @@ pub(crate) async fn route_decoded_samples(
 
     if !dropped_by_barrier.is_empty() {
         let total_dropped: u64 = dropped_by_barrier.values().sum();
-        state
-            .samples_blocked_by_schema_barrier
-            .fetch_add(total_dropped, std::sync::atomic::Ordering::Relaxed);
-        // Also bump the Prometheus counter (per-agg label) so the
-        // drop rate is scrapable from /metrics without enabling debug
-        // logs in production.
         for (agg_id, count) in &dropped_by_barrier {
-            crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-                .with_label_values(&[&agg_id.to_string()])
-                .inc_by(*count as f64);
+            state.record_barrier_drop(*agg_id, *count);
         }
         debug!(
             total_dropped,
@@ -449,6 +457,44 @@ mod tests {
         assert!(
             (after - baseline - 4.0).abs() < f64::EPSILON,
             "prom counter for agg_id={label} should have advanced by 4; baseline={baseline}, after={after}"
+        );
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// `record_barrier_drop` is the single entry point every ingest
+    /// driver (Prometheus remote-write, VictoriaMetrics remote-write,
+    /// OTLP raw / sketch / modified-proto) funnels through, so
+    /// verify both sides of the contract: the in-process atomic AND
+    /// the Prometheus `CounterVec` move together, keyed by agg_id.
+    #[tokio::test]
+    async fn record_barrier_drop_advances_atomic_and_prom_counter() {
+        let (state, drain) = setup_state(4242, "metric_helper_test").await;
+        let label = "4242";
+        let prom_baseline = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+            .with_label_values(&[label])
+            .get();
+        let atomic_baseline = state
+            .samples_blocked_by_schema_barrier
+            .load(Ordering::Relaxed);
+
+        state.record_barrier_drop(4242, 7);
+
+        let prom_after = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+            .with_label_values(&[label])
+            .get();
+        let atomic_after = state
+            .samples_blocked_by_schema_barrier
+            .load(Ordering::Relaxed);
+
+        assert!(
+            (prom_after - prom_baseline - 7.0).abs() < f64::EPSILON,
+            "prom counter must advance by 7 via the helper"
+        );
+        assert_eq!(
+            atomic_after - atomic_baseline,
+            7,
+            "atomic counter must advance by 7 via the helper"
         );
         drop(state);
         let _ = drain.await;

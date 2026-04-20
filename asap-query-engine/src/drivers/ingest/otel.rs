@@ -338,6 +338,30 @@ fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) 
 /// Metrics whose name does not match any aggregation in the streaming
 /// config are dropped with a debug log — the precompute engine only
 /// maintains state for configured metrics.
+///
+/// Flush a per-driver `HashMap<agg_id, count>` of §6.3 write-barrier
+/// drops into `IngestState::record_barrier_drop`, emitting a single
+/// debug log summarising the batch. Called from every OTLP routing
+/// function after its inner loop finishes, so a query against the
+/// `/metrics` endpoint sees a unified `samples_blocked_by_schema_barrier`
+/// counter regardless of which OTLP variant the DataCollector is
+/// shipping.
+fn flush_barrier_drops(state: &IngestState, drops: &HashMap<u64, u64>, driver_tag: &'static str) {
+    if drops.is_empty() {
+        return;
+    }
+    let total: u64 = drops.values().sum();
+    for (agg_id, count) in drops {
+        state.record_barrier_drop(*agg_id, *count);
+    }
+    debug!(
+        driver = driver_tag,
+        total_dropped = total,
+        by_agg_id = ?drops,
+        "§6.3 write barrier dropped OTLP samples (agg is retired/expired)"
+    );
+}
+
 async fn route_otlp_to_precompute(
     request: &ExportMetricsServiceRequest,
     ingest_state: &Arc<IngestState>,
@@ -359,6 +383,7 @@ async fn route_otlp_to_precompute(
     let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
     let mut raw_matched = 0usize;
     let mut raw_unmatched = 0usize;
+    let mut raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
 
     for point in &points {
         let series_key = format_series_key(&point.name, &point.labels);
@@ -373,6 +398,7 @@ async fn route_otlp_to_precompute(
             }
             // §6.3 write-side schema barrier — see ingest_handler.rs.
             if !ingest_state.schemas.is_writable(config.aggregation_id) {
+                *raw_barrier_drops.entry(config.aggregation_id).or_default() += 1;
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -388,6 +414,7 @@ async fn route_otlp_to_precompute(
             raw_unmatched += 1;
         }
     }
+    flush_barrier_drops(ingest_state, &raw_barrier_drops, "otlp-raw");
 
     let raw_messages: Vec<WorkerMessage> = by_group
         .into_iter()
@@ -421,6 +448,7 @@ async fn route_otlp_to_precompute(
     let mut sketch_messages: Vec<WorkerMessage> = Vec::new();
     let mut sketch_matched = 0usize;
     let mut sketch_unmatched = 0usize;
+    let mut sketch_barrier_drops: HashMap<u64, u64> = HashMap::new();
     for point in &sketch_payloads {
         let series_key = format_series_key(&point.name, &point.labels);
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
@@ -435,6 +463,9 @@ async fn route_otlp_to_precompute(
             }
             // §6.3 write-side schema barrier — see ingest_handler.rs.
             if !ingest_state.schemas.is_writable(config.aggregation_id) {
+                *sketch_barrier_drops
+                    .entry(config.aggregation_id)
+                    .or_default() += 1;
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -476,6 +507,7 @@ async fn route_otlp_to_precompute(
             sketch_unmatched += 1;
         }
     }
+    flush_barrier_drops(ingest_state, &sketch_barrier_drops, "otlp-sketch-envelope");
 
     if !sketch_messages.is_empty() {
         if let Err(e) = ingest_state
@@ -525,6 +557,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
+    let mut barrier_drops: HashMap<u64, u64> = HashMap::new();
 
     for resource_metrics in &request.resource_metrics {
         let resource_attrs = resource_metrics
@@ -644,6 +677,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                         // §6.3 write-side schema barrier — see ingest_handler.rs.
                         if !ingest_state.schemas.is_writable(config.aggregation_id) {
+                            *barrier_drops.entry(config.aggregation_id).or_default() += 1;
                             continue;
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -665,6 +699,8 @@ async fn route_modified_otlp_sketches_to_precompute(
             }
         }
     }
+
+    flush_barrier_drops(ingest_state, &barrier_drops, "otlp-modified-proto");
 
     if !messages.is_empty() {
         if let Err(e) = ingest_state
