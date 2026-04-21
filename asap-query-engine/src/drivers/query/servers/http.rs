@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
+use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::engines::SimpleEngine;
 use crate::query_tracker::QueryTracker;
 use crate::stores::Store;
@@ -146,6 +147,8 @@ impl HttpServer {
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        srv_metrics::register_all();
+
         // Create adapter using factory
         let adapter = create_http_adapter(self.config.adapter_config.clone());
 
@@ -400,6 +403,7 @@ async fn handle_instant_query(
     query_params: Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> Response {
+    let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_INSTANT);
     let start_time = Instant::now();
     debug!("=== INCOMING GET REQUEST ===");
     debug!("Raw query params: {:?}", query_params.0);
@@ -414,6 +418,10 @@ async fn handle_instant_query(
         }
         Err(parse_error) => {
             debug!("Failed to parse request: {:?}", parse_error);
+            srv_metrics::record_query_outcome(
+                srv_metrics::QUERY_TYPE_INSTANT,
+                srv_metrics::QUERY_STATUS_ERROR,
+            );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
                 Err(status) => status.into_response(),
@@ -421,7 +429,13 @@ async fn handle_instant_query(
         }
     };
 
-    process_query_request(&state, &parsed_request, start_time, HashMap::new()).await
+    let response =
+        process_query_request(&state, &parsed_request, start_time, HashMap::new()).await;
+    srv_metrics::record_query_outcome(
+        srv_metrics::QUERY_TYPE_INSTANT,
+        query_status_label(&response),
+    );
+    response
 }
 
 async fn handle_instant_query_post(
@@ -429,6 +443,7 @@ async fn handle_instant_query_post(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_INSTANT);
     let start_time = Instant::now();
     debug!("=== INCOMING POST REQUEST ===");
 
@@ -461,6 +476,10 @@ async fn handle_instant_query_post(
             }
             Err(parse_error) => {
                 debug!("Failed to parse JSON POST request: {:?}", parse_error);
+                srv_metrics::record_query_outcome(
+                    srv_metrics::QUERY_TYPE_INSTANT,
+                    srv_metrics::QUERY_STATUS_ERROR,
+                );
                 return match state.adapter.format_error_response(&parse_error).await {
                     Ok(json) => json.into_response(),
                     Err(status) => status.into_response(),
@@ -477,6 +496,10 @@ async fn handle_instant_query_post(
             Err(e) => {
                 debug!("Failed to parse body as UTF-8: {}", e);
                 use crate::drivers::query::adapters::AdapterError;
+                srv_metrics::record_query_outcome(
+                    srv_metrics::QUERY_TYPE_INSTANT,
+                    srv_metrics::QUERY_STATUS_ERROR,
+                );
                 return match state
                     .adapter
                     .format_error_response(&AdapterError::ParseError(format!(
@@ -508,6 +531,10 @@ async fn handle_instant_query_post(
             }
             Err(parse_error) => {
                 debug!("Failed to parse POST request: {:?}", parse_error);
+                srv_metrics::record_query_outcome(
+                    srv_metrics::QUERY_TYPE_INSTANT,
+                    srv_metrics::QUERY_STATUS_ERROR,
+                );
                 return match state.adapter.format_error_response(&parse_error).await {
                     Ok(json) => json.into_response(),
                     Err(status) => status.into_response(),
@@ -525,6 +552,10 @@ async fn handle_instant_query_post(
         total_duration.as_secs_f64() * 1000.0
     );
 
+    srv_metrics::record_query_outcome(
+        srv_metrics::QUERY_TYPE_INSTANT,
+        query_status_label(&result),
+    );
     result
 }
 
@@ -550,6 +581,20 @@ async fn handle_runtime_info(
         .adapter
         .handle_runtime_info_with_headers(state.store.clone(), forwarding_headers)
         .await
+}
+
+// Map a finished Response to an `asap_query_requests_total` status
+// label. We distinguish 5xx (internal) errors from 4xx (client / parse)
+// errors — both count as `error`, and 2xx / 3xx count as `ok`. A more
+// granular split into `unsupported` / `fallback` would require the
+// handlers to thread the outcome back out; the Response status is the
+// tractable signal we have today.
+fn query_status_label(response: &Response) -> &'static str {
+    if response.status().is_success() || response.status().is_redirection() {
+        srv_metrics::QUERY_STATUS_OK
+    } else {
+        srv_metrics::QUERY_STATUS_ERROR
+    }
 }
 
 // ============================================================
@@ -658,6 +703,7 @@ async fn handle_range_query(
     query_params: Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> Response {
+    let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_RANGE);
     let start_time = Instant::now();
     debug!("=== INCOMING RANGE QUERY GET REQUEST ===");
     debug!("Raw query params: {:?}", query_params.0);
@@ -672,6 +718,10 @@ async fn handle_range_query(
         }
         Err(parse_error) => {
             debug!("Failed to parse range query request: {:?}", parse_error);
+            srv_metrics::record_query_outcome(
+                srv_metrics::QUERY_TYPE_RANGE,
+                srv_metrics::QUERY_STATUS_ERROR,
+            );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
                 Err(status) => status.into_response(),
@@ -679,10 +729,16 @@ async fn handle_range_query(
         }
     };
 
-    process_range_query_request(&state, &parsed_request, start_time).await
+    let response = process_range_query_request(&state, &parsed_request, start_time).await;
+    srv_metrics::record_query_outcome(
+        srv_metrics::QUERY_TYPE_RANGE,
+        query_status_label(&response),
+    );
+    response
 }
 
 async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> Response {
+    let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_RANGE);
     let start_time = Instant::now();
     debug!("=== INCOMING RANGE QUERY POST REQUEST ===");
 
@@ -692,6 +748,10 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
         Err(e) => {
             debug!("Failed to parse body as UTF-8: {}", e);
             use crate::drivers::query::adapters::AdapterError;
+            srv_metrics::record_query_outcome(
+                srv_metrics::QUERY_TYPE_RANGE,
+                srv_metrics::QUERY_STATUS_ERROR,
+            );
             return match state
                 .adapter
                 .format_error_response(&AdapterError::ParseError(format!(
@@ -722,6 +782,10 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
         }
         Err(parse_error) => {
             debug!("Failed to parse range POST request: {:?}", parse_error);
+            srv_metrics::record_query_outcome(
+                srv_metrics::QUERY_TYPE_RANGE,
+                srv_metrics::QUERY_STATUS_ERROR,
+            );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
                 Err(status) => status.into_response(),
@@ -729,7 +793,12 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
         }
     };
 
-    process_range_query_request(&state, &parsed_request, start_time).await
+    let response = process_range_query_request(&state, &parsed_request, start_time).await;
+    srv_metrics::record_query_outcome(
+        srv_metrics::QUERY_TYPE_RANGE,
+        query_status_label(&response),
+    );
+    response
 }
 
 #[cfg(test)]

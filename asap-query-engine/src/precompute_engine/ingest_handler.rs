@@ -1,6 +1,7 @@
 use crate::data_model::HotReloadStreamingConfig;
 use crate::drivers::ingest::prometheus_remote_write::decode_prometheus_remote_write;
 use crate::drivers::ingest::victoriametrics_remote_write::decode_victoriametrics_remote_write;
+use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{extract_metric_name, parse_labels_from_series_key};
 use crate::stores::sketch_db::SchemaRegistry;
@@ -102,6 +103,7 @@ pub(crate) async fn route_decoded_samples(
     state: &IngestState,
     samples: Vec<crate::drivers::ingest::prometheus_remote_write::DecodedSample>,
     ingest_received_at: Instant,
+    protocol: &str,
 ) -> StatusCode {
     if samples.is_empty() {
         return StatusCode::NO_CONTENT;
@@ -111,6 +113,7 @@ pub(crate) async fn route_decoded_samples(
     state
         .samples_ingested
         .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    srv_metrics::record_ingest_samples(protocol, count);
 
     if state.pass_raw_samples {
         // Raw mode: group by series key and send as RawSamples
@@ -234,15 +237,23 @@ pub(crate) async fn handle_prometheus_ingest(
     State(state): State<Arc<IngestState>>,
     body: Bytes,
 ) -> StatusCode {
+    let _timer = srv_metrics::start_ingest_timer(srv_metrics::INGEST_PROTO_PROM_RW);
     let ingest_received_at = Instant::now();
     let samples = match decode_prometheus_remote_write(&body) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to decode Prometheus remote write: {}", e);
+            srv_metrics::record_ingest_decode_error(srv_metrics::INGEST_PROTO_PROM_RW);
             return StatusCode::BAD_REQUEST;
         }
     };
-    route_decoded_samples(&state, samples, ingest_received_at).await
+    route_decoded_samples(
+        &state,
+        samples,
+        ingest_received_at,
+        srv_metrics::INGEST_PROTO_PROM_RW,
+    )
+    .await
 }
 
 /// Axum handler for VictoriaMetrics remote write (Zstd + Protobuf).
@@ -250,15 +261,23 @@ pub(crate) async fn handle_victoriametrics_ingest(
     State(state): State<Arc<IngestState>>,
     body: Bytes,
 ) -> StatusCode {
+    let _timer = srv_metrics::start_ingest_timer(srv_metrics::INGEST_PROTO_VM_RW);
     let ingest_received_at = Instant::now();
     let samples = match decode_victoriametrics_remote_write(&body) {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to decode VictoriaMetrics remote write: {}", e);
+            srv_metrics::record_ingest_decode_error(srv_metrics::INGEST_PROTO_VM_RW);
             return StatusCode::BAD_REQUEST;
         }
     };
-    route_decoded_samples(&state, samples, ingest_received_at).await
+    route_decoded_samples(
+        &state,
+        samples,
+        ingest_received_at,
+        srv_metrics::INGEST_PROTO_VM_RW,
+    )
+    .await
 }
 
 #[cfg(test)]
