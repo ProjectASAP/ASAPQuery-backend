@@ -15,7 +15,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-/// Prometheus-compatible response structure
+/// Prometheus-compatible response structure, with two ASAP
+/// extensions:
+///
+/// * `infos` — Prometheus 3.0-style informational annotations
+///   (Grafana 11+ renders these inline). Mirrors a one-liner
+///   summary of `accuracy` so older / non-JSON-aware UIs still
+///   see the ε/δ bound.
+/// * `accuracy` — structured [`AccuracyEnvelope`] carrying ε, δ,
+///   kind, and optional `per_segment` for schema-timeline-
+///   crossing queries. Standard Prometheus clients ignore
+///   unknown top-level fields, so this is a zero-risk extension.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PrometheusResponse {
     pub status: String,
@@ -31,6 +41,19 @@ pub struct PrometheusResponse {
     /// Purged segment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Prometheus 3.0 `infos: []`. Grafana 11+ renders each
+    /// string inline. Used to mirror a human-readable
+    /// `accuracy: ε=..., δ=..., kind=...` line when the
+    /// structured `accuracy` field is present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub infos: Vec<String>,
+    /// ASAP extension: theoretical accuracy envelope for the
+    /// answer (§6.4 of docs/design-sketch-db.md). Unknown to
+    /// standard Prometheus clients (they ignore unknown fields),
+    /// consumed by Grafana panels / paper artifacts that want
+    /// the machine-readable (ε, δ) bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<crate::stores::sketch_db::AccuracyEnvelope>,
 }
 
 impl PrometheusResponse {
@@ -41,6 +64,8 @@ impl PrometheusResponse {
             error_type: None,
             error: None,
             warnings: Vec::new(),
+            infos: Vec::new(),
+            accuracy: None,
         }
     }
 
@@ -53,7 +78,19 @@ impl PrometheusResponse {
             error_type: None,
             error: None,
             warnings,
+            infos: Vec::new(),
+            accuracy: None,
         }
+    }
+
+    /// Attach an accuracy envelope: sets the structured `accuracy`
+    /// field and mirrors a human-readable one-liner to `infos`.
+    /// Chainable so both warning + accuracy paths can decorate
+    /// the same `success(...)` construction.
+    pub fn with_accuracy(mut self, envelope: crate::stores::sketch_db::AccuracyEnvelope) -> Self {
+        self.infos.push(envelope.summary());
+        self.accuracy = Some(envelope);
+        self
     }
 
     pub fn error(error_type: &str, error: &str) -> Self {
@@ -63,6 +100,8 @@ impl PrometheusResponse {
             error_type: Some(error_type.to_string()),
             error: Some(error.to_string()),
             warnings: Vec::new(),
+            infos: Vec::new(),
+            accuracy: None,
         }
     }
 }
@@ -225,11 +264,15 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         // so they land on the top-level `warnings` field, matching
         // Prometheus's native API.
         let warnings = result.query_result.warnings().to_vec();
-        let response = if warnings.is_empty() {
+        let accuracy = result.query_result.accuracy().cloned();
+        let mut response = if warnings.is_empty() {
             PrometheusResponse::success(prometheus_data)
         } else {
             PrometheusResponse::success_with_warnings(prometheus_data, warnings)
         };
+        if let Some(envelope) = accuracy {
+            response = response.with_accuracy(envelope);
+        }
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
 
@@ -245,11 +288,15 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         let warnings = result.warnings().to_vec();
-        let response = if warnings.is_empty() {
+        let accuracy = result.accuracy().cloned();
+        let mut response = if warnings.is_empty() {
             PrometheusResponse::success(prometheus_data)
         } else {
             PrometheusResponse::success_with_warnings(prometheus_data, warnings)
         };
+        if let Some(envelope) = accuracy {
+            response = response.with_accuracy(envelope);
+        }
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
 

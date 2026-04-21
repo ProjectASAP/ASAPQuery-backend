@@ -1,4 +1,5 @@
 use crate::data_model::KeyByLabelValues;
+use crate::stores::sketch_db::AccuracyEnvelope;
 use serde::{Deserialize, Serialize};
 
 use promql_utilities::query_logics::enums::QueryResultType;
@@ -23,6 +24,7 @@ impl QueryResult {
             values,
             timestamp,
             warnings: Vec::new(),
+            accuracy: None,
         })
     }
 
@@ -42,6 +44,7 @@ impl QueryResult {
             values,
             timestamp,
             warnings,
+            accuracy: None,
         })
     }
 
@@ -49,6 +52,7 @@ impl QueryResult {
         QueryResult::Matrix(RangeVector {
             values,
             warnings: Vec::new(),
+            accuracy: None,
         })
     }
 
@@ -60,6 +64,29 @@ impl QueryResult {
             QueryResult::Vector(iv) => &iv.warnings,
             QueryResult::Matrix(m) => &m.warnings,
         }
+    }
+
+    /// Theoretical accuracy envelope for this answer (§6.4 of
+    /// the sketch-DB design). `None` when the engine couldn't
+    /// resolve a schema — legacy paths that haven't been wired
+    /// yet, or fallback-produced responses.
+    pub fn accuracy(&self) -> Option<&AccuracyEnvelope> {
+        match self {
+            QueryResult::Vector(iv) => iv.accuracy.as_ref(),
+            QueryResult::Matrix(m) => m.accuracy.as_ref(),
+        }
+    }
+
+    /// Attach an accuracy envelope. Chainable so engine paths
+    /// can build the bare result first and decorate once the
+    /// `agg_id → AggregationConfig → AccuracyProfile` lookup
+    /// has resolved.
+    pub fn with_accuracy(mut self, envelope: AccuracyEnvelope) -> Self {
+        match &mut self {
+            QueryResult::Vector(iv) => iv.accuracy = Some(envelope),
+            QueryResult::Matrix(m) => m.accuracy = Some(envelope),
+        }
+        self
     }
 }
 
@@ -77,6 +104,12 @@ pub struct InstantVector {
     /// missing from the current config).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// §6.4 accuracy envelope. Attached by the engine once the
+    /// `agg_id` is resolved; surfaced as `PrometheusResponse`'s
+    /// top-level `accuracy` field and mirrored to `infos` for
+    /// Grafana 11+ inline display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<AccuracyEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +131,9 @@ pub struct RangeVector {
     /// See [`InstantVector::warnings`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// See [`InstantVector::accuracy`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accuracy: Option<AccuracyEnvelope>,
 }
 
 /// Individual element in a range vector

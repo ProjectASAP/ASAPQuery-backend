@@ -1,3 +1,4 @@
+pub mod accuracy_in_promql_response_tests;
 pub mod capability_matching_tests;
 pub mod capability_miss_http_e2e_tests;
 pub mod clickhouse_forwarding_tests;

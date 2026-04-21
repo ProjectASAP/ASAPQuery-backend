@@ -41,7 +41,7 @@ pub mod schema;
 pub mod schema_eviction;
 pub mod simple_map_store;
 
-pub use accuracy::{AccuracyKind, AccuracyProfile};
+pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{
     BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage, CreateError,
 };

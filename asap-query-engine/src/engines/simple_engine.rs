@@ -1921,6 +1921,7 @@ impl SimpleEngine {
         context: QueryExecutionContext,
         enable_topk: bool,
     ) -> Option<(KeyByLabelNames, QueryResult)> {
+        let agg_id = context.agg_info.aggregation_id_for_value;
         let results = self
             .execute_query_pipeline(&context, enable_topk)
             .map_err(|e| {
@@ -1928,9 +1929,27 @@ impl SimpleEngine {
                 e
             })
             .ok()?;
-        Some((
-            context.metadata.query_output_labels,
-            QueryResult::vector(results, context.query_time),
+        let qr = QueryResult::vector(results, context.query_time);
+        let qr = match self.accuracy_envelope_for(agg_id) {
+            Some(env) => qr.with_accuracy(env),
+            None => qr,
+        };
+        Some((context.metadata.query_output_labels, qr))
+    }
+
+    /// Build an [`AccuracyEnvelope`] for a single resolved
+    /// `agg_id` by looking up the matching `AggregationConfig` in
+    /// the current streaming-config snapshot and deriving its
+    /// [`AccuracyProfile`]. Returns `None` when the agg isn't in
+    /// config (e.g. post-retire / test harness with empty config).
+    pub(crate) fn accuracy_envelope_for(
+        &self,
+        agg_id: u64,
+    ) -> Option<crate::stores::sketch_db::AccuracyEnvelope> {
+        let snap = self.streaming_config_snapshot();
+        let cfg = snap.get_aggregation_config(agg_id)?;
+        Some(crate::stores::sketch_db::AccuracyEnvelope::single(
+            crate::stores::sketch_db::AccuracyProfile::derive(cfg),
         ))
     }
 
@@ -3241,10 +3260,30 @@ impl SimpleEngine {
             Vec::new()
         };
 
-        Some((
-            probe_context.metadata.query_output_labels,
-            QueryResult::vector_with_warnings(output, probe_context.query_time, warnings),
-        ))
+        // §6.4: build a per-segment accuracy envelope from each
+        // segment's resolved agg_id. Segments that don't resolve
+        // to an in-config agg drop out — their partial-ness is
+        // already reflected in `warnings` above.
+        let snap = self.streaming_config_snapshot();
+        let per_segment: Vec<crate::stores::sketch_db::PerSegmentAccuracy> = segments
+            .iter()
+            .filter_map(|seg| {
+                let cfg = snap.get_aggregation_config(seg.agg_id)?;
+                Some(crate::stores::sketch_db::PerSegmentAccuracy {
+                    agg_id: seg.agg_id,
+                    range_ms: [seg.start_ms as i64, seg.end_ms as i64],
+                    profile: crate::stores::sketch_db::AccuracyProfile::derive(cfg),
+                })
+            })
+            .collect();
+        let envelope = crate::stores::sketch_db::AccuracyEnvelope::from_segments(per_segment);
+
+        let qr = QueryResult::vector_with_warnings(output, probe_context.query_time, warnings);
+        let qr = match envelope {
+            Some(e) => qr.with_accuracy(e),
+            None => qr,
+        };
+        Some((probe_context.metadata.query_output_labels, qr))
     }
 
     /// Merge precomputed outputs (extracts buckets from timestamped data)
