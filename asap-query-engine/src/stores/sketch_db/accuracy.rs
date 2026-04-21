@@ -30,6 +30,7 @@
 //! |---|---|---|---|
 //! | Sum / Min / Max / Increase | `Exact` | 0 | 0 |
 //! | CountMinSketch(w, d) | `AdditiveFrequency` | e / w | 1 / 2^d |
+//! | CountMinSketchWithHeap(w, d, k) | `TopK` | max(e/w, 1/k) | 1 / 2^d |
 //! | CountSketch(w, d) | `AdditiveFrequency` | 1 / √w | 1 / 2^d |
 //! | HLL(p) | `RelativeCardinality` | 1.04 / √(2^p) | — (Gaussian std-dev) |
 //! | KLL(k) | `RankQuantile` | ≈ 2.296 / √k (worst-case constant) | 1 / 100 (fixed) |
@@ -69,6 +70,12 @@ pub enum AccuracyKind {
     /// within `ε · q_true` of the true quantile, where `q_true`
     /// is the true value. Applies to DDSketch.
     RelativeQuantile,
+    /// Top-K retention + additive-estimate error. An item
+    /// whose true frequency is ≥ `ε · N` is guaranteed to be in
+    /// the returned top-K set; each returned count is within
+    /// `ε · N` of the true count. Applies to CMS-with-heap and
+    /// SpaceSaving-family heavy-hitter sketches.
+    TopK,
 }
 
 /// Theoretical accuracy bound for an [`AggSchema`](super::AggSchema).
@@ -105,6 +112,7 @@ impl AccuracyProfile {
                 AccuracyKind::RelativeCardinality => "relative_cardinality",
                 AccuracyKind::RankQuantile => "rank_quantile",
                 AccuracyKind::RelativeQuantile => "relative_quantile",
+                AccuracyKind::TopK => "top_k",
             }
         )
     }
@@ -133,7 +141,7 @@ impl AccuracyProfile {
             // existing `accumulator_factory::cms_params` names
             // them; fall back to the factory's (rows=4, cols=1000)
             // defaults if absent.
-            AggregationType::CountMinSketch | AggregationType::CountMinSketchWithHeap => {
+            AggregationType::CountMinSketch => {
                 let (rows, cols) = cms_params(config);
                 // Using natural e ≈ 2.71828 for tighter bound.
                 // Source: Cormode & Muthukrishnan, "An improved
@@ -145,6 +153,47 @@ impl AccuracyProfile {
                     epsilon,
                     delta,
                     kind: AccuracyKind::AdditiveFrequency,
+                }
+            }
+
+            // CountMinSketchWithHeap: CMS frequency estimator
+            // coupled with a heap of the top-`k` heaviest items
+            // (Metwally et al.'s SpaceSaving-style retention).
+            // Two bounds apply:
+            //   * per-item point-lookup: ε_point = e/w
+            //     (inherited from the CMS part)
+            //   * top-K retention: any item with true frequency
+            //     ≥ N/heap_size is guaranteed to be in the top-K
+            //     output; each retained count is within N/heap_size
+            //     of the true value (SpaceSaving guarantee).
+            // We report the **tighter** of the two as the
+            // user-facing ε — typically the heap bound
+            // `1/heap_size` dominates when heap_size ≪ w, and the
+            // CMS bound `e/w` dominates when the heap is generously
+            // sized. `kind = TopK` signals that ε is the
+            // combined frequency + retention guarantee.
+            // δ stays `1/2^d` from the CMS half; retention itself
+            // is deterministic given an adversarial-free stream,
+            // but the count estimate remains probabilistic at
+            // depth d.
+            // Sources:
+            //   - Cormode & Muthukrishnan 2005 (CMS bound)
+            //   - Metwally, Agrawal, El Abbadi. "Efficient
+            //     computation of frequent and top-k elements in
+            //     data streams." ICDT 2005. (top-K retention)
+            AggregationType::CountMinSketchWithHeap => {
+                let (rows, cols) = cms_params(config);
+                let heap = cms_heap_size(config);
+                let cms_epsilon = std::f64::consts::E / (cols as f64).max(1.0);
+                let heap_epsilon = 1.0 / (heap as f64).max(1.0);
+                // Worst of the two — a user should expect errors
+                // no bigger than `ε · N`.
+                let epsilon = cms_epsilon.max(heap_epsilon);
+                let delta = 0.5_f64.powi(rows as i32);
+                Self {
+                    epsilon,
+                    delta,
+                    kind: AccuracyKind::TopK,
                 }
             }
 
@@ -270,6 +319,20 @@ fn ddsketch_alpha(config: &AggregationConfig) -> f64 {
         .get("alpha")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.01)
+}
+
+/// CMS-with-heap heap size (the `k` in "top-k retention"). Read
+/// from `parameters["heap_size"]` with a default of 100 —
+/// matches the default the controller's planner uses when the
+/// caller didn't override.
+fn cms_heap_size(config: &AggregationConfig) -> u64 {
+    config
+        .parameters
+        .get("heap_size")
+        .or_else(|| config.parameters.get("topk"))
+        .or_else(|| config.parameters.get("k"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100)
 }
 
 /// Per-segment accuracy record. Attached to a multi-segment
@@ -427,6 +490,75 @@ mod tests {
         // Defaults rows=4, cols=1000 per accumulator_factory.
         assert!((p.epsilon - std::f64::consts::E / 1000.0).abs() < 1e-12);
         assert!((p.delta - 0.0625).abs() < 1e-12); // 1/16
+    }
+
+    #[test]
+    fn cms_with_heap_carries_top_k_kind_and_heap_bound() {
+        // Large heap: 1/heap_size (= 1e-4) dominates the e/w CMS
+        // bound (e/1e6 ≈ 2.72e-6). Expect ε = 1/heap.
+        let mut params = HashMap::new();
+        params.insert("row_num".to_string(), json!(5));
+        params.insert("col_num".to_string(), json!(1_000_000));
+        params.insert("heap_size".to_string(), json!(10_000));
+        let p = AccuracyProfile::derive(&base_config(
+            AggregationType::CountMinSketchWithHeap,
+            params,
+        ));
+        assert_eq!(p.kind, AccuracyKind::TopK);
+        assert!((p.epsilon - 1.0 / 10_000.0).abs() < 1e-12);
+        assert!((p.delta - 1.0 / 32.0).abs() < 1e-12); // 1/2^5
+    }
+
+    #[test]
+    fn cms_with_heap_cms_bound_dominates_when_heap_is_generous() {
+        // Generously-sized heap (1e6) + narrow CMS (w=100) →
+        // 1/heap (1e-6) ≪ e/w (2.7e-2), so the CMS bound dominates.
+        let mut params = HashMap::new();
+        params.insert("row_num".to_string(), json!(4));
+        params.insert("col_num".to_string(), json!(100));
+        params.insert("heap_size".to_string(), json!(1_000_000));
+        let p = AccuracyProfile::derive(&base_config(
+            AggregationType::CountMinSketchWithHeap,
+            params,
+        ));
+        assert_eq!(p.kind, AccuracyKind::TopK);
+        assert!((p.epsilon - std::f64::consts::E / 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cms_with_heap_uses_default_heap_size_100() {
+        let mut params = HashMap::new();
+        params.insert("row_num".to_string(), json!(4));
+        params.insert("col_num".to_string(), json!(1000));
+        // heap_size absent → default 100 → 1/100 = 0.01 dominates
+        // e/1000 ≈ 0.00272.
+        let p = AccuracyProfile::derive(&base_config(
+            AggregationType::CountMinSketchWithHeap,
+            params,
+        ));
+        assert_eq!(p.kind, AccuracyKind::TopK);
+        assert!((p.epsilon - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cms_with_heap_accepts_alternative_param_names() {
+        // Config may name the heap "k" or "topk" instead of
+        // "heap_size" — all three should work.
+        for alias in ["heap_size", "topk", "k"] {
+            let mut params = HashMap::new();
+            params.insert("row_num".to_string(), json!(4));
+            params.insert("col_num".to_string(), json!(1_000_000));
+            params.insert(alias.to_string(), json!(500));
+            let p = AccuracyProfile::derive(&base_config(
+                AggregationType::CountMinSketchWithHeap,
+                params,
+            ));
+            assert!(
+                (p.epsilon - 1.0 / 500.0).abs() < 1e-12,
+                "alias '{}' should produce heap-driven ε",
+                alias
+            );
+        }
     }
 
     #[test]
