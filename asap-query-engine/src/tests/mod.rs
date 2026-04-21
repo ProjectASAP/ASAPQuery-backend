@@ -1,4 +1,5 @@
 pub mod capability_matching_tests;
+pub mod capability_miss_http_e2e_tests;
 pub mod clickhouse_forwarding_tests;
 pub mod cold_fallback_tests;
 pub mod datafusion;
