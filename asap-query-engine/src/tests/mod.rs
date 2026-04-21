@@ -1,5 +1,6 @@
 pub mod capability_matching_tests;
 pub mod clickhouse_forwarding_tests;
+pub mod cold_fallback_tests;
 pub mod datafusion;
 pub mod elastic_dsl_query_tests;
 pub mod elastic_forwarding_tests;
