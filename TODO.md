@@ -8,25 +8,26 @@ See the design source at [`docs/design-sketch-db.md`](docs/design-sketch-db.md).
 
 ## For paper submission (blocker)
 
-### 1. Cold-query fallback — §5.2 of the sketch-DB design
+### 1. Cold-query fallback — §5.2 of the sketch-DB design — **done (local-FS cold store)**
 
-Capability-miss at query time today falls through to the §5.2
-forwarding adapter which hits Prometheus (the raw source). For
-the paper's "hot sketch + cold exact" story we need:
+Initial v1 landed: [`drivers/query/fallback/s3_adapter.rs`](asap-query-engine/src/drivers/query/fallback/s3_adapter.rs)
+is a `FallbackClient` that serves capability-misses from a
+hour-bucketed JSONL raw store. The format (`raw/<metric>/YYYY/MM/DD/HH/part-NNNNNN.jsonl`)
+is byte-identical to the S3 layout, so a future
+`S3ColdStore: ColdStore` drops in with no adapter changes.
 
-- **Adapter that reads from S3-resident raw exports on cold
-  miss.** New module `drivers/query/fallback/s3_adapter.rs` in
-  parallel with the existing Prometheus fallback. Input: a
-  `(metric, time_range, labels)` triple; output: a computed
-  answer using exact raw records.
-- **Cost model aware of hot/cold split.** When the schema
-  timeline says a time range is `Purged`, the query routes
-  through the S3 adapter instead of failing.
-- **Telemetry.** Counters for bytes-served-from-sketch vs
-  bytes-served-from-S3 per query, keyed by query shape.
-  Mirror the PR #47 pattern.
+Follow-ups (not paper-blocking):
 
-Scale target: ≤2× P99 latency degradation vs. warm-hot queries.
+- **S3-backed `ColdStore` impl** next to the local-FS one; same
+  trait, `aws-sdk-s3` list-objects-v2 for prefix pruning.
+- **Richer query surface.** Today we compute `metric{...}`,
+  `sum|count|avg|min|max(...)`. Regex matchers, `by (...)`
+  grouping, and `rate/increase` over raw samples delegate to
+  the chained inner fallback (typically Prometheus). Adding
+  grouping + regex is ~200 LOC when needed.
+- **Latency target.** Paper claim is ≤2× P99 vs. warm-hot —
+  unverified until the multi-agent harness lands (blocker #6
+  of `DataCollector/TODO.md`).
 
 ### 2. Accuracy-profile library per sketch type
 
