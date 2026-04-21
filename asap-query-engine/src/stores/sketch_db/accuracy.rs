@@ -91,6 +91,24 @@ impl AccuracyProfile {
         }
     }
 
+    /// Human-readable one-liner. Surfaced in Prometheus-style
+    /// `infos` arrays so Grafana 11+ shows it inline without a
+    /// custom panel.
+    pub fn summary(&self) -> String {
+        format!(
+            "accuracy: ε={}, δ={}, kind={}",
+            self.epsilon,
+            self.delta,
+            match self.kind {
+                AccuracyKind::Exact => "exact",
+                AccuracyKind::AdditiveFrequency => "additive_frequency",
+                AccuracyKind::RelativeCardinality => "relative_cardinality",
+                AccuracyKind::RankQuantile => "rank_quantile",
+                AccuracyKind::RelativeQuantile => "relative_quantile",
+            }
+        )
+    }
+
     /// Derive an [`AccuracyProfile`] from a pinned
     /// [`AggregationConfig`]. Reads `aggregation_type` and any
     /// necessary entries in `parameters`; falls back to exact for
@@ -252,6 +270,93 @@ fn ddsketch_alpha(config: &AggregationConfig) -> f64 {
         .get("alpha")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.01)
+}
+
+/// Per-segment accuracy record. Attached to a multi-segment
+/// [`AccuracyEnvelope`] so clients can see the error bound for
+/// each piece of the schema-timeline-crossing query.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PerSegmentAccuracy {
+    pub agg_id: u64,
+    /// Half-open millisecond range `[start_ms, end_ms)` this
+    /// segment covered.
+    pub range_ms: [i64; 2],
+    #[serde(flatten)]
+    pub profile: AccuracyProfile,
+}
+
+/// Wire-side envelope emitted on PromQL responses as the
+/// top-level `accuracy` field. Single-schema queries fill
+/// `profile`; queries that span a schema-timeline boundary also
+/// populate `per_segment` so the caller can see each piece's
+/// bound. The top-level `profile` is the worst-case (max ε,
+/// max δ) across segments — a conservative upper envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccuracyEnvelope {
+    #[serde(flatten)]
+    pub profile: AccuracyProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_segment: Vec<PerSegmentAccuracy>,
+}
+
+impl AccuracyEnvelope {
+    /// Envelope for a single resolved aggregation.
+    pub fn single(profile: AccuracyProfile) -> Self {
+        Self {
+            profile,
+            per_segment: Vec::new(),
+        }
+    }
+
+    /// Build an envelope from a slice of per-segment tuples.
+    /// Top-level `profile.epsilon` is `max(segment.epsilon)` and
+    /// same for δ — the conservative envelope across segments.
+    /// Returns `None` when the slice is empty.
+    pub fn from_segments(segs: Vec<PerSegmentAccuracy>) -> Option<Self> {
+        if segs.is_empty() {
+            return None;
+        }
+        let mut epsilon = 0.0_f64;
+        let mut delta = 0.0_f64;
+        // Pick the "most lossy" kind: any non-Exact wins over
+        // Exact; if mixed non-Exact kinds span segments we pick
+        // the first non-Exact and trust the per-segment data for
+        // the caller's finer needs.
+        let mut kind = AccuracyKind::Exact;
+        for s in &segs {
+            if s.profile.epsilon > epsilon {
+                epsilon = s.profile.epsilon;
+            }
+            if s.profile.delta > delta {
+                delta = s.profile.delta;
+            }
+            if matches!(kind, AccuracyKind::Exact) && !matches!(s.profile.kind, AccuracyKind::Exact)
+            {
+                kind = s.profile.kind;
+            }
+        }
+        Some(Self {
+            profile: AccuracyProfile {
+                epsilon,
+                delta,
+                kind,
+            },
+            per_segment: segs,
+        })
+    }
+
+    /// Summary line suitable for Prometheus `infos`.
+    pub fn summary(&self) -> String {
+        if self.per_segment.is_empty() {
+            self.profile.summary()
+        } else {
+            format!(
+                "{} (worst-case over {} schema-timeline segments)",
+                self.profile.summary(),
+                self.per_segment.len()
+            )
+        }
+    }
 }
 
 #[cfg(test)]
