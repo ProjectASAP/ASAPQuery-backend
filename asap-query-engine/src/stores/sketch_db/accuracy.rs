@@ -39,6 +39,8 @@
 //! Constants are chosen to match the tighter published bounds
 //! rather than loose textbook versions; sources are cited inline
 //! in each branch of [`AccuracyProfile::derive`].
+//!
+// See `docs/proofs.md` for formal statements of the accuracy bounds + combine_statistic / write-barrier / backfill theorems.
 
 use serde::{Deserialize, Serialize};
 
