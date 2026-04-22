@@ -763,17 +763,15 @@ fn decode_modified_otlp_sketch_bytes(
     };
 
     // The encoding value is the raw i32 from the per-sketch encoding
-    // enum. All five sketch variants share the same wire tag layout for
-    // tags 1–4, so we can match on one set of constants here:
+    // enum. All five sketch variants share the same wire tag layout:
     //
-    //   1  — ENCODING_PROTO          (PR B / PR C: sketchlib proto-encoded)
-    //   2  — ENCODING_PROTO_DELTA    (delta transmission; deferred — falls
-    //                                 through to §5.2 fallback)
-    //   3  — ENCODING_MSGPACK        (PR I: cross-language sketch-core
-    //                                 msgpack wire format — this dispatcher)
-    //   4  — ENCODING_MSGPACK_DELTA  (deferred same as PROTO_DELTA)
-    const ENCODING_PROTO: i32 = 1;
-    const ENCODING_MSGPACK: i32 = 3;
+    //   1  — ENCODING_PROTO          (full sketchlib proto state)
+    //   2  — ENCODING_PROTO_DELTA    (sparse diff vs caller's base
+    //                                 snapshot — apply via
+    //                                 `apply_modified_otlp_delta_bytes`;
+    //                                 not standalone-decodable)
+    //   3  — ENCODING_MSGPACK        (full sketch-core msgpack state)
+    //   4  — ENCODING_MSGPACK_DELTA  (MSGPACK diff; not yet wired)
 
     match encoding {
         ENCODING_PROTO => match kind {
@@ -806,13 +804,94 @@ fn decode_modified_otlp_sketch_bytes(
             SketchKind::DdSketch => Ok(Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes)?)),
             SketchKind::Hll => Ok(Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes)?)),
         },
-        _ => Err(format!(
-            "modified-OTLP sketch encoding {encoding} not yet supported \
-             (PROTO = 1 and MSGPACK = 3 are wired; PROTO_DELTA = 2 and \
-             MSGPACK_DELTA = 4 are deferred — caller falls through to §5.2 \
-             fallback)"
+        ENCODING_PROTO_DELTA => Err(format!(
+            "sketch encoding PROTO_DELTA (2) is not standalone-decodable — \
+             it carries only a diff against the caller's base snapshot. \
+             Caller must route these through \
+             `apply_modified_otlp_delta_bytes` with a cached accumulator; \
+             this decoder is for full-state frames only."
         )
         .into()),
+        ENCODING_MSGPACK_DELTA => Err(format!(
+            "sketch encoding MSGPACK_DELTA (4) deferred — PR G wires \
+             PROTO_DELTA only; msgpack delta is a follow-up."
+        )
+        .into()),
+        _ => Err(format!(
+            "unknown modified-OTLP sketch encoding {encoding} \
+             (expected 1 / 2 / 3 / 4)"
+        )
+        .into()),
+    }
+}
+
+// Shared constants — exposed at module scope so both the full-state
+// decoder and the delta applier match on the same values.
+const ENCODING_PROTO: i32 = 1;
+const ENCODING_PROTO_DELTA: i32 = 2;
+const ENCODING_MSGPACK: i32 = 3;
+const ENCODING_MSGPACK_DELTA: i32 = 4;
+
+/// Apply a modified-OTLP `*SketchDataPoint.sketch` delta frame onto an
+/// existing accumulator.
+///
+/// Paper §6.2 B3 / B4 sketch delta-transmission: the agent sends a
+/// sparse diff against its last-flushed snapshot. The backend keeps a
+/// per-series accumulator around, and on arrival of a delta frame
+/// dispatches here to merge the diff in place.
+///
+/// The caller owns the per-series snapshot cache — this dispatcher is
+/// stateless. Today wires `PROTO_DELTA` for DDSketch + HLL (the two
+/// delta-capable sketches in `sketchlib-go`); `MSGPACK_DELTA` and the
+/// KLL/CountSketch/CountMinSketch deltas are deferred to follow-ups
+/// as their delta codecs land.
+pub(crate) fn apply_modified_otlp_delta_bytes(
+    kind: SketchKind,
+    encoding: i32,
+    existing: &mut Box<dyn AggregateCore>,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::precompute_operators::{DDSketchAccumulator, HllSketchAccumulator};
+
+    match (encoding, kind) {
+        (ENCODING_PROTO_DELTA, SketchKind::DdSketch) => {
+            let dd = existing
+                .as_any_mut()
+                .downcast_mut::<DDSketchAccumulator>()
+                .ok_or(
+                    "apply_modified_otlp_delta_bytes: existing accumulator is \
+                     not a DDSketchAccumulator",
+                )?;
+            dd.apply_proto_delta_bytes(bytes)
+        }
+        (ENCODING_PROTO_DELTA, SketchKind::Hll) => {
+            let hll = existing
+                .as_any_mut()
+                .downcast_mut::<HllSketchAccumulator>()
+                .ok_or(
+                    "apply_modified_otlp_delta_bytes: existing accumulator is \
+                     not an HllSketchAccumulator",
+                )?;
+            hll.apply_proto_delta_bytes(bytes)
+        }
+        (ENCODING_PROTO_DELTA, other) => Err(format!(
+            "PROTO_DELTA for sketch kind {other:?} is not yet supported; \
+             DDSketch and HLL are wired in PR G"
+        )
+        .into()),
+        (ENCODING_MSGPACK_DELTA, _) => Err(
+            "MSGPACK_DELTA encoding is not yet wired; PR G covers PROTO_DELTA only"
+                .into(),
+        ),
+        (ENCODING_PROTO, _) | (ENCODING_MSGPACK, _) => Err(format!(
+            "encoding {encoding} is a full-state frame — route through \
+             `decode_modified_otlp_sketch_bytes` and replace the cached \
+             accumulator, not through the delta applier"
+        )
+        .into()),
+        (other, _) => Err(
+            format!("unknown modified-OTLP sketch encoding {other}").into(),
+        ),
     }
 }
 
@@ -1152,4 +1231,136 @@ fn attributes_to_map(
         }
     }
     m
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+    use crate::data_model::AggregateCore;
+    use crate::precompute_operators::{DDSketchAccumulator, HllSketchAccumulator};
+    use sketch_core::dd_sketch::DdSketch;
+    use sketch_core::hll_sketch::HllVariant;
+
+    #[test]
+    fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {
+        use asap_otel_proto::sketchlib::v1::{
+            DdSketchBucketDelta, DdSketchDelta as PbDelta,
+        };
+        use prost::Message;
+
+        // Base sketch represents the last full snapshot the agent sent.
+        let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0),
+        });
+
+        let bytes = PbDelta {
+            buckets: vec![
+                DdSketchBucketDelta { index: 0, d_count: 10 },
+                DdSketchBucketDelta { index: 2, d_count: 20 },
+            ],
+            d_count: 30,
+            d_sum: 70.0,
+            new_min: 0.5,
+            new_max: 5.0,
+            min_changed: true,
+            max_changed: true,
+        }
+        .encode_to_vec();
+
+        apply_modified_otlp_delta_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc,
+            &bytes,
+        )
+        .expect("apply ok");
+
+        let dd = acc
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .unwrap();
+        assert_eq!(dd.inner.store_counts, vec![11, 2, 23]);
+        assert_eq!(dd.inner.count, 36);
+        assert_eq!(dd.inner.min, 0.5);
+        assert_eq!(dd.inner.max, 5.0);
+    }
+
+    #[test]
+    fn apply_modified_otlp_delta_bytes_hll_round_trip() {
+        use asap_otel_proto::sketchlib::v1::{HllDelta as PbDelta, HllRegisterUpdate};
+        use prost::Message;
+
+        let mut acc: Box<dyn AggregateCore> =
+            Box::new(HllSketchAccumulator::new(HllVariant::Regular, 2));
+        acc.as_any_mut()
+            .downcast_mut::<HllSketchAccumulator>()
+            .unwrap()
+            .inner
+            .registers = vec![1, 5, 3, 7];
+
+        let bytes = PbDelta {
+            updates: vec![
+                HllRegisterUpdate { index: 0, value: 4 },
+                HllRegisterUpdate { index: 2, value: 6 },
+            ],
+        }
+        .encode_to_vec();
+
+        apply_modified_otlp_delta_bytes(
+            SketchKind::Hll,
+            ENCODING_PROTO_DELTA,
+            &mut acc,
+            &bytes,
+        )
+        .expect("apply ok");
+
+        let hll = acc
+            .as_any()
+            .downcast_ref::<HllSketchAccumulator>()
+            .unwrap();
+        assert_eq!(hll.inner.registers, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn apply_rejects_wrong_accumulator_type() {
+        let mut acc: Box<dyn AggregateCore> =
+            Box::new(HllSketchAccumulator::new(HllVariant::Regular, 2));
+        let err = apply_modified_otlp_delta_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc,
+            &[0u8; 4],
+        )
+        .expect_err("expected type-mismatch error")
+        .to_string();
+        assert!(err.contains("not a DDSketchAccumulator"));
+    }
+
+    #[test]
+    fn apply_rejects_full_state_encoding() {
+        let mut acc: Box<dyn AggregateCore> =
+            Box::new(DDSketchAccumulator::new(0.01));
+        let err = apply_modified_otlp_delta_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO,
+            &mut acc,
+            &[],
+        )
+        .expect_err("expected full-state-rejection error")
+        .to_string();
+        assert!(err.contains("full-state frame"));
+    }
+
+    #[test]
+    fn decode_rejects_delta_encoding_with_helpful_message() {
+        let err = match decode_modified_otlp_sketch_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO_DELTA,
+            &[],
+        ) {
+            Ok(_) => panic!("expected PROTO_DELTA to be rejected by full-state decoder"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("apply_modified_otlp_delta_bytes"));
+    }
 }

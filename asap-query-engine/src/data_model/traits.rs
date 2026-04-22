@@ -18,6 +18,11 @@ pub trait AggregateCore: SerializableToSink + Send + Sync {
     /// Downcast to Any for type checking
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// Mutable downcast to Any. Used by ingest paths that need to
+    /// mutate a boxed accumulator in place — e.g. the PROTO_DELTA
+    /// delta-merge applier in `drivers::ingest::otel::apply_modified_otlp_delta_bytes`.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+
     /// Merge this accumulator with another accumulator of the same type
     /// Returns a new merged accumulator, leaving the original unchanged
     fn merge_with(
