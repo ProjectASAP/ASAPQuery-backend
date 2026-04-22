@@ -18,6 +18,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Sparse delta between two consecutive DDSketch snapshots — the
+/// input shape for [`DdSketch::apply_delta`]. Mirrors the
+/// `DDSketchDelta` proto in `sketchlib-go/proto/ddsketch/ddsketch.proto`
+/// (and its Rust bindings vendored in `asap_otel_proto::sketchlib::v1`).
+/// Kept as a plain struct in sketch-core so the pure-math crate doesn't
+/// need a tonic/prost dependency; proto decode lives in the accumulator.
+#[derive(Debug, Clone, Default)]
+pub struct DdSketchDelta {
+    /// `(absolute_bucket_index, Δcount)` pairs, additive.
+    pub buckets: Vec<(i32, u64)>,
+    /// Δ total count. May be negative (signed on the wire).
+    pub d_count: i64,
+    /// Δ sum.
+    pub d_sum: f64,
+    /// Whether `new_min` carries a meaningful value. Min can only
+    /// decrease; a delta that didn't lower min sends `false`.
+    pub min_changed: bool,
+    pub new_min: f64,
+    /// Whether `new_max` carries a meaningful value. Max can only
+    /// increase.
+    pub max_changed: bool,
+    pub new_max: f64,
+}
+
 /// Minimal DDSketch state — bucket counts + alpha + aggregates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DdSketch {
@@ -130,6 +154,51 @@ impl DdSketch {
         Ok(())
     }
 
+    /// Apply a sparse delta to this sketch in place. Matches the
+    /// `ApplyDelta` logic in `sketchlib-go/sketches/DDSketch/delta.go`:
+    /// bucket counts add, total count + sum add, min can only decrease
+    /// and max can only increase. Used by the backend ingest path to
+    /// reconstitute a full sketch from a base snapshot + subsequent
+    /// delta-transmission frames (paper §6.2 B3 / B4 baselines).
+    pub fn apply_delta(&mut self, delta: &DdSketchDelta) {
+        for (abs_idx, d_count) in &delta.buckets {
+            if self.store_counts.is_empty() {
+                self.store_counts = vec![0u64; 1];
+                self.store_offset = *abs_idx;
+            }
+            let cur_start = self.store_offset as i64;
+            let cur_end = cur_start + self.store_counts.len() as i64;
+            let k = *abs_idx as i64;
+            if k < cur_start {
+                // Prepend zeros.
+                let pad = (cur_start - k) as usize;
+                let mut buf = vec![0u64; pad];
+                buf.append(&mut self.store_counts);
+                self.store_counts = buf;
+                self.store_offset = *abs_idx;
+            } else if k >= cur_end {
+                let pad = (k - cur_end + 1) as usize;
+                self.store_counts
+                    .extend(std::iter::repeat(0u64).take(pad));
+            }
+            let arr_idx = (k - self.store_offset as i64) as usize;
+            self.store_counts[arr_idx] =
+                self.store_counts[arr_idx].saturating_add(*d_count);
+        }
+        if delta.d_count >= 0 {
+            self.count = self.count.saturating_add(delta.d_count as u64);
+        } else {
+            self.count = self.count.saturating_sub((-delta.d_count) as u64);
+        }
+        self.sum += delta.d_sum;
+        if delta.min_changed && delta.new_min < self.min {
+            self.min = delta.new_min;
+        }
+        if delta.max_changed && delta.new_max > self.max {
+            self.max = delta.new_max;
+        }
+    }
+
     /// Merge a slice of references into a single new sketch. Returns
     /// `Err` on alpha mismatch or an empty input.
     pub fn merge_refs(
@@ -204,6 +273,74 @@ mod tests {
         // Window [0..7) → [1,2,0,0,0,3,4]
         assert_eq!(a.store_counts, vec![1, 2, 0, 0, 0, 3, 4]);
         assert_eq!(a.store_offset, 0);
+    }
+
+    #[test]
+    fn test_apply_delta_additive_inside_store() {
+        let mut base = DdSketch::from_raw(0.01, vec![1, 2, 3], -1, 6, 30.0, 1.0, 5.0);
+        let delta = DdSketchDelta {
+            buckets: vec![(-1, 4), (0, 8), (1, 12)],
+            d_count: 24,
+            d_sum: 120.0,
+            min_changed: false,
+            new_min: 0.0,
+            max_changed: true,
+            new_max: 9.0,
+        };
+        base.apply_delta(&delta);
+        assert_eq!(base.store_counts, vec![5, 10, 15]);
+        assert_eq!(base.count, 30);
+        assert_eq!(base.sum, 150.0);
+        assert_eq!(base.min, 1.0);
+        assert_eq!(base.max, 9.0);
+    }
+
+    #[test]
+    fn test_apply_delta_expands_store_on_new_bucket() {
+        // Base covers [0..2]; delta adds a bucket at absolute index 4.
+        let mut base = DdSketch::from_raw(0.01, vec![1, 2], 0, 3, 3.0, 1.0, 2.0);
+        let delta = DdSketchDelta {
+            buckets: vec![(4, 7)],
+            d_count: 7,
+            d_sum: 35.0,
+            min_changed: false,
+            new_min: 0.0,
+            max_changed: true,
+            new_max: 6.0,
+        };
+        base.apply_delta(&delta);
+        assert_eq!(base.store_counts, vec![1, 2, 0, 0, 7]);
+        assert_eq!(base.store_offset, 0);
+        assert_eq!(base.count, 10);
+        assert_eq!(base.max, 6.0);
+    }
+
+    #[test]
+    fn test_apply_delta_matches_full_merge() {
+        // Snapshot the sketch, add more samples via a merge, and confirm
+        // the delta+apply path lands at the same state.
+        let base = DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0);
+        let addition = DdSketch::from_raw(0.01, vec![10, 0, 20], 0, 30, 70.0, 0.5, 5.0);
+        let mut via_merge = base.clone();
+        via_merge.merge(&addition).unwrap();
+
+        let delta = DdSketchDelta {
+            buckets: vec![(0, 10), (2, 20)],
+            d_count: 30,
+            d_sum: 70.0,
+            min_changed: true,
+            new_min: 0.5,
+            max_changed: true,
+            new_max: 5.0,
+        };
+        let mut via_delta = base;
+        via_delta.apply_delta(&delta);
+
+        assert_eq!(via_delta.store_counts, via_merge.store_counts);
+        assert_eq!(via_delta.count, via_merge.count);
+        assert_eq!(via_delta.sum, via_merge.sum);
+        assert_eq!(via_delta.min, via_merge.min);
+        assert_eq!(via_delta.max, via_merge.max);
     }
 
     #[test]

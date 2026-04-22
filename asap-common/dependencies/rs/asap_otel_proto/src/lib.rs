@@ -39,3 +39,15 @@ pub mod tonic {
         }
     }
 }
+
+/// Delta wire-format types for DDSketch + HLL, kept separate from the
+/// main `tonic` tree because they live in `sketchlib.v1` (not
+/// `opentelemetry.proto.*`). Vendored locally until the upstream
+/// `asap_sketchlib` crate picks up the same proto definitions — see
+/// `proto/sketchlib_delta/*.proto` for the file headers that explain
+/// why the local copy exists.
+pub mod sketchlib {
+    pub mod v1 {
+        tonic::include_proto!("sketchlib.v1");
+    }
+}

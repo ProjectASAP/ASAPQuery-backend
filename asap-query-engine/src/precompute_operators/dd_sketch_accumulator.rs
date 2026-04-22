@@ -13,7 +13,7 @@
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use serde_json::Value;
-use sketch_core::dd_sketch::DdSketch;
+use sketch_core::dd_sketch::{DdSketch, DdSketchDelta};
 use std::collections::HashMap;
 
 /// DDSketch accumulator — inner log-bucketed sketch.
@@ -90,6 +90,42 @@ impl DDSketchAccumulator {
             state.max,
         );
         Ok(Self { inner })
+    }
+
+    /// Apply a proto-encoded `DDSketchDelta` frame to this
+    /// accumulator's inner sketch — the decode path for
+    /// `DD_SKETCH_ENCODING_PROTO_DELTA` (paper §6.2 B3 / B4).
+    ///
+    /// Called against an accumulator that already carries the base
+    /// sketch state; the caller is the per-series snapshot cache in
+    /// the ingest path. Bytes are the
+    /// `asap_otel_proto::sketchlib::v1::DdSketchDelta` message.
+    pub fn apply_proto_delta_bytes(
+        &mut self,
+        buffer: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use asap_otel_proto::sketchlib::v1::DdSketchDelta as PbDelta;
+        use prost::Message;
+
+        let pb = PbDelta::decode(buffer)
+            .map_err(|e| format!("decode DDSketchDelta: {e}"))?;
+
+        let buckets = pb
+            .buckets
+            .into_iter()
+            .map(|b| (b.index, b.d_count))
+            .collect();
+        let delta = DdSketchDelta {
+            buckets,
+            d_count: pb.d_count,
+            d_sum: pb.d_sum,
+            min_changed: pb.min_changed,
+            new_min: pb.new_min,
+            max_changed: pb.max_changed,
+            new_max: pb.new_max,
+        };
+        self.inner.apply_delta(&delta);
+        Ok(())
     }
 }
 
@@ -300,5 +336,49 @@ mod tests {
     fn test_from_msgpack_bytes_rejects_garbage() {
         let result = DDSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_round_trip() {
+        use asap_otel_proto::sketchlib::v1::{
+            DdSketchBucketDelta, DdSketchDelta as PbDelta,
+        };
+        use prost::Message;
+
+        let mut acc = DDSketchAccumulator::new(0.01);
+        acc.inner = DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0);
+
+        let bytes = PbDelta {
+            buckets: vec![
+                DdSketchBucketDelta {
+                    index: 0,
+                    d_count: 10,
+                },
+                DdSketchBucketDelta {
+                    index: 2,
+                    d_count: 20,
+                },
+            ],
+            d_count: 30,
+            d_sum: 70.0,
+            new_min: 0.5,
+            new_max: 5.0,
+            min_changed: true,
+            max_changed: true,
+        }
+        .encode_to_vec();
+
+        acc.apply_proto_delta_bytes(&bytes).expect("apply ok");
+        assert_eq!(acc.inner.store_counts, vec![11, 2, 23]);
+        assert_eq!(acc.inner.count, 36);
+        assert_eq!(acc.inner.sum, 82.0);
+        assert_eq!(acc.inner.min, 0.5);
+        assert_eq!(acc.inner.max, 5.0);
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_rejects_garbage() {
+        let mut acc = DDSketchAccumulator::new(0.01);
+        assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
     }
 }

@@ -29,6 +29,20 @@ pub enum HllVariant {
     Hip,
 }
 
+/// Sparse delta between two consecutive HLL snapshots — the input
+/// shape for [`HllSketch::apply_delta`]. Mirrors the `HLLDelta` proto
+/// in `sketchlib-go/proto/hll/hll.proto` (and its Rust bindings
+/// vendored in `asap_otel_proto::sketchlib::v1`). HLL registers merge
+/// with max semantics, so a delta carries only the register indices
+/// whose value increased since the last snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct HllDelta {
+    /// `(register_index, new_value)` pairs. `new_value` is the full
+    /// post-update register value; `apply_delta` does
+    /// `registers[i] = max(registers[i], new_value)`.
+    pub updates: Vec<(u32, u8)>,
+}
+
 /// Minimal HLL state — registers + variant + precision. Register-wise
 /// mergeable (max over aligned cells).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +135,37 @@ impl HllSketch {
         Ok(())
     }
 
+    /// Apply a sparse register delta in place. Matches the
+    /// `registers[i] = max(registers[i], new_value)` logic in
+    /// `sketchlib-go/sketches/HLL/delta.go::ApplyRegisterDelta`. Used
+    /// by the backend ingest path to reconstitute a full sketch from
+    /// a base snapshot + subsequent delta-transmission frames (paper
+    /// §6.2 B3 / B4 baselines).
+    ///
+    /// Returns `Err` if any delta index is out of range for the
+    /// sketch's precision — indicating a precision mismatch between
+    /// the snapshot this sketch was built from and the delta sender.
+    pub fn apply_delta(
+        &mut self,
+        delta: &HllDelta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let n = self.registers.len();
+        for (idx, new_val) in &delta.updates {
+            let i = *idx as usize;
+            if i >= n {
+                return Err(format!(
+                    "HllDelta index {i} out of range (precision={} → {n} registers)",
+                    self.precision
+                )
+                .into());
+            }
+            if *new_val > self.registers[i] {
+                self.registers[i] = *new_val;
+            }
+        }
+        Ok(())
+    }
+
     /// Merge a slice of references into a single new sketch. All inputs
     /// must share the same variant and precision; returns `Err` on
     /// mismatch or an empty input.
@@ -168,6 +213,45 @@ mod tests {
         let b = HllSketch::from_raw(HllVariant::Regular, 2, vec![4, 2, 6, 0], 0.0, 0.0, 0.0);
         a.merge(&b).unwrap();
         assert_eq!(a.registers, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_apply_delta_max_semantics() {
+        let mut h =
+            HllSketch::from_raw(HllVariant::Regular, 2, vec![1, 5, 3, 7], 0.0, 0.0, 0.0);
+        let delta = HllDelta {
+            updates: vec![(0, 4), (1, 2), (2, 6), (3, 0)],
+        };
+        h.apply_delta(&delta).unwrap();
+        // reg[0]: max(1,4)=4, reg[1]: max(5,2)=5, reg[2]: max(3,6)=6,
+        // reg[3]: max(7,0)=7.
+        assert_eq!(h.registers, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_apply_delta_out_of_range() {
+        let mut h = HllSketch::new(HllVariant::Regular, 2); // 4 registers
+        let delta = HllDelta {
+            updates: vec![(7, 3)],
+        };
+        assert!(h.apply_delta(&delta).is_err());
+    }
+
+    #[test]
+    fn test_apply_delta_matches_full_merge() {
+        let base =
+            HllSketch::from_raw(HllVariant::Regular, 2, vec![1, 5, 3, 7], 0.0, 0.0, 0.0);
+        let addition =
+            HllSketch::from_raw(HllVariant::Regular, 2, vec![4, 0, 6, 0], 0.0, 0.0, 0.0);
+        let mut via_merge = base.clone();
+        via_merge.merge(&addition).unwrap();
+
+        let delta = HllDelta {
+            updates: vec![(0, 4), (2, 6)],
+        };
+        let mut via_delta = base;
+        via_delta.apply_delta(&delta).unwrap();
+        assert_eq!(via_delta.registers, via_merge.registers);
     }
 
     #[test]

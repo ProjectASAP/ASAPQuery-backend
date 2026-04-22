@@ -1,0 +1,23 @@
+// hll_delta.proto — Delta wire format for HLL.
+//
+// Mirrors `sketchlib-go/proto/hll/hll.proto` HLLDelta +
+// HLLRegisterUpdate byte-for-byte. Vendored for the same reason as
+// ddsketch_delta.proto — `asap_sketchlib` upstream doesn't yet
+// generate delta types. HLL uses max semantics: applying a delta
+// is `registers[idx] = max(registers[idx], value)` for each update.
+//
+// No threshold is meaningful for HLL — any skipped register update
+// causes permanent underestimation.
+
+syntax = "proto3";
+
+package sketchlib.v1;
+
+message HLLDelta {
+  repeated HLLRegisterUpdate updates = 1;
+}
+
+message HLLRegisterUpdate {
+  uint32 index = 1;  // register index, 0 … 2^precision-1
+  uint32 value = 2;  // new register value (only sent when > snapshot)
+}
