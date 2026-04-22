@@ -214,6 +214,79 @@ impl DdSketch {
         Ok(merged)
     }
 
+    /// Insert a single positive value. Updates count, sum, min/max
+    /// and increments the bucket for `floor(ln(v) / ln(gamma))`
+    /// where `gamma = (1+α)/(1-α)`. Provided primarily so tests can
+    /// build a ground-truth sketch to compare delta-apply output
+    /// against.
+    pub fn insert(&mut self, value: f64) {
+        if value <= 0.0 {
+            // DDSketch is defined for positive reals; the paper's
+            // sketchlib-go rejects non-positive values silently.
+            return;
+        }
+        let gamma = (1.0 + self.alpha) / (1.0 - self.alpha);
+        let ln_gamma = gamma.ln();
+        let idx = (value.ln() / ln_gamma).floor() as i32;
+        if self.store_counts.is_empty() {
+            self.store_counts = vec![1];
+            self.store_offset = idx;
+        } else {
+            let cur_start = self.store_offset as i64;
+            let cur_end = cur_start + self.store_counts.len() as i64;
+            let k = idx as i64;
+            if k < cur_start {
+                let pad = (cur_start - k) as usize;
+                let mut buf = vec![0u64; pad];
+                buf.append(&mut self.store_counts);
+                self.store_counts = buf;
+                self.store_offset = idx;
+            } else if k >= cur_end {
+                let pad = (k - cur_end + 1) as usize;
+                self.store_counts.extend(std::iter::repeat(0u64).take(pad));
+            }
+            let arr_idx = (k - self.store_offset as i64) as usize;
+            self.store_counts[arr_idx] = self.store_counts[arr_idx].saturating_add(1);
+        }
+        self.count = self.count.saturating_add(1);
+        self.sum += value;
+        if value < self.min {
+            self.min = value;
+        }
+        if value > self.max {
+            self.max = value;
+        }
+    }
+
+    /// Estimate the quantile at rank `q` ∈ [0, 1]. Walks the bucket
+    /// array in ascending absolute-index order, accumulating counts
+    /// until the target rank; returns the bucket's representative
+    /// value `gamma^(k + 0.5)` where `k` is the bucket's absolute
+    /// index. Returns `None` if the sketch is empty.
+    ///
+    /// Accuracy: bounded by DDSketch's α parameter — the estimated
+    /// quantile value is within `(1+α)/(1-α)` relative error of the
+    /// true quantile.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        if self.count == 0 || self.store_counts.is_empty() {
+            return None;
+        }
+        let target = (q * (self.count.saturating_sub(1)) as f64).floor() as u64;
+        let mut cumulative: u64 = 0;
+        let gamma = (1.0 + self.alpha) / (1.0 - self.alpha);
+        for (i, &c) in self.store_counts.iter().enumerate() {
+            cumulative = cumulative.saturating_add(c);
+            if cumulative > target {
+                let k = (self.store_offset as i64 + i as i64) as f64;
+                // Bucket midpoint: gamma^(k + 0.5) — centers the
+                // estimate in the logarithmic bucket.
+                return Some(gamma.powf(k + 0.5));
+            }
+        }
+        // Numerical edge case: if we fall off the end, return max.
+        Some(self.max)
+    }
+
     /// Serialize to MessagePack bytes.
     pub fn serialize_msgpack(&self) -> Vec<u8> {
         rmp_serde::to_vec(self).unwrap_or_default()
@@ -358,5 +431,158 @@ mod tests {
         assert_eq!(decoded.store_counts, original.store_counts);
         assert_eq!(decoded.store_offset, original.store_offset);
         assert_eq!(decoded.count, original.count);
+    }
+
+    #[test]
+    fn test_insert_and_quantile_lognormal() {
+        // Ground-truth: insert a large i.i.d. log-normal sample into
+        // a full sketch and sanity-check P50 / P90 / P99.
+        let mut gt = DdSketch::new(0.01);
+        let mut rng = 0xdead_beefu64;
+        let mut next = || {
+            // xorshift64*
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        // Box-Muller normal → log-normal(mu=3, sigma=0.7).
+        let lognormal = |u: u64, v: u64| -> f64 {
+            let r1 = (u as f64) / (u64::MAX as f64).max(1.0);
+            let r2 = (v as f64) / (u64::MAX as f64).max(1.0);
+            let z = (-2.0 * r1.max(1e-12).ln()).sqrt() * (2.0 * std::f64::consts::PI * r2).cos();
+            (3.0 + 0.7 * z).exp()
+        };
+        for _ in 0..100_000 {
+            gt.insert(lognormal(next(), next()));
+        }
+        let p50 = gt.quantile(0.5).unwrap();
+        let p99 = gt.quantile(0.99).unwrap();
+        // Analytical P50 = exp(mu) = e^3 ≈ 20.09;
+        // P99 ≈ exp(mu + sigma * Φ⁻¹(0.99)) = e^(3 + 0.7×2.326) ≈ 102.4.
+        assert!((p50 / 20.09).ln().abs() < 0.05, "P50 {} not close to 20.09", p50);
+        assert!((p99 / 102.4).ln().abs() < 0.05, "P99 {} not close to 102.4", p99);
+    }
+
+    /// Core accuracy claim for PRs #60-#63 end-to-end: building a
+    /// sketch via `base + apply_delta()` produces quantile estimates
+    /// within DDSketch's α bound of the ground-truth full-sketch
+    /// path. If this fails, the paper's delta-reconstitution story
+    /// is broken.
+    #[test]
+    fn test_delta_chain_preserves_quantile_accuracy() {
+        let alpha = 0.01;
+        let mut rng = 0xcafe_babeu64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let lognormal = |u: u64, v: u64| -> f64 {
+            let r1 = (u as f64) / (u64::MAX as f64).max(1.0);
+            let r2 = (v as f64) / (u64::MAX as f64).max(1.0);
+            let z = (-2.0 * r1.max(1e-12).ln()).sqrt() * (2.0 * std::f64::consts::PI * r2).cos();
+            (3.0 + 0.7 * z).exp()
+        };
+
+        // Path A (ground truth): one sketch, 50k samples inserted
+        // directly.
+        let mut full = DdSketch::new(alpha);
+        // Path B (delta chain): a base sketch from the first 10k
+        // samples, then 4 incremental "flushes" of 10k samples each,
+        // each transmitted as a delta computed against the previous
+        // snapshot.
+        let mut reconstituted = DdSketch::new(alpha);
+        let mut prev_snapshot = DdSketch::new(alpha); // what the "receiver" has cached
+
+        let batch = 10_000;
+        let batches = 5;
+        for b in 0..batches {
+            let mut this_batch = prev_snapshot.clone();
+            for _ in 0..batch {
+                let v = lognormal(next(), next());
+                full.insert(v);
+                this_batch.insert(v);
+            }
+            // Compute a "delta" = diff of this_batch vs prev_snapshot
+            // in our in-memory struct shape. Matches what
+            // `sketchlib-go/sketches/DDSketch/delta.go::ComputeDelta`
+            // would put on the wire.
+            let delta = compute_dd_delta(&prev_snapshot, &this_batch);
+            if b == 0 {
+                // First batch seeds the reconstituted sketch.
+                reconstituted = this_batch.clone();
+            } else {
+                reconstituted.apply_delta(&delta);
+            }
+            prev_snapshot = this_batch;
+        }
+
+        // Both paths should see the same total count + sum (exact).
+        assert_eq!(reconstituted.count, full.count, "count diverged");
+        assert!(
+            (reconstituted.sum - full.sum).abs() < 1e-6,
+            "sum diverged: recon={} full={}",
+            reconstituted.sum,
+            full.sum
+        );
+
+        // And P50 / P90 / P99 should agree within α bound.
+        for q in [0.5, 0.9, 0.99] {
+            let got = reconstituted.quantile(q).unwrap();
+            let want = full.quantile(q).unwrap();
+            let rel_err = (got / want - 1.0).abs();
+            assert!(
+                rel_err <= alpha,
+                "q={} rel_err={:.4} exceeds α={}: reconstituted={}, full={}",
+                q, rel_err, alpha, got, want,
+            );
+        }
+    }
+
+    /// Helper used only in the delta-chain test: computes a
+    /// `DdSketchDelta` from two snapshots. Mirrors the sketchlib-go
+    /// `ComputeDelta` logic so the test exercises the wire-format
+    /// path end-to-end.
+    fn compute_dd_delta(snapshot: &DdSketch, current: &DdSketch) -> DdSketchDelta {
+        let mut cells = Vec::new();
+        if !current.store_counts.is_empty() {
+            for (i, &c) in current.store_counts.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let k = current.store_offset + i as i32;
+                let snap_count: u64 = if !snapshot.store_counts.is_empty() {
+                    let idx = k as i64 - snapshot.store_offset as i64;
+                    if idx >= 0 && (idx as usize) < snapshot.store_counts.len() {
+                        snapshot.store_counts[idx as usize]
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                let dc = c.saturating_sub(snap_count);
+                if dc > 0 {
+                    cells.push((k, dc));
+                }
+            }
+        }
+        let d_count = current.count as i64 - snapshot.count as i64;
+        let d_sum = current.sum - snapshot.sum;
+        let min_changed = current.count > 0
+            && (snapshot.count == 0 || current.min < snapshot.min);
+        let max_changed = current.count > 0
+            && (snapshot.count == 0 || current.max > snapshot.max);
+        DdSketchDelta {
+            buckets: cells,
+            d_count,
+            d_sum,
+            min_changed,
+            new_min: current.min,
+            max_changed,
+            new_max: current.max,
+        }
     }
 }
