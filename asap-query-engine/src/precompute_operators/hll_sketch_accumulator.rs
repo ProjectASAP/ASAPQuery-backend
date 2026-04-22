@@ -13,7 +13,7 @@
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use serde_json::Value;
-use sketch_core::hll_sketch::{HllSketch, HllVariant};
+use sketch_core::hll_sketch::{HllDelta, HllSketch, HllVariant};
 use std::collections::HashMap;
 
 /// HLL accumulator — inner register array + variant metadata.
@@ -107,6 +107,36 @@ impl HllSketchAccumulator {
             state.hip_est,
         );
         Ok(Self { inner })
+    }
+
+    /// Apply a proto-encoded `HLLDelta` frame to this accumulator's
+    /// inner sketch — the decode path for
+    /// `HLL_SKETCH_ENCODING_PROTO_DELTA` (paper §6.2 B3 / B4).
+    ///
+    /// Called against an accumulator that already carries the base
+    /// sketch state; the caller is the per-series snapshot cache in
+    /// the ingest path. Bytes are the
+    /// `asap_otel_proto::sketchlib::v1::HllDelta` message.
+    pub fn apply_proto_delta_bytes(
+        &mut self,
+        buffer: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
+        use prost::Message;
+
+        let pb = PbDelta::decode(buffer)
+            .map_err(|e| format!("decode HLLDelta: {e}"))?;
+
+        let updates = pb
+            .updates
+            .into_iter()
+            .map(|u| (u.index, u.value as u8))
+            .collect();
+        let delta = HllDelta { updates };
+        self.inner
+            .apply_delta(&delta)
+            .map_err(|e| format!("apply HLLDelta: {e}"))?;
+        Ok(())
     }
 }
 
@@ -360,5 +390,32 @@ mod tests {
     fn test_from_msgpack_bytes_rejects_garbage() {
         let result = HllSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_round_trip() {
+        use asap_otel_proto::sketchlib::v1::{HllDelta as PbDelta, HllRegisterUpdate};
+        use prost::Message;
+
+        let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 2);
+        acc.inner.registers = vec![1, 5, 3, 7];
+
+        let delta_bytes = PbDelta {
+            updates: vec![
+                HllRegisterUpdate { index: 0, value: 4 },
+                HllRegisterUpdate { index: 2, value: 6 },
+            ],
+        }
+        .encode_to_vec();
+
+        acc.apply_proto_delta_bytes(&delta_bytes).expect("apply ok");
+        // Max semantics: reg[0]=max(1,4)=4, reg[2]=max(3,6)=6; others unchanged.
+        assert_eq!(acc.inner.registers, vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_rejects_garbage() {
+        let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 2);
+        assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
     }
 }

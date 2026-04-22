@@ -361,6 +361,7 @@ mod tests {
             &state,
             vec![sample("metric_1", 100, 1.0), sample("metric_1", 200, 2.0)],
             std::time::Instant::now(),
+            "prometheus_rw",
         )
         .await;
         assert_eq!(
@@ -383,6 +384,7 @@ mod tests {
             &state,
             vec![sample("metric_1", 100, 1.0)],
             std::time::Instant::now(),
+            "prometheus_rw",
         )
         .await;
         assert_eq!(
@@ -404,6 +406,7 @@ mod tests {
                 sample("metric_1", 500, 5.0),
             ],
             std::time::Instant::now(),
+            "prometheus_rw",
         )
         .await;
         assert_eq!(
@@ -432,6 +435,7 @@ mod tests {
                 sample("yet_another", 200, 2.0),
             ],
             std::time::Instant::now(),
+            "prometheus_rw",
         )
         .await;
         assert_eq!(
@@ -467,6 +471,7 @@ mod tests {
                 sample("metric_prom_test", 400, 4.0),
             ],
             std::time::Instant::now(),
+            "prometheus_rw",
         )
         .await;
 

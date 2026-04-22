@@ -1,0 +1,35 @@
+// ddsketch_delta.proto — Delta wire format for DDSketch.
+//
+// Mirrors `sketchlib-go/proto/ddsketch/ddsketch.proto` DDSketchDelta +
+// DDSketchBucketDelta messages byte-for-byte. Kept as a separate tiny
+// proto in this crate because the upstream `asap_sketchlib` Rust crate
+// only generates the state types today, not the delta types. Once
+// `asap_sketchlib` picks these up upstream this vendoring can be removed.
+//
+// See `sketches/DDSketch/delta.go::ApplyDelta` for the canonical
+// merge semantics — additive bucket counts, additive count + sum,
+// min (can only decrease) + max (can only increase) as lossless
+// scalars when changed.
+
+syntax = "proto3";
+
+package sketchlib.v1;
+
+// DDSketchDelta carries only the buckets that changed above threshold.
+// count/sum are additive deltas; min/max are lossless scalars transmitted
+// only when they changed.
+message DDSketchDelta {
+  repeated DDSketchBucketDelta buckets     = 1;
+  int64   d_count     = 2;
+  double  d_sum       = 3;
+  double  new_min     = 4;
+  double  new_max     = 5;
+  bool    min_changed = 6;
+  bool    max_changed = 7;
+}
+
+// DDSketchBucketDelta is the delta for one log-scale bucket.
+message DDSketchBucketDelta {
+  sint32 index   = 1;  // signed bucket index (negative for values < 1)
+  uint64 d_count = 2;  // Δcount ≥ threshold T
+}

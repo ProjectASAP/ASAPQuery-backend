@@ -5,6 +5,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/opentelemetry/proto/resource/v1/resource.proto",
         "proto/opentelemetry/proto/metrics/v1/metrics.proto",
         "proto/opentelemetry/proto/collector/metrics/v1/metrics_service.proto",
+        // sketchlib.v1 delta messages — vendored locally because
+        // the upstream asap_sketchlib crate only exposes state
+        // types today, not delta types. See the .proto file
+        // headers for the sketchlib-go source of truth.
+        "proto/sketchlib_delta/ddsketch_delta.proto",
+        "proto/sketchlib_delta/hll_delta.proto",
     ];
     for f in &proto_files {
         println!("cargo:rerun-if-changed={f}");
