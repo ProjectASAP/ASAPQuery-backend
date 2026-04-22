@@ -37,6 +37,24 @@ pub enum CountMinBackend {
 }
 
 /// Count-Min Sketch probabilistic data structure for frequency counting.
+/// Sparse delta between two consecutive CountMinSketch snapshots —
+/// the input shape for [`CountMinSketch::apply_delta`]. Mirrors the
+/// `CountMinDelta` proto in
+/// `sketchlib-go/proto/countminsketch/countminsketch.proto` (packed
+/// encoding only).
+///
+/// Cells apply additively: `matrix[row][col] += d_count`. Per-row
+/// L1 and L2 norm deltas are carried for downstream error-accounting
+/// but are not consumed by `apply_delta` itself.
+#[derive(Debug, Clone, Default)]
+pub struct CountMinDelta {
+    pub rows: u32,
+    pub cols: u32,
+    pub cells: Vec<(u32, u32, i64)>,
+    pub l1: Vec<f64>,
+    pub l2: Vec<f64>,
+}
+
 /// Provides approximate frequency counts with error bounds.
 /// This is the canonical shared implementation; the msgpack wire format is the
 /// contract between Arroyo UDAFs (producers) and QueryEngineRust (consumer).
@@ -257,6 +275,53 @@ impl CountMinSketch {
         }
     }
 
+    /// Apply a sparse delta in place. Matches the `ApplyDelta`
+    /// semantics in `sketchlib-go/sketches/CountMinSketch/delta.go`:
+    /// `matrix[row][col] += d_count` for each cell in the delta.
+    ///
+    /// Both backends (Legacy Vec-of-Vec and Sketchlib FFI) are
+    /// supported: for Legacy we mutate `sketch_mut()` in place; for
+    /// Sketchlib the FFI handle is opaque, so we snapshot the
+    /// matrix, apply cell updates, and rebuild the backend. The
+    /// rebuild is O(rows × cols) per delta and is acceptable for
+    /// ingest-side reconstitution — no delta should fire more than
+    /// once per window (10s–300s in the paper's B3 / B4 configs).
+    pub fn apply_delta(
+        &mut self,
+        delta: &CountMinDelta,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        for (row, col, _) in &delta.cells {
+            let r = *row as usize;
+            let c = *col as usize;
+            if r >= self.row_num || c >= self.col_num {
+                return Err(format!(
+                    "CountMinDelta cell ({r},{c}) out of range (matrix={}x{})",
+                    self.row_num, self.col_num
+                )
+                .into());
+            }
+        }
+        match &mut self.backend {
+            CountMinBackend::Legacy(matrix) => {
+                for (row, col, d_count) in &delta.cells {
+                    matrix[*row as usize][*col as usize] += *d_count as f64;
+                }
+            }
+            CountMinBackend::Sketchlib(_) => {
+                let mut matrix = self.sketch();
+                for (row, col, d_count) in &delta.cells {
+                    matrix[*row as usize][*col as usize] += *d_count as f64;
+                }
+                self.backend = CountMinBackend::Sketchlib(sketchlib_cms_from_matrix(
+                    self.row_num,
+                    self.col_num,
+                    &matrix,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize to MessagePack — matches the Arroyo UDF wire format exactly.
     pub fn serialize_msgpack(&self) -> Vec<u8> {
         let sketch = self.sketch();
@@ -419,5 +484,65 @@ mod tests {
     #[test]
     fn test_aggregate_count_empty() {
         assert!(CountMinSketch::aggregate_count(4, 100, &[], &[]).is_none());
+    }
+
+    #[test]
+    fn test_apply_delta_additive() {
+        let mut cms = CountMinSketch::from_legacy_matrix(
+            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+            2,
+            3,
+        );
+        let delta = CountMinDelta {
+            rows: 2,
+            cols: 3,
+            cells: vec![(0, 0, 10), (1, 2, 100)],
+            l1: vec![],
+            l2: vec![],
+        };
+        cms.apply_delta(&delta).unwrap();
+        assert_eq!(
+            cms.sketch(),
+            vec![vec![11.0, 2.0, 3.0], vec![4.0, 5.0, 106.0]]
+        );
+    }
+
+    #[test]
+    fn test_apply_delta_matches_full_merge() {
+        let base = CountMinSketch::from_legacy_matrix(
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            2,
+            2,
+        );
+        let addition = CountMinSketch::from_legacy_matrix(
+            vec![vec![10.0, 0.0], vec![0.0, 20.0]],
+            2,
+            2,
+        );
+        let via_merge = CountMinSketch::merge(vec![base.clone(), addition]).unwrap();
+
+        let delta = CountMinDelta {
+            rows: 2,
+            cols: 2,
+            cells: vec![(0, 0, 10), (1, 1, 20)],
+            l1: vec![],
+            l2: vec![],
+        };
+        let mut via_delta = base;
+        via_delta.apply_delta(&delta).unwrap();
+        assert_eq!(via_delta.sketch(), via_merge.sketch());
+    }
+
+    #[test]
+    fn test_apply_delta_out_of_range() {
+        let mut cms = CountMinSketch::new(2, 3);
+        let delta = CountMinDelta {
+            rows: 2,
+            cols: 3,
+            cells: vec![(5, 0, 1)],
+            l1: vec![],
+            l2: vec![],
+        };
+        assert!(cms.apply_delta(&delta).is_err());
     }
 }

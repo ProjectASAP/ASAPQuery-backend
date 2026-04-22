@@ -11,6 +11,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // headers for the sketchlib-go source of truth.
         "proto/sketchlib_delta/ddsketch_delta.proto",
         "proto/sketchlib_delta/hll_delta.proto",
+        "proto/sketchlib_delta/countsketch_delta.proto",
+        "proto/sketchlib_delta/countminsketch_delta.proto",
     ];
     for f in &proto_files {
         println!("cargo:rerun-if-changed={f}");

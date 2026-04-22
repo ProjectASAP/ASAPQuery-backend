@@ -21,7 +21,7 @@
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use serde_json::Value;
-use sketch_core::count_sketch::CountSketch;
+use sketch_core::count_sketch::{CountSketch, CountSketchDelta};
 use std::collections::HashMap;
 
 /// Count Sketch accumulator — inner matrix of signed counts.
@@ -142,6 +142,55 @@ impl CountSketchAccumulator {
         Ok(Self {
             inner: CountSketch::from_legacy_matrix(matrix, rows, cols),
         })
+    }
+
+    /// Apply a proto-encoded `CountSketchDelta` frame to this
+    /// accumulator's inner sketch — the decode path for
+    /// `COUNT_SKETCH_ENCODING_PROTO_DELTA` (paper §6.2 B3 / B4).
+    ///
+    /// Cells apply additively: `matrix[cell_rows[i]][cell_cols[i]]
+    /// += d_counts[i]`. Per-row L2 is parsed off the wire but
+    /// ignored at application time — it's a downstream error-
+    /// accounting signal, not a merge input.
+    pub fn apply_proto_delta_bytes(
+        &mut self,
+        buffer: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use asap_otel_proto::sketchlib::v1::CountSketchDelta as PbDelta;
+        use prost::Message;
+
+        let pb = PbDelta::decode(buffer)
+            .map_err(|e| format!("decode CountSketchDelta: {e}"))?;
+
+        if pb.cell_rows.len() != pb.cell_cols.len()
+            || pb.cell_rows.len() != pb.d_counts.len()
+        {
+            return Err(format!(
+                "CountSketchDelta packed-array length mismatch: \
+                 cell_rows={}, cell_cols={}, d_counts={}",
+                pb.cell_rows.len(),
+                pb.cell_cols.len(),
+                pb.d_counts.len()
+            )
+            .into());
+        }
+        let cells = pb
+            .cell_rows
+            .iter()
+            .zip(pb.cell_cols.iter())
+            .zip(pb.d_counts.iter())
+            .map(|((r, c), dc)| (*r, *c, *dc))
+            .collect();
+        let delta = CountSketchDelta {
+            rows: pb.rows,
+            cols: pb.cols,
+            cells,
+            l2: pb.l2,
+        };
+        self.inner
+            .apply_delta(&delta)
+            .map_err(|e| format!("apply CountSketchDelta: {e}"))?;
+        Ok(())
     }
 }
 
@@ -411,5 +460,40 @@ mod tests {
     fn test_from_msgpack_bytes_rejects_garbage() {
         let result = CountSketchAccumulator::from_msgpack_bytes(b"not valid msgpack");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_round_trip() {
+        use asap_otel_proto::sketchlib::v1::CountSketchDelta as PbDelta;
+        use prost::Message;
+
+        let mut acc = CountSketchAccumulator {
+            inner: CountSketch::from_legacy_matrix(
+                vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+                2,
+                3,
+            ),
+        };
+        let bytes = PbDelta {
+            rows: 2,
+            cols: 3,
+            cell_rows: vec![0, 1],
+            cell_cols: vec![0, 2],
+            d_counts: vec![10, -6],
+            l2: vec![],
+        }
+        .encode_to_vec();
+
+        acc.apply_proto_delta_bytes(&bytes).expect("apply ok");
+        assert_eq!(
+            acc.inner.sketch(),
+            &vec![vec![11.0, 2.0, 3.0], vec![4.0, 5.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_rejects_garbage() {
+        let mut acc = CountSketchAccumulator::new(2, 3);
+        assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
     }
 }

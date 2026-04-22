@@ -917,7 +917,10 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     existing: &mut Box<dyn AggregateCore>,
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::precompute_operators::{DDSketchAccumulator, HllSketchAccumulator};
+    use crate::precompute_operators::{
+        CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
+        HllSketchAccumulator,
+    };
 
     match (encoding, kind) {
         (ENCODING_PROTO_DELTA, SketchKind::DdSketch) => {
@@ -940,9 +943,29 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
                 )?;
             hll.apply_proto_delta_bytes(bytes)
         }
+        (ENCODING_PROTO_DELTA, SketchKind::CountSketch) => {
+            let cs = existing
+                .as_any_mut()
+                .downcast_mut::<CountSketchAccumulator>()
+                .ok_or(
+                    "apply_modified_otlp_delta_bytes: existing accumulator is \
+                     not a CountSketchAccumulator",
+                )?;
+            cs.apply_proto_delta_bytes(bytes)
+        }
+        (ENCODING_PROTO_DELTA, SketchKind::CountMin) => {
+            let cms = existing
+                .as_any_mut()
+                .downcast_mut::<CountMinSketchAccumulator>()
+                .ok_or(
+                    "apply_modified_otlp_delta_bytes: existing accumulator is \
+                     not a CountMinSketchAccumulator",
+                )?;
+            cms.apply_proto_delta_bytes(bytes)
+        }
         (ENCODING_PROTO_DELTA, other) => Err(format!(
             "PROTO_DELTA for sketch kind {other:?} is not yet supported; \
-             DDSketch and HLL are wired in PR G"
+             DDSketch / HLL / CountSketch / CountMin are wired"
         )
         .into()),
         (ENCODING_MSGPACK_DELTA, _) => Err(
