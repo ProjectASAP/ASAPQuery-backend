@@ -42,6 +42,25 @@ pub struct IngestState {
     pub schemas: Arc<SchemaRegistry>,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
+    /// Per-series snapshot cache for delta-sketch reconstitution
+    /// (paper §6.2 B3 / B4). On arrival of a full `ENCODING_PROTO`
+    /// / `ENCODING_MSGPACK` frame the ingest path stores a clone of
+    /// the decoded accumulator keyed by the metric's series_key. On
+    /// arrival of a subsequent `ENCODING_PROTO_DELTA` frame it looks
+    /// up the cached base, clones it, applies the delta via
+    /// `apply_modified_otlp_delta_bytes`, and updates the cache so
+    /// the next delta composes correctly.
+    ///
+    /// DashMap chosen over `Mutex<HashMap>` so concurrent OTLP
+    /// receiver tasks don't serialize on cache access — each
+    /// series_key is an independent shard.
+    ///
+    /// Growth is bounded by the active series set in the running
+    /// streaming config; no explicit eviction yet. A cold-store
+    /// follow-up will add TTL-based eviction keyed by last-seen
+    /// timestamp so long-running deployments don't leak memory
+    /// on retired series.
+    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::data_model::AggregateCore>>,
 }
 
 impl IngestState {
@@ -348,6 +367,7 @@ mod tests {
             hot_reload_config: hot_reload,
             schemas,
             pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -520,6 +540,109 @@ mod tests {
             7,
             "atomic counter must advance by 7 via the helper"
         );
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// Base frame → delta frame → second delta frame path against
+    /// the per-series sketch snapshot cache. Exercises what the OTLP
+    /// ingest loop does for a DDSketch stream: store on full, apply
+    /// + refresh on delta, verify the cumulative state matches a
+    /// hand-merged sequence of full sketches.
+    #[tokio::test]
+    async fn delta_path_reconstitutes_cumulative_state() {
+        use crate::drivers::ingest::otel::{
+            apply_modified_otlp_delta_bytes, SketchKind,
+        };
+        use crate::precompute_operators::DDSketchAccumulator;
+        use asap_otel_proto::sketchlib::v1::{
+            DdSketchBucketDelta, DdSketchDelta as PbDelta,
+        };
+        use prost::Message;
+        use sketch_core::dd_sketch::DdSketch;
+
+        const ENCODING_PROTO_DELTA: i32 = 2;
+
+        let (state, drain) = setup_state(42, "latency_ms").await;
+
+        // Seed the cache with a base DDSketch as if the agent's
+        // first PROTO-encoded frame had landed. Use a distinct key
+        // so we're not racing any earlier tests.
+        let series_key = "__name__=latency_ms,inst=a";
+        let base = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0),
+        };
+        state
+            .sketch_snapshots
+            .insert(series_key.to_string(), Box::new(base.clone()));
+
+        // First delta adds to bucket 0 and bucket 2.
+        let d1 = PbDelta {
+            buckets: vec![
+                DdSketchBucketDelta { index: 0, d_count: 10 },
+                DdSketchBucketDelta { index: 2, d_count: 20 },
+            ],
+            d_count: 30,
+            d_sum: 70.0,
+            new_max: 5.0,
+            max_changed: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut acc1 = state
+            .sketch_snapshots
+            .get(series_key)
+            .unwrap()
+            .clone_boxed_core();
+        apply_modified_otlp_delta_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc1,
+            &d1,
+        )
+        .expect("apply first delta");
+        state
+            .sketch_snapshots
+            .insert(series_key.to_string(), acc1.clone_boxed_core());
+
+        // Second delta — picks up on top of the first, proving the
+        // cache refresh is transitive.
+        let d2 = PbDelta {
+            buckets: vec![DdSketchBucketDelta { index: 1, d_count: 5 }],
+            d_count: 5,
+            d_sum: 10.0,
+            new_max: 6.0,
+            max_changed: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut acc2 = state
+            .sketch_snapshots
+            .get(series_key)
+            .unwrap()
+            .clone_boxed_core();
+        apply_modified_otlp_delta_bytes(
+            SketchKind::DdSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc2,
+            &d2,
+        )
+        .expect("apply second delta");
+
+        let final_dd = acc2
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .unwrap();
+        // Base [1,2,3] + d1 [+10 on 0, +20 on 2] = [11,2,23];
+        // + d2 [+5 on 1] = [11,7,23].
+        assert_eq!(final_dd.inner.store_counts, vec![11, 7, 23]);
+        // Counts add: 6 + 30 + 5 = 41.
+        assert_eq!(final_dd.inner.count, 41);
+        // Sum: 12 + 70 + 10 = 92.
+        assert_eq!(final_dd.inner.sum, 92.0);
+        // Max updated to 6.0 via d2's max_changed flag.
+        assert_eq!(final_dd.inner.max, 6.0);
+
         drop(state);
         let _ = drain.await;
     }

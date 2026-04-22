@@ -650,22 +650,88 @@ async fn route_modified_otlp_sketches_to_precompute(
                     let series_key = format_series_key(&metric.name, &dp.attrs);
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
-                    let accumulator: Box<dyn AggregateCore> =
-                        match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
-                            Ok(acc) => acc,
-                            Err(e) => {
-                                decoded_failed += 1;
-                                debug!(
-                                "OTLP modified-proto sketch decode failed (metric={}, kind={:?}, encoding={}, bytes={}): {} — falling through to §5.2 fallback",
+                    // Encoding dispatch: full frames (PROTO /
+                    // MSGPACK) decode standalone and refresh the
+                    // per-series snapshot cache; delta frames
+                    // (PROTO_DELTA) look up the cached base and
+                    // apply the diff in place. The cache key is the
+                    // series_key — agent-side windowing guarantees
+                    // one in-flight delta per (metric, labels) so
+                    // the next full snapshot replaces the current
+                    // cache entry cleanly.
+                    let accumulator: Box<dyn AggregateCore> = if dp.encoding
+                        == ENCODING_PROTO_DELTA
+                        || dp.encoding == ENCODING_MSGPACK_DELTA
+                    {
+                        let Some(base) = ingest_state
+                            .sketch_snapshots
+                            .get(&series_key)
+                            .map(|e| e.clone_boxed_core())
+                        else {
+                            decoded_failed += 1;
+                            debug!(
+                                "OTLP delta-sketch arrived before any base \
+                                 snapshot (metric={}, series_key={}); \
+                                 dropping — agent must resend the next full \
+                                 frame",
+                                metric.name, series_key
+                            );
+                            continue;
+                        };
+                        let mut merged = base;
+                        if let Err(e) = apply_modified_otlp_delta_bytes(
+                            dp.kind,
+                            dp.encoding,
+                            &mut merged,
+                            &dp.sketch,
+                        ) {
+                            decoded_failed += 1;
+                            debug!(
+                                "OTLP delta-sketch apply failed \
+                                 (metric={}, kind={:?}, encoding={}, \
+                                 bytes={}): {} — falling through to §5.2 \
+                                 fallback",
                                 metric.name,
                                 dp.kind,
                                 dp.encoding,
                                 dp.sketch.len(),
                                 e
                             );
+                            continue;
+                        }
+                        ingest_state
+                            .sketch_snapshots
+                            .insert(series_key.clone(), merged.clone_boxed_core());
+                        merged
+                    } else {
+                        match decode_modified_otlp_sketch_bytes(
+                            dp.kind,
+                            dp.encoding,
+                            &dp.sketch,
+                        ) {
+                            Ok(acc) => {
+                                ingest_state
+                                    .sketch_snapshots
+                                    .insert(series_key.clone(), acc.clone_boxed_core());
+                                acc
+                            }
+                            Err(e) => {
+                                decoded_failed += 1;
+                                debug!(
+                                    "OTLP modified-proto sketch decode failed \
+                                     (metric={}, kind={:?}, encoding={}, \
+                                     bytes={}): {} — falling through to §5.2 \
+                                     fallback",
+                                    metric.name,
+                                    dp.kind,
+                                    dp.encoding,
+                                    dp.sketch.len(),
+                                    e
+                                );
                                 continue;
                             }
-                        };
+                        }
+                    };
 
                     let mut matched_any = false;
                     for config in agg_configs.values() {
@@ -723,7 +789,7 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// Sketch family carried by a modified-OTLP `*SketchDataPoint`. Used by
 /// the encoding dispatcher in `decode_modified_otlp_sketch_bytes`.
 #[derive(Debug, Clone, Copy)]
-enum SketchKind {
+pub(crate) enum SketchKind {
     DdSketch,
     Kll,
     CountSketch,

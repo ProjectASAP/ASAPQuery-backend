@@ -93,6 +93,7 @@ impl PrecomputeEngine {
             hot_reload_config: hot_reload_config.clone(),
             schemas,
             pass_raw_samples: config.pass_raw_samples,
+            sketch_snapshots: dashmap::DashMap::new(),
         });
 
         Self {
