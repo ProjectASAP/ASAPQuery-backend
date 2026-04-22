@@ -3,7 +3,7 @@ use crate::data_model::{
     MultipleSubpopulationAggregate, SerializableToSink,
 };
 use serde_json::Value;
-use sketch_core::count_min::CountMinSketch;
+use sketch_core::count_min::{CountMinDelta, CountMinSketch};
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
@@ -174,6 +174,51 @@ impl CountMinSketchAccumulator {
         Ok(Self {
             inner: CountMinSketch::from_legacy_matrix(matrix, rows, cols),
         })
+    }
+
+    /// Apply a proto-encoded `CountMinDelta` frame to this
+    /// accumulator's inner sketch — the decode path for
+    /// `COUNT_MIN_SKETCH_ENCODING_PROTO_DELTA` (paper §6.2 B3 / B4).
+    pub fn apply_proto_delta_bytes(
+        &mut self,
+        buffer: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use prost::Message;
+
+        let pb = PbDelta::decode(buffer)
+            .map_err(|e| format!("decode CountMinDelta: {e}"))?;
+
+        if pb.cell_rows.len() != pb.cell_cols.len()
+            || pb.cell_rows.len() != pb.d_counts.len()
+        {
+            return Err(format!(
+                "CountMinDelta packed-array length mismatch: \
+                 cell_rows={}, cell_cols={}, d_counts={}",
+                pb.cell_rows.len(),
+                pb.cell_cols.len(),
+                pb.d_counts.len()
+            )
+            .into());
+        }
+        let cells = pb
+            .cell_rows
+            .iter()
+            .zip(pb.cell_cols.iter())
+            .zip(pb.d_counts.iter())
+            .map(|((r, c), dc)| (*r, *c, *dc))
+            .collect();
+        let delta = CountMinDelta {
+            rows: pb.rows,
+            cols: pb.cols,
+            cells,
+            l1: pb.l1,
+            l2: pb.l2,
+        };
+        self.inner
+            .apply_delta(&delta)
+            .map_err(|e| format!("apply CountMinDelta: {e}"))?;
+        Ok(())
     }
 
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -738,5 +783,41 @@ mod tests {
         let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("zero dims"));
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_round_trip() {
+        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use prost::Message;
+
+        let mut acc = CountMinSketchAccumulator {
+            inner: CountMinSketch::from_legacy_matrix(
+                vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+                2,
+                3,
+            ),
+        };
+        let bytes = PbDelta {
+            rows: 2,
+            cols: 3,
+            cell_rows: vec![0, 1],
+            cell_cols: vec![0, 2],
+            d_counts: vec![10, 100],
+            l1: vec![],
+            l2: vec![],
+        }
+        .encode_to_vec();
+
+        acc.apply_proto_delta_bytes(&bytes).expect("apply ok");
+        assert_eq!(
+            acc.inner.sketch(),
+            vec![vec![11.0, 2.0, 3.0], vec![4.0, 5.0, 106.0]]
+        );
+    }
+
+    #[test]
+    fn test_apply_proto_delta_bytes_rejects_garbage() {
+        let mut acc = CountMinSketchAccumulator::new(2, 3);
+        assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
     }
 }

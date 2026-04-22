@@ -1,0 +1,33 @@
+// countsketch_delta.proto — Delta wire format for CountSketch.
+//
+// Mirrors the new packed encoding of `CountSketchDelta` in
+// `sketchlib-go/proto/countsketch/countsketch.proto`. Only the
+// packed `cell_rows` / `cell_cols` / `d_counts` path is modeled
+// here — the deprecated `cells_legacy` / `l2_legacy` fields and
+// the `topk` / `hh_keys` top-K carriers are omitted because:
+//
+//   * Legacy cells: new producers (sketchlib-go v0 and later)
+//     don't emit them.
+//   * Top-K on delta path: CountSketch's top-K is non-linear, so
+//     sketchlib-go transmits it in full (TopKState), not via
+//     delta. Merging top-K deltas would require re-querying the
+//     CS accumulator for each candidate key, which the backend
+//     doesn't wire today. A follow-up PR can pick this up once
+//     the §6.4 accuracy experiments flag top-K as worth chasing.
+//
+// Bucket additive semantics: `cell_rows[i]`, `cell_cols[i]` →
+// matrix[row][col] += d_counts[i]. L2 norm is per-row
+// additive.
+
+syntax = "proto3";
+
+package sketchlib.v1;
+
+message CountSketchDelta {
+  uint32         rows      = 1;
+  uint32         cols      = 2;
+  repeated uint32 cell_rows = 9  [packed = true];
+  repeated uint32 cell_cols = 10 [packed = true];
+  repeated sint64 d_counts  = 11 [packed = true];
+  repeated double l2        = 12 [packed = true];
+}
