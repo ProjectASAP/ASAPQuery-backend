@@ -1,7 +1,10 @@
 # Design: Sketch DB as a Pluggable Component
 
-Companion to [`design-sketch-db.md`](./design-sketch-db.md). That doc defines
-*what* the sketch DB is; this one defines *how it detaches* from
+Companion to the sketch DB design set — see
+[`design-sketch-db.md`](./design-sketch-db.md) for the index and
+[`design-sketch-db-core.md`](./design-sketch-db-core.md) for the
+as-built contract. Those docs define *what* the sketch DB is; this
+one defines *how it detaches* from
 `asap-query-engine` so it can be consumed either as a **library crate** embedded
 in another process or as a **standalone binary** (a sketch-store service) that
 any component in the system can talk to over the network.
@@ -48,7 +51,7 @@ interchangeable shapes:
 Both shapes share **one** Rust API surface, one schema, one on-disk format.
 
 Scope is a refactor with no change to the sketch DB's semantics. The
-design-sketch-db.md contract (agg_id immutability, write barrier, timeline
+design-sketch-db-core.md contract (agg_id immutability, write barrier, timeline
 dispatch, accuracy profiles, backfill) is preserved verbatim.
 
 ---
