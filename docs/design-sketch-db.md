@@ -83,6 +83,7 @@ regardless of which file a reader is in.
 | 18 | Open questions | **roadmap** |
 | 19 | Performance envelope (incl. §19.9 accuracy bounds, §19.10 merge propagation) | **performance** |
 | 20 | Sketch profiler library | **performance** |
+| 21 | Related approaches: wavelets and ML models as materialized views | **performance** |
 
 ---
 

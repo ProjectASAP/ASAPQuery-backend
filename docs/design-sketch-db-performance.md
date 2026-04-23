@@ -427,3 +427,143 @@ This library does not exist yet. It is called out here because:
   infrastructure that doesn't belong here.
 
 A separate design doc (`design-sketch-profiler.md`) will follow.
+
+---
+
+## 21. Related approaches: wavelets and ML models as materialized views
+
+The MV framing in core §2 treats sketches as "precomputed,
+incrementally-maintainable summaries of a base relation." That
+description is broader than sketches — wavelets and (some) ML models
+fit it too. This section positions the sketch DB design against those
+neighbours so future extensions can reason about which of them slot in
+cleanly and which require contract changes.
+
+The framing holds whenever five properties are present:
+
+1. A **base relation** the summary is derived from.
+2. **Deterministic derivation** (given parameters).
+3. Either **incremental** or **refresh** maintenance semantics.
+4. **Queries answerable without rescanning the base.**
+5. A **known accuracy contract** (how wrong the answer can be).
+
+Sketches hit all five. Wavelets and ML models hit some but not all —
+the pattern of misses determines what it would take to treat them as
+first-class citizens of the sketch DB.
+
+### 21.1 Side-by-side comparison
+
+| Dimension | Sketches (CMS / HLL / KLL / DDSketch) | Wavelets (DWT / Haar + thresholding) | ML models |
+|---|---|---|---|
+| Base relation | Raw sample stream | Signal / time series | Training set |
+| Mergeable (monoid) | **Yes, by design** — associative + commutative merge is a defining property | **Partially** — Haar on aligned dyadic intervals merges cleanly; general DWT does not | **Rarely** — only linear / moment-based things (online PCA via covariance sums, linear regression normal equations, naive Bayes w/ conjugate priors). Neural nets are not monoids: training on A then B ≠ B then A |
+| Incremental update cost | O(1) per sample | Amortized O(log n) for online / sliding DWT | Variable; SGD continuations risk catastrophic forgetting |
+| Refresh cost | Cheap (replay stream) | Moderate (one DWT pass) | **Huge** — full retraining is why RAG exists as a workaround |
+| Accuracy bound | **Provable, closed-form** from parameters (ε, δ, K, α, m) | Provable — L2 error bounded by discarded coefficient energy (Parseval) | **Empirical**, data-dependent; PAC / conformal bounds exist but are much weaker and narrower |
+| Query classes answered | Fixed at design: count, sum, quantile, top-k, cardinality | Fixed: range sums, heavy hitters, point queries, wavelet-domain features | **Open-ended** — whatever the training objective was |
+| View-definition formalism | An aggregation function + parameters | A basis transform + threshold | Training objective + architecture + hyperparameters + seed |
+
+### 21.2 Wavelets — a sibling sketch family
+
+Wavelets are essentially an alternative sketch family. The classical
+AQP line of work
+(Garofalakis, Gibbons, Matias, Vitter — "Approximate Query Processing
+via Wavelets," VLDB 1998 onward) treats them as a direct alternative
+to randomized sketches for range-sum and heavy-hitter workloads.
+
+Compared to CMS / KLL:
+
+- **Strength**: wavelets exploit signal structure. On smooth or
+  low-entropy signals (diurnal telemetry, time-of-day patterns,
+  histograms that concentrate on a few modes) thresholded wavelets
+  produce dramatically smaller representations than sketches of
+  comparable accuracy.
+- **Weakness**: on high-entropy / uniform data their advantage
+  disappears, because the thresholded coefficient set doesn't shrink.
+- **Operational fit**: Haar wavelets on aligned dyadic intervals merge
+  cleanly, which means a Haar-based agg could use the same
+  `(agg_id, group_key, window)` storage as a CMS agg with only
+  modest changes to the merge trait. Non-Haar wavelets would require
+  either strict window alignment or a refresh-only maintenance
+  strategy.
+
+**Takeaway**: if a future `SketchType::Wavelet` were added, the
+existing sketch-DB contracts (schema timeline, backfill, accuracy
+profile, tier storage) generalize without structural change. The
+`AccuracyProfile::ErrorBound` enum already has room for an
+L2-energy-based variant.
+
+### 21.3 ML models — MVs with weaker contracts
+
+ML models fit the MV framing in the loose sense: they are precomputed,
+queryable, compressed summaries of a base relation. But the sketch
+DB's **four operational contracts** weaken or vanish:
+
+- **Mergeability** (core §7.3 cross-segment combine) — lost for
+  non-linear models. Only linear or moment-based models (running
+  PCA, linear regression normal equations, conjugate Bayes,
+  streaming k-means coresets) retain a monoid structure and can
+  meaningfully merge across segments or time ranges.
+- **Closed-form accuracy bound** (core §6.4) — lost. Replaced by
+  empirical validation + sometimes conformal prediction bands. The
+  `AccuracyProfile` contract would need a new `Empirical` variant
+  that carries calibration data rather than a parameterized formula.
+- **Deterministic rebuild** (core §10.5) — weak. Training is
+  conditionally deterministic (seed + hyperparams + batch order +
+  hardware), but reproducing bit-identical outputs across hardware is
+  a well-known open problem in ML engineering.
+- **Cheap refresh** — gone. Refresh cost is the dominant operational
+  concern for large models; the two-tier maintenance strategy
+  (incremental + refresh) that makes sketch-DB reconfigure painless
+  does not translate — continual training and fine-tuning are poor
+  substitutes for sketch refresh.
+
+The interesting **sub-class** that does fit is linear / additive
+models:
+
+- **Online PCA / streaming covariance** — monoid via covariance sum;
+  bounded error via eigenvalue bounds. Functionally a sketch.
+- **Linear regression (normal equations form)** — `XᵀX` and `Xᵀy`
+  accumulators merge by summation; bounds follow from standard linear
+  algebra. Functionally a sketch.
+- **Coreset-based clustering** (BIRCH, k-means coresets) — mergeable
+  by construction; accuracy is a multiplicative factor on the optimal
+  clustering cost.
+- **Naive Bayes with conjugate priors** — parameter updates are
+  additive in sufficient statistics.
+
+Each of these could be added to the sketch DB as a `SketchType`
+variant without changing the core contract. They would share schema
+timeline, backfill, accuracy profile, and tier storage with the
+existing sketches.
+
+Neural / tree-ensemble / LLM models would require a parallel design
+with weaker contracts: no merge, refresh-only maintenance,
+empirical-only accuracy. That's closer to a **model registry** than a
+sketch DB, and the open research literature
+(Kraska et al. — SageDB; Hilprecht et al. — DeepDB; Yang et al. —
+NeuroCard; DBEst / DBEst++) explores exactly that split. A pragmatic
+integration path would be: host model artifacts beside sketches under
+the same `agg_id` lifecycle and HTTP surface, but use a separate
+storage engine internally — the `SketchDb` facade
+(see [`design-sketch-db-pluggable.md`](./design-sketch-db-pluggable.md))
+makes this kind of backend swap mechanical.
+
+### 21.4 Practical implication for the sketch DB design
+
+The sketch DB's architecture — `agg_id` lifecycle, schema timeline,
+backfill-from-base, accuracy-as-metadata — generalizes without change
+to:
+
+1. **Sketches** (today).
+2. **Wavelets** (mostly; Haar is trivial, general DWT needs window
+   alignment).
+3. **Linear-ish ML summaries** (PCA, linear regression, coresets,
+   conjugate-prior Bayes).
+
+It does **not** generalize cleanly to neural / tree-ensemble models
+without relaxing the mergeability and closed-form-bound contracts.
+Keeping those relaxations out of the core, and introducing them in a
+companion "model view" subsystem if the need arises, preserves the
+properties that make the sketch DB's behavior predictable.
+
