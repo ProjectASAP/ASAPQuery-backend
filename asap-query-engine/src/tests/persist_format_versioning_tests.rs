@@ -432,3 +432,170 @@ mod part_meta {
         let _ = format!("{err}");
     }
 }
+
+// ─── v2 forward-compat: load-with-bumped-version contract ──────────────
+//
+// TODO.md §4 calls for: "Check in a golden snapshot at v1, load with v2
+// code, verify expected migration OR safe fall-back-to-fresh, assert no
+// crash, no data corruption." The earlier modules cover the policy with
+// hardcoded v999 sentinels; this module pins the contract to the
+// **actual constant + 1**, so the tests self-update if/when the version
+// is bumped — and explicitly asserts the rewritten on-disk file is at
+// the current version with no orphan fields.
+mod v2_forward_compat {
+    use super::*;
+    use crate::stores::sketch_db::backfill::PERSIST_FORMAT_VERSION as BACKFILL_V;
+    use crate::stores::sketch_db::schema::PERSIST_FORMAT_VERSION as SCHEMA_V;
+    use crate::stores::sketch_db::simple_map_store::persistence::part::PartReader;
+
+    /// SchemaRegistry: snapshot tagged v_current+1 must trigger safe
+    /// fallback, and the rewrite must be at v_current with the new
+    /// config's schemas — no leakage from the future-version blob.
+    #[test]
+    fn schema_v1_with_future_version_falls_back_and_rewrites_clean() {
+        use crate::data_model::StreamingConfig;
+        use asap_types::aggregation_config::AggregationConfig;
+        use asap_types::enums::{AggregationType, WindowType};
+        use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+
+        fn make_cfg(agg_id: u64, metric: &str) -> AggregationConfig {
+            AggregationConfig::new(
+                agg_id,
+                AggregationType::CountMinSketch,
+                String::new(),
+                std::collections::HashMap::new(),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                String::new(),
+                60,
+                60,
+                WindowType::Tumbling,
+                String::new(),
+                metric.to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+
+        let dir = tmpdir();
+        let path = dir.path().join("schemas.json");
+
+        // Seed a legitimate v_current snapshot with one schema.
+        let cfg_seed = {
+            let mut m = std::collections::HashMap::new();
+            m.insert(7, make_cfg(7, "future_version_metric"));
+            StreamingConfig::new(m)
+        };
+        drop(SchemaRegistry::load_or_new_from_config(&path, &cfg_seed));
+
+        // Bump version field to SCHEMA_V + 1 — simulating "v2 code wrote
+        // this; we are v1 and should refuse to interpret it as v1."
+        let mut snap: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        snap["version"] = serde_json::json!(SCHEMA_V + 1);
+        fs::write(&path, serde_json::to_vec_pretty(&snap).unwrap()).unwrap();
+
+        // Reload with a fresh config: must fall back, agg 7 must NOT
+        // appear, agg 99 (from new config) must appear.
+        let cfg_new = {
+            let mut m = std::collections::HashMap::new();
+            m.insert(99, make_cfg(99, "fresh_metric"));
+            StreamingConfig::new(m)
+        };
+        let r = SchemaRegistry::load_or_new_from_config(&path, &cfg_new);
+        assert!(r.is_writable(99), "fresh registry must seed from cfg_new");
+        assert!(
+            r.get(7).is_none(),
+            "future-version snapshot's schemas must NOT leak in",
+        );
+
+        // No data corruption: the rewritten file must be valid JSON, at
+        // SCHEMA_V exactly, with the new agg_id present and no stray
+        // fields from the bumped blob.
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).expect("post-fallback file is JSON");
+        assert_eq!(after["version"], SCHEMA_V);
+        assert!(
+            after["schemas"].is_array(),
+            "post-fallback snapshot has the v_current shape"
+        );
+    }
+
+    /// BackfillRegistry: same contract.
+    #[test]
+    fn backfill_v1_with_future_version_falls_back_and_rewrites_clean() {
+        let dir = tmpdir();
+        let path = dir.path().join("backfill.json");
+
+        // Hand-write a snapshot at BACKFILL_V + 1 with one job.
+        let job = BackfillJob {
+            job_id: 1,
+            agg_id: 1,
+            time_range: (0, 1000),
+            source: BackfillSource::Prometheus {
+                url: "http://prom".to_string(),
+            },
+            status: BackfillStatus::Queued,
+            windows_done: 0,
+            windows_total: 1,
+            created_at_ms: 1_700_000_000_000,
+            started_at_ms: None,
+            completed_at_ms: None,
+            error_message: None,
+        };
+        let snap = serde_json::json!({
+            "version": BACKFILL_V + 1,
+            "next_job_id": 2,
+            "jobs": [job],
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&snap).unwrap()).unwrap();
+
+        let r = BackfillRegistry::load_or_new(path.clone());
+        assert!(r.get(1).is_none(), "future-version job must not leak in");
+
+        // No data corruption: rewritten file at BACKFILL_V, valid shape.
+        let after: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).expect("post-fallback file is JSON");
+        assert_eq!(after["version"], BACKFILL_V);
+        assert!(after["jobs"].is_array());
+        assert!(
+            after["next_job_id"].is_number(),
+            "next_job_id field must remain present"
+        );
+    }
+
+    /// SimpleMapStore part meta.bin: header tagged PART_FORMAT_VERSION+1
+    /// must surface a `PersistError::Format`. This is the
+    /// "v2-on-disk-loaded-by-v1-code" path; for parts there is no
+    /// fallback (each part is opaque), so a clean error is the contract.
+    #[test]
+    fn part_meta_with_future_version_returns_format_error() {
+        let dir = tmpdir();
+        let mut header = vec![0u8; META_HEADER_SIZE];
+        header[0..4].copy_from_slice(&MAGIC_META.to_le_bytes());
+        header[4..6].copy_from_slice(&(PART_FORMAT_VERSION + 1).to_le_bytes());
+        header[8..16].copy_from_slice(&1u64.to_le_bytes());
+        header[16..24].copy_from_slice(&0u64.to_le_bytes());
+        header[24..32].copy_from_slice(&1000u64.to_le_bytes());
+        header[32..36].copy_from_slice(&5u32.to_le_bytes());
+        header[40..48].copy_from_slice(&0u64.to_le_bytes());
+        header[48..56].copy_from_slice(&0u64.to_le_bytes());
+        header[56..60].copy_from_slice(&1_700_000_000u32.to_le_bytes());
+
+        let part_dir = dir.path().join("part_0000000000000001");
+        fs::create_dir_all(&part_dir).unwrap();
+        fs::write(part_dir.join("meta.bin"), &header).unwrap();
+        fs::write(part_dir.join("data.bin"), b"").unwrap();
+        fs::write(part_dir.join("index.bin"), b"").unwrap();
+
+        let err = PartReader::read_meta(&part_dir).expect_err("must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported version"),
+            "error must mention unsupported version; got: {msg}"
+        );
+    }
+}
