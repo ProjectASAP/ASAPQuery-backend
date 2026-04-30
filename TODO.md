@@ -27,7 +27,13 @@ Follow-ups (not paper-blocking):
   grouping + regex is ~200 LOC when needed.
 - **Latency target.** Paper claim is ≤2× P99 vs. warm-hot —
   unverified until the multi-agent harness lands (blocker #6
-  of `DataCollector/TODO.md`).
+  of `DataCollector/TODO.md`). The three-way query harness in
+  [#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66)
+  (`benchmarks/run_full_eval.sh`) is the runner that will produce
+  this number once `asap-query-engine`'s `main.rs` wires the
+  `ASAP_COLD_STORE_ROOT` flag into the `prometheus_promql_with_cold`
+  constructor — until then it exercises only the Prom-forwarding
+  fallback leg.
 
 ### 2. Accuracy-profile library per sketch type
 
@@ -77,18 +83,31 @@ Follow-up (not paper-blocking):
   plan push and the repeat query — still tracked as an
   operational follow-up in the DataCollector repo.
 
-### 4. Serialization format versioning tests
+### 4. Serialization format versioning tests — **done ([#65](https://github.com/ProjectASAP/ASAPQuery-backend/pull/65))**
 
-`PERSIST_FORMAT_VERSION = 1` exists but no migration test or
-forward-compat story. Paper claim "sketchDB restarts without
-data loss across format bumps" needs evidence.
+`mod v2_forward_compat` in
+[`asap-query-engine/src/tests/persist_format_versioning_tests.rs`](asap-query-engine/src/tests/persist_format_versioning_tests.rs)
+covers all three persistence sites with three tests that pin the contract
+to `PERSIST_FORMAT_VERSION + 1` (self-updating if the version is bumped):
 
-- Check in a golden snapshot at v1 (schema registry +
-  SimpleMapStore parts/manifest + backfill registry)
-- Load with v2 code (intentional incompatible bump in a test)
-- Verify expected migration OR safe fall-back-to-fresh (log +
-  new empty registry) — per design doc
-- Assert no crash, no data corruption
+- `schema_v1_with_future_version_falls_back_and_rewrites_clean` — tampers
+  the JSON `version` field to v_current+1, asserts safe-fallback + rewrite
+  at v_current with the new config's schemas and **no leakage from the
+  bumped blob** (the no-data-corruption claim).
+- `backfill_v1_with_future_version_falls_back_and_rewrites_clean` — same
+  contract for `BackfillRegistry`, including `next_job_id` field presence
+  post-fallback.
+- `part_meta_with_future_version_returns_format_error` — `SimpleMapStore`
+  `meta.bin` has no fallback (parts are opaque), so the contract is a
+  clean `PersistError::Format("unsupported version ...")`.
+
+All three pass.
+
+Follow-up (not paper-blocking): a docker-compose harness that bumps
+`PERSIST_FORMAT_VERSION` in code, rebuilds, and restarts a running
+backend with on-disk v1 state to verify the live restart path. The
+unit tests cover the load path which is where the version-mismatch
+logic lives, so this is just defense in depth.
 
 ### 5. Correctness proofs (for paper's theory section)
 
