@@ -1,20 +1,101 @@
-# CI image override: replaces quickstart's pinned release images with images
-# built from the current branch. Intended for use as a Compose override:
+# Three-way query benchmark harness — OVERRIDE for asap-quickstart.
 #
-#   ASAP_IMAGE_TAG=sha-<short-sha> docker compose \
+# This file is intended to be merged with asap-quickstart/docker-compose.yml:
+#
+#   docker compose \
 #     --project-directory . \
 #     -f asap-quickstart/docker-compose.yml \
 #     -f benchmarks/docker-compose.yml \
 #     up -d
 #
-# ASAP_IMAGE_TAG is set automatically by the 'build' job in accuracy_performance.yml.
+# What this override adds on top of the asap-quickstart base stack
+# (kafka + arroyo + planner + summary-ingest + queryengine + prometheus +
+# 7 pattern-based fake exporters):
+#
+#   1. victoriametrics — third backend under test, scrapes the same fake
+#      exporters so all three backends (ASAP / Prom / VM) see an identical
+#      input stream. Comparable 1d retention.
+#
+#   2. queryengine override — adds a cold-store bind-mount at /cold-store.
+#      The §5.2 ColdFallback (LocalFsColdStore) reads raw JSONL fixtures
+#      from this dir to answer ad-hoc queries that the sketch path can't
+#      serve. Pre-populate with `benchmarks/scripts/seed_cold_store.py`
+#      before running the ad-hoc workload.
+#
+# CI / GHCR image override: kept compatible with the existing
+# accuracy_performance.yml workflow — pass ASAP_IMAGE_TAG to swap pinned
+# release images for branch-built images.
 
 services:
+  # NOTE: the asap-quickstart base file pins these to v0.2.0 release tags.
+  # Setting ASAP_IMAGE_TAG (e.g. sha-abcdef0) overrides them for CI runs.
   asap-planner-rs:
-    image: ghcr.io/projectasap/asap-planner-rs:${ASAP_IMAGE_TAG}
+    image: ghcr.io/projectasap/asap-planner-rs:${ASAP_IMAGE_TAG:-v0.2.0}
 
   asap-summary-ingest:
-    image: ghcr.io/projectasap/asap-summary-ingest:${ASAP_IMAGE_TAG}
+    image: ghcr.io/projectasap/asap-summary-ingest:${ASAP_IMAGE_TAG:-v0.2.0}
 
+  # ---------------------------------------------------------------------------
+  # QueryEngine override — adds cold-store mount + env knob.
+  #
+  # The cold-store volume is a directory under benchmarks/ (gitignored);
+  # seed_cold_store.py writes JSONL parts into the layout the ColdFallback
+  # adapter expects (raw/<metric>/YYYY/MM/DD/HH/part-NNNNNN.jsonl).
+  #
+  # ASAP_COLD_STORE_ROOT is a placeholder env var until main.rs grows a
+  # --cold-store-root CLI flag. For now AdapterConfig::prometheus_promql
+  # (the path actually wired in main.rs) gives us the Prometheus-only
+  # fallback chain — the cold tier kicks in once the binary reads the env.
+  # The bind-mount + seed script are correct as-is so the harness will
+  # work without re-touching this YAML when that flag lands.
+  # ---------------------------------------------------------------------------
   queryengine:
-    image: ghcr.io/projectasap/asap-query-engine:${ASAP_IMAGE_TAG}
+    image: ghcr.io/projectasap/asap-query-engine:${ASAP_IMAGE_TAG:-v0.2.0}
+    volumes:
+      - asap-planner-output:/asap-planner-output:ro
+      - ./asap-quickstart/output/queryengine:/app/outputs
+      - ./benchmarks/cold-store:/cold-store
+    environment:
+      - RUST_LOG=INFO
+      - RUST_BACKTRACE=1
+      - ASAP_COLD_STORE_ROOT=/cold-store
+
+  # ---------------------------------------------------------------------------
+  # VictoriaMetrics — third backend under test.
+  # Scrapes the same fake exporters Prometheus does, with comparable
+  # retention. Exposes the standard 8428 query port.
+  # ---------------------------------------------------------------------------
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.106.1
+    container_name: asap-victoriametrics
+    hostname: victoriametrics
+    networks:
+      - asap-network
+    ports:
+      - "8428:8428"
+    volumes:
+      - victoriametrics-data:/storage
+      - ./benchmarks/config/vmagent-scrape.yml:/etc/vm/scrape.yml:ro
+    command:
+      - "-storageDataPath=/storage"
+      - "-retentionPeriod=1d"
+      - "-promscrape.config=/etc/vm/scrape.yml"
+      - "-httpListenAddr=:8428"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8428/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    depends_on:
+      - fake-exporter-constant
+      - fake-exporter-linear-up
+      - fake-exporter-linear-down
+      - fake-exporter-sine
+      - fake-exporter-sine-noise
+      - fake-exporter-step
+      - fake-exporter-exp-up
+    restart: no
+
+volumes:
+  victoriametrics-data:
