@@ -1,0 +1,22 @@
+# VictoriaMetrics scrape config — points at the same fake exporters as
+# the asap-quickstart Prometheus scrape config, so VM ingests an
+# identical input stream. 1s scrape matches asap-quickstart prometheus.yml.
+
+global:
+  scrape_interval: 1s
+
+scrape_configs:
+  - job_name: 'pattern-exporters'
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: sensor_reading
+        action: keep
+    static_configs:
+      - targets:
+          - 'fake-exporter-constant:50000'
+          - 'fake-exporter-linear-up:50001'
+          - 'fake-exporter-linear-down:50002'
+          - 'fake-exporter-sine:50003'
+          - 'fake-exporter-sine-noise:50004'
+          - 'fake-exporter-step:50005'
+          - 'fake-exporter-exp-up:50006'

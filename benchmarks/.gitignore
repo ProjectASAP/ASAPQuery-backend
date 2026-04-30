@@ -1,0 +1,11 @@
+# Python cache
+scripts/__pycache__/
+*.pyc
+
+# Generated benchmark output
+reports/*.json
+reports/*.csv
+reports/*.md
+
+# Cold-store data populated by seed_cold_store.py — keep the dir, drop the data
+cold-store/raw/

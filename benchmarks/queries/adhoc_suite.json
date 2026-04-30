@@ -1,0 +1,54 @@
+{
+  "_comment": "Workload W2 — ad-hoc PromQL queries that exercise the ASAP fallback path. Per docs/01-getting-started/architecture.md, ASAP cannot serve regex matchers, label_replace, exact histograms, or non-quantile range functions from sketches; they fall through to the cold-store first (LocalFsColdStore via ColdFallback) and finally to Prometheus. All queries here also work against the Prometheus and VictoriaMetrics baselines for direct comparison.",
+  "queries": [
+    {
+      "id": "regex_pattern_match",
+      "expr": "sensor_reading{pattern=~\"sine.*\"}",
+      "kind": "regex_matcher",
+      "fallback": "cold_store",
+      "rationale": "Regex label matchers are not pushed into sketch keys; ColdFallback scans raw samples in the cold tier."
+    },
+    {
+      "id": "label_replace_relabel",
+      "expr": "label_replace(sensor_reading, \"new_label\", \"$1\", \"region\", \"region(.*)\")",
+      "kind": "label_manipulation",
+      "fallback": "prometheus",
+      "rationale": "label_replace is a label-rewrite operator that has no sketch-side equivalent — forwarded straight to Prometheus."
+    },
+    {
+      "id": "rate_over_5m",
+      "expr": "rate(sensor_reading[5m])",
+      "kind": "range_function",
+      "fallback": "prometheus",
+      "rationale": "rate() needs per-sample positions; sketches store summaries, not raw points."
+    },
+    {
+      "id": "increase_over_1m",
+      "expr": "increase(sensor_reading[1m])",
+      "kind": "range_function",
+      "fallback": "prometheus",
+      "rationale": "Same as rate — counter-difference over a window."
+    },
+    {
+      "id": "exact_histogram_q99",
+      "expr": "histogram_quantile(0.99, sum by (le) (rate(sensor_reading_bucket[5m])))",
+      "kind": "exact_histogram",
+      "fallback": "prometheus",
+      "rationale": "Exact histogram quantiles need _bucket series; ASAP serves quantiles via DDSketch instead, this path is forwarded."
+    },
+    {
+      "id": "regex_negative_match",
+      "expr": "sum(sensor_reading{service!~\"svc[0-3]\"})",
+      "kind": "regex_matcher",
+      "fallback": "cold_store",
+      "rationale": "Negative regex matcher — same fallback path as positive regex."
+    },
+    {
+      "id": "raw_lookup_specific_series",
+      "expr": "sensor_reading{pattern=\"sine\",region=\"region0\"}",
+      "kind": "instant_vector_selector",
+      "fallback": "cold_store",
+      "rationale": "Bare instant vector lookup — ColdFallback v1 scope per s3_adapter.rs handles this exactly: per-series latest value within Prometheus's 5m lookback delta."
+    }
+  ]
+}
