@@ -693,9 +693,14 @@ impl SimpleMapStorePerKey {
                 if rec.agg_id != aggregation_id {
                     continue;
                 }
-                // Same overlap semantics as MutableEpoch::range_query_into:
-                // window must be fully inside [start, end].
-                if rec.start_ts < start || rec.start_ts > end || rec.end_ts > end {
+                // Overlap semantics matching MutableEpoch::range_query_into:
+                // include any window whose [start_ts, end_ts) interval
+                // intersects [start, end). The earlier "fully inside"
+                // form silently dropped windows that crossed the query
+                // boundaries, which is what tumbling windows do
+                // virtually always when the query timestamp doesn't
+                // align to the window grid.
+                if rec.end_ts <= start || rec.start_ts >= end {
                     continue;
                 }
                 let disk_entry = match reader.load_entry(&rec) {
