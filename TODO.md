@@ -1,10 +1,90 @@
 # TODO — ASAPQuery-backend / sketchDB
 
-Post-session state: PRs #43–#51 landed. This doc enumerates what's
+_Last updated: 2026-05-01._
+
+Post-session state: PRs #43–#71 landed. This doc enumerates what's
 left for sketchDB to be paper-ready (VLDB / SIGMOD) + what's
 deferred to future work.
 
 See the design source at [`docs/design-sketch-db.md`](docs/design-sketch-db.md).
+
+## Warm-tier query path closes the loop (2026-05-01)
+
+The all-five-sketch query path from 2026-04-30 was wire-correct but
+the live PromQL surface still returned empty even with data
+demonstrably in the precompute store. Two PRs fixed that:
+
+- **OTLP gRPC `max_decoding_message_size`** ([#70](https://github.com/ProjectASAP/ASAPQuery-backend/pull/70)).
+  tonic's 4 MiB default rejected the gateway's first-window
+  full-state DDSketch batch (~17 MiB at 1k cardinality). Gateway
+  exporter looped on `decoded message length too large` forever.
+  Bumped the receiver to 64 MiB, matching the `max_recv_msg_size_mib`
+  value the agent and gateway already declare on their own OTLP
+  receivers.
+
+- **`range_query_into` overlap filter + closest-pane + response
+  annotation** ([#71](https://github.com/ProjectASAP/ASAPQuery-backend/pull/71)).
+  Two-part fix:
+
+  1. **Overlap filter (store side).** `MutableEpoch::range_query_into`
+     and `SealedEpoch::range_query_into` in
+     `simple_map_store/common.rs` (and the on-disk parts variant
+     in `per_key.rs:query_disk_parts`) used a "fully-contained"
+     filter (`tr.0 < start || tr.0 > end || tr.1 > end → skip`).
+     For tumbling windows of size W with a query range R, this
+     matches at most `floor(R/W)` panes and only when both query
+     endpoints land exactly on the pane grid. PromQL queries
+     don't align to the grid (the wall-clock fractional portion
+     of `query_time` is generally non-zero), so the strict filter
+     returned 0 panes for every realistic query. Replaced with
+     standard half-open overlap: keep `[tr.0, tr.1)` if `tr.1 > start
+     && tr.0 < end`.
+
+  2. **Closest-pane + annotation (engine + adapter side).** Per
+     follow-up review: rather than merge multiple overlapping
+     panes (slightly imprecise for sketch summaries), the engine
+     now picks a **single closest pane** (max `tr.1`, tie-break
+     on max `tr.0`) and threads the chosen `[start_ms, end_ms)`
+     up through `QueryResult::with_window_used` to the Prometheus
+     HTTP adapter, which adds it to the response's `infos` array
+     as `precompute_window: [..., ...) ms (width N ms)`. Mirrors
+     the existing `with_accuracy` annotation pattern. Now the
+     caller sees exactly which precompute time range produced
+     each value — important when the request range and the
+     answered range differ.
+
+### Live verification
+
+```
+$ curl '/api/v1/query?query=quantile_over_time(0.5, http_requests_total_latency_ms_quantile[1m])&time=$(now-90s)'
+{"data":{"result":[{"metric":{"node":""},
+                    "value":[..., "19.493849507395904"]}],
+         "resultType":"vector"},
+ "infos":["accuracy: ε=0.01, δ=0, kind=relative_quantile",
+          "precompute_window: [1777655280000, 1777655310000) ms (width 30000 ms)"]}
+```
+
+Pre-fix: `result: []` with `No precomputed outputs found` even
+though `runtime_info.earliest_timestamp_per_aggregation_id` was
+populated and worker logs showed `Worker emitting 1 sketch outputs
+for group (1, )` at every flush.
+
+### Companion changes on the agent side
+
+The collector-side path needed three connected fixes for delta
+transmission to round-trip
+([ASAPCollector#210](https://github.com/ProjectASAP/ASAPCollector/pull/210))
+plus a windowed-processor pass-through to make multi-sketch
+single-pipeline configs work
+([ASAPCollector#211](https://github.com/ProjectASAP/ASAPCollector/pull/211)).
+The backend-side delta apply path
+(`apply_modified_otlp_delta_bytes` →
+`{DDSketch,CMS,CountSketch,HLL}Accumulator::apply_proto_delta_bytes`)
+was already in place; it just wasn't reachable until the agent
+correctly tagged delta payloads on the typed encoding field and
+stopped polluting the per-data-point attribute set with the
+encoding string (which had broken the per-series snapshot cache
+key).
 
 ## All-five-sketch query path verification (2026-04-30)
 
@@ -48,6 +128,18 @@ data points). Specifically:
   frequency. To drive `topk(N, …)` over CMS-tracked keys we need
   a key-aggregator processor on the agent. Tracked as a paper
   follow-up; out of scope for v1.
+- **`IngestState.sketch_snapshots` is RAM-only.** Per-series
+  snapshot cache that delta frames apply against is lost on
+  backend restart. After a bounce, agents continue emitting
+  `proto_delta` against their local snapshots, and the backend
+  drops them as "delta-sketch arrived before any base snapshot"
+  until the agent itself restarts. Persist to the existing
+  per-key disk layer used by `SimpleMapStore::with_persistence_per_key`,
+  or add an OpAMP capability for backend → agent "send next
+  frame as full state" signalling. Same item lives on the
+  collector side
+  ([`PROGRESS.md` follow-up #3](https://github.com/ProjectASAP/ASAPCollector/blob/main/PROGRESS.md));
+  a fix on either side closes the gap.
 
 ## For paper submission (blocker)
 
