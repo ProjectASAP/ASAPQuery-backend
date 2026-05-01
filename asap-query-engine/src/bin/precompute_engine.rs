@@ -9,7 +9,7 @@ use query_engine_rust::precompute_engine::config::{LateDataPolicy, PrecomputeEng
 use query_engine_rust::precompute_engine::output_sink::{RawPassthroughSink, StoreOutputSink};
 use query_engine_rust::precompute_engine::PrecomputeEngine;
 use query_engine_rust::stores::SimpleMapStore;
-use query_engine_rust::{HttpServer, HttpServerConfig};
+use query_engine_rust::{HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -95,6 +95,68 @@ struct Args {
     /// Tier-2 part-cache byte budget, in MiB. 0 disables.
     #[arg(long)]
     persistence_part_cache_mb: Option<u64>,
+
+    /// Root of the §5.2 cold-tier raw-sample store. When set,
+    /// capability-miss queries first try the hour-bucketed JSONL
+    /// layout under this root. Combine with
+    /// `--forward-unsupported-queries` to keep Prometheus as the
+    /// tail of the fallback chain. Reads from `ASAP_COLD_STORE_ROOT`
+    /// so containerised deploys can wire it via env (matches the
+    /// backend Docker image's environment in
+    /// `deploy/docker-compose/base.yml`).
+    #[arg(long, env = "ASAP_COLD_STORE_ROOT")]
+    cold_store_root: Option<std::path::PathBuf>,
+
+    /// Upstream Prometheus URL for the tail of the fallback chain.
+    /// Only consulted when `--forward-unsupported-queries` is set.
+    #[arg(long, default_value = "http://localhost:9090")]
+    prometheus_server: String,
+
+    /// Forward unsupported PromQL shapes to Prometheus rather than
+    /// returning empty.
+    #[arg(long, default_value_t = false)]
+    forward_unsupported_queries: bool,
+
+    /// Path to the inference config YAML — maps query patterns to
+    /// aggregation IDs so the query engine can pick the right
+    /// stored sketch for an incoming PromQL. Without it the query
+    /// engine starts with an empty pattern table and every query
+    /// "no matches" → falls through to cold/Prom fallback. Same
+    /// schema as `query_engine_rust --config`.
+    #[arg(long)]
+    inference_config: Option<String>,
+
+    /// Prometheus-equivalent scrape interval (seconds). Used by
+    /// SimpleEngine when computing the instant-query lookback
+    /// window: each `query` resolves the metric over the last
+    /// `scrape_interval` seconds. For tumbling-window
+    /// aggregations this MUST be ≥ the window size in
+    /// `streaming-config`, otherwise a window's bucket end
+    /// timestamp falls outside the lookback and the query
+    /// returns empty even though data is in the store. Default 30
+    /// matches the e2e harness's 30s window. Old default was 15
+    /// (kept as a deprecated alias).
+    #[arg(long, default_value_t = 30)]
+    prometheus_scrape_interval: u64,
+
+    /// Enable OTLP metrics ingest (gRPC + HTTP). Required for the
+    /// e2e harness's warm-tier sketch path: `query_engine_rust`'s
+    /// patched proto deserialiser handles `DDSketch` / `KLLSketch` /
+    /// `CountSketch` / `CountMinSketch` / `HLLSketch` types that
+    /// the stock OTel `prometheusremotewrite` exporter would
+    /// otherwise drop.
+    #[arg(long, default_value_t = false)]
+    enable_otel_ingest: bool,
+
+    /// OTLP gRPC listen port (only consulted when
+    /// `--enable-otel-ingest` is set).
+    #[arg(long, default_value_t = 4317)]
+    otel_grpc_port: u16,
+
+    /// OTLP HTTP listen port (only consulted when
+    /// `--enable-otel-ingest` is set).
+    #[arg(long, default_value_t = 4318)]
+    otel_http_port: u16,
 }
 
 #[tokio::main]
@@ -178,23 +240,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Optionally start the query HTTP server
     if args.query_port > 0 {
-        let inference_config =
-            InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::CircularBuffer);
+        let inference_config = match args.inference_config.as_deref() {
+            Some(path) => query_engine_rust::utils::file_io::read_inference_config(
+                path,
+                QueryLanguage::promql,
+            )?,
+            None => InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::CircularBuffer),
+        };
+        info!(
+            "Loaded inference config with {} query configs",
+            inference_config.query_configs.len()
+        );
         let query_engine = Arc::new(SimpleEngine::new(
             store.clone(),
             inference_config,
             streaming_config.clone(),
-            15, // default prometheus scrape interval
+            args.prometheus_scrape_interval, // default 30s (matches e2e window size)
             QueryLanguage::promql,
         ));
+        if let Some(root) = args.cold_store_root.as_deref() {
+            info!(
+                cold_store_root = %root.display(),
+                prom_tail = args.forward_unsupported_queries,
+                "Cold-tier fallback enabled (§5.2 cold store)",
+            );
+        }
+        let adapter_config = AdapterConfig::from_prom_with_optional_cold(
+            args.prometheus_server.clone(),
+            args.forward_unsupported_queries,
+            args.cold_store_root.as_deref(),
+        );
         let http_config = HttpServerConfig {
             port: args.query_port,
             handle_http_requests: true,
-            adapter_config: AdapterConfig {
-                protocol: query_engine_rust::data_model::QueryProtocol::PrometheusHttp,
-                language: QueryLanguage::promql,
-                fallback: None,
-            },
+            adapter_config,
         };
         let http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
         tokio::spawn(async move {
@@ -227,15 +306,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::new(StoreOutputSink::new(store))
         };
 
-    // Build and run the engine
+    // Build the engine. Snapshot `ingest_state` BEFORE starting the
+    // engine — once `engine.run()` is awaited it owns the engine
+    // and we can't pull the handle out for the OTLP receiver.
     let engine = PrecomputeEngine::new(
         engine_config,
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         output_sink,
     );
+    let ingest_state = if args.enable_otel_ingest {
+        Some(engine.ingest_state())
+    } else {
+        None
+    };
+
+    // Spawn the OTLP receiver alongside the engine when requested.
+    // Without it the warm-tier sketch path doesn't get fed: the
+    // gateway's PRW translator drops `DDSketch` / `HLLSketch` types,
+    // so the only way to deliver sketches to the backend is OTLP.
+    let otel_handle = if let Some(ingest_state) = ingest_state {
+        let otel_config = OtlpReceiverConfig {
+            grpc_port: args.otel_grpc_port,
+            http_port: args.otel_http_port,
+        };
+        info!(
+            grpc_port = args.otel_grpc_port,
+            http_port = args.otel_http_port,
+            "Starting OTLP receiver wired to precompute engine",
+        );
+        let receiver = OtlpReceiver::with_ingest_state(otel_config, ingest_state);
+        Some(tokio::spawn(async move {
+            if let Err(e) = receiver.run().await {
+                tracing::error!("OTLP receiver error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
 
     info!("Starting precompute engine...");
-    engine.run().await?;
+    let run_result = engine.run().await;
 
+    if let Some(h) = otel_handle {
+        h.abort();
+        let _ = h.await;
+    }
+
+    run_result?;
     Ok(())
 }

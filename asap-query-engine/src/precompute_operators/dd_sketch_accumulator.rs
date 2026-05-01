@@ -198,14 +198,42 @@ impl AggregateCore for DDSketchAccumulator {
 
     fn query_statistic(
         &self,
-        _statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: promql_utilities::query_logics::enums::Statistic,
         _key: &Option<KeyByLabelValues>,
-        _query_kwargs: &HashMap<String, String>,
+        query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        Err("DDSketchAccumulator: query_statistic not yet implemented \
-             (bucket round-trip works, but quantile estimation deferred; \
-              tracked as a PR C-CountSketch follow-up)"
-            .into())
+        use promql_utilities::query_logics::enums::Statistic;
+
+        match statistic {
+            Statistic::Quantile => {
+                // PromQL `histogram_quantile(q, …)` and
+                // `quantile_over_time(q, …)` both land here with
+                // `q` in `query_kwargs["quantile"]`. Default to
+                // 0.99 when the caller didn't provide one
+                // (defensive — pattern-matched queries in
+                // `inference_config.yaml` always populate it).
+                let q: f64 = query_kwargs
+                    .get("quantile")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.99);
+                if !(0.0..=1.0).contains(&q) {
+                    return Err(format!("DDSketchAccumulator: quantile {q} out of [0,1]").into());
+                }
+                self.inner.quantile(q).ok_or_else(|| {
+                    "DDSketchAccumulator: quantile() returned None (sketch empty?)".into()
+                })
+            }
+            Statistic::Sum => Ok(self.inner.sum),
+            Statistic::Count => Ok(self.inner.count as f64),
+            Statistic::Min => Ok(self.inner.min),
+            Statistic::Max => Ok(self.inner.max),
+            other => Err(format!(
+                "DDSketchAccumulator: statistic {:?} not supported (only Quantile / Sum / \
+                 Count / Min / Max)",
+                other,
+            )
+            .into()),
+        }
     }
 }
 

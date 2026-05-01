@@ -102,6 +102,33 @@ impl AdapterConfig {
         )
     }
 
+    /// Pick between [`Self::prometheus_promql`] and
+    /// [`Self::prometheus_promql_with_cold`] based on whether the
+    /// caller has a cold-store root configured (`--cold-store-root`
+    /// CLI flag or `ASAP_COLD_STORE_ROOT` env var).
+    ///
+    /// Wired into both binaries that face deployment:
+    /// `query_engine_rust` (`src/main.rs`) and `precompute_engine`
+    /// (`src/bin/precompute_engine.rs`). Centralised here so the
+    /// behaviour matrix only lives in one place.
+    pub fn from_prom_with_optional_cold(
+        prometheus_server: String,
+        forward_unsupported: bool,
+        cold_store_root: Option<&std::path::Path>,
+    ) -> Self {
+        match cold_store_root {
+            Some(root) => {
+                let prom = if forward_unsupported {
+                    Some(prometheus_server)
+                } else {
+                    None
+                };
+                Self::prometheus_promql_with_cold(root.to_path_buf(), prom)
+            }
+            None => Self::prometheus_promql(prometheus_server, forward_unsupported),
+        }
+    }
+
     /// Create a configuration for ClickHouse HTTP with SQL
     /// Convenience constructor for ClickHouse adapter
     pub fn clickhouse_sql(base_url: String, database: String, forward_unsupported: bool) -> Self {

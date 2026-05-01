@@ -1,8 +1,8 @@
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, Measurement};
 use crate::precompute_operators::{
-    CountMinSketchAccumulator, DatasketchesKLLAccumulator, HydraKllSketchAccumulator,
-    IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator, MultipleMinMaxAccumulator,
-    MultipleSumAccumulator, SumAccumulator,
+    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
+    MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
 };
 use asap_types::aggregation_config::AggregationConfig;
 
@@ -263,6 +263,84 @@ impl AccumulatorUpdater for KllAccumulatorUpdater {
     fn memory_usage_bytes(&self) -> usize {
         // KLL sketch size is hard to estimate precisely; use a rough estimate
         std::mem::size_of::<DatasketchesKLLAccumulator>() + 4096
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DDSketchAccumulatorUpdater — pendant to KllAccumulatorUpdater
+// ---------------------------------------------------------------------------
+//
+// Drives the agent-aggregated DDSketch path: the worker either
+// (a) merges an inbound `DDSketchAccumulator` from the
+// modified-OTLP `Data::Ddsketch` ingest (via the worker's
+// `merge_with`), or (b) consumes raw values via `update_single`
+// when an OTLP scalar datapoint matches an aggregation typed as
+// DDSketch. (b) is the less common path but it lets the same
+// aggregation slot serve both pre-aggregated agent sketches and
+// raw OTLP gauges.
+pub struct DDSketchAccumulatorUpdater {
+    acc: DDSketchAccumulator,
+    alpha: f64,
+}
+
+impl DDSketchAccumulatorUpdater {
+    pub fn new(alpha: f64) -> Self {
+        Self {
+            acc: DDSketchAccumulator::new(alpha),
+            alpha,
+        }
+    }
+}
+
+impl AccumulatorUpdater for DDSketchAccumulatorUpdater {
+    fn update_single(&mut self, value: f64, _timestamp_ms: i64) {
+        // sketch-core's DdSketch (the inner of DDSketchAccumulator)
+        // exposes `insert(f64)` for single-value ingestion. The
+        // worker calls this when a raw OTLP datapoint matches an
+        // aggregation typed as DDSketch — the sketch-merge path
+        // uses `merge_with` directly.
+        self.acc.inner.insert(value);
+    }
+
+    fn update_keyed(&mut self, _key: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
+        self.update_single(value, timestamp_ms);
+    }
+
+    impl_clone_accumulator_methods!(acc);
+
+    fn reset(&mut self) {
+        self.acc = DDSketchAccumulator::new(self.alpha);
+    }
+
+    fn is_keyed(&self) -> bool {
+        false
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        // Bucket store is variable; rough estimate matches KLL.
+        std::mem::size_of::<DDSketchAccumulator>() + 4096
+    }
+}
+
+/// Pull `relativeAccuracy` (or canonical aliases) out of a
+/// streaming-config aggregation entry. Defaults to 0.01 (1% rel-
+/// err, the same default the agent's `ddsketchprocessor` uses).
+fn ddsketch_alpha_param(config: &AggregationConfig) -> f64 {
+    let parsed = config
+        .parameters
+        .get("relativeAccuracy")
+        .or_else(|| config.parameters.get("relative_accuracy"))
+        .or_else(|| config.parameters.get("alpha"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.01);
+    if parsed > 0.0 && parsed < 1.0 {
+        parsed
+    } else {
+        tracing::warn!(
+            "DDSketch relativeAccuracy {} out of (0,1); using default 0.01",
+            parsed
+        );
+        0.01
     }
 }
 
@@ -655,6 +733,9 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         AggregationType::HydraKLL => {
             let (row_num, col_num, k) = hydra_kll_params(config);
             Box::new(HydraKllAccumulatorUpdater::new(row_num, col_num, k))
+        }
+        AggregationType::DDSketch => {
+            Box::new(DDSketchAccumulatorUpdater::new(ddsketch_alpha_param(config)))
         }
         other => {
             tracing::warn!(

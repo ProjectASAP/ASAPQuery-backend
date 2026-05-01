@@ -6,6 +6,49 @@ deferred to future work.
 
 See the design source at [`docs/design-sketch-db.md`](docs/design-sketch-db.md).
 
+## All-five-sketch query path verification (2026-04-30)
+
+Each sketch type now has a runtime-verified PromQL → backend path
+through the modified-OTLP wire format (typed `Metric.data =
+{DDSketch | KLLSketch | HLLSketch | CountSketch | CountMinSketch}`
+data points). Specifically:
+
+- **`query_statistic` for every sketch accumulator.** Implemented
+  on `DDSketchAccumulator` (Quantile / Sum / Count / Min / Max),
+  `HllSketchAccumulator` (Cardinality, with `Count` accepted as a
+  Cardinality alias for the existing PromQL `count(...)` path),
+  `CountSketchAccumulator` (Topk / Count / Sum, no-key fallback
+  returns row-mean total), and `CountMinSketchAccumulator` (Count
+  / Sum, no-key fallback returns the min-row sum — the canonical
+  CMS total-event estimator that's exact when each insert
+  increments one cell per row).
+- **`accumulator_factory.rs`**: `DDSketchAccumulatorUpdater` wired
+  in (alongside CMS / CountSketch / KLL / HLL updaters) so the
+  precompute_engine recognises `AggregationType::DDSketch` from the
+  `streaming.yaml` schema.
+- **Modified-OTLP envelope decoders** for each sketch type land via
+  the agent processors using sketchlib-go's `SerializePortable` /
+  `SerializeMsgpack`; the backend's `from_sketchlib_proto_bytes` /
+  `from_msgpack_bytes` constructors round-trip through
+  `SketchEnvelope { sketch_state: Some(SketchState::*(state)) }`.
+
+### Known reconciliation gap (cleanup, not a blocker)
+
+- `compatible_agg_types` in
+  [`asap_types/src/capability_matching.rs`](asap-common/dependencies/rs/asap_types/src/capability_matching.rs)
+  does not list `CountMinSketch` under `Statistic::Sum`, but
+  [`promql_utilities/src/query_logics/logics.rs`](asap-common/dependencies/rs/promql_utilities/src/query_logics/logics.rs)
+  treats CMS as the canonical approximator for both `Sum` and
+  `Count`. The runtime e2e succeeds because the inference YAML's
+  exact-match `find_query_config` path bypasses
+  `find_compatible_aggregation`. Two tables → one table is the
+  right cleanup.
+- CMS query without a paired `SetAggregator` /
+  `DeltaSetAggregator` returns total volume, not per-key
+  frequency. To drive `topk(N, …)` over CMS-tracked keys we need
+  a key-aggregator processor on the agent. Tracked as a paper
+  follow-up; out of scope for v1.
+
 ## For paper submission (blocker)
 
 ### 1. Cold-query fallback — §5.2 of the sketch-DB design — **done (local-FS cold store)**
@@ -30,10 +73,15 @@ Follow-ups (not paper-blocking):
   of `DataCollector/TODO.md`). The three-way query harness in
   [#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66)
   (`benchmarks/run_full_eval.sh`) is the runner that will produce
-  this number once `asap-query-engine`'s `main.rs` wires the
-  `ASAP_COLD_STORE_ROOT` flag into the `prometheus_promql_with_cold`
-  constructor — until then it exercises only the Prom-forwarding
-  fallback leg.
+  this number.
+- ~~`asap-query-engine` `main.rs` wiring of `ASAP_COLD_STORE_ROOT`~~
+  **done (P1, 2026-04-30).** `--cold-store-root` flag with
+  `env = "ASAP_COLD_STORE_ROOT"` plumbed into a
+  `build_adapter_config` helper that selects
+  `prometheus_promql_with_cold` when set. Four unit tests pin
+  the wiring matrix (cold × forward). Combine with
+  `--forward-unsupported-queries` to keep Prom as the tail of
+  the chain; without it, unsupported shapes return empty.
 
 ### 2. Accuracy-profile library per sketch type
 
