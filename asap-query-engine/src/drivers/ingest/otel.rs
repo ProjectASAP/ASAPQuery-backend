@@ -97,10 +97,20 @@ impl OtlpReceiver {
         let grpc_svc = MetricsServiceImpl {
             shared: shared.clone(),
         };
+        // Bump tonic's default 4 MiB receive cap. A single agent
+        // window emits ~1000 series, each carrying a typed
+        // DDSketch / KLLSketch / ... state — the full-state
+        // payloads run 17+ MiB at the cardinalities the e2e
+        // harness uses. With the default cap, the gateway's
+        // OTLP exporter retries forever with
+        // `decoded message length too large`. Match the
+        // gateway/agent receiver caps (`max_recv_msg_size_mib: 64`
+        // in their YAMLs) so all three tiers agree.
         let grpc_svc =
             asap_otel_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer::new(
                 grpc_svc,
-            );
+            )
+            .max_decoding_message_size(64 * 1024 * 1024);
 
         let app = Router::new()
             .route("/v1/metrics", post(handle_otlp_http))
