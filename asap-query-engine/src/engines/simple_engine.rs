@@ -876,7 +876,7 @@ impl SimpleEngine {
         plan: &StoreQueryPlan,
         do_merge: bool,
         agg_info: &AggregationIdInfo,
-    ) -> Result<(MergedOutputsMap, Option<MergedOutputsMap>), String> {
+    ) -> Result<(MergedOutputsMap, Option<MergedOutputsMap>, Option<(u64, u64)>), String> {
         // Query and merge values
         let values_map = self.execute_store_query(&plan.values_query).map_err(|e| {
             warn!("Error querying store for values: {}", e);
@@ -899,7 +899,23 @@ impl SimpleEngine {
             WindowType::Tumbling
         };
 
-        let merged_values = if plan.values_query.is_exact_query {
+        // Pick the single CLOSEST precompute window across all keys —
+        // the latest pane (max tr.1, tie-break on max tr.0) that
+        // overlaps the request range. The store's overlap filter may
+        // have returned multiple tumbling panes that straddle the
+        // request, but a window query
+        // (e.g. `quantile_over_time(...[1m])`) should answer with
+        // *one* concrete window so the caller can see exactly which
+        // pane produced the value (annotated downstream as
+        // `precompute_window`). Keys whose data didn't land in that
+        // chosen window are dropped from the result rather than
+        // contributing a stale answer from an older pane.
+        let chosen_window: Option<(u64, u64)> = values_map
+            .values()
+            .flat_map(|buckets| buckets.iter().map(|(tr, _)| *tr))
+            .max_by_key(|tr| (tr.1, tr.0));
+
+        let merged_values: MergedOutputsMap = if plan.values_query.is_exact_query {
             // Sliding window: no merge needed, extract buckets from timestamped data
             debug!("Sliding window mode: Skipping merge (expecting 1 precompute per key)");
             values_map
@@ -917,10 +933,36 @@ impl SimpleEngine {
                 })
                 .collect()
         } else {
-            // Tumbling window: merge needed
-            debug!("Tumbling window mode: Merging {} outputs", values_map.len());
+            // Tumbling window: keep only the chosen-window bucket per
+            // key, then run through the existing merge code (which is
+            // a no-op for a single bucket but preserves whatever
+            // accumulator-side cleanup the merge path does).
+            let target = chosen_window.expect(
+                "values_map non-empty (checked above) but chosen_window was None — \
+                 invariant: if buckets exist, max_by_key returns Some",
+            );
+            let filtered: TimestampedBucketsMap = values_map
+                .into_iter()
+                .filter_map(|(key, buckets)| {
+                    let kept: Vec<_> = buckets
+                        .into_iter()
+                        .filter(|(tr, _)| *tr == target)
+                        .collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some((key, kept))
+                    }
+                })
+                .collect();
+            debug!(
+                "Tumbling window mode: closest pane [{}, {}); {} keys present in that pane",
+                target.0,
+                target.1,
+                filtered.len()
+            );
             self.merge_precomputed_outputs(
-                &values_map,
+                &filtered,
                 do_merge,
                 agg_info.aggregation_type_for_value,
             )
@@ -969,7 +1011,7 @@ impl SimpleEngine {
             None
         };
 
-        Ok((merged_values, merged_keys))
+        Ok((merged_values, merged_keys, chosen_window))
     }
 
     /// Collects all results based on whether keys are separate or not
@@ -995,14 +1037,23 @@ impl SimpleEngine {
         }
     }
 
-    /// Executes the complete query pipeline: plan, execute, collect, and format
+    /// Executes the complete query pipeline: plan, execute, collect, and format.
+    ///
+    /// Returns the formatted instant-vector elements alongside the
+    /// `[start_ms, end_ms)` precompute window the engine actually
+    /// consulted (for tumbling-window queries this is the latest
+    /// pane that overlapped the request range; for sliding-window
+    /// queries it's the exact window). Callers attach this onto the
+    /// outgoing `QueryResult` via `with_window_used` so the
+    /// HTTP-adapter response can annotate it as
+    /// `precompute_window`.
     pub fn execute_query_pipeline(
         &self,
         context: &QueryExecutionContext,
         enable_topk: bool,
-    ) -> Result<Vec<InstantVectorElement>, String> {
+    ) -> Result<(Vec<InstantVectorElement>, Option<(u64, u64)>), String> {
         // Step 1: Execute the query plan (already created in context.store_plan)
-        let (merged_values, merged_keys) = self.execute_and_merge_store_queries(
+        let (merged_values, merged_keys, chosen_window) = self.execute_and_merge_store_queries(
             &context.store_plan,
             context.do_merge,
             &context.agg_info,
@@ -1035,7 +1086,7 @@ impl SimpleEngine {
             results_start_time.elapsed().as_millis()
         );
 
-        Ok(results)
+        Ok((results, chosen_window))
     }
 
     /// Execute a query using the plan-based approach (for testing)
@@ -1922,7 +1973,7 @@ impl SimpleEngine {
         enable_topk: bool,
     ) -> Option<(KeyByLabelNames, QueryResult)> {
         let agg_id = context.agg_info.aggregation_id_for_value;
-        let results = self
+        let (results, window_used) = self
             .execute_query_pipeline(&context, enable_topk)
             .map_err(|e| {
                 warn!("Query execution failed: {}", e);
@@ -1932,6 +1983,10 @@ impl SimpleEngine {
         let qr = QueryResult::vector(results, context.query_time);
         let qr = match self.accuracy_envelope_for(agg_id) {
             Some(env) => qr.with_accuracy(env),
+            None => qr,
+        };
+        let qr = match window_used {
+            Some(w) => qr.with_window_used(w),
             None => qr,
         };
         Some((context.metadata.query_output_labels, qr))
@@ -3145,20 +3200,28 @@ impl SimpleEngine {
                 keys_q.end_timestamp = segment.end_ms;
             }
 
-            let per_segment_results = match self.execute_query_pipeline(&ctx, true) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        agg_id = segment.agg_id,
-                        start_ms = segment.start_ms,
-                        end_ms = segment.end_ms,
-                        "Timeline segment execution failed: {}",
-                        e
-                    );
-                    unresolved.push(segment.clone());
-                    continue;
-                }
-            };
+            let (per_segment_results, _segment_window) =
+                match self.execute_query_pipeline(&ctx, true) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            agg_id = segment.agg_id,
+                            start_ms = segment.start_ms,
+                            end_ms = segment.end_ms,
+                            "Timeline segment execution failed: {}",
+                            e
+                        );
+                        unresolved.push(segment.clone());
+                        continue;
+                    }
+                };
+
+            // The per-segment window isn't surfaced in the combined
+            // result for the schema-timeline dispatch path — the
+            // combined answer spans multiple agg_ids/windows by
+            // design, so a single `precompute_window` annotation
+            // would be misleading. The single-agg path
+            // (execute_context above) carries it through normally.
 
             debug!(
                 agg_id = segment.agg_id,

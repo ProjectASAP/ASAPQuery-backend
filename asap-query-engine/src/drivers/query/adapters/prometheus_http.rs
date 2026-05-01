@@ -93,6 +93,23 @@ impl PrometheusResponse {
         self
     }
 
+    /// Attach the actual `[start_ms, end_ms)` precompute window
+    /// the engine consulted to answer this query. Surfaced as a
+    /// `precompute_window: ...` line in the response's `infos`
+    /// array so the caller can see which pane produced the
+    /// answer — important for window queries where the request
+    /// range and the answered range may differ (the engine picks
+    /// the latest closest pane that overlaps the request).
+    pub fn with_precompute_window(mut self, window: (u64, u64)) -> Self {
+        self.infos.push(format!(
+            "precompute_window: [{}, {}) ms (width {} ms)",
+            window.0,
+            window.1,
+            window.1.saturating_sub(window.0),
+        ));
+        self
+    }
+
     pub fn error(error_type: &str, error: &str) -> Self {
         Self {
             status: "error".to_string(),
@@ -265,6 +282,7 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         // Prometheus's native API.
         let warnings = result.query_result.warnings().to_vec();
         let accuracy = result.query_result.accuracy().cloned();
+        let window_used = result.query_result.window_used();
         let mut response = if warnings.is_empty() {
             PrometheusResponse::success(prometheus_data)
         } else {
@@ -272,6 +290,9 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         };
         if let Some(envelope) = accuracy {
             response = response.with_accuracy(envelope);
+        }
+        if let Some(window) = window_used {
+            response = response.with_precompute_window(window);
         }
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }
@@ -289,6 +310,7 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         })?;
         let warnings = result.warnings().to_vec();
         let accuracy = result.accuracy().cloned();
+        let window_used = result.window_used();
         let mut response = if warnings.is_empty() {
             PrometheusResponse::success(prometheus_data)
         } else {
@@ -296,6 +318,9 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
         };
         if let Some(envelope) = accuracy {
             response = response.with_accuracy(envelope);
+        }
+        if let Some(window) = window_used {
+            response = response.with_precompute_window(window);
         }
         Ok(Json(serde_json::to_value(response).unwrap()).into_response())
     }

@@ -25,6 +25,7 @@ impl QueryResult {
             timestamp,
             warnings: Vec::new(),
             accuracy: None,
+            window_used: None,
         })
     }
 
@@ -45,6 +46,7 @@ impl QueryResult {
             timestamp,
             warnings,
             accuracy: None,
+            window_used: None,
         })
     }
 
@@ -53,6 +55,7 @@ impl QueryResult {
             values,
             warnings: Vec::new(),
             accuracy: None,
+            window_used: None,
         })
     }
 
@@ -88,6 +91,30 @@ impl QueryResult {
         }
         self
     }
+
+    /// Actual `[start_ms, end_ms)` precompute window used to answer
+    /// the query. Set by the engine when a window-style query (e.g.
+    /// `quantile_over_time(...[1m])`) resolved to a single closest
+    /// pane rather than a merge across the request range — the
+    /// caller's request range and the answered range are not the
+    /// same in that case, and the user needs to know which window
+    /// was actually consulted.
+    pub fn window_used(&self) -> Option<(u64, u64)> {
+        match self {
+            QueryResult::Vector(iv) => iv.window_used,
+            QueryResult::Matrix(m) => m.window_used,
+        }
+    }
+
+    /// Attach the actual window range that produced this answer.
+    /// Chainable, mirroring `with_accuracy`.
+    pub fn with_window_used(mut self, window: (u64, u64)) -> Self {
+        match &mut self {
+            QueryResult::Vector(iv) => iv.window_used = Some(window),
+            QueryResult::Matrix(m) => m.window_used = Some(window),
+        }
+        self
+    }
 }
 
 /// Instant vector - a set of time series containing a single sample for each time series, all sharing the same timestamp
@@ -110,6 +137,16 @@ pub struct InstantVector {
     /// Grafana 11+ inline display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accuracy: Option<AccuracyEnvelope>,
+    /// `[start_ms, end_ms)` of the precompute window the engine
+    /// actually used to answer this query. Set when a window query
+    /// resolved to a single closest pane (latest pane that overlaps
+    /// the request range) rather than a merge across the full
+    /// request range — the caller's request and the answered range
+    /// differ in that case, and they need to know which window was
+    /// consulted. Surfaced as a `precompute_window` info line in
+    /// `PrometheusResponse.infos` for the Prometheus HTTP adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_used: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +171,9 @@ pub struct RangeVector {
     /// See [`InstantVector::accuracy`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accuracy: Option<AccuracyEnvelope>,
+    /// See [`InstantVector::window_used`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_used: Option<(u64, u64)>,
 }
 
 /// Individual element in a range vector
