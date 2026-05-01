@@ -194,8 +194,20 @@ impl MutableEpoch {
         out: &mut MetricBucketMap,
         matched_windows: &mut Vec<TimestampRange>,
     ) {
+        // Overlap filter, not fully-contained: include any window whose
+        // [tr.0, tr.1) interval intersects [start, end). The previous
+        // form (`tr.0 < start || tr.0 > end || tr.1 > end → skip`)
+        // required `start ≤ tr.0 ≤ tr.1 ≤ end`, which excluded windows
+        // that crossed the query boundaries — typical for tumbling
+        // windows with a query range that doesn't align to the window
+        // grid (e.g. 60s query range over 30s panes with an unaligned
+        // query end timestamp returns 0 panes instead of the 2 it
+        // should). `quantile_over_time(...[1m])` against a sketch
+        // emitted into a 30s pane otherwise reports
+        // "No precomputed outputs found" even when the data is
+        // demonstrably in the store.
         for (i, &tr) in self.windows_col.iter().enumerate() {
-            if tr.0 < start || tr.0 > end || tr.1 > end {
+            if tr.1 <= start || tr.0 >= end {
                 continue;
             }
             let metric_id = self.metric_ids_col[i];
@@ -304,6 +316,13 @@ impl SealedEpoch {
     }
 
     /// Binary-search start + linear scan — O(log N + actual_matches), cache-friendly.
+    ///
+    /// Overlap filter (not fully-contained): include any window whose
+    /// `[tr.0, tr.1)` interval intersects `[start, end)`. See the
+    /// matching change on the columnar variant above for the longer
+    /// rationale — short version: tumbling windows that cross the
+    /// query boundary should still match, otherwise unaligned query
+    /// ranges silently return no data.
     pub fn range_query_into(
         &self,
         start: u64,
@@ -311,12 +330,13 @@ impl SealedEpoch {
         out: &mut MetricBucketMap,
         matched_windows: &mut Vec<TimestampRange>,
     ) {
-        let start_pos = self.entries.partition_point(|(tr, _, _)| tr.0 < start);
-        for (tr, metric_id, agg) in &self.entries[start_pos..] {
-            if tr.0 > end {
-                break;
-            }
-            if tr.1 > end {
+        // Entries are sorted by `tr.0`. Bound the upper end with
+        // `tr.0 < end`; entries past that point can't overlap.
+        let end_pos = self.entries.partition_point(|(tr, _, _)| tr.0 < end);
+        for (tr, metric_id, agg) in &self.entries[..end_pos] {
+            // Lower-end overlap check: skip entries that ended at or
+            // before the query start.
+            if tr.1 <= start {
                 continue;
             }
             out.entry(*metric_id)
