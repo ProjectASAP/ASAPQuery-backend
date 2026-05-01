@@ -1,4 +1,4 @@
-//! Count Sketch accumulator — wraps `asap_sketchlib::asap::count_sketch::CountSketch`.
+//! Count Sketch accumulator — wraps `asap_sketchlib::sketches::count::CountSketch`.
 //!
 //! This is the concrete accumulator reached from the modified-OTLP
 //! `Metric.data = CountSketch{…}` hot path (PR C-CountSketch). Its
@@ -20,7 +20,7 @@
 //! round-trip works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::asap::count_sketch::{CountSketch, CountSketchDelta};
+use asap_sketchlib::sketches::count::{CountSketch, CountSketchDelta};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -194,14 +194,14 @@ impl CountSketchAccumulator {
 impl SerializableToSink for CountSketchAccumulator {
     fn serialize_to_json(&self) -> Value {
         serde_json::json!({
-            "row_num": self.inner.row_num,
-            "col_num": self.inner.col_num,
+            "row_num": self.inner.rows,
+            "col_num": self.inner.cols,
             "sketch": self.inner.sketch(),
         })
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack()
+        self.inner.serialize_msgpack().unwrap_or_default()
     }
 }
 
@@ -266,7 +266,7 @@ impl AggregateCore for CountSketchAccumulator {
         // but not a heavy-hitter answer). Hash compatibility note:
         // this relies on the agent and backend using the
         // sketchlib HashSpec; sketchlib-go's `portableHashSpec`
-        // is the canonical seed list, and `asap_sketchlib::asap::CountSketch`
+        // is the canonical seed list, and `asap_sketchlib::sketches::CountSketch`
         // hashes against the same spec.
         match statistic {
             Statistic::Topk | Statistic::Count => {
@@ -302,7 +302,7 @@ impl AggregateCore for CountSketchAccumulator {
 ///
 /// Hash compatibility with the agent is via the sketchlib hash
 /// spec; the agent's `sketchlib-go::CountSketch` and the
-/// backend's `asap_sketchlib::asap::count_sketch::CountSketch` must use
+/// backend's `asap_sketchlib::sketches::count::CountSketch` must use
 /// the same seed list (sketchlib's `portableHashSpec` /
 /// `default_hash_spec`).
 fn count_sketch_query_key(matrix: &Vec<Vec<f64>>, key: &str) -> f64 {
@@ -507,10 +507,10 @@ mod tests {
             2,
             3,
         );
-        let bytes = original.serialize_msgpack();
+        let bytes = original.serialize_msgpack().unwrap();
         let acc = CountSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
-        assert_eq!(acc.inner.row_num, 2);
-        assert_eq!(acc.inner.col_num, 3);
+        assert_eq!(acc.inner.rows, 2);
+        assert_eq!(acc.inner.cols, 3);
         assert_eq!(acc.inner.sketch(), original.sketch());
     }
 

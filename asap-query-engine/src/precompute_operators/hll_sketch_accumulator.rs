@@ -1,4 +1,4 @@
-//! HLL accumulator — wraps `asap_sketchlib::asap::hll_sketch::HllSketch`.
+//! HLL accumulator — wraps `asap_sketchlib::sketches::hll::HllSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = HLLSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,7 +12,7 @@
 //! store round-trip works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::asap::hll_sketch::{HllDelta, HllSketch, HllVariant};
+use asap_sketchlib::sketches::hll::{HllSketch, HllSketchDelta, HllVariant};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -131,7 +131,7 @@ impl HllSketchAccumulator {
             .into_iter()
             .map(|u| (u.index, u.value as u8))
             .collect();
-        let delta = HllDelta { updates };
+        let delta = HllSketchDelta { updates };
         self.inner
             .apply_delta(&delta)
             .map_err(|e| format!("apply HLLDelta: {e}"))?;
@@ -152,7 +152,7 @@ impl SerializableToSink for HllSketchAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack()
+        self.inner.serialize_msgpack().unwrap_or_default()
     }
 }
 
@@ -234,7 +234,7 @@ impl AggregateCore for HllSketchAccumulator {
 /// (linear-counting) and large-range (32-bit space) corrections
 /// from the original Flajolet et al. paper.
 ///
-/// Inlined here rather than added as a method on `asap_sketchlib::asap::HllSketch`
+/// Inlined here rather than added as a method on `asap_sketchlib::sketches::HllSketch`
 /// because the existing `asap_sketchlib::asap` types only expose merge /
 /// serialize today; adding a query method there would force a
 /// cross-crate change.
@@ -441,7 +441,7 @@ mod tests {
             2.5,
             42.0,
         );
-        let bytes = original.serialize_msgpack();
+        let bytes = original.serialize_msgpack().unwrap();
         let acc = HllSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.variant, HllVariant::Hip);
         assert_eq!(acc.inner.precision, 3);

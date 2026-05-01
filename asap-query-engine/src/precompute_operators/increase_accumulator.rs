@@ -216,11 +216,8 @@ impl AggregateCore for IncreaseAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(

@@ -1329,8 +1329,8 @@ mod dispatcher_tests {
     use super::*;
     use crate::data_model::AggregateCore;
     use crate::precompute_operators::{DDSketchAccumulator, HllSketchAccumulator};
-    use asap_sketchlib::asap::dd_sketch::DdSketch;
-    use asap_sketchlib::asap::hll_sketch::HllVariant;
+    use asap_sketchlib::sketches::ddsketch::DdSketch;
+    use asap_sketchlib::sketches::hll::HllVariant;
 
     #[test]
     fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {
