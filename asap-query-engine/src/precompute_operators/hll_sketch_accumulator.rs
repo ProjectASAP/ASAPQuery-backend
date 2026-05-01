@@ -208,15 +208,75 @@ impl AggregateCore for HllSketchAccumulator {
 
     fn query_statistic(
         &self,
-        _statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: promql_utilities::query_logics::enums::Statistic,
         _key: &Option<KeyByLabelValues>,
         _query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        Err("HllSketchAccumulator: query_statistic not yet implemented \
-             (register round-trip works, but cardinality estimation deferred; \
-              tracked as a PR C-CountSketch follow-up)"
-            .into())
+        use promql_utilities::query_logics::enums::Statistic;
+        match statistic {
+            // HLL's natural answer is unique-cardinality. PromQL's
+            // `count_over_time(...)` and `count(...)` both surface
+            // as `Statistic::Count` after pattern matching but
+            // semantically they mean "how many distinct values
+            // were observed in this window" when the underlying
+            // aggregator is HLL — that's the cardinality estimate,
+            // not a sample-count. Accept both.
+            Statistic::Cardinality | Statistic::Count => {
+                Ok(hll_cardinality_estimate(&self.inner.registers))
+            }
+            other => Err(format!(
+                "HllSketchAccumulator: statistic {:?} not supported (only Cardinality / Count)",
+                other,
+            )
+            .into()),
+        }
     }
+}
+
+/// Standard HyperLogLog cardinality estimate with the canonical
+/// `α_m × m² / Σ 2^(-register[i])` formula plus the small-range
+/// (linear-counting) and large-range (32-bit space) corrections
+/// from the original Flajolet et al. paper.
+///
+/// Inlined here rather than added as a method on `sketch_core::HllSketch`
+/// because the existing `sketch_core` types only expose merge /
+/// serialize today; adding a query method there would force a
+/// cross-crate change.
+fn hll_cardinality_estimate(registers: &[u8]) -> f64 {
+    let m = registers.len() as f64;
+    if m == 0.0 {
+        return 0.0;
+    }
+    let alpha = match registers.len() {
+        16 => 0.673,
+        32 => 0.697,
+        64 => 0.709,
+        _ => 0.7213 / (1.0 + 1.079 / m),
+    };
+
+    let mut sum = 0.0f64;
+    let mut zero_registers = 0usize;
+    for &r in registers {
+        sum += 2f64.powi(-(r as i32));
+        if r == 0 {
+            zero_registers += 1;
+        }
+    }
+    let raw = alpha * m * m / sum;
+
+    // Small-range (linear-counting) correction.
+    if raw <= 2.5 * m && zero_registers > 0 {
+        return m * (m / zero_registers as f64).ln();
+    }
+
+    // Large-range correction (only meaningful with 32-bit register
+    // spaces; sketch-core uses up to 64-bit hashes so this branch
+    // rarely fires in practice — kept for completeness).
+    let two_pow_32 = 4_294_967_296f64;
+    if raw > two_pow_32 / 30.0 {
+        return -two_pow_32 * (1.0 - raw / two_pow_32).ln();
+    }
+    raw
 }
 
 #[cfg(test)]

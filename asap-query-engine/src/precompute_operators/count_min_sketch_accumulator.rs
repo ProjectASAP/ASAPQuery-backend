@@ -387,10 +387,40 @@ impl AggregateCore for CountMinSketchAccumulator {
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         use crate::data_model::MultipleSubpopulationAggregate;
-        let key_val = key
-            .as_ref()
-            .ok_or("Key required for CountMinSketchAccumulator")?;
-        self.query(statistic, key_val, Some(query_kwargs))
+        use promql_utilities::query_logics::enums::Statistic;
+
+        // Key-provided path: route to MultipleSubpopulationAggregate::query
+        // (the canonical "what's the count of this key?" lookup).
+        if let Some(key_val) = key.as_ref() {
+            return self.query(statistic, key_val, Some(query_kwargs));
+        }
+        if let Some(k) = query_kwargs.get("key") {
+            let key_val = crate::KeyByLabelValues::new_with_labels(vec![k.clone()]);
+            return self.query(statistic, &key_val, Some(query_kwargs));
+        }
+
+        // No-key path: return total event volume. The min-row-sum is the
+        // canonical CMS estimator for "how many inserts were observed" —
+        // each insert increments exactly one cell per row, so every row
+        // sums to the true insert count (modulo collisions, which CMS
+        // never *underestimates*; min is the tightest upper bound).
+        match statistic {
+            Statistic::Count | Statistic::Sum => {
+                let matrix = self.inner.sketch();
+                if matrix.is_empty() || matrix[0].is_empty() {
+                    return Ok(0.0);
+                }
+                let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
+                let min_total = row_totals.fold(f64::INFINITY, f64::min);
+                Ok(if min_total.is_finite() { min_total } else { 0.0 })
+            }
+            other => Err(format!(
+                "CountMinSketchAccumulator: statistic {:?} not supported \
+                 without a key (only Count / Sum aggregate over the whole sketch)",
+                other,
+            )
+            .into()),
+        }
     }
 }
 
