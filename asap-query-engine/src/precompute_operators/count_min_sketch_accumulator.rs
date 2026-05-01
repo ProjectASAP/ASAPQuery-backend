@@ -2,13 +2,13 @@ use crate::data_model::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
+use asap_sketchlib::asap::count_min::{CountMinDelta, CountMinSketch};
 use serde_json::Value;
-use sketch_core::count_min::{CountMinDelta, CountMinSketch};
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// Count-Min Sketch accumulator — wraps sketch_core::CountMinSketch.
+/// Count-Min Sketch accumulator — wraps asap_sketchlib::asap::CountMinSketch.
 /// Core struct, update/merge/serde logic live in sketch-core.
 /// This file retains QE-specific trait impls, legacy deserializers, and JSON output.
 #[derive(Debug, Clone)]
@@ -186,12 +186,9 @@ impl CountMinSketchAccumulator {
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
         use prost::Message;
 
-        let pb = PbDelta::decode(buffer)
-            .map_err(|e| format!("decode CountMinDelta: {e}"))?;
+        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountMinDelta: {e}"))?;
 
-        if pb.cell_rows.len() != pb.cell_cols.len()
-            || pb.cell_rows.len() != pb.d_counts.len()
-        {
+        if pb.cell_rows.len() != pb.cell_cols.len() || pb.cell_rows.len() != pb.d_counts.len() {
             return Err(format!(
                 "CountMinDelta packed-array length mismatch: \
                  cell_rows={}, cell_cols={}, d_counts={}",
@@ -335,11 +332,8 @@ impl AggregateCore for CountMinSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(
@@ -412,7 +406,11 @@ impl AggregateCore for CountMinSketchAccumulator {
                 }
                 let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
                 let min_total = row_totals.fold(f64::INFINITY, f64::min);
-                Ok(if min_total.is_finite() { min_total } else { 0.0 })
+                Ok(if min_total.is_finite() {
+                    min_total
+                } else {
+                    0.0
+                })
             }
             other => Err(format!(
                 "CountMinSketchAccumulator: statistic {:?} not supported \

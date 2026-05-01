@@ -5,13 +5,13 @@ use crate::{
     },
     KeyByLabelValues,
 };
+use asap_sketchlib::asap::hydra_kll::HydraKllSketch;
 use base64::{engine::general_purpose, Engine as _};
-use sketch_core::hydra_kll::HydraKllSketch;
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// HydraKLL sketch accumulator — wraps sketch_core::HydraKllSketch.
+/// HydraKLL sketch accumulator — wraps asap_sketchlib::asap::HydraKllSketch.
 /// Core struct, update/merge/serde logic live in sketch-core.
 /// This file retains QE-specific trait impls and JSON output.
 #[derive(Debug, Clone)]
@@ -88,11 +88,8 @@ impl AggregateCore for HydraKllSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(

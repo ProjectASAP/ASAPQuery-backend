@@ -2,8 +2,8 @@ use crate::data_model::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
+use asap_sketchlib::asap::delta_set_aggregator::{deserialize_msgpack, serialize_msgpack};
 use serde_json::Value;
-use sketch_core::delta_set_aggregator::{deserialize_msgpack, serialize_msgpack};
 use std::collections::{HashMap, HashSet};
 
 use promql_utilities::query_logics::enums::Statistic;
@@ -219,11 +219,8 @@ impl AggregateCore for DeltaSetAggregatorAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(

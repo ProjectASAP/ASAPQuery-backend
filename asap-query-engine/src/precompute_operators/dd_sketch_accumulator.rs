@@ -1,4 +1,4 @@
-//! DDSketch accumulator — wraps `sketch_core::dd_sketch::DdSketch`.
+//! DDSketch accumulator — wraps `asap_sketchlib::asap::dd_sketch::DdSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = DDSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,8 +12,8 @@
 //! works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+use asap_sketchlib::asap::dd_sketch::{DdSketch, DdSketchDelta};
 use serde_json::Value;
-use sketch_core::dd_sketch::{DdSketch, DdSketchDelta};
 use std::collections::HashMap;
 
 /// DDSketch accumulator — inner log-bucketed sketch.
@@ -107,8 +107,7 @@ impl DDSketchAccumulator {
         use asap_otel_proto::sketchlib::v1::DdSketchDelta as PbDelta;
         use prost::Message;
 
-        let pb = PbDelta::decode(buffer)
-            .map_err(|e| format!("decode DDSketchDelta: {e}"))?;
+        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode DDSketchDelta: {e}"))?;
 
         let buckets = pb
             .buckets
@@ -160,11 +159,8 @@ impl AggregateCore for DDSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(
@@ -375,9 +371,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{
-            DdSketchBucketDelta, DdSketchDelta as PbDelta,
-        };
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
 
         let mut acc = DDSketchAccumulator::new(0.01);

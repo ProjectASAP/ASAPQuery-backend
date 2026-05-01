@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use sketch_core::config::{self, ImplMode};
+use asap_sketchlib::asap::config::{self, ImplMode};
 
 use query_engine_rust::data_model::enums::{InputFormat, LockStrategy, StreamingEngine};
 use query_engine_rust::drivers::AdapterConfig;
@@ -941,11 +941,8 @@ mod tests {
 
     #[test]
     fn no_cold_no_forward_yields_no_fallback() {
-        let cfg = AdapterConfig::from_prom_with_optional_cold(
-            "http://prom:9090".into(),
-            false,
-            None,
-        );
+        let cfg =
+            AdapterConfig::from_prom_with_optional_cold("http://prom:9090".into(), false, None);
         assert!(
             cfg.fallback.is_none(),
             "without cold-store and without forward, no fallback should be installed",
@@ -954,11 +951,8 @@ mod tests {
 
     #[test]
     fn no_cold_with_forward_yields_prom_fallback() {
-        let cfg = AdapterConfig::from_prom_with_optional_cold(
-            "http://prom:9090".into(),
-            true,
-            None,
-        );
+        let cfg =
+            AdapterConfig::from_prom_with_optional_cold("http://prom:9090".into(), true, None);
         assert!(
             cfg.fallback.is_some(),
             "forward_unsupported=true must install Prom fallback",

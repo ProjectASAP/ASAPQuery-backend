@@ -669,8 +669,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // one in-flight delta per (metric, labels) so
                     // the next full snapshot replaces the current
                     // cache entry cleanly.
-                    let accumulator: Box<dyn AggregateCore> = if dp.encoding
-                        == ENCODING_PROTO_DELTA
+                    let accumulator: Box<dyn AggregateCore> = if dp.encoding == ENCODING_PROTO_DELTA
                         || dp.encoding == ENCODING_MSGPACK_DELTA
                     {
                         let Some(base) = ingest_state
@@ -714,11 +713,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .insert(series_key.clone(), merged.clone_boxed_core());
                         merged
                     } else {
-                        match decode_modified_otlp_sketch_bytes(
-                            dp.kind,
-                            dp.encoding,
-                            &dp.sketch,
-                        ) {
+                        match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
                             Ok(acc) => {
                                 ingest_state
                                     .sketch_snapshots
@@ -978,19 +973,16 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
              DDSketch / HLL / CountSketch / CountMin are wired"
         )
         .into()),
-        (ENCODING_MSGPACK_DELTA, _) => Err(
-            "MSGPACK_DELTA encoding is not yet wired; PR G covers PROTO_DELTA only"
-                .into(),
-        ),
+        (ENCODING_MSGPACK_DELTA, _) => {
+            Err("MSGPACK_DELTA encoding is not yet wired; PR G covers PROTO_DELTA only".into())
+        }
         (ENCODING_PROTO, _) | (ENCODING_MSGPACK, _) => Err(format!(
             "encoding {encoding} is a full-state frame — route through \
              `decode_modified_otlp_sketch_bytes` and replace the cached \
              accumulator, not through the delta applier"
         )
         .into()),
-        (other, _) => Err(
-            format!("unknown modified-OTLP sketch encoding {other}").into(),
-        ),
+        (other, _) => Err(format!("unknown modified-OTLP sketch encoding {other}").into()),
     }
 }
 
@@ -1337,14 +1329,12 @@ mod dispatcher_tests {
     use super::*;
     use crate::data_model::AggregateCore;
     use crate::precompute_operators::{DDSketchAccumulator, HllSketchAccumulator};
-    use sketch_core::dd_sketch::DdSketch;
-    use sketch_core::hll_sketch::HllVariant;
+    use asap_sketchlib::asap::dd_sketch::DdSketch;
+    use asap_sketchlib::asap::hll_sketch::HllVariant;
 
     #[test]
     fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{
-            DdSketchBucketDelta, DdSketchDelta as PbDelta,
-        };
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
 
         // Base sketch represents the last full snapshot the agent sent.
@@ -1354,8 +1344,14 @@ mod dispatcher_tests {
 
         let bytes = PbDelta {
             buckets: vec![
-                DdSketchBucketDelta { index: 0, d_count: 10 },
-                DdSketchBucketDelta { index: 2, d_count: 20 },
+                DdSketchBucketDelta {
+                    index: 0,
+                    d_count: 10,
+                },
+                DdSketchBucketDelta {
+                    index: 2,
+                    d_count: 20,
+                },
             ],
             d_count: 30,
             d_sum: 70.0,
@@ -1374,10 +1370,7 @@ mod dispatcher_tests {
         )
         .expect("apply ok");
 
-        let dd = acc
-            .as_any()
-            .downcast_ref::<DDSketchAccumulator>()
-            .unwrap();
+        let dd = acc.as_any().downcast_ref::<DDSketchAccumulator>().unwrap();
         assert_eq!(dd.inner.store_counts, vec![11, 2, 23]);
         assert_eq!(dd.inner.count, 36);
         assert_eq!(dd.inner.min, 0.5);
@@ -1405,18 +1398,10 @@ mod dispatcher_tests {
         }
         .encode_to_vec();
 
-        apply_modified_otlp_delta_bytes(
-            SketchKind::Hll,
-            ENCODING_PROTO_DELTA,
-            &mut acc,
-            &bytes,
-        )
-        .expect("apply ok");
+        apply_modified_otlp_delta_bytes(SketchKind::Hll, ENCODING_PROTO_DELTA, &mut acc, &bytes)
+            .expect("apply ok");
 
-        let hll = acc
-            .as_any()
-            .downcast_ref::<HllSketchAccumulator>()
-            .unwrap();
+        let hll = acc.as_any().downcast_ref::<HllSketchAccumulator>().unwrap();
         assert_eq!(hll.inner.registers, vec![4, 5, 6, 7]);
     }
 
@@ -1437,16 +1422,11 @@ mod dispatcher_tests {
 
     #[test]
     fn apply_rejects_full_state_encoding() {
-        let mut acc: Box<dyn AggregateCore> =
-            Box::new(DDSketchAccumulator::new(0.01));
-        let err = apply_modified_otlp_delta_bytes(
-            SketchKind::DdSketch,
-            ENCODING_PROTO,
-            &mut acc,
-            &[],
-        )
-        .expect_err("expected full-state-rejection error")
-        .to_string();
+        let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator::new(0.01));
+        let err =
+            apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO, &mut acc, &[])
+                .expect_err("expected full-state-rejection error")
+                .to_string();
         assert!(err.contains("full-state frame"));
     }
 

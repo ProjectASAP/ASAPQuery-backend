@@ -1,4 +1,4 @@
-//! HLL accumulator — wraps `sketch_core::hll_sketch::HllSketch`.
+//! HLL accumulator — wraps `asap_sketchlib::asap::hll_sketch::HllSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = HLLSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,8 +12,8 @@
 //! store round-trip works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+use asap_sketchlib::asap::hll_sketch::{HllDelta, HllSketch, HllVariant};
 use serde_json::Value;
-use sketch_core::hll_sketch::{HllDelta, HllSketch, HllVariant};
 use std::collections::HashMap;
 
 /// HLL accumulator — inner register array + variant metadata.
@@ -95,7 +95,7 @@ impl HllSketchAccumulator {
         let variant = match proto_variant {
             ProtoVariant::Unspecified => HllVariant::Unspecified,
             ProtoVariant::Regular => HllVariant::Regular,
-            ProtoVariant::Datafusion => HllVariant::Datafusion,
+            ProtoVariant::ErtlMle => HllVariant::Datafusion,
             ProtoVariant::Hip => HllVariant::Hip,
         };
         let inner = HllSketch::from_raw(
@@ -124,8 +124,7 @@ impl HllSketchAccumulator {
         use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 
-        let pb = PbDelta::decode(buffer)
-            .map_err(|e| format!("decode HLLDelta: {e}"))?;
+        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode HLLDelta: {e}"))?;
 
         let updates = pb
             .updates
@@ -170,11 +169,8 @@ impl AggregateCore for HllSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(
@@ -238,8 +234,8 @@ impl AggregateCore for HllSketchAccumulator {
 /// (linear-counting) and large-range (32-bit space) corrections
 /// from the original Flajolet et al. paper.
 ///
-/// Inlined here rather than added as a method on `sketch_core::HllSketch`
-/// because the existing `sketch_core` types only expose merge /
+/// Inlined here rather than added as a method on `asap_sketchlib::asap::HllSketch`
+/// because the existing `asap_sketchlib::asap` types only expose merge /
 /// serialize today; adding a query method there would force a
 /// cross-crate change.
 fn hll_cardinality_estimate(registers: &[u8]) -> f64 {
