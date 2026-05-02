@@ -876,7 +876,14 @@ impl SimpleEngine {
         plan: &StoreQueryPlan,
         do_merge: bool,
         agg_info: &AggregationIdInfo,
-    ) -> Result<(MergedOutputsMap, Option<MergedOutputsMap>, Option<(u64, u64)>), String> {
+    ) -> Result<
+        (
+            MergedOutputsMap,
+            Option<MergedOutputsMap>,
+            Option<(u64, u64)>,
+        ),
+        String,
+    > {
         // Query and merge values
         let values_map = self.execute_store_query(&plan.values_query).map_err(|e| {
             warn!("Error querying store for values: {}", e);
@@ -961,11 +968,7 @@ impl SimpleEngine {
                 target.1,
                 filtered.len()
             );
-            self.merge_precomputed_outputs(
-                &filtered,
-                do_merge,
-                agg_info.aggregation_type_for_value,
-            )
+            self.merge_precomputed_outputs(&filtered, do_merge, agg_info.aggregation_type_for_value)
         };
 
         let merge_duration = merge_start_time.elapsed();

@@ -637,7 +637,7 @@ pub async fn assert_old_new_match(engine: &SimpleEngine, query: &str, query_time
         .build_query_execution_context_promql(query.to_string(), query_time_sec)
         .expect("Failed to build context");
 
-    let old_results = engine
+    let (old_results, _) = engine
         .execute_query_pipeline(&context, false)
         .expect("Old pipeline failed");
 

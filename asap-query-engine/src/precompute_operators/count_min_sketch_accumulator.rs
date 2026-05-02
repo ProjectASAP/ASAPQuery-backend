@@ -2,14 +2,14 @@ use crate::data_model::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
+use asap_sketchlib::sketches::countmin::{CountMinSketch, CountMinSketchDelta};
 use serde_json::Value;
-use sketch_core::count_min::{CountMinDelta, CountMinSketch};
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// Count-Min Sketch accumulator — wraps sketch_core::CountMinSketch.
-/// Core struct, update/merge/serde logic live in sketch-core.
+/// Count-Min Sketch accumulator — wraps asap_sketchlib::sketches::CountMinSketch.
+/// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
 /// This file retains QE-specific trait impls, legacy deserializers, and JSON output.
 #[derive(Debug, Clone)]
 pub struct CountMinSketchAccumulator {
@@ -29,7 +29,7 @@ impl CountMinSketchAccumulator {
     }
 
     pub fn query_key(&self, key: &KeyByLabelValues) -> f64 {
-        self.inner.query_key(&key.to_semicolon_str())
+        self.inner.estimate(&key.to_semicolon_str())
     }
 
     pub fn deserialize_from_json(data: &Value) -> Result<Self, Box<dyn std::error::Error>> {
@@ -64,7 +64,8 @@ impl CountMinSketchAccumulator {
         buffer: &[u8],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: CountMinSketch::deserialize_msgpack(buffer)?,
+            inner: CountMinSketch::deserialize_msgpack(buffer)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
         })
     }
 
@@ -76,7 +77,8 @@ impl CountMinSketchAccumulator {
     /// uses — this method is the modified-OTLP entrypoint for PR I).
     pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: CountMinSketch::deserialize_msgpack(buffer)?,
+            inner: CountMinSketch::deserialize_msgpack(buffer)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
         })
     }
 
@@ -186,12 +188,9 @@ impl CountMinSketchAccumulator {
         use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
         use prost::Message;
 
-        let pb = PbDelta::decode(buffer)
-            .map_err(|e| format!("decode CountMinDelta: {e}"))?;
+        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountMinDelta: {e}"))?;
 
-        if pb.cell_rows.len() != pb.cell_cols.len()
-            || pb.cell_rows.len() != pb.d_counts.len()
-        {
+        if pb.cell_rows.len() != pb.cell_cols.len() || pb.cell_rows.len() != pb.d_counts.len() {
             return Err(format!(
                 "CountMinDelta packed-array length mismatch: \
                  cell_rows={}, cell_cols={}, d_counts={}",
@@ -208,7 +207,7 @@ impl CountMinSketchAccumulator {
             .zip(pb.d_counts.iter())
             .map(|((r, c), dc)| (*r, *c, *dc))
             .collect();
-        let delta = CountMinDelta {
+        let delta = CountMinSketchDelta {
             rows: pb.rows,
             cols: pb.cols,
             cells,
@@ -289,10 +288,10 @@ impl CountMinSketchAccumulator {
         }
 
         // Check dimensions are consistent
-        let row_num = cms_accumulators[0].inner.row_num;
-        let col_num = cms_accumulators[0].inner.col_num;
+        let rows = cms_accumulators[0].inner.rows();
+        let cols = cms_accumulators[0].inner.cols();
         for acc in &cms_accumulators {
-            if acc.inner.row_num != row_num || acc.inner.col_num != col_num {
+            if acc.inner.rows() != rows || acc.inner.cols() != cols {
                 return Err(
                     "Cannot merge CountMinSketch accumulators with different dimensions".into(),
                 );
@@ -311,14 +310,14 @@ impl CountMinSketchAccumulator {
 impl SerializableToSink for CountMinSketchAccumulator {
     fn serialize_to_json(&self) -> Value {
         serde_json::json!({
-            "row_num": self.inner.row_num,
-            "col_num": self.inner.col_num,
+            "row_num": self.inner.rows(),
+            "col_num": self.inner.cols(),
             "sketch": self.inner.sketch()
         })
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack()
+        self.inner.serialize_msgpack().unwrap_or_default()
     }
 }
 
@@ -335,11 +334,8 @@ impl AggregateCore for CountMinSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(
@@ -412,7 +408,11 @@ impl AggregateCore for CountMinSketchAccumulator {
                 }
                 let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
                 let min_total = row_totals.fold(f64::INFINITY, f64::min);
-                Ok(if min_total.is_finite() { min_total } else { 0.0 })
+                Ok(if min_total.is_finite() {
+                    min_total
+                } else {
+                    0.0
+                })
             }
             other => Err(format!(
                 "CountMinSketchAccumulator: statistic {:?} not supported \
@@ -446,11 +446,12 @@ impl MergeableAccumulator<CountMinSketchAccumulator> for CountMinSketchAccumulat
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
         }
-        let inners: Vec<CountMinSketch> = accumulators.into_iter().map(|acc| acc.inner).collect();
-        let merged_inner = CountMinSketch::merge(inners)?;
-        Ok(Self {
-            inner: merged_inner,
-        })
+        let mut iter = accumulators.into_iter();
+        let mut merged = iter.next().unwrap();
+        for acc in iter {
+            merged.inner.merge(&acc.inner)?;
+        }
+        Ok(merged)
     }
 }
 
@@ -461,8 +462,8 @@ mod tests {
     #[test]
     fn test_count_min_sketch_creation() {
         let cms = CountMinSketchAccumulator::new(4, 1000);
-        assert_eq!(cms.inner.row_num, 4);
-        assert_eq!(cms.inner.col_num, 1000);
+        assert_eq!(cms.inner.rows(), 4);
+        assert_eq!(cms.inner.cols(), 1000);
         let sketch = cms.inner.sketch();
         assert_eq!(sketch.len(), 4);
         assert_eq!(sketch[0].len(), 1000);
@@ -541,8 +542,8 @@ mod tests {
         let deserialized =
             CountMinSketchAccumulator::deserialize_from_bytes_arroyo(&bytes).unwrap();
 
-        assert_eq!(deserialized.inner.row_num, 2);
-        assert_eq!(deserialized.inner.col_num, 3);
+        assert_eq!(deserialized.inner.rows(), 2);
+        assert_eq!(deserialized.inner.cols(), 3);
         let deser_sketch = deserialized.inner.sketch();
         assert_eq!(deser_sketch[0][1], 42.0);
         assert_eq!(deser_sketch[1][2], 100.0);

@@ -1191,11 +1191,12 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     // Build a known sketch in sketch-core and serialize with msgpack — this
     // is what the Go producer (sketchlib-go) will emit once PR I's matching
     // Go-side work lands.
-    let mut cms = sketch_core::count_min::CountMinSketch::new(rows as usize, cols as usize);
+    let mut cms =
+        asap_sketchlib::sketches::countmin::CountMinSketch::new(rows as usize, cols as usize);
     cms.update("user_a", 1.0);
     cms.update("user_b", 1.0);
     cms.update("user_a", 1.0);
-    let sketch_bytes = cms.serialize_msgpack();
+    let sketch_bytes = cms.serialize_msgpack().expect("serialize CMS msgpack");
 
     let client = reqwest::Client::new();
     let req = build_count_min_msgpack_export_request(
@@ -1207,12 +1208,15 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     post_otlp_http(&client, otlp_http_port, req).await;
 
     // Watermark advance using an empty msgpack sketch.
-    let empty = sketch_core::count_min::CountMinSketch::new(rows as usize, cols as usize);
+    let empty =
+        asap_sketchlib::sketches::countmin::CountMinSketch::new(rows as usize, cols as usize);
     let watermark_req = build_count_min_msgpack_export_request(
         metric_name,
         service_label,
         2_000_000_000,
-        empty.serialize_msgpack(),
+        empty
+            .serialize_msgpack()
+            .expect("serialize empty CMS msgpack"),
     );
     post_otlp_http(&client, otlp_http_port, watermark_req).await;
 
@@ -1233,10 +1237,10 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
         .downcast_ref::<CountMinSketchAccumulator>()
         .expect("captured accumulator should be CountMinSketchAccumulator");
 
-    // user_a was updated twice → query_key("user_a") should estimate ≥ 2.
+    // user_a was updated twice → estimate("user_a") should be ≥ 2.
     assert!(
-        cms_acc.inner.query_key("user_a") >= 2.0,
+        cms_acc.inner.estimate("user_a") >= 2.0,
         "CountMinSketch msgpack round-trip should preserve user_a count (got {})",
-        cms_acc.inner.query_key("user_a")
+        cms_acc.inner.estimate("user_a")
     );
 }

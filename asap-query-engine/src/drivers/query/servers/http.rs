@@ -429,8 +429,7 @@ async fn handle_instant_query(
         }
     };
 
-    let response =
-        process_query_request(&state, &parsed_request, start_time, HashMap::new()).await;
+    let response = process_query_request(&state, &parsed_request, start_time, HashMap::new()).await;
     srv_metrics::record_query_outcome(
         srv_metrics::QUERY_TYPE_INSTANT,
         query_status_label(&response),
@@ -552,10 +551,7 @@ async fn handle_instant_query_post(
         total_duration.as_secs_f64() * 1000.0
     );
 
-    srv_metrics::record_query_outcome(
-        srv_metrics::QUERY_TYPE_INSTANT,
-        query_status_label(&result),
-    );
+    srv_metrics::record_query_outcome(srv_metrics::QUERY_TYPE_INSTANT, query_status_label(&result));
     result
 }
 
@@ -730,10 +726,7 @@ async fn handle_range_query(
     };
 
     let response = process_range_query_request(&state, &parsed_request, start_time).await;
-    srv_metrics::record_query_outcome(
-        srv_metrics::QUERY_TYPE_RANGE,
-        query_status_label(&response),
-    );
+    srv_metrics::record_query_outcome(srv_metrics::QUERY_TYPE_RANGE, query_status_label(&response));
     response
 }
 
@@ -794,10 +787,7 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
     };
 
     let response = process_range_query_request(&state, &parsed_request, start_time).await;
-    srv_metrics::record_query_outcome(
-        srv_metrics::QUERY_TYPE_RANGE,
-        query_status_label(&response),
-    );
+    srv_metrics::record_query_outcome(srv_metrics::QUERY_TYPE_RANGE, query_status_label(&response));
     response
 }
 

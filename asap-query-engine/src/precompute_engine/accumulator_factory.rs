@@ -295,11 +295,11 @@ impl DDSketchAccumulatorUpdater {
 impl AccumulatorUpdater for DDSketchAccumulatorUpdater {
     fn update_single(&mut self, value: f64, _timestamp_ms: i64) {
         // sketch-core's DdSketch (the inner of DDSketchAccumulator)
-        // exposes `insert(f64)` for single-value ingestion. The
+        // exposes `update(f64)` for single-value ingestion. The
         // worker calls this when a raw OTLP datapoint matches an
         // aggregation typed as DDSketch — the sketch-merge path
         // uses `merge_with` directly.
-        self.acc.inner.insert(value);
+        self.acc.inner.update(value);
     }
 
     fn update_keyed(&mut self, _key: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
@@ -734,9 +734,9 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             let (row_num, col_num, k) = hydra_kll_params(config);
             Box::new(HydraKllAccumulatorUpdater::new(row_num, col_num, k))
         }
-        AggregationType::DDSketch => {
-            Box::new(DDSketchAccumulatorUpdater::new(ddsketch_alpha_param(config)))
-        }
+        AggregationType::DDSketch => Box::new(DDSketchAccumulatorUpdater::new(
+            ddsketch_alpha_param(config),
+        )),
         other => {
             tracing::warn!(
                 "Unknown aggregation_type '{:?}', defaulting to SingleSubpopulation Sum",

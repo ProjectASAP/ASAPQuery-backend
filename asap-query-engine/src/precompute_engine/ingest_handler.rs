@@ -551,15 +551,11 @@ mod tests {
     /// hand-merged sequence of full sketches.
     #[tokio::test]
     async fn delta_path_reconstitutes_cumulative_state() {
-        use crate::drivers::ingest::otel::{
-            apply_modified_otlp_delta_bytes, SketchKind,
-        };
+        use crate::drivers::ingest::otel::{apply_modified_otlp_delta_bytes, SketchKind};
         use crate::precompute_operators::DDSketchAccumulator;
-        use asap_otel_proto::sketchlib::v1::{
-            DdSketchBucketDelta, DdSketchDelta as PbDelta,
-        };
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_sketchlib::sketches::ddsketch::DdSketch;
         use prost::Message;
-        use sketch_core::dd_sketch::DdSketch;
 
         const ENCODING_PROTO_DELTA: i32 = 2;
 
@@ -579,8 +575,14 @@ mod tests {
         // First delta adds to bucket 0 and bucket 2.
         let d1 = PbDelta {
             buckets: vec![
-                DdSketchBucketDelta { index: 0, d_count: 10 },
-                DdSketchBucketDelta { index: 2, d_count: 20 },
+                DdSketchBucketDelta {
+                    index: 0,
+                    d_count: 10,
+                },
+                DdSketchBucketDelta {
+                    index: 2,
+                    d_count: 20,
+                },
             ],
             d_count: 30,
             d_sum: 70.0,
@@ -594,13 +596,8 @@ mod tests {
             .get(series_key)
             .unwrap()
             .clone_boxed_core();
-        apply_modified_otlp_delta_bytes(
-            SketchKind::DdSketch,
-            ENCODING_PROTO_DELTA,
-            &mut acc1,
-            &d1,
-        )
-        .expect("apply first delta");
+        apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc1, &d1)
+            .expect("apply first delta");
         state
             .sketch_snapshots
             .insert(series_key.to_string(), acc1.clone_boxed_core());
@@ -608,7 +605,10 @@ mod tests {
         // Second delta — picks up on top of the first, proving the
         // cache refresh is transitive.
         let d2 = PbDelta {
-            buckets: vec![DdSketchBucketDelta { index: 1, d_count: 5 }],
+            buckets: vec![DdSketchBucketDelta {
+                index: 1,
+                d_count: 5,
+            }],
             d_count: 5,
             d_sum: 10.0,
             new_max: 6.0,
@@ -621,18 +621,10 @@ mod tests {
             .get(series_key)
             .unwrap()
             .clone_boxed_core();
-        apply_modified_otlp_delta_bytes(
-            SketchKind::DdSketch,
-            ENCODING_PROTO_DELTA,
-            &mut acc2,
-            &d2,
-        )
-        .expect("apply second delta");
+        apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc2, &d2)
+            .expect("apply second delta");
 
-        let final_dd = acc2
-            .as_any()
-            .downcast_ref::<DDSketchAccumulator>()
-            .unwrap();
+        let final_dd = acc2.as_any().downcast_ref::<DDSketchAccumulator>().unwrap();
         // Base [1,2,3] + d1 [+10 on 0, +20 on 2] = [11,2,23];
         // + d2 [+5 on 1] = [11,7,23].
         assert_eq!(final_dd.inner.store_counts, vec![11, 7, 23]);

@@ -1,4 +1,4 @@
-//! DDSketch accumulator — wraps `sketch_core::dd_sketch::DdSketch`.
+//! DDSketch accumulator — wraps `asap_sketchlib::sketches::ddsketch::DdSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = DDSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,8 +12,8 @@
 //! works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+use asap_sketchlib::sketches::ddsketch::{DdSketch, DdSketchDelta};
 use serde_json::Value;
-use sketch_core::dd_sketch::{DdSketch, DdSketchDelta};
 use std::collections::HashMap;
 
 /// DDSketch accumulator — inner log-bucketed sketch.
@@ -107,8 +107,7 @@ impl DDSketchAccumulator {
         use asap_otel_proto::sketchlib::v1::DdSketchDelta as PbDelta;
         use prost::Message;
 
-        let pb = PbDelta::decode(buffer)
-            .map_err(|e| format!("decode DDSketchDelta: {e}"))?;
+        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode DDSketchDelta: {e}"))?;
 
         let buckets = pb
             .buckets
@@ -143,7 +142,7 @@ impl SerializableToSink for DDSketchAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack()
+        self.inner.serialize_msgpack().unwrap_or_default()
     }
 }
 
@@ -160,11 +159,8 @@ impl AggregateCore for DDSketchAccumulator {
         self
     }
 
-
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-
         self
-
     }
 
     fn merge_with(
@@ -358,7 +354,7 @@ mod tests {
     #[test]
     fn test_from_msgpack_bytes_round_trip() {
         let original = DdSketch::from_raw(0.01, vec![5, 10, 15, 20], -2, 50, 150.0, 0.25, 8.0);
-        let bytes = original.serialize_msgpack();
+        let bytes = original.serialize_msgpack().unwrap();
         let acc = DDSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.alpha, 0.01);
         assert_eq!(acc.inner.store_counts, vec![5, 10, 15, 20]);
@@ -375,9 +371,7 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{
-            DdSketchBucketDelta, DdSketchDelta as PbDelta,
-        };
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use prost::Message;
 
         let mut acc = DDSketchAccumulator::new(0.01);
