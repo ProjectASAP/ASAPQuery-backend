@@ -178,11 +178,23 @@ impl CountSketchAccumulator {
             .zip(pb.d_counts.iter())
             .map(|((r, c), dc)| (*r, *c, *dc))
             .collect();
+        // Proto-schema-divergence-tracker: the Go-side
+        // `CountSketchDelta` proto carries an `hh_keys` field
+        // (heavy-hitter candidate keys forwarded by the upstream
+        // Space-Saving tracker). The Rust wire-format struct now
+        // models it (`asap_sketchlib::CountSketchDelta::hh_keys`),
+        // but the vendored Rust proto bindings in
+        // `asap_otel_proto::sketchlib::v1` haven't been regenerated
+        // against the latest `.proto` yet, so no `hh_keys` arrive on
+        // the wire from Go producers. Sending an empty `hh_keys`
+        // disables the TopK rebuild path; it'll start firing once the
+        // proto-schema sync PR lands.
         let delta = CountSketchDelta {
             rows: pb.rows,
             cols: pb.cols,
             cells,
             l2: pb.l2,
+            hh_keys: Vec::new(),
         };
         self.inner
             .apply_delta(&delta)
