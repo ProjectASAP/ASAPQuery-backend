@@ -199,8 +199,8 @@ Follow-ups (not paper-blocking):
 `AccuracyProfile` trait landed in Phase 6.4 as a stub. Each
 sketch type needs formally-derived bounds + empirical validation.
 
-**Reference: the sketchlib-bench design doc**
-<https://github.com/ProjectASAP/sketchlib-bench/blob/main/docs/DESIGN.md>.
+**Reference: the sketch-bench design doc**
+<https://github.com/ProjectASAP/sketch-bench/blob/main/docs/DESIGN.md>.
 
 Sketches to cover:
 - **KLL** (datasketches-rs): `ε` vs `k` bound
@@ -211,7 +211,7 @@ Sketches to cover:
 
 Deliverable: `AccuracyProfile::derive(&AggregationConfig)`
 returns concrete (ε, δ) per sketch type — not a stub. Unit tests
-against the sketchlib-bench corpus.
+against the sketch-bench corpus.
 
 ### 3. End-to-end capability-miss feedback loop test — **done (HTTP round-trip)**
 

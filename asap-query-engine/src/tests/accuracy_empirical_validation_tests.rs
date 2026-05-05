@@ -15,11 +15,11 @@
 //! Live "measure sketch error, compare to bound" runs don't
 //! live here — the `asap_sketchlib` git dep the backend pulls
 //! exposes a different API from the
-//! [`sketchlib-bench`](https://github.com/ProjectASAP/sketchlib-bench)
+//! [`sketch-bench`](https://github.com/ProjectASAP/sketch-bench)
 //! workspace's path dep, and bridging the two inside a unit
 //! test pulls in a lot of version-coupling we don't want.
 //! Empirical sweeps are produced by `sketchlib bench
-//! --metrics accuracy` runs in sketchlib-bench and compared
+//! --metrics accuracy` runs in sketch-bench and compared
 //! against `AccuracyProfile::derive` externally; the test
 //! below pins the *theoretical* side that those comparisons
 //! are made against.
@@ -252,7 +252,7 @@ fn relative_ordering_of_bounds_matches_published_intuition() {
     // a smaller ε than CountMin when w is large enough that
     // 1/√w < e/w (i.e. w > e² ≈ 7.39). Cross-check the
     // `countsketch_oxide_matches_cms_oxide` sanity in
-    // sketchlib-bench.
+    // sketch-bench.
     let mut params = HashMap::new();
     params.insert("row_num".to_string(), json!(4u64));
     params.insert("col_num".to_string(), json!(10_000u64));
