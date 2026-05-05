@@ -37,6 +37,27 @@ struct GroupState {
     /// Per-group watermark: tracks the maximum timestamp seen across all
     /// series in this group on this worker.
     previous_watermark_ms: i64,
+    /// Wall-clock-time (ms since epoch) at which each currently-open pane
+    /// was first opened. Used by `flush_all`'s wall-clock fallback to
+    /// close panes that have been alive too long when event-time has
+    /// stagnated. Keyed by `pane_start_ms` and covers entries in BOTH
+    /// `active_panes` and `sketch_panes` (a single pane_start may have
+    /// either or both populated). Entries are GC'd by
+    /// `prune_pane_wall_clock_starts` after each window-close cycle.
+    pane_wall_clock_starts_ms: BTreeMap<i64, i64>,
+}
+
+impl GroupState {
+    /// Drop wall-clock-start entries whose pane no longer exists in
+    /// either pane map. Called after window-close cycles in
+    /// `process_group_samples`, `process_accumulator_input`, and
+    /// `flush_all` so the bookkeeping doesn't leak as panes turn over.
+    fn prune_pane_wall_clock_starts(&mut self) {
+        let active = &self.active_panes;
+        let sketch = &self.sketch_panes;
+        self.pane_wall_clock_starts_ms
+            .retain(|ps, _| active.contains_key(ps) || sketch.contains_key(ps));
+    }
 }
 
 /// Runtime configuration for a Worker, grouping non-structural parameters.
@@ -46,6 +67,10 @@ pub struct WorkerRuntimeConfig {
     pub pass_raw_samples: bool,
     pub raw_mode_aggregation_id: u64,
     pub late_data_policy: LateDataPolicy,
+    /// See `PrecomputeEngineConfig::wall_clock_grace_period_ms`. Set to a
+    /// non-positive value to disable the wall-clock fallback entirely
+    /// (event-time-only behaviour, matching pre-fix semantics).
+    pub wall_clock_grace_period_ms: i64,
 }
 
 /// Worker that processes samples for a shard of the group space.
@@ -79,6 +104,16 @@ pub struct Worker {
     all_worker_watermarks: Vec<Arc<AtomicI64>>,
     /// Externally-readable group count for diagnostics.
     group_count: Arc<AtomicUsize>,
+    /// Grace period (ms) for the wall-clock fallback in `flush_all`.
+    /// `<= 0` disables the fallback (event-time-only).
+    wall_clock_grace_period_ms: i64,
+    /// Injectable clock returning current wall-clock time in milliseconds
+    /// since the unix epoch. Production uses `SystemTime::now`; tests
+    /// override with a deterministic fake. The closure runs under
+    /// `&mut self` only on `flush_all` and pane creation, so a single
+    /// non-`Sync` cell behind a mutex is fine — but we keep the bound
+    /// `Send + Sync` for clarity since `Worker` itself is `Send`.
+    now_ms_fn: Box<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Worker {
@@ -99,6 +134,7 @@ impl Worker {
             pass_raw_samples,
             raw_mode_aggregation_id,
             late_data_policy,
+            wall_clock_grace_period_ms,
         } = runtime_config;
         Self {
             id,
@@ -113,7 +149,19 @@ impl Worker {
             worker_watermark,
             all_worker_watermarks,
             group_count,
+            wall_clock_grace_period_ms,
+            now_ms_fn: Box::new(default_now_ms),
         }
+    }
+
+    /// Test/diagnostic-only setter for the wall-clock source. Replaces
+    /// the default `SystemTime::now`-backed clock with a deterministic
+    /// fake so unit tests can drive the wall-clock fallback in
+    /// `flush_all` without `std::thread::sleep`. Production code never
+    /// calls this.
+    #[cfg(test)]
+    pub fn set_now_ms_fn(&mut self, f: Box<dyn Fn() -> i64 + Send + Sync>) {
+        self.now_ms_fn = f;
     }
 
     /// Run the worker loop. Blocks until shutdown.
@@ -248,6 +296,7 @@ impl Worker {
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
+                pane_wall_clock_starts_ms: BTreeMap::new(),
             };
             self.group_states.insert(key.clone(), gs);
             self.group_count
@@ -269,6 +318,7 @@ impl Worker {
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
+        let now_ms = (self.now_ms_fn)();
 
         if self.get_or_create_group_state(agg_id, group_key).is_none() {
             warn!(
@@ -345,7 +395,14 @@ impl Worker {
                 }
             }
 
-            // Normal path: route sample to its single pane accumulator
+            // Normal path: route sample to its single pane accumulator.
+            // Record the pane's wall-clock birth time the first time
+            // we touch it (so the wall-clock fallback in `flush_all`
+            // can age it out even if event-time freezes).
+            state
+                .pane_wall_clock_starts_ms
+                .entry(pane_start)
+                .or_insert(now_ms);
             let updater = state
                 .active_panes
                 .entry(pane_start)
@@ -375,6 +432,7 @@ impl Worker {
         }
 
         state.previous_watermark_ms = current_wm;
+        state.prune_pane_wall_clock_starts();
 
         // Emit to output sink
         if !emit_batch.is_empty() {
@@ -413,6 +471,7 @@ impl Worker {
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
+        let now_ms = (self.now_ms_fn)();
 
         if self.get_or_create_group_state(agg_id, group_key).is_none() {
             warn!(
@@ -471,6 +530,15 @@ impl Worker {
             return Ok(());
         }
 
+        // Record the pane's wall-clock birth time the first time we
+        // touch it (so the wall-clock fallback in `flush_all` can age
+        // it out even if event-time freezes — e.g. agents stamping
+        // every sketch with the same `time_unix_nano`).
+        state
+            .pane_wall_clock_starts_ms
+            .entry(pane_start)
+            .or_insert(now_ms);
+
         // Merge into the sketch pane covering this timestamp.
         match state.sketch_panes.remove(&pane_start) {
             Some(existing) => {
@@ -520,6 +588,7 @@ impl Worker {
         }
 
         state.previous_watermark_ms = current_wm;
+        state.prune_pane_wall_clock_starts();
 
         if !emit_batch.is_empty() {
             debug!(
@@ -609,6 +678,9 @@ impl Worker {
             return Ok(());
         }
 
+        let now_ms = (self.now_ms_fn)();
+        let grace_ms = self.wall_clock_grace_period_ms;
+
         // Step 1: Compute worker watermark = max of all group watermarks.
         let worker_wm = self
             .group_states
@@ -638,7 +710,30 @@ impl Worker {
             } else {
                 state.previous_watermark_ms
             };
-            let effective_wm = propagated_wm.saturating_add(1);
+            let mut effective_wm = propagated_wm.saturating_add(1);
+
+            // Wall-clock fallback for stuck event-time. If the agent
+            // stamps every sketch with the same `time_unix_nano`
+            // (e.g. window-start), `previous_watermark_ms` freezes
+            // and `closed_windows(prev, prev+1)` returns empty
+            // forever — the 30s window never closes and warm-tier
+            // queries come back empty even though sketches keep
+            // arriving (sweep blocker #2). Force `effective_wm` past
+            // `pane_start + window_size_ms` for any pane older than
+            // `window_size + grace` of WALL-CLOCK time. Set
+            // `wall_clock_grace_period_ms <= 0` to opt out and keep
+            // strict event-time semantics.
+            if grace_ms > 0 {
+                let window_size_ms = state.window_manager.window_size_ms();
+                for (&pane_start, &pane_birth_ms) in &state.pane_wall_clock_starts_ms {
+                    if now_ms.saturating_sub(pane_birth_ms) >= window_size_ms + grace_ms {
+                        let force_to = pane_start.saturating_add(window_size_ms);
+                        if force_to > effective_wm {
+                            effective_wm = force_to;
+                        }
+                    }
+                }
+            }
 
             let closed = state
                 .window_manager
@@ -675,10 +770,14 @@ impl Worker {
                 }
             }
 
-            // Update group watermark to reflect the advancement.
+            // Monotonic advance — never retreat. Both the event-time
+            // boundary `propagated_wm + 1` and the wall-clock fallback
+            // only push `effective_wm` forward, so this is safe.
             if effective_wm > state.previous_watermark_ms {
                 state.previous_watermark_ms = effective_wm;
             }
+
+            state.prune_pane_wall_clock_starts();
         }
 
         if !emit_batch.is_empty() {
@@ -717,6 +816,19 @@ impl Worker {
 /// e.g. "constant" → KeyByLabelValues { labels: ["constant"] }
 /// e.g. "us-east;svc-a" → KeyByLabelValues { labels: ["us-east", "svc-a"] }
 /// e.g. "" → KeyByLabelValues { labels: [""] }
+/// Default wall-clock-now source: milliseconds since the unix epoch.
+/// Used by `Worker::new`. Tests override via `set_now_ms_fn`.
+fn default_now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        // Pre-1970 wall clock (only happens if the host clock is
+        // grossly misconfigured) — fall back to 0 so the fallback
+        // simply doesn't trigger rather than panicking.
+        .unwrap_or(0)
+}
+
 fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
     let labels: Vec<String> = group_key.split(';').map(|s| s.to_string()).collect();
     KeyByLabelValues::new_with_labels(labels)
@@ -1049,6 +1161,7 @@ mod tests {
                 pass_raw_samples: pass_raw,
                 raw_mode_aggregation_id: raw_agg_id,
                 late_data_policy: late_policy,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -1815,6 +1928,7 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -1867,6 +1981,7 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::ForwardToStore,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -2096,6 +2211,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm0,
@@ -2123,6 +2239,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm0,
@@ -2154,6 +2271,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm0,
@@ -2194,6 +2312,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -2375,6 +2494,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -2516,5 +2636,199 @@ aggregations:
                 "zone {zone} must roll up exactly {expected_count} per-tuple sketches"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Sweep blocker #2 — root-cause fix: wall-clock watermark fallback.
+    //
+    // Pin the failure mode PR #82 escalated as "watermark-semantics design
+    // change": event-time stagnates (agent stamps every sketch with the same
+    // `time_unix_nano`, e.g. window-start instead of flush-time), so
+    // `closed_windows(prev_wm, prev_wm + 1)` in `flush_all` returns empty
+    // forever, the 30s window never closes, no output ever lands in the
+    // per_key store, and warm-tier queries come back empty even though
+    // `worker_process_accumulator` keeps logging.
+    //
+    // The fix tracks each pane's wall-clock birth time and force-closes its
+    // window once `now - pane_birth >= window_size + grace`. This test
+    // injects a fake clock so it runs in milliseconds instead of needing
+    // `std::thread::sleep(35s)`.
+    // -----------------------------------------------------------------------
+
+    /// Build a Worker for the wall-clock fallback test that is otherwise
+    /// identical to `make_worker`, but takes an explicit
+    /// `wall_clock_grace_period_ms`. Test-local helper so existing
+    /// callsites stay untouched.
+    fn make_worker_with_grace(
+        agg_configs: HashMap<u64, AggregationConfig>,
+        sink: Arc<CapturingOutputSink>,
+        wall_clock_grace_period_ms: i64,
+    ) -> Worker {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let wm = Arc::new(AtomicI64::new(i64::MIN));
+        Worker::new(
+            0,
+            rx,
+            sink,
+            make_hot_reload(agg_configs),
+            WorkerRuntimeConfig {
+                max_buffer_per_series: 10_000,
+                allowed_lateness_ms: 0,
+                pass_raw_samples: false,
+                raw_mode_aggregation_id: 0,
+                late_data_policy: LateDataPolicy::Drop,
+                wall_clock_grace_period_ms,
+            },
+            Arc::new(AtomicUsize::new(0)),
+            wm.clone(),
+            vec![wm],
+        )
+    }
+
+    /// Direct test of the wall-clock fallback in `flush_all`. Pins
+    /// the fix for sweep blocker #2: even if event-time freezes (every
+    /// sketch arrives with the same `time_unix_nano`), the pane must
+    /// close once wall-clock time exceeds `window_size + grace`. Uses
+    /// an injected fake clock to run in microseconds rather than
+    /// sleeping 35 real seconds.
+    #[test]
+    fn wall_clock_fallback_closes_idle_window() {
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30, // 30-second tumbling window
+            0,
+            vec!["zone"],
+        );
+        let agg_configs = HashMap::from([(1, cfg)]);
+        let sink = Arc::new(CapturingOutputSink::new());
+        // 5s grace period — production default.
+        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 5_000);
+
+        // Pin clock at t_wall = 1_000_000 ms during ingest. Every
+        // sketch arrives stamped with the SAME event-time
+        // (time_unix_nano collapsing to a constant 0 / window-start
+        // is the production failure mode the live diagnostic showed:
+        // 8000 worker_process_accumulator log lines, 0 store entries).
+        let wall_clock = Arc::new(AtomicI64::new(1_000_000));
+        let wc_clone = wall_clock.clone();
+        worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
+
+        // Ingest 10 sketches all stamped at frozen event-time t_event=0.
+        for i in 0..10 {
+            let s = make_ddsketch(0.01, &[1.0 + i as f64]);
+            worker
+                .process_accumulator_input(1, "us-east", 0, Box::new(s))
+                .expect("ingest must accept frozen-event-time sketches");
+        }
+        assert_eq!(
+            sink.len(),
+            0,
+            "no output should be emitted yet: event-time hasn't advanced past the window"
+        );
+
+        // Flush at the same wall-clock time (only ~0s elapsed since
+        // pane creation). Wall-clock fallback must NOT trigger yet —
+        // pane is younger than window_size + grace = 35s.
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "flush at t_wall=pane_birth must not close the window — fallback fires only after grace"
+        );
+
+        // Advance fake wall-clock by exactly window_size + grace = 35s.
+        // Now the pane has been open long enough that the fallback
+        // must close + emit + persist its window, even though
+        // event-time is still pinned at 0.
+        wall_clock.store(1_000_000 + 30_000 + 5_000, Ordering::Relaxed);
+        worker.flush_all().unwrap();
+
+        let captured = sink.drain();
+        assert!(
+            !captured.is_empty(),
+            "wall-clock fallback failed to close the idle window — \
+             this is the live sweep blocker #2 root cause: with frozen event-time, \
+             flush_all's +1ms event-time advance is a no-op and the 30s window \
+             never closes."
+        );
+
+        // The emitted output must cover the window [0, 30_000)
+        // — the tumbling 30s window containing all the frozen-time
+        // sketches.
+        let (output, acc) = &captured[0];
+        assert_eq!(output.aggregation_id, 1);
+        assert_eq!(output.start_timestamp, 0);
+        assert_eq!(output.end_timestamp, 30_000);
+        assert_eq!(
+            acc.type_name(),
+            "DDSketchAccumulator",
+            "wall-clock-fallback-emitted accumulator must round-trip as DDSketchAccumulator"
+        );
+        let dd = acc
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .expect("must downcast back to DDSketchAccumulator");
+        assert_eq!(
+            dd.inner.count, 10,
+            "all 10 frozen-time sketches must merge into the single emitted output"
+        );
+
+        // Calling flush_all again with no new data must NOT re-emit
+        // the same window — once a window has been closed via the
+        // fallback, its pane is drained from `sketch_panes` and from
+        // `pane_wall_clock_starts_ms`, so there's nothing left to
+        // close. This pins the monotonicity invariant: emitted
+        // windows have monotonically non-decreasing close times and
+        // each window is emitted at most once.
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "wall-clock fallback must be idempotent — already-closed window must not re-emit"
+        );
+    }
+
+    /// Pin the wall-clock-fallback opt-out: setting
+    /// `wall_clock_grace_period_ms = 0` reverts to event-time-only
+    /// semantics, matching pre-fix behaviour. This keeps
+    /// `flush_all`'s contract backward-compatible for callers that
+    /// want strict event-time (e.g. deterministic replays).
+    #[test]
+    fn wall_clock_fallback_disabled_preserves_event_time_only_semantics() {
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30,
+            0,
+            vec!["zone"],
+        );
+        let agg_configs = HashMap::from([(1, cfg)]);
+        let sink = Arc::new(CapturingOutputSink::new());
+        // grace=0 disables the fallback entirely.
+        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 0);
+
+        let wall_clock = Arc::new(AtomicI64::new(1_000_000));
+        let wc_clone = wall_clock.clone();
+        worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
+
+        let s = make_ddsketch(0.01, &[42.0]);
+        worker
+            .process_accumulator_input(1, "us-east", 0, Box::new(s))
+            .unwrap();
+
+        // Even after a wall-clock eternity, no emit happens with
+        // grace=0 — event-time hasn't advanced past the window.
+        wall_clock.store(1_000_000 + 86_400_000, Ordering::Relaxed); // +24h
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "grace=0 must disable the fallback — event-time-only semantics"
+        );
     }
 }

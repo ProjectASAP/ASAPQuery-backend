@@ -32,6 +32,18 @@ pub struct PrecomputeEngineConfig {
     pub raw_mode_aggregation_id: u64,
     /// Policy for handling late samples that arrive after their window has closed.
     pub late_data_policy: LateDataPolicy,
+    /// Wall-clock grace period (milliseconds) for the watermark fallback in
+    /// `flush_all`. When event-time stagnates (e.g. agents stamp every
+    /// sketch with the same `time_unix_nano`), `flush_all`'s `+1ms`
+    /// watermark advance is a no-op and idle windows never close. The
+    /// wall-clock fallback closes a pane whose creation has been older
+    /// than `window_size_ms + wall_clock_grace_period_ms` of *wall-clock*
+    /// time, regardless of where event-time is. The grace period
+    /// tolerates late-arriving events that would otherwise be evicted as
+    /// "the window already closed". Default: 5000 ms (matches
+    /// `allowed_lateness_ms` default).
+    #[serde(default = "default_wall_clock_grace_period_ms")]
+    pub wall_clock_grace_period_ms: i64,
     /// Optional path where the `SchemaRegistry` persists per-`agg_id`
     /// lifecycle state across restarts (sketch DB Phase 2c). When
     /// set, the registry loads prior `created_at_ms` / `retired_at_ms`
@@ -55,9 +67,14 @@ impl Default for PrecomputeEngineConfig {
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
             late_data_policy: LateDataPolicy::Drop,
+            wall_clock_grace_period_ms: default_wall_clock_grace_period_ms(),
             schema_persist_path: None,
         }
     }
+}
+
+fn default_wall_clock_grace_period_ms() -> i64 {
+    5_000
 }
 
 #[cfg(test)]
@@ -76,5 +93,6 @@ mod tests {
         assert!(!config.pass_raw_samples);
         assert_eq!(config.raw_mode_aggregation_id, 0);
         assert_eq!(config.late_data_policy, LateDataPolicy::Drop);
+        assert_eq!(config.wall_clock_grace_period_ms, 5_000);
     }
 }
