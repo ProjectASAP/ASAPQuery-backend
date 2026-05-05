@@ -61,7 +61,7 @@ zstd = "0.13"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tracing-appender = "0.2"
 elastic_dsl_utilities.workspace = true
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "refactor/wire-format-align-go" }
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 # Persistence layer (SimpleMapStore parts / manifest / Tier-2 cache)
 moka = { version = "0.12", features = ["sync"] }
 memmap2 = "0.9"

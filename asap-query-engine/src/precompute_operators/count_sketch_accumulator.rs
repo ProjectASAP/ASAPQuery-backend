@@ -1,4 +1,4 @@
-//! Count Sketch accumulator — wraps `asap_sketchlib::sketches::count::CountSketch`.
+//! Count Sketch accumulator — wraps `asap_sketchlib::sketches::countsketch::CountSketch`.
 //!
 //! This is the concrete accumulator reached from the modified-OTLP
 //! `Metric.data = CountSketch{…}` hot path (PR C-CountSketch). Its
@@ -20,7 +20,7 @@
 //! round-trip works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::sketches::count::{CountSketch, CountSketchDelta};
+use asap_sketchlib::sketches::countsketch::{CountSketch, CountSketchDelta};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -314,7 +314,7 @@ impl AggregateCore for CountSketchAccumulator {
 ///
 /// Hash compatibility with the agent is via the sketchlib hash
 /// spec; the agent's `sketchlib-go::CountSketch` and the
-/// backend's `asap_sketchlib::sketches::count::CountSketch` must use
+/// backend's `asap_sketchlib::sketches::countsketch::CountSketch` must use
 /// the same seed list (sketchlib's `portableHashSpec` /
 /// `default_hash_spec`).
 fn count_sketch_query_key(matrix: &Vec<Vec<f64>>, key: &str) -> f64 {

@@ -423,7 +423,7 @@ dependencies = [
 [[package]]
 name = "asap_sketchlib"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/asap_sketchlib?branch=refactor%2Fwire-format-align-go#d8c0c7f50c99d0e455080e3aa9ecac545c8a070e"
+source = "git+https://github.com/ProjectASAP/asap_sketchlib?branch=main#0b32c811ada12e32cc68b407d24d1f74cc0af6b7"
 dependencies = [
  "bytes",
  "prost",
