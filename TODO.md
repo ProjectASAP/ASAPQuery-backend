@@ -86,6 +86,15 @@ stopped polluting the per-data-point attribute set with the
 encoding string (which had broken the per-series snapshot cache
 key).
 
+- **Inference-YAML pattern coverage.** Expanded
+  `asap-query-engine/examples/promql/inference_config.yaml` (and the
+  SQL twin) with multi-quantile / wider-range / rate / increase /
+  topk entries; closes
+  [ASAPCollector PROGRESS.md follow-up #4](https://github.com/ProjectASAP/ASAPCollector/blob/main/PROGRESS.md#open-follow-ups-not-e2e-blockers)
+  ("Inference config breadth"). New `tests/inference_yaml_pattern_coverage.rs`
+  pins each family's YAML → `find_query_config` → `query_statistic`
+  routing.
+
 ## All-five-sketch query path verification (2026-04-30)
 
 Each sketch type now has a runtime-verified PromQL → backend path
