@@ -1,4 +1,4 @@
-//! Count Sketch accumulator — wraps `asap_sketchlib::sketches::count::CountSketch`.
+//! Count Sketch accumulator — wraps `asap_sketchlib::sketches::countsketch::CountSketch`.
 //!
 //! This is the concrete accumulator reached from the modified-OTLP
 //! `Metric.data = CountSketch{…}` hot path (PR C-CountSketch). Its
@@ -20,7 +20,7 @@
 //! round-trip works end-to-end without that richer query surface.
 
 use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::sketches::count::{CountSketch, CountSketchDelta};
+use asap_sketchlib::sketches::countsketch::{CountSketch, CountSketchDelta};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -178,11 +178,23 @@ impl CountSketchAccumulator {
             .zip(pb.d_counts.iter())
             .map(|((r, c), dc)| (*r, *c, *dc))
             .collect();
+        // Proto-schema-divergence-tracker: the Go-side
+        // `CountSketchDelta` proto carries an `hh_keys` field
+        // (heavy-hitter candidate keys forwarded by the upstream
+        // Space-Saving tracker). The Rust wire-format struct now
+        // models it (`asap_sketchlib::CountSketchDelta::hh_keys`),
+        // but the vendored Rust proto bindings in
+        // `asap_otel_proto::sketchlib::v1` haven't been regenerated
+        // against the latest `.proto` yet, so no `hh_keys` arrive on
+        // the wire from Go producers. Sending an empty `hh_keys`
+        // disables the TopK rebuild path; it'll start firing once the
+        // proto-schema sync PR lands.
         let delta = CountSketchDelta {
             rows: pb.rows,
             cols: pb.cols,
             cells,
             l2: pb.l2,
+            hh_keys: Vec::new(),
         };
         self.inner
             .apply_delta(&delta)
@@ -302,7 +314,7 @@ impl AggregateCore for CountSketchAccumulator {
 ///
 /// Hash compatibility with the agent is via the sketchlib hash
 /// spec; the agent's `sketchlib-go::CountSketch` and the
-/// backend's `asap_sketchlib::sketches::count::CountSketch` must use
+/// backend's `asap_sketchlib::sketches::countsketch::CountSketch` must use
 /// the same seed list (sketchlib's `portableHashSpec` /
 /// `default_hash_spec`).
 fn count_sketch_query_key(matrix: &Vec<Vec<f64>>, key: &str) -> f64 {

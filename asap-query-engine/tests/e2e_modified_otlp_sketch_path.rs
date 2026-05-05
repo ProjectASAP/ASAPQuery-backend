@@ -1192,7 +1192,7 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     // is what the Go producer (sketchlib-go) will emit once PR I's matching
     // Go-side work lands.
     let mut cms =
-        asap_sketchlib::sketches::countmin::CountMinSketch::new(rows as usize, cols as usize);
+        asap_sketchlib::sketches::countminsketch::CountMinSketch::new(rows as usize, cols as usize);
     cms.update("user_a", 1.0);
     cms.update("user_b", 1.0);
     cms.update("user_a", 1.0);
@@ -1209,7 +1209,7 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
 
     // Watermark advance using an empty msgpack sketch.
     let empty =
-        asap_sketchlib::sketches::countmin::CountMinSketch::new(rows as usize, cols as usize);
+        asap_sketchlib::sketches::countminsketch::CountMinSketch::new(rows as usize, cols as usize);
     let watermark_req = build_count_min_msgpack_export_request(
         metric_name,
         service_label,
