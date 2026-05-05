@@ -66,6 +66,58 @@ ASAPQuery has four main components: the **asap-planner-rs** generates sketch con
 # Note: Arroyo fork lives at https://github.com/ProjectASAP/arroyo
 ```
 
+### Ingest path consumes asap-precompute-rs
+
+Phase 3 step 3 of the ASAP edge-framework migration (see
+`docs/design-asap-edge-framework.md` and ADR-0002). The backend's
+ingest path now delegates the **shared** envelope-parsing,
+sketch-reconstruction, and sketch-merge logic to
+[`asap-precompute-rs`](https://github.com/ProjectASAP/ASAPCollector/tree/main/asap-precompute-rs)
+— the host-neutral Rust edge runtime — so the same code runs in
+agents (Rust shims) and the backend.
+
+**What moved out of this repo (to asap-precompute-rs):**
+
+- Envelope wire-format parsing (`SketchEnvelope` runtime view; was
+  inlined in every backend `*Accumulator::from_sketchlib_proto_bytes`).
+- Per-sketch state extraction from the
+  `asap_sketchlib::proto::sketchlib::SketchEnvelope.sketch_state`
+  oneof.
+- Sketch reconstruction (DDSketch + KLL today;
+  HLL / CountSketch / CountMinSketch are tracked under
+  [ProjectASAP/ASAPCollector#243](https://github.com/ProjectASAP/ASAPCollector/issues/243)).
+- Cross-runtime sketch merge (asap-precompute-rs's `Sketch::merge`).
+
+**What stays in this repo:**
+
+- Query-side engine — PromQL aggregation, storage, query planning.
+- Backend's per-accumulator query-side surface (`AggregateCore`,
+  `query_statistic`, `MergeableAccumulator`, ...).
+- Sparse-delta application
+  (`apply_modified_otlp_delta_bytes` /
+  `*Accumulator::apply_proto_delta_bytes`) — `asap_sketchlib`
+  doesn't yet expose the `compute_delta` family upstream
+  (Go's `sketchlib-go` has it; tracked upstream), so
+  asap-precompute-rs's wrappers fall back to "always full" delta
+  encoding. Backend's typed-delta apply is independent and stays.
+
+**Bridge layer:**
+[`asap-query-engine/src/precompute_operators/edge_runtime_adapter.rs`](asap-query-engine/src/precompute_operators/edge_runtime_adapter.rs)
+re-exports the asap-precompute-rs runtime view types
+(`SketchEnvelope`, `Encoding`, `SketchType`, the `Sketch` trait
+family) and provides the
+`reconstruct_via_runtime` / `unwrap_envelope_state` /
+`encode_ddsketch_envelope` / `merge_ddsketches_via_runtime`
+helpers used by the backend's `decode_modified_otlp_sketch_bytes`
+hot path.
+
+**Acceptance tests:**
+[`asap-query-engine/tests/edge_runtime_consumes_precompute_rs.rs`](asap-query-engine/tests/edge_runtime_consumes_precompute_rs.rs)
+contains round-trip + structural tests proving asap-precompute-rs
+sits in the backend's ingest path. HLL / CountSketch / CountMinSketch
+tests are present and `#[ignore]`'d with a comment pointing at issue
+#243.
+
 ## Coming soon
 
 1. Drop-in ASAPQuery artifact that works with your existing pre-configured Prometheus-Grafana stack
