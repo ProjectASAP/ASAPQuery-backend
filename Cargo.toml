@@ -17,6 +17,22 @@ members = [
 edition = "2021"
 version = "0.1.0"
 
+# Phase 3 step 3: backend ingest path consumes `asap-precompute-rs`,
+# which (today) path-deps `asap_sketchlib` from `../../asap_sketchlib`
+# (see `ASAPCollector/asap-precompute-rs/Cargo.toml`). The backend
+# crates depend on `asap_sketchlib` via a git URL. Without this
+# `[patch]`, cargo treats the two sources as distinct crates and the
+# `asap_sketchlib::sketches::*` types from the two sides won't unify
+# at the FFI boundary (the wrapper-`inner()` → backend-accumulator
+# bridge in `precompute_operators::edge_runtime_adapter`).
+#
+# Pointing both at the local checkout is the same pattern downstream
+# Strategy-B adapter consumers will use; flip this to a `git = "..."`
+# entry once `asap-precompute-rs` itself moves to a git-sourced
+# `asap_sketchlib`.
+[patch."https://github.com/ProjectASAP/asap_sketchlib"]
+asap_sketchlib = { path = "../asap_sketchlib" }
+
 [workspace.dependencies]
 # Shared external deps (used by 2+ crates)
 serde = { version = "1.0", features = ["derive"] }

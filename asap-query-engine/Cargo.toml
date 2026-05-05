@@ -62,6 +62,26 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 tracing-appender = "0.2"
 elastic_dsl_utilities.workspace = true
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
+# Phase 3 step 3: backend ingest path consumes asap-precompute-rs for the
+# SHARED envelope-parsing / delta-apply / sketch-reconstruction / merge
+# logic. Query-side engine (PromQL aggregation, storage, query planner)
+# is unaffected. See README §"Ingest path consumes asap-precompute-rs"
+# and `docs/adr/ADR-phase3-asap-precompute-rs.md`.
+# `asap-precompute-rs` lives in the `ASAPCollector` repo as a sibling
+# crate alongside non-Rust submodules (telegraf / opentelemetry-go /
+# opentelemetry-collector / etc.) that cargo can't recursively fetch
+# during a `git` source resolution because the parent repo's submodule
+# pins reference commits not reachable via `git fetch <commit>`. The
+# `asap-precompute-rs` Cargo.toml itself path-deps `asap_sketchlib`
+# (`../../asap_sketchlib`) — that path is meaningful only inside the
+# checkout, not from cargo's git cache.
+#
+# We therefore consume `asap-precompute-rs` via a sibling path dep,
+# matching how `asap-precompute-rs` itself path-deps `asap_sketchlib`.
+# Downstream CI / reproducible builds: clone `ASAPCollector` next to
+# `ASAPQuery-backend` (sibling directories under `~/repos/`) before
+# `cargo build`. The path is relative so any matching layout works.
+asap-precompute-rs = { path = "../../ASAPCollector/asap-precompute-rs" }
 # Persistence layer (SimpleMapStore parts / manifest / Tier-2 cache)
 moka = { version = "0.12", features = ["sync"] }
 memmap2 = "0.9"
