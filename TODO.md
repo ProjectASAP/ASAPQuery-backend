@@ -259,25 +259,27 @@ backend with on-disk v1 state to verify the live restart path. The
 unit tests cover the load path which is where the version-mismatch
 logic lives, so this is just defense in depth.
 
-### 5. Correctness proofs (for paper's theory section)
+### 5. Correctness proofs (for paper's theory section) — **done ([`docs/proofs.md`](docs/proofs.md))**
 
-Three proofs to write up. Target location: `docs/proofs.md`;
-seed the paper's §theory from it.
+All three proofs landed in [`docs/proofs.md`](docs/proofs.md) §§2–4
+(statement / setup-lemmas / proof / caveats / code-anchors per
+proof; §1 reproduces the per-sketch accuracy bounds the proofs
+treat as black boxes).
 
 1. **`combine_statistic` correctness** across schema-timeline
-   segments: additive stats (Count / Sum / Min / Max) combined
-   over non-overlapping segments equal the single-schema
-   answer up to per-segment sketch error. Non-combinable
-   stats (Quantile / Topk / Cardinality / Rate / Increase)
-   return `Partial` with a bounded `covered` subset.
-2. **Write-barrier safety**: no sample ingested at wall-clock
-   time `t > force_expire(agg_id).ts` appears in any query
-   whose range includes `t'`. Follows from the `is_writable`
-   check + schema lifecycle monotonicity.
-3. **Backfill determinism**: the §10.5 invariants
-   (time-disjoint, known agg, within retention) plus ordered
-   raw-sample replay produce bit-identical sketches vs. live
-   ingest for the same underlying samples.
+   segments (`docs/proofs.md` §2): additive stats (Count / Sum /
+   Min / Max) combined over non-overlapping segments equal the
+   single-schema answer up to per-segment sketch error.
+   Non-combinable stats (Quantile / Topk / Cardinality / Rate /
+   Increase) return `Partial` with a bounded `covered` subset.
+2. **Write-barrier safety** (`docs/proofs.md` §3): no sample
+   ingested at wall-clock time `t > force_expire(agg_id).ts`
+   appears in any query whose range includes `t'`. Follows from
+   the `is_writable` check + schema lifecycle monotonicity.
+3. **Backfill determinism** (`docs/proofs.md` §4): the §10.5
+   invariants (time-disjoint, known agg, within retention) plus
+   ordered raw-sample replay produce bit-identical sketches vs.
+   live ingest for the same underlying samples.
 
 ## Future work (post-paper)
 
