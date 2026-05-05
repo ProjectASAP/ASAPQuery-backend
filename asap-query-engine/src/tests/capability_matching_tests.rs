@@ -10,7 +10,9 @@ use crate::data_model::{
     WindowType,
 };
 use crate::engines::simple_engine::SimpleEngine;
+use crate::precompute_operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+use crate::precompute_operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_operators::sum_accumulator::SumAccumulator;
 use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 use crate::stores::traits::Store;
@@ -83,6 +85,14 @@ fn engine_no_query_configs(
                 kll.update(1.0);
                 Box::new(kll)
             }
+            "CountMinSketch" => {
+                // Default CMS dimensions; for a capability-matching test we
+                // care that the engine routes here, not about the sketch
+                // accuracy parameters.
+                let cms = CountMinSketchAccumulator::new(4, 1000);
+                Box::new(cms)
+            }
+            "DeltaSetAggregator" => Box::new(DeltaSetAggregatorAccumulator::new()),
             _ => Box::new(SumAccumulator::with_sum(42.0)),
         };
         store.insert_precomputed_output(output, acc).unwrap();
@@ -294,5 +304,58 @@ fn priority_largest_window_wins() {
     assert_eq!(
         ctx.agg_info.aggregation_id_for_value, 2,
         "The 900 s (id=2) aggregation should be preferred over the 300 s (id=1)"
+    );
+}
+
+/// E2E for the headline bug fix: a `sum_over_time(...)` query against a
+/// CMS-only backend (no `Sum` / `MultipleSum` config available) must resolve
+/// via capability matching to the CountMinSketch aggregation, paired with the
+/// `DeltaSetAggregator` key aggregation. Pre-fix, `compatible_agg_types(Sum)`
+/// did not list `CountMinSketch`, so this query fell through capability
+/// matching to the cold tier (or returned an empty result).
+#[test]
+fn cms_only_backend_resolves_sum_over_time_via_capability_matching() {
+    let cms = make_agg_config(
+        100,
+        "http_requests_total",
+        AggregationType::CountMinSketch,
+        300,
+        WindowType::Tumbling,
+        &[],
+    );
+    // CMS is a multi-population value type — `find_compatible_aggregation`
+    // requires a paired key aggregation on the same metric.
+    let key_agg = make_agg_config(
+        101,
+        "http_requests_total",
+        AggregationType::DeltaSetAggregator,
+        300,
+        WindowType::Tumbling,
+        &[],
+    );
+    let engine = engine_no_query_configs("http_requests_total", &[], vec![cms, key_agg]);
+
+    let ctx = engine
+        .build_query_execution_context_promql(
+            "sum_over_time(http_requests_total[5m])".to_string(),
+            1000.0,
+        )
+        .expect(
+            "post-fix: capability matching must resolve sum_over_time against a CMS-only backend; \
+             pre-fix returned None and the query fell through to the cold tier.",
+        );
+
+    assert_eq!(
+        ctx.agg_info.aggregation_id_for_value, 100,
+        "Capability matching should route Sum to the CMS aggregation (id=100)",
+    );
+    assert_eq!(
+        ctx.agg_info.aggregation_type_for_value,
+        AggregationType::CountMinSketch,
+        "Resolved value aggregation type must be CountMinSketch",
+    );
+    assert_eq!(
+        ctx.agg_info.aggregation_id_for_key, 101,
+        "CMS is multi-population — must be paired with the DeltaSetAggregator (id=101)",
     );
 }

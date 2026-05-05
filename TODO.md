@@ -114,7 +114,7 @@ data points). Specifically:
 
 ### Known reconciliation gap (cleanup, not a blocker)
 
-- `compatible_agg_types` in
+- ~~`compatible_agg_types` in
   [`asap_types/src/capability_matching.rs`](asap-common/dependencies/rs/asap_types/src/capability_matching.rs)
   does not list `CountMinSketch` under `Statistic::Sum`, but
   [`promql_utilities/src/query_logics/logics.rs`](asap-common/dependencies/rs/promql_utilities/src/query_logics/logics.rs)
@@ -122,7 +122,17 @@ data points). Specifically:
   `Count`. The runtime e2e succeeds because the inference YAML's
   exact-match `find_query_config` path bypasses
   `find_compatible_aggregation`. Two tables → one table is the
-  right cleanup.
+  right cleanup.~~ **Closed by
+  `fix/capability-matching-cms-sum-reconcile`.** `compatible_agg_types`
+  now lists `CountMinSketch` under `Statistic::Sum` (and `MultipleSum`
+  under `Statistic::Count`); both tables are kept in agreement by the
+  `capability_canonical_map_agreement` test, which enumerates every
+  `(Statistic, QueryTreatmentType)` pair and asserts the canonical map's
+  output is contained in `compatible_agg_types(Statistic)`. The dead
+  `Min/Max-Approximate → DatasketchesKLL` branch in
+  `map_statistic_to_precompute_operator` was removed (KLL has no
+  min/max query surface — that route would have produced runtime
+  errors).
 - CMS query without a paired `SetAggregator` /
   `DeltaSetAggregator` returns total volume, not per-key
   frequency. To drive `topk(N, …)` over CMS-tracked keys we need
