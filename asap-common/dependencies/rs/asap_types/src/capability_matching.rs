@@ -16,10 +16,39 @@ use promql_utilities::query_logics::enums::AggregationType;
 // ---------------------------------------------------------------------------
 
 /// Returns the aggregation types that can serve this statistic.
+///
+/// This list is the **superset of compatibility**: every `AggregationType`
+/// that the planner's canonical map (`promql_utilities::query_logics::logics::
+/// map_statistic_to_precompute_operator`) may legally produce for this
+/// statistic — across both `Exact` and `Approximate` treatment types — must
+/// appear here. The agreement is enforced by
+/// `capability_canonical_map_agreement` in the test module: any future
+/// divergence between this table and `map_statistic_to_precompute_operator`
+/// will be caught at test-time.
+///
+/// The runtime caller (`find_compatible_aggregation`) has no
+/// `QueryTreatmentType` to consult — `QueryRequirements` is treatment-agnostic
+/// — so this list intentionally enumerates *every* type that could serve the
+/// statistic. Selection between e.g. `Sum` (exact) and `CountMinSketch`
+/// (approximate) for `Statistic::Sum` is made downstream via
+/// `aggregation_priority` (largest window size wins).
 pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
     match stat {
-        Statistic::Sum => &[AggregationType::Sum, AggregationType::MultipleSum],
+        // Sum: exact via Sum / MultipleSum; approximate via CountMinSketch
+        // (the canonical approximator picked by `map_statistic_to_precompute_operator`).
+        // Pre-fix this list omitted CountMinSketch, so a `sum_over_time(...)`
+        // query against a CMS-only config fell through capability matching
+        // and onto the cold tier.
+        Statistic::Sum => &[
+            AggregationType::Sum,
+            AggregationType::MultipleSum,
+            AggregationType::CountMinSketch,
+        ],
+        // Count: exact via MultipleSum (the planner's canonical pick for
+        // Count-Exact uses `MultipleSum` with sub_type="count"); approximate
+        // via CountMinSketch / CountMinSketchWithHeap.
         Statistic::Count => &[
+            AggregationType::MultipleSum,
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
         ],
@@ -785,5 +814,157 @@ mod tests {
             ),
         );
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-of-truth agreement check.
+    //
+    // `compatible_agg_types(Statistic)` (this file) and
+    // `promql_utilities::query_logics::logics::map_statistic_to_precompute_operator`
+    // are two views onto the same `(Statistic, AggregationType)` capability
+    // table. The planner emits configs from the canonical map; capability
+    // matching dispatches queries against the compat list. They MUST agree —
+    // every canonical map output for a given Statistic must be a member of
+    // `compatible_agg_types(Statistic)` — or queries the planner configured
+    // will silently fall through capability matching to the cold-tier
+    // fallback.
+    //
+    // This test enumerates every supported `(Statistic, QueryTreatmentType)`
+    // pair, calls the canonical map, and asserts membership. Any future edit
+    // on either side that breaks the agreement fails the build.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capability_canonical_map_agreement() {
+        use promql_utilities::query_logics::enums::QueryTreatmentType;
+        use promql_utilities::query_logics::logics::map_statistic_to_precompute_operator;
+
+        // Listed exhaustively so adding a new `Statistic` variant fails to
+        // compile here (forcing the author to decide its compat membership).
+        let stats = [
+            Statistic::Count,
+            Statistic::Sum,
+            Statistic::Cardinality,
+            Statistic::Increase,
+            Statistic::Rate,
+            Statistic::Min,
+            Statistic::Max,
+            Statistic::Quantile,
+            Statistic::Topk,
+        ];
+        let treatments = [QueryTreatmentType::Exact, QueryTreatmentType::Approximate];
+
+        for &stat in &stats {
+            let compat = compatible_agg_types(stat);
+            for &treat in &treatments {
+                match map_statistic_to_precompute_operator(stat, treat) {
+                    Ok((agg_type, _sub_type)) => {
+                        assert!(
+                            compat.contains(&agg_type),
+                            "Divergence: map_statistic_to_precompute_operator({stat:?}, {treat:?}) \
+                             returns {agg_type:?}, but compatible_agg_types({stat:?}) = {compat:?} \
+                             does not list it. Either add {agg_type:?} to compatible_agg_types or \
+                             change the canonical map. See the docstring on \
+                             compatible_agg_types for the source-of-truth invariant.",
+                        );
+                    }
+                    Err(_) => {
+                        // The canonical map declines this pair (e.g.
+                        // Quantile-Exact, Cardinality, etc.). That's fine —
+                        // capability_matching never sees a planner-emitted
+                        // config for that pair, so there's nothing to agree on.
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pin the canonical-approximator picks driving the warm-tier query path
+    /// (the "five sketch types" CMS / KLL / HLL / DDSketch / CountSketch
+    /// canonical statistic table from PROGRESS.md). HLL / DDSketch /
+    /// CountSketch route via the modified-OTLP wire format and are not in the
+    /// planner's canonical map; KLL covers Quantile, CMS covers Sum + Count,
+    /// CMSWithHeap covers Topk. Each must appear in its `Statistic`'s compat
+    /// list — this is the bug fix that motivated this PR.
+    #[test]
+    fn five_sketch_canonical_statistics_in_compat_list() {
+        // KLL → Quantile
+        assert!(
+            compatible_agg_types(Statistic::Quantile).contains(&AggregationType::DatasketchesKLL),
+            "KLL must be a compatible type for Quantile",
+        );
+        // CMS → Sum (the headline bug fix that motivated this PR)
+        assert!(
+            compatible_agg_types(Statistic::Sum).contains(&AggregationType::CountMinSketch),
+            "CountMinSketch must be a compatible type for Sum (PR fix)",
+        );
+        // CMS → Count
+        assert!(
+            compatible_agg_types(Statistic::Count).contains(&AggregationType::CountMinSketch),
+            "CountMinSketch must be a compatible type for Count",
+        );
+        // CMSWithHeap → Topk
+        assert!(
+            compatible_agg_types(Statistic::Topk)
+                .contains(&AggregationType::CountMinSketchWithHeap),
+            "CountMinSketchWithHeap must be a compatible type for Topk",
+        );
+    }
+
+    /// Regression test for the pre-fix bug: a query for `Statistic::Sum`
+    /// against a CMS-only configuration must now resolve via capability
+    /// matching, not fall through to the cold tier. Pre-fix, this returned
+    /// `None`; post-fix, it returns the CMS aggregation paired with the
+    /// `DeltaSetAggregator` key aggregation.
+    #[test]
+    fn cms_resolves_sum_query_post_fix() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            42,
+            make_config(
+                42,
+                "http_requests_total",
+                "CountMinSketch",
+                "sum",
+                300,
+                "tumbling",
+                &[],
+                "",
+            ),
+        );
+        // CountMinSketch is a multi-population value type and
+        // `find_compatible_aggregation` requires a paired key aggregation.
+        configs.insert(
+            43,
+            make_config(
+                43,
+                "http_requests_total",
+                "DeltaSetAggregator",
+                "",
+                300,
+                "tumbling",
+                &[],
+                "",
+            ),
+        );
+        let result = find_compatible_aggregation(
+            &configs,
+            &req(
+                "http_requests_total",
+                &[Statistic::Sum],
+                Some(300_000),
+                &[],
+                "",
+            ),
+        );
+        let info = result.expect(
+            "post-fix: capability matching must resolve sum_over_time against a CMS-only config",
+        );
+        assert_eq!(info.aggregation_id_for_value, 42);
+        assert_eq!(
+            info.aggregation_type_for_value,
+            AggregationType::CountMinSketch
+        );
+        assert_eq!(info.aggregation_id_for_key, 43);
     }
 }

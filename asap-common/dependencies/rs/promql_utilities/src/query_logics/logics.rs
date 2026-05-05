@@ -3,8 +3,21 @@ use crate::query_logics::enums::{
 };
 use tracing::debug;
 
-/// Map statistic to precompute operator based on treatment type
-/// This mirrors the Python implementation's logic
+/// Map statistic to precompute operator based on treatment type.
+///
+/// This is the **canonical primary picker** consulted by the planner when
+/// emitting `IntermediateAggConfig`s from a query plan. For each
+/// `(Statistic, QueryTreatmentType)` pair it returns one canonical
+/// `AggregationType` plus an optional `aggregation_sub_type` string.
+///
+/// **Source-of-truth invariant:** every `AggregationType` returned here for a
+/// given `Statistic` must also appear in
+/// `asap_types::capability_matching::compatible_agg_types(Statistic)`. The
+/// invariant is enforced by the `capability_canonical_map_agreement` test in
+/// `asap_types::capability_matching::tests` and is the single guard against
+/// divergence between the planner-side and matcher-side capability tables.
+///
+/// This mirrors the Python implementation's logic.
 pub fn map_statistic_to_precompute_operator(
     statistic: Statistic,
     treatment_type: QueryTreatmentType,
@@ -23,15 +36,21 @@ pub fn map_statistic_to_precompute_operator(
             }
         }
         Statistic::Min | Statistic::Max => {
-            if treatment_type == QueryTreatmentType::Approximate {
-                Ok((AggregationType::DatasketchesKLL, "".to_string()))
-                //Ok((AggregationType::HydraKLL, "".to_string()))
-            } else {
-                Ok((
-                    AggregationType::MultipleMinMax,
-                    statistic.to_string().to_lowercase(),
-                ))
-            }
+            // Min/Max are always served by `MultipleMinMax` regardless of
+            // treatment type. The previous Approximate branch routed to
+            // `DatasketchesKLL`, but `DatasketchesKLLAccumulator::query` only
+            // implements `Statistic::Quantile` — KLL exposes no min/max query
+            // surface — so that branch produced configs whose runtime path
+            // would error. `MultipleMinMax` is exact and cheap; an
+            // approximate KLL-backed variant is reserved for a future KLL
+            // extension that exposes `min_value` / `max_value` through
+            // `query_statistic` (tracked alongside the accumulator-library
+            // work, not in this PR).
+            let _ = treatment_type;
+            Ok((
+                AggregationType::MultipleMinMax,
+                statistic.to_string().to_lowercase(),
+            ))
         }
         Statistic::Sum | Statistic::Count => {
             if treatment_type == QueryTreatmentType::Approximate {
