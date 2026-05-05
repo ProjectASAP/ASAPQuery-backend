@@ -152,6 +152,7 @@ fn engine_config(port: u16) -> PrecomputeEngineConfig {
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
+        wall_clock_grace_period_ms: 5_000,
         schema_persist_path: None,
     }
 }
