@@ -13,6 +13,8 @@
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
+use tracing::warn;
 
 use super::ColdStoreError;
 
@@ -67,26 +69,47 @@ pub fn hour_prefixes(metric: &str, start_ms: i64, end_ms: i64) -> Vec<String> {
 }
 
 /// Parse a `.jsonl` blob into `RawSample`s, filtering to the
-/// half-open range `[start_ms, end_ms)`. Malformed lines fail the
-/// whole parse — partial results from a corrupted part are worse
-/// than an error a caller can route around.
+/// half-open range `[start_ms, end_ms)`. Mid-file malformed lines
+/// are hard errors. A malformed *trailing* line is tolerated
+/// (warn + drop) only when the blob has no terminating newline —
+/// that's the producer-mid-flush shape, see `docs/design-sketch-db.md`
+/// §5.2. `path` is threaded through purely for the warn log.
 pub fn parse_jsonl(
     bytes: &[u8],
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<RawSample>, ColdStoreError> {
+    parse_jsonl_at(bytes, start_ms, end_ms, None)
+}
+
+pub fn parse_jsonl_at(
+    bytes: &[u8],
+    start_ms: i64,
+    end_ms: i64,
+    path: Option<&Path>,
+) -> Result<Vec<RawSample>, ColdStoreError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| ColdStoreError::Malformed(format!("non-utf8: {e}")))?;
+    let trailing_torn = !text.is_empty() && !text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().collect();
+    let last = lines.len().saturating_sub(1);
     let mut out = Vec::new();
-    for (lineno, line) in text.lines().enumerate() {
-        let line = line.trim();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        let sample: RawSample = serde_json::from_str(line)
-            .map_err(|e| ColdStoreError::Malformed(format!("line {}: {}", lineno + 1, e)))?;
-        if sample.ts_ms >= start_ms && sample.ts_ms < end_ms {
-            out.push(sample);
+        match serde_json::from_str::<RawSample>(line) {
+            Ok(s) if s.ts_ms >= start_ms && s.ts_ms < end_ms => out.push(s),
+            Ok(_) => {}
+            Err(e) if i == last && trailing_torn => warn!(
+                path = %path.map(|p| p.display().to_string()).unwrap_or_default(),
+                line = %line.chars().take(200).collect::<String>(),
+                error = %e,
+                "cold-store: dropping torn trailing line in JSONL part \
+                 (no terminating newline; likely producer mid-flush)"
+            ),
+            Err(e) => return Err(ColdStoreError::Malformed(format!("line {}: {}", i + 1, e))),
         }
     }
     Ok(out)
@@ -146,5 +169,40 @@ mod tests {
     fn parse_jsonl_malformed_errs() {
         let blob = "not-json\n";
         assert!(parse_jsonl(blob.as_bytes(), 0, i64::MAX).is_err());
+    }
+
+    /// Pins follow-up #5: producer is mid-flush, reader sees a
+    /// part file whose last line is partial (no terminating
+    /// newline). We must surface the N preceding records, not
+    /// fail the whole scan.
+    #[test]
+    fn parse_jsonl_ignores_torn_trailing_line() {
+        let blob = "{\"ts_ms\":100,\"labels\":{\"a\":\"1\"},\"value\":1.0}\n\
+                    {\"ts_ms\":200,\"labels\":{\"a\":\"2\"},\"value\":2.0}\n\
+                    {\"ts_ms\":300,\"labels\":{\"a\":\"3\"},\"value\":3.0}\n\
+                    {\"ts_ms\":400,\"labels\":{\"a\":\"4\"},\"valu";
+        let out = parse_jsonl(blob.as_bytes(), 0, i64::MAX).expect("torn tail must not error");
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].ts_ms, 100);
+        assert_eq!(out[2].ts_ms, 300);
+    }
+
+    /// A malformed line in the *middle* of the file is real
+    /// corruption, not a concurrent-write torn tail — must still
+    /// hard-error so callers can route around the bad part.
+    #[test]
+    fn parse_jsonl_errors_on_mid_file_corruption() {
+        let blob = "{\"ts_ms\":100,\"labels\":{\"a\":\"1\"},\"value\":1.0}\n\
+                    not-json\n\
+                    {\"ts_ms\":300,\"labels\":{\"a\":\"3\"},\"value\":3.0}\n";
+        let err = parse_jsonl(blob.as_bytes(), 0, i64::MAX)
+            .expect_err("mid-file corruption must surface as an error");
+        match err {
+            ColdStoreError::Malformed(msg) => assert!(
+                msg.contains("line 2"),
+                "expected lineno in error, got: {msg}"
+            ),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
     }
 }
