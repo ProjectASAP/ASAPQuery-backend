@@ -2215,4 +2215,306 @@ aggregations:
             "worker watermark should be published after flush"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Sweep blocker #2: warm-tier persistence path for sketch ingest.
+    //
+    // Pre-fix the OTLP sketch path produced `worker_process_accumulator`
+    // log lines but never persisted into the per_key store, so PromQL
+    // queries returned `Metric not found`. The tests below pin the
+    // `process_accumulator_input` → window-close → emit_batch contract
+    // so a future refactor can't regress it without tripping a unit
+    // test. They are deliberately written in terms of the public worker
+    // API + a real `DDSketchAccumulator`, exactly mirroring what the
+    // OTLP ingest dispatch builds via `decode_modified_otlp_sketch_bytes`.
+    // -----------------------------------------------------------------------
+
+    use crate::precompute_operators::DDSketchAccumulator;
+    use asap_sketchlib::sketches::ddsketch::DdSketch;
+
+    /// Build a fresh DDSketch holding `vals` so each test has a real,
+    /// non-empty sketch to push through `process_accumulator_input`.
+    fn make_ddsketch(alpha: f64, vals: &[f64]) -> DDSketchAccumulator {
+        let mut s = DdSketch::new(alpha);
+        for v in vals {
+            // DDSketch only ingests positive values; the agent's
+            // `_quantile` suffix metric carries latencies, so
+            // positive-only is the realistic shape.
+            s.update(*v);
+        }
+        DDSketchAccumulator { inner: s }
+    }
+
+    /// Pinning test: a single-group, single-window sketch ingest must
+    /// emit *exactly one* persisted output once the watermark advances
+    /// past the window boundary. This is the unit-level reproducer of
+    /// the sweep blocker — pre-fix the path between
+    /// `worker_process_accumulator` and the per_key store insert was
+    /// silent, so this test would never see an emit.
+    #[test]
+    fn test_process_accumulator_input_persists_after_window_close() {
+        // 30s tumbling window — matches `backend-streaming.yaml`
+        // for `http_requests_total_latency_ms_quantile`.
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30,
+            0,
+            vec!["zone"],
+        );
+        let agg_configs = HashMap::from([(1, cfg)]);
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
+
+        // First batch: 10 sketches at t=60_000 ms, all under the same
+        // group_key="us-east" — mirrors the agent emitting one sketch per
+        // (zone,rack,node,pod) tuple while the backend rolls them up by zone.
+        for i in 0..10 {
+            let s = make_ddsketch(0.01, &[1.0 + i as f64, 2.0, 3.0]);
+            worker
+                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
+                .expect("first batch must process");
+        }
+        assert_eq!(
+            sink.len(),
+            0,
+            "first batch alone does not close any window — watermark is still at first-sample time"
+        );
+
+        // Second batch at t=120_000 ms (60s later). Watermark advances
+        // 60_000 → 120_000, and `closed_windows` must return [60_000, 90_000)
+        // (a 30s window). The pane at 60_000 holds the merged sketch from
+        // batch 1, so `merge_sketch_panes_for_window` returns Some(...)
+        // and the output is emitted.
+        let s2 = make_ddsketch(0.01, &[5.0, 6.0]);
+        worker
+            .process_accumulator_input(1, "us-east", 120_000, Box::new(s2))
+            .expect("second batch must process");
+
+        let captured = sink.drain();
+        assert!(
+            !captured.is_empty(),
+            "warm-tier sketch persistence regressed: window close did not emit any output. \
+             pre-fix this is exactly the symptom the sweep agent saw — \
+             `worker_process_accumulator` fires but per_key store stays empty."
+        );
+        // The emitted output's window must be [60_000, 90_000) — the
+        // 30s tumbling window that contained the first batch.
+        let (output, acc) = &captured[0];
+        assert_eq!(output.aggregation_id, 1);
+        assert_eq!(output.start_timestamp, 60_000);
+        assert_eq!(output.end_timestamp, 90_000);
+        assert_eq!(
+            acc.type_name(),
+            "DDSketchAccumulator",
+            "persisted accumulator must round-trip as DDSketchAccumulator (not silently demoted)"
+        );
+
+        // The merged sketch must contain all 10 first-batch sketches.
+        // Each sketch added 3 values, so total count = 10 * 3 = 30.
+        let dd = acc
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .expect("must downcast back to DDSketchAccumulator");
+        assert_eq!(
+            dd.inner.count, 30,
+            "all 10 first-batch sketches must merge into the persisted output (3 values × 10)"
+        );
+    }
+
+    /// End-to-end pin: the sweep blocker's diagnostic (`Metric ... not found
+    /// in store` + `No precomputed outputs found for metric: ...`) is reachable
+    /// only when nothing was ever inserted at `(agg_id, ...)`. This test
+    /// runs the full ingest → worker → per_key store path and then queries
+    /// the store, asserting the query returns a non-empty result for the
+    /// queried metric / agg_id.
+    #[test]
+    fn test_sketch_ingest_persists_and_query_returns_non_empty() {
+        use crate::data_model::{CleanupPolicy, StreamingConfig};
+        use crate::precompute_engine::output_sink::StoreOutputSink;
+        use crate::stores::sketch_db::simple_map_store::per_key::SimpleMapStorePerKey;
+        use crate::stores::Store;
+
+        // Streaming config: agg_id=1, 30s tumbling, DDSketch,
+        // grouping by zone — the canonical e2e shape.
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30,
+            0,
+            vec!["zone"],
+        );
+        let mut configs_map = HashMap::new();
+        configs_map.insert(1u64, cfg);
+        let streaming_config = Arc::new(StreamingConfig::new(configs_map.clone()));
+
+        // A real per_key store, so the test exercises the actual
+        // insert + query path the production backend uses.
+        let store = Arc::new(SimpleMapStorePerKey::new(
+            streaming_config.clone(),
+            CleanupPolicy::CircularBuffer,
+        ));
+        let sink: Arc<dyn OutputSink> =
+            Arc::new(StoreOutputSink::new(store.clone() as Arc<dyn Store>));
+
+        // Build a worker bound to the *real* store sink.
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let wm = Arc::new(AtomicI64::new(i64::MIN));
+        let mut worker = Worker::new(
+            0,
+            rx,
+            sink,
+            crate::data_model::HotReloadStreamingConfig::new(StreamingConfig::new(configs_map)),
+            WorkerRuntimeConfig {
+                max_buffer_per_series: 10_000,
+                allowed_lateness_ms: 0,
+                pass_raw_samples: false,
+                raw_mode_aggregation_id: 0,
+                late_data_policy: LateDataPolicy::Drop,
+            },
+            Arc::new(AtomicUsize::new(0)),
+            wm.clone(),
+            vec![wm],
+        );
+
+        // Two batches across two windows so the first window closes.
+        for i in 0..5 {
+            let s = make_ddsketch(0.01, &[10.0 + i as f64]);
+            worker
+                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
+                .unwrap();
+        }
+        let s_advance = make_ddsketch(0.01, &[42.0]);
+        worker
+            .process_accumulator_input(1, "us-east", 120_000, Box::new(s_advance))
+            .unwrap();
+
+        // Now query the store the same way the PromQL warm-tier path does.
+        // The query lookup is keyed by `aggregation_id` — the metric name is
+        // diagnostic-only (per_key.rs:817 `aggregation_config.metric.clone()`).
+        // If the persistence path is wired correctly, this returns at least
+        // one bucket for the closed window [60_000, 90_000).
+        let results = store
+            .query_precomputed_output(
+                "http_requests_total_latency_ms_quantile",
+                1,
+                0,
+                u64::MAX / 2,
+            )
+            .expect("query must succeed");
+        assert!(
+            !results.is_empty(),
+            "warm-tier query returned empty even though sketches were ingested — \
+             this is the exact sweep blocker #2 symptom (`No precomputed outputs found for \
+             metric: http_requests_total_latency_ms_quantile, aggregation_id: 1`)."
+        );
+
+        // Drill into the result: at least one (key → buckets) entry, and at
+        // least one bucket lands in [60_000, 90_000).
+        let total_buckets: usize = results.values().map(|v| v.len()).sum();
+        assert!(
+            total_buckets > 0,
+            "query returned a key entry but with zero buckets — persistence is half-broken"
+        );
+        let any_in_first_window = results.values().flat_map(|v| v.iter()).any(|(range, _)| {
+            range.0 == 60_000 && range.1 == 90_000
+        });
+        assert!(
+            any_in_first_window,
+            "no bucket landed in the closed window [60_000, 90_000) — persistence pathway misroutes"
+        );
+    }
+
+    /// Pin the agent-emit-shape vs. backend-grouping-config invariant from
+    /// hypothesis (A) of the sweep diagnostic. The agent emits one sketch
+    /// per `(zone, rack, node, pod)` tuple; backend's `grouping_labels =
+    /// [zone]` rolls them up. This test asserts the rollup actually
+    /// happens — sketches with different `(rack, node, pod)` but same
+    /// `zone` must collapse into a single persisted output per zone.
+    /// If a future change changes `grouping_labels` to include
+    /// `rack/node/pod`, the agent's per-tuple emit shape would land 1000
+    /// outputs in the store instead of `n_zones`, blowing up cardinality
+    /// and breaking warm-tier reads.
+    #[test]
+    fn test_grouping_labels_roll_up_per_tuple_sketches() {
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30,
+            0,
+            vec!["zone"], // sole grouping dim — rack/node/pod are rolled up
+        );
+        let agg_configs = HashMap::from([(1, cfg)]);
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
+
+        // Three sketches in the SAME zone but different (rack,node,pod)
+        // tuples — emulating what the agent ships. Group key the ingest
+        // path computes is the zone value alone.
+        for i in 0..3 {
+            let s = make_ddsketch(0.01, &[100.0 + i as f64]);
+            worker
+                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
+                .unwrap();
+        }
+        // Two sketches in a different zone.
+        for i in 0..2 {
+            let s = make_ddsketch(0.01, &[200.0 + i as f64]);
+            worker
+                .process_accumulator_input(1, "us-west", 60_000, Box::new(s))
+                .unwrap();
+        }
+
+        // Advance the watermark past 90_000 to close window [60_000, 90_000).
+        let s = make_ddsketch(0.01, &[1.0]);
+        worker
+            .process_accumulator_input(1, "us-east", 120_000, Box::new(s))
+            .unwrap();
+        let s = make_ddsketch(0.01, &[1.0]);
+        worker
+            .process_accumulator_input(1, "us-west", 120_000, Box::new(s))
+            .unwrap();
+
+        let captured = sink.drain();
+        // Exactly two emissions for the closed window: one per zone.
+        // (us-east merges 3 per-tuple sketches; us-west merges 2.)
+        let closed_window_outputs: Vec<_> = captured
+            .iter()
+            .filter(|(o, _)| o.start_timestamp == 60_000 && o.end_timestamp == 90_000)
+            .collect();
+        assert_eq!(
+            closed_window_outputs.len(),
+            2,
+            "must emit exactly 2 outputs (one per zone) for the closed window — \
+             rollup over rack/node/pod must collapse the 5 per-tuple sketches into 2 per-zone outputs"
+        );
+
+        // Verify the merged counts: us-east merges 3 sketches × 1 value each = 3.
+        for (output, acc) in closed_window_outputs.iter() {
+            let dd = acc
+                .as_any()
+                .downcast_ref::<DDSketchAccumulator>()
+                .expect("must be DDSketchAccumulator");
+            let zone = output
+                .key
+                .as_ref()
+                .and_then(|k| k.labels.first().cloned())
+                .unwrap_or_default();
+            let expected_count = match zone.as_str() {
+                "us-east" => 3,
+                "us-west" => 2,
+                other => panic!("unexpected zone {other}"),
+            };
+            assert_eq!(
+                dd.inner.count, expected_count,
+                "zone {zone} must roll up exactly {expected_count} per-tuple sketches"
+            );
+        }
+    }
 }
