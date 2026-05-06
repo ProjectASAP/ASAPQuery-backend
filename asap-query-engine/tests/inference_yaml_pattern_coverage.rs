@@ -188,6 +188,7 @@ fn build_engine(
     );
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
     let store = Arc::new(SimpleMapStore::new(
         streaming_config.clone(),

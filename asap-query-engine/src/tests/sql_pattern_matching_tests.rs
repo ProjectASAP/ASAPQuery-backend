@@ -77,6 +77,7 @@ mod tests {
         agg_configs.insert(agg_id, agg_config);
         let streaming_config = Arc::new(StreamingConfig {
             aggregation_configs: agg_configs,
+            storage_backend: Default::default(),
         });
 
         let store = Arc::new(SimpleMapStore::new(

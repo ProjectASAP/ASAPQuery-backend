@@ -4088,6 +4088,49 @@ impl SimpleEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase-5: `QueryEngine` trait impl.
+//
+// Adapter only — does NOT change `handle_query` or any other existing
+// surface. The trait's `execute(&str)` walks the same `handle_query` code
+// path the binary's HTTP driver uses today; `None` (capability miss) is
+// translated to `EngineError::CapabilityMiss` so the router can fall through
+// to the next compatible backend.
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl crate::engines::router::QueryEngine for SimpleEngine {
+    async fn execute(
+        &self,
+        query: &str,
+    ) -> Result<crate::engines::query_result::QueryResult, crate::engines::EngineError> {
+        // `handle_query` is sync + needs a `time: f64` (epoch millis as float).
+        // The router doesn't pass a query time, so we use wall-clock now —
+        // matches `GorillaQueryEngine::execute`'s convention.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        match self.handle_query(query.to_string(), now_ms) {
+            Some((_labels, result)) => Ok(result),
+            None => Err(crate::engines::EngineError::capability_miss(
+                asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                format!("SimpleEngine has no compatible aggregation for `{query}`"),
+            )),
+        }
+    }
+
+    fn capabilities(&self) -> crate::engines::router::EngineCapabilities {
+        crate::engines::router::EngineCapabilities {
+            data_source_id: asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+            storage_backend: asap_types::StorageBackend::SketchWarmTier,
+            // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
+            // for buffered ops (KLL with k=200 is well below this).
+            supports_streams_above_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
 #[cfg(test)]
 mod range_query_tests {
     use crate::data_model::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};

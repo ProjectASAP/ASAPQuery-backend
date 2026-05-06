@@ -211,6 +211,7 @@ impl TestConfigBuilder {
         // Create StreamingConfig
         let streaming_config = StreamingConfig {
             aggregation_configs: self.streaming_configs,
+            storage_backend: Default::default(),
         };
 
         (inference_config, Arc::new(streaming_config))
@@ -252,6 +253,7 @@ impl TestConfigBuilder {
         // Create StreamingConfig
         let streaming_config = StreamingConfig {
             aggregation_configs: self.streaming_configs,
+            storage_backend: Default::default(),
         };
 
         (

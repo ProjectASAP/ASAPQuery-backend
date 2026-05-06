@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use promql_utilities::data_model::KeyByLabelNames;
 use promql_utilities::query_logics::enums::Statistic;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
@@ -10,6 +11,81 @@ use crate::enums::WindowType;
 use crate::query_requirements::QueryRequirements;
 use crate::utils::normalize_spatial_filter;
 use promql_utilities::query_logics::enums::AggregationType;
+
+// ---------------------------------------------------------------------------
+// Phase-5: storage-backend capability axis
+//
+// Today's `find_compatible_aggregation` matches on
+// `(metric, statistic, sub_type, window_size, grouping_labels, spatial_filter)`
+// — there is no axis for "which storage tier serves this query." The Phase-5
+// `GorillaQueryEngine` (PR #85) introduces a parallel exact tier; the planner /
+// router needs to disambiguate between warm-tier sketches and Gorilla-S3
+// chunks. See `docs/design-gorilla-s3-cold-engine.md` §8.
+// ---------------------------------------------------------------------------
+
+/// Which physical storage tier a query (or a metric configuration) routes to.
+///
+/// `SketchWarmTier` is the default — every existing `AggregationConfig` and
+/// `StreamingConfig` decodes into this variant via `#[serde(default)]`, so
+/// pre-Phase-5 deploys keep dispatching to `SimpleEngine` unchanged.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackend {
+    /// Warm-tier sketch DB (today's `SimpleMapStore` + accumulators).
+    /// Served by `SimpleEngine`. Default for unconfigured metrics.
+    #[default]
+    SketchWarmTier,
+
+    /// NEW (Phase 5) — Gorilla-S3 archive. Served by `GorillaQueryEngine`,
+    /// reading per-hour Gorilla chunks from S3 / MinIO via the Phase-3
+    /// `GorillaS3ColdStore`.
+    GorillaS3Archive,
+
+    /// Local-FS JSONL fallback (PR #54 §5.2). Served by the existing
+    /// cold-fallback path; used when no warm-tier or archive aggregation
+    /// can answer the query.
+    ColdJsonlFallback,
+
+    /// Double-write: the metric is written to both warm-tier sketches AND the
+    /// Gorilla-S3 archive. Capability matching surfaces both options and the
+    /// cost-aware dispatcher picks per query (typically warm-tier for low-
+    /// latency approximate, archive for exact).
+    DoubleWrite,
+}
+
+impl StorageBackend {
+    /// String tag pinned for byte-comparable dispatch on the wire (mirrors
+    /// the `data_source: <tag>` info-line on `QueryResult`). Engines
+    /// register themselves under these IDs in the router.
+    pub const fn data_source_id(self) -> &'static str {
+        match self {
+            StorageBackend::SketchWarmTier => "sketch_warm",
+            StorageBackend::GorillaS3Archive => "gorilla_archive",
+            StorageBackend::ColdJsonlFallback => "cold_jsonl",
+            StorageBackend::DoubleWrite => "double_write",
+        }
+    }
+}
+
+/// Accuracy hint pushed by the controller at intent-binding time
+/// (`controller/docs/design.md` §6 `core::workload`). The Phase-5 capability
+/// router consults this to decide whether a metric configured for both warm-
+/// tier and Gorilla-S3 should answer from the archive (Exact) or the
+/// approximate warm-tier sketch.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AccuracyTarget {
+    /// Caller demands an exact answer; warm-tier sketches are not eligible
+    /// unless they happen to be exact accumulators (Sum, MinMax, Increase).
+    Exact,
+    /// Caller accepts ε/δ-bounded approximate answers. Default.
+    #[default]
+    Approximate,
+}
 
 // ---------------------------------------------------------------------------
 // Pure compatibility helpers
@@ -64,6 +140,67 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::DeltaSetAggregator,
         ],
         Statistic::Topk => &[AggregationType::CountMinSketchWithHeap],
+    }
+}
+
+/// Returns the storage backends that can serve a `(statistic, accuracy)`
+/// query when the metric is configured for `metric_storage_config`.
+///
+/// The returned list is **ordered by preference**: the router walks it in
+/// order and dispatches to the first backend whose engine is registered.
+/// `ColdJsonlFallback` is appended whenever the warm tier is in play so a
+/// capability miss falls through to the §5.2 raw-store path before erroring.
+///
+/// Routing rules (mirrors `docs/design-gorilla-s3-cold-engine.md` §8):
+///
+/// * Metric configured for `GorillaS3Archive`: always
+///   `[GorillaS3Archive]`. Exact-on-archive subsumes approximate-on-warm,
+///   so even a `Statistic::Quantile` with an `Approximate` target still
+///   routes to the archive when the metric is Gorilla-only — there is no
+///   warm-tier sketch to fall back to in that deploy shape.
+/// * Metric configured for `SketchWarmTier` (or unconfigured / default):
+///   `[SketchWarmTier, ColdJsonlFallback]` — warm tier first, raw-store
+///   fallback if no compatible aggregation exists.
+/// * Metric configured for `DoubleWrite`: head depends on accuracy hint,
+///   tail is the failover sequence (the cost-aware `EngineRouter` picks
+///   the head, walks the tail on failure):
+///   - `Exact` → `[GorillaS3Archive, SketchWarmTier, ColdJsonlFallback]`
+///   - `Approximate` → `[SketchWarmTier, GorillaS3Archive, ColdJsonlFallback]`
+/// * Metric explicitly configured for `ColdJsonlFallback`: just
+///   `[ColdJsonlFallback]`.
+pub fn compatible_storage_backends(
+    _stat: Statistic,
+    accuracy: AccuracyTarget,
+    metric_storage_config: StorageBackend,
+) -> Vec<StorageBackend> {
+    match metric_storage_config {
+        StorageBackend::GorillaS3Archive => {
+            // Exact-on-archive subsumes approximate-on-warm: a Gorilla-only
+            // metric has no sketch to back-fall to, and the archive can
+            // always answer exact (and therefore also approximate) queries.
+            vec![StorageBackend::GorillaS3Archive]
+        }
+        StorageBackend::SketchWarmTier => {
+            vec![
+                StorageBackend::SketchWarmTier,
+                StorageBackend::ColdJsonlFallback,
+            ]
+        }
+        StorageBackend::DoubleWrite => match accuracy {
+            AccuracyTarget::Exact => vec![
+                StorageBackend::GorillaS3Archive,
+                StorageBackend::SketchWarmTier,
+                StorageBackend::ColdJsonlFallback,
+            ],
+            AccuracyTarget::Approximate => vec![
+                StorageBackend::SketchWarmTier,
+                StorageBackend::GorillaS3Archive,
+                StorageBackend::ColdJsonlFallback,
+            ],
+        },
+        StorageBackend::ColdJsonlFallback => {
+            vec![StorageBackend::ColdJsonlFallback]
+        }
     }
 }
 
@@ -966,5 +1103,189 @@ mod tests {
             AggregationType::CountMinSketch
         );
         assert_eq!(info.aggregation_id_for_key, 43);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase-5: storage-backend routing
+    //
+    // The Phase-5 `EngineRouter` (see `asap-query-engine/src/engines/router.rs`)
+    // consults `compatible_storage_backends(stat, accuracy, metric_storage)`
+    // to pick a backend. These tests pin the routing matrix so the dispatcher
+    // stays in lock-step with the design doc §8.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gorilla_s3_metric_routes_to_archive() {
+        let backends = compatible_storage_backends(
+            Statistic::Sum,
+            AccuracyTarget::Exact,
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(backends, vec![StorageBackend::GorillaS3Archive]);
+    }
+
+    #[test]
+    fn sketch_warm_tier_metric_routes_to_simple_engine() {
+        let backends = compatible_storage_backends(
+            Statistic::Quantile,
+            AccuracyTarget::Approximate,
+            StorageBackend::SketchWarmTier,
+        );
+        assert_eq!(
+            backends,
+            vec![
+                StorageBackend::SketchWarmTier,
+                StorageBackend::ColdJsonlFallback,
+            ]
+        );
+    }
+
+    #[test]
+    fn double_write_metric_returns_both_options() {
+        // Exact: archive head, warm-tier failover, then JSONL.
+        let exact = compatible_storage_backends(
+            Statistic::Sum,
+            AccuracyTarget::Exact,
+            StorageBackend::DoubleWrite,
+        );
+        assert_eq!(
+            exact,
+            vec![
+                StorageBackend::GorillaS3Archive,
+                StorageBackend::SketchWarmTier,
+                StorageBackend::ColdJsonlFallback,
+            ]
+        );
+        // Approximate: warm-tier head (cheaper for ε/δ-bounded answers),
+        // archive failover, then JSONL.
+        let approx = compatible_storage_backends(
+            Statistic::Quantile,
+            AccuracyTarget::Approximate,
+            StorageBackend::DoubleWrite,
+        );
+        assert_eq!(
+            approx,
+            vec![
+                StorageBackend::SketchWarmTier,
+                StorageBackend::GorillaS3Archive,
+                StorageBackend::ColdJsonlFallback,
+            ]
+        );
+    }
+
+    /// Exact-on-archive subsumes approximate-on-warm: a metric configured
+    /// only for Gorilla-S3 still routes to the archive even when the caller
+    /// asks for an approximate answer (no warm-tier sketch exists to back-
+    /// fall to in that deploy shape).
+    #[test]
+    fn gorilla_s3_with_non_exact_accuracy_still_archives() {
+        let backends = compatible_storage_backends(
+            Statistic::Quantile,
+            AccuracyTarget::Approximate,
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(backends, vec![StorageBackend::GorillaS3Archive]);
+    }
+
+    #[test]
+    fn cold_jsonl_only_metric_routes_to_jsonl() {
+        let backends = compatible_storage_backends(
+            Statistic::Sum,
+            AccuracyTarget::Exact,
+            StorageBackend::ColdJsonlFallback,
+        );
+        assert_eq!(backends, vec![StorageBackend::ColdJsonlFallback]);
+    }
+
+    #[test]
+    fn storage_backend_default_is_warm_tier() {
+        // `#[serde(default)]` on `StreamingConfig.storage_backend` (and on
+        // `StorageBackend::default()`) MUST be `SketchWarmTier` so pre-Phase-5
+        // configs decode without bumping deploys onto the archive.
+        assert_eq!(StorageBackend::default(), StorageBackend::SketchWarmTier);
+    }
+
+    #[test]
+    fn storage_backend_data_source_id_is_pinned() {
+        // The router registers engines by these strings; dashboards
+        // byte-compare them. Pin to catch accidental rename.
+        assert_eq!(StorageBackend::SketchWarmTier.data_source_id(), "sketch_warm");
+        assert_eq!(
+            StorageBackend::GorillaS3Archive.data_source_id(),
+            "gorilla_archive",
+        );
+        assert_eq!(
+            StorageBackend::ColdJsonlFallback.data_source_id(),
+            "cold_jsonl",
+        );
+    }
+
+    /// Source-of-truth agreement check, mirrors
+    /// `capability_canonical_map_agreement` for the storage axis.
+    ///
+    /// For every `(Statistic, AccuracyTarget, StorageBackend)` triple:
+    /// 1. The returned backend list is non-empty.
+    /// 2. The first element matches the expected head per the routing matrix
+    ///    in `compatible_storage_backends`'s docstring (kept sync'd by hand).
+    /// 3. Every list ends in something the router can dispatch — either the
+    ///    archive (Gorilla-only deploys) or `ColdJsonlFallback` (every
+    ///    other deploy shape).
+    #[test]
+    fn capability_storage_backend_agreement() {
+        let stats = [
+            Statistic::Count,
+            Statistic::Sum,
+            Statistic::Cardinality,
+            Statistic::Increase,
+            Statistic::Rate,
+            Statistic::Min,
+            Statistic::Max,
+            Statistic::Quantile,
+            Statistic::Topk,
+        ];
+        let accuracies = [AccuracyTarget::Exact, AccuracyTarget::Approximate];
+        let configs = [
+            StorageBackend::SketchWarmTier,
+            StorageBackend::GorillaS3Archive,
+            StorageBackend::ColdJsonlFallback,
+            StorageBackend::DoubleWrite,
+        ];
+
+        for &stat in &stats {
+            for &acc in &accuracies {
+                for &cfg in &configs {
+                    let backends = compatible_storage_backends(stat, acc, cfg);
+                    assert!(
+                        !backends.is_empty(),
+                        "compatible_storage_backends({stat:?}, {acc:?}, {cfg:?}) returned empty \
+                         — every metric configuration must route to at least one backend",
+                    );
+                    let last = *backends.last().unwrap();
+                    assert!(
+                        last == StorageBackend::ColdJsonlFallback
+                            || last == StorageBackend::GorillaS3Archive,
+                        "backend list for ({stat:?}, {acc:?}, {cfg:?}) must terminate in a \
+                         dispatchable failover (ColdJsonlFallback or GorillaS3Archive); got {last:?}",
+                    );
+                    // The expected head is determined by `(metric_storage_config, accuracy)`:
+                    let expected_head = match (cfg, acc) {
+                        (StorageBackend::GorillaS3Archive, _) => StorageBackend::GorillaS3Archive,
+                        (StorageBackend::SketchWarmTier, _) => StorageBackend::SketchWarmTier,
+                        (StorageBackend::ColdJsonlFallback, _) => StorageBackend::ColdJsonlFallback,
+                        (StorageBackend::DoubleWrite, AccuracyTarget::Exact) => {
+                            StorageBackend::GorillaS3Archive
+                        }
+                        (StorageBackend::DoubleWrite, AccuracyTarget::Approximate) => {
+                            StorageBackend::SketchWarmTier
+                        }
+                    };
+                    assert_eq!(
+                        backends[0], expected_head,
+                        "head mismatch for ({stat:?}, {acc:?}, {cfg:?}): expected {expected_head:?}, got {:?}",
+                        backends[0],
+                    );
+                }
+            }
+        }
     }
 }

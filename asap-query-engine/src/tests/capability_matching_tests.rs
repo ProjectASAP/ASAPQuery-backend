@@ -68,6 +68,7 @@ fn engine_no_query_configs(
     }
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
+        storage_backend: Default::default(),
     });
     let store = Arc::new(SimpleMapStore::new(
         streaming_config.clone(),
@@ -129,6 +130,7 @@ fn engine_with_query_config(
     agg_map.insert(agg_id, agg_config.clone());
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
+        storage_backend: Default::default(),
     });
     let store = Arc::new(SimpleMapStore::new(
         streaming_config.clone(),

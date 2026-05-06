@@ -264,3 +264,49 @@ impl ExecutionOutcome {
         ]
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase-5: `QueryEngine` trait impl.
+//
+// Wraps `GorillaQueryEngine::execute` with the EngineError envelope the
+// router speaks. Plan-time / parse-time failures fold into
+// `EngineError::CapabilityMiss` (the engine cannot serve this query
+// shape; router should fall through). Cold-store / timeout / buffer-budget
+// failures fold into `EngineError::Backend` (the engine could have served
+// the query but its backend transiently failed; router should also fall
+// through, typically to `ColdJsonlFallback`).
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl crate::engines::router::QueryEngine for GorillaQueryEngine {
+    async fn execute(
+        &self,
+        query: &str,
+    ) -> Result<QueryResult, crate::engines::EngineError> {
+        match GorillaQueryEngine::execute(self, query).await {
+            Ok(result) => Ok(result),
+            Err(EngineError::Plan(msg)) => Err(crate::engines::EngineError::capability_miss(
+                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                msg,
+            )),
+            Err(other) => Err(crate::engines::EngineError::backend(
+                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                other,
+            )),
+        }
+    }
+
+    fn capabilities(&self) -> crate::engines::router::EngineCapabilities {
+        crate::engines::router::EngineCapabilities {
+            data_source_id: asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+            storage_backend: asap_types::StorageBackend::GorillaS3Archive,
+            // The buffered-aggregate budget gives a natural ceiling: each
+            // sample is ~16 B (i64 ts + f64 value), so the byte budget is
+            // ~16 × max_buffered_samples.
+            supports_streams_above_bytes: self
+                .config
+                .max_buffered_samples
+                .saturating_mul(16),
+        }
+    }
+}
