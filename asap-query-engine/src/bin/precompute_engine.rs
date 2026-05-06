@@ -11,7 +11,7 @@ use query_engine_rust::precompute_engine::PrecomputeEngine;
 use query_engine_rust::stores::SimpleMapStore;
 use query_engine_rust::{HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::fmt::format::FmtSpan;
 
 #[derive(Parser, Debug)]
@@ -275,7 +275,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             handle_http_requests: true,
             adapter_config,
         };
-        let http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
+        let mut http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
+
+        // Phase-5/6: register a `GorillaQueryEngine` for the cold
+        // archive tier when the operator has provisioned one via the
+        // `ASAP_GORILLA_S3_*` env-var family. `HttpServer::new` already
+        // registers the `SimpleEngine` for the warm tier; we just plug in
+        // the archive engine here so any metric whose
+        // `StreamingConfig::storage_backend()` is `GorillaS3Archive`
+        // routes through the router and answers exactly from S3.
+        //
+        // When the env vars are absent (the common dev / unit-test case)
+        // we leave the router single-engine — non-`SketchWarmTier` metrics
+        // would then surface a `503 NoEngineRegistered` from the HTTP
+        // handler, which is the correct fail-loud behaviour: a deploy
+        // that pins `GorillaS3Archive` without provisioning the cold
+        // store is a configuration bug.
+        //
+        // Mirrors the registration block in `src/main.rs` so the
+        // `precompute_engine` binary (used by the deploy/docker image)
+        // matches the full backend's behaviour.
+        match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3Config::from_env() {
+            Ok(s3_cfg) => {
+                match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3ColdStore::with_default_backend(s3_cfg) {
+                    Ok(cold_store) => {
+                        use query_engine_rust::engines::{
+                            GorillaEngineConfig, GorillaQueryEngine, QueryEngine,
+                        };
+                        let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
+                            Arc::new(cold_store),
+                            GorillaEngineConfig::default(),
+                        ));
+                        info!(
+                            "Phase-6: registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
+                        );
+                        http_server = http_server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "ASAP_GORILLA_S3_* env vars present but GorillaS3ColdStore failed to build ({e}); router will not have a cold-archive engine",
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                info!(
+                    "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable cold-archive routing)",
+                );
+            }
+        }
+
         tokio::spawn(async move {
             if let Err(e) = http_server.run().await {
                 tracing::error!("Query server error: {}", e);
