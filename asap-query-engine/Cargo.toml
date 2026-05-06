@@ -86,6 +86,17 @@ asap-precompute-rs = { path = "../../ASAPCollector/asap-precompute-rs" }
 moka = { version = "0.12", features = ["sync"] }
 memmap2 = "0.9"
 crc32fast = "1.4"
+# Phase 3 — Gorilla-S3 cold engine. `asap-gorilla` (path-dep, mirrors
+# the `asap-precompute-rs` sibling-checkout pattern) provides the
+# `GORILLA1` block decoder + per-hour `index.json` catalog. `rust-s3`
+# (`s3` package on crates.io) is a single-crate S3-compatible client
+# with first-class MinIO support; we hold it behind
+# `default-features = false` + `tokio-rustls-tls` so it shares the
+# rustls backend already pulled in by `reqwest`. `lru` powers the
+# Phase 3 `ChunkCache` keyed on chunk object key.
+asap-gorilla = { path = "../../ASAPCollector/asap-gorilla" }
+s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls"] }
+lru = "0.12"
 
 [[bin]]
 name = "precompute_engine"
