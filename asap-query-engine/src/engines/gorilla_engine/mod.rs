@@ -156,6 +156,14 @@ impl GorillaQueryEngine {
         &self.config
     }
 
+    /// Test-only accessor for the underlying cold store. mvp/v5
+    /// tests use this to construct a `ExactExecutor` that shares
+    /// the same mock without re-wrapping in a fresh `Arc`.
+    #[cfg(test)]
+    pub(super) fn cold_store_for_tests(&self) -> Arc<dyn ColdStore> {
+        self.cold_store.clone()
+    }
+
     /// Execute a parsed PromQL query against the cold tier.
     ///
     /// The query string is parsed via [`query_planner::plan_query`],
@@ -241,6 +249,22 @@ pub struct ExecutionOutcome {
     pub samples_scanned: usize,
     /// Number of chunks the executor fetched from the cold store.
     pub chunks_fetched: usize,
+    /// **mvp/v5**: number of chunks the postings filter pruned —
+    /// the executor was able to skip these without a chunk-body
+    /// fetch. `0` when the postings-aware path didn't run (no label
+    /// matchers / postings missing).
+    pub chunks_skipped_via_postings: usize,
+    /// **mvp/v5**: number of series the postings file said matched
+    /// the label predicates. The executor uses this to decide
+    /// whether a chunk's `label_hash` is interesting before paying
+    /// for the chunk body. Surfaces in `infos` as
+    /// `postings_filtered_series_count`.
+    pub postings_filtered_series_count: usize,
+    /// **mvp/v5**: `true` when the engine hit a missing postings
+    /// sidecar in the request window and fell back to the scan-all
+    /// path. Drives the `data_source_quirk: postings_missing`
+    /// `infos` annotation.
+    pub postings_missing: bool,
 }
 
 impl ExecutionOutcome {
@@ -250,18 +274,34 @@ impl ExecutionOutcome {
             value: f64::NAN,
             samples_scanned: 0,
             chunks_fetched: 0,
+            chunks_skipped_via_postings: 0,
+            postings_filtered_series_count: 0,
+            postings_missing: false,
         }
     }
 
     /// Build the `infos` array surfaced on the wire response.
     /// Pulled out so tests can pin the exact strings.
     pub fn info_lines(&self) -> Vec<String> {
-        vec![
+        let mut out = vec![
             AccuracyProfile::exact().summary(),
             DATA_SOURCE_GORILLA_ARCHIVE.to_string(),
             format!("samples_scanned: {}", self.samples_scanned),
             format!("chunks_fetched: {}", self.chunks_fetched),
-        ]
+        ];
+        // mvp/v5: surface postings-aware execution counters.
+        out.push(format!(
+            "chunks_skipped_via_postings: {}",
+            self.chunks_skipped_via_postings
+        ));
+        out.push(format!(
+            "postings_filtered_series_count: {}",
+            self.postings_filtered_series_count
+        ));
+        if self.postings_missing {
+            out.push("data_source_quirk: postings_missing".to_string());
+        }
+        out
     }
 }
 
