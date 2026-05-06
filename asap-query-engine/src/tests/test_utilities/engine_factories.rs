@@ -95,6 +95,7 @@ pub fn create_engine_single_pop_with_aggregated(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(
@@ -215,6 +216,7 @@ pub fn create_engine_dual_input(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(
@@ -330,6 +332,7 @@ pub fn create_engine_two_metrics(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(
@@ -434,6 +437,7 @@ pub fn create_engine_three_metrics(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(
@@ -514,6 +518,7 @@ pub fn create_engine_multi_timestamp(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(
@@ -594,6 +599,7 @@ pub fn create_engine_multi_timestamp_with_window(
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
+        storage_backend: Default::default(),
     });
 
     let store = Arc::new(SimpleMapStore::new(

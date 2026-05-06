@@ -8,6 +8,7 @@ use std::ops::Index;
 
 use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
 use crate::capability_matching::find_compatible_aggregation as common_find_compatible;
+use crate::capability_matching::StorageBackend;
 use crate::enums::QueryLanguage;
 use crate::inference_config::{InferenceConfig, SchemaConfig};
 use crate::query_requirements::QueryRequirements;
@@ -15,13 +16,41 @@ use crate::query_requirements::QueryRequirements;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
     pub aggregation_configs: HashMap<u64, AggregationConfig>,
+    /// Phase-5 capability-routing axis: which storage tier serves this
+    /// per-metric runtime config. The controller pushes this when planning
+    /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
+    /// configs decode with `#[serde(default)]` to `SketchWarmTier` so
+    /// existing deploys keep dispatching to `SimpleEngine`.
+    #[serde(default)]
+    pub storage_backend: StorageBackend,
 }
 
 impl StreamingConfig {
     pub fn new(aggregation_configs: HashMap<u64, AggregationConfig>) -> Self {
         Self {
             aggregation_configs,
+            storage_backend: StorageBackend::default(),
         }
+    }
+
+    /// Phase-5 constructor: build with an explicit storage-backend pin.
+    /// Used by the controller-driven plan-push path; tests typically
+    /// stay on `Self::new(...)` and let the default land.
+    pub fn with_storage_backend(
+        aggregation_configs: HashMap<u64, AggregationConfig>,
+        storage_backend: StorageBackend,
+    ) -> Self {
+        Self {
+            aggregation_configs,
+            storage_backend,
+        }
+    }
+
+    /// Read-only access to the storage backend pinned at construction
+    /// time. The Phase-5 router consults this to pick which engine
+    /// answers a query.
+    pub fn storage_backend(&self) -> StorageBackend {
+        self.storage_backend
     }
 
     pub fn get_aggregation_config(&self, aggregation_id: u64) -> Option<&AggregationConfig> {
@@ -127,5 +156,27 @@ impl Index<u64> for StreamingConfig {
 impl Default for StreamingConfig {
     fn default() -> Self {
         Self::new(HashMap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pre-Phase-5 deploys serialize `StreamingConfig` without the
+    /// `storage_backend` field; deserialize must default to `SketchWarmTier`
+    /// so the router keeps dispatching to `SimpleEngine` unchanged.
+    #[test]
+    fn deserialize_legacy_yaml_defaults_to_warm_tier() {
+        let yaml = "{\"aggregation_configs\":{}}";
+        let cfg: StreamingConfig = serde_json::from_str(yaml).expect("legacy decode");
+        assert_eq!(cfg.storage_backend(), StorageBackend::SketchWarmTier);
+    }
+
+    #[test]
+    fn deserialize_with_explicit_archive_pin() {
+        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_s3_archive\"}";
+        let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
+        assert_eq!(cfg.storage_backend(), StorageBackend::GorillaS3Archive);
     }
 }

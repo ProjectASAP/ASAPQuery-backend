@@ -12,7 +12,9 @@ pub mod utils;
 
 pub use aggregation_config::*;
 pub use aggregation_reference::*;
-pub use capability_matching::find_compatible_aggregation;
+pub use capability_matching::{
+    compatible_storage_backends, find_compatible_aggregation, AccuracyTarget, StorageBackend,
+};
 pub use enums::*;
 pub use inference_config::*;
 pub use promql_schema::*;
