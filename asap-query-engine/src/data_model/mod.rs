@@ -1,5 +1,6 @@
 pub mod aggregation_config;
 pub mod aggregation_reference;
+pub mod backend_storage_routing;
 pub mod enums;
 pub mod hot_reload_config;
 pub mod inference_config;
@@ -13,6 +14,7 @@ pub mod traits;
 
 pub use aggregation_config::*;
 pub use aggregation_reference::*;
+pub use backend_storage_routing::*;
 pub use enums::*;
 pub use hot_reload_config::*;
 pub use inference_config::*;

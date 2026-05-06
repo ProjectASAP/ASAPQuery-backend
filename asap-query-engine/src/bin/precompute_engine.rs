@@ -157,6 +157,21 @@ struct Args {
     /// `--enable-otel-ingest` is set).
     #[arg(long, default_value_t = 4318)]
     otel_http_port: u16,
+
+    /// Path to the per-metric backend storage routing YAML
+    /// (`{metric_name: storage_backend}` map). Loaded once at
+    /// startup; the HTTP query handler consults it on every PromQL
+    /// query to decide which engine should answer (warm-tier
+    /// SimpleEngine vs cold-archive GorillaQueryEngine vs JSONL
+    /// fallback). Without this flag the handler falls back to the
+    /// streaming-config single axis (which always defaults to
+    /// `SketchWarmTier`), so cold-archive metrics never reach the
+    /// `EngineRouter` — the bug issue #46 v2's `MVP_REPORT.md` flagged.
+    /// Reads from `ASAP_BACKEND_STORAGE_ROUTING` so containerised
+    /// deploys can wire it via env (matches the backend Docker
+    /// image's pattern in `deploy/docker-compose/base.yml`).
+    #[arg(long, env = "ASAP_BACKEND_STORAGE_ROUTING")]
+    backend_storage_routing: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -276,6 +291,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             adapter_config,
         };
         let mut http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
+
+        // Per-metric storage-backend routing table (issue #46
+        // criterion ⑤). When provided, the HTTP handler consults this
+        // table on every PromQL query — extracting the metric name
+        // from the AST and looking up its `StorageBackend`. Without
+        // it the handler falls back to the streaming-config single
+        // axis (which always defaults to `SketchWarmTier`) and the
+        // `EngineRouter` is effectively bypassed.
+        if let Some(routing_path) = args.backend_storage_routing.as_deref() {
+            match query_engine_rust::data_model::BackendStorageRouting::from_yaml_file(
+                routing_path,
+            ) {
+                Ok(routing) => {
+                    info!(
+                        "Loaded backend-storage-routing from {:?}: default={:?}, entries={}",
+                        routing_path,
+                        routing.default_backend(),
+                        routing.len(),
+                    );
+                    http_server = http_server.with_backend_storage_routing(Arc::new(routing));
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load backend-storage-routing from {:?}: {} — falling back to streaming-config single axis",
+                        routing_path, e,
+                    );
+                }
+            }
+        } else {
+            info!(
+                "--backend-storage-routing not set — every query routes per the streaming-config single axis (typically `sketch_warm`)",
+            );
+        }
 
         // Phase-5/6: register a `GorillaQueryEngine` for the cold
         // archive tier when the operator has provisioned one via the

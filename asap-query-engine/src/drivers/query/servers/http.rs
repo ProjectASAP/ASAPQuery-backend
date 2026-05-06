@@ -49,6 +49,17 @@ pub struct HttpServer {
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
+    /// Per-metric storage-backend routing table consulted by the HTTP
+    /// instant-query handler at request time. When `Some(..)` and the
+    /// query parses, the handler extracts the metric name from the
+    /// PromQL AST, consults this table, and dispatches through
+    /// `EngineRouter` for any per-metric override. When `None` the
+    /// handler falls back to the pre-Phase-5 behaviour of consulting
+    /// the streaming-config's single `storage_backend()` axis (which
+    /// itself defaults to `SketchWarmTier`). Wired by the binary via
+    /// [`Self::with_backend_storage_routing`]; production deploys
+    /// load `deploy/configs/backend-storage-routing.yaml`.
+    backend_storage_routing: Option<Arc<crate::data_model::BackendStorageRouting>>,
     /// Per-`agg_id` schema registry (sketch DB §6). `None` when the
     /// caller hasn't wired the precompute engine into the HTTP
     /// server — in that case the `POST /api/v1/streaming-config`
@@ -80,6 +91,8 @@ struct AppState {
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
+    /// See [`HttpServer::backend_storage_routing`].
+    backend_storage_routing: Option<Arc<crate::data_model::BackendStorageRouting>>,
     /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
     /// `POST /api/v1/streaming-config` to call `schemas.reconcile()`
     /// on every swap so schema lifecycle transitions happen
@@ -114,6 +127,7 @@ impl HttpServer {
             store,
             query_tracker,
             hot_reload_config: None,
+            backend_storage_routing: None,
             schemas: None,
             backfill: None,
             data_retention_ms: None,
@@ -147,6 +161,25 @@ impl HttpServer {
         handle: crate::data_model::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
+        self
+    }
+
+    /// Attach a per-metric storage-backend routing table loaded from
+    /// `backend-storage-routing.yaml`. When attached, every instant
+    /// query consults this table (after extracting the metric name
+    /// from the PromQL AST) and dispatches through `EngineRouter` for
+    /// any per-metric override. Without this handle the handler falls
+    /// back to the pre-Phase-5 single-axis behaviour driven by
+    /// `StreamingConfig::storage_backend()`.
+    ///
+    /// This is the bridge from "warm-tier-only deploy" to
+    /// "cold-archive-routed metrics" until the controller's plan-push
+    /// pipeline lands per-metric `StorageBackend` updates.
+    pub fn with_backend_storage_routing(
+        mut self,
+        routing: Arc<crate::data_model::BackendStorageRouting>,
+    ) -> Self {
+        self.backend_storage_routing = Some(routing);
         self
     }
 
@@ -211,6 +244,7 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
+            backend_storage_routing: self.backend_storage_routing.clone(),
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -278,6 +312,7 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
+            backend_storage_routing: self.backend_storage_routing.clone(),
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -370,24 +405,33 @@ async fn process_query_request(
     // Step 2: Pick a dispatch path based on the metric's pinned
     // storage backend (Phase-5 capability routing).
     //
-    // - `SketchWarmTier` (default for legacy / unconfigured deploys)
-    //   keeps the direct `SimpleEngine::handle_query` path: it returns
-    //   a `KeyByLabelNames` Prometheus needs to populate the `metric`
-    //   map, which the trait surface (`router.execute → QueryResult`
-    //   only) cannot thread through.
-    // - Anything else (`GorillaS3Archive`, `DoubleWrite`,
-    //   `ColdJsonlFallback`) goes through the `EngineRouter`. Phase-6
-    //   (Gorilla MVP) returns a scalar with empty labels, so dropping
-    //   `KeyByLabelNames` is acceptable; the response carries
-    //   `accuracy` + `data_source` via the wire-extension annotations.
-    let metric_storage = state
-        .hot_reload_config
-        .as_ref()
-        .map(|h| h.snapshot().storage_backend())
-        .unwrap_or_default();
+    // Routing precedence:
+    //   (a) Per-metric `BackendStorageRouting` table (loaded from
+    //       `backend-storage-routing.yaml` at startup). The PromQL
+    //       query is parsed; the metric name is extracted from the
+    //       AST and looked up in the table. This is the production
+    //       path the issue-46 MVP relies on so cold-archive metrics
+    //       (e.g. `http_requests_total` → `gorilla_archive`) actually
+    //       route through the `EngineRouter`.
+    //   (b) Single-axis `StreamingConfig::storage_backend()` from the
+    //       hot-reload config (the pre-Phase-5 fallback). Pre-controller
+    //       deploys ride this path; it always lands on `SketchWarmTier`
+    //       unless the YAML was hand-patched.
+    //   (c) Default — `SketchWarmTier`. Keeps the direct
+    //       `SimpleEngine::handle_query` path so the response carries
+    //       the `KeyByLabelNames` the Prometheus adapter needs to
+    //       populate the `metric` map.
+    //
+    // For non-`SketchWarmTier` axes the dispatch goes through the
+    // `EngineRouter`. Phase-6 (Gorilla MVP) returns a scalar with
+    // empty labels, so dropping `KeyByLabelNames` is acceptable; the
+    // response carries `accuracy` + `data_source` via the
+    // wire-extension annotations.
+    let metric_storage = resolve_metric_storage(state, &parsed_request.query);
     debug!(
-        "Dispatch axis: metric_storage={:?} (from hot-reload config: {})",
+        "Dispatch axis: metric_storage={:?} (from backend-storage-routing: {}, hot-reload: {})",
         metric_storage,
+        state.backend_storage_routing.is_some(),
         state.hot_reload_config.is_some(),
     );
 
@@ -395,6 +439,72 @@ async fn process_query_request(
         process_via_simple_engine(state, parsed_request, start_time, headers).await
     } else {
         process_via_router(state, parsed_request, start_time, metric_storage).await
+    }
+}
+
+/// Resolve the [`StorageBackend`] that should handle this query.
+///
+/// Routing precedence (see `process_query_request` for context):
+/// 1. Per-metric `BackendStorageRouting` table — parse the PromQL,
+///    pull the metric name out of the AST, look it up in the table.
+///    This is the path issue #46's MVP demo relies on.
+/// 2. Streaming-config single-axis fallback — preserves pre-Phase-5
+///    behaviour for deploys that haven't loaded a routing table.
+/// 3. Default `SketchWarmTier`.
+///
+/// Parsing failures fall through to (2)/(3) so a malformed PromQL
+/// doesn't surface as a routing 5xx (the engines themselves will
+/// reject it with a clearer error).
+fn resolve_metric_storage(state: &AppState, query: &str) -> StorageBackend {
+    if let Some(routing) = state.backend_storage_routing.as_ref() {
+        match promql_parser::parser::parse(query) {
+            Ok(expr) => {
+                if let Some(metric_name) = first_metric_name(&expr) {
+                    let backend = routing.lookup(&metric_name);
+                    debug!(
+                        "resolve_metric_storage: routing-table hit for metric={} → {:?}",
+                        metric_name, backend,
+                    );
+                    return backend;
+                }
+                debug!(
+                    "resolve_metric_storage: PromQL parsed but no metric name found in AST; falling back to streaming-config axis",
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "resolve_metric_storage: PromQL parse failed ({}); falling back to streaming-config axis",
+                    e,
+                );
+            }
+        }
+    }
+
+    state
+        .hot_reload_config
+        .as_ref()
+        .map(|h| h.snapshot().storage_backend())
+        .unwrap_or_default()
+}
+
+/// Walk a PromQL AST and return the first metric name we encounter.
+/// Used by the routing-table lookup to pick a key. PromQL queries that
+/// reference multiple metrics (e.g. `a / on(x) b`) are not currently
+/// supported by the routing table — the first-encountered metric wins.
+/// In practice the issue-46 demo replay queries each touch exactly one
+/// metric, so this heuristic is correct for the MVP.
+fn first_metric_name(expr: &promql_parser::parser::Expr) -> Option<String> {
+    use promql_parser::parser::Expr;
+    match expr {
+        Expr::VectorSelector(vs) => vs.name.clone(),
+        Expr::MatrixSelector(ms) => ms.vs.name.clone(),
+        Expr::Call(call) => call.args.args.iter().find_map(|a| first_metric_name(a)),
+        Expr::Aggregate(agg) => first_metric_name(&agg.expr),
+        Expr::Binary(bin) => first_metric_name(&bin.lhs).or_else(|| first_metric_name(&bin.rhs)),
+        Expr::Subquery(sq) => first_metric_name(&sq.expr),
+        Expr::Paren(p) => first_metric_name(&p.expr),
+        Expr::Unary(u) => first_metric_name(&u.expr),
+        _ => None,
     }
 }
 
@@ -2272,6 +2382,63 @@ aggregations:
             .expect("Failed to start test server")
     }
 
+    /// Build an `HttpServer` wired with a per-metric
+    /// `BackendStorageRouting` table — the **production path** the
+    /// issue-46 MVP relies on. The streaming-config single axis stays
+    /// at `SketchWarmTier` (the realistic deploy state); the routing
+    /// table is what flips per-metric dispatch over to the
+    /// `EngineRouter`. This proves the production code path
+    /// (`process_query_request → resolve_metric_storage → routing
+    /// table lookup`), as opposed to the
+    /// `setup_test_server_with_router` helper above which mocks the
+    /// resolution by pinning `streaming_cfg.storage_backend` directly.
+    async fn setup_test_server_with_routing_table(
+        routing: crate::data_model::BackendStorageRouting,
+        extra_engines: Vec<Arc<dyn QueryEngine>>,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        // Streaming-config stays on the default `SketchWarmTier` axis
+        // — exactly what the production deploy looks like (the YAML
+        // loader doesn't parse `storage_backend`). All routing
+        // decisions must come from the per-metric routing table.
+        let streaming_cfg = StreamingConfig::default();
+        let streaming_arc = Arc::new(streaming_cfg);
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_arc.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_arc,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let mut server = HttpServer::new(config, query_engine, store, None)
+            .with_hot_reload_config(hot_reload)
+            .with_backend_storage_routing(Arc::new(routing));
+        for engine in extra_engines {
+            server = server.with_query_engine(engine);
+        }
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
+    }
+
     /// Build a server whose `EngineRouter` has zero registered
     /// engines. We can't reach this through the public API
     /// (`HttpServer::new` always registers `SimpleEngine`), so the
@@ -2534,6 +2701,137 @@ aggregations:
         // exercised happens via call counts.
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
         assert_eq!(jsonl_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── Issue #46 production-path coverage: BackendStorageRouting ─────────────
+    //
+    // The tests above (e.g. `http_routes_archive_metric_to_gorilla_engine`)
+    // mock the routing decision by pinning `streaming_cfg.storage_backend
+    // = GorillaS3Archive` directly. That proves the dispatch BRANCH is
+    // wired, but not the production code path — in real deploys the
+    // streaming-config YAML loader drops `storage_backend` (it always
+    // defaults to `SketchWarmTier`), so the issue-46 v2 demo's queries
+    // never reached the EngineRouter. The tests below exercise the
+    // **production path** end-to-end: streaming config stays default,
+    // a per-metric `BackendStorageRouting` table is loaded at startup
+    // (mirroring `--backend-storage-routing` on `precompute_engine`),
+    // and the handler must consult the table on every request.
+
+    #[tokio::test]
+    async fn http_production_path_routes_archive_metric_via_routing_table() {
+        // Production path: streaming-config single axis stays on
+        // `SketchWarmTier` (the YAML loader's default), but the
+        // per-metric routing table flips `http_requests_total` to
+        // `gorilla_archive`. The handler must extract the metric name
+        // from the PromQL AST, look it up, and dispatch through the
+        // EngineRouter — landing the `data_source: gorilla_archive`
+        // info-line on the response.
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "http_requests_total".to_string(),
+            StorageBackend::GorillaS3Archive,
+        );
+        let routing = crate::data_model::BackendStorageRouting::new(
+            StorageBackend::SketchWarmTier,
+            metrics,
+        );
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "count(http_requests_total)"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "production-path archive dispatch must return 2xx; got {}",
+            resp.status(),
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "GorillaQueryEngine must be hit exactly once on the production path",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_production_path_unlisted_metric_falls_back_to_warm_tier() {
+        // The same routing table only overrides `http_requests_total`;
+        // a query against a different metric must take the warm-tier
+        // direct-dispatch path (no `EngineRouter` round-trip).
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "http_requests_total".to_string(),
+            StorageBackend::GorillaS3Archive,
+        );
+        let routing = crate::data_model::BackendStorageRouting::new(
+            StorageBackend::SketchWarmTier,
+            metrics,
+        );
+        let server_port =
+            setup_test_server_with_routing_table(routing, Vec::new()).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "sum_over_time(some_other_metric[5m])"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "warm-tier fallback must return 2xx; got {}",
+            resp.status(),
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "sketch_warm");
+    }
+
+    #[tokio::test]
+    async fn http_production_path_default_axis_routes_all_metrics() {
+        // Routing table with no per-metric overrides but a non-default
+        // top-level `default: gorilla_s3_archive` — every metric must
+        // route through the router. Pins the §8 "all-metrics-archive"
+        // deploy mode.
+        let routing = crate::data_model::BackendStorageRouting::new(
+            StorageBackend::GorillaS3Archive,
+            std::collections::HashMap::new(),
+        );
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "count(any_metric_at_all)"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
 }
