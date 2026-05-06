@@ -16,9 +16,11 @@ use tracing::{debug, info, warn};
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
-use crate::engines::SimpleEngine;
+use crate::engines::{EngineRouter, EngineRouterError, QueryEngine, SimpleEngine};
 use crate::query_tracker::QueryTracker;
 use crate::stores::Store;
+use asap_types::{AccuracyTarget, StorageBackend};
+use promql_utilities::query_logics::enums::Statistic;
 
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
@@ -31,6 +33,17 @@ pub struct HttpServerConfig {
 pub struct HttpServer {
     config: HttpServerConfig,
     query_engine: Arc<SimpleEngine>,
+    /// Phase-5/6 capability router. Built from `query_engine` at
+    /// construction time (`SimpleEngine` registered as the warm-tier
+    /// `QueryEngine`) and extended via [`Self::with_query_engine`] —
+    /// e.g. to plug in a `GorillaQueryEngine` for the cold archive
+    /// tier. Instant-query dispatch consults this for metrics whose
+    /// `StreamingConfig::storage_backend()` is anything other than
+    /// `SketchWarmTier`; warm-tier queries still take the direct
+    /// `SimpleEngine::handle_query` path so they keep the
+    /// `KeyByLabelNames` Prometheus needs to populate the `metric`
+    /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
+    query_router: Arc<EngineRouter>,
     store: Arc<dyn Store>,
     query_tracker: Option<Arc<QueryTracker>>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
@@ -60,6 +73,8 @@ pub struct HttpServer {
 struct AppState {
     config: HttpServerConfig,
     query_engine: Arc<SimpleEngine>,
+    /// See [`HttpServer::query_router`].
+    query_router: Arc<EngineRouter>,
     store: Arc<dyn Store>,
     query_tracker: Option<Arc<QueryTracker>>,
     adapter: Arc<dyn HttpProtocolAdapter>,
@@ -85,9 +100,17 @@ impl HttpServer {
         store: Arc<dyn Store>,
         query_tracker: Option<Arc<QueryTracker>>,
     ) -> Self {
+        // Bootstrap the capability router with `SimpleEngine` registered
+        // for the warm-tier (`sketch_warm`) `data_source_id`. Callers
+        // wiring up additional engines (e.g. `GorillaQueryEngine` for
+        // the cold archive) extend the router via `with_query_engine`.
+        let mut router = EngineRouter::new();
+        router.register(query_engine.clone() as Arc<dyn QueryEngine>);
+        let query_router = Arc::new(router);
         Self {
             config,
             query_engine,
+            query_router,
             store,
             query_tracker,
             hot_reload_config: None,
@@ -95,6 +118,24 @@ impl HttpServer {
             backfill: None,
             data_retention_ms: None,
         }
+    }
+
+    /// Plug an additional [`QueryEngine`] into the capability router.
+    /// Used by the binary to register `GorillaQueryEngine` (cold
+    /// archive) alongside the `SimpleEngine` registered by `new`.
+    /// Engines are keyed by their `data_source_id`; calling this with
+    /// an engine whose id collides with an already-registered one
+    /// replaces the previous registration (matches `EngineRouter`'s
+    /// hot-swap contract).
+    pub fn with_query_engine(mut self, engine: Arc<dyn QueryEngine>) -> Self {
+        // The router stored here is the canonical one — callers always
+        // hold an `Arc<EngineRouter>`, so we rebuild from a fresh
+        // `EngineRouter::clone()` (cheap; the `engines` map clones the
+        // inner `Arc`s, not the engines themselves).
+        let mut router: EngineRouter = (*self.query_router).clone();
+        router.register(engine);
+        self.query_router = Arc::new(router);
+        self
     }
 
     /// Attach a `HotReloadStreamingConfig` handle so the
@@ -164,6 +205,7 @@ impl HttpServer {
         let app_state = AppState {
             config: self.config.clone(),
             query_engine: self.query_engine,
+            query_router: self.query_router,
             store: self.store,
             query_tracker: self.query_tracker,
             adapter: adapter.clone(),
@@ -230,6 +272,7 @@ impl HttpServer {
         let app_state = AppState {
             config: self.config.clone(),
             query_engine: self.query_engine.clone(),
+            query_router: self.query_router.clone(),
             store: self.store.clone(),
             query_tracker: self.query_tracker.clone(),
             adapter: adapter.clone(),
@@ -324,7 +367,49 @@ async fn process_query_request(
         tracker.record_instant(&parsed_request.query, parsed_request.time);
     }
 
-    // Step 2: Execute query with engine (using parsed request)
+    // Step 2: Pick a dispatch path based on the metric's pinned
+    // storage backend (Phase-5 capability routing).
+    //
+    // - `SketchWarmTier` (default for legacy / unconfigured deploys)
+    //   keeps the direct `SimpleEngine::handle_query` path: it returns
+    //   a `KeyByLabelNames` Prometheus needs to populate the `metric`
+    //   map, which the trait surface (`router.execute → QueryResult`
+    //   only) cannot thread through.
+    // - Anything else (`GorillaS3Archive`, `DoubleWrite`,
+    //   `ColdJsonlFallback`) goes through the `EngineRouter`. Phase-6
+    //   (Gorilla MVP) returns a scalar with empty labels, so dropping
+    //   `KeyByLabelNames` is acceptable; the response carries
+    //   `accuracy` + `data_source` via the wire-extension annotations.
+    let metric_storage = state
+        .hot_reload_config
+        .as_ref()
+        .map(|h| h.snapshot().storage_backend())
+        .unwrap_or_default();
+    debug!(
+        "Dispatch axis: metric_storage={:?} (from hot-reload config: {})",
+        metric_storage,
+        state.hot_reload_config.is_some(),
+    );
+
+    if matches!(metric_storage, StorageBackend::SketchWarmTier) {
+        process_via_simple_engine(state, parsed_request, start_time, headers).await
+    } else {
+        process_via_router(state, parsed_request, start_time, metric_storage).await
+    }
+}
+
+/// Direct `SimpleEngine::handle_query` dispatch — preserves the
+/// `KeyByLabelNames` the Prometheus adapter needs to fill in the
+/// `metric` map. Used for warm-tier metrics (the default) so the
+/// response surface is byte-identical to the pre-router path. Adds a
+/// `data_source: sketch_warm` info-line at the JSON layer so Phase-6
+/// callers can byte-compare regardless of the dispatch path.
+async fn process_via_simple_engine(
+    state: &AppState,
+    parsed_request: &ParsedQueryRequest,
+    start_time: Instant,
+    headers: HashMap<String, String>,
+) -> Response {
     let query_start_time = Instant::now();
     debug!(
         "About to call query_engine.handle_query with query='{}' and time={}",
@@ -364,7 +449,11 @@ async fn process_query_request(
                 .format_success_response(&execution_result)
                 .await
             {
-                Ok(json) => json.into_response(),
+                Ok(response) => annotate_data_source(
+                    response,
+                    StorageBackend::SketchWarmTier.data_source_id(),
+                )
+                .await,
                 Err(status) => status.into_response(),
             }
         }
@@ -389,14 +478,211 @@ async fn process_query_request(
                 }
             } else {
                 debug!("Query not supported and forwarding disabled, returning error");
-                // Adapter formats the unsupported query error for its protocol
+                // Adapter formats the unsupported query error for its protocol.
+                // We still annotate `data_source: sketch_warm` so callers
+                // see which tier the request was dispatched against —
+                // the routing decision happened, the metric just had no
+                // compatible aggregation. Mirrors the
+                // SimpleEngine-as-router-engine path where a
+                // `EngineError::CapabilityMiss` response is still tagged.
                 match state.adapter.format_unsupported_query_response().await {
-                    Ok(json) => json.into_response(),
+                    Ok(response) => annotate_data_source(
+                        response,
+                        StorageBackend::SketchWarmTier.data_source_id(),
+                    )
+                    .await,
                     Err(status) => status.into_response(),
                 }
             }
         }
     }
+}
+
+/// Dispatch through the [`EngineRouter`] — used for any metric whose
+/// pinned `StorageBackend` is something other than `SketchWarmTier`.
+///
+/// The router's `execute` API is `(&str, Statistic, AccuracyTarget,
+/// StorageBackend) -> QueryResult`. Three of those four axes are
+/// pinned by the request:
+///
+/// * `query` — straight from the parsed request.
+/// * `metric_storage` — looked up from the hot-reload `StreamingConfig`
+///   by the caller.
+///
+/// The remaining two — `Statistic` + `AccuracyTarget` — would
+/// normally be derived by parsing the PromQL AST. Pre-Phase-6 we don't
+/// have an HTTP-side parser wired in; the router's
+/// [`compatible_storage_backends`] consults them only for the
+/// `DoubleWrite` head-selection heuristic (other deploy shapes
+/// degenerate to a fixed list keyed only by `metric_storage`), so
+/// defaulting to `(Sum, Approximate)` is safe for `GorillaS3Archive`-
+/// only and `ColdJsonlFallback`-only deploys. A follow-up will thread
+/// the real values through once the Phase-6 query-tracker exposes
+/// them per request.
+///
+/// Map `EngineRouterError` variants to HTTP statuses:
+/// * `NoEngineRegistered` → 503 (configuration bug — restart with the
+///   right engine plugged in).
+/// * `AllFailed { last: CapabilityMiss }` → 404 (no engine in the
+///   failover sequence could serve this query shape).
+/// * `AllFailed { last: Backend }` → 500 (engines were all eligible
+///   but their backends transiently failed).
+async fn process_via_router(
+    state: &AppState,
+    parsed_request: &ParsedQueryRequest,
+    start_time: Instant,
+    metric_storage: StorageBackend,
+) -> Response {
+    use crate::drivers::query::adapters::QueryExecutionResult;
+    use crate::engines::EngineError;
+
+    let query_start_time = Instant::now();
+    debug!(
+        "Dispatching via EngineRouter: query='{}' metric_storage={:?}",
+        parsed_request.query, metric_storage,
+    );
+
+    // Default `(Sum, Approximate)` — see fn doc above. The router's
+    // capability table only consults these axes for `DoubleWrite`
+    // metrics; for `GorillaS3Archive`-only and `ColdJsonlFallback`-only
+    // deploys the dispatch is a function of `metric_storage` alone.
+    let stat = Statistic::Sum;
+    let accuracy = AccuracyTarget::Approximate;
+
+    let router_result = state
+        .query_router
+        .execute(&parsed_request.query, stat, accuracy, metric_storage)
+        .await;
+
+    match router_result {
+        Ok(query_result) => {
+            let query_duration = query_start_time.elapsed();
+            debug!(
+                "EngineRouter dispatch took: {:.2}ms; result: {:?}",
+                query_duration.as_secs_f64() * 1000.0,
+                query_result
+            );
+
+            // The Phase-4 Gorilla MVP returns a scalar with empty
+            // labels; trait dispatch loses the `KeyByLabelNames` shape
+            // SimpleEngine carries. Default to an empty `KeyByLabelNames`
+            // — the Prometheus adapter renders an empty `metric: {}`,
+            // which is a valid Prometheus shape (every label is just
+            // unset) and matches `wrap_result`'s Phase-4 contract.
+            let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
+            let execution_result = QueryExecutionResult {
+                query_output_labels,
+                query_result,
+            };
+
+            let total_duration = start_time.elapsed();
+            debug!(
+                "Total request processing took: {:.2}ms",
+                total_duration.as_secs_f64() * 1000.0
+            );
+            debug!("=== RETURNING ROUTER SUCCESS RESPONSE ===");
+
+            match state
+                .adapter
+                .format_success_response(&execution_result)
+                .await
+            {
+                Ok(response) => annotate_data_source(
+                    response,
+                    metric_storage.data_source_id(),
+                )
+                .await,
+                Err(status) => status.into_response(),
+            }
+        }
+        Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
+            warn!(
+                tried = ?tried,
+                registered = ?registered,
+                "EngineRouter: no engine registered for any compatible backend",
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "internal",
+                    "error": format!(
+                        "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
+                    ),
+                })),
+            )
+                .into_response()
+        }
+        Err(EngineRouterError::AllFailed { last }) => {
+            warn!(error = %last, "EngineRouter: all compatible engines failed");
+            let (status, error_type) = match &last {
+                EngineError::CapabilityMiss { .. } => {
+                    (StatusCode::NOT_FOUND, "bad_data")
+                }
+                EngineError::Backend { .. } => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "internal")
+                }
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": error_type,
+                    "error": last.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Append a `data_source: <id>` info-line to the response JSON's
+/// `infos` array (Prometheus 3.0-style, mirrors the wire-format
+/// extension the `GorillaQueryEngine` documents in §6 of
+/// `docs/design-gorilla-s3-cold-engine.md`). Best-effort: when the
+/// adapter's response isn't a JSON object (or doesn't have an
+/// `infos` array shape), this is a no-op and the response passes
+/// through unchanged.
+async fn annotate_data_source(response: Response, data_source_id: &'static str) -> Response {
+    use axum::body::to_bytes;
+
+    let (parts, body) = response.into_parts();
+    // Adapter responses are bounded JSON objects; cap at 16 MiB to
+    // bracket pathological cases without blowing memory.
+    let bytes = match to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("annotate_data_source: failed to read response body: {e}");
+            return Response::from_parts(parts, axum::body::Body::empty());
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            // Not a JSON body — pass through. Reconstruct the body
+            // from the buffered bytes so the caller still sees the
+            // original payload.
+            return Response::from_parts(parts, axum::body::Body::from(bytes));
+        }
+    };
+    if let serde_json::Value::Object(map) = &mut value {
+        let infos_entry = map
+            .entry("infos".to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let serde_json::Value::Array(arr) = infos_entry {
+            arr.push(serde_json::Value::String(format!(
+                "data_source: {data_source_id}"
+            )));
+        }
+    }
+    let serialized = match serde_json::to_vec(&value) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("annotate_data_source: failed to re-serialize: {e}");
+            return Response::from_parts(parts, axum::body::Body::from(bytes));
+        }
+    };
+    Response::from_parts(parts, axum::body::Body::from(serialized))
 }
 
 async fn handle_instant_query(
@@ -1868,6 +2154,388 @@ aggregations:
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
     }
+
+    // ── Phase-6 follow-up: EngineRouter wired into the HTTP query path ──────
+    //
+    // These tests cover the deliverable in the
+    // `feat/http-server-wire-engine-router` PR — every query that
+    // arrives through `/api/v1/query` now consults the
+    // `StreamingConfig::storage_backend()` axis and dispatches via the
+    // `EngineRouter` for non-warm-tier metrics. The wire response
+    // carries a `data_source: <id>` info-line so dashboards / e2e
+    // tests can byte-compare which engine answered.
+
+    use crate::engines::{EngineCapabilities, EngineError, QueryEngine, QueryResult};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-test stub `QueryEngine`. Records call counts and returns a
+    /// canned `QueryResult` keyed to the configured `data_source_id`
+    /// so HTTP-level assertions can pin which engine answered.
+    struct MockQueryEngine {
+        caps: EngineCapabilities,
+        calls: Arc<AtomicUsize>,
+        outcome: MockOutcome,
+    }
+
+    #[derive(Clone)]
+    enum MockOutcome {
+        /// Empty instant vector — the Prometheus adapter still
+        /// produces `status=success` with `data.result=[]`.
+        OkEmpty,
+        /// Force the engine to fail with `EngineError::Backend` so
+        /// the router falls through to the next compatible backend.
+        Backend,
+    }
+
+    impl MockQueryEngine {
+        fn new(backend: StorageBackend, outcome: MockOutcome) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let engine = Arc::new(Self {
+                caps: EngineCapabilities {
+                    data_source_id: backend.data_source_id(),
+                    storage_backend: backend,
+                    supports_streams_above_bytes: 1024 * 1024,
+                },
+                calls: calls.clone(),
+                outcome,
+            });
+            (engine, calls)
+        }
+    }
+
+    #[async_trait]
+    impl QueryEngine for MockQueryEngine {
+        async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::OkEmpty => Ok(QueryResult::vector(Vec::new(), 0)),
+                MockOutcome::Backend => Err(EngineError::backend(
+                    self.caps.data_source_id,
+                    "simulated backend failure",
+                )),
+            }
+        }
+        fn capabilities(&self) -> EngineCapabilities {
+            self.caps
+        }
+    }
+
+    /// Build an `HttpServer` whose router holds the supplied set of
+    /// `QueryEngine`s. The hot-reload `StreamingConfig` is pinned at
+    /// `metric_storage_backend` so query dispatch follows the
+    /// requested capability axis. Returns the bound port + the
+    /// `HotReloadStreamingConfig` handle so tests can swap the
+    /// `storage_backend` mid-flight if they need to.
+    async fn setup_test_server_with_router(
+        metric_storage_backend: StorageBackend,
+        extra_engines: Vec<Arc<dyn QueryEngine>>,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        // Pin `storage_backend` on the streaming config so the http
+        // dispatcher reads it back through the hot-reload handle.
+        let streaming_cfg =
+            StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
+        let streaming_arc = Arc::new(streaming_cfg);
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_arc.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_arc,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let mut server = HttpServer::new(config, query_engine, store, None)
+            .with_hot_reload_config(hot_reload);
+        for engine in extra_engines {
+            server = server.with_query_engine(engine);
+        }
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
+    }
+
+    /// Build a server whose `EngineRouter` has zero registered
+    /// engines. We can't reach this through the public API
+    /// (`HttpServer::new` always registers `SimpleEngine`), so the
+    /// helper drops in a router by hand via the same builder
+    /// surface — but registers nothing, then asks the router-path
+    /// dispatch to route an archive metric. Used by the
+    /// `503 NoEngineRegistered` test.
+    async fn setup_test_server_with_empty_router(
+        metric_storage_backend: StorageBackend,
+    ) -> u16 {
+        // `HttpServer::new` always registers SimpleEngine for the
+        // warm tier. To force `NoEngineRegistered` we point the
+        // metric at a backend whose data_source_id doesn't match
+        // any registered engine — since `HttpServer::new` only
+        // registers SimpleEngine (sketch_warm), routing a
+        // `ColdJsonlFallback`-only metric trips the empty path
+        // (compatible_storage_backends = [ColdJsonlFallback], no
+        // engine registered for that id).
+        setup_test_server_with_router(metric_storage_backend, Vec::new()).await
+    }
+
+    /// Asserts the `data_source: <expected>` info-line lands on the
+    /// Prometheus response body's `infos` array. Pulled out so each
+    /// dispatch-axis test reads the same way.
+    fn assert_data_source(body: &serde_json::Value, expected: &str) {
+        let infos = body
+            .get("infos")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected `infos` array in response body, got {body}",
+                )
+            });
+        let want = format!("data_source: {expected}");
+        assert!(
+            infos.iter().any(|v| v.as_str() == Some(&want)),
+            "expected `{want}` in infos, got {infos:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_routes_warm_tier_metric_to_simple_engine() {
+        // Default (no hot-reload) → `SketchWarmTier`. The handler
+        // takes the direct `SimpleEngine::handle_query` path; the
+        // response's `infos` array carries `data_source: sketch_warm`
+        // so callers can byte-compare which engine answered.
+        let server_port =
+            setup_test_server_with_router(StorageBackend::SketchWarmTier, Vec::new()).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "warm-tier dispatch must return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "sketch_warm");
+    }
+
+    #[tokio::test]
+    async fn http_routes_archive_metric_to_gorilla_engine() {
+        // Pin `storage_backend = GorillaS3Archive` and register a
+        // `MockQueryEngine` under that id. The handler must dispatch
+        // through the router (not SimpleEngine) and the response's
+        // `infos` array must carry `data_source: gorilla_archive`.
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_router(
+            StorageBackend::GorillaS3Archive,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "sum_over_time(audit_events[1h])"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "archive dispatch must return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "Gorilla mock engine should have been hit exactly once",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_query_with_no_storage_config_defaults_to_warm_tier() {
+        // `StreamingConfig::default()` has `storage_backend =
+        // SketchWarmTier` (per the `#[serde(default)]` on the
+        // field — see `streaming_config.rs`). A server set up
+        // without a hot-reload handle still infers warm-tier and
+        // takes the SimpleEngine direct path. Back-compat for
+        // pre-Phase-5 deploys whose YAML doesn't include the new
+        // `storage_backend` key.
+        let server_port = setup_test_server().await; // No hot-reload handle attached.
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "default-config dispatch must return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "sketch_warm");
+    }
+
+    #[tokio::test]
+    async fn http_returns_503_when_no_engines_registered() {
+        // Pin `storage_backend = ColdJsonlFallback` but register no
+        // engine for that id (only `SimpleEngine` is registered, and
+        // it lives under `sketch_warm`). The router walks
+        // `compatible_storage_backends = [ColdJsonlFallback]` and
+        // bails out with `NoEngineRegistered`, which the HTTP layer
+        // surfaces as 503.
+        let server_port =
+            setup_test_server_with_empty_router(StorageBackend::ColdJsonlFallback).await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "no-engine routing must surface as 503",
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "error");
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("no engine registered"),
+            "503 body must explain the routing failure; got {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_passes_through_accuracy_envelope() {
+        // The Phase-5 `QueryResult` carries an `accuracy:
+        // AccuracyEnvelope` field; the HTTP adapter mirrors it onto
+        // the response's `infos` array (`accuracy: ε=..., δ=...,
+        // kind=exact`) so Grafana 11+ surfaces it inline. We verify
+        // the router-path dispatch preserves that mirroring rather
+        // than stripping the envelope on its way through.
+        struct ExactStub;
+        #[async_trait]
+        impl QueryEngine for ExactStub {
+            async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
+                use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
+                Ok(QueryResult::vector(Vec::new(), 0)
+                    .with_accuracy(AccuracyEnvelope::single(AccuracyProfile::exact())))
+            }
+            fn capabilities(&self) -> EngineCapabilities {
+                EngineCapabilities {
+                    data_source_id: StorageBackend::GorillaS3Archive.data_source_id(),
+                    storage_backend: StorageBackend::GorillaS3Archive,
+                    supports_streams_above_bytes: 1024 * 1024,
+                }
+            }
+        }
+        let server_port = setup_test_server_with_router(
+            StorageBackend::GorillaS3Archive,
+            vec![Arc::new(ExactStub) as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "sum_over_time(foo[1h])"), ("time", "1700000000")])
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // Both the `data_source` info-line AND the
+        // `accuracy: ε=..., δ=..., kind=exact` summary must land on
+        // the response — proving the router-path dispatch preserves
+        // the engine's wire annotations.
+        assert_data_source(&body, "gorilla_archive");
+        let infos = body["infos"].as_array().expect("infos array");
+        assert!(
+            infos
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("kind=exact")),
+            "exact-accuracy summary must be present in infos; got {infos:?}",
+        );
+        // The structured `accuracy` field also round-trips.
+        let accuracy = body
+            .get("accuracy")
+            .expect("accuracy field must round-trip on router path");
+        assert_eq!(accuracy["epsilon"], 0.0);
+        assert_eq!(accuracy["delta"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn http_router_falls_through_to_jsonl_when_archive_fails() {
+        // Optional (graceful fallback) — verifies that a
+        // `DoubleWrite` deploy whose archive engine errors does NOT
+        // surface a 5xx; the router walks the compatibility list and
+        // ColdJsonlFallback answers. Pins the §8 behaviour of
+        // `design-gorilla-s3-cold-engine.md`.
+        let (gorilla_failing, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::Backend);
+        let (jsonl_ok, jsonl_calls) =
+            MockQueryEngine::new(StorageBackend::ColdJsonlFallback, MockOutcome::OkEmpty);
+        // SimpleEngine is registered under `sketch_warm` by
+        // `HttpServer::new`; for `DoubleWrite` + `Approximate` the
+        // compatibility list is
+        // `[SketchWarmTier, GorillaS3Archive, ColdJsonlFallback]`.
+        // SimpleEngine is configured with no agg ids, so its
+        // `handle_query` returns `None` → `EngineError::CapabilityMiss`,
+        // which the router tolerates and falls through. Then Gorilla
+        // fails with `Backend`, so JSONL must answer.
+        let server_port = setup_test_server_with_router(
+            StorageBackend::DoubleWrite,
+            vec![
+                gorilla_failing as Arc<dyn QueryEngine>,
+                jsonl_ok as Arc<dyn QueryEngine>,
+            ],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "double-write fallback must answer 2xx; got {}",
+            resp.status()
+        );
+        // We dispatched as `metric_storage = DoubleWrite`, so the
+        // `data_source` info-line reflects the *requested* axis (the
+        // router's `execute` doesn't expose which member of the
+        // failover list answered). Verifying the fallback was
+        // exercised happens via call counts.
+        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(jsonl_calls.load(Ordering::SeqCst), 1);
+    }
+
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────

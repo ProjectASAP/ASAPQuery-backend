@@ -669,6 +669,50 @@ async fn main() -> Result<()> {
     // (legacy per-batch reconcile in ingest still works).
     let mut server = HttpServer::new(http_config, engine, store.clone(), query_tracker)
         .with_hot_reload_config(hot_reload_config.clone());
+
+    // Phase-5/6: register a `GorillaQueryEngine` for the cold
+    // archive tier when the operator has provisioned one via the
+    // `ASAP_GORILLA_S3_*` env-var family. `HttpServer::new` already
+    // registers the `SimpleEngine` for the warm tier; we just plug in
+    // the archive engine here so any metric whose
+    // `StreamingConfig::storage_backend()` is `GorillaS3Archive`
+    // routes through the router and answers exactly from S3.
+    //
+    // When the env vars are absent (the common dev / unit-test case)
+    // we leave the router single-engine — non-`SketchWarmTier` metrics
+    // would then surface a `503 NoEngineRegistered` from the HTTP
+    // handler, which is the correct fail-loud behaviour: a deploy
+    // that pins `GorillaS3Archive` without provisioning the cold
+    // store is a configuration bug.
+    match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3Config::from_env() {
+        Ok(s3_cfg) => {
+            match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3ColdStore::with_default_backend(s3_cfg) {
+                Ok(cold_store) => {
+                    use query_engine_rust::engines::{
+                        GorillaEngineConfig, GorillaQueryEngine, QueryEngine,
+                    };
+                    let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
+                        Arc::new(cold_store),
+                        GorillaEngineConfig::default(),
+                    ));
+                    info!(
+                        "Phase-6: registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
+                    );
+                    server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
+                }
+                Err(e) => {
+                    warn!(
+                        "ASAP_GORILLA_S3_* env vars present but GorillaS3ColdStore failed to build ({e}); router will not have a cold-archive engine",
+                    );
+                }
+            }
+        }
+        Err(_) => {
+            info!(
+                "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable cold-archive routing)",
+            );
+        }
+    }
     if let Some(ingest_state) = precompute_ingest_state.as_ref() {
         server = server.with_schemas(ingest_state.schemas.clone());
     }
