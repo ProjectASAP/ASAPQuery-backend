@@ -50,9 +50,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use asap_gorilla::{GorillaDecoder, IndexFile};
+use asap_gorilla::{GorillaDecoder, IndexFile, Postings};
 
-use super::{ChunkRef, ColdStore, ColdStoreError, RawSample};
+use super::{ChunkRef, ColdStore, ColdStoreError, PostingsHits, RawSample};
 
 // ─────────────────────────────────────────────────────────────────────
 // Public config
@@ -310,6 +310,15 @@ pub use rust_s3_backend::S3ObjectStore;
 /// chunk skip the Gorilla decode pass entirely.
 type ChunkCache = Mutex<LruCache<String, Arc<Vec<RawSample>>>>;
 
+/// **mvp/v5**: LRU cache for parsed postings sidecars. Keyed by
+/// the postings-v1.json S3 key (one per `(metric, hour)`). 256
+/// entries by default → ≈ 256 MiB at 1 MiB per postings file.
+type PostingsCache = Mutex<LruCache<String, Arc<Postings>>>;
+
+/// **mvp/v5**: LRU cache for parsed `index.json` files (per
+/// `(metric, hour)`). Same capacity tier as the postings cache.
+type IndexCache = Mutex<LruCache<String, Arc<IndexFile>>>;
+
 /// `ColdStore` adapter that reads `GORILLA1`-format chunks out of
 /// an S3-compatible bucket. See module docs for layout + S3 client
 /// notes.
@@ -317,6 +326,16 @@ pub struct GorillaS3ColdStore {
     object_store: Arc<dyn ObjectStore>,
     config: GorillaS3Config,
     cache: ChunkCache,
+    /// **mvp/v5**: postings sidecar cache.
+    postings_cache: PostingsCache,
+    /// **mvp/v5**: index.json cache. Reserved for the upcoming
+    /// `Range:`-based partial-read path that fetches chunk bytes
+    /// out of compactor-merged objects — the cache is wired now to
+    /// match the backend's hot-path layout but the caller doesn't
+    /// yet route partial reads through it. The current `read_chunk`
+    /// already uses an LRU on samples, which is the dominant cost.
+    #[allow(dead_code)]
+    index_cache: IndexCache,
 }
 
 impl GorillaS3ColdStore {
@@ -326,18 +345,32 @@ impl GorillaS3ColdStore {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: GorillaS3Config) -> Self {
         let cap = NonZeroUsize::new(config.cache_capacity.max(1))
             .unwrap_or(NonZeroUsize::new(1).unwrap());
+        // mvp/v5: postings + index caches scale with the chunk
+        // cache (one entry per hour-bucket, mirrors typical query
+        // cardinality).
+        let pc_cap = NonZeroUsize::new(cap.get().max(64))
+            .unwrap_or(NonZeroUsize::new(64).unwrap());
         Self {
             object_store,
             config,
             cache: Mutex::new(LruCache::new(cap)),
+            postings_cache: Mutex::new(LruCache::new(pc_cap)),
+            index_cache: Mutex::new(LruCache::new(pc_cap)),
         }
     }
 
     /// Build from a [`GorillaS3Config`] using the default
     /// `rust-s3`-backed [`ObjectStore`].
+    ///
+    /// **mvp/v5**: the underlying `S3ObjectStore` is wrapped in an
+    /// [`super::S3CostTrackingObjectStore`] tied to the global
+    /// counter set, so the HTTP server's `/internal/s3_cost.csv`
+    /// + `/metrics` endpoints report measured PUT/GET/etc counts.
     pub fn with_default_backend(config: GorillaS3Config) -> Result<Self, ColdStoreError> {
-        let backend = Arc::new(S3ObjectStore::new(&config)?);
-        Ok(Self::new(backend, config))
+        let backend: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(&config)?);
+        let counters = super::s3_cost_tracker::global_s3_cost_counters();
+        let tracked = super::S3CostTrackingObjectStore::new(backend, counters);
+        Ok(Self::new(Arc::new(tracked), config))
     }
 
     /// Borrow the active config — useful for diagnostics.
@@ -348,6 +381,22 @@ impl GorillaS3ColdStore {
     /// Render the configured `prefix_template` for one
     /// `(metric, hour)` bucket and append `index.json`.
     fn index_key(&self, metric: &str, ts_ms: i64) -> String {
+        let mut key = self.bucket_prefix(metric, ts_ms);
+        key.push_str("index.json");
+        key
+    }
+
+    /// **mvp/v5**: derive the postings-v1.json key for the same
+    /// `(metric, hour)` bucket as [`Self::index_key`].
+    fn postings_key(&self, metric: &str, ts_ms: i64) -> String {
+        let mut key = self.bucket_prefix(metric, ts_ms);
+        key.push_str("postings-v1.json");
+        key
+    }
+
+    /// Shared prefix-rendering helper used by [`Self::index_key`] /
+    /// [`Self::postings_key`]. Always ends with `/`.
+    fn bucket_prefix(&self, metric: &str, ts_ms: i64) -> String {
         let dt: DateTime<Utc> = DateTime::<Utc>::from_timestamp_millis(ts_ms)
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
         let prefix = self
@@ -363,7 +412,6 @@ impl GorillaS3ColdStore {
         if !key.ends_with('/') {
             key.push('/');
         }
-        key.push_str("index.json");
         key
     }
 
@@ -485,6 +533,102 @@ impl ColdStore for GorillaS3ColdStore {
             guard.put(chunk.key.clone(), arc);
         }
         Ok(samples)
+    }
+
+    /// **mvp/v5**: postings-aware chunk pruning.
+    ///
+    /// Walks the per-hour buckets covering `[start_ms, end_ms)`,
+    /// fetches each `postings-v1.json` (LRU-cached), and intersects
+    /// the per-matcher series-id lists across every bucket.
+    /// Missing-postings buckets are noted (caller-visible quirk).
+    ///
+    /// Empty `matchers` ⇒ returns the union of all postings'
+    /// series_ids in range — this is the "no predicate"
+    /// short-circuit and the engine usually skips calling us in
+    /// that case.
+    async fn list_postings_for(
+        &self,
+        metric: &str,
+        start_ms: i64,
+        end_ms: i64,
+        matchers: &[(String, String)],
+    ) -> Result<PostingsHits, ColdStoreError> {
+        let buckets = Self::hour_starts(start_ms, end_ms);
+        let mut hits = PostingsHits {
+            series_ids: Vec::new(),
+            buckets_in_range: buckets.len(),
+            buckets_with_postings: 0,
+        };
+        // Per-bucket: load postings, intersect across matchers,
+        // union into the running result. Cross-bucket join is a
+        // UNION (a series might exist in one hour but not the
+        // next); intra-bucket intersection across matchers is an
+        // AND.
+        let mut union_set: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
+        for hour_ms in buckets {
+            let key = self.postings_key(metric, hour_ms);
+            // LRU short-circuit.
+            let postings = {
+                let mut guard = self.postings_cache.lock().await;
+                guard.get(&key).cloned()
+            };
+            let postings = match postings {
+                Some(p) => Some(p),
+                None => match self.object_store.get_object(&key).await {
+                    Ok(bytes) => match Postings::read(bytes.as_slice()) {
+                        Ok(p) => {
+                            let arc = Arc::new(p);
+                            let mut guard = self.postings_cache.lock().await;
+                            guard.put(key.clone(), arc.clone());
+                            Some(arc)
+                        }
+                        Err(e) => {
+                            // Treat a corrupt postings file as
+                            // "missing" — the engine then falls
+                            // through to the scan-all path with
+                            // the postings_missing quirk.
+                            debug!(key = %key, error = %e, "gorilla-s3: postings parse failed; treating as missing");
+                            None
+                        }
+                    },
+                    Err(e) if self.object_store.object_missing(&e) => {
+                        debug!(key = %key, "gorilla-s3: postings missing for hour bucket");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+            };
+            let Some(postings) = postings else { continue };
+            hits.buckets_with_postings += 1;
+
+            // Intersect across matchers within this bucket.
+            let bucket_set: std::collections::BTreeSet<u64> = if matchers.is_empty() {
+                // Union of every series_id across every label.
+                let mut set = std::collections::BTreeSet::new();
+                for by_value in postings.by_label.values() {
+                    for ids in by_value.values() {
+                        set.extend(ids.iter().copied());
+                    }
+                }
+                set
+            } else {
+                let first =
+                    postings.lookup(&matchers[0].0, &matchers[0].1);
+                let mut acc: std::collections::BTreeSet<u64> =
+                    first.iter().copied().collect();
+                for (label_name, label_value) in &matchers[1..] {
+                    let next = postings.lookup(label_name, label_value);
+                    let next_set: std::collections::BTreeSet<u64> =
+                        next.iter().copied().collect();
+                    acc = acc.intersection(&next_set).copied().collect();
+                }
+                acc
+            };
+            union_set.extend(bucket_set);
+        }
+        hits.series_ids = union_set.into_iter().collect();
+        Ok(hits)
     }
 }
 
@@ -666,6 +810,9 @@ mod tests {
                 sample_count: 10,
                 label_hash: 0xAAAA,
                 size_bytes: 100,
+            object_key: None,
+            byte_offset: None,
+            byte_length: None,
             },
             IndexEntry {
                 key: key_b.clone(),
@@ -673,6 +820,9 @@ mod tests {
                 sample_count: 11,
                 label_hash: 0xBBBB,
                 size_bytes: 110,
+            object_key: None,
+            byte_offset: None,
+            byte_length: None,
             },
             IndexEntry {
                 key: key_c.clone(),
@@ -680,6 +830,9 @@ mod tests {
                 sample_count: 12,
                 label_hash: 0xCCCC,
                 size_bytes: 120,
+            object_key: None,
+            byte_offset: None,
+            byte_length: None,
             },
         ];
 
@@ -731,6 +884,9 @@ mod tests {
                     sample_count: 3,
                     label_hash: 0x1234,
                     size_bytes: block.len() as u32,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
                 }]),
             )
             .await;
@@ -772,6 +928,9 @@ mod tests {
                     sample_count: 2,
                     label_hash: 0,
                     size_bytes: block.len() as u32,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
                 }]),
             )
             .await;
@@ -818,6 +977,9 @@ mod tests {
                 sample_count: 2,
                 label_hash: i as u64,
                 size_bytes: block.len() as u32,
+            object_key: None,
+            byte_offset: None,
+            byte_length: None,
             });
             chunk_refs.push(ChunkRef {
                 key,
@@ -923,6 +1085,9 @@ mod tests {
                     sample_count: 2,
                     label_hash: 0,
                     size_bytes: block.len() as u32,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
                 }]),
             )
             .await;
@@ -954,6 +1119,9 @@ mod tests {
                     sample_count: 1,
                     label_hash: 0,
                     size_bytes: 50,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
                 }]),
             )
             .await;
@@ -969,6 +1137,9 @@ mod tests {
                     sample_count: 1,
                     label_hash: 0,
                     size_bytes: 50,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
                 }]),
             )
             .await;

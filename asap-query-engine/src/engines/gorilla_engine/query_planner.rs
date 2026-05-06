@@ -64,6 +64,23 @@ impl QueryStatistic {
     }
 }
 
+/// One label-equality matcher extracted from the PromQL AST. mvp/v5
+/// uses these to drive the postings-aware chunk-pruning path.
+///
+/// The MVP only supports exact equality (`label = "value"`). Regex
+/// (`=~`) and inequality (`!=`, `!~`) matchers fall through to a
+/// post-decode filter — the postings file holds *exact* values per
+/// label, not patterns. The fall-through is correct (just slower)
+/// and is signalled to callers via
+/// [`QueryPlan::has_unsupported_matchers`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabelMatcher {
+    /// Label name, e.g. `"service"`.
+    pub name: String,
+    /// Label value, e.g. `"api"`.
+    pub value: String,
+}
+
 /// Output of [`plan_query`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPlan {
@@ -73,6 +90,19 @@ pub struct QueryPlan {
     /// `[range]` duration.
     pub time_range_ms: (i64, i64),
     pub statistic: QueryStatistic,
+    /// **mvp/v5**: exact-equality label matchers extracted from the
+    /// vector selector. Empty for `metric[range]` (no predicate).
+    /// Non-empty for `metric{label="value"}[range]`. Used by the
+    /// postings-aware chunk filter; `=~` / `!=` / `!~` matchers are
+    /// dropped from this list and signalled via
+    /// [`Self::has_unsupported_matchers`].
+    pub label_matchers: Vec<LabelMatcher>,
+    /// **mvp/v5**: `true` iff the original PromQL had at least one
+    /// matcher we couldn't translate into a postings lookup (regex,
+    /// inequality). The caller must still apply those matchers
+    /// post-decode; we surface the flag so `data_source_quirk`
+    /// annotations make it back to the client.
+    pub has_unsupported_matchers: bool,
 }
 
 /// Parse `query` and produce a [`QueryPlan`]. `now` defaults to
@@ -128,10 +158,13 @@ fn plan_from_call(call: &Call, now_ms: i64) -> Result<QueryPlan, String> {
                 "increase" => QueryStatistic::Increase,
                 _ => unreachable!(),
             };
+            let (label_matchers, has_unsupported) = extract_label_matchers(&ms.vs);
             Ok(QueryPlan {
                 metric,
                 time_range_ms: (now_ms - range_ms, now_ms),
                 statistic: stat,
+                label_matchers,
+                has_unsupported_matchers: has_unsupported,
             })
         }
         "quantile_over_time" => {
@@ -145,10 +178,13 @@ fn plan_from_call(call: &Call, now_ms: i64) -> Result<QueryPlan, String> {
             let phi = expect_number(&call.args.args[0], "quantile_over_time φ")?;
             let ms = expect_matrix_selector(&call.args.args[1], "quantile_over_time")?;
             let (metric, range_ms) = matrix_metric_and_range_ms(ms);
+            let (label_matchers, has_unsupported) = extract_label_matchers(&ms.vs);
             Ok(QueryPlan {
                 metric,
                 time_range_ms: (now_ms - range_ms, now_ms),
                 statistic: QueryStatistic::QuantileOverTime { phi },
+                label_matchers,
+                has_unsupported_matchers: has_unsupported,
             })
         }
         other => Err(format!(
@@ -187,10 +223,13 @@ fn plan_from_aggregate(agg: &AggregateExpr, now_ms: i64) -> Result<QueryPlan, St
     let inner_plan = match &*agg.expr {
         Expr::MatrixSelector(ms) => {
             let (metric, range_ms) = matrix_metric_and_range_ms(ms);
+            let (label_matchers, has_unsupported) = extract_label_matchers(&ms.vs);
             QueryPlan {
                 metric,
                 time_range_ms: (now_ms - range_ms, now_ms),
                 statistic: QueryStatistic::SumOverTime, // overlay below
+                label_matchers,
+                has_unsupported_matchers: has_unsupported,
             }
         }
         _ => plan_from_ast(&agg.expr, now_ms)?,
@@ -199,6 +238,8 @@ fn plan_from_aggregate(agg: &AggregateExpr, now_ms: i64) -> Result<QueryPlan, St
         metric: inner_plan.metric,
         time_range_ms: inner_plan.time_range_ms,
         statistic: QueryStatistic::TopK { k: k as usize },
+        label_matchers: inner_plan.label_matchers,
+        has_unsupported_matchers: inner_plan.has_unsupported_matchers,
     })
 }
 
@@ -254,6 +295,45 @@ fn vector_selector_metric(vs: &VectorSelector) -> String {
         }
     }
     String::new()
+}
+
+/// **mvp/v5**: extract exact-equality label matchers from a vector
+/// selector for postings-aware chunk pruning.
+///
+/// Returns `(supported_matchers, has_unsupported_matchers)`. Supported
+/// matchers are the `label = "value"` tuples the postings file can
+/// answer directly. Anything else (regex, inequality, the implicit
+/// `__name__` matcher) is excluded from `supported_matchers` and
+/// flips the second return value to `true` — the executor still
+/// applies them post-decode for correctness.
+pub(crate) fn extract_label_matchers(vs: &VectorSelector) -> (Vec<LabelMatcher>, bool) {
+    use promql_parser::label::MatchOp;
+
+    let mut supported = Vec::new();
+    let mut has_unsupported = false;
+    for m in vs.matchers.matchers.iter() {
+        // The implicit `__name__` matcher is the metric name itself
+        // — we already pulled that out of the selector elsewhere.
+        if m.name == "__name__" {
+            continue;
+        }
+        match &m.op {
+            MatchOp::Equal => {
+                supported.push(LabelMatcher {
+                    name: m.name.clone(),
+                    value: m.value.clone(),
+                });
+            }
+            // Regex / inequality matchers are correctness-relevant
+            // but cannot be answered by an exact postings lookup.
+            // Surface the flag so the caller emits a quirk
+            // annotation; the actual filter is applied post-decode.
+            MatchOp::NotEqual | MatchOp::Re(_) | MatchOp::NotRe(_) => {
+                has_unsupported = true;
+            }
+        }
+    }
+    (supported, has_unsupported)
 }
 
 #[cfg(test)]

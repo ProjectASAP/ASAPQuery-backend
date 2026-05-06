@@ -36,10 +36,14 @@ use thiserror::Error;
 pub mod format;
 pub mod gorilla_s3;
 pub mod local_fs;
+pub mod s3_cost_tracker;
 
 pub use format::{part_path_prefix, RawSample};
 pub use gorilla_s3::{GorillaS3ColdStore, GorillaS3Config, GorillaS3ConfigError};
 pub use local_fs::LocalFsColdStore;
+pub use s3_cost_tracker::{
+    global_s3_cost_counters, S3CostCounters, S3CostSnapshot, S3CostTrackingObjectStore,
+};
 
 /// Error surface for cold-store scans.
 #[derive(Debug, Error)]
@@ -93,6 +97,39 @@ pub struct ChunkRef {
     pub sample_count: u32,
     /// On-wire size of the chunk object in bytes.
     pub size_bytes: u32,
+}
+
+/// **mvp/v5**: postings result returned by [`ColdStore::list_postings_for`].
+///
+/// `series_ids` is the union of `series_id` lists across all hour
+/// buckets in the requested time range, deduped and sorted ascending.
+/// `postings_present_buckets` counts how many hour buckets actually
+/// had a postings sidecar — used by the engine to decide whether to
+/// emit a `data_source_quirk: postings_missing` annotation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PostingsHits {
+    /// Series ids matching all label predicates, sorted ascending,
+    /// deduplicated.
+    pub series_ids: Vec<u64>,
+    /// Hour buckets in the request window.
+    pub buckets_in_range: usize,
+    /// Buckets that actually had a `postings-v1.json` sidecar.
+    pub buckets_with_postings: usize,
+}
+
+impl PostingsHits {
+    /// `true` iff at least one hour bucket carried postings —
+    /// indicates the postings-aware filter ran on real data and the
+    /// caller should trust [`Self::series_ids`] as a complete answer.
+    pub fn fully_covered(&self) -> bool {
+        self.buckets_in_range > 0 && self.buckets_with_postings == self.buckets_in_range
+    }
+
+    /// `true` iff postings were present for every bucket AND at
+    /// least one matched series.
+    pub fn nonempty_and_complete(&self) -> bool {
+        self.fully_covered() && !self.series_ids.is_empty()
+    }
 }
 
 /// Read-only view over a cold raw-sample store.
@@ -156,6 +193,27 @@ pub trait ColdStore: Send + Sync {
         _chunk: &ChunkRef,
     ) -> Result<Vec<RawSample>, ColdStoreError> {
         Err(ColdStoreError::Unsupported("read_chunk"))
+    }
+
+    /// **mvp/v5**: load + intersect per-bucket postings under
+    /// `(metric, time_range)` for the supplied `(label_name,
+    /// label_value)` matchers. The result's `series_ids` is the
+    /// intersection across all matchers — i.e. only series_ids
+    /// that match every predicate. With zero matchers this returns
+    /// the union of every series_id in range (rare; the engine
+    /// short-circuits the postings-aware path before calling).
+    ///
+    /// Default impl returns [`ColdStoreError::Unsupported`] so
+    /// JSONL-only stores keep compiling. The Gorilla-S3 cold
+    /// store overrides.
+    async fn list_postings_for(
+        &self,
+        _metric: &str,
+        _start_ms: i64,
+        _end_ms: i64,
+        _matchers: &[(String, String)],
+    ) -> Result<PostingsHits, ColdStoreError> {
+        Err(ColdStoreError::Unsupported("list_postings_for"))
     }
 }
 

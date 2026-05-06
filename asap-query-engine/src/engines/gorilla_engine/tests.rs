@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use crate::drivers::query::fallback::cold_store::{
-    ChunkRef, ColdStore, ColdStoreError, RawSample,
+    ChunkRef, ColdStore, ColdStoreError, PostingsHits, RawSample,
 };
 use crate::engines::query_result::QueryResult;
 use crate::stores::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
@@ -39,6 +39,11 @@ struct MockColdStore {
     /// If set, every `read_chunk` call sleeps for this duration —
     /// used by the timeout test.
     read_delay: Option<Duration>,
+    /// **mvp/v5**: optional postings table keyed by `(label_name,
+    /// label_value)`. When `Some`, [`ColdStore::list_postings_for`]
+    /// answers from this table; when `None`, returns a "missing
+    /// postings" outcome (driving the fall-back path test).
+    postings: Option<BTreeMap<(String, String), Vec<u64>>>,
 }
 
 impl MockColdStore {
@@ -46,11 +51,22 @@ impl MockColdStore {
         Self {
             chunks,
             read_delay: None,
+            postings: None,
         }
     }
 
     fn with_read_delay(mut self, d: Duration) -> Self {
         self.read_delay = Some(d);
+        self
+    }
+
+    /// mvp/v5: install a postings table for the
+    /// `list_postings_for` path.
+    fn with_postings(
+        mut self,
+        postings: BTreeMap<(String, String), Vec<u64>>,
+    ) -> Self {
+        self.postings = Some(postings);
         self
     }
 }
@@ -106,6 +122,49 @@ impl ColdStore for MockColdStore {
             "mock: no such chunk {}",
             chunk.key
         )))
+    }
+
+    async fn list_postings_for(
+        &self,
+        _metric: &str,
+        _start_ms: i64,
+        _end_ms: i64,
+        matchers: &[(String, String)],
+    ) -> Result<PostingsHits, ColdStoreError> {
+        let Some(table) = &self.postings else {
+            // Mirror "real" missing-postings behaviour: the trait
+            // says return Unsupported when the backend doesn't
+            // know how to compute this. The executor treats that
+            // as fall-through.
+            return Err(ColdStoreError::Unsupported("list_postings_for"));
+        };
+        let mut hits = PostingsHits {
+            series_ids: Vec::new(),
+            buckets_in_range: 1,
+            buckets_with_postings: 1,
+        };
+        if matchers.is_empty() {
+            // Union of every series id in the table.
+            let mut set: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
+            for ids in table.values() {
+                set.extend(ids.iter().copied());
+            }
+            hits.series_ids = set.into_iter().collect();
+            return Ok(hits);
+        }
+        let first = table
+            .get(&matchers[0])
+            .cloned()
+            .unwrap_or_default();
+        let mut acc: std::collections::BTreeSet<u64> = first.into_iter().collect();
+        for m in &matchers[1..] {
+            let next = table.get(m).cloned().unwrap_or_default();
+            let next_set: std::collections::BTreeSet<u64> = next.into_iter().collect();
+            acc = acc.intersection(&next_set).copied().collect();
+        }
+        hits.series_ids = acc.into_iter().collect();
+        Ok(hits)
     }
 }
 
@@ -553,6 +612,9 @@ async fn result_includes_data_source_gorilla_archive() {
         value: 42.0,
         samples_scanned: 7,
         chunks_fetched: 2,
+        chunks_skipped_via_postings: 0,
+        postings_filtered_series_count: 0,
+        postings_missing: false,
     };
     let infos = outcome.info_lines();
     assert!(
@@ -613,3 +675,114 @@ async fn engine_respects_config_timeout() {
         other => panic!("expected Timeout, got {other:?}"),
     }
 }
+
+
+// ─────────────────────────────────────────────────────────────────────
+// mvp/v5 — postings-aware path tests
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build a chunk with explicit `label_hash` so the postings-aware
+/// path can prune via `series_id == label_hash`.
+fn labeled_chunk(
+    key: &str,
+    label_hash: u64,
+    label_value: &str,
+    start_ms: i64,
+    samples: &[(i64, f64)],
+) -> (ChunkRef, Vec<RawSample>) {
+    let last_ts = samples.last().map(|(t, _)| *t).unwrap_or(start_ms);
+    let chunk = ChunkRef {
+        key: key.to_string(),
+        metric: METRIC.to_string(),
+        time_range_ms: (start_ms, last_ts + 1),
+        label_hash,
+        sample_count: samples.len() as u32,
+        size_bytes: 0,
+    };
+    let mut labels = BTreeMap::new();
+    labels.insert("zone".to_string(), label_value.to_string());
+    let raw_samples: Vec<RawSample> = samples
+        .iter()
+        .map(|(t, v)| RawSample {
+            ts_ms: *t,
+            labels: labels.clone(),
+            value: *v,
+        })
+        .collect();
+    (chunk, raw_samples)
+}
+
+#[tokio::test]
+async fn postings_aware_path_prunes_chunks() {
+    // Two chunks: one for zone=a (label_hash=11), one for zone=b
+    // (label_hash=22). Postings says zone=a → [11]. The engine
+    // must read only the zone=a chunk.
+    let (chunk_a, samples_a) =
+        labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0), (NOW_MS - 500, 5.0)]);
+    let (chunk_b, samples_b) =
+        labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0), (NOW_MS - 500, 99.0)]);
+    let mut postings: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
+    postings.insert(("zone".to_string(), "a".to_string()), vec![11]);
+    postings.insert(("zone".to_string(), "b".to_string()), vec![22]);
+    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)])
+        .with_postings(postings);
+    let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
+    let plan =
+        plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
+    assert_eq!(plan.label_matchers.len(), 1);
+    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let outcome = exec.execute_plan(&plan).await.unwrap();
+    // Only zone=a chunk contributed: 5.0 + 5.0 = 10.0 (NOT 5+5+99+99=208).
+    assert_eq!(outcome.value, 10.0);
+    assert_eq!(outcome.chunks_fetched, 1);
+    assert_eq!(outcome.chunks_skipped_via_postings, 1);
+    assert_eq!(outcome.postings_filtered_series_count, 1);
+    assert!(!outcome.postings_missing);
+}
+
+#[tokio::test]
+async fn postings_missing_falls_back_to_scan_all() {
+    // Same chunks, NO postings table → the executor falls through
+    // to the scan-all path and uses the post-decode label filter
+    // for correctness. The `postings_missing` flag must be set.
+    let (chunk_a, samples_a) =
+        labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0)]);
+    let (chunk_b, samples_b) =
+        labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0)]);
+    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
+    let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
+    let plan =
+        plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
+    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let outcome = exec.execute_plan(&plan).await.unwrap();
+    // Correctness: only zone=a sample (5.0) folded in. The
+    // post-decode filter does the work.
+    assert_eq!(outcome.value, 5.0);
+    // Both chunks were fetched — postings filter no-oped.
+    assert_eq!(outcome.chunks_fetched, 2);
+    assert_eq!(outcome.chunks_skipped_via_postings, 0);
+    assert!(outcome.postings_missing, "missing-postings flag must be set");
+    let infos = outcome.info_lines();
+    assert!(infos.iter().any(|i| i == "data_source_quirk: postings_missing"));
+}
+
+#[tokio::test]
+async fn postings_path_no_label_predicate_skips_postings_lookup() {
+    // No label predicate → postings filter is a no-op; the
+    // postings table is never consulted. Total = 5+99 = 104.
+    let (chunk_a, samples_a) =
+        labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0)]);
+    let (chunk_b, samples_b) =
+        labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0)]);
+    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
+    let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
+    let plan = plan_query_at(&format!("sum_over_time({METRIC}[5m])"), NOW_MS).unwrap();
+    assert!(plan.label_matchers.is_empty());
+    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let outcome = exec.execute_plan(&plan).await.unwrap();
+    assert_eq!(outcome.value, 104.0);
+    assert_eq!(outcome.chunks_fetched, 2);
+    assert!(!outcome.postings_missing);
+    assert_eq!(outcome.chunks_skipped_via_postings, 0);
+}
+
