@@ -46,6 +46,7 @@ pub mod engine;
 pub mod postings;
 pub mod s3_cost;
 pub mod store;
+pub mod thanos_forward;
 
 #[cfg(test)]
 mod tests;
@@ -71,6 +72,11 @@ pub use s3_cost::{
 pub use store::{
     ChunkRef, GorillaS3Config, GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample,
     S3ObjectStore, Store, StoreError,
+};
+pub use thanos_forward::{
+    engine_from_env as thanos_engine_from_env, ThanosForwardConfig, ThanosForwardEngine,
+    ThanosForwardError, ASAP_THANOS_QUERY_URL_ENV, DATA_SOURCE_THANOS_ARCHIVE_ID,
+    DATA_SOURCE_THANOS_ARCHIVE_INFO, DEFAULT_THANOS_QUERY_URL, QUIRK_THANOS_UNREACHABLE,
 };
 
 /// Marker line that every `GorillaQueryEngine` answer carries on
