@@ -396,18 +396,53 @@ impl GorillaS3ColdStore {
 
     /// Shared prefix-rendering helper used by [`Self::index_key`] /
     /// [`Self::postings_key`]. Always ends with `/`.
+    ///
+    /// Accepts BOTH placeholder vocabularies:
+    ///
+    /// * `{year}`/`{month}`/`{day}`/`{hour}` — the backend's
+    ///   long-standing names.
+    /// * `{YYYY}`/`{MM}`/`{DD}`/`{HH}` — the agent
+    ///   `gorillas3processor`'s naming, documented in
+    ///   `opentelemetry-collector-contrib-patch/processor/
+    ///   gorillas3processor/config.go`.
+    ///
+    /// Pre-v7 the two sides used different placeholders, so when a
+    /// deploy set `ASAP_GORILLA_S3_PREFIX_TEMPLATE` to the
+    /// agent-side spelling (the v6 demo does — see
+    /// `deploy/docker-compose/mvp-v6-multi-stage.yml`), the backend
+    /// substituted `{tenant}` and `{metric}` but left the
+    /// timestamp placeholders un-replaced, so every `index.json`
+    /// fetch issued a literal `{YYYY}/{MM}/{DD}/{HH}` path that
+    /// missed the actual chunk objects on disk. Issue #46
+    /// criterion ⑥ (freshness probes) surfaced as 0 samples on
+    /// every path because of this. Accepting both spellings keeps
+    /// pre-v7 deploys working AND the v6/v7 demo deploy aligned.
     fn bucket_prefix(&self, metric: &str, ts_ms: i64) -> String {
         let dt: DateTime<Utc> = DateTime::<Utc>::from_timestamp_millis(ts_ms)
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let year = format!("{:04}", dt.year());
+        let month = format!("{:02}", dt.month());
+        let day = format!("{:02}", dt.day());
+        let hour = format!("{:02}", dt.hour());
         let prefix = self
             .config
             .prefix_template
             .replace("{tenant}", &self.config.tenant)
             .replace("{metric}", metric)
-            .replace("{year}", &format!("{:04}", dt.year()))
-            .replace("{month}", &format!("{:02}", dt.month()))
-            .replace("{day}", &format!("{:02}", dt.day()))
-            .replace("{hour}", &format!("{:02}", dt.hour()));
+            // Long-form placeholders (the backend's historical
+            // spelling — preserved for backwards compatibility).
+            .replace("{year}", &year)
+            .replace("{month}", &month)
+            .replace("{day}", &day)
+            .replace("{hour}", &hour)
+            // Agent-side `{YYYY}`/`{MM}`/`{DD}`/`{HH}` aliases —
+            // matches the spelling in the agent's
+            // `gorillas3processor/config.go` and
+            // `s3_sink.go::renderPrefix`.
+            .replace("{YYYY}", &year)
+            .replace("{MM}", &month)
+            .replace("{DD}", &day)
+            .replace("{HH}", &hour);
         let mut key = prefix;
         if !key.ends_with('/') {
             key.push('/');
@@ -1151,6 +1186,48 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].key, key12);
         assert_eq!(chunks[1].key, key13);
+    }
+
+    #[test]
+    fn bucket_prefix_supports_long_form_placeholders() {
+        // Backend's historical spelling — preserved.
+        let mut config = cfg();
+        config.prefix_template = "{tenant}/{metric}/{year}/{month}/{day}/{hour}/".to_string();
+        let store = InMemoryObjectStore::new();
+        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let key = cs.bucket_prefix("foo", ms(2026, 5, 6, 12, 0, 0));
+        assert_eq!(key, "tenant1/foo/2026/05/06/12/");
+    }
+
+    #[test]
+    fn bucket_prefix_supports_agent_side_yyyy_mm_dd_hh_placeholders() {
+        // v7 fix: the agent's gorillas3processor uses
+        // `{YYYY}`/`{MM}`/`{DD}`/`{HH}`. Pre-v7 the backend left
+        // these literal; v7 substitutes them so a deploy that
+        // configures the routing yaml with the agent-side
+        // spelling gets matching index.json keys on both sides.
+        let mut config = cfg();
+        config.prefix_template = "{tenant}/{metric}/{YYYY}/{MM}/{DD}/{HH}/".to_string();
+        let store = InMemoryObjectStore::new();
+        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let key = cs.bucket_prefix("http_freshness_probe_archive", ms(2026, 5, 7, 4, 0, 0));
+        assert_eq!(
+            key,
+            "tenant1/http_freshness_probe_archive/2026/05/07/04/",
+            "v7 must substitute {{YYYY}}/{{MM}}/{{DD}}/{{HH}} the same as the long-form names",
+        );
+    }
+
+    #[test]
+    fn bucket_prefix_handles_mixed_long_and_short_placeholders() {
+        // Defensive — accept a mix in case some operator templates
+        // it that way.
+        let mut config = cfg();
+        config.prefix_template = "{tenant}/{metric}/{year}/{MM}/{DD}/{hour}/".to_string();
+        let store = InMemoryObjectStore::new();
+        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let key = cs.bucket_prefix("m", ms(2026, 5, 7, 4, 0, 0));
+        assert_eq!(key, "tenant1/m/2026/05/07/04/");
     }
 
     #[test]
