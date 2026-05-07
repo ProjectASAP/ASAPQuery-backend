@@ -16,7 +16,15 @@ Then it adds ASAPQuery's components on top:
 - **Query Engine** - Prometheus-compatible API with sketch-based acceleration
 - **[Arroyo](https://github.com/ProjectASAP/arroyo) + asap-summary-ingest** - Streaming engine with pipelines configured for building sketches
 - **Kafka** - Message broker for streaming data from Arroyo to the Query Engine
-- **asap-planner-rs** - Automatically configures sketches from PromQL queries
+- **Plan emitter (init container)** - Automatically configures sketches from PromQL queries.
+  Today the demo uses the published `ghcr.io/projectasap/asap-planner-rs:v0.2.0` image
+  to emit `streaming_config.yaml` + `inference_config.yaml` into a shared volume
+  consumed by the Query Engine and asap-summary-ingest. The `asap-planner-rs` source
+  has been deleted from this repo (Phase γ); the planner now lives in
+  [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller).
+  The Phase δ rewrite of this quickstart will replace the init container with a
+  controller HTTP push to `POST /api/v1/streaming-config` /
+  `POST /api/v1/storage_routing` on the Query Engine.
 
 Once you run the quickstart, you will see a pre-configured Grafana dashboard that compares Prometheues and ASAPQuery side-by-side. You will see **visually indistinguishable** results from Prometheus and ASAPQuery, with ASAPQuery being 100x faster
 
@@ -88,9 +96,11 @@ Run `python3 set_data_cardinality.py <M> <N>` where `M` is the number of labels 
 
 To modify the queries in the Grafana dashboard and run ASAPQuery against those:
 
-#### 1. Edit the asap-planner-rs Config
+#### 1. Edit the Plan Emitter Config
 
-Edit `config/controller-config.yaml`:
+Edit `config/controller-config.yaml` (consumed by the published
+`asap-planner-rs:v0.2.0` init container — see the component list above
+for context on the post-Phase-γ migration):
 
 ```yaml
 query_groups:

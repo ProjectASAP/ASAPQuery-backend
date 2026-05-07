@@ -30,16 +30,12 @@ metrics:
 
 ### 3. Run the planner
 
-```bash
-asap-planner \
-  --query-log /var/log/prometheus/query.log \
-  --metrics-config metrics.yaml \
-  --output_dir ./configs \
-  --prometheus_scrape_interval 15 \
-  --streaming_engine arroyo
-```
-
-This writes `streaming_config.yaml` and `inference_config.yaml` to `./configs/`.
+The standalone `asap-planner` CLI was removed in Phase γ; the planner
+now lives inside the [ASAPCollector controller](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller).
+Drive it via the controller's CLI / HTTP surface (see the controller
+README for the equivalent invocation). The controller writes
+`streaming_config.yaml` + `inference_config.yaml` and pushes the
+resulting `BackendStorageRouting` to the backend over HTTP.
 
 ## Notes
 

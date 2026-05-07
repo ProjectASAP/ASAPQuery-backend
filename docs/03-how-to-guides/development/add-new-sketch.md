@@ -75,9 +75,9 @@ pub use your_sketch_accumulator::*;
 
 ---
 
-## Step 4: asap-planner-rs - Sketch Parameters (Optional)
+## Step 4: Planner - Sketch Parameters (Optional)
 
-**Usually**: asap-planner-rs picks up sketch automatically from asap-common mapping. Custom sketch parameters (size, epsilon, etc.) can be added in the Rust source under `asap-planner-rs/src/`.
+**Usually**: the planner picks up the sketch automatically from the asap-common mapping. Custom sketch parameters (size, epsilon, etc.) can be added in the Rust source under [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller). The legacy `asap-planner-rs/src/` location was deleted in Phase γ.
 
 ---
 
@@ -86,7 +86,7 @@ pub use your_sketch_accumulator::*;
 - [ ] `validate_udfs.py` passes (ArroyoSketch)
 - [ ] `cargo build --release` succeeds (asap-query-engine)
 - [ ] `cargo test` passes (asap-query-engine)
-- [ ] End-to-end: asap-planner-rs → asap-summary-ingest → Arroyo → Kafka → QueryEngine → Query result
+- [ ] End-to-end: ASAPCollector controller (planner) → asap-summary-ingest → Arroyo → Kafka → QueryEngine → Query result
 
 ---
 

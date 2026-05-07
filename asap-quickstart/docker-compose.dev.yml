@@ -9,10 +9,10 @@ name: asapquery-quickstart
 # External users who just want the quickstart should use docker-compose.yml directly.
 
 services:
-  asap-planner-rs:
-    build:
-      context: ..
-      dockerfile: asap-planner-rs/Dockerfile
+  # asap-planner-rs source was deleted in Phase γ — the dev override
+  # falls back to the published `ghcr.io/projectasap/asap-planner-rs:v0.2.0`
+  # image referenced by docker-compose.yml. Phase δ replaces this init
+  # container with a controller HTTP push entirely.
 
   asap-summary-ingest:
     build:
