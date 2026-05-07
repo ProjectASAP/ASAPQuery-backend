@@ -373,6 +373,79 @@ async fn execute_max_over_time() {
 }
 
 #[tokio::test]
+async fn execute_last_over_time_v7() {
+    // v7 / issue #46 ⑥: `last_over_time(<metric>[<range>])` returns
+    // the value of the largest-timestamp sample in the window.
+    // Counter-shaped freshness probes encode `unix_ts_ms` in their
+    // value; the replay client subtracts (poll_ts - observed_value)
+    // to get a per-path freshness delta.
+    //
+    // Three samples spanning 0..2s with monotonically-increasing
+    // values 100, 200, 300. The last-stamp sample is at NOW-1s with
+    // value 300. `last_over_time(...[10s])` must return 300.
+    let samples = vec![
+        raw(NOW_MS - 3_000, 100.0),
+        raw(NOW_MS - 2_000, 200.0),
+        raw(NOW_MS - 1_000, 300.0),
+    ];
+    let chunk = ChunkRef {
+        key: "c".into(),
+        metric: METRIC.into(),
+        time_range_ms: (NOW_MS - 3_000, NOW_MS),
+        label_hash: 0,
+        sample_count: 3,
+        size_bytes: 0,
+    };
+    let engine = engine_with(vec![(chunk, samples)]);
+    let result = engine
+        .execute_at(&format!("last_over_time({METRIC}[10s])"), NOW_MS)
+        .await
+        .unwrap();
+    if let QueryResult::Vector(iv) = result {
+        assert_eq!(
+            iv.values[0].value, 300.0,
+            "last_over_time must return the largest-timestamp sample's value",
+        );
+    } else {
+        panic!("expected Vector");
+    }
+}
+
+#[tokio::test]
+async fn execute_last_over_time_unordered_samples_picks_largest_ts() {
+    // Samples arrive with non-monotonic timestamps — the chunk
+    // claims (start, last_ts+1) but the per-sample observe() must
+    // still pick the largest ts, not the last-arrived sample.
+    let samples = vec![
+        raw(NOW_MS - 5_000, 50.0),  // largest ts is sample[2]
+        raw(NOW_MS - 8_000, 80.0),  // smallest ts but later in vec
+        raw(NOW_MS - 1_000, 1234.5), // largest ts
+        raw(NOW_MS - 3_000, 30.0),
+    ];
+    let chunk = ChunkRef {
+        key: "c".into(),
+        metric: METRIC.into(),
+        time_range_ms: (NOW_MS - 8_000, NOW_MS),
+        label_hash: 0,
+        sample_count: 4,
+        size_bytes: 0,
+    };
+    let engine = engine_with(vec![(chunk, samples)]);
+    let result = engine
+        .execute_at(&format!("last_over_time({METRIC}[10s])"), NOW_MS)
+        .await
+        .unwrap();
+    if let QueryResult::Vector(iv) = result {
+        assert!(
+            (iv.values[0].value - 1234.5).abs() < 1e-12,
+            "must return the value of the largest-ts sample, not the last-arrived",
+        );
+    } else {
+        panic!("expected Vector");
+    }
+}
+
+#[tokio::test]
 async fn execute_rate_basic() {
     // Counter goes from 100 at t=NOW-10s to 200 at t=NOW-1s.
     // rate over 10s window = (200 - 100) / 10s = 10.0

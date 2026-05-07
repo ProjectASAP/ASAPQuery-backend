@@ -459,15 +459,23 @@ async fn process_query_request(
 /// Parsing failures fall through to (2)/(3) so a malformed PromQL
 /// doesn't surface as a routing 5xx (the engines themselves will
 /// reject it with a clearer error).
+///
+/// v7: when the routing table has multi-target rows for the metric,
+/// the parsed AST is also classified via
+/// [`crate::data_model::classify_query_shape`] and the lookup picks
+/// the target whose `applies_to_query_shape` matches. v6.1
+/// single-target metrics keep their original semantics — every shape
+/// resolves to the one configured backend.
 fn resolve_metric_storage(state: &AppState, query: &str) -> StorageBackend {
     if let Some(routing) = state.backend_storage_routing.as_ref() {
         match promql_parser::parser::parse(query) {
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
-                    let backend = routing.lookup(&metric_name);
+                    let shape = crate::data_model::classify_query_shape(&expr);
+                    let backend = routing.lookup_with_shape(&metric_name, shape);
                     debug!(
-                        "resolve_metric_storage: routing-table hit for metric={} → {:?}",
-                        metric_name, backend,
+                        "resolve_metric_storage: routing-table hit for metric={} shape={:?} → {:?}",
+                        metric_name, shape, backend,
                     );
                     return backend;
                 }
@@ -2758,7 +2766,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaS3Archive,
         );
-        let routing = crate::data_model::BackendStorageRouting::new(
+        let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchWarmTier,
             metrics,
         );
@@ -2803,7 +2811,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaS3Archive,
         );
-        let routing = crate::data_model::BackendStorageRouting::new(
+        let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchWarmTier,
             metrics,
         );
@@ -2834,7 +2842,7 @@ aggregations:
         // top-level `default: gorilla_s3_archive` — every metric must
         // route through the router. Pins the §8 "all-metrics-archive"
         // deploy mode.
-        let routing = crate::data_model::BackendStorageRouting::new(
+        let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
             StorageBackend::GorillaS3Archive,
             std::collections::HashMap::new(),
         );
@@ -2859,6 +2867,127 @@ aggregations:
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_data_source(&body, "gorilla_archive");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── v7 dual-routing production-path coverage ──────────────────────────────
+    //
+    // v7 lets one metric fan out to multiple `(backend,
+    // applies_to_query_shape)` targets. The two tests below mirror
+    // `http_production_path_routes_archive_metric_via_routing_table`
+    // — same setup, but the routing table has TWO targets for
+    // `http_requests_total`: a default warm-tier slot and a
+    // cold-archive slot scoped to `[count, topk, rate_post_hoc]`.
+    // A `count(...)` query must land on the archive; a
+    // `quantile_over_time(...)` query must land on the warm tier.
+
+    #[tokio::test]
+    async fn http_v7_dual_routing_count_lands_on_archive() {
+        use crate::data_model::{
+            BackendStorageRouting, QueryShape, RoutingTarget,
+        };
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "http_requests_total".to_string(),
+            vec![
+                RoutingTarget::always(StorageBackend::SketchWarmTier),
+                RoutingTarget::for_shapes(
+                    StorageBackend::GorillaS3Archive,
+                    vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
+                ),
+            ],
+        );
+        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "count(http_requests_total{service=\"payments\"})"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "v7 dual-routing: count must dispatch and return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "v7 dual-routing: count must hit the archive engine",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_v7_dual_routing_quantile_stays_on_warm_tier() {
+        use crate::data_model::{
+            BackendStorageRouting, QueryShape, RoutingTarget,
+        };
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "http_requests_total".to_string(),
+            vec![
+                RoutingTarget::always(StorageBackend::SketchWarmTier),
+                RoutingTarget::for_shapes(
+                    StorageBackend::GorillaS3Archive,
+                    vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
+                ),
+            ],
+        );
+        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+
+        // Register a Gorilla mock so a misroute would surface as a
+        // failed assertion rather than a silent fall-through. The
+        // mock starts with 0 calls; a quantile must NOT touch it.
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                (
+                    "query",
+                    "quantile_over_time(0.99, http_requests_total[1m])",
+                ),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        // Warm tier path returns 2xx with `data_source: sketch_warm`
+        // (the SimpleEngine returns None for this unconfigured
+        // metric, but the handler still annotates the wire response
+        // with the warm-tier source).
+        assert!(
+            resp.status().is_success(),
+            "v7 dual-routing: quantile must dispatch and return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "sketch_warm");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            0,
+            "v7 dual-routing: quantile must NOT hit the archive engine",
+        );
     }
 
 }
