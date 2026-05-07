@@ -44,6 +44,13 @@ pub enum QueryStatistic {
     /// sample values in the range — once Phase 5 adds spatial
     /// grouping the executor will return a per-group vector.
     TopK { k: usize },
+    /// **v7**: `last_over_time(m[range])` — value of the
+    /// largest-timestamp sample in the range. Used by issue #46
+    /// criterion ⑥ freshness probes; counter-shaped probes encode
+    /// `unix_ts_ms_of_emission` in their cumulative value, and
+    /// `last_over_time(...)` returns that value so the replay
+    /// client can compute per-path freshness deltas.
+    LastOverTime,
 }
 
 impl QueryStatistic {
@@ -60,6 +67,7 @@ impl QueryStatistic {
                 | Self::MaxOverTime
                 | Self::Rate
                 | Self::Increase
+                | Self::LastOverTime
         )
     }
 }
@@ -144,6 +152,7 @@ fn plan_from_call(call: &Call, now_ms: i64) -> Result<QueryPlan, String> {
         | "avg_over_time"
         | "min_over_time"
         | "max_over_time"
+        | "last_over_time"
         | "rate"
         | "increase" => {
             let ms = expect_single_matrix_arg(&call.args, &name)?;
@@ -154,6 +163,7 @@ fn plan_from_call(call: &Call, now_ms: i64) -> Result<QueryPlan, String> {
                 "avg_over_time" => QueryStatistic::AvgOverTime,
                 "min_over_time" => QueryStatistic::MinOverTime,
                 "max_over_time" => QueryStatistic::MaxOverTime,
+                "last_over_time" => QueryStatistic::LastOverTime,
                 "rate" => QueryStatistic::Rate,
                 "increase" => QueryStatistic::Increase,
                 _ => unreachable!(),
@@ -381,7 +391,20 @@ mod tests {
     fn streaming_classification() {
         assert!(QueryStatistic::SumOverTime.is_streaming_additive());
         assert!(QueryStatistic::Rate.is_streaming_additive());
+        assert!(QueryStatistic::LastOverTime.is_streaming_additive());
         assert!(!QueryStatistic::QuantileOverTime { phi: 0.5 }.is_streaming_additive());
         assert!(!QueryStatistic::TopK { k: 1 }.is_streaming_additive());
+    }
+
+    #[test]
+    fn plans_last_over_time_v7() {
+        // v7: `last_over_time(...)` translates to the streaming
+        // additive path, picking the value of the largest-timestamp
+        // sample in [now-range, now). Issue #46 ⑥ freshness probes
+        // ride this path.
+        let plan = plan_query_at("last_over_time(http_freshness_probe_warm[10s])", NOW).unwrap();
+        assert_eq!(plan.metric, "http_freshness_probe_warm");
+        assert_eq!(plan.statistic, QueryStatistic::LastOverTime);
+        assert_eq!(plan.time_range_ms, (NOW - 10_000, NOW));
     }
 }

@@ -38,6 +38,12 @@ pub enum AdditiveOp {
     Increase,
     /// `(last - first) / range_seconds`.
     Rate,
+    /// **v7**: the value of the latest sample in the range. Used by
+    /// `last_over_time(<metric>[<range>])` — the freshness probe
+    /// queries from MVP v6 issue #46 criterion ⑥. The fold tracks
+    /// `(ts_ms, value)` pairs already; this op just returns `value`
+    /// of the largest-timestamp sample.
+    Last,
 }
 
 /// Per-statistic executor. Holds an `Arc<dyn ColdStore>` so the
@@ -77,6 +83,9 @@ impl ExactExecutor {
             QueryStatistic::Increase => {
                 self.execute_streaming_additive(plan, AdditiveOp::Increase)
                     .await
+            }
+            QueryStatistic::LastOverTime => {
+                self.execute_streaming_additive(plan, AdditiveOp::Last).await
             }
             QueryStatistic::QuantileOverTime { phi } => self.execute_quantile(plan, *phi).await,
             QueryStatistic::TopK { k } => self.execute_topk(plan, *k).await,
@@ -482,6 +491,18 @@ impl AdditiveAccumulator {
                     }
                 }
                 _ => f64::NAN,
+            },
+            // v7 / issue #46 ⑥: return the value of the
+            // largest-timestamp sample. Counter-shaped freshness
+            // probes (http_freshness_probe_*) encode the unix_ts_ms
+            // of the most recent emission directly in the
+            // cumulative counter value, so `last_over_time(...)`
+            // returning that value lets the replay client subtract
+            // the polled timestamp and get a per-path freshness
+            // delta.
+            AdditiveOp::Last => match self.last {
+                Some((_, lv)) => lv,
+                None => f64::NAN,
             },
         }
     }
