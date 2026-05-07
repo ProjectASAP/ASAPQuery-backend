@@ -132,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             fallback: None,
         },
     };
-    let http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
+    let http_server = HttpServer::new(http_config, query_engine, store.clone());
     tokio::spawn(async move {
         if let Err(e) = http_server.run().await {
             eprintln!("Query server error: {e}");

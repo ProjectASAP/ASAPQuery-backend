@@ -186,7 +186,7 @@ graph LR
 | **asap-query-engine** | Answers PromQL queries using sketches | Rust | `asap-query-engine/` |
 | **Arroyo** | Stream processing for building sketches | Rust (forked) | [github.com/ProjectASAP/arroyo](https://github.com/ProjectASAP/arroyo) |
 | **asap-summary-ingest** | Configures Arroyo pipelines from config | Python | `asap-summary-ingest/` |
-| **asap-planner-rs** | Auto-determines sketch parameters | Rust | `asap-planner-rs/` |
+| **Planner** (Rust) | Auto-determines sketch parameters | Rust | [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller) — moved out of this repo in Phase γ |
 | **Kafka** | Message broker for sketch distribution | Apache Kafka | (external) |
 | **Prometheus** | Time-series database (existing) | Go | (external) |
 | **Exporters** | Generate synthetic metrics for testing | Rust/Python | `asap-tools/data-sources/prometheus-exporters/` |
@@ -264,10 +264,8 @@ ASAPQuery/
 │   ├── templates/            # Jinja2 SQL templates
 │   └── utils/                # Arroyo API client
 │
-├── asap-planner-rs/          # Auto-configuration service
-│   ├── main_controller.py    # Entry point
-│   ├── classes/              # Config data structures
-│   └── utils/                # Decision logic
+├── (Planner: lives in ASAPCollector/controller/, deleted from this
+│    repo in Phase γ — see https://github.com/ProjectASAP/ASAPCollector)
 │
 ├── asap-tools/               # Experiment framework & tooling
 │   ├── data-sources/

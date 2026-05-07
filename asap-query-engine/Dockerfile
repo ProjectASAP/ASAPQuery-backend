@@ -19,7 +19,6 @@ COPY asap-common ./asap-common
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY asap-query-engine/Cargo.toml ./asap-query-engine/
-COPY asap-planner-rs/Cargo.toml ./asap-planner-rs/
 
 # Create dummy source files so Cargo can resolve all workspace members
 # All explicit [[bin]] targets in Cargo.toml must have stubs here for the dependency cache layer
@@ -29,9 +28,7 @@ RUN mkdir -p asap-query-engine/src/bin \
     && echo "fn main() {}" > asap-query-engine/src/bin/test_e2e_precompute.rs \
     && echo "fn main() {}" > asap-query-engine/src/bin/bench_precompute_sketch.rs \
     && echo "fn main() {}" > asap-query-engine/src/bin/e2e_quickstart_resource_test.rs \
-    && mkdir -p asap-query-engine/benches && echo "fn main() {}" > asap-query-engine/benches/simple_store_bench.rs \
-    && mkdir -p asap-planner-rs/src && echo "fn main() {}" > asap-planner-rs/src/main.rs \
-    && echo "pub fn placeholder() {}" >> asap-planner-rs/src/lib.rs
+    && mkdir -p asap-query-engine/benches && echo "fn main() {}" > asap-query-engine/benches/simple_store_bench.rs
 
 # Build dependencies (this layer will be cached)
 WORKDIR /code/asap-query-engine
@@ -39,10 +36,9 @@ RUN cargo build --release && rm -rf src/
 
 # Copy source code
 COPY asap-query-engine/src ./src
-COPY asap-planner-rs/src /code/asap-planner-rs/src
 
 # Build the actual application
-RUN touch src/main.rs && touch /code/asap-planner-rs/src/lib.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release
 
 # Runtime stage with Ubuntu 24.04 (has newer glibc/libstdc++)
 FROM ubuntu:24.04

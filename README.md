@@ -99,11 +99,6 @@ ASAPQuery-backend/
 │                              #   (Arroyo pipelines for users who
 │                              #    prefer it over canonical OTLP
 │                              #    ingest from ASAPCollector)
-├── asap-planner-rs/          # CLI tool — `bin/asap-planner` only.
-│                              # Library code that previously planned
-│                              # sketch placement was migrated into
-│                              # the ASAPCollector controller (see
-│                              # "Where the planner lives" below).
 └── docs/                      # Design docs
 ```
 
@@ -126,10 +121,12 @@ each push without restart. ASAPQuery-backend is therefore mostly an
 **executor** — it ingests sketches, evaluates queries, and dispatches
 based on the controller-emitted routing table.
 
-The legacy `asap-planner-rs` library (which had its own pattern
-matchers) was migrated into the controller. The CLI binary
-(`bin/asap-planner`) is retained for external users who script
-against the planner from the command line.
+The legacy `asap-planner-rs` workspace member (library + CLI) was
+deleted in Phase γ — its 5 PromQL pattern matchers and 11
+archive-only intents now live in the ASAPCollector controller's L3 /
+L4 stages. External users who previously scripted against
+`bin/asap-planner` should drive the controller directly via its HTTP
+API (or its own CLI surface — separate work item).
 
 ## Quick start
 

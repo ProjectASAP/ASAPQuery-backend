@@ -18,7 +18,6 @@ use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpPr
 use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::engines::SimpleEngine;
 use crate::routing::{EngineRouter, EngineRouterError, QueryEngine};
-use crate::query_tracker::QueryTracker;
 use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
@@ -65,7 +64,6 @@ pub struct HttpServer {
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
     store: Arc<dyn Store>,
-    query_tracker: Option<Arc<QueryTracker>>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
@@ -116,7 +114,6 @@ struct AppState {
     /// See [`HttpServer::query_router`].
     query_router: Arc<EngineRouter>,
     store: Arc<dyn Store>,
-    query_tracker: Option<Arc<QueryTracker>>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
@@ -140,7 +137,6 @@ impl HttpServer {
         config: HttpServerConfig,
         query_engine: Arc<SimpleEngine>,
         store: Arc<dyn Store>,
-        query_tracker: Option<Arc<QueryTracker>>,
     ) -> Self {
         // Bootstrap the capability router with `SimpleEngine` registered
         // for the warm-tier (`sketch_warm`) `data_source_id`. Callers
@@ -154,7 +150,6 @@ impl HttpServer {
             query_engine,
             query_router,
             store,
-            query_tracker,
             hot_reload_config: None,
             backend_storage_routing: None,
             schemas: None,
@@ -312,7 +307,6 @@ impl HttpServer {
             query_engine: self.query_engine,
             query_router: self.query_router,
             store: self.store,
-            query_tracker: self.query_tracker,
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -391,7 +385,6 @@ impl HttpServer {
             query_engine: self.query_engine.clone(),
             query_router: self.query_router.clone(),
             store: self.store.clone(),
-            query_tracker: self.query_tracker.clone(),
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -497,10 +490,11 @@ async fn process_query_request(
         }
     }
 
-    // Record query for passive auto-discovery (if tracker is enabled)
-    if let Some(tracker) = &state.query_tracker {
-        tracker.record_instant(&parsed_request.query, parsed_request.time);
-    }
+    // (Phase γ: legacy in-backend query tracker removed — the
+    // ASAPCollector controller now observes queries via its own
+    // PromQL scrape side-channel and pushes plans / routing tables
+    // back to the backend. See README "post-consolidation backend
+    // scope" prose.)
 
     // Phase-6 Fix 1: per-query engine override.
     //
@@ -1359,15 +1353,8 @@ async fn process_range_query_request(
         };
     }
 
-    // Record query for passive auto-discovery (if tracker is enabled)
-    if let Some(tracker) = &state.query_tracker {
-        tracker.record_range(
-            &parsed_request.query,
-            parsed_request.start,
-            parsed_request.end,
-            parsed_request.step,
-        );
-    }
+    // (Phase γ: legacy in-backend query tracker removed — see
+    // companion comment in `handle_instant_query`.)
 
     // Execute range query with engine
     let query_start_time = Instant::now();
@@ -1556,7 +1543,7 @@ mod tests {
             crate::data_model::QueryLanguage::promql,
         ));
 
-        let mut server = HttpServer::new(config, query_engine, store, None);
+        let mut server = HttpServer::new(config, query_engine, store);
         if let Some(handle) = hot_reload {
             server = server.with_hot_reload_config(handle);
         }
@@ -1812,7 +1799,7 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let server = HttpServer::new(config, query_engine, store, None)
+        let server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
             .with_schemas(schemas);
         server
@@ -2326,7 +2313,7 @@ aggregations:
             let sc = StreamingConfig::new(map);
             Arc::new(crate::stores::sketch_db::SchemaRegistry::from_streaming_config(&sc))
         };
-        let server = HttpServer::new(config, query_engine, store, None)
+        let server = HttpServer::new(config, query_engine, store)
             .with_backfill_registry(registry)
             .with_schemas(schemas);
         server
@@ -2696,7 +2683,7 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let mut server = HttpServer::new(config, query_engine, store, None)
+        let mut server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload);
         for engine in extra_engines {
             server = server.with_query_engine(engine);
@@ -2752,7 +2739,7 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let mut server = HttpServer::new(config, query_engine, store, None)
+        let mut server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
             .with_backend_storage_routing(Arc::new(routing));
         for engine in extra_engines {
@@ -3542,7 +3529,7 @@ aggregations:
             crate::data_model::QueryLanguage::promql,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
-        let server = HttpServer::new(config, query_engine, store, None)
+        let server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
             .with_hot_reload_backend_storage_routing(routing_handle.clone());
         let port = server.start_test_server().await.expect("start ok");
@@ -3915,7 +3902,7 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let mut server = HttpServer::new(config, query_engine, store, None)
+        let mut server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload);
         for (id, engine) in aliased_engines {
             server = server.with_query_engine_aliased(id, engine);

@@ -1,3 +1,0 @@
-metrics:
-  - metric: http_requests_total
-    labels: [instance, job, method, status]

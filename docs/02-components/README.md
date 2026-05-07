@@ -9,7 +9,7 @@ This document provides an overview of all ASAP components and links to detailed 
 | **asap-query-engine** | Answers PromQL queries using sketches | Rust | [Details](query-engine.md) · [Code](../../asap-query-engine/) · [Dev Docs](../../asap-query-engine/docs/README.md) |
 | **Arroyo** | Stream processing for building sketches | Rust (forked) | [Details](arroyo.md) · [Code](https://github.com/ProjectASAP/arroyo) |
 | **asap-summary-ingest** | Configures Arroyo pipelines from config | Python | [Details](arroyosketch.md) · [Code](../../asap-summary-ingest/) · [README](../../asap-summary-ingest/README.md) |
-| **asap-planner-rs-rs** | Auto-determines sketch parameters | Rust | [Details](controller.md) · [Code](../../asap-planner-rs-rs/) |
+| **Planner (in ASAPCollector)** | Auto-determines sketch parameters; pushes plans to backend via OpAMP / HTTP | Rust | [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller) |
 | **Exporters** | Generate synthetic metrics for testing | Rust/Python | [Details](exporters.md) · [Code](../../asap-tools/data-sources/prometheus-exporters/) · [README](../../asap-tools/data-sources/prometheus-exporters/README.md) |
 | **asap-tools** | Experiment framework for CloudLab | Python | [Details](utilities.md) · [Code](../../asap-tools/) · [Docs](../../asap-tools/docs/architecture.md) |
 
@@ -19,7 +19,7 @@ This document provides an overview of all ASAP components and links to detailed 
 graph TB
     subgraph "Configuration (Offline)"
         U[User] -->|edits| CC[controller-config.yaml]
-        CC --> C[asap-planner-rs]
+        CC --> C[Planner in ASAPCollector]
         C -->|streaming_config.yaml| AS[asap-summary-ingest]
         C -->|inference_config.yaml| Q
         AS -->|create pipelines| A
@@ -73,10 +73,13 @@ These run continuously to serve queries:
 
 These run once to set up the system:
 
-- **[asap-planner-rs](controller.md)** - Determines optimal sketch parameters
+- **Planner** (in [ASAPCollector/controller](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller))
+  - Determines optimal sketch parameters
   - Analyzes query workload
   - Selects sketch algorithms
-  - Generates configs for Arroyo and QueryEngine
+  - Pushes streaming + inference configs to Arroyo and QueryEngine
+    via OpAMP / HTTP (replaces the deleted `asap-planner-rs` library
+    + CLI; see Phase γ)
 
 - **[asap-summary-ingest](arroyosketch.md)** - Creates Arroyo pipelines
   - Reads streaming_config.yaml
@@ -111,10 +114,12 @@ Performance-critical components written in Rust:
 
 Configuration and orchestration in Python:
 
-- **asap-planner-rs** - Query analysis and config generation
 - **asap-summary-ingest** - Pipeline configuration
 - **asap-tools** - Experiment framework
 - **Python Exporters** - Simpler metric generators
+
+(Planner config-generation moved to the `ASAPCollector/controller/`
+Rust crate after Phase γ deletion of `asap-planner-rs/`.)
 
 ## Component Dependencies
 
@@ -122,7 +127,7 @@ Configuration and orchestration in Python:
 asap-query-engine
 ├── Kafka (runtime) - Consumes sketches
 ├── Prometheus (runtime, optional) - Fallback queries
-└── inference_config.yaml (config) - From asap-planner-rs
+└── inference_config.yaml (config) - From ASAPCollector controller
 
 Arroyo
 ├── Prometheus (runtime) - Remote write source
@@ -131,9 +136,9 @@ Arroyo
 
 asap-summary-ingest
 ├── Arroyo (runtime) - Creates pipelines via API
-└── streaming_config.yaml (config) - From asap-planner-rs
+└── streaming_config.yaml (config) - From ASAPCollector controller
 
-asap-planner-rs
+Planner (lives in ASAPCollector/controller/, not this repo)
 ├── controller-config.yaml (input) - User-provided
 ├── streaming_config.yaml (output) - For asap-summary-ingest
 └── inference_config.yaml (output) - For asap-query-engine
@@ -153,7 +158,8 @@ asap-tools
 - [asap-query-engine](query-engine.md) - Query processor deep dive
 - [Arroyo](arroyo.md) - Streaming engine + ASAP customizations
 - [asap-summary-ingest](arroyosketch.md) - Pipeline configurator
-- [asap-planner-rs](controller.md) - Auto-configuration service
+- Planner — auto-configuration service. See
+  [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller).
 - [Exporters](exporters.md) - Metric generators
 - [asap-tools](utilities.md) - Experiment framework
 
@@ -162,7 +168,6 @@ asap-tools
 For implementation details, see READMEs co-located with code:
 
 - [asap-query-engine/docs/](../../asap-query-engine/docs/README.md) - Extensibility guides
-- [asap-planner-rs/README.md](../../asap-planner-rs/README.md) - asap-planner-rs internals
 - [asap-summary-ingest/README.md](../../asap-summary-ingest/README.md) - Pipeline config internals
 - [asap-tools/data-sources/prometheus-exporters/README.md](../../asap-tools/data-sources/prometheus-exporters/README.md) - Exporter implementations
 - [asap-tools/docs/](../../asap-tools/docs/architecture.md) - Experiment framework architecture
