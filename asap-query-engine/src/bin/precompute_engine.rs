@@ -289,7 +289,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // it the handler falls back to the streaming-config single
         // axis (which always defaults to `SketchWarmTier`) and the
         // `EngineRouter` is effectively bypassed.
-        if let Some(routing_path) = args.backend_storage_routing.as_deref() {
+        // Phase α (MVP): always install a hot-reload routing handle —
+        // bootstrap from YAML when available, an empty table otherwise.
+        // The `POST /api/v1/storage_routing` endpoint can then swap in
+        // a controller-emitted table at runtime without restart.
+        let bootstrap_routing = if let Some(routing_path) =
+            args.backend_storage_routing.as_deref()
+        {
             match query_engine_rust::data_model::BackendStorageRouting::from_yaml_file(
                 routing_path,
             ) {
@@ -300,20 +306,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         routing.default_backend(),
                         routing.len(),
                     );
-                    http_server = http_server.with_backend_storage_routing(Arc::new(routing));
+                    routing
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to load backend-storage-routing from {:?}: {} — falling back to streaming-config single axis",
+                        "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
                         routing_path, e,
                     );
+                    query_engine_rust::data_model::BackendStorageRouting::empty()
                 }
             }
         } else {
             info!(
-                "--backend-storage-routing not set — every query routes per the streaming-config single axis (typically `sketch_warm`)",
+                "--backend-storage-routing not set — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
             );
-        }
+            query_engine_rust::data_model::BackendStorageRouting::empty()
+        };
+        http_server = http_server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
         // Phase-5/6: register a `GorillaQueryEngine` for the cold
         // archive tier when the operator has provisioned one via the
