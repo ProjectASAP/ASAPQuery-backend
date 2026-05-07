@@ -531,13 +531,26 @@ impl ColdStore for GorillaS3ColdStore {
         let mut out = Vec::new();
         for hour_ms in Self::hour_starts(start_ms, end_ms) {
             let idx = self.fetch_index(metric, hour_ms).await?;
+            let bucket_prefix = self.bucket_prefix(metric, hour_ms);
             for entry in idx.prune_by_time((start_ns, end_ns)) {
                 let (entry_start_ms, entry_end_ms) = (
                     (entry.time_range.0 / 1_000_000) as i64,
                     (entry.time_range.1 / 1_000_000) as i64,
                 );
+                // v7: agent-produced index entries carry just the
+                // chunk's basename (`part-NNNN-MMMM.gor`), not the
+                // full S3 key. Detect a bare basename (no `/`) and
+                // prepend the bucket prefix so the subsequent
+                // `read_chunk` GET hits the right object.
+                // Backend-produced entries carry the full key; we
+                // leave those unchanged.
+                let key = if entry.key.contains('/') {
+                    entry.key.clone()
+                } else {
+                    format!("{}{}", bucket_prefix, entry.key)
+                };
                 out.push(ChunkRef {
-                    key: entry.key.clone(),
+                    key,
                     metric: metric.to_string(),
                     time_range_ms: (entry_start_ms, entry_end_ms),
                     label_hash: entry.label_hash,
