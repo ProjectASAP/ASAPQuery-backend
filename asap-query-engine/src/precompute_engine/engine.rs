@@ -1,15 +1,11 @@
 use crate::data_model::HotReloadStreamingConfig;
 use crate::precompute_engine::config::PrecomputeEngineConfig;
-use crate::precompute_engine::ingest_handler::{
-    handle_prometheus_ingest, handle_victoriametrics_ingest, IngestState,
-};
+use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
 use crate::precompute_engine::worker::{Worker, WorkerRuntimeConfig};
-use axum::{routing::post, Router};
 use std::sync::atomic::{AtomicI64, AtomicUsize};
 use std::sync::Arc;
-use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -21,10 +17,12 @@ pub struct PrecomputeWorkerDiagnostics {
 
 /// The top-level precompute engine orchestrator.
 ///
-/// Creates worker threads, the series router, and the Axum ingest server.
-/// The ingest state (router + hot-reload handle) is built eagerly in `new()`
-/// so that other ingest sources (e.g. OTLP) can hold a handle and push data
-/// into the same worker pool.
+/// Creates worker threads and the series router. The ingest state
+/// (router + hot-reload handle) is built eagerly in `new()` so that
+/// ingest sources (currently OTLP) can hold a handle and push data
+/// into the same worker pool. The legacy Prometheus / VictoriaMetrics
+/// remote-write HTTP listener was deleted alongside the rest of the
+/// remote-write ingest path — backend ingest is OTLP-only now.
 pub struct PrecomputeEngine {
     config: PrecomputeEngineConfig,
     output_sink: Arc<dyn OutputSink>,
@@ -113,13 +111,16 @@ impl PrecomputeEngine {
 
     /// Get a clonable handle to the shared ingest state. Other ingest sources
     /// (OTLP, Kafka, etc.) call this before `run()` to push into the same
-    /// worker pool as the built-in Prometheus/VM HTTP server.
+    /// worker pool.
     pub fn ingest_state(&self) -> Arc<IngestState> {
         self.ingest_state.clone()
     }
 
-    /// Start the precompute engine. This spawns worker tasks and the HTTP
-    /// ingest server, then blocks until shutdown.
+    /// Start the precompute engine. This spawns worker tasks and the
+    /// periodic flush timer, then blocks until shutdown. The legacy
+    /// Prometheus / VictoriaMetrics HTTP ingest listener has been
+    /// removed; ingest now flows in via the OTLP receiver, which holds
+    /// the same `IngestState` handle returned by `ingest_state()`.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let num_workers = self.config.num_workers;
 
@@ -154,10 +155,7 @@ impl PrecomputeEngine {
             worker_handles.push(handle);
         }
 
-        info!(
-            "PrecomputeEngine started with {} workers on port {}",
-            num_workers, self.config.ingest_port
-        );
+        info!("PrecomputeEngine started with {} workers", num_workers);
 
         let ingest_state = self.ingest_state.clone();
 
@@ -175,18 +173,6 @@ impl PrecomputeEngine {
                 }
             }
         });
-
-        // Start the Axum HTTP server for ingest (Prometheus + VictoriaMetrics).
-        let app = Router::new()
-            .route("/api/v1/write", post(handle_prometheus_ingest))
-            .route("/api/v1/import", post(handle_victoriametrics_ingest))
-            .with_state(ingest_state);
-
-        let addr = format!("0.0.0.0:{}", self.config.ingest_port);
-        info!("Ingest server listening on {}", addr);
-
-        let listener = TcpListener::bind(&addr).await?;
-        axum::serve(listener, app).await?;
 
         // Wait for workers to finish (this only happens on shutdown).
         for handle in worker_handles {

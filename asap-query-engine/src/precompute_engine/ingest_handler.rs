@@ -1,23 +1,15 @@
 use crate::data_model::HotReloadStreamingConfig;
-use crate::drivers::ingest::prometheus_remote_write::decode_prometheus_remote_write;
-use crate::drivers::ingest::victoriametrics_remote_write::decode_victoriametrics_remote_write;
-use crate::drivers::query::servers::metrics as srv_metrics;
-use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
-use crate::precompute_engine::worker::{extract_metric_name, parse_labels_from_series_key};
+use crate::precompute_engine::series_router::SeriesRouter;
+use crate::precompute_engine::worker::parse_labels_from_series_key;
 use crate::stores::sketch_db::SchemaRegistry;
 use asap_types::aggregation_config::AggregationConfig;
-use axum::{body::Bytes, extract::State, http::StatusCode};
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
-use tracing::{debug, warn};
 
-/// Shared state for the ingest HTTP handler.
+/// Shared state for the ingest path.
 ///
 /// Holds the worker router plus the aggregation configs needed for group-key
-/// extraction. A single instance is shared by the Prometheus/VictoriaMetrics
-/// HTTP ingest server and any other ingest source that wants to route into
-/// the same worker pool (e.g. the OTLP receiver).
+/// extraction. A single instance is shared by every ingest source (currently
+/// the OTLP receiver) so they all push into the same worker pool.
 pub struct IngestState {
     pub router: SeriesRouter,
     pub samples_ingested: std::sync::atomic::AtomicU64,
@@ -89,8 +81,7 @@ impl IngestState {
     /// `samples_blocked_by_schema_barrier` atomic and the Prometheus
     /// `queryengine_ingest_samples_blocked_by_schema_barrier_total`
     /// counter, both keyed by `agg_id`. Called by every ingest path
-    /// (Prometheus remote-write, VictoriaMetrics remote-write,
-    /// OTLP raw points, OTLP sketch envelopes, OTLP modified-proto
+    /// (OTLP raw points, OTLP sketch envelopes, OTLP modified-proto
     /// sketches) so the drop rate observable on `/metrics` is a
     /// single number regardless of which driver is active.
     pub fn record_barrier_drop(&self, agg_id: u64, count: u64) {
@@ -117,193 +108,10 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
     values.join(";")
 }
 
-/// Shared logic: group decoded samples by (agg_id, group_key) and route to workers.
-pub(crate) async fn route_decoded_samples(
-    state: &IngestState,
-    samples: Vec<crate::drivers::ingest::prometheus_remote_write::DecodedSample>,
-    ingest_received_at: Instant,
-    protocol: &str,
-) -> StatusCode {
-    if samples.is_empty() {
-        return StatusCode::NO_CONTENT;
-    }
-
-    let count = samples.len() as u64;
-    state
-        .samples_ingested
-        .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-    srv_metrics::record_ingest_samples(protocol, count);
-
-    if state.pass_raw_samples {
-        // Raw mode: group by series key and send as RawSamples
-        let mut by_series: HashMap<&str, Vec<(i64, f64)>> = HashMap::new();
-        for s in &samples {
-            by_series
-                .entry(&s.labels)
-                .or_default()
-                .push((s.timestamp_ms, s.value));
-        }
-        let messages: Vec<WorkerMessage> = by_series
-            .into_iter()
-            .map(|(k, v)| WorkerMessage::RawSamples {
-                series_key: k.to_string(),
-                samples: v,
-                ingest_received_at,
-            })
-            .collect();
-
-        if let Err(e) = state
-            .router
-            .route_group_batch(messages, ingest_received_at)
-            .await
-        {
-            warn!("Batch routing error: {}", e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
-        return StatusCode::NO_CONTENT;
-    }
-
-    // Group-by mode: for each sample, find matching agg configs and group by
-    // (agg_id, group_key). This is the equivalent of Arroyo's GROUP BY.
-    //
-    // Snapshot the latest config from the hot-reload handle at the
-    // start of each batch, so config swaps are visible immediately.
-    // This is a single Arc refcount bump (~5ns), not a clone.
-    let snap = state.config_snapshot();
-    let agg_configs = snap.get_all_aggregation_configs();
-
-    // Reconcile the schema registry against the snapshot (Phase 2a of
-    // the sketch DB design — `docs/design-sketch-db.md` §6). New
-    // agg_ids in the snapshot become Active schemas; agg_ids removed
-    // from the snapshot transition to Retired (the §6.3 write barrier
-    // then rejects further writes to them). Reconcile is a HashMap
-    // diff against the registry's current state — cheap.
-    let _summary = state.schemas.reconcile(&snap);
-
-    // Key: (agg_id, group_key) → Vec<(series_key, timestamp_ms, value)>
-    type GroupKey = (u64, String);
-    type SampleTuple = (String, i64, f64);
-    let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
-
-    // Per-batch drop tally for the §6.3 barrier. Aggregated here and
-    // flushed once at the end of the batch so a hot ingest path doesn't
-    // spam one log line per sample.
-    let mut dropped_by_barrier: HashMap<u64, u64> = HashMap::new();
-
-    for s in &samples {
-        let metric_name = extract_metric_name(&s.labels);
-        for config in agg_configs.values() {
-            if config.metric != metric_name
-                && config.spatial_filter_normalized != metric_name
-                && config.spatial_filter != metric_name
-            {
-                continue;
-            }
-            // §6.3 write-side schema barrier: silently skip retired or
-            // expired aggs even if they're still in the snapshot for some
-            // reason. This is the authoritative "no writes after
-            // retirement" guarantee.
-            if !state.schemas.is_writable(config.aggregation_id) {
-                *dropped_by_barrier.entry(config.aggregation_id).or_default() += 1;
-                continue;
-            }
-            let group_key = extract_group_key(&s.labels, config);
-            by_group
-                .entry((config.aggregation_id, group_key))
-                .or_default()
-                .push((s.labels.clone(), s.timestamp_ms, s.value));
-        }
-    }
-
-    if !dropped_by_barrier.is_empty() {
-        let total_dropped: u64 = dropped_by_barrier.values().sum();
-        for (agg_id, count) in &dropped_by_barrier {
-            state.record_barrier_drop(*agg_id, *count);
-        }
-        debug!(
-            total_dropped,
-            by_agg_id = ?dropped_by_barrier,
-            "§6.3 write barrier dropped samples (agg is retired/expired)"
-        );
-    }
-
-    let messages: Vec<WorkerMessage> = by_group
-        .into_iter()
-        .map(
-            |((agg_id, group_key), samples)| WorkerMessage::GroupSamples {
-                agg_id,
-                group_key,
-                samples,
-                ingest_received_at,
-            },
-        )
-        .collect();
-
-    if let Err(e) = state
-        .router
-        .route_group_batch(messages, ingest_received_at)
-        .await
-    {
-        warn!("Batch routing error: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    StatusCode::NO_CONTENT
-}
-
-/// Axum handler for Prometheus remote write (Snappy + Protobuf).
-pub(crate) async fn handle_prometheus_ingest(
-    State(state): State<Arc<IngestState>>,
-    body: Bytes,
-) -> StatusCode {
-    let _timer = srv_metrics::start_ingest_timer(srv_metrics::INGEST_PROTO_PROM_RW);
-    let ingest_received_at = Instant::now();
-    let samples = match decode_prometheus_remote_write(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to decode Prometheus remote write: {}", e);
-            srv_metrics::record_ingest_decode_error(srv_metrics::INGEST_PROTO_PROM_RW);
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    route_decoded_samples(
-        &state,
-        samples,
-        ingest_received_at,
-        srv_metrics::INGEST_PROTO_PROM_RW,
-    )
-    .await
-}
-
-/// Axum handler for VictoriaMetrics remote write (Zstd + Protobuf).
-pub(crate) async fn handle_victoriametrics_ingest(
-    State(state): State<Arc<IngestState>>,
-    body: Bytes,
-) -> StatusCode {
-    let _timer = srv_metrics::start_ingest_timer(srv_metrics::INGEST_PROTO_VM_RW);
-    let ingest_received_at = Instant::now();
-    let samples = match decode_victoriametrics_remote_write(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to decode VictoriaMetrics remote write: {}", e);
-            srv_metrics::record_ingest_decode_error(srv_metrics::INGEST_PROTO_VM_RW);
-            return StatusCode::BAD_REQUEST;
-        }
-    };
-    route_decoded_samples(
-        &state,
-        samples,
-        ingest_received_at,
-        srv_metrics::INGEST_PROTO_VM_RW,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data_model::StreamingConfig;
-    use crate::drivers::ingest::prometheus_remote_write::DecodedSample;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::stores::sketch_db::SchemaRegistry;
     use asap_types::aggregation_config::AggregationConfig;
@@ -333,14 +141,6 @@ mod tests {
             None,
             None,
         )
-    }
-
-    fn sample(metric: &str, ts: i64, val: f64) -> DecodedSample {
-        DecodedSample {
-            labels: metric.to_string(),
-            timestamp_ms: ts,
-            value: val,
-        }
     }
 
     /// Set up an `IngestState` with one Active agg for `metric` and a
@@ -374,141 +174,8 @@ mod tests {
         (state, drain)
     }
 
-    #[tokio::test]
-    async fn barrier_counter_stays_zero_when_schema_is_active() {
-        let (state, drain) = setup_state(1, "metric_1").await;
-        let _ = route_decoded_samples(
-            &state,
-            vec![sample("metric_1", 100, 1.0), sample("metric_1", 200, 2.0)],
-            std::time::Instant::now(),
-            "prometheus_rw",
-        )
-        .await;
-        assert_eq!(
-            state
-                .samples_blocked_by_schema_barrier
-                .load(Ordering::Relaxed),
-            0,
-            "barrier must not fire for an Active schema"
-        );
-        drop(state);
-        let _ = drain.await;
-    }
-
-    #[tokio::test]
-    async fn barrier_counter_increments_after_force_expire() {
-        let (state, drain) = setup_state(1, "metric_1").await;
-
-        // Baseline: Active schema, barrier idle.
-        let _ = route_decoded_samples(
-            &state,
-            vec![sample("metric_1", 100, 1.0)],
-            std::time::Instant::now(),
-            "prometheus_rw",
-        )
-        .await;
-        assert_eq!(
-            state
-                .samples_blocked_by_schema_barrier
-                .load(Ordering::Relaxed),
-            0
-        );
-
-        // Flip the schema to Expired via the #42 manual endpoint.
-        assert!(state.schemas.force_expire(1).is_some());
-
-        // Second batch: every matching sample gets barrier-dropped.
-        let _ = route_decoded_samples(
-            &state,
-            vec![
-                sample("metric_1", 300, 3.0),
-                sample("metric_1", 400, 4.0),
-                sample("metric_1", 500, 5.0),
-            ],
-            std::time::Instant::now(),
-            "prometheus_rw",
-        )
-        .await;
-        assert_eq!(
-            state
-                .samples_blocked_by_schema_barrier
-                .load(Ordering::Relaxed),
-            3,
-            "three post-expire samples must be dropped by the §6.3 barrier"
-        );
-        drop(state);
-        let _ = drain.await;
-    }
-
-    /// Samples for metrics that don't match any agg must not count as
-    /// barrier drops — the barrier only fires on (matching metric) ×
-    /// (non-Active agg).
-    #[tokio::test]
-    async fn barrier_counter_ignores_non_matching_metrics() {
-        let (state, drain) = setup_state(1, "metric_1").await;
-        assert!(state.schemas.force_expire(1).is_some());
-
-        let _ = route_decoded_samples(
-            &state,
-            vec![
-                sample("other_metric", 100, 1.0),
-                sample("yet_another", 200, 2.0),
-            ],
-            std::time::Instant::now(),
-            "prometheus_rw",
-        )
-        .await;
-        assert_eq!(
-            state
-                .samples_blocked_by_schema_barrier
-                .load(Ordering::Relaxed),
-            0,
-            "samples for unrelated metrics must not count as barrier drops"
-        );
-        drop(state);
-        let _ = drain.await;
-    }
-
-    /// Prometheus CounterVec is process-global via `lazy_static`, so
-    /// we key on a unique agg_id (9001) to get a fresh baseline that
-    /// no other test in the process has touched.
-    #[tokio::test]
-    async fn barrier_prom_counter_increments_per_agg_label() {
-        let (state, drain) = setup_state(9001, "metric_prom_test").await;
-        let label = "9001";
-        let baseline = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-            .with_label_values(&[label])
-            .get();
-
-        assert!(state.schemas.force_expire(9001).is_some());
-
-        let _ = route_decoded_samples(
-            &state,
-            vec![
-                sample("metric_prom_test", 100, 1.0),
-                sample("metric_prom_test", 200, 2.0),
-                sample("metric_prom_test", 300, 3.0),
-                sample("metric_prom_test", 400, 4.0),
-            ],
-            std::time::Instant::now(),
-            "prometheus_rw",
-        )
-        .await;
-
-        let after = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-            .with_label_values(&[label])
-            .get();
-        assert!(
-            (after - baseline - 4.0).abs() < f64::EPSILON,
-            "prom counter for agg_id={label} should have advanced by 4; baseline={baseline}, after={after}"
-        );
-        drop(state);
-        let _ = drain.await;
-    }
-
     /// `record_barrier_drop` is the single entry point every ingest
-    /// driver (Prometheus remote-write, VictoriaMetrics remote-write,
-    /// OTLP raw / sketch / modified-proto) funnels through, so
+    /// driver (OTLP raw / sketch / modified-proto) funnels through, so
     /// verify both sides of the contract: the in-process atomic AND
     /// the Prometheus `CounterVec` move together, keyed by agg_id.
     #[tokio::test]
