@@ -143,6 +143,28 @@ impl EngineRouter {
         self.engines.is_empty()
     }
 
+    /// Look up a registered engine by its `data_source_id`. Returns
+    /// `None` when no engine has registered under that id.
+    ///
+    /// Used by the per-query engine override path in the HTTP layer
+    /// (`X-ASAP-Engine` header / `?engine=` query param). Bypasses the
+    /// capability matrix entirely — the caller has explicitly named the
+    /// engine and accepts the consequences. Used by the accuracy
+    /// reducer to query the same PromQL against the warm sketch and
+    /// the Gorilla archive on MinIO so it can compute apples-to-apples
+    /// relative error.
+    pub fn engine_by_id(&self, data_source_id: &str) -> Option<&Arc<dyn QueryEngine>> {
+        self.engines.get(data_source_id)
+    }
+
+    /// Iterate over the `data_source_id`s of every registered engine.
+    /// Used by the HTTP layer to surface a useful error message when
+    /// an explicit `X-ASAP-Engine` override names an engine that
+    /// hasn't been registered.
+    pub fn registered_ids(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.engines.keys().copied()
+    }
+
     /// Walk the compatible-backend list for `(stat, accuracy, metric_storage)`,
     /// dispatch to the first registered engine, and (on
     /// [`EngineError::Backend`] or [`EngineError::CapabilityMiss`]) fall
@@ -403,6 +425,35 @@ mod tests {
             }
             other => panic!("expected AllFailed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn engine_by_id_returns_registered_engines_or_none() {
+        let mut router = EngineRouter::new();
+        let (warm, _) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (gorilla, gorilla_calls) =
+            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
+        router.register(warm);
+        router.register(gorilla);
+
+        // Hit by id — must return the engine for that backend.
+        let archive = router
+            .engine_by_id("gorilla_archive")
+            .expect("gorilla_archive engine registered");
+        let _ = archive.execute("count(foo)").await;
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "engine_by_id must return the engine that was registered under that id",
+        );
+
+        // Miss — unknown id returns None.
+        assert!(router.engine_by_id("does_not_exist").is_none());
+
+        // Iter exposes every registered id.
+        let mut ids: Vec<&str> = router.registered_ids().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["gorilla_archive", "sketch_warm"]);
     }
 
     #[tokio::test]
