@@ -22,6 +22,24 @@ use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
 
+/// Per-query engine override header (Phase-6 accuracy reducer).
+///
+/// When the client sets `X-ASAP-Engine: <data_source_id>` (or the
+/// equivalent `?engine=<data_source_id>` query param), the HTTP layer
+/// bypasses the per-metric `BackendStorageRouting` lookup and dispatches
+/// the PromQL string straight to the named engine. Used by the
+/// `accuracy_reduce.py` reducer to ask the same query against the warm
+/// sketch and the Gorilla archive on MinIO so it can compute
+/// apples-to-apples relative error per replay row. See
+/// `docs/design-jsonl-deprecation-and-gorilla-promql-completeness.md`
+/// (Fix 1) for the design rationale.
+///
+/// Recognised values match `StorageBackend::data_source_id()` —
+/// `sketch_warm`, `gorilla_archive`, `cold_jsonl`, `double_write`. An
+/// unknown value returns 400.
+pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
+pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
+
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
     pub port: u16,
@@ -366,12 +384,22 @@ impl HttpServer {
     }
 }
 
-/// Core query execution logic shared between GET and POST handlers
+/// Core query execution logic shared between GET and POST handlers.
+///
+/// `engine_override` (Phase-6 Fix 1): when `Some(data_source_id)` the
+/// per-metric `BackendStorageRouting` lookup is bypassed and the query
+/// is dispatched straight to the named engine. Set by the
+/// `X-ASAP-Engine` request header (POST) or the `?engine=` query
+/// parameter (GET / POST), both consumed at the handler boundary
+/// before the request reaches this function. Used by the accuracy
+/// reducer to query the same PromQL against warm sketch and Gorilla
+/// archive for cross-tier rel-err computation.
 async fn process_query_request(
     state: &AppState,
     parsed_request: &ParsedQueryRequest,
     start_time: Instant,
     headers: HashMap<String, String>,
+    engine_override: Option<String>,
 ) -> Response {
     // Check if handling is enabled
     if !state.config.handle_http_requests {
@@ -404,6 +432,18 @@ async fn process_query_request(
     // Record query for passive auto-discovery (if tracker is enabled)
     if let Some(tracker) = &state.query_tracker {
         tracker.record_instant(&parsed_request.query, parsed_request.time);
+    }
+
+    // Phase-6 Fix 1: per-query engine override.
+    //
+    // If the caller explicitly named an engine (via `X-ASAP-Engine`
+    // header or `?engine=` query param) bypass `BackendStorageRouting`
+    // and dispatch directly. The accuracy reducer relies on this to
+    // ask the same PromQL against the warm sketch (`sketch_warm`) and
+    // the Gorilla archive (`gorilla_archive`) so it can compute
+    // apples-to-apples relative error per replay row.
+    if let Some(override_id) = engine_override.as_deref() {
+        return process_via_named_engine(state, parsed_request, start_time, override_id).await;
     }
 
     // Step 2: Pick a dispatch path based on the metric's pinned
@@ -620,6 +660,123 @@ async fn process_via_simple_engine(
     }
 }
 
+/// Dispatch directly to the engine registered under `data_source_id`,
+/// bypassing the `BackendStorageRouting` lookup. Set by the per-query
+/// `X-ASAP-Engine` header (or `?engine=` query param). Used by the
+/// accuracy reducer to query the same PromQL against the warm sketch
+/// and the Gorilla archive on MinIO so it can compute apples-to-apples
+/// relative error per replay row.
+///
+/// HTTP semantics:
+/// * Unknown `data_source_id` → 400 with the list of registered ids.
+/// * Engine returns `EngineError::Backend` → 500.
+/// * Engine returns `EngineError::CapabilityMiss` → 404.
+/// * Engine returns `Ok` → 2xx with `data_source: <id>` info-line.
+async fn process_via_named_engine(
+    state: &AppState,
+    parsed_request: &ParsedQueryRequest,
+    start_time: Instant,
+    data_source_id: &str,
+) -> Response {
+    use crate::drivers::query::adapters::QueryExecutionResult;
+    use crate::engines::EngineError;
+
+    let query_start_time = Instant::now();
+    debug!(
+        "Dispatching via named engine override: query='{}' data_source_id={}",
+        parsed_request.query, data_source_id,
+    );
+
+    let Some(engine) = state.query_router.engine_by_id(data_source_id) else {
+        let registered: Vec<&'static str> = state.query_router.registered_ids().collect();
+        warn!(
+            requested = data_source_id,
+            registered = ?registered,
+            "named engine override: requested engine not registered",
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "errorType": "bad_data",
+                "error": format!(
+                    "no engine registered under data_source_id={data_source_id:?}; \
+                     registered={registered:?}"
+                ),
+            })),
+        )
+            .into_response();
+    };
+
+    let engine = engine.clone();
+    let result = engine.execute(&parsed_request.query).await;
+
+    let total_duration = start_time.elapsed();
+    debug!(
+        "Named engine dispatch took: {:.2}ms (total req {:.2}ms)",
+        query_start_time.elapsed().as_secs_f64() * 1000.0,
+        total_duration.as_secs_f64() * 1000.0,
+    );
+
+    match result {
+        Ok(query_result) => {
+            // Trait dispatch loses `KeyByLabelNames`, identical to
+            // `process_via_router`. Default to empty so the
+            // Prometheus adapter renders `metric: {}` for every
+            // returned series.
+            let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
+            let execution_result = QueryExecutionResult {
+                query_output_labels,
+                query_result,
+            };
+            // Resolve the `data_source` annotation from the engine's
+            // own capabilities so the wire response stays in sync
+            // even if the request used a typo'd casing of the id.
+            let canonical_id = engine.capabilities().data_source_id;
+            match state
+                .adapter
+                .format_success_response(&execution_result)
+                .await
+            {
+                Ok(response) => annotate_data_source(response, canonical_id).await,
+                Err(status) => status.into_response(),
+            }
+        }
+        Err(EngineError::CapabilityMiss { .. }) => {
+            warn!(
+                data_source_id = data_source_id,
+                "named engine: capability miss",
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "bad_data",
+                    "error": format!(
+                        "engine {data_source_id:?} could not serve this query (capability miss)"
+                    ),
+                })),
+            )
+                .into_response()
+        }
+        Err(EngineError::Backend { .. }) => {
+            warn!(
+                data_source_id = data_source_id,
+                "named engine: backend failure",
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "internal",
+                    "error": format!("engine {data_source_id:?} backend failed"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Dispatch through the [`EngineRouter`] — used for any metric whose
 /// pinned `StorageBackend` is something other than `SketchWarmTier`.
 ///
@@ -809,12 +966,20 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
 
 async fn handle_instant_query(
     query_params: Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
     let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_INSTANT);
     let start_time = Instant::now();
     debug!("=== INCOMING GET REQUEST ===");
     debug!("Raw query params: {:?}", query_params.0);
+
+    // Phase-6 Fix 1: per-query engine override. Header takes
+    // precedence over query param; either flips the dispatcher to
+    // `process_via_named_engine`. Recorded before `parse_get_request`
+    // strips the param out (it doesn't, but reading the source of
+    // truth keeps this robust to adapter changes).
+    let engine_override = extract_engine_override(&headers, &query_params.0);
 
     let parsed_request = match state.adapter.parse_get_request(query_params).await {
         Ok(req) => {
@@ -837,12 +1002,37 @@ async fn handle_instant_query(
         }
     };
 
-    let response = process_query_request(&state, &parsed_request, start_time, HashMap::new()).await;
+    let response =
+        process_query_request(&state, &parsed_request, start_time, HashMap::new(), engine_override)
+            .await;
     srv_metrics::record_query_outcome(
         srv_metrics::QUERY_TYPE_INSTANT,
         query_status_label(&response),
     );
     response
+}
+
+/// Extract the per-query engine override (Phase-6 Fix 1).
+///
+/// Precedence: the `X-ASAP-Engine` header wins over the `?engine=`
+/// query parameter when both are present. Returns `None` (default
+/// dispatch via `BackendStorageRouting`) when neither is set.
+fn extract_engine_override(
+    headers: &axum::http::HeaderMap,
+    query_params: &HashMap<String, String>,
+) -> Option<String> {
+    if let Some(v) = headers.get(ENGINE_OVERRIDE_HEADER) {
+        if let Ok(s) = v.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    query_params
+        .get(ENGINE_OVERRIDE_QUERY_PARAM)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 async fn handle_instant_query_post(
@@ -869,6 +1059,16 @@ async fn handle_instant_query_post(
         .unwrap_or("");
 
     debug!("Content-Type: {}", content_type);
+
+    // Phase-6 Fix 1: per-query engine override read from the header
+    // before parsing the body. We don't yet know the form-decoded
+    // params, so query-param fallback (rare for POST) is wired in
+    // below after the form parse.
+    let mut engine_override: Option<String> = headers
+        .get(ENGINE_OVERRIDE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     let parsed_request = if content_type.contains("application/json") {
         // Handle JSON POST (Elasticsearch)
@@ -927,6 +1127,16 @@ async fn handle_instant_query_post(
             .collect();
         debug!("Form params extracted: {:?}", params);
 
+        // Phase-6 Fix 1: form-body fallback for the engine override
+        // (header still wins). Lets a curl POST send `engine=archive`
+        // alongside `query=` and `time=`.
+        if engine_override.is_none() {
+            engine_override = params
+                .get(ENGINE_OVERRIDE_QUERY_PARAM)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+        }
+
         // Use adapter to parse POST request (handles form-encoded parameters)
         match state.adapter.parse_post_request(Form(params)).await {
             Ok(req) => {
@@ -950,8 +1160,14 @@ async fn handle_instant_query_post(
         }
     };
 
-    let result =
-        process_query_request(&state, &parsed_request, start_time, forwarding_headers).await;
+    let result = process_query_request(
+        &state,
+        &parsed_request,
+        start_time,
+        forwarding_headers,
+        engine_override,
+    )
+    .await;
 
     let total_duration = start_time.elapsed();
     debug!(
@@ -2988,6 +3204,234 @@ aggregations:
             0,
             "v7 dual-routing: quantile must NOT hit the archive engine",
         );
+    }
+
+    // ── Phase-6 Fix 1: per-query engine override ─────────────────────────
+    //
+    // The accuracy reducer asks the same PromQL against both the warm
+    // sketch and the Gorilla archive on MinIO so it can compute
+    // apples-to-apples relative error. This requires a way to bypass
+    // the per-metric `BackendStorageRouting` lookup and dispatch
+    // straight to a named engine. Two surfaces are exposed:
+    //
+    // * `X-ASAP-Engine: <data_source_id>` request header (preferred)
+    // * `?engine=<data_source_id>` query / form param (fallback)
+    //
+    // Both flip the dispatcher to `process_via_named_engine`.
+
+    /// Header override flips a `quantile_over_time` query — which the
+    /// v7 dual-routing table sends to the warm sketch — over to the
+    /// Gorilla archive engine. Proves the override bypasses the
+    /// shape-classifier and dispatches to the explicitly named engine.
+    #[tokio::test]
+    async fn http_engine_override_header_routes_to_named_engine() {
+        use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
+
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+
+        // Dual-routing for `metric_warm`: quantiles → warm, count →
+        // archive. Without the header the test query routes to warm.
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "metric_warm".to_string(),
+            vec![
+                RoutingTarget::for_shapes(
+                    StorageBackend::SketchWarmTier,
+                    vec![QueryShape::Quantile],
+                ),
+                RoutingTarget::for_shapes(
+                    StorageBackend::GorillaS3Archive,
+                    vec![QueryShape::Count],
+                ),
+            ],
+        );
+        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        // Ask a quantile query (default routing → warm) but override
+        // to archive via the header.
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .header(ENGINE_OVERRIDE_HEADER, "gorilla_archive")
+            .query(&[
+                ("query", "quantile_over_time(0.5, metric_warm[1m])"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "header-override dispatch must return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "header override must dispatch to the named engine exactly once",
+        );
+    }
+
+    /// Without the override header the same query takes the default
+    /// routing-table path. Proves the override is opt-in and
+    /// backwards-compatible.
+    #[tokio::test]
+    async fn http_engine_override_missing_uses_default_routing() {
+        use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
+
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "metric_warm".to_string(),
+            vec![
+                RoutingTarget::for_shapes(
+                    StorageBackend::SketchWarmTier,
+                    vec![QueryShape::Quantile],
+                ),
+                RoutingTarget::for_shapes(
+                    StorageBackend::GorillaS3Archive,
+                    vec![QueryShape::Count],
+                ),
+            ],
+        );
+        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+        let server_port = setup_test_server_with_routing_table(
+            routing,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        // No override → quantile shape routes to warm tier.
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "quantile_over_time(0.5, metric_warm[1m])"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(resp.status().is_success(), "default routing must still 2xx");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "sketch_warm");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            0,
+            "no override → archive engine must NOT be hit",
+        );
+    }
+
+    /// Query-param fallback: `?engine=gorilla_archive` overrides the
+    /// routing table when the header is absent.
+    #[tokio::test]
+    async fn http_engine_override_query_param_routes_to_named_engine() {
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+
+        let server_port = setup_test_server_with_router(
+            StorageBackend::SketchWarmTier,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "sum_over_time(foo[5m])"),
+                ("time", "1700000000"),
+                (ENGINE_OVERRIDE_QUERY_PARAM, "gorilla_archive"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(resp.status().is_success(), "query-param override must 2xx");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "query-param override must hit the archive engine exactly once",
+        );
+    }
+
+    /// Unknown engine id returns 400 with a useful error body listing
+    /// the registered engines. Lets `accuracy_reduce.py` distinguish
+    /// "engine not deployed" (config bug) from "archive miss" (the
+    /// chunk hasn't landed yet — still 200 with an empty result).
+    #[tokio::test]
+    async fn http_engine_override_unknown_id_returns_400() {
+        let server_port =
+            setup_test_server_with_router(StorageBackend::SketchWarmTier, Vec::new()).await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .header(ENGINE_OVERRIDE_HEADER, "does_not_exist")
+            .query(&[
+                ("query", "sum_over_time(foo[5m])"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            err.contains("does_not_exist"),
+            "error must name the bad id; got {err}",
+        );
+        assert!(
+            err.contains("sketch_warm"),
+            "error must list registered engines; got {err}",
+        );
+    }
+
+    /// POST + form-encoded body works the same way: header still
+    /// wins, body's `engine=` is the fallback.
+    #[tokio::test]
+    async fn http_engine_override_post_header_routes_to_named_engine() {
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_router(
+            StorageBackend::SketchWarmTier,
+            vec![gorilla as Arc<dyn QueryEngine>],
+        )
+        .await;
+
+        let client = Client::new();
+        let form_body = "query=sum_over_time(foo%5B5m%5D)&time=1700000000";
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .header(ENGINE_OVERRIDE_HEADER, "gorilla_archive")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body)
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "POST header-override must 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "gorilla_archive");
+        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
 }
