@@ -467,6 +467,66 @@ fn spatial_sum_routes_through_warm_tier() {
     assert!(!elements.is_empty(), "sum() result should not be empty");
 }
 
+/// Phase-3.1 regression: pin the canonical MVP-demo PromQL query
+/// `quantile_over_time(0.99, http_requests_total_latency_ms[1m])`
+/// against a DDSketch-typed agg WITHOUT a matching `query_config`
+/// exact-string entry. This forces capability-based matching
+/// (`find_compatible_aggregation`) — pre-fix, this branch returned
+/// `None` because `compatible_agg_types(Quantile)` listed only KLL
+/// types. Post-fix, DDSketch is enumerated and the warm tier
+/// answers the query cleanly. Mirrors the demo configuration
+/// described in `ASAPCollector/docs/spec-mvp-controller-driven-multi-stage-demo.md`
+/// (DDSketch for `_latency_ms` quantile-over-time at the edge).
+///
+/// NOTE: schema labels and grouping labels are kept empty so the
+/// `OnlyTemporal` `requirements.grouping_labels` (= all schema
+/// labels) matches the config's grouping labels exactly under the
+/// strict-equality `labels_compatible` check. The labels-superset
+/// relaxation TODO'd in `capability_matching.rs:238` is out of
+/// scope for this fix.
+#[test]
+fn canonical_mvp_demo_quantile_over_time_resolves_via_capability_matching() {
+    init_test_tracing();
+    let acc = make_dd_acc(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]);
+    let engine = build_engine(
+        "http_requests_total_latency_ms",
+        &[],
+        AggregationType::DDSketch,
+        &[],
+        60, // 1m window
+        acc,
+        // `query_config` query string deliberately mismatches the live
+        // request below so `find_query_config` misses and the engine
+        // falls through to `find_compatible_aggregation`.
+        "quantile_over_time(0.5, http_requests_total_latency_ms[5m])",
+    );
+
+    let result = engine
+        .handle_query_promql(
+            // The MVP-demo canonical query — neither phi nor range
+            // overlaps with the registered query_config above.
+            "quantile_over_time(0.99, http_requests_total_latency_ms[1m])".to_string(),
+            QUERY_TIME_SEC,
+        )
+        .expect(
+            "warm tier must resolve quantile_over_time against a DDSketch-only config via capability matching",
+        );
+    let (_, qr) = result;
+    let elements = match qr {
+        query_engine_rust::engines::QueryResult::Vector(iv) => iv.values,
+        other => panic!("expected vector, got {other:?}"),
+    };
+    assert!(
+        !elements.is_empty(),
+        "expected non-empty p99 result — capability matching now picks DDSketch for Quantile",
+    );
+    let p99 = elements[0].value;
+    assert!(
+        p99.is_finite() && (50.0..=110.0).contains(&p99),
+        "p99 out of plausible range for [10..100]: {p99}",
+    );
+}
+
 #[test]
 fn spatial_multi_quantile_routes_through_warm_tier() {
     // p50 spatial — pre-PR only p99 had an entry, so this would
