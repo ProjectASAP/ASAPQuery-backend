@@ -11,17 +11,22 @@
 //!
 //! ## Public surface
 //!
-//! Two engines + the shared error envelope:
+//! Three engines + the shared error envelope:
 //!
 //! * [`simple::SimpleEngine`] — warm-tier sketch query engine.
 //! * [`gorilla::GorillaQueryEngine`] — archive-tier exact query
 //!   engine over the [`gorilla::store::GorillaS3Store`].
+//! * [`prometheus::PrometheusForwardEngine`] — HTTP-forwarder to a
+//!   Prometheus `/api/v1/query` endpoint, registered under the
+//!   `prometheus_remote` engine id when
+//!   `ASAP_PROMETHEUS_QUERY_URL` is set (Phase ε.2).
 //! * [`EngineError`] — the trait-level error envelope every
 //!   `crate::routing::QueryEngine` impl returns.
 
 pub mod gorilla;
 pub mod logical;
 pub mod physical;
+pub mod prometheus;
 pub mod query_result;
 pub mod simple;
 pub mod timeline_dispatch;
@@ -30,6 +35,7 @@ pub mod window_merger;
 pub use gorilla::{
     EngineError as GorillaEngineError, GorillaEngineConfig, GorillaQueryEngine,
 };
+pub use prometheus::{PrometheusForwardConfig, PrometheusForwardEngine, PrometheusForwardError};
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
 pub use simple::SimpleEngine;
 pub use timeline_dispatch::{combine_statistic, CombinedResult};

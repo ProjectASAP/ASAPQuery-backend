@@ -763,9 +763,17 @@ fn parse_engine_string(s: &str) -> Result<StorageBackend> {
             Ok(StorageBackend::GorillaS3Archive)
         }
         "double_write" => Ok(StorageBackend::DoubleWrite),
+        // Phase ε.2: the controller's Mode 3
+        // (`RawAtEdgePrometheusArchive`) emits this when a metric's
+        // raw data is shipped to Prometheus's native OTLP receiver.
+        // The backend's `PrometheusForwardEngine` (in
+        // `engines::prometheus::forward`) registers under this id
+        // when `ASAP_PROMETHEUS_QUERY_URL` is set.
+        "prometheus_remote" => Ok(StorageBackend::PrometheusRemote),
         other => Err(anyhow::anyhow!(
             "unknown engine '{}': expected one of \
-             [sketch_warm_tier, thanos_archive, gorilla_s3_archive, double_write]",
+             [sketch_warm_tier, thanos_archive, gorilla_s3_archive, double_write, \
+             prometheus_remote]",
             other,
         )),
     }
@@ -1359,6 +1367,37 @@ routes:
         });
         let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
         assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaS3Archive);
+    }
+
+    /// Phase ε.2: the controller's Mode 3
+    /// (`RawAtEdgePrometheusArchive`) emits `engine: prometheus_remote`
+    /// in the routing JSON for metrics whose raw data is shipped to
+    /// Prometheus's native OTLP receiver. The backend's parser must
+    /// accept this string and resolve to `StorageBackend::PrometheusRemote`
+    /// so the dispatcher's `engine_by_id` lookup hits the registered
+    /// `PrometheusForwardEngine`.
+    #[test]
+    fn json_payload_prometheus_remote_parses_to_prometheus_remote_backend() {
+        let value = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [{
+                "name": "node_cpu_seconds_total",
+                "targets": [
+                    { "engine": "prometheus_remote" }
+                ]
+            }]
+        });
+        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
+        assert_eq!(
+            r.lookup("node_cpu_seconds_total"),
+            StorageBackend::PrometheusRemote,
+        );
+        assert_eq!(
+            StorageBackend::PrometheusRemote.data_source_id(),
+            "prometheus_remote",
+            "the routing-table lookup must produce the same id the engine \
+             registers under so the dispatcher can find it",
+        );
     }
 
     #[test]
