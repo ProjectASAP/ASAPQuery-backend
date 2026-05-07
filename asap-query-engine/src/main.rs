@@ -704,45 +704,90 @@ async fn main() -> Result<()> {
     };
     server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
-    // Phase-5/6: register a `GorillaQueryEngine` for the cold
-    // archive tier when the operator has provisioned one via the
-    // `ASAP_GORILLA_S3_*` env-var family. `HttpServer::new` already
-    // registers the `SimpleEngine` for the warm tier; we just plug in
-    // the archive engine here so any metric whose
-    // `StreamingConfig::storage_backend()` is `GorillaS3Archive`
-    // routes through the router and answers exactly from S3.
+    // Phase-5/6 + Step-2.3: register an archive-tier engine on the
+    // capability router. Two operating modes, selected at startup:
     //
-    // When the env vars are absent (the common dev / unit-test case)
-    // we leave the router single-engine — non-`SketchWarmTier` metrics
-    // would then surface a `503 NoEngineRegistered` from the HTTP
-    // handler, which is the correct fail-loud behaviour: a deploy
-    // that pins `GorillaS3Archive` without provisioning the cold
-    // store is a configuration bug.
-    match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
-        Ok(s3_cfg) => {
-            match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
-                Ok(store) => {
-                    use query_engine_rust::engines::{GorillaEngineConfig, GorillaQueryEngine};
-                    use query_engine_rust::routing::QueryEngine;
-                    let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
-                        Arc::new(store),
-                        GorillaEngineConfig::default(),
-                    ));
-                    info!(
-                        "Registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
-                    );
-                    server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
+    // * **Path A2 mode** — when `ASAP_THANOS_QUERY_URL` is set, the
+    //   backend forwards archive-tier PromQL queries to a
+    //   `thanos-query` sidecar via the
+    //   [`ThanosForwardEngine`]. The forwarder is registered under
+    //   both `thanos_archive` (its native id, for explicit
+    //   `X-ASAP-Engine` overrides) and `gorilla_archive` (the legacy
+    //   archive slot that the existing
+    //   `compatible_storage_backends` failover sequence walks), so
+    //   per-metric routing config can target either name without
+    //   surprise. The legacy in-process `GorillaQueryEngine` is
+    //   skipped in this mode.
+    // * **Legacy mode** — when `ASAP_THANOS_QUERY_URL` is unset, the
+    //   in-process `GorillaQueryEngine` answers archive queries
+    //   from per-hour Gorilla chunks landed on S3 / MinIO via the
+    //   `GorillaS3Store`. This is the dev path and is preserved
+    //   verbatim until Phase δ deletes it after Path A2 is verified
+    //   end-to-end.
+    //
+    // When neither env-var family is configured we leave the router
+    // single-engine — non-`SketchWarmTier` metrics surface a
+    // `503 NoEngineRegistered` from the HTTP handler, which is the
+    // correct fail-loud behaviour for a misconfigured deploy.
+    match query_engine_rust::engines::gorilla::thanos_engine_from_env() {
+        Ok(Some(thanos)) => {
+            use query_engine_rust::engines::gorilla::DATA_SOURCE_THANOS_ARCHIVE_ID;
+            use query_engine_rust::routing::QueryEngine;
+            info!(
+                upstream = thanos.base_url(),
+                "Path A2: registering ThanosForwardEngine for the archive tier (data_source_id=thanos_archive, alias=gorilla_archive); legacy in-process GorillaQueryEngine skipped",
+            );
+            // Two registrations of the same engine instance: one
+            // under its native id (explicit overrides) and one
+            // aliased onto the legacy archive slot so the
+            // `compatible_storage_backends` failover sequence finds
+            // it transparently.
+            let thanos_arc: Arc<dyn QueryEngine> = Arc::new(thanos);
+            server = server
+                .with_query_engine_aliased(
+                    DATA_SOURCE_THANOS_ARCHIVE_ID,
+                    thanos_arc.clone(),
+                )
+                .with_query_engine_aliased(
+                    asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                    thanos_arc,
+                );
+        }
+        Ok(None) => {
+            // Legacy path: register the in-process Gorilla engine
+            // when its env vars are present.
+            match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
+                Ok(s3_cfg) => {
+                    match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
+                        Ok(store) => {
+                            use query_engine_rust::engines::{GorillaEngineConfig, GorillaQueryEngine};
+                            use query_engine_rust::routing::QueryEngine;
+                            let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
+                                Arc::new(store),
+                                GorillaEngineConfig::default(),
+                            ));
+                            info!(
+                                "Registering legacy in-process GorillaQueryEngine on the capability router (data_source_id=gorilla_archive); set ASAP_THANOS_QUERY_URL to switch to Path A2 thanos forwarding",
+                            );
+                            server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
+                        }
+                        Err(e) => {
+                            warn!(
+                                "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
+                Err(_) => {
+                    info!(
+                        "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing, or set ASAP_THANOS_QUERY_URL to enable Path A2 thanos forwarding)",
                     );
                 }
             }
         }
-        Err(_) => {
-            info!(
-                "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing)",
+        Err(e) => {
+            warn!(
+                "ASAP_THANOS_QUERY_URL set but ThanosForwardEngine failed to build ({e}); router will not have an archive engine",
             );
         }
     }

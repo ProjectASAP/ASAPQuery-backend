@@ -181,6 +181,27 @@ impl HttpServer {
         self
     }
 
+    /// Like [`Self::with_query_engine`] but registers the engine
+    /// under an explicit `data_source_id` instead of the one its
+    /// `capabilities()` reports. Used by Step-2.3's Path A2 wiring:
+    /// the same `ThanosForwardEngine` instance is registered under
+    /// both `thanos_archive` (its native id, for explicit overrides)
+    /// and `gorilla_archive` (the legacy archive slot that the
+    /// existing `compatible_storage_backends` failover sequence
+    /// walks). The legacy in-process `GorillaQueryEngine` is only
+    /// registered when `ASAP_THANOS_QUERY_URL` is unset, so the two
+    /// registrations never collide on the same id.
+    pub fn with_query_engine_aliased(
+        mut self,
+        id: &'static str,
+        engine: Arc<dyn QueryEngine>,
+    ) -> Self {
+        let mut router: EngineRouter = (*self.query_router).clone();
+        router.register_aliased(id, engine);
+        self.query_router = Arc::new(router);
+        self
+    }
+
     /// Attach a `HotReloadStreamingConfig` handle so the
     /// `GET/POST /api/v1/streaming-config` endpoints can read and
     /// swap the currently active config. Without this handle the
@@ -3684,6 +3705,225 @@ aggregations:
             ),
             StorageBackend::SketchWarmTier,
         );
+    }
+
+    // ── Step 2.3: Path A2 thanos forwarder integration tests ────────────────
+    //
+    // Pin the full HTTP path: backend receives PromQL → routes to
+    // `gorilla_archive` (via the alias) → forwards to a mock
+    // `thanos-query` sidecar → returns wrapped Prometheus response.
+    //
+    // The mock thanos sidecar is a tiny in-process axum server bound
+    // to an ephemeral 127.0.0.1 port; the real wire path runs end-to-
+    // end (reqwest serialises the form, axum parses it, the mock
+    // returns canned JSON, the engine parses it back, the HTTP
+    // handler annotates `data_source: thanos_archive` on the wire
+    // response).
+
+    #[tokio::test]
+    async fn http_archive_metric_forwards_to_thanos_query() {
+        use crate::engines::gorilla::thanos_forward::test_support::{
+            spawn_mock_thanos, CANNED_VECTOR_BODY,
+        };
+        use crate::engines::gorilla::{
+            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
+        };
+
+        let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
+        let cfg = ThanosForwardConfig {
+            base_url: mock_url,
+            request_timeout: std::time::Duration::from_secs(5),
+        };
+        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
+
+        // Mirror the binary's Step-2.3 wiring: register under both
+        // ids so the failover sequence finds the engine via
+        // `gorilla_archive` and explicit overrides reach it via
+        // `thanos_archive`.
+        let server_port = setup_test_server_with_router_aliased(
+            StorageBackend::GorillaS3Archive,
+            vec![
+                (DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine.clone()),
+                (
+                    StorageBackend::GorillaS3Archive.data_source_id(),
+                    arc_engine,
+                ),
+            ],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[
+                ("query", "up"),
+                ("time", "1700000000"),
+            ])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "thanos-forward dispatch must return 2xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The failover-dispatch path annotates `data_source:
+        // <metric_storage>.data_source_id()`, which for an
+        // archive-pinned metric is `gorilla_archive`. Path A2
+        // re-uses the archive tier slot in the routing matrix —
+        // the wire `data_source` reflects the *tier* (archive),
+        // not which engine implementation answered. The explicit
+        // `X-ASAP-Engine: thanos_archive` override path (covered
+        // by `http_engine_override_can_target_thanos_archive_id`)
+        // is the route that pins `data_source: thanos_archive`
+        // on the wire.
+        assert_data_source(&body, "gorilla_archive");
+    }
+
+    #[tokio::test]
+    async fn http_thanos_unreachable_returns_503_with_quirk() {
+        use crate::engines::gorilla::thanos_forward::test_support::spawn_mock_thanos_503;
+        use crate::engines::gorilla::{
+            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
+        };
+
+        let (mock_url, _mock_handle) = spawn_mock_thanos_503().await;
+        let cfg = ThanosForwardConfig {
+            base_url: mock_url,
+            request_timeout: std::time::Duration::from_secs(2),
+        };
+        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
+
+        let server_port = setup_test_server_with_router_aliased(
+            StorageBackend::GorillaS3Archive,
+            vec![
+                (DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine.clone()),
+                (
+                    StorageBackend::GorillaS3Archive.data_source_id(),
+                    arc_engine,
+                ),
+            ],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "up"), ("time", "1700000000")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        // The HTTP handler maps `EngineError::Backend` to 5xx via
+        // `EngineRouterError::AllFailed`. We only assert on 5xx
+        // (any 5xx is acceptable; the precise code is determined by
+        // the router-error → status mapping).
+        assert!(
+            resp.status().is_server_error(),
+            "thanos-unreachable dispatch must return 5xx; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The error body must mention the quirk so the upcoming
+        // Step-2.4 e2e demo can pin fail-loud behaviour.
+        let body_str = serde_json::to_string(&body).unwrap();
+        assert!(
+            body_str.contains("thanos_unreachable"),
+            "5xx body must carry thanos_unreachable marker; got {body_str}",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_engine_override_can_target_thanos_archive_id() {
+        // X-ASAP-Engine: thanos_archive must reach the forwarder
+        // even when the metric's storage axis would otherwise route
+        // to the warm tier. Path A2's accuracy reducer relies on
+        // this for apples-to-apples comparison runs.
+        use crate::engines::gorilla::thanos_forward::test_support::{
+            spawn_mock_thanos, CANNED_VECTOR_BODY,
+        };
+        use crate::engines::gorilla::{
+            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
+        };
+
+        let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
+        let cfg = ThanosForwardConfig {
+            base_url: mock_url,
+            request_timeout: std::time::Duration::from_secs(5),
+        };
+        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
+
+        let server_port = setup_test_server_with_router_aliased(
+            StorageBackend::SketchWarmTier, // Default storage axis is warm tier.
+            vec![(DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine)],
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "up"), ("time", "1700000000")])
+            .header(ENGINE_OVERRIDE_HEADER, DATA_SOURCE_THANOS_ARCHIVE_ID)
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "X-ASAP-Engine: thanos_archive must reach the forwarder; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "thanos_archive");
+    }
+
+    /// Build an `HttpServer` whose router holds the supplied set of
+    /// `(alias_id, engine)` pairs. Mirrors `setup_test_server_with_router`
+    /// but uses [`HttpServer::with_query_engine_aliased`] so a single
+    /// engine instance can register under multiple ids — the Step-2.3
+    /// pattern Path A2 relies on.
+    async fn setup_test_server_with_router_aliased(
+        metric_storage_backend: StorageBackend,
+        aliased_engines: Vec<(&'static str, Arc<dyn QueryEngine>)>,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        let streaming_cfg =
+            StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
+        let streaming_arc = Arc::new(streaming_cfg);
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_arc.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_arc,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let mut server = HttpServer::new(config, query_engine, store, None)
+            .with_hot_reload_config(hot_reload);
+        for (id, engine) in aliased_engines {
+            server = server.with_query_engine_aliased(id, engine);
+        }
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
     }
 
 }
