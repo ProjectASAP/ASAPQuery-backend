@@ -72,7 +72,7 @@ These functions always go directly to the precomputed pipeline (not in `promsket
 
 > **NOTE:** The Prometheus / VictoriaMetrics remote-write ingest path was
 > removed; backend ingest is OTLP-only now (sketch envelopes from
-> sketchcol / sketchotap / sketchtelegraf in ASAPCollector). Sections that
+> asap-otel / asap-otap / asap-telegraf in ASAPCollector). Sections that
 > assume a `/api/v1/write` listener on the query engine no longer apply —
 > see `README.md` for the current architecture.
 
@@ -103,7 +103,7 @@ sampling:
 ## 5. Deployment Checklist
 
 > **HISTORICAL:** The remote-write ingest path described below was removed.
-> Drive ingest from ASAPCollector (sketchcol / sketchotap / sketchtelegraf)
+> Drive ingest from ASAPCollector (asap-otel / asap-otap / asap-telegraf)
 > over OTLP into the query engine's OTLP ports (gRPC 4317 / HTTP 4318)
 > instead. The `--promsketch-config` flag is still honoured for sketch
 > tuning when the precompute streaming engine is enabled.
