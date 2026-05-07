@@ -213,14 +213,6 @@ struct Args {
     #[arg(long)]
     schema_eviction_dry_run: bool,
 
-    /// Enable automatic query tracking and planning
-    #[arg(long)]
-    enable_query_tracker: bool,
-
-    /// Query tracker: observation window in seconds before triggering planning
-    #[arg(long, default_value = "100")]
-    tracker_observation_window_secs: u64,
-
     // ---- SimpleMapStore persistence ----
     //
     // When --persistence-enabled is set, the store is constructed via
@@ -624,36 +616,12 @@ async fn main() -> Result<()> {
         adapter_config,
     };
 
-    let query_tracker = if args.enable_query_tracker {
-        use query_engine_rust::planner_client::LocalPlannerClient;
-        use query_engine_rust::QueryTrackerConfig;
-
-        let tracker_config = QueryTrackerConfig {
-            observation_window_secs: args.tracker_observation_window_secs,
-            prometheus_scrape_interval: args.prometheus_scrape_interval,
-        };
-        let runtime_options = asap_planner::RuntimeOptions {
-            prometheus_scrape_interval: args.prometheus_scrape_interval,
-            streaming_engine: asap_planner::StreamingEngine::Precompute,
-            enable_punting: false,
-            range_duration: 300,
-            step: args.prometheus_scrape_interval,
-        };
-        let planner_client = Arc::new(LocalPlannerClient::new(
-            runtime_options,
-            args.query_language,
-            args.prometheus_server.clone(),
-        ));
-        let tracker = Arc::new(query_engine_rust::QueryTracker::new(tracker_config));
-        let _tracker_handle = tracker.start_background_loop(planner_client);
-        info!(
-            "Query tracker enabled (observation window: {}s)",
-            args.tracker_observation_window_secs
-        );
-        Some(tracker)
-    } else {
-        None
-    };
+    // The legacy in-backend query tracker / LocalPlannerClient was
+    // removed in Phase γ (deletion of `asap-planner-rs`). The
+    // ASAPCollector controller is now the sole emitter of streaming
+    // configs / `BackendStorageRouting`; the backend is a pure
+    // executor that consumes plans pushed via
+    // `POST /api/v1/streaming-config` and `POST /api/v1/storage_routing`.
 
     // Forward the precompute engine's schema registry to the HTTP
     // server so `POST /api/v1/streaming-config` can drive schema
@@ -661,7 +629,7 @@ async fn main() -> Result<()> {
     // design, §6). When precompute isn't enabled, the registry is
     // absent and the swap handler no-ops on schema reconciliation
     // (legacy per-batch reconcile in ingest still works).
-    let mut server = HttpServer::new(http_config, engine, store.clone(), query_tracker)
+    let mut server = HttpServer::new(http_config, engine, store.clone())
         .with_hot_reload_config(hot_reload_config.clone());
 
     // Per-metric storage-backend routing table (issue #46

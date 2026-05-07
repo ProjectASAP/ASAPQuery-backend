@@ -280,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             handle_http_requests: true,
             adapter_config,
         };
-        let mut http_server = HttpServer::new(http_config, query_engine, store.clone(), None);
+        let mut http_server = HttpServer::new(http_config, query_engine, store.clone());
 
         // Per-metric storage-backend routing table (issue #46
         // criterion ⑤). When provided, the HTTP handler consults this
