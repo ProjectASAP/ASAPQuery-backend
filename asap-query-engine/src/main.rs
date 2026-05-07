@@ -729,6 +729,42 @@ async fn main() -> Result<()> {
             );
         }
     }
+
+    // Phase ε.2: register a `PrometheusForwardEngine` under the
+    // `prometheus_remote` engine id when `ASAP_PROMETHEUS_QUERY_URL`
+    // is set. The controller's Mode 3 (`RawAtEdgePrometheusArchive`)
+    // emits routing-table entries with `engine: prometheus_remote`
+    // for metrics whose raw data is shipped to Prometheus's native
+    // OTLP receiver. When the env var is unset the engine is not
+    // registered; if a routing-table entry references
+    // `prometheus_remote` in that case, the dispatcher returns a
+    // clear `NoEngineRegistered` 503 — fail-loud is the correct
+    // behaviour for a misconfigured deploy.
+    //
+    // Mirrors the `ASAP_THANOS_QUERY_URL` wiring above; the two
+    // engines coexist on the router under different ids and answer
+    // different routing-table entries.
+    match query_engine_rust::engines::prometheus::prometheus_engine_from_env() {
+        Ok(Some(prom)) => {
+            use query_engine_rust::routing::QueryEngine;
+            info!(
+                upstream = prom.base_url(),
+                "Phase ε.2: registering PrometheusForwardEngine on the capability router (data_source_id=prometheus_remote); routing-table entries that reference `prometheus_remote` will dispatch here",
+            );
+            server = server.with_query_engine(Arc::new(prom) as Arc<dyn QueryEngine>);
+        }
+        Ok(None) => {
+            info!(
+                "ASAP_PROMETHEUS_QUERY_URL not set — PrometheusForwardEngine skipped; routing-table entries referencing `prometheus_remote` will surface NoEngineRegistered",
+            );
+        }
+        Err(e) => {
+            warn!(
+                "ASAP_PROMETHEUS_QUERY_URL set but PrometheusForwardEngine failed to build ({e}); router will not have a prometheus_remote engine",
+            );
+        }
+    }
+
     if let Some(ingest_state) = precompute_ingest_state.as_ref() {
         server = server.with_schemas(ingest_state.schemas.clone());
     }

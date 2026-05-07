@@ -385,6 +385,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        // Phase ε.2: register a `PrometheusForwardEngine` under the
+        // `prometheus_remote` engine id when
+        // `ASAP_PROMETHEUS_QUERY_URL` is set. Mirrors the block in
+        // `src/main.rs` so the `precompute_engine` binary (used by
+        // the deploy/docker image) matches the full backend's
+        // behaviour.
+        match query_engine_rust::engines::prometheus::prometheus_engine_from_env() {
+            Ok(Some(prom)) => {
+                use query_engine_rust::routing::QueryEngine;
+                info!(
+                    upstream = prom.base_url(),
+                    "Phase ε.2: registering PrometheusForwardEngine on the capability router (data_source_id=prometheus_remote)",
+                );
+                http_server = http_server
+                    .with_query_engine(Arc::new(prom) as Arc<dyn QueryEngine>);
+            }
+            Ok(None) => {
+                info!(
+                    "ASAP_PROMETHEUS_QUERY_URL not set — PrometheusForwardEngine skipped; routing-table entries referencing `prometheus_remote` will surface NoEngineRegistered",
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "ASAP_PROMETHEUS_QUERY_URL set but PrometheusForwardEngine failed to build ({e}); router will not have a prometheus_remote engine",
+                );
+            }
+        }
+
         tokio::spawn(async move {
             if let Err(e) = http_server.run().await {
                 tracing::error!("Query server error: {}", e);

@@ -563,4 +563,62 @@ mod tests {
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1, "later registration wins");
     }
+
+    /// Phase ε.2: a routing-table entry with
+    /// `metric_storage = StorageBackend::PrometheusRemote` must
+    /// dispatch to the engine registered under `prometheus_remote`.
+    /// Mirrors the gorilla-archive single-backend dispatch test;
+    /// PrometheusRemote also has no failover (the metric's data
+    /// never landed in ASAP-managed storage) so the failover
+    /// sequence is just `[PrometheusRemote]`.
+    #[tokio::test]
+    async fn router_dispatches_to_prometheus_remote_for_mode3_metrics() {
+        let mut router = EngineRouter::new();
+        let (prom, prom_calls) =
+            StubEngine::new(StorageBackend::PrometheusRemote, Outcome::Ok);
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        router.register(prom);
+        router.register(warm);
+
+        let result = router
+            .execute(
+                "rate(node_cpu_seconds_total[5m])",
+                Statistic::Rate,
+                AccuracyTarget::Exact,
+                StorageBackend::PrometheusRemote,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(prom_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            0,
+            "warm-tier must not run for a Mode 3 metric — Prometheus owns the storage",
+        );
+    }
+
+    /// Phase ε.2: when `ASAP_PROMETHEUS_QUERY_URL` is unset the
+    /// `prometheus_remote` engine is not registered, and a routing
+    /// entry that targets it must surface a clear
+    /// `NoEngineRegistered` error rather than silently falling
+    /// through.
+    #[tokio::test]
+    async fn router_with_no_prometheus_engine_errors_for_mode3_metric() {
+        let router = EngineRouter::new();
+        let result = router
+            .execute(
+                "rate(node_cpu_seconds_total[5m])",
+                Statistic::Rate,
+                AccuracyTarget::Exact,
+                StorageBackend::PrometheusRemote,
+            )
+            .await;
+        match result {
+            Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
+                assert_eq!(tried, vec![StorageBackend::PrometheusRemote]);
+                assert!(registered.is_empty());
+            }
+            other => panic!("expected NoEngineRegistered, got {other:?}"),
+        }
+    }
 }

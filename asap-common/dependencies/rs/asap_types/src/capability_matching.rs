@@ -54,6 +54,17 @@ pub enum StorageBackend {
     /// cost-aware dispatcher picks per query (typically warm-tier for low-
     /// latency approximate, archive for exact).
     DoubleWrite,
+
+    /// Prometheus-remote: the metric's data is shipped raw to a
+    /// Prometheus instance via the native OTLP receiver. Phase ε.2
+    /// registers a `PrometheusForwardEngine` (HTTP-forwarder to
+    /// Prometheus's `/api/v1/query`) under this slot so the
+    /// controller's `RawAtEdgePrometheusArchive` mode can route a
+    /// metric's queries to Prometheus directly. Mirrors the
+    /// `GorillaS3Archive` slot's "single backend, no failover"
+    /// semantics — there is no warm-tier sketch to fall back on for a
+    /// Prometheus-remote metric.
+    PrometheusRemote,
 }
 
 impl StorageBackend {
@@ -65,6 +76,7 @@ impl StorageBackend {
             StorageBackend::SketchWarmTier => "sketch_warm",
             StorageBackend::GorillaS3Archive => "gorilla_archive",
             StorageBackend::DoubleWrite => "double_write",
+            StorageBackend::PrometheusRemote => "prometheus_remote",
         }
     }
 }
@@ -218,6 +230,16 @@ pub fn compatible_storage_backends(
                 StorageBackend::GorillaS3Archive,
             ],
         },
+        // Phase ε.2: Prometheus-remote metrics route only to the
+        // Prometheus forwarder. There is no warm-tier sketch to fall
+        // back on (the metric's raw samples never landed in
+        // ASAP-managed storage), so the failover sequence is the
+        // single backend itself; a missing engine surfaces as a
+        // `NoEngineRegistered` 503 from the HTTP handler, which is
+        // the correct fail-loud behaviour for a misconfigured deploy.
+        StorageBackend::PrometheusRemote => {
+            vec![StorageBackend::PrometheusRemote]
+        }
     }
 }
 
@@ -1285,6 +1307,10 @@ mod tests {
             StorageBackend::DoubleWrite.data_source_id(),
             "double_write",
         );
+        assert_eq!(
+            StorageBackend::PrometheusRemote.data_source_id(),
+            "prometheus_remote",
+        );
     }
 
     /// Source-of-truth agreement check, mirrors
@@ -1312,6 +1338,7 @@ mod tests {
             StorageBackend::SketchWarmTier,
             StorageBackend::GorillaS3Archive,
             StorageBackend::DoubleWrite,
+            StorageBackend::PrometheusRemote,
         ];
 
         for &stat in &stats {
@@ -1326,9 +1353,11 @@ mod tests {
                     let last = *backends.last().unwrap();
                     assert!(
                         last == StorageBackend::SketchWarmTier
-                            || last == StorageBackend::GorillaS3Archive,
+                            || last == StorageBackend::GorillaS3Archive
+                            || last == StorageBackend::PrometheusRemote,
                         "backend list for ({stat:?}, {acc:?}, {cfg:?}) must terminate in a \
-                         dispatchable failover (SketchWarmTier or GorillaS3Archive); got {last:?}",
+                         dispatchable failover (SketchWarmTier, GorillaS3Archive, or \
+                         PrometheusRemote); got {last:?}",
                     );
                     // The expected head is determined by `(metric_storage_config, accuracy)`:
                     let expected_head = match (cfg, acc) {
@@ -1339,6 +1368,9 @@ mod tests {
                         }
                         (StorageBackend::DoubleWrite, AccuracyTarget::Approximate) => {
                             StorageBackend::SketchWarmTier
+                        }
+                        (StorageBackend::PrometheusRemote, _) => {
+                            StorageBackend::PrometheusRemote
                         }
                     };
                     assert_eq!(
