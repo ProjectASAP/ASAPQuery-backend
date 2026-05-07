@@ -14,9 +14,6 @@ pub const QUERY_STATUS_UNSUPPORTED: &str = "unsupported";
 pub const QUERY_TYPE_INSTANT: &str = "instant";
 pub const QUERY_TYPE_RANGE: &str = "range";
 
-pub const INGEST_PROTO_PROM_RW: &str = "prometheus_rw";
-pub const INGEST_PROTO_VM_RW: &str = "victoriametrics_rw";
-
 lazy_static! {
     pub static ref QUERY_REQUESTS_TOTAL: CounterVec = register_counter_vec!(
         "asap_query_requests_total",

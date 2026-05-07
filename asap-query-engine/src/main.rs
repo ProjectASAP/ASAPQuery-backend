@@ -121,14 +121,6 @@ struct Args {
     #[arg(long, value_enum)]
     lock_strategy: LockStrategy,
 
-    /// Enable Prometheus remote write ingest endpoint
-    #[arg(long)]
-    enable_prometheus_remote_write: bool,
-
-    /// Port for the Prometheus remote write endpoint
-    #[arg(long, default_value = "9090")]
-    prometheus_remote_write_port: u16,
-
     /// Path to promsketch configuration YAML file (optional; uses defaults if omitted)
     #[arg(long)]
     promsketch_config: Option<String>,
@@ -186,10 +178,9 @@ struct Args {
     /// for controller REFRESH dispatch validation. When on, a
     /// background task picks up queued jobs and runs them through
     /// `BackfillWindowProcessor` (real sketch rebuild + store
-    /// writes). Requires `--enable-prometheus-remote-write` or
-    /// `--streaming-engine=precompute` so the schema registry is
-    /// available; otherwise a warning is logged and the service
-    /// stays down.
+    /// writes). Requires `--streaming-engine=precompute` so the
+    /// schema registry is available; otherwise a warning is logged
+    /// and the service stays down.
     #[arg(long)]
     enable_backfill_worker: bool,
 
@@ -378,25 +369,6 @@ async fn main() -> Result<()> {
         ))
     };
 
-    // // Setup PromSketchStore (shared between engine and remote write server)
-    // let promsketch_store = if args.enable_prometheus_remote_write {
-    //     let promsketch_config = match &args.promsketch_config {
-    //         Some(path) => {
-    //             let cfg = read_promsketch_config(path)?;
-    //             info!("Loaded promsketch config from {}: {:?}", path, cfg);
-    //             cfg
-    //         }
-    //         None => {
-    //             info!("Using default promsketch config");
-    //             PromSketchConfig::default()
-    //         }
-    //     };
-    //     info!("Prometheus remote write enabled: creating PromSketchStore");
-    //     Some(Arc::new(PromSketchStore::new(promsketch_config)))
-    // } else {
-    //     None
-    // };
-
     // Setup query engine. SimpleEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
     // to /api/v1/streaming-config is observable by the next query
@@ -494,18 +466,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Setup precompute engine (replaces standalone Prometheus remote write server)
-    // Automatically enable when using precompute streaming engine.
+    // Setup precompute engine. Automatically enabled when the configured
+    // streaming engine is Precompute. Backend ingest is OTLP-only — the
+    // precompute engine no longer hosts an HTTP listener of its own; the
+    // OTLP receiver below pushes envelopes / raw points into the worker
+    // pool via the `IngestState` handle returned by `engine.ingest_state()`.
     //
     // NOTE: precompute is constructed BEFORE the OTLP receiver so the receiver
     // can obtain an `Arc<IngestState>` handle and push OTLP metrics / sketches
     // into the same worker pool (and not just write directly to the store).
-    let enable_precompute =
-        args.enable_prometheus_remote_write || args.streaming_engine == StreamingEngine::Precompute;
+    let enable_precompute = args.streaming_engine == StreamingEngine::Precompute;
     let (precompute_handle, precompute_ingest_state) = if enable_precompute {
         let precompute_config = PrecomputeEngineConfig {
             num_workers: args.precompute_num_workers,
-            ingest_port: args.prometheus_remote_write_port,
             allowed_lateness_ms: args.precompute_allowed_lateness_ms,
             max_buffer_per_series: args.precompute_max_buffer_per_series,
             flush_interval_ms: args.precompute_flush_interval_ms,
@@ -521,10 +494,7 @@ async fn main() -> Result<()> {
             PrecomputeEngine::new(precompute_config, hot_reload_config.clone(), output_sink);
         let worker_diagnostics = engine.diagnostics();
         let ingest_state = engine.ingest_state();
-        info!(
-            "Starting precompute engine on port {}",
-            args.prometheus_remote_write_port
-        );
+        info!("Starting precompute engine (OTLP-fed; no HTTP ingest port)");
 
         // Spawn periodic memory diagnostics logger
         let diag_store = store.clone();

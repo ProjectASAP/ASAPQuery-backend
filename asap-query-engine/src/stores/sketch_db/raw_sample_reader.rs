@@ -38,9 +38,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 /// A single raw sample read from the exact DB during a backfill.
-/// Shape mirrors `drivers::ingest::prometheus_remote_write::DecodedSample`
-/// so the downstream sketch builder can consume both native ingest
-/// and backfill output through one code path.
+/// Shape mirrors what the OTLP ingest path emits internally so the
+/// downstream sketch builder can consume both native ingest and
+/// backfill output through one code path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawSample {
     /// Full series key (Prometheus-style `metric{k="v",...}` string)

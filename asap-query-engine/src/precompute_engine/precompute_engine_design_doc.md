@@ -19,32 +19,27 @@ and VictoriaMetrics remote write), buffers them, computes windowed aggregations
 ## 2. Architecture
 
 ```
-         Prometheus Remote Write       VictoriaMetrics Remote Write
-          (Snappy + Protobuf)             (Zstd + Protobuf)
-                  |                              |
-                  v                              v
-         POST /api/v1/write           POST /api/v1/import
-                  \                            /
-                   \                          /
-                    Axum HTTP Server (:9090)
-                            |
-                  route_decoded_samples()
-                   (group by series key)
-                            |
-                     SeriesRouter (hash)
-                   /        |        \
-              Worker 0   Worker 1   Worker 2  ...  Worker N-1
-              (shard 0)  (shard 1)  (shard 2)      (shard N-1)
-                 |           |           |              |
-                 +---------- + --------- + ----------- +
-                             |
-                      OutputSink.emit_batch()
-                             |
-                          Store
-                   (SimpleMapStore / PerKey)
-                             |
-                      Query Engine
-                   (PromQL / SQL / etc.)
+                 OTLP receiver (gRPC :4317 / HTTP :4318)
+                  raw points + sketch envelopes (modified-OTLP)
+                                  |
+                                  v
+                    IngestState (route_otel_*)
+                     (group by series key)
+                                  |
+                            SeriesRouter (hash)
+                          /        |        \
+                     Worker 0   Worker 1   Worker 2  ...  Worker N-1
+                     (shard 0)  (shard 1)  (shard 2)      (shard N-1)
+                        |           |           |              |
+                        +---------- + --------- + ----------- +
+                                    |
+                             OutputSink.emit_batch()
+                                    |
+                                 Store
+                          (SimpleMapStore / PerKey)
+                                    |
+                             Query Engine
+                          (PromQL / SQL / etc.)
 ```
 
 A periodic **flush timer** broadcasts `Flush` messages to all workers so that
@@ -193,7 +188,6 @@ pub struct PrecomputeEngine {
 ```rust
 pub struct PrecomputeEngineConfig {
     pub num_workers: usize,              // default: 4
-    pub ingest_port: u16,                // default: 9090
     pub allowed_lateness_ms: i64,        // default: 5,000
     pub max_buffer_per_series: usize,    // default: 10,000
     pub flush_interval_ms: u64,          // default: 1,000
@@ -1147,7 +1141,6 @@ independently.
 ```bash
 cargo run --bin precompute_engine -- \
   --streaming-config streaming_config.yaml \
-  --ingest-port 9090 \
   --num-workers 4 \
   --allowed-lateness-ms 5000 \
   --max-buffer-per-series 10000 \
@@ -1161,7 +1154,8 @@ cargo run --bin precompute_engine -- \
 ### Embedded in main binary
 
 The precompute engine is also embedded in the main `query_engine_rust` binary,
-enabled via `--enable-prometheus-remote-write`. In this mode it shares the
+auto-enabled by `--streaming-engine=precompute`. Ingest reaches it via the
+OTLP receiver (which holds the same `IngestState` handle), and it shares the
 store with the Kafka consumer path.
 
 ## 11. Testing
@@ -1179,10 +1173,14 @@ store with the Kafka consumer path.
 
 - **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `series_buffer.rs` (ordering, watermark), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
 
-- **E2E test** (`bin/test_e2e_precompute.rs`): Starts engine + store + query
-  server in-process, sends remote-write samples over HTTP, queries via PromQL HTTP,
-  validates aggregated results. Includes batch latency benchmark, windowed throughput
-  benchmark (W=1/3/6), and worker scalability benchmark (1-16 workers).
+- **E2E coverage**: end-to-end paths now run through the OTLP receiver
+  driving the same `IngestState` (`tests/e2e_modified_otlp_sketch_path.rs`,
+  `tests/edge_runtime_consumes_precompute_rs.rs`, demo runs in
+  `asap-quickstart/`). The legacy in-process remote-write E2E binaries
+  (`bin/test_e2e_precompute.rs`, `bin/e2e_quickstart_resource_test.rs`,
+  `bin/bench_precompute_sketch.rs`) and the equivalent test
+  (`tests/e2e_precompute_equivalence.rs`) were removed when the
+  remote-write ingest path was deleted.
 
 ## 12. Known Data Loss Cases and Fault Tolerance TODOs
 
@@ -1227,7 +1225,9 @@ A lighter alternative: **periodic pane snapshots** written to disk at each flush
 
 | File | Purpose |
 |------|---------|
-| `precompute_engine/mod.rs` | Orchestrator, HTTP ingest handler |
+| `precompute_engine/mod.rs` | Orchestrator |
+| `precompute_engine/engine.rs` | `PrecomputeEngine` (workers + flush timer; OTLP-fed via `IngestState`) |
+| `precompute_engine/ingest_handler.rs` | `IngestState`: shared router, schema registry, §6.3 barrier helpers |
 | `precompute_engine/config.rs` | `PrecomputeEngineConfig`, `LateDataPolicy` |
 | `precompute_engine/worker.rs` | Per-shard processing, aggregation, window management |
 | `precompute_engine/series_router.rs` | Hash-based series → worker routing |
@@ -1236,4 +1236,3 @@ A lighter alternative: **periodic pane snapshots** written to disk at each flush
 | `precompute_engine/accumulator_factory.rs` | `AccumulatorUpdater` trait + factory |
 | `precompute_engine/output_sink.rs` | `OutputSink` trait + `StoreOutputSink`, `NoopOutputSink`, `CapturingOutputSink` (testing) |
 | `bin/precompute_engine.rs` | Standalone CLI binary |
-| `bin/test_e2e_precompute.rs` | End-to-end integration test |

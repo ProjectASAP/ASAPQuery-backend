@@ -3642,7 +3642,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "snap",
  "sql_utilities",
  "sqlparser 0.59.0",
  "structopt",
@@ -3657,7 +3656,6 @@ dependencies = [
  "urlencoding",
  "uuid",
  "xxhash-rust",
- "zstd",
 ]
 
 [[package]]

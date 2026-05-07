@@ -90,11 +90,12 @@ fn make_count_min_agg_config(
 }
 
 /// Engine config with a fast flush interval so the test does not have to
-/// wait long after the watermark advances.
-fn engine_config(precompute_port: u16) -> PrecomputeEngineConfig {
+/// wait long after the watermark advances. The legacy remote-write HTTP
+/// listener (and its `ingest_port`) was removed; OTLP receiver ports are
+/// configured separately on the receiver itself.
+fn engine_config() -> PrecomputeEngineConfig {
     PrecomputeEngineConfig {
         num_workers: 2,
-        ingest_port: precompute_port,
         allowed_lateness_ms: 0,
         max_buffer_per_series: 10_000,
         flush_interval_ms: 100,
@@ -204,7 +205,6 @@ async fn e2e_count_min_sketch_modified_otlp_path() {
     let rows = 2u32;
     let cols = 4u32;
 
-    let precompute_port = 19500u16;
     let otlp_grpc_port = 19501u16;
     let otlp_http_port = 19502u16;
 
@@ -222,7 +222,7 @@ async fn e2e_count_min_sketch_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
@@ -434,7 +434,6 @@ async fn e2e_count_sketch_modified_otlp_path() {
     let rows = 2u32;
     let cols = 4u32;
 
-    let precompute_port = 19510u16;
     let otlp_grpc_port = 19511u16;
     let otlp_http_port = 19512u16;
 
@@ -452,7 +451,7 @@ async fn e2e_count_sketch_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
@@ -640,7 +639,6 @@ async fn e2e_kll_sketch_modified_otlp_path() {
     let window_secs = 1u64;
     let k = 200u32;
 
-    let precompute_port = 19520u16;
     let otlp_grpc_port = 19521u16;
     let otlp_http_port = 19522u16;
 
@@ -651,7 +649,7 @@ async fn e2e_kll_sketch_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
@@ -828,7 +826,6 @@ async fn e2e_dd_sketch_modified_otlp_path() {
     let window_secs = 1u64;
     let alpha = 0.01;
 
-    let precompute_port = 19530u16;
     let otlp_grpc_port = 19531u16;
     let otlp_http_port = 19532u16;
 
@@ -840,7 +837,7 @@ async fn e2e_dd_sketch_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
@@ -1004,7 +1001,6 @@ async fn e2e_hll_sketch_modified_otlp_path() {
     let precision = 4u32;
     let num_registers = 1usize << precision;
 
-    let precompute_port = 19540u16;
     let otlp_grpc_port = 19541u16;
     let otlp_http_port = 19542u16;
 
@@ -1016,7 +1012,7 @@ async fn e2e_hll_sketch_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
@@ -1148,7 +1144,6 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     let rows = 2u32;
     let cols = 4u32;
 
-    let precompute_port = 19550u16;
     let otlp_grpc_port = 19551u16;
     let otlp_http_port = 19552u16;
 
@@ -1166,7 +1161,7 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
 
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
-        engine_config(precompute_port),
+        engine_config(),
         query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );

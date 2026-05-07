@@ -22,10 +22,6 @@ struct Args {
     #[arg(long)]
     streaming_config: String,
 
-    /// Port for Prometheus remote write ingest
-    #[arg(long, default_value_t = 9090)]
-    ingest_port: u16,
-
     /// Number of worker threads
     #[arg(long, default_value_t = 4)]
     num_workers: usize,
@@ -400,7 +396,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Build the precompute engine config
     let engine_config = PrecomputeEngineConfig {
         num_workers: args.num_workers,
-        ingest_port: args.ingest_port,
         allowed_lateness_ms: args.allowed_lateness_ms,
         max_buffer_per_series: args.max_buffer_per_series,
         flush_interval_ms: args.flush_interval_ms,

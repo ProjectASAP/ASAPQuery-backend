@@ -70,10 +70,14 @@ These functions always go directly to the precomputed pipeline (not in `promsket
 
 ### CLI Arguments
 
+> **NOTE:** The Prometheus / VictoriaMetrics remote-write ingest path was
+> removed; backend ingest is OTLP-only now (sketch envelopes from
+> sketchcol / sketchotap / sketchtelegraf in ASAPCollector). Sections that
+> assume a `/api/v1/write` listener on the query engine no longer apply —
+> see `README.md` for the current architecture.
+
 | Argument                            | Description                                                       | Default         |
 |-------------------------------------|-------------------------------------------------------------------|-----------------|
-| `--enable-prometheus-remote-write`  | Enable the Prometheus remote write ingest endpoint                | `false`         |
-| `--prometheus-remote-write-port`    | Port for the Prometheus remote write HTTP server                  | `9090`          |
 | `--auto-init-sketches`              | Auto-initialize all 3 sketch types for every new series           | `true`          |
 | `--promsketch-config`               | Path to a sketch configuration YAML file (optional)               | (none)          |
 
@@ -98,26 +102,20 @@ sampling:
 
 ## 5. Deployment Checklist
 
-### Start QueryEngine with remote write enabled:
+> **HISTORICAL:** The remote-write ingest path described below was removed.
+> Drive ingest from ASAPCollector (sketchcol / sketchotap / sketchtelegraf)
+> over OTLP into the query engine's OTLP ports (gRPC 4317 / HTTP 4318)
+> instead. The `--promsketch-config` flag is still honoured for sketch
+> tuning when the precompute streaming engine is enabled.
+
+### Start QueryEngine
 
 ```bash
 ./query_engine \
-  --enable-prometheus-remote-write \
-  --prometheus-remote-write-port 9090 \
+  --streaming-engine=precompute \
+  --enable-otel-ingest \
   --promsketch-config promsketch_config.yaml   # optional
 ```
-
-### Configure Prometheus (or any remote write sender) to write to the endpoint:
-
-```yaml
-# prometheus.yml
-remote_write:
-  - url: "http://<query-engine-host>:9090/api/v1/write"
-```
-
-### Verify ingestion
-
-Check logs for `"Received N samples"` messages.
 
 ### Verify queries
 
