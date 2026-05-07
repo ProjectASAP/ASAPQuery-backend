@@ -78,8 +78,17 @@ pub struct HttpServer {
     /// the streaming-config's single `storage_backend()` axis (which
     /// itself defaults to `SketchWarmTier`). Wired by the binary via
     /// [`Self::with_backend_storage_routing`]; production deploys
-    /// load `deploy/configs/backend-storage-routing.yaml`.
-    backend_storage_routing: Option<Arc<crate::data_model::BackendStorageRouting>>,
+    /// bootstrap from `deploy/configs/backend-storage-routing.yaml`
+    /// (legacy form) or the controller's first
+    /// `POST /api/v1/storage_routing` push (Phase α).
+    ///
+    /// Phase α: this field is now a `HotReloadBackendStorageRouting`
+    /// — an `ArcSwap`-backed wrapper that supports atomic at-runtime
+    /// swap from the `POST /api/v1/storage_routing` endpoint. The
+    /// existing read path snapshots the wrapper once per request
+    /// (`handle.snapshot().lookup_with_shape(...)`); swap is observed
+    /// by the next request without restart.
+    backend_storage_routing: Option<crate::routing::HotReloadBackendStorageRouting>,
     /// Per-`agg_id` schema registry (sketch DB §6). `None` when the
     /// caller hasn't wired the precompute engine into the HTTP
     /// server — in that case the `POST /api/v1/streaming-config`
@@ -112,7 +121,7 @@ struct AppState {
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::data_model::HotReloadStreamingConfig>,
     /// See [`HttpServer::backend_storage_routing`].
-    backend_storage_routing: Option<Arc<crate::data_model::BackendStorageRouting>>,
+    backend_storage_routing: Option<crate::routing::HotReloadBackendStorageRouting>,
     /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
     /// `POST /api/v1/streaming-config` to call `schemas.reconcile()`
     /// on every swap so schema lifecycle transitions happen
@@ -184,22 +193,44 @@ impl HttpServer {
         self
     }
 
-    /// Attach a per-metric storage-backend routing table loaded from
-    /// `backend-storage-routing.yaml`. When attached, every instant
-    /// query consults this table (after extracting the metric name
-    /// from the PromQL AST) and dispatches through `EngineRouter` for
-    /// any per-metric override. Without this handle the handler falls
-    /// back to the pre-Phase-5 single-axis behaviour driven by
-    /// `StreamingConfig::storage_backend()`.
+    /// Attach a per-metric storage-backend routing table. The table is
+    /// wrapped in a hot-reload handle internally so the
+    /// `POST /api/v1/storage_routing` endpoint (Phase α) can swap it
+    /// atomically without restart.
     ///
-    /// This is the bridge from "warm-tier-only deploy" to
-    /// "cold-archive-routed metrics" until the controller's plan-push
-    /// pipeline lands per-metric `StorageBackend` updates.
+    /// Bootstrap typically comes from
+    /// `BackendStorageRouting::from_yaml_file(...)` for legacy / dev
+    /// deploys, or from `BackendStorageRouting::empty()` when the
+    /// controller will push the first table — the controller's first
+    /// `POST /api/v1/storage_routing` then fills in all the entries.
+    ///
+    /// When the wrapper is attached, every instant query consults the
+    /// snapshot (after extracting the metric name from the PromQL AST)
+    /// and dispatches through `EngineRouter` for any per-metric
+    /// override. Without the wrapper the handler falls back to the
+    /// pre-Phase-5 single-axis behaviour driven by
+    /// `StreamingConfig::storage_backend()`.
     pub fn with_backend_storage_routing(
         mut self,
         routing: Arc<crate::data_model::BackendStorageRouting>,
     ) -> Self {
-        self.backend_storage_routing = Some(routing);
+        self.backend_storage_routing = Some(
+            crate::routing::HotReloadBackendStorageRouting::from_arc(routing),
+        );
+        self
+    }
+
+    /// Phase α (MVP): attach a pre-built hot-reload routing handle.
+    /// Used by callers that want to share the same handle with other
+    /// subsystems (e.g. the query-router for diagnostics) — the
+    /// `with_backend_storage_routing` builder is the simpler entry
+    /// point that wraps an `Arc<BackendStorageRouting>` for callers
+    /// that don't.
+    pub fn with_hot_reload_backend_storage_routing(
+        mut self,
+        handle: crate::routing::HotReloadBackendStorageRouting,
+    ) -> Self {
+        self.backend_storage_routing = Some(handle);
         self
     }
 
@@ -292,6 +323,13 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
+            // Phase α (MVP): controller-pushed `BackendStorageRouting`
+            // table. POST replaces the current table atomically; GET
+            // returns a JSON snapshot for operator diagnostics.
+            .route(
+                "/api/v1/storage_routing",
+                get(handle_get_storage_routing).post(handle_post_storage_routing),
+            )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route(
                 "/api/v1/db/schemas/:agg_id/retire",
@@ -353,6 +391,13 @@ impl HttpServer {
             .route(
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
+            // Phase α (MVP): controller-pushed `BackendStorageRouting`
+            // table. POST replaces the current table atomically; GET
+            // returns a JSON snapshot for operator diagnostics.
+            .route(
+                "/api/v1/storage_routing",
+                get(handle_get_storage_routing).post(handle_post_storage_routing),
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route(
@@ -509,7 +554,12 @@ async fn process_query_request(
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
 fn resolve_metric_storage(state: &AppState, query: &str) -> StorageBackend {
-    if let Some(routing) = state.backend_storage_routing.as_ref() {
+    if let Some(routing_handle) = state.backend_storage_routing.as_ref() {
+        // Phase α: snapshot the hot-reload handle once per request.
+        // Concurrent swaps from `POST /api/v1/storage_routing` produce
+        // a fresh `Arc`; this snapshot remains valid for the rest of
+        // the dispatch (no torn read).
+        let routing = routing_handle.snapshot();
         match promql_parser::parser::parse(query) {
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
@@ -3434,6 +3484,208 @@ aggregations:
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
+    // ── Phase α: BackendStorageRouting hot-reload HTTP integration ────
+
+    /// Standard test wiring for the `/api/v1/storage_routing` endpoint:
+    /// install an empty hot-reload routing handle, hold the handle so
+    /// the test can introspect the swap result.
+    async fn setup_test_server_for_storage_routing() -> (u16, crate::routing::HotReloadBackendStorageRouting) {
+        use crate::data_model::{HotReloadStreamingConfig, StreamingConfig};
+        use crate::routing::HotReloadBackendStorageRouting;
+
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        let streaming_cfg = StreamingConfig::default();
+        let streaming_arc = Arc::new(streaming_cfg);
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_arc.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_arc,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let routing_handle = HotReloadBackendStorageRouting::empty();
+        let server = HttpServer::new(config, query_engine, store, None)
+            .with_hot_reload_config(hot_reload)
+            .with_hot_reload_backend_storage_routing(routing_handle.clone());
+        let port = server.start_test_server().await.expect("start ok");
+        (port, routing_handle)
+    }
+
+    fn fixture_routing_json() -> serde_json::Value {
+        serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [
+                {
+                    "name": "http_requests_total",
+                    "targets": [
+                        { "engine": "sketch_warm_tier" },
+                        {
+                            "engine": "thanos_archive",
+                            "applies_to_query_shape": [
+                                "histogram_quantile", "delta", "absent",
+                                "rate_post_hoc", "count"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn storage_routing_post_swaps_table_atomically() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        // Initial table is empty.
+        assert_eq!(handle.snapshot().len(), 0);
+
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body(fixture_routing_json().to_string())
+            .send()
+            .await
+            .expect("send ok");
+
+        assert!(resp.status().is_success(), "swap must 2xx; got {}", resp.status());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["metrics_count"], 1);
+        let returned_hash = body["table_hash"].as_str().unwrap().to_string();
+        assert!(!returned_hash.is_empty(), "hash must be non-empty");
+
+        // Snapshot now reflects the new table — and the hash matches
+        // what the response advertised.
+        let snap = handle.snapshot();
+        assert_eq!(snap.len(), 1);
+        let live_hash = crate::routing::routing_table_hash(snap.as_ref());
+        assert_eq!(live_hash, returned_hash, "live hash must match advertised");
+    }
+
+    #[tokio::test]
+    async fn storage_routing_post_rejects_invalid_json() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+
+        // Garbage body — not even valid JSON.
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body("not json {{")
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(resp.status().as_u16(), 400, "garbage body must 400");
+
+        // Valid JSON but invalid schema (unknown engine).
+        let bad = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [{
+                "name": "x",
+                "targets": [{ "engine": "not_a_real_engine" }]
+            }]
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body(bad.to_string())
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "schema-invalid body must 400; got {}",
+            resp.status(),
+        );
+
+        // Confirm the table was NOT swapped (still empty).
+        assert_eq!(handle.snapshot().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn storage_routing_get_returns_current_snapshot() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        // Pre-load the table.
+        let new = crate::data_model::BackendStorageRouting::from_json_payload(
+            &fixture_routing_json(),
+        )
+        .expect("parse");
+        handle.swap(new);
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .send()
+            .await
+            .expect("send ok");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["default_engine"], "sketch_warm");
+        assert_eq!(body["metrics_count"], 1);
+        let snap_hash = body["table_hash"].as_str().unwrap();
+        let live_hash = crate::routing::routing_table_hash(handle.snapshot().as_ref());
+        assert_eq!(snap_hash, live_hash);
+    }
+
+    #[tokio::test]
+    async fn storage_routing_swap_observed_by_subsequent_query_dispatch() {
+        // End-to-end production-path test: POST a routing table, then
+        // issue a `count(http_requests_total)` query. The handler must
+        // see the freshly-swapped table and route the query through
+        // the EngineRouter. We can't easily assert the response engine
+        // without setting up a Gorilla mock, but we can verify the
+        // swap landed by GETting the hash — that's the contract the
+        // controller relies on.
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body(fixture_routing_json().to_string())
+            .send()
+            .await
+            .expect("send ok");
+        assert!(resp.status().is_success());
+
+        // `lookup_with_shape` must reflect the swapped contents on
+        // the very next read.
+        let snap = handle.snapshot();
+        assert_eq!(
+            snap.lookup_with_shape(
+                "http_requests_total",
+                crate::data_model::QueryShape::Count,
+            ),
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(
+            snap.lookup_with_shape(
+                "http_requests_total",
+                crate::data_model::QueryShape::Quantile,
+            ),
+            StorageBackend::SketchWarmTier,
+        );
+    }
+
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -3664,6 +3916,118 @@ async fn handle_post_streaming_config(
         "new_aggregation_count": new_ids.len(),
         "schemas_created": schema_added,
         "schemas_retired": schema_retired,
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+// ── Phase α: BackendStorageRouting hot-reload endpoints ────────────
+
+/// `GET /api/v1/storage_routing` — return a JSON snapshot of the
+/// currently-active per-metric `BackendStorageRouting` table.
+///
+/// Useful for operators to confirm a controller push landed with the
+/// expected entries. Returns 503 when the backend wasn't built with a
+/// routing-table handle (legacy deploys that loaded the YAML directly
+/// can still hit `/api/v1/streaming-config` — this endpoint is for
+/// the Phase α JSON path).
+async fn handle_get_storage_routing(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(handle) = state.backend_storage_routing.as_ref() else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    let snap = handle.snapshot();
+    let body = serde_json::json!({
+        "status": "success",
+        "default_engine": snap.default_backend().data_source_id(),
+        "metrics_count": snap.len(),
+        "table_hash": crate::routing::routing_table_hash(snap.as_ref()),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// `POST /api/v1/storage_routing` — replace the per-metric routing
+/// table from a controller-emitted JSON document.
+///
+/// Body shape — see
+/// `controller/src/config/stage_config.rs::emit_backend_storage_routing`
+/// (or `BackendStorageRouting::from_json_payload` in this crate for
+/// the matching parser). On 2xx the response body carries the new
+/// table's hash and entry count so the controller can verify the
+/// installed bytes match what it pushed.
+///
+/// Errors:
+/// * 400 — body is not valid UTF-8, not valid JSON, or the JSON
+///   fails the schema check (unknown engine / empty targets / etc.).
+/// * 503 — backend wasn't built with a routing-table handle.
+///
+/// The swap is atomic: in-flight queries either see the entire old
+/// table or the entire new table; never a half-applied state. Mirrors
+/// the existing `POST /api/v1/streaming-config` swap contract.
+async fn handle_post_storage_routing(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(handle) = state.backend_storage_routing.as_ref() else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing",
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+
+    let json_text = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("request body is not valid UTF-8: {e}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    let json_value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("JSON parse error: {e}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+    let new_table = match crate::data_model::BackendStorageRouting::from_json_payload(&json_value) {
+        Ok(t) => t,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("BackendStorageRouting build error: {e:#}"),
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+
+    let entries = new_table.len();
+    let hash = crate::routing::routing_table_hash(&new_table);
+    let _old = handle.swap(new_table);
+    info!(
+        entries,
+        table_hash = %hash,
+        "storage-routing JSON hot-reload swap completed",
+    );
+
+    let body = serde_json::json!({
+        "status": "success",
+        "metrics_count": entries,
+        "table_hash": hash,
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }

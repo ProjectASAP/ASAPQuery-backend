@@ -670,7 +670,14 @@ async fn main() -> Result<()> {
     // HTTP handler consults a per-metric `StorageBackend` map on
     // every PromQL query instead of bypassing the EngineRouter when
     // the streaming-config single axis defaults to `SketchWarmTier`.
-    if let Some(routing_path) = args.backend_storage_routing.as_deref() {
+    //
+    // Phase α (MVP): even when no static YAML is loaded, install an
+    // empty hot-reload handle so the controller's first
+    // `POST /api/v1/storage_routing` push lands without first-call 503
+    // lossage. Operators can still hand-author the YAML for
+    // dev / standalone — the YAML supplies the bootstrap, controller
+    // pushes overwrite it.
+    let bootstrap_routing = if let Some(routing_path) = args.backend_storage_routing.as_deref() {
         match query_engine_rust::data_model::BackendStorageRouting::from_yaml_file(routing_path) {
             Ok(routing) => {
                 info!(
@@ -679,20 +686,23 @@ async fn main() -> Result<()> {
                     routing.default_backend(),
                     routing.len(),
                 );
-                server = server.with_backend_storage_routing(Arc::new(routing));
+                routing
             }
             Err(e) => {
                 warn!(
-                    "Failed to load backend-storage-routing from {:?}: {} — falling back to streaming-config single axis",
+                    "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
                     routing_path, e,
                 );
+                query_engine_rust::data_model::BackendStorageRouting::empty()
             }
         }
     } else {
         info!(
-            "--backend-storage-routing not set — every query routes per the streaming-config single axis (typically `sketch_warm`)",
+            "--backend-storage-routing not set — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
         );
-    }
+        query_engine_rust::data_model::BackendStorageRouting::empty()
+    };
+    server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
     // Phase-5/6: register a `GorillaQueryEngine` for the cold
     // archive tier when the operator has provisioned one via the

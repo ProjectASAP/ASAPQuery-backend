@@ -99,6 +99,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use asap_types::StorageBackend;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
@@ -115,6 +116,11 @@ use tracing::{debug, info};
 /// warm-tier sketch path either can't serve at all (count over an
 /// approximate sketch is misleading) or serves with worse precision
 /// than the archive (rate post-hoc).
+///
+/// Phase α (controller-emitted routing tables) adds `HistogramQuantile`
+/// / `Delta` / `Deriv` / `Absent` — these are PromQL shapes no warm-tier
+/// sketch can serve and the controller's emitter reliably routes them
+/// to the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryShape {
@@ -146,6 +152,20 @@ pub enum QueryShape {
     /// accumulator (Change B), archive serves by selecting the
     /// most-recent sample in each chunk.
     LastOverTime,
+    /// `histogram_quantile(φ, ...)` — Prometheus-native histogram
+    /// readout. No warm-tier sketch fits the bucket-vector input
+    /// shape; archive serves via post-hoc bucket scan.
+    HistogramQuantile,
+    /// `delta(<counter>[<range>])` — first-difference over a range.
+    /// Archive-only.
+    Delta,
+    /// `deriv(<gauge>[<range>])` — least-squares slope of a gauge.
+    /// Archive-only.
+    Deriv,
+    /// `absent(<metric>{...})` — 1 if no series match, vacuous
+    /// vector otherwise. Archive answers natively from the postings
+    /// index; warm-tier sketch has no compatible aggregation.
+    Absent,
     /// Anything else — `min/max_over_time`, `count_over_time`,
     /// `avg_over_time`, etc. Lets the routing table register
     /// targets that catch the long tail without enumerating every
@@ -154,7 +174,11 @@ pub enum QueryShape {
 }
 
 impl QueryShape {
-    /// Stable string tag used in YAML.
+    /// Stable string tag used in YAML / JSON. Mirrors the controller's
+    /// `config::stage_config::emit_backend_storage_routing` shape
+    /// vocabulary — the wire form is the canonical PromQL function
+    /// name (or a `_` prefixed variant for shapes without a single
+    /// canonical name, e.g. `rate_post_hoc`).
     pub fn as_str(self) -> &'static str {
         match self {
             QueryShape::Count => "count",
@@ -163,6 +187,10 @@ impl QueryShape {
             QueryShape::Quantile => "quantile",
             QueryShape::Sum => "sum",
             QueryShape::LastOverTime => "last_over_time",
+            QueryShape::HistogramQuantile => "histogram_quantile",
+            QueryShape::Delta => "delta",
+            QueryShape::Deriv => "deriv",
+            QueryShape::Absent => "absent",
             QueryShape::Other => "other",
         }
     }
@@ -220,6 +248,14 @@ pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
                 QueryShape::Count
             } else if name == "last_over_time" {
                 QueryShape::LastOverTime
+            } else if name == "histogram_quantile" {
+                QueryShape::HistogramQuantile
+            } else if name == "delta" || name == "increase" {
+                QueryShape::Delta
+            } else if name == "deriv" {
+                QueryShape::Deriv
+            } else if name == "absent" || name == "absent_over_time" {
+                QueryShape::Absent
             } else {
                 QueryShape::Other
             }
@@ -425,6 +461,143 @@ impl BackendStorageRouting {
         Ok(routing)
     }
 
+    /// Phase α (MVP): parse a controller-emitted JSON document into a
+    /// fresh routing table. The schema mirrors
+    /// `controller/src/config/stage_config.rs::emit_backend_storage_routing`:
+    ///
+    /// ```json
+    /// {
+    ///   "default_engine": "sketch_warm_tier",
+    ///   "metrics": [
+    ///     { "name": "http_requests_total",
+    ///       "targets": [
+    ///         { "engine": "sketch_warm_tier" },
+    ///         { "engine": "thanos_archive",
+    ///           "applies_to_query_shape": ["count", "topk", "rate_post_hoc",
+    ///                                      "histogram_quantile", "delta", "absent"] }
+    ///       ]
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Engine-name compatibility (controller → backend `StorageBackend`):
+    ///
+    /// * `sketch_warm_tier` → `SketchWarmTier`
+    /// * `thanos_archive` → `GorillaS3Archive` (Phase α uses the existing
+    ///   archive engine; future phases may register a real Thanos engine).
+    /// * `gorilla_s3_archive` → `GorillaS3Archive` (back-compat alias).
+    /// * `double_write` → `DoubleWrite`.
+    ///
+    /// Unknown query-shape strings are mapped to [`QueryShape::Other`]
+    /// rather than failing the parse — the controller's vocabulary may
+    /// drift forward of the backend's. Empty `targets` arrays are
+    /// rejected (same contract as `from_yaml_str`).
+    ///
+    /// Side fields (e.g. `warm_tier_native_shapes`) the controller emits
+    /// for operator inspection are ignored — the JSON parser pulls only
+    /// `default_engine` and `metrics:[...]`.
+    pub fn from_json_payload(value: &JsonValue) -> Result<Self> {
+        let default_engine = value
+            .get("default_engine")
+            .and_then(|v| v.as_str())
+            .unwrap_or("sketch_warm_tier");
+        let default = parse_engine_string(default_engine).with_context(|| {
+            format!(
+                "backend-storage-routing JSON: invalid default_engine '{}'",
+                default_engine
+            )
+        })?;
+
+        let metrics_arr = value
+            .get("metrics")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!("backend-storage-routing JSON: missing 'metrics' array")
+            })?;
+
+        let mut metrics: HashMap<String, Vec<RoutingTarget>> = HashMap::new();
+        for (i, entry) in metrics_arr.iter().enumerate() {
+            let name = entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "backend-storage-routing JSON: metrics[{}] missing 'name'",
+                        i
+                    )
+                })?
+                .to_string();
+            let targets_arr = entry
+                .get("targets")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "backend-storage-routing JSON: metric '{}' missing 'targets' array",
+                        name,
+                    )
+                })?;
+            if targets_arr.is_empty() {
+                anyhow::bail!(
+                    "backend-storage-routing JSON: metric '{}' has empty targets list",
+                    name,
+                );
+            }
+            let mut targets: Vec<RoutingTarget> = Vec::with_capacity(targets_arr.len());
+            for (j, t) in targets_arr.iter().enumerate() {
+                let engine_str = t
+                    .get("engine")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "backend-storage-routing JSON: metric '{}' targets[{}] missing 'engine'",
+                            name, j,
+                        )
+                    })?;
+                let backend = parse_engine_string(engine_str).with_context(|| {
+                    format!(
+                        "backend-storage-routing JSON: metric '{}' targets[{}] invalid engine '{}'",
+                        name, j, engine_str,
+                    )
+                })?;
+                let applies_to_query_shape =
+                    t.get("applies_to_query_shape").and_then(|v| v.as_array()).map(|arr| {
+                        arr.iter()
+                            .filter_map(|s| s.as_str())
+                            .map(parse_query_shape_string)
+                            .collect::<Vec<_>>()
+                    });
+                targets.push(RoutingTarget {
+                    backend,
+                    applies_to_query_shape,
+                });
+            }
+            metrics.insert(name, targets);
+        }
+
+        Ok(Self { default, metrics })
+    }
+
+    /// Atomically replace this routing table's contents with `new_table`.
+    /// Used by the `POST /api/v1/storage_routing` swap handler — the
+    /// HTTP layer wraps the table in `arc_swap::ArcSwap` so the swap is
+    /// observed atomically by all in-flight queries; this method is the
+    /// in-place form that callers without an `ArcSwap` wrapper can use
+    /// (e.g. tests, single-threaded shadow-mode evaluation). Production
+    /// deployments should go through [`HotReloadBackendStorageRouting`]
+    /// instead.
+    pub fn replace(&mut self, new_table: BackendStorageRouting) {
+        let added = new_table.metrics.len();
+        let removed = self.metrics.len();
+        *self = new_table;
+        info!(
+            added,
+            removed,
+            new_default = ?self.default,
+            "BackendStorageRouting: replaced (in-place)",
+        );
+    }
+
     /// Look up the storage backend for `metric_name`, ignoring query
     /// shape. Walks the metric's target list and returns the first
     /// target's backend (the v6.1 default-target slot). Falls back
@@ -568,6 +741,172 @@ impl BackendStorageRouting {
 impl Default for BackendStorageRouting {
     fn default() -> Self {
         Self::empty()
+    }
+}
+
+/// Map a JSON `engine` string into a backend `StorageBackend` variant.
+/// Phase α accepts both the controller's vocabulary (`thanos_archive`)
+/// and the existing YAML's vocabulary (`gorilla_s3_archive`) — both
+/// resolve to `StorageBackend::GorillaS3Archive` because the cold-archive
+/// engine registered today serves both via `GorillaQueryEngine`.
+/// `unknown_engine` returns an error so a typo doesn't silently turn
+/// into a default-routing footgun.
+fn parse_engine_string(s: &str) -> Result<StorageBackend> {
+    match s {
+        "sketch_warm_tier" | "sketch_warm" => Ok(StorageBackend::SketchWarmTier),
+        // `thanos_archive` is the controller-emitted name; the backend
+        // currently registers the Gorilla-S3 cold archive under
+        // `gorilla_archive` / `gorilla_s3_archive`. They map to the
+        // same `StorageBackend` variant for Phase α — when a real
+        // Thanos engine lands the parser can split the two.
+        "thanos_archive" | "gorilla_s3_archive" | "gorilla_archive" => {
+            Ok(StorageBackend::GorillaS3Archive)
+        }
+        "double_write" => Ok(StorageBackend::DoubleWrite),
+        other => Err(anyhow::anyhow!(
+            "unknown engine '{}': expected one of \
+             [sketch_warm_tier, thanos_archive, gorilla_s3_archive, double_write]",
+            other,
+        )),
+    }
+}
+
+/// Map a JSON `applies_to_query_shape` string into a backend
+/// `QueryShape`. Unknown shapes are mapped to [`QueryShape::Other`] —
+/// the controller's vocabulary may emit shape names a backend revision
+/// doesn't yet understand, and `Other` is the safe fall-through (the
+/// archive's claim list typically includes `Other` so unknowns still
+/// route to the archive).
+fn parse_query_shape_string(s: &str) -> QueryShape {
+    match s {
+        "count" => QueryShape::Count,
+        "topk" => QueryShape::Topk,
+        "rate_post_hoc" | "rate" | "irate" => QueryShape::RatePostHoc,
+        "quantile" | "quantile_over_time" => QueryShape::Quantile,
+        "sum" | "sum_over_time" => QueryShape::Sum,
+        "last_over_time" => QueryShape::LastOverTime,
+        "histogram_quantile" => QueryShape::HistogramQuantile,
+        "delta" | "increase" => QueryShape::Delta,
+        "deriv" => QueryShape::Deriv,
+        "absent" | "absent_over_time" => QueryShape::Absent,
+        _ => QueryShape::Other,
+    }
+}
+
+/// Compute a stable, short hash of a `BackendStorageRouting` table for
+/// the swap handler's response. The controller uses this to verify the
+/// backend installed exactly the bytes it pushed (cheap drift check on
+/// every plan emit).
+///
+/// The hash is computed over the routing table's data fields — default
+/// + sorted metric → sorted target list. We sort to make the hash
+/// reproducible across `HashMap` iteration orders.
+pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    // Default tag.
+    table.default.data_source_id().hash(&mut h);
+    // Sort metric names for determinism.
+    let mut names: Vec<&String> = table.metrics.keys().collect();
+    names.sort();
+    for name in names {
+        name.hash(&mut h);
+        let targets = &table.metrics[name];
+        for t in targets {
+            t.backend.data_source_id().hash(&mut h);
+            if let Some(shapes) = &t.applies_to_query_shape {
+                for s in shapes {
+                    s.as_str().hash(&mut h);
+                }
+                "}".hash(&mut h);
+            } else {
+                "*".hash(&mut h);
+            }
+        }
+    }
+    format!("{:016x}", h.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Phase α: HotReloadBackendStorageRouting — atomic-swap wrapper
+// ---------------------------------------------------------------------------
+
+/// Atomic-swap wrapper around `BackendStorageRouting`, mirroring
+/// [`crate::data_model::HotReloadStreamingConfig`]. Lets the
+/// `POST /api/v1/storage_routing` HTTP handler swap the table at
+/// runtime without restarting the backend. Cloneable; clones share the
+/// underlying `ArcSwap` so all holders see the same swaps.
+///
+/// ## Read path
+///
+/// HTTP query handler calls [`Self::snapshot`] once per request to get
+/// a stable `Arc<BackendStorageRouting>` it can call
+/// `lookup_with_shape` on. The snapshot is cheap (single atomic load)
+/// and lock-free; concurrent swaps don't block readers.
+///
+/// ## Write path
+///
+/// The swap handler calls [`Self::swap`] with the new table parsed from
+/// the controller's JSON. The previous `Arc` is dropped when the last
+/// in-flight reader goes out of scope.
+///
+/// ## Bootstrap
+///
+/// Built at backend startup from either:
+/// * `Self::from_yaml_file(path)` — load the static
+///   `deploy/configs/backend-storage-routing.yaml` (legacy
+///   bootstrap; preserved for dev / standalone deployments).
+/// * `Self::empty()` — start with an empty table; the controller's
+///   first push fills it.
+#[derive(Clone)]
+pub struct HotReloadBackendStorageRouting {
+    inner: std::sync::Arc<arc_swap::ArcSwap<BackendStorageRouting>>,
+}
+
+impl HotReloadBackendStorageRouting {
+    /// Construct with an initial routing table.
+    pub fn new(initial: BackendStorageRouting) -> Self {
+        Self {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(initial))),
+        }
+    }
+
+    /// Construct with an empty table — every metric resolves to
+    /// `SketchWarmTier` until the first push lands.
+    pub fn empty() -> Self {
+        Self::new(BackendStorageRouting::empty())
+    }
+
+    /// Construct from a pre-built `Arc<BackendStorageRouting>` —
+    /// avoids a redundant clone when the caller already holds one.
+    pub fn from_arc(initial: std::sync::Arc<BackendStorageRouting>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(initial)),
+        }
+    }
+
+    /// Cheap, cloneable snapshot of the current table. Stable for the
+    /// caller's lifetime; concurrent swaps don't invalidate it.
+    pub fn snapshot(&self) -> std::sync::Arc<BackendStorageRouting> {
+        self.inner.load_full()
+    }
+
+    /// Atomically replace the current table. Returns the `Arc` that
+    /// was just replaced for callers that want to log the diff.
+    pub fn swap(&self, new: BackendStorageRouting) -> std::sync::Arc<BackendStorageRouting> {
+        self.inner.swap(std::sync::Arc::new(new))
+    }
+}
+
+impl std::fmt::Debug for HotReloadBackendStorageRouting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snap = self.snapshot();
+        f.debug_struct("HotReloadBackendStorageRouting")
+            .field("entries", &snap.metrics.len())
+            .field("default", &snap.default)
+            .finish()
     }
 }
 
@@ -852,5 +1191,270 @@ routes:
     fn classifies_bare_selector_as_other() {
         let e = parse("http_requests_total");
         assert_eq!(classify_query_shape(&e), QueryShape::Other);
+    }
+
+    // ── Phase α: from_json_payload + replace + hot-reload tests ────────
+
+    fn fixture_json() -> serde_json::Value {
+        serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [
+                {
+                    "name": "http_requests_total",
+                    "targets": [
+                        { "engine": "sketch_warm_tier" },
+                        {
+                            "engine": "thanos_archive",
+                            "applies_to_query_shape": [
+                                "histogram_quantile", "delta", "deriv",
+                                "absent", "rate_post_hoc", "count"
+                            ]
+                        }
+                    ],
+                    "warm_tier_native_shapes": ["topk", "rate", "sum"]
+                },
+                {
+                    "name": "request_latency_seconds",
+                    "targets": [
+                        { "engine": "sketch_warm_tier" },
+                        {
+                            "engine": "thanos_archive",
+                            "applies_to_query_shape": [
+                                "histogram_quantile", "delta", "absent",
+                                "rate_post_hoc", "topk", "count"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn json_payload_parses_controller_fixture() {
+        let r = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        assert_eq!(r.default_backend(), StorageBackend::SketchWarmTier);
+        assert_eq!(r.len(), 2);
+
+        // http_requests_total: histogram_quantile / delta / etc → archive,
+        // quantile / sum / topk → warm.
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::Delta),
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::Count),
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
+            StorageBackend::SketchWarmTier,
+        );
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::Topk),
+            StorageBackend::SketchWarmTier,
+        );
+        // LastOverTime not in the archive's filter list → falls
+        // through to the default (warm) slot.
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::LastOverTime),
+            StorageBackend::SketchWarmTier,
+        );
+    }
+
+    #[test]
+    fn json_payload_unknown_shape_defaults_to_other() {
+        let value = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [
+                {
+                    "name": "x",
+                    "targets": [
+                        { "engine": "sketch_warm_tier" },
+                        {
+                            "engine": "thanos_archive",
+                            "applies_to_query_shape": ["some_future_shape", "count"]
+                        }
+                    ]
+                }
+            ]
+        });
+        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
+        // count still routes to archive; the unknown shape was mapped
+        // to QueryShape::Other (silently — forward-compat).
+        assert_eq!(
+            r.lookup_with_shape("x", QueryShape::Count),
+            StorageBackend::GorillaS3Archive,
+        );
+        assert_eq!(
+            r.lookup_with_shape("x", QueryShape::Other),
+            StorageBackend::GorillaS3Archive,
+        );
+    }
+
+    #[test]
+    fn json_payload_invalid_engine_errors() {
+        let value = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [{
+                "name": "x",
+                "targets": [{ "engine": "not_a_real_engine" }]
+            }]
+        });
+        let err = BackendStorageRouting::from_json_payload(&value).expect_err("must reject");
+        // The bad engine name appears somewhere in the error chain
+        // (the parser wraps the inner `parse_engine_string` error in
+        // a context that mentions the metric/target index).
+        let chain_str = format!("{err:#}");
+        assert!(
+            chain_str.contains("not_a_real_engine"),
+            "error chain must mention the bad engine: {chain_str}"
+        );
+    }
+
+    #[test]
+    fn json_payload_empty_targets_errors() {
+        let value = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [{ "name": "x", "targets": [] }]
+        });
+        let err = BackendStorageRouting::from_json_payload(&value).expect_err("must reject");
+        assert!(err.to_string().contains("empty targets"));
+    }
+
+    #[test]
+    fn json_payload_missing_metrics_errors() {
+        let value = serde_json::json!({ "default_engine": "sketch_warm_tier" });
+        let err = BackendStorageRouting::from_json_payload(&value).expect_err("must reject");
+        assert!(err.to_string().contains("metrics"));
+    }
+
+    #[test]
+    fn json_payload_default_engine_optional_falls_back_to_warm() {
+        let value = serde_json::json!({
+            "metrics": [
+                { "name": "x", "targets": [{ "engine": "sketch_warm_tier" }] }
+            ]
+        });
+        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
+        assert_eq!(r.default_backend(), StorageBackend::SketchWarmTier);
+    }
+
+    #[test]
+    fn json_payload_back_compat_gorilla_s3_archive_alias() {
+        // An older deploy might emit the YAML's vocabulary instead of
+        // `thanos_archive`; both must parse and resolve the same.
+        let value = serde_json::json!({
+            "default_engine": "sketch_warm_tier",
+            "metrics": [{
+                "name": "audit_events",
+                "targets": [
+                    { "engine": "gorilla_s3_archive" }
+                ]
+            }]
+        });
+        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
+        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaS3Archive);
+    }
+
+    #[test]
+    fn replace_swaps_table_in_place() {
+        let mut r = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "old_metric".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        let new = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        r.replace(new);
+        // Old metric is gone; new metrics are visible.
+        assert_eq!(r.lookup("old_metric"), StorageBackend::SketchWarmTier);
+        assert_eq!(
+            r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
+            StorageBackend::GorillaS3Archive,
+        );
+    }
+
+    #[test]
+    fn hot_reload_wrapper_swap_is_observed_by_clones() {
+        let hr = HotReloadBackendStorageRouting::empty();
+        let hr_writer = hr.clone();
+
+        let new = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        hr_writer.swap(new);
+
+        let snap = hr.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(
+            snap.lookup_with_shape("http_requests_total", QueryShape::Delta),
+            StorageBackend::GorillaS3Archive,
+        );
+    }
+
+    #[test]
+    fn hot_reload_wrapper_concurrent_readers_see_no_torn_state() {
+        use std::thread;
+        let hr = HotReloadBackendStorageRouting::empty();
+        let writer_hr = hr.clone();
+        let writer = thread::spawn(move || {
+            for i in 0..50 {
+                let mut metrics = HashMap::new();
+                metrics.insert(
+                    format!("metric_{i}"),
+                    vec![RoutingTarget::always(StorageBackend::GorillaS3Archive)],
+                );
+                let new = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+                writer_hr.swap(new);
+            }
+        });
+        let reader_hr = hr.clone();
+        let reader = thread::spawn(move || {
+            for _ in 0..200 {
+                let snap = reader_hr.snapshot();
+                // Snapshot must always be internally consistent —
+                // either empty (initial) or one-entry (post-swap).
+                let n = snap.len();
+                assert!(n == 0 || n == 1, "torn snapshot: {n} entries");
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn routing_table_hash_is_stable_across_runs() {
+        let r1 = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse 1");
+        let r2 = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse 2");
+        assert_eq!(routing_table_hash(&r1), routing_table_hash(&r2));
+    }
+
+    #[test]
+    fn routing_table_hash_differs_when_table_differs() {
+        let r1 = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        let r2 = BackendStorageRouting::empty();
+        assert_ne!(routing_table_hash(&r1), routing_table_hash(&r2));
+    }
+
+    #[test]
+    fn classifies_histogram_quantile_correctly() {
+        let e = parse("histogram_quantile(0.99, sum by (le) (rate(http_request_duration_bucket[5m])))");
+        assert_eq!(classify_query_shape(&e), QueryShape::HistogramQuantile);
+    }
+
+    #[test]
+    fn classifies_delta_correctly() {
+        let e = parse("delta(http_requests_total[5m])");
+        assert_eq!(classify_query_shape(&e), QueryShape::Delta);
+    }
+
+    #[test]
+    fn classifies_absent_correctly() {
+        let e = parse("absent(http_requests_total{job=\"x\"})");
+        assert_eq!(classify_query_shape(&e), QueryShape::Absent);
     }
 }
