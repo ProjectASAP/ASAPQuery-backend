@@ -52,11 +52,9 @@ prost = "0.13"
 asap_otel_proto = { path = "../asap-common/dependencies/rs/asap_otel_proto" }
 tonic = "0.12"
 tokio-stream = "0.1"
-snap = "1"
 regex = "1"
 prometheus = "0.13"
 lazy_static = "1.4"
-zstd = "0.13"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tracing-appender = "0.2"
 elastic_dsl_utilities.workspace = true
@@ -108,18 +106,6 @@ lru = "0.12"
 [[bin]]
 name = "precompute_engine"
 path = "src/bin/precompute_engine.rs"
-
-[[bin]]
-name = "test_e2e_precompute"
-path = "src/bin/test_e2e_precompute.rs"
-
-[[bin]]
-name = "bench_precompute_sketch"
-path = "src/bin/bench_precompute_sketch.rs"
-
-[[bin]]
-name = "e2e_quickstart_resource_test"
-path = "src/bin/e2e_quickstart_resource_test.rs"
 
 [dev-dependencies]
 tempfile = "3.20.0"
