@@ -1110,7 +1110,7 @@ impl SimpleEngine {
         use datafusion::execution::context::SessionContext;
         use datafusion::physical_plan::collect;
 
-        use super::physical::conversion::record_batch_to_result_map;
+        use crate::engines::physical::conversion::record_batch_to_result_map;
 
         let total_start = Instant::now();
 
@@ -1133,7 +1133,7 @@ impl SimpleEngine {
         let session_ctx = SessionContext::new();
         #[allow(deprecated)]
         let state = session_ctx.state().with_query_planner(std::sync::Arc::new(
-            super::physical::CustomQueryPlanner::new(self.store.clone()),
+            crate::engines::physical::CustomQueryPlanner::new(self.store.clone()),
         ));
 
         // 3. Create physical plan
@@ -1218,13 +1218,13 @@ impl SimpleEngine {
         use datafusion::execution::context::SessionContext;
         use datafusion::physical_plan::collect;
 
-        use super::physical::conversion::record_batch_to_result_map;
+        use crate::engines::physical::conversion::record_batch_to_result_map;
 
         // Create session context with our custom extension planner
         let session_ctx = SessionContext::new();
         #[allow(deprecated)]
         let state = session_ctx.state().with_query_planner(std::sync::Arc::new(
-            super::physical::CustomQueryPlanner::new(self.store.clone()),
+            crate::engines::physical::CustomQueryPlanner::new(self.store.clone()),
         ));
 
         let physical_plan = state
@@ -4099,7 +4099,7 @@ impl SimpleEngine {
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-impl crate::engines::router::QueryEngine for SimpleEngine {
+impl crate::routing::engine_router::QueryEngine for SimpleEngine {
     async fn execute(
         &self,
         query: &str,
@@ -4120,8 +4120,8 @@ impl crate::engines::router::QueryEngine for SimpleEngine {
         }
     }
 
-    fn capabilities(&self) -> crate::engines::router::EngineCapabilities {
-        crate::engines::router::EngineCapabilities {
+    fn capabilities(&self) -> crate::routing::engine_router::EngineCapabilities {
+        crate::routing::engine_router::EngineCapabilities {
             data_source_id: asap_types::StorageBackend::SketchWarmTier.data_source_id(),
             storage_backend: asap_types::StorageBackend::SketchWarmTier,
             // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
@@ -4909,7 +4909,7 @@ mod range_query_tests {
 #[cfg(test)]
 mod sketch_query_tests {
     // use crate::data_model::{CleanupPolicy, InferenceConfig, QueryLanguage, StreamingConfig};
-    // use crate::engines::simple_engine::SimpleEngine;
+    // use crate::engines::simple::engine::SimpleEngine;
     // use crate::stores::promsketch_store::PromSketchStore;
     // use crate::stores::{Store, TimestampedBucketsMap};
     // use std::collections::HashMap;

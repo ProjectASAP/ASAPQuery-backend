@@ -11,7 +11,7 @@ use crate::data_model::{
     StreamingConfig, WindowType,
 };
 use crate::engines::query_result::InstantVectorElement;
-use crate::engines::simple_engine::SimpleEngine;
+use crate::engines::simple::engine::SimpleEngine;
 use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
 use crate::stores::Store;
 use crate::AggregateCore;

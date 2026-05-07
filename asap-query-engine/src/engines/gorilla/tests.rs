@@ -1,7 +1,7 @@
-//! Phase-4 unit tests for the Gorilla query engine.
+//! Unit tests for the Gorilla query engine.
 //!
-//! Tests exercise the engine end-to-end via a `MockColdStore`
-//! injected in place of the production `GorillaS3ColdStore`. The
+//! Tests exercise the engine end-to-end via a `MockStore`
+//! injected in place of the production `GorillaS3Store`. The
 //! mock is intentionally minimal: it owns a `Vec<(ChunkRef,
 //! Vec<RawSample>)>` and answers `list_chunks` / `read_chunk`
 //! straight off it, with optional latency injection for the
@@ -14,39 +14,37 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::time::sleep;
 
-use crate::drivers::query::fallback::cold_store::{
-    ChunkRef, ColdStore, ColdStoreError, PostingsHits, RawSample,
-};
 use crate::engines::query_result::QueryResult;
 use crate::stores::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
 
-use super::query_planner::{plan_query_at, QueryStatistic};
+use super::engine::{plan_query_at, QueryStatistic};
+use super::store::{ChunkRef, RawSample, Store, StoreError};
 use super::{
     wrap_result, EngineError, ExactExecutor, ExecutionOutcome, GorillaEngineConfig,
-    GorillaQueryEngine, DATA_SOURCE_GORILLA_ARCHIVE,
+    GorillaQueryEngine, PostingsHits, DATA_SOURCE_GORILLA_ARCHIVE,
 };
 
 // ─────────────────────────────────────────────────────────────────────
 // Mock cold store
 // ─────────────────────────────────────────────────────────────────────
 
-/// In-process mock that satisfies the [`ColdStore`] trait without
+/// In-process mock that satisfies the [`Store`] trait without
 /// any S3 / disk roundtrip. Built once in each test from a list of
 /// `(ChunkRef, samples)` pairs.
 #[derive(Default)]
-struct MockColdStore {
+struct MockStore {
     chunks: Vec<(ChunkRef, Vec<RawSample>)>,
     /// If set, every `read_chunk` call sleeps for this duration —
     /// used by the timeout test.
     read_delay: Option<Duration>,
     /// **mvp/v5**: optional postings table keyed by `(label_name,
-    /// label_value)`. When `Some`, [`ColdStore::list_postings_for`]
+    /// label_value)`. When `Some`, [`Store::list_postings_for`]
     /// answers from this table; when `None`, returns a "missing
     /// postings" outcome (driving the fall-back path test).
     postings: Option<BTreeMap<(String, String), Vec<u64>>>,
 }
 
-impl MockColdStore {
+impl MockStore {
     fn new(chunks: Vec<(ChunkRef, Vec<RawSample>)>) -> Self {
         Self {
             chunks,
@@ -72,13 +70,13 @@ impl MockColdStore {
 }
 
 #[async_trait]
-impl ColdStore for MockColdStore {
+impl Store for MockStore {
     async fn scan(
         &self,
         metric: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<RawSample>, ColdStoreError> {
+    ) -> Result<Vec<RawSample>, StoreError> {
         let mut out = Vec::new();
         let chunks = self.list_chunks(metric, start_ms, end_ms).await?;
         for c in chunks {
@@ -96,7 +94,7 @@ impl ColdStore for MockColdStore {
         metric: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<ChunkRef>, ColdStoreError> {
+    ) -> Result<Vec<ChunkRef>, StoreError> {
         Ok(self
             .chunks
             .iter()
@@ -109,7 +107,7 @@ impl ColdStore for MockColdStore {
             .collect())
     }
 
-    async fn read_chunk(&self, chunk: &ChunkRef) -> Result<Vec<RawSample>, ColdStoreError> {
+    async fn read_chunk(&self, chunk: &ChunkRef) -> Result<Vec<RawSample>, StoreError> {
         if let Some(d) = self.read_delay {
             sleep(d).await;
         }
@@ -118,7 +116,7 @@ impl ColdStore for MockColdStore {
                 return Ok(samples.clone());
             }
         }
-        Err(ColdStoreError::Backend(format!(
+        Err(StoreError::Backend(format!(
             "mock: no such chunk {}",
             chunk.key
         )))
@@ -130,13 +128,13 @@ impl ColdStore for MockColdStore {
         _start_ms: i64,
         _end_ms: i64,
         matchers: &[(String, String)],
-    ) -> Result<PostingsHits, ColdStoreError> {
+    ) -> Result<PostingsHits, StoreError> {
         let Some(table) = &self.postings else {
             // Mirror "real" missing-postings behaviour: the trait
             // says return Unsupported when the backend doesn't
             // know how to compute this. The executor treats that
             // as fall-through.
-            return Err(ColdStoreError::Unsupported("list_postings_for"));
+            return Err(StoreError::Unsupported("list_postings_for"));
         };
         let mut hits = PostingsHits {
             series_ids: Vec::new(),
@@ -216,14 +214,14 @@ fn cfg() -> GorillaEngineConfig {
 }
 
 fn engine_with(chunks: Vec<(ChunkRef, Vec<RawSample>)>) -> GorillaQueryEngine {
-    GorillaQueryEngine::new(Arc::new(MockColdStore::new(chunks)), cfg())
+    GorillaQueryEngine::new(Arc::new(MockStore::new(chunks)), cfg())
 }
 
 fn engine_with_config(
     chunks: Vec<(ChunkRef, Vec<RawSample>)>,
     config: GorillaEngineConfig,
 ) -> GorillaQueryEngine {
-    GorillaQueryEngine::new(Arc::new(MockColdStore::new(chunks)), config)
+    GorillaQueryEngine::new(Arc::new(MockStore::new(chunks)), config)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -246,7 +244,7 @@ async fn execute_sum_over_time_streaming() {
     assert_eq!(plan.statistic, QueryStatistic::SumOverTime);
 
     let exec = ExactExecutor::new(
-        Arc::new(MockColdStore::new(vec![linear_chunk(
+        Arc::new(MockStore::new(vec![linear_chunk(
             "c1",
             NOW_MS - 60_000,
             1_000,
@@ -275,7 +273,7 @@ async fn execute_count_over_time() {
     let engine = engine_with(chunks);
     let plan = plan_query_at(&format!("count_over_time({METRIC}[1m])"), NOW_MS).unwrap();
     let exec = ExactExecutor::new(
-        Arc::new(MockColdStore::new(vec![linear_chunk(
+        Arc::new(MockStore::new(vec![linear_chunk(
             "c1",
             NOW_MS - 30_000,
             1_000,
@@ -734,7 +732,7 @@ async fn engine_respects_config_timeout() {
         };
         chunks.push((chunk, vec![raw(NOW_MS - 1_000, 1.0)]));
     }
-    let mock = MockColdStore::new(chunks).with_read_delay(Duration::from_millis(250));
+    let mock = MockStore::new(chunks).with_read_delay(Duration::from_millis(250));
     let cfg = GorillaEngineConfig {
         max_buffered_samples: 1_000_000,
         query_timeout_secs: 1,
@@ -797,13 +795,13 @@ async fn postings_aware_path_prunes_chunks() {
     let mut postings: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     postings.insert(("zone".to_string(), "a".to_string()), vec![11]);
     postings.insert(("zone".to_string(), "b".to_string()), vec![22]);
-    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)])
+    let mock = MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)])
         .with_postings(postings);
     let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
     let plan =
         plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
     assert_eq!(plan.label_matchers.len(), 1);
-    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let exec = ExactExecutor::new(engine.store_for_tests(), cfg());
     let outcome = exec.execute_plan(&plan).await.unwrap();
     // Only zone=a chunk contributed: 5.0 + 5.0 = 10.0 (NOT 5+5+99+99=208).
     assert_eq!(outcome.value, 10.0);
@@ -822,11 +820,11 @@ async fn postings_missing_falls_back_to_scan_all() {
         labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0)]);
     let (chunk_b, samples_b) =
         labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0)]);
-    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
+    let mock = MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
     let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
     let plan =
         plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
-    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let exec = ExactExecutor::new(engine.store_for_tests(), cfg());
     let outcome = exec.execute_plan(&plan).await.unwrap();
     // Correctness: only zone=a sample (5.0) folded in. The
     // post-decode filter does the work.
@@ -847,11 +845,11 @@ async fn postings_path_no_label_predicate_skips_postings_lookup() {
         labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0)]);
     let (chunk_b, samples_b) =
         labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0)]);
-    let mock = MockColdStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
+    let mock = MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
     let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
     let plan = plan_query_at(&format!("sum_over_time({METRIC}[5m])"), NOW_MS).unwrap();
     assert!(plan.label_matchers.is_empty());
-    let exec = ExactExecutor::new(engine.cold_store_for_tests(), cfg());
+    let exec = ExactExecutor::new(engine.store_for_tests(), cfg());
     let outcome = exec.execute_plan(&plan).await.unwrap();
     assert_eq!(outcome.value, 104.0);
     assert_eq!(outcome.chunks_fetched, 2);

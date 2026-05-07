@@ -76,7 +76,8 @@
 //!
 //! Valid `StorageBackend` values mirror the snake-cased serde tags on
 //! `asap_types::StorageBackend`: `sketch_warm_tier`,
-//! `gorilla_s3_archive`, `cold_jsonl_fallback`, `double_write`.
+//! `gorilla_s3_archive`, `double_write`. (Step-1 of the JSONL
+//! deprecation refactor removed the `cold_jsonl_fallback` tag.)
 //!
 //! Loaded once at backend startup (CLI flag `--backend-storage-routing`
 //! on `precompute_engine`) and stored in `AppState`. Lookup is
@@ -592,7 +593,7 @@ mod tests {
 default: sketch_warm_tier
 metrics:
   http_requests_total: gorilla_s3_archive
-  audit_events: cold_jsonl_fallback
+  audit_events: gorilla_s3_archive
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(
@@ -601,7 +602,7 @@ metrics:
         );
         assert_eq!(
             r.lookup("audit_events"),
-            StorageBackend::ColdJsonlFallback
+            StorageBackend::GorillaS3Archive
         );
         assert_eq!(r.lookup("unlisted"), StorageBackend::SketchWarmTier);
         assert_eq!(r.len(), 2);
@@ -731,7 +732,7 @@ metrics:
         let yaml = r#"
 default: sketch_warm_tier
 metrics:
-  http_requests_total: cold_jsonl_fallback
+  http_requests_total: gorilla_s3_archive
 routes:
   - metric: http_requests_total
     targets:
@@ -740,7 +741,7 @@ routes:
         applies_to_query_shape: [count]
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        // Default slot wins for non-count shapes.
+        // Default slot (warm) wins for non-count shapes.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
             StorageBackend::SketchWarmTier,
@@ -750,8 +751,8 @@ routes:
             r.lookup_with_shape("http_requests_total", QueryShape::Count),
             StorageBackend::GorillaS3Archive,
         );
-        // The `metrics:` entry was overridden — no trace of
-        // ColdJsonlFallback.
+        // The `metrics:` entry was overridden by the multi-target
+        // `routes:` entry (the single-target archive vanished).
         assert_eq!(r.target_count("http_requests_total"), 2);
     }
 
@@ -777,7 +778,7 @@ routes:
             vec![
                 RoutingTarget::for_shapes(StorageBackend::GorillaS3Archive, vec![QueryShape::Count]),
                 RoutingTarget::for_shapes(
-                    StorageBackend::ColdJsonlFallback,
+                    StorageBackend::SketchWarmTier,
                     vec![QueryShape::Topk],
                 ),
             ],

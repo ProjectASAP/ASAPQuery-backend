@@ -8,7 +8,7 @@
 //! queries against a store.
 
 use crate::data_model::{QueryLanguage, WindowType};
-use crate::engines::simple_engine::SimpleEngine;
+use crate::engines::simple::engine::SimpleEngine;
 use crate::stores::{Store, TimestampedBucketsMap};
 use crate::tests::test_utilities::{assert_execution_context_equivalent, TestConfigBuilder};
 use std::collections::HashMap;

@@ -6,7 +6,7 @@
 //! These tests use an actual store with test data.
 
 use crate::data_model::{AggregationType, KeyByLabelValues, Measurement};
-use crate::engines::simple_engine::SimpleEngine;
+use crate::engines::simple::engine::SimpleEngine;
 use crate::precompute_operators::sum_accumulator::SumAccumulator;
 use std::collections::HashMap;
 

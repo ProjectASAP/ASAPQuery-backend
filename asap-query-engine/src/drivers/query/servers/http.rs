@@ -16,7 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
-use crate::engines::{EngineRouter, EngineRouterError, QueryEngine, SimpleEngine};
+use crate::engines::SimpleEngine;
+use crate::routing::{EngineRouter, EngineRouterError, QueryEngine};
 use crate::query_tracker::QueryTracker;
 use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
@@ -35,7 +36,8 @@ use promql_utilities::query_logics::enums::Statistic;
 /// (Fix 1) for the design rationale.
 ///
 /// Recognised values match `StorageBackend::data_source_id()` —
-/// `sketch_warm`, `gorilla_archive`, `cold_jsonl`, `double_write`. An
+/// `sketch_warm`, `gorilla_archive`, `double_write`. (Step-1 of
+/// the JSONL deprecation removed the `cold_jsonl` value.) An
 /// unknown value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
@@ -795,7 +797,7 @@ async fn process_via_named_engine(
 /// `DoubleWrite` head-selection heuristic (other deploy shapes
 /// degenerate to a fixed list keyed only by `metric_storage`), so
 /// defaulting to `(Sum, Approximate)` is safe for `GorillaS3Archive`-
-/// only and `ColdJsonlFallback`-only deploys. A follow-up will thread
+/// only deploys. A follow-up will thread
 /// the real values through once the Phase-6 query-tracker exposes
 /// them per request.
 ///
@@ -823,8 +825,8 @@ async fn process_via_router(
 
     // Default `(Sum, Approximate)` — see fn doc above. The router's
     // capability table only consults these axes for `DoubleWrite`
-    // metrics; for `GorillaS3Archive`-only and `ColdJsonlFallback`-only
-    // deploys the dispatch is a function of `metric_storage` alone.
+    // metrics; for `GorillaS3Archive`-only deploys the dispatch
+    // is a function of `metric_storage` alone.
     let stat = Statistic::Sum;
     let accuracy = AccuracyTarget::Approximate;
 
@@ -1231,7 +1233,7 @@ async fn handle_metrics() -> impl IntoResponse {
     // exposition. Mirrors `/internal/s3_cost.csv` — the CSV is for
     // the demo, this is for live dashboards.
     let counters =
-        crate::drivers::query::fallback::cold_store::global_s3_cost_counters();
+        crate::engines::gorilla::global_s3_cost_counters();
     buffer.extend_from_slice(counters.render_prometheus().as_bytes());
     (
         [(
@@ -1249,7 +1251,7 @@ async fn handle_metrics() -> impl IntoResponse {
 /// the CSV is still well-formed).
 async fn handle_s3_cost_csv() -> impl IntoResponse {
     let counters =
-        crate::drivers::query::fallback::cold_store::global_s3_cost_counters();
+        crate::engines::gorilla::global_s3_cost_counters();
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -2526,7 +2528,8 @@ aggregations:
     // carries a `data_source: <id>` info-line so dashboards / e2e
     // tests can byte-compare which engine answered.
 
-    use crate::engines::{EngineCapabilities, EngineError, QueryEngine, QueryResult};
+    use crate::engines::{EngineError, QueryResult};
+    use crate::routing::{EngineCapabilities, QueryEngine};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2705,8 +2708,8 @@ aggregations:
         // metric at a backend whose data_source_id doesn't match
         // any registered engine — since `HttpServer::new` only
         // registers SimpleEngine (sketch_warm), routing a
-        // `ColdJsonlFallback`-only metric trips the empty path
-        // (compatible_storage_backends = [ColdJsonlFallback], no
+        // `GorillaS3Archive`-only metric trips the empty path
+        // (compatible_storage_backends = [GorillaS3Archive], no
         // engine registered for that id).
         setup_test_server_with_router(metric_storage_backend, Vec::new()).await
     }
@@ -2819,14 +2822,16 @@ aggregations:
 
     #[tokio::test]
     async fn http_returns_503_when_no_engines_registered() {
-        // Pin `storage_backend = ColdJsonlFallback` but register no
-        // engine for that id (only `SimpleEngine` is registered, and
-        // it lives under `sketch_warm`). The router walks
-        // `compatible_storage_backends = [ColdJsonlFallback]` and
+        // Pin `storage_backend = GorillaS3Archive` but register no
+        // archive engine (only `SimpleEngine` is registered under
+        // `sketch_warm`). The router walks
+        // `compatible_storage_backends = [GorillaS3Archive]` and
         // bails out with `NoEngineRegistered`, which the HTTP layer
-        // surfaces as 503.
+        // surfaces as 503. Step-1 of the JSONL deprecation removed
+        // the `ColdJsonlFallback` failover slot, so this is the
+        // canonical "engine missing" path now.
         let server_port =
-            setup_test_server_with_empty_router(StorageBackend::ColdJsonlFallback).await;
+            setup_test_server_with_empty_router(StorageBackend::GorillaS3Archive).await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -2907,29 +2912,25 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_router_falls_through_to_jsonl_when_archive_fails() {
-        // Optional (graceful fallback) — verifies that a
-        // `DoubleWrite` deploy whose archive engine errors does NOT
-        // surface a 5xx; the router walks the compatibility list and
-        // ColdJsonlFallback answers. Pins the §8 behaviour of
-        // `design-gorilla-s3-cold-engine.md`.
-        let (gorilla_failing, gorilla_calls) =
+    async fn http_router_serves_double_write_via_warm_head() {
+        // Step-1 of the JSONL deprecation deleted the
+        // `ColdJsonlFallback` last-resort slot; the surviving
+        // failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
+        // The HTTP handler dispatches with default
+        // `(Statistic::Sum, AccuracyTarget::Approximate)`, so for a
+        // `DoubleWrite` metric the compatibility list is
+        // `[SketchWarmTier, GorillaS3Archive]` and the warm-tier
+        // mock answers first. The archive must NOT be hit (no
+        // failover needed when the head succeeds).
+        let (warm_ok, warm_calls) =
+            MockQueryEngine::new(StorageBackend::SketchWarmTier, MockOutcome::OkEmpty);
+        let (archive, archive_calls) =
             MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::Backend);
-        let (jsonl_ok, jsonl_calls) =
-            MockQueryEngine::new(StorageBackend::ColdJsonlFallback, MockOutcome::OkEmpty);
-        // SimpleEngine is registered under `sketch_warm` by
-        // `HttpServer::new`; for `DoubleWrite` + `Approximate` the
-        // compatibility list is
-        // `[SketchWarmTier, GorillaS3Archive, ColdJsonlFallback]`.
-        // SimpleEngine is configured with no agg ids, so its
-        // `handle_query` returns `None` → `EngineError::CapabilityMiss`,
-        // which the router tolerates and falls through. Then Gorilla
-        // fails with `Backend`, so JSONL must answer.
         let server_port = setup_test_server_with_router(
             StorageBackend::DoubleWrite,
             vec![
-                gorilla_failing as Arc<dyn QueryEngine>,
-                jsonl_ok as Arc<dyn QueryEngine>,
+                warm_ok as Arc<dyn QueryEngine>,
+                archive as Arc<dyn QueryEngine>,
             ],
         )
         .await;
@@ -2942,16 +2943,15 @@ aggregations:
             .unwrap();
         assert!(
             resp.status().is_success(),
-            "double-write fallback must answer 2xx; got {}",
+            "double-write must answer 2xx; got {}",
             resp.status()
         );
-        // We dispatched as `metric_storage = DoubleWrite`, so the
-        // `data_source` info-line reflects the *requested* axis (the
-        // router's `execute` doesn't expose which member of the
-        // failover list answered). Verifying the fallback was
-        // exercised happens via call counts.
-        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(jsonl_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            0,
+            "archive must not run when the warm-tier head answers cleanly",
+        );
     }
 
     // ── Issue #46 production-path coverage: BackendStorageRouting ─────────────

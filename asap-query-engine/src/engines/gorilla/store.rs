@@ -1,22 +1,21 @@
-//! Gorilla-on-S3 [`ColdStore`] adapter — Phase 3 of the
-//! Gorilla-S3-cold-engine.
+//! Gorilla-on-S3 archive store — the Phase-4 [`GorillaQueryEngine`](super::GorillaQueryEngine)'s
+//! sole storage backend.
 //!
 //! Lists per-hour `index.json` catalogs out of an S3-compatible
 //! bucket, prunes them by time range, then fetches + decodes the
-//! selected `GORILLA1` chunks via the freshly-merged
-//! [`asap_gorilla`] crate (`ASAPCollector` PR #281).
+//! selected `GORILLA1` chunks via the [`asap_gorilla`] crate
+//! (`ASAPCollector` PR #281).
 //!
-//! Sits alongside [`super::LocalFsColdStore`] — both impls satisfy
-//! the same [`super::ColdStore`] trait, so the existing
-//! `s3_adapter::ColdFallback` query path can swap between them
-//! without code change. The Phase 3 trait extension
-//! ([`super::ColdStore::list_chunks`] / [`super::ColdStore::read_chunk`])
-//! lets the upcoming Phase 4 `GorillaQueryEngine` pull chunks one
-//! at a time without materialising every sample.
+//! Step-1 refactor (`refactor: tier-co-locate engines/{simple,gorilla}/`)
+//! folded the previous `ColdStore` trait + `RawSample`/`ChunkRef`
+//! types into this module. The legacy JSONL leg
+//! (`LocalFsColdStore`, `parse_jsonl`, `ColdJsonlFallback`) was
+//! deleted at the same commit; this is now the only `Store` impl
+//! in the archive tier.
 //!
 //! # Object key layout
 //!
-//! `GorillaS3ColdStore` is **agnostic** about the on-S3 chunk-key
+//! `GorillaS3Store` is **agnostic** about the on-S3 chunk-key
 //! shape. Two layouts are known to coexist (see PR #281):
 //!
 //! * design.md canonical:
@@ -37,6 +36,7 @@
 //! Hidden behind the [`ObjectStore`] trait below so tests use an
 //! in-memory mock and do not need a live MinIO.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -46,19 +46,140 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use lru::LruCache;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use asap_gorilla::{GorillaDecoder, IndexFile, Postings};
+use asap_gorilla::{GorillaDecoder, IndexFile};
 
-use super::{ChunkRef, ColdStore, ColdStoreError, PostingsHits, RawSample};
+use super::postings::{intersect_per_bucket_postings, PostingsCache, PostingsHits};
+use super::s3_cost::{global_s3_cost_counters, S3CostTrackingObjectStore};
+
+// ─────────────────────────────────────────────────────────────────────
+// Public types — merged in from the deleted `cold_store/mod.rs`
+// ─────────────────────────────────────────────────────────────────────
+
+/// A single raw observability sample as decoded out of a
+/// `GORILLA1` chunk. `labels` is a `BTreeMap` so identical samples
+/// hash deterministically (handy for golden tests + the postings
+/// cross-check).
+///
+/// Pre-Step-1 this lived in the JSONL `cold_store::format` module
+/// and was the wire format the legacy `LocalFsColdStore` parsed.
+/// JSONL is gone; the type stays as the in-memory shape every
+/// gorilla-engine consumer (`exact_executor`, the postings filter,
+/// the test mocks) speaks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RawSample {
+    pub ts_ms: i64,
+    pub labels: BTreeMap<String, String>,
+    pub value: f64,
+}
+
+/// Convenience alias: a label set as stored on a [`RawSample`].
+pub type LabelSet = BTreeMap<String, String>;
+
+/// Error surface for archive-store operations.
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("malformed record: {0}")]
+    Malformed(String),
+    /// Backend-storage error (e.g. an S3 GET failed) that is not
+    /// itself a `std::io::Error`.
+    #[error("backend error: {0}")]
+    Backend(String),
+    /// A trait method that this `Store` impl does not support.
+    /// Reserved for forwards-compatible trait extensions.
+    #[error("unsupported store operation: {0}")]
+    Unsupported(&'static str),
+}
+
+/// Descriptor for a single immutable chunk stored in the archive
+/// tier. Returned by [`Store::list_chunks`]; carries enough
+/// metadata for callers to prune by time / label without reading
+/// the chunk body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkRef {
+    /// Opaque object key (e.g. an S3 key). The Telegraf-side
+    /// `gorilla_s3` output uses
+    /// `<prefix>/block-<unix>-<idx>-<rand>.gorilla`; the
+    /// design.md-style layout is `<tenant>/<metric>/YYYY/MM/DD/HH/
+    /// part-NNNNNN.gor`. Either is fine — the index file is the
+    /// source of truth for what keys exist.
+    pub key: String,
+    /// Metric name the chunk was fetched against. Recovered from
+    /// the caller's `list_chunks` request rather than the on-wire
+    /// chunk metadata.
+    pub metric: String,
+    /// `(start_unix_ms, end_unix_ms)` covered by the chunk.
+    pub time_range_ms: (i64, i64),
+    /// 64-bit canonical-label-set hash — for prune-by-label-equality
+    /// without fetching the chunk.
+    pub label_hash: u64,
+    /// Number of samples in the chunk.
+    pub sample_count: u32,
+    /// On-wire size of the chunk object in bytes.
+    pub size_bytes: u32,
+}
+
+/// Read-only view over the Gorilla archive tier.
+///
+/// Trait-shaped (rather than collapsed onto `GorillaS3Store`
+/// concretely) so tests can drop in an in-memory mock without
+/// touching production S3 wiring. Step-2 of the JSONL deprecation
+/// (Prometheus-block format + Thanos store-gateway) will plug a
+/// second impl in under the same trait.
+///
+/// Scans are `(metric, [start_ms, end_ms))` — inclusive start,
+/// exclusive end — matching the half-open range convention used by
+/// the rest of the engine.
+#[async_trait]
+pub trait Store: Send + Sync {
+    /// Return all samples for `metric` whose timestamp lies in
+    /// `[start_ms, end_ms)`. Ordering is not guaranteed.
+    async fn scan(
+        &self,
+        metric: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<RawSample>, StoreError>;
+
+    /// List chunk descriptors covering `[start_ms, end_ms)` without
+    /// decoding any bodies.
+    async fn list_chunks(
+        &self,
+        metric: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<ChunkRef>, StoreError>;
+
+    /// Decode a single chunk into an owned `Vec<RawSample>`.
+    async fn read_chunk(&self, chunk: &ChunkRef) -> Result<Vec<RawSample>, StoreError>;
+
+    /// Load + intersect per-bucket postings under `(metric,
+    /// time_range)` for the supplied `(label_name, label_value)`
+    /// matchers. Default impl returns
+    /// [`StoreError::Unsupported`] so chunk-only stores keep
+    /// compiling without postings sidecars.
+    async fn list_postings_for(
+        &self,
+        _metric: &str,
+        _start_ms: i64,
+        _end_ms: i64,
+        _matchers: &[(String, String)],
+    ) -> Result<PostingsHits, StoreError> {
+        Err(StoreError::Unsupported("list_postings_for"))
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Public config
 // ─────────────────────────────────────────────────────────────────────
 
-/// Tunable configuration for [`GorillaS3ColdStore`].
+/// Tunable configuration for [`GorillaS3Store`].
 ///
 /// Use [`GorillaS3Config::from_env`] to pull values from environment
 /// variables in deployment, or build manually for tests.
@@ -188,26 +309,21 @@ impl GorillaS3Config {
 
 /// Minimal async object-fetch interface.
 ///
-/// Sized + `Send + Sync` so [`GorillaS3ColdStore`] can hold one
+/// Sized + `Send + Sync` so [`GorillaS3Store`] can hold one
 /// behind an `Arc<dyn ObjectStore>` regardless of how it's backed.
 /// Production callers use [`S3ObjectStore`] (rust-s3); tests use the
 /// in-memory mock at the bottom of this file.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     /// Fetch the full object body for `key`.
-    ///
-    /// Returns [`ColdStoreError::Backend`] for transport errors and
-    /// [`ColdStoreError::Backend`] (with a `not found` substring)
-    /// for missing keys; callers distinguish via
-    /// [`ObjectStore::object_missing`] if they need to.
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, ColdStoreError>;
+    async fn get_object(&self, key: &str) -> Result<Vec<u8>, StoreError>;
 
     /// True iff `err` was raised because the requested key did not
     /// exist (vs. a transport / permission failure). Used by the
     /// list path to treat a missing `index.json` as "no chunks for
     /// this hour" rather than a hard error.
-    fn object_missing(&self, err: &ColdStoreError) -> bool {
-        matches!(err, ColdStoreError::Backend(msg) if msg.contains("not found"))
+    fn object_missing(&self, err: &StoreError) -> bool {
+        matches!(err, StoreError::Backend(msg) if msg.contains("not found"))
     }
 }
 
@@ -230,7 +346,7 @@ mod rust_s3_backend {
         /// Build from a [`GorillaS3Config`]. Sets
         /// `path_style = true` whenever a custom endpoint is
         /// configured (MinIO mandates path-style addressing).
-        pub fn new(cfg: &GorillaS3Config) -> Result<Self, ColdStoreError> {
+        pub fn new(cfg: &GorillaS3Config) -> Result<Self, StoreError> {
             let region = match &cfg.endpoint {
                 Some(ep) => {
                     let endpoint = if ep.starts_with("http://") || ep.starts_with("https://") {
@@ -248,20 +364,20 @@ mod rust_s3_backend {
                 None => cfg
                     .region
                     .parse::<S3Region>()
-                    .map_err(|e| ColdStoreError::Backend(format!("region parse: {e}")))?,
+                    .map_err(|e| StoreError::Backend(format!("region parse: {e}")))?,
             };
             let creds = match (&cfg.access_key_id, &cfg.secret_access_key) {
                 (Some(ak), Some(sk)) => {
                     Credentials::new(Some(ak), Some(sk), None, None, None).map_err(|e| {
-                        ColdStoreError::Backend(format!("credentials: {e}"))
+                        StoreError::Backend(format!("credentials: {e}"))
                     })?
                 }
                 _ => Credentials::default().map_err(|e| {
-                    ColdStoreError::Backend(format!("default credentials: {e}"))
+                    StoreError::Backend(format!("default credentials: {e}"))
                 })?,
             };
             let bucket = Bucket::new(&cfg.bucket, region, creds)
-                .map_err(|e| ColdStoreError::Backend(format!("bucket: {e}")))?;
+                .map_err(|e| StoreError::Backend(format!("bucket: {e}")))?;
             // MinIO + most S3-compatibles require path-style addressing
             // when a custom endpoint is in play. AWS S3 supports both,
             // so leaving it on for the AWS path is safe but slightly
@@ -277,19 +393,19 @@ mod rust_s3_backend {
 
     #[async_trait]
     impl ObjectStore for S3ObjectStore {
-        async fn get_object(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+        async fn get_object(&self, key: &str) -> Result<Vec<u8>, StoreError> {
             let resp = self
                 .bucket
                 .get_object(key)
                 .await
-                .map_err(|e| ColdStoreError::Backend(format!("s3 get {key}: {e}")))?;
+                .map_err(|e| StoreError::Backend(format!("s3 get {key}: {e}")))?;
             if resp.status_code() == 404 {
-                return Err(ColdStoreError::Backend(format!(
+                return Err(StoreError::Backend(format!(
                     "s3 get {key}: not found"
                 )));
             }
             if !(200..300).contains(&resp.status_code()) {
-                return Err(ColdStoreError::Backend(format!(
+                return Err(StoreError::Backend(format!(
                     "s3 get {key}: status {}",
                     resp.status_code()
                 )));
@@ -302,7 +418,7 @@ mod rust_s3_backend {
 pub use rust_s3_backend::S3ObjectStore;
 
 // ─────────────────────────────────────────────────────────────────────
-// GorillaS3ColdStore
+// GorillaS3Store
 // ─────────────────────────────────────────────────────────────────────
 
 /// LRU cache keyed by chunk object key. Stored values are
@@ -310,19 +426,18 @@ pub use rust_s3_backend::S3ObjectStore;
 /// chunk skip the Gorilla decode pass entirely.
 type ChunkCache = Mutex<LruCache<String, Arc<Vec<RawSample>>>>;
 
-/// **mvp/v5**: LRU cache for parsed postings sidecars. Keyed by
-/// the postings-v1.json S3 key (one per `(metric, hour)`). 256
-/// entries by default → ≈ 256 MiB at 1 MiB per postings file.
-type PostingsCache = Mutex<LruCache<String, Arc<Postings>>>;
-
 /// **mvp/v5**: LRU cache for parsed `index.json` files (per
 /// `(metric, hour)`). Same capacity tier as the postings cache.
 type IndexCache = Mutex<LruCache<String, Arc<IndexFile>>>;
 
-/// `ColdStore` adapter that reads `GORILLA1`-format chunks out of
-/// an S3-compatible bucket. See module docs for layout + S3 client
+/// `Store` adapter that reads `GORILLA1`-format chunks out of an
+/// S3-compatible bucket. See module docs for layout + S3 client
 /// notes.
-pub struct GorillaS3ColdStore {
+///
+/// Step-1 rename (`GorillaS3ColdStore` → `GorillaS3Store`) reflects
+/// the JSONL deprecation: there is no longer a "warm/cold" split
+/// inside the archive tier; this is *the* archive store.
+pub struct GorillaS3Store {
     object_store: Arc<dyn ObjectStore>,
     config: GorillaS3Config,
     cache: ChunkCache,
@@ -338,7 +453,7 @@ pub struct GorillaS3ColdStore {
     index_cache: IndexCache,
 }
 
-impl GorillaS3ColdStore {
+impl GorillaS3Store {
     /// Build with an explicit object-store backend. The production
     /// constructor [`Self::with_default_backend`] wires up
     /// `S3ObjectStore` from `cfg`; tests inject the in-memory mock.
@@ -363,13 +478,13 @@ impl GorillaS3ColdStore {
     /// `rust-s3`-backed [`ObjectStore`].
     ///
     /// **mvp/v5**: the underlying `S3ObjectStore` is wrapped in an
-    /// [`super::S3CostTrackingObjectStore`] tied to the global
-    /// counter set, so the HTTP server's `/internal/s3_cost.csv`
-    /// + `/metrics` endpoints report measured PUT/GET/etc counts.
-    pub fn with_default_backend(config: GorillaS3Config) -> Result<Self, ColdStoreError> {
+    /// [`S3CostTrackingObjectStore`] tied to the global counter
+    /// set, so the HTTP server's `/internal/s3_cost.csv` +
+    /// `/metrics` endpoints report measured PUT/GET/etc counts.
+    pub fn with_default_backend(config: GorillaS3Config) -> Result<Self, StoreError> {
         let backend: Arc<dyn ObjectStore> = Arc::new(S3ObjectStore::new(&config)?);
-        let counters = super::s3_cost_tracker::global_s3_cost_counters();
-        let tracked = super::S3CostTrackingObjectStore::new(backend, counters);
+        let counters = global_s3_cost_counters();
+        let tracked = S3CostTrackingObjectStore::new(backend, counters);
         Ok(Self::new(Arc::new(tracked), config))
     }
 
@@ -402,21 +517,7 @@ impl GorillaS3ColdStore {
     /// * `{year}`/`{month}`/`{day}`/`{hour}` — the backend's
     ///   long-standing names.
     /// * `{YYYY}`/`{MM}`/`{DD}`/`{HH}` — the agent
-    ///   `gorillas3processor`'s naming, documented in
-    ///   `opentelemetry-collector-contrib-patch/processor/
-    ///   gorillas3processor/config.go`.
-    ///
-    /// Pre-v7 the two sides used different placeholders, so when a
-    /// deploy set `ASAP_GORILLA_S3_PREFIX_TEMPLATE` to the
-    /// agent-side spelling (the v6 demo does — see
-    /// `deploy/docker-compose/mvp-v6-multi-stage.yml`), the backend
-    /// substituted `{tenant}` and `{metric}` but left the
-    /// timestamp placeholders un-replaced, so every `index.json`
-    /// fetch issued a literal `{YYYY}/{MM}/{DD}/{HH}` path that
-    /// missed the actual chunk objects on disk. Issue #46
-    /// criterion ⑥ (freshness probes) surfaced as 0 samples on
-    /// every path because of this. Accepting both spellings keeps
-    /// pre-v7 deploys working AND the v6/v7 demo deploy aligned.
+    ///   `gorillas3processor`'s naming.
     fn bucket_prefix(&self, metric: &str, ts_ms: i64) -> String {
         let dt: DateTime<Utc> = DateTime::<Utc>::from_timestamp_millis(ts_ms)
             .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
@@ -429,16 +530,10 @@ impl GorillaS3ColdStore {
             .prefix_template
             .replace("{tenant}", &self.config.tenant)
             .replace("{metric}", metric)
-            // Long-form placeholders (the backend's historical
-            // spelling — preserved for backwards compatibility).
             .replace("{year}", &year)
             .replace("{month}", &month)
             .replace("{day}", &day)
             .replace("{hour}", &hour)
-            // Agent-side `{YYYY}`/`{MM}`/`{DD}`/`{HH}` aliases —
-            // matches the spelling in the agent's
-            // `gorillas3processor/config.go` and
-            // `s3_sink.go::renderPrefix`.
             .replace("{YYYY}", &year)
             .replace("{MM}", &month)
             .replace("{DD}", &day)
@@ -471,12 +566,12 @@ impl GorillaS3ColdStore {
 
     /// Fetch + parse one hour's `index.json`. Missing index = empty
     /// catalog (the producer may not have flushed yet); transport
-    /// failure surfaces as `ColdStoreError::Backend`.
-    async fn fetch_index(&self, metric: &str, hour_ms: i64) -> Result<IndexFile, ColdStoreError> {
+    /// failure surfaces as `StoreError::Backend`.
+    async fn fetch_index(&self, metric: &str, hour_ms: i64) -> Result<IndexFile, StoreError> {
         let key = self.index_key(metric, hour_ms);
         match self.object_store.get_object(&key).await {
             Ok(bytes) => IndexFile::read(bytes.as_slice()).map_err(|e| {
-                ColdStoreError::Malformed(format!("index.json at {key}: {e}"))
+                StoreError::Malformed(format!("index.json at {key}: {e}"))
             }),
             Err(e) if self.object_store.object_missing(&e) => {
                 debug!(key = %key, "gorilla-s3: index.json missing for hour bucket; skipping");
@@ -488,13 +583,13 @@ impl GorillaS3ColdStore {
 }
 
 #[async_trait]
-impl ColdStore for GorillaS3ColdStore {
+impl Store for GorillaS3Store {
     async fn scan(
         &self,
         metric: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<RawSample>, ColdStoreError> {
+    ) -> Result<Vec<RawSample>, StoreError> {
         let chunks = self.list_chunks(metric, start_ms, end_ms).await?;
         let mut out = Vec::new();
         for chunk in chunks {
@@ -513,15 +608,11 @@ impl ColdStore for GorillaS3ColdStore {
         metric: &str,
         start_ms: i64,
         end_ms: i64,
-    ) -> Result<Vec<ChunkRef>, ColdStoreError> {
+    ) -> Result<Vec<ChunkRef>, StoreError> {
         // Convert the request window to the nanosecond unit the
         // index file uses (`IndexEntry.time_range` is `(ns, ns)`,
         // mirroring the Go encoder's `time.Time.UnixNano()` source).
         let start_ns = (start_ms as i128).saturating_mul(1_000_000) as u64;
-        // `end_ms` is exclusive on the ms side; the index iter
-        // overlap test is inclusive so subtract 1 ns to keep the
-        // semantics aligned. If `end_ms == start_ms` we still want
-        // to scan the bucket containing `start_ms`.
         let end_ns = if end_ms <= start_ms {
             start_ns
         } else {
@@ -540,10 +631,7 @@ impl ColdStore for GorillaS3ColdStore {
                 // v7: agent-produced index entries carry just the
                 // chunk's basename (`part-NNNN-MMMM.gor`), not the
                 // full S3 key. Detect a bare basename (no `/`) and
-                // prepend the bucket prefix so the subsequent
-                // `read_chunk` GET hits the right object.
-                // Backend-produced entries carry the full key; we
-                // leave those unchanged.
+                // prepend the bucket prefix.
                 let key = if entry.key.contains('/') {
                     entry.key.clone()
                 } else {
@@ -562,7 +650,7 @@ impl ColdStore for GorillaS3ColdStore {
         Ok(out)
     }
 
-    async fn read_chunk(&self, chunk: &ChunkRef) -> Result<Vec<RawSample>, ColdStoreError> {
+    async fn read_chunk(&self, chunk: &ChunkRef) -> Result<Vec<RawSample>, StoreError> {
         // Cache hit fast path.
         {
             let mut guard = self.cache.lock().await;
@@ -573,7 +661,7 @@ impl ColdStore for GorillaS3ColdStore {
 
         let bytes = self.object_store.get_object(&chunk.key).await?;
         let samples = decode_block(&bytes)
-            .map_err(|e| ColdStoreError::Malformed(format!("decode {}: {e}", chunk.key)))?;
+            .map_err(|e| StoreError::Malformed(format!("decode {}: {e}", chunk.key)))?;
 
         let arc = Arc::new(samples.clone());
         {
@@ -583,100 +671,29 @@ impl ColdStore for GorillaS3ColdStore {
         Ok(samples)
     }
 
-    /// **mvp/v5**: postings-aware chunk pruning.
-    ///
-    /// Walks the per-hour buckets covering `[start_ms, end_ms)`,
-    /// fetches each `postings-v1.json` (LRU-cached), and intersects
-    /// the per-matcher series-id lists across every bucket.
-    /// Missing-postings buckets are noted (caller-visible quirk).
-    ///
-    /// Empty `matchers` ⇒ returns the union of all postings'
-    /// series_ids in range — this is the "no predicate"
-    /// short-circuit and the engine usually skips calling us in
-    /// that case.
+    /// **mvp/v5**: postings-aware chunk pruning — delegated to
+    /// [`super::postings::intersect_per_bucket_postings`] so the
+    /// per-bucket fetch + intersect logic sits in one place
+    /// regardless of which `Store` impl owns the postings cache.
     async fn list_postings_for(
         &self,
         metric: &str,
         start_ms: i64,
         end_ms: i64,
         matchers: &[(String, String)],
-    ) -> Result<PostingsHits, ColdStoreError> {
+    ) -> Result<PostingsHits, StoreError> {
         let buckets = Self::hour_starts(start_ms, end_ms);
-        let mut hits = PostingsHits {
-            series_ids: Vec::new(),
-            buckets_in_range: buckets.len(),
-            buckets_with_postings: 0,
-        };
-        // Per-bucket: load postings, intersect across matchers,
-        // union into the running result. Cross-bucket join is a
-        // UNION (a series might exist in one hour but not the
-        // next); intra-bucket intersection across matchers is an
-        // AND.
-        let mut union_set: std::collections::BTreeSet<u64> =
-            std::collections::BTreeSet::new();
+        let mut keys: Vec<String> = Vec::with_capacity(buckets.len());
         for hour_ms in buckets {
-            let key = self.postings_key(metric, hour_ms);
-            // LRU short-circuit.
-            let postings = {
-                let mut guard = self.postings_cache.lock().await;
-                guard.get(&key).cloned()
-            };
-            let postings = match postings {
-                Some(p) => Some(p),
-                None => match self.object_store.get_object(&key).await {
-                    Ok(bytes) => match Postings::read(bytes.as_slice()) {
-                        Ok(p) => {
-                            let arc = Arc::new(p);
-                            let mut guard = self.postings_cache.lock().await;
-                            guard.put(key.clone(), arc.clone());
-                            Some(arc)
-                        }
-                        Err(e) => {
-                            // Treat a corrupt postings file as
-                            // "missing" — the engine then falls
-                            // through to the scan-all path with
-                            // the postings_missing quirk.
-                            debug!(key = %key, error = %e, "gorilla-s3: postings parse failed; treating as missing");
-                            None
-                        }
-                    },
-                    Err(e) if self.object_store.object_missing(&e) => {
-                        debug!(key = %key, "gorilla-s3: postings missing for hour bucket");
-                        None
-                    }
-                    Err(e) => return Err(e),
-                },
-            };
-            let Some(postings) = postings else { continue };
-            hits.buckets_with_postings += 1;
-
-            // Intersect across matchers within this bucket.
-            let bucket_set: std::collections::BTreeSet<u64> = if matchers.is_empty() {
-                // Union of every series_id across every label.
-                let mut set = std::collections::BTreeSet::new();
-                for by_value in postings.by_label.values() {
-                    for ids in by_value.values() {
-                        set.extend(ids.iter().copied());
-                    }
-                }
-                set
-            } else {
-                let first =
-                    postings.lookup(&matchers[0].0, &matchers[0].1);
-                let mut acc: std::collections::BTreeSet<u64> =
-                    first.iter().copied().collect();
-                for (label_name, label_value) in &matchers[1..] {
-                    let next = postings.lookup(label_name, label_value);
-                    let next_set: std::collections::BTreeSet<u64> =
-                        next.iter().copied().collect();
-                    acc = acc.intersection(&next_set).copied().collect();
-                }
-                acc
-            };
-            union_set.extend(bucket_set);
+            keys.push(self.postings_key(metric, hour_ms));
         }
-        hits.series_ids = union_set.into_iter().collect();
-        Ok(hits)
+        intersect_per_bucket_postings(
+            self.object_store.as_ref(),
+            &self.postings_cache,
+            &keys,
+            matchers,
+        )
+        .await
     }
 }
 
@@ -685,17 +702,11 @@ impl ColdStore for GorillaS3ColdStore {
 // ─────────────────────────────────────────────────────────────────────
 
 /// Decode a single in-memory `GORILLA1` block into [`RawSample`]s.
-///
-/// Walks every series in the block; multi-series blocks are
-/// flattened into one `Vec`. Timestamps are converted from the
-/// on-wire nanoseconds (Go `time.Time.UnixNano()` source) to the
-/// [`RawSample::ts_ms`] millisecond unit.
 fn decode_block(bytes: &[u8]) -> Result<Vec<RawSample>, asap_gorilla::DecodeError> {
     let mut decoder = GorillaDecoder::from_reader(bytes)?;
     let mut out: Vec<RawSample> = Vec::new();
     while let Some(header) = decoder.header().cloned() {
-        let labels: std::collections::BTreeMap<String, String> =
-            header.labels.iter().cloned().collect();
+        let labels: BTreeMap<String, String> = header.labels.iter().cloned().collect();
         for sample in decoder.samples() {
             let (ts_ns, value) = sample?;
             out.push(RawSample {
@@ -716,11 +727,6 @@ fn decode_block(bytes: &[u8]) -> Result<Vec<RawSample>, asap_gorilla::DecodeErro
 // can exercise the same fixture without a live MinIO.
 // ─────────────────────────────────────────────────────────────────────
 
-/// In-memory [`ObjectStore`] used by `gorilla_s3` tests.
-///
-/// Holds a `HashMap<key, Vec<u8>>` plus a per-key fetch counter so
-/// cache-hit assertions are first-class. Optionally fails every
-/// `get_object` call for the network-error test.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct InMemoryObjectStore {
@@ -762,24 +768,24 @@ impl InMemoryObjectStore {
 #[cfg(test)]
 #[async_trait]
 impl ObjectStore for InMemoryObjectStore {
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+    async fn get_object(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         let mut g = self.inner.lock().await;
         if let Some(msg) = g.fail_all.clone() {
-            return Err(ColdStoreError::Backend(msg));
+            return Err(StoreError::Backend(msg));
         }
         *g.fetch_counts.entry(key.to_string()).or_insert(0) += 1;
         match g.objects.get(key) {
             Some(b) => Ok(b.clone()),
-            None => Err(ColdStoreError::Backend(format!("get {key}: not found"))),
+            None => Err(StoreError::Backend(format!("get {key}: not found"))),
         }
     }
 }
 
-// Static `Send` assertion — `GorillaS3ColdStore` must be storable
-// behind an `Arc<dyn ColdStore>` in the existing s3_adapter chain.
+// Static `Send` assertion — `GorillaS3Store` must be storable
+// behind an `Arc<dyn Store>` in the engine wiring.
 const _: fn() = || {
     fn _assert_send<T: Send>() {}
-    _assert_send::<GorillaS3ColdStore>();
+    _assert_send::<GorillaS3Store>();
 };
 
 // ─────────────────────────────────────────────────────────────────────
@@ -812,7 +818,6 @@ mod tests {
                 .collect(),
         );
         for (ts_ms, v) in samples {
-            // ts_ms → ts_ns
             enc.append((*ts_ms as u64) * 1_000_000, *v);
         }
         enc.finalize().unwrap()
@@ -838,8 +843,6 @@ mod tests {
         }
     }
 
-    /// Layout: hour bucket H, three chunks A/B/C in time order, the
-    /// requested window only overlaps B → list returns B alone.
     #[tokio::test]
     async fn list_chunks_via_indexfile_prunes_by_time() {
         let store = InMemoryObjectStore::new();
@@ -858,9 +861,9 @@ mod tests {
                 sample_count: 10,
                 label_hash: 0xAAAA,
                 size_bytes: 100,
-            object_key: None,
-            byte_offset: None,
-            byte_length: None,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
             },
             IndexEntry {
                 key: key_b.clone(),
@@ -868,9 +871,9 @@ mod tests {
                 sample_count: 11,
                 label_hash: 0xBBBB,
                 size_bytes: 110,
-            object_key: None,
-            byte_offset: None,
-            byte_length: None,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
             },
             IndexEntry {
                 key: key_c.clone(),
@@ -878,9 +881,9 @@ mod tests {
                 sample_count: 12,
                 label_hash: 0xCCCC,
                 size_bytes: 120,
-            object_key: None,
-            byte_offset: None,
-            byte_length: None,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
             },
         ];
 
@@ -891,7 +894,7 @@ mod tests {
             )
             .await;
 
-        let cs = GorillaS3ColdStore::new(Arc::new(store), cfg());
+        let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let chunks = cs
             .list_chunks(metric, h0 + 5_500, h0 + 5_800)
             .await
@@ -932,14 +935,14 @@ mod tests {
                     sample_count: 3,
                     label_hash: 0x1234,
                     size_bytes: block.len() as u32,
-                object_key: None,
-                byte_offset: None,
-                byte_length: None,
+                    object_key: None,
+                    byte_offset: None,
+                    byte_length: None,
                 }]),
             )
             .await;
 
-        let cs = GorillaS3ColdStore::new(Arc::new(store), cfg());
+        let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let chunks = cs.list_chunks(metric, h0, h0 + 60_000).await.unwrap();
         assert_eq!(chunks.len(), 1);
 
@@ -976,14 +979,14 @@ mod tests {
                     sample_count: 2,
                     label_hash: 0,
                     size_bytes: block.len() as u32,
-                object_key: None,
-                byte_offset: None,
-                byte_length: None,
+                    object_key: None,
+                    byte_offset: None,
+                    byte_length: None,
                 }]),
             )
             .await;
 
-        let cs = GorillaS3ColdStore::new(store.clone(), cfg());
+        let cs = GorillaS3Store::new(store.clone(), cfg());
         let chunks = cs.list_chunks(metric, h0, h0 + 60_000).await.unwrap();
         assert_eq!(chunks.len(), 1);
 
@@ -1001,8 +1004,6 @@ mod tests {
 
     #[tokio::test]
     async fn lru_eviction_under_pressure() {
-        // cache_capacity=2, fill with three chunks then re-read the
-        // first → that triggers an S3 GET because the LRU evicted it.
         let store = Arc::new(InMemoryObjectStore::new());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
 
@@ -1025,9 +1026,9 @@ mod tests {
                 sample_count: 2,
                 label_hash: i as u64,
                 size_bytes: block.len() as u32,
-            object_key: None,
-            byte_offset: None,
-            byte_length: None,
+                object_key: None,
+                byte_offset: None,
+                byte_length: None,
             });
             chunk_refs.push(ChunkRef {
                 key,
@@ -1044,7 +1045,7 @@ mod tests {
 
         let mut config = cfg();
         config.cache_capacity = 2;
-        let cs = GorillaS3ColdStore::new(store.clone(), config);
+        let cs = GorillaS3Store::new(store.clone(), config);
 
         cs.read_chunk(&chunk_refs[0]).await.unwrap();
         cs.read_chunk(&chunk_refs[1]).await.unwrap();
@@ -1071,10 +1072,10 @@ mod tests {
             )
             .await;
 
-        let cs = GorillaS3ColdStore::new(Arc::new(store), cfg());
+        let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let res = cs.list_chunks("m", h0, h0 + 60_000).await;
         match res {
-            Err(ColdStoreError::Malformed(msg)) => {
+            Err(StoreError::Malformed(msg)) => {
                 assert!(msg.contains("index.json"), "msg should name the key: {msg}")
             }
             other => panic!("expected Malformed, got {other:?}"),
@@ -1085,11 +1086,11 @@ mod tests {
     async fn s3_unavailable_returns_error() {
         let store = Arc::new(InMemoryObjectStore::new());
         store.fail_all("simulated network outage").await;
-        let cs = GorillaS3ColdStore::new(store, cfg());
+        let cs = GorillaS3Store::new(store, cfg());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
         let res = cs.list_chunks("m", h0, h0 + 60_000).await;
         match res {
-            Err(ColdStoreError::Backend(msg)) => assert!(msg.contains("simulated network outage")),
+            Err(StoreError::Backend(msg)) => assert!(msg.contains("simulated network outage")),
             other => panic!("expected Backend, got {other:?}"),
         }
     }
@@ -1097,7 +1098,7 @@ mod tests {
     #[tokio::test]
     async fn missing_index_is_empty_not_error() {
         let store = InMemoryObjectStore::new();
-        let cs = GorillaS3ColdStore::new(Arc::new(store), cfg());
+        let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
         let chunks = cs.list_chunks("never_written", h0, h0 + 60_000).await.unwrap();
         assert!(chunks.is_empty());
@@ -1107,11 +1108,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_filters_to_requested_range() {
-        // Chunk has samples at h0+1_000 and h0+10_000; request only
-        // [h0+5_000, h0+9_000) — chunk overlaps the request, but the
-        // matching sample is *outside* the inner filter, so scan
-        // returns 0 samples (read_chunk would still load + cache the
-        // chunk).
         let store = Arc::new(InMemoryObjectStore::new());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
         let block = make_block(
@@ -1133,14 +1129,14 @@ mod tests {
                     sample_count: 2,
                     label_hash: 0,
                     size_bytes: block.len() as u32,
-                object_key: None,
-                byte_offset: None,
-                byte_length: None,
+                    object_key: None,
+                    byte_offset: None,
+                    byte_length: None,
                 }]),
             )
             .await;
 
-        let cs = GorillaS3ColdStore::new(store, cfg());
+        let cs = GorillaS3Store::new(store, cfg());
         let samples = cs.scan("m", h0 + 5_000, h0 + 9_000).await.unwrap();
         assert!(samples.is_empty(), "no sample inside [5_000, 9_000) ms");
 
@@ -1167,9 +1163,9 @@ mod tests {
                     sample_count: 1,
                     label_hash: 0,
                     size_bytes: 50,
-                object_key: None,
-                byte_offset: None,
-                byte_length: None,
+                    object_key: None,
+                    byte_offset: None,
+                    byte_length: None,
                 }]),
             )
             .await;
@@ -1185,13 +1181,13 @@ mod tests {
                     sample_count: 1,
                     label_hash: 0,
                     size_bytes: 50,
-                object_key: None,
-                byte_offset: None,
-                byte_length: None,
+                    object_key: None,
+                    byte_offset: None,
+                    byte_length: None,
                 }]),
             )
             .await;
-        let cs = GorillaS3ColdStore::new(Arc::new(store), cfg());
+        let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let chunks = cs
             .list_chunks("m", h12 + 3_500_000, h13 + 30_000)
             .await
@@ -1203,50 +1199,39 @@ mod tests {
 
     #[test]
     fn bucket_prefix_supports_long_form_placeholders() {
-        // Backend's historical spelling — preserved.
         let mut config = cfg();
         config.prefix_template = "{tenant}/{metric}/{year}/{month}/{day}/{hour}/".to_string();
         let store = InMemoryObjectStore::new();
-        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let cs = GorillaS3Store::new(Arc::new(store), config);
         let key = cs.bucket_prefix("foo", ms(2026, 5, 6, 12, 0, 0));
         assert_eq!(key, "tenant1/foo/2026/05/06/12/");
     }
 
     #[test]
     fn bucket_prefix_supports_agent_side_yyyy_mm_dd_hh_placeholders() {
-        // v7 fix: the agent's gorillas3processor uses
-        // `{YYYY}`/`{MM}`/`{DD}`/`{HH}`. Pre-v7 the backend left
-        // these literal; v7 substitutes them so a deploy that
-        // configures the routing yaml with the agent-side
-        // spelling gets matching index.json keys on both sides.
         let mut config = cfg();
         config.prefix_template = "{tenant}/{metric}/{YYYY}/{MM}/{DD}/{HH}/".to_string();
         let store = InMemoryObjectStore::new();
-        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let cs = GorillaS3Store::new(Arc::new(store), config);
         let key = cs.bucket_prefix("http_freshness_probe_archive", ms(2026, 5, 7, 4, 0, 0));
         assert_eq!(
             key,
             "tenant1/http_freshness_probe_archive/2026/05/07/04/",
-            "v7 must substitute {{YYYY}}/{{MM}}/{{DD}}/{{HH}} the same as the long-form names",
         );
     }
 
     #[test]
     fn bucket_prefix_handles_mixed_long_and_short_placeholders() {
-        // Defensive — accept a mix in case some operator templates
-        // it that way.
         let mut config = cfg();
         config.prefix_template = "{tenant}/{metric}/{year}/{MM}/{DD}/{hour}/".to_string();
         let store = InMemoryObjectStore::new();
-        let cs = GorillaS3ColdStore::new(Arc::new(store), config);
+        let cs = GorillaS3Store::new(Arc::new(store), config);
         let key = cs.bucket_prefix("m", ms(2026, 5, 7, 4, 0, 0));
         assert_eq!(key, "tenant1/m/2026/05/07/04/");
     }
 
     #[test]
     fn from_env_requires_bucket() {
-        // Don't pollute global env in a unit test; just exercise the
-        // missing-var path.
         let prev_bucket = std::env::var("ASAP_GORILLA_S3_BUCKET").ok();
         std::env::remove_var("ASAP_GORILLA_S3_BUCKET");
         let res = GorillaS3Config::from_env();

@@ -7,7 +7,7 @@
 mod tests {
     use crate::data_model::AggregationIdInfo;
     use crate::engines::logical::plan_builder::{build_binary_vector_plan, build_scalar_plan};
-    use crate::engines::simple_engine::{
+    use crate::engines::simple::engine::{
         QueryExecutionContext, QueryMetadata, StoreQueryParams, StoreQueryPlan,
     };
     use datafusion::logical_expr::LogicalPlan;

@@ -96,16 +96,11 @@ struct Args {
     #[arg(long)]
     persistence_part_cache_mb: Option<u64>,
 
-    /// Root of the §5.2 cold-tier raw-sample store. When set,
-    /// capability-miss queries first try the hour-bucketed JSONL
-    /// layout under this root. Combine with
-    /// `--forward-unsupported-queries` to keep Prometheus as the
-    /// tail of the fallback chain. Reads from `ASAP_COLD_STORE_ROOT`
-    /// so containerised deploys can wire it via env (matches the
-    /// backend Docker image's environment in
-    /// `deploy/docker-compose/base.yml`).
-    #[arg(long, env = "ASAP_COLD_STORE_ROOT")]
-    cold_store_root: Option<std::path::PathBuf>,
+    // Step-1 of the JSONL deprecation refactor removed the
+    // `--cold-store-root` / `ASAP_COLD_STORE_ROOT` flag. The §5.2
+    // local-FS JSONL fallback was deleted at the same commit; the
+    // surviving fallback chain is just Prometheus (gated by
+    // `--forward-unsupported-queries`).
 
     /// Upstream Prometheus URL for the tail of the fallback chain.
     /// Only consulted when `--forward-unsupported-queries` is set.
@@ -273,17 +268,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.prometheus_scrape_interval, // default 30s (matches e2e window size)
             QueryLanguage::promql,
         ));
-        if let Some(root) = args.cold_store_root.as_deref() {
-            info!(
-                cold_store_root = %root.display(),
-                prom_tail = args.forward_unsupported_queries,
-                "Cold-tier fallback enabled (§5.2 cold store)",
-            );
-        }
-        let adapter_config = AdapterConfig::from_prom_with_optional_cold(
+        // Step-1 of the JSONL deprecation: the only surviving
+        // fallback path is Prometheus (gated by
+        // `--forward-unsupported-queries`).
+        let adapter_config = AdapterConfig::prometheus_promql(
             args.prometheus_server.clone(),
             args.forward_unsupported_queries,
-            args.cold_store_root.as_deref(),
         );
         let http_config = HttpServerConfig {
             port: args.query_port,
@@ -343,32 +333,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Mirrors the registration block in `src/main.rs` so the
         // `precompute_engine` binary (used by the deploy/docker image)
         // matches the full backend's behaviour.
-        match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3Config::from_env() {
+        match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
             Ok(s3_cfg) => {
-                match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3ColdStore::with_default_backend(s3_cfg) {
-                    Ok(cold_store) => {
-                        use query_engine_rust::engines::{
-                            GorillaEngineConfig, GorillaQueryEngine, QueryEngine,
-                        };
+                match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
+                    Ok(store) => {
+                        use query_engine_rust::engines::{GorillaEngineConfig, GorillaQueryEngine};
+                        use query_engine_rust::routing::QueryEngine;
                         let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
-                            Arc::new(cold_store),
+                            Arc::new(store),
                             GorillaEngineConfig::default(),
                         ));
                         info!(
-                            "Phase-6: registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
+                            "Registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
                         );
                         http_server = http_server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
                     }
                     Err(e) => {
                         warn!(
-                            "ASAP_GORILLA_S3_* env vars present but GorillaS3ColdStore failed to build ({e}); router will not have a cold-archive engine",
+                            "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
                         );
                     }
                 }
             }
             Err(_) => {
                 info!(
-                    "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable cold-archive routing)",
+                    "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing)",
                 );
             }
         }

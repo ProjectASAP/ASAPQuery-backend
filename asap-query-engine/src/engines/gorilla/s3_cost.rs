@@ -14,7 +14,8 @@
 //! ## Boundary
 //!
 //! The wrapper sits at the lowest level — between the
-//! `GorillaS3ColdStore::ObjectStore` impl and the actual `Bucket`.
+//! [`GorillaS3Store`](super::store::GorillaS3Store)'s `ObjectStore`
+//! impl and the actual `Bucket`.
 //! Tests that don't need S3 (the in-memory mock path) never touch
 //! it; production deployments wire `S3CostTrackingObjectStore`
 //! around `S3ObjectStore`.
@@ -26,7 +27,7 @@ use async_trait::async_trait;
 
 /// Process-wide S3 cost counters. The HTTP server's
 /// `/internal/s3_cost.csv` endpoint reads this; the
-/// `GorillaS3ColdStore` constructor opts in via
+/// [`GorillaS3Store`](super::store::GorillaS3Store) constructor opts in via
 /// [`S3CostTrackingObjectStore`]. Lazy-initialised on first access.
 static GLOBAL_S3_COST: OnceLock<Arc<S3CostCounters>> = OnceLock::new();
 
@@ -37,8 +38,7 @@ pub fn global_s3_cost_counters() -> Arc<S3CostCounters> {
         .clone()
 }
 
-use super::gorilla_s3::ObjectStore;
-use super::ColdStoreError;
+use super::store::{ObjectStore, StoreError};
 
 /// Per-operation counter set + cumulative bytes.
 #[derive(Debug, Default)]
@@ -158,7 +158,7 @@ impl S3CostTrackingObjectStore {
 
 #[async_trait]
 impl ObjectStore for S3CostTrackingObjectStore {
-    async fn get_object(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+    async fn get_object(&self, key: &str) -> Result<Vec<u8>, StoreError> {
         self.counters.get_count.fetch_add(1, Ordering::Relaxed);
         let body = self.inner.get_object(key).await?;
         self.counters
@@ -167,7 +167,7 @@ impl ObjectStore for S3CostTrackingObjectStore {
         Ok(body)
     }
 
-    fn object_missing(&self, err: &ColdStoreError) -> bool {
+    fn object_missing(&self, err: &StoreError) -> bool {
         self.inner.object_missing(err)
     }
 }
@@ -175,7 +175,7 @@ impl ObjectStore for S3CostTrackingObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drivers::query::fallback::cold_store::gorilla_s3::ObjectStore as _;
+    use crate::engines::gorilla::store::ObjectStore as _;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
@@ -189,11 +189,11 @@ mod tests {
 
     #[async_trait]
     impl ObjectStore for StubStore {
-        async fn get_object(&self, key: &str) -> Result<Vec<u8>, ColdStoreError> {
+        async fn get_object(&self, key: &str) -> Result<Vec<u8>, StoreError> {
             let g = self.inner.lock().await;
             match g.get(key) {
                 Some(b) => Ok(b.clone()),
-                None => Err(ColdStoreError::Backend(format!("get {key}: not found"))),
+                None => Err(StoreError::Backend(format!("get {key}: not found"))),
             }
         }
     }
