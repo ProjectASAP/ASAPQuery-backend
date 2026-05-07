@@ -133,6 +133,29 @@ impl EngineRouter {
         self.engines.insert(caps.data_source_id, engine);
     }
 
+    /// Register an engine under an alias `data_source_id`, ignoring the
+    /// id reported by `engine.capabilities()`. Used by Step-2.3's
+    /// Path A2 wiring: the same `ThanosForwardEngine` instance is
+    /// registered under both its native id (`thanos_archive`, for
+    /// explicit overrides) and under the legacy archive id
+    /// (`gorilla_archive`, so the existing
+    /// `compatible_storage_backends` failover sequence finds it
+    /// transparently). The legacy in-process `GorillaQueryEngine` is
+    /// only registered when `ASAP_THANOS_QUERY_URL` is unset; the
+    /// alias mechanism guarantees the two registrations never
+    /// collide on the same id.
+    ///
+    /// If two engines claim the same `id` the later registration wins
+    /// (matches [`Self::register`]'s hot-swap contract).
+    pub fn register_aliased(&mut self, id: &'static str, engine: Arc<dyn QueryEngine>) {
+        debug!(
+            data_source_id = id,
+            engine_native_id = engine.capabilities().data_source_id,
+            "router: registering engine under alias",
+        );
+        self.engines.insert(id, engine);
+    }
+
     /// Number of engines registered. Test-only convenience.
     pub fn len(&self) -> usize {
         self.engines.len()
@@ -455,6 +478,69 @@ mod tests {
         let mut ids: Vec<&str> = router.registered_ids().collect();
         ids.sort();
         assert_eq!(ids, vec!["gorilla_archive", "sketch_warm"]);
+    }
+
+    #[tokio::test]
+    async fn register_aliased_inserts_under_explicit_id() {
+        // Step-2.3 wiring: a single ThanosForwardEngine instance is
+        // registered under both `thanos_archive` (its native id) and
+        // `gorilla_archive` (the legacy archive slot the failover
+        // sequence walks). Both lookups must hit the same engine.
+        let mut router = EngineRouter::new();
+        let (engine, calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        // First, register under the engine's native id (`sketch_warm`).
+        router.register(engine.clone());
+        // Then alias it under a totally different id.
+        router.register_aliased("custom_alias", engine);
+        // Both lookups must return the engine — we exercise both and
+        // verify the call counter ticked twice.
+        let native = router
+            .engine_by_id("sketch_warm")
+            .expect("native id registered");
+        let aliased = router
+            .engine_by_id("custom_alias")
+            .expect("alias registered");
+        let _ = native.execute("foo").await;
+        let _ = aliased.execute("foo").await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both lookups must reach the same engine instance",
+        );
+
+        let mut ids: Vec<&str> = router.registered_ids().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["custom_alias", "sketch_warm"]);
+    }
+
+    #[tokio::test]
+    async fn register_aliased_overrides_capability_dispatch_target() {
+        // Step-2.3 wiring continued: when `ThanosForwardEngine` is
+        // aliased onto `gorilla_archive`, the failover sequence walks
+        // the alias instead of the legacy in-process engine. We
+        // simulate this with a stub registered under
+        // `GorillaS3Archive`'s native id via the alias path.
+        let mut router = EngineRouter::new();
+        let (legacy, legacy_calls) =
+            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
+        // Use alias to register under the gorilla_archive id
+        // explicitly (matches Step-2.3's "thanos under legacy slot"
+        // wiring).
+        router.register_aliased(
+            StorageBackend::GorillaS3Archive.data_source_id(),
+            legacy,
+        );
+
+        let result = router
+            .execute(
+                "sum_over_time(audit_events[1h])",
+                Statistic::Sum,
+                AccuracyTarget::Exact,
+                StorageBackend::GorillaS3Archive,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
