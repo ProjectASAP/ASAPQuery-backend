@@ -131,13 +131,41 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
         Statistic::Min | Statistic::Max => {
             &[AggregationType::MinMax, AggregationType::MultipleMinMax]
         }
-        Statistic::Quantile => &[AggregationType::DatasketchesKLL, AggregationType::HydraKLL],
+        // Quantile: KLL (planner-emitted canonical pick) plus the
+        // sketch types whose accumulators answer `Statistic::Quantile`
+        // natively but that the planner's canonical map does not
+        // emit. The MVP demo's controller (`ASAPCollector/controller`)
+        // plans `http_requests_total_latency_ms` as a `DDSketch`
+        // directly from `mvp-workload.yaml` and routes the resulting
+        // delta payloads through the modified-OTLP wire format
+        // (DDSketch state landing in `DDSketchAccumulator`, which
+        // supports `Statistic::Quantile` — see
+        // `precompute_operators/dd_sketch_accumulator.rs`). Without
+        // DDSketch enumerated here, capability matching for an
+        // out-of-YAML query like `quantile_over_time(0.99,
+        // http_requests_total_latency_ms[1m])` would miss and the
+        // warm-tier engine returns `EngineError::CapabilityMiss`.
+        Statistic::Quantile => &[
+            AggregationType::DatasketchesKLL,
+            AggregationType::HydraKLL,
+            AggregationType::DDSketch,
+        ],
         Statistic::Rate | Statistic::Increase => {
             &[AggregationType::Increase, AggregationType::MultipleIncrease]
         }
+        // Cardinality: SetAggregator / DeltaSetAggregator are the
+        // exact key trackers; HLL is the canonical approximator
+        // whose accumulator answers `Statistic::Cardinality` (and
+        // `Statistic::Count` as a cardinality alias) — see
+        // `precompute_operators/hll_sketch_accumulator.rs`. HLL is
+        // not in the planner's canonical map (it's wired in via
+        // modified-OTLP from the agent processors) but the runtime
+        // accumulator surface still resolves it, so list it here so
+        // capability matching can pick it up.
         Statistic::Cardinality => &[
             AggregationType::SetAggregator,
             AggregationType::DeltaSetAggregator,
+            AggregationType::HLL,
         ],
         Statistic::Topk => &[AggregationType::CountMinSketchWithHeap],
     }
@@ -1019,6 +1047,23 @@ mod tests {
             compatible_agg_types(Statistic::Quantile).contains(&AggregationType::DatasketchesKLL),
             "KLL must be a compatible type for Quantile",
         );
+        // DDSketch → Quantile (Phase-3.1 fix). Required so the MVP demo's
+        // `quantile_over_time(0.99, http_requests_total_latency_ms[1m])`
+        // — which routes a DDSketch agg from `mvp-workload.yaml` and may
+        // miss the inference-YAML exact-string match — still resolves
+        // through capability matching instead of returning a 404.
+        assert!(
+            compatible_agg_types(Statistic::Quantile).contains(&AggregationType::DDSketch),
+            "DDSketch must be a compatible type for Quantile (Phase-3.1 fix)",
+        );
+        // HLL → Cardinality (Phase-3.1 fix). HLL accumulators answer
+        // `Statistic::Cardinality` natively (and `Statistic::Count` as a
+        // cardinality alias); enumerating them here lets capability
+        // matching pick up an HLL-only deploy.
+        assert!(
+            compatible_agg_types(Statistic::Cardinality).contains(&AggregationType::HLL),
+            "HLL must be a compatible type for Cardinality (Phase-3.1 fix)",
+        );
         // CMS → Sum (the headline bug fix that motivated this PR)
         assert!(
             compatible_agg_types(Statistic::Sum).contains(&AggregationType::CountMinSketch),
@@ -1035,6 +1080,54 @@ mod tests {
                 .contains(&AggregationType::CountMinSketchWithHeap),
             "CountMinSketchWithHeap must be a compatible type for Topk",
         );
+    }
+
+    /// Phase-3.1 regression test for the canonical MVP-demo failure
+    /// described in `docs/spec-mvp-controller-driven-multi-stage-demo.md`:
+    /// the controller plans `http_requests_total_latency_ms` as a
+    /// `DDSketch` for the `quantile_over_time(0.99,
+    /// http_requests_total_latency_ms[1m])` query class. When the
+    /// inference YAML doesn't include an exact-string entry for the
+    /// query, `find_query_config` misses and the engine falls into
+    /// capability matching. Pre-fix, `compatible_agg_types(Quantile)`
+    /// listed only KLL types, so the DDSketch agg was filtered out
+    /// and the warm-tier engine returned a 404 / null; post-fix,
+    /// DDSketch is enumerated and capability matching resolves the
+    /// agg cleanly.
+    #[test]
+    fn ddsketch_resolves_quantile_query_post_fix() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            42,
+            make_config(
+                42,
+                "http_requests_total_latency_ms",
+                "DDSketch",
+                "",
+                60,
+                "tumbling",
+                &[],
+                "",
+            ),
+        );
+        let result = find_compatible_aggregation(
+            &configs,
+            &req(
+                "http_requests_total_latency_ms",
+                &[Statistic::Quantile],
+                Some(60_000),
+                &[],
+                "",
+            ),
+        );
+        let info = result.expect(
+            "post-fix: capability matching must resolve quantile_over_time against a DDSketch-only config",
+        );
+        assert_eq!(info.aggregation_id_for_value, 42);
+        assert_eq!(info.aggregation_type_for_value, AggregationType::DDSketch);
+        // DDSketch is single-population (not is_multi_population_value_type),
+        // so the matcher pairs it with itself for the key agg.
+        assert_eq!(info.aggregation_id_for_key, 42);
     }
 
     /// Regression test for the pre-fix bug: a query for `Statistic::Sum`
