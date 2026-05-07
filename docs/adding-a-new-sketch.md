@@ -196,9 +196,9 @@ opentelemetry-collector-contrib-patch/processor/foosketchprocessor/
 Use existing processors (countminsketchprocessor, kllprocessor) as
 templates — the structure is identical aside from the sketch type.
 
-#### C.2 sketchcollector builder config
+#### C.2 asap-otel builder config
 
-`opentelemetry-collector-contrib-patch/cmd/sketchcollector/builder-config.yaml`:
+`opentelemetry-collector-contrib-patch/cmd/asap-otel/builder-config.yaml`:
 
 ```yaml
 processors:
@@ -207,7 +207,7 @@ processors:
     path: ./processor/foosketchprocessor
 ```
 
-Rebuild the sketchcollector binary, confirm it accepts a config
+Rebuild the asap-otel binary, confirm it accepts a config
 with `processors: foo:` and emits FooSketch data points the backend
 can decode.
 
