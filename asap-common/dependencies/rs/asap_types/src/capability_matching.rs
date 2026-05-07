@@ -28,6 +28,12 @@ use promql_utilities::query_logics::enums::AggregationType;
 /// `SketchWarmTier` is the default — every existing `AggregationConfig` and
 /// `StreamingConfig` decodes into this variant via `#[serde(default)]`, so
 /// pre-Phase-5 deploys keep dispatching to `SimpleEngine` unchanged.
+///
+/// **Step-1 of the JSONL deprecation refactor** removed the
+/// `ColdJsonlFallback` variant. The legacy local-FS JSONL leg
+/// (`LocalFsColdStore`, `parse_jsonl`, the §5.2 raw-store
+/// fallback) was deleted at the same commit; the surviving
+/// failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
 )]
@@ -38,15 +44,10 @@ pub enum StorageBackend {
     #[default]
     SketchWarmTier,
 
-    /// NEW (Phase 5) — Gorilla-S3 archive. Served by `GorillaQueryEngine`,
-    /// reading per-hour Gorilla chunks from S3 / MinIO via the Phase-3
-    /// `GorillaS3ColdStore`.
+    /// Gorilla-S3 archive. Served by `GorillaQueryEngine`, reading
+    /// per-hour Gorilla chunks from S3 / MinIO via the
+    /// `GorillaS3Store`.
     GorillaS3Archive,
-
-    /// Local-FS JSONL fallback (PR #54 §5.2). Served by the existing
-    /// cold-fallback path; used when no warm-tier or archive aggregation
-    /// can answer the query.
-    ColdJsonlFallback,
 
     /// Double-write: the metric is written to both warm-tier sketches AND the
     /// Gorilla-S3 archive. Capability matching surfaces both options and the
@@ -63,7 +64,6 @@ impl StorageBackend {
         match self {
             StorageBackend::SketchWarmTier => "sketch_warm",
             StorageBackend::GorillaS3Archive => "gorilla_archive",
-            StorageBackend::ColdJsonlFallback => "cold_jsonl",
             StorageBackend::DoubleWrite => "double_write",
         }
     }
@@ -148,8 +148,10 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
 ///
 /// The returned list is **ordered by preference**: the router walks it in
 /// order and dispatches to the first backend whose engine is registered.
-/// `ColdJsonlFallback` is appended whenever the warm tier is in play so a
-/// capability miss falls through to the §5.2 raw-store path before erroring.
+///
+/// **Step-1 of the JSONL deprecation refactor**: the legacy
+/// `ColdJsonlFallback` failover slot was removed. Surviving
+/// failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
 ///
 /// Routing rules (mirrors `docs/design-gorilla-s3-cold-engine.md` §8):
 ///
@@ -159,15 +161,13 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
 ///   routes to the archive when the metric is Gorilla-only — there is no
 ///   warm-tier sketch to fall back to in that deploy shape.
 /// * Metric configured for `SketchWarmTier` (or unconfigured / default):
-///   `[SketchWarmTier, ColdJsonlFallback]` — warm tier first, raw-store
-///   fallback if no compatible aggregation exists.
+///   `[SketchWarmTier]`. A capability miss in the warm tier surfaces
+///   as a 404 — the previous JSONL fallback path has been deleted.
 /// * Metric configured for `DoubleWrite`: head depends on accuracy hint,
 ///   tail is the failover sequence (the cost-aware `EngineRouter` picks
 ///   the head, walks the tail on failure):
-///   - `Exact` → `[GorillaS3Archive, SketchWarmTier, ColdJsonlFallback]`
-///   - `Approximate` → `[SketchWarmTier, GorillaS3Archive, ColdJsonlFallback]`
-/// * Metric explicitly configured for `ColdJsonlFallback`: just
-///   `[ColdJsonlFallback]`.
+///   - `Exact` → `[GorillaS3Archive, SketchWarmTier]`
+///   - `Approximate` → `[SketchWarmTier, GorillaS3Archive]`
 pub fn compatible_storage_backends(
     _stat: Statistic,
     accuracy: AccuracyTarget,
@@ -175,32 +175,21 @@ pub fn compatible_storage_backends(
 ) -> Vec<StorageBackend> {
     match metric_storage_config {
         StorageBackend::GorillaS3Archive => {
-            // Exact-on-archive subsumes approximate-on-warm: a Gorilla-only
-            // metric has no sketch to back-fall to, and the archive can
-            // always answer exact (and therefore also approximate) queries.
             vec![StorageBackend::GorillaS3Archive]
         }
         StorageBackend::SketchWarmTier => {
-            vec![
-                StorageBackend::SketchWarmTier,
-                StorageBackend::ColdJsonlFallback,
-            ]
+            vec![StorageBackend::SketchWarmTier]
         }
         StorageBackend::DoubleWrite => match accuracy {
             AccuracyTarget::Exact => vec![
                 StorageBackend::GorillaS3Archive,
                 StorageBackend::SketchWarmTier,
-                StorageBackend::ColdJsonlFallback,
             ],
             AccuracyTarget::Approximate => vec![
                 StorageBackend::SketchWarmTier,
                 StorageBackend::GorillaS3Archive,
-                StorageBackend::ColdJsonlFallback,
             ],
         },
-        StorageBackend::ColdJsonlFallback => {
-            vec![StorageBackend::ColdJsonlFallback]
-        }
     }
 }
 
@@ -1131,18 +1120,15 @@ mod tests {
             AccuracyTarget::Approximate,
             StorageBackend::SketchWarmTier,
         );
-        assert_eq!(
-            backends,
-            vec![
-                StorageBackend::SketchWarmTier,
-                StorageBackend::ColdJsonlFallback,
-            ]
-        );
+        // Step-1 of the JSONL deprecation: warm-tier only routes
+        // to itself; the previous `ColdJsonlFallback` failover slot
+        // has been deleted.
+        assert_eq!(backends, vec![StorageBackend::SketchWarmTier]);
     }
 
     #[test]
     fn double_write_metric_returns_both_options() {
-        // Exact: archive head, warm-tier failover, then JSONL.
+        // Exact: archive head, warm-tier failover.
         let exact = compatible_storage_backends(
             Statistic::Sum,
             AccuracyTarget::Exact,
@@ -1153,11 +1139,10 @@ mod tests {
             vec![
                 StorageBackend::GorillaS3Archive,
                 StorageBackend::SketchWarmTier,
-                StorageBackend::ColdJsonlFallback,
             ]
         );
-        // Approximate: warm-tier head (cheaper for ε/δ-bounded answers),
-        // archive failover, then JSONL.
+        // Approximate: warm-tier head (cheaper for ε/δ-bounded
+        // answers), archive failover.
         let approx = compatible_storage_backends(
             Statistic::Quantile,
             AccuracyTarget::Approximate,
@@ -1168,7 +1153,6 @@ mod tests {
             vec![
                 StorageBackend::SketchWarmTier,
                 StorageBackend::GorillaS3Archive,
-                StorageBackend::ColdJsonlFallback,
             ]
         );
     }
@@ -1185,16 +1169,6 @@ mod tests {
             StorageBackend::GorillaS3Archive,
         );
         assert_eq!(backends, vec![StorageBackend::GorillaS3Archive]);
-    }
-
-    #[test]
-    fn cold_jsonl_only_metric_routes_to_jsonl() {
-        let backends = compatible_storage_backends(
-            Statistic::Sum,
-            AccuracyTarget::Exact,
-            StorageBackend::ColdJsonlFallback,
-        );
-        assert_eq!(backends, vec![StorageBackend::ColdJsonlFallback]);
     }
 
     #[test]
@@ -1215,21 +1189,18 @@ mod tests {
             "gorilla_archive",
         );
         assert_eq!(
-            StorageBackend::ColdJsonlFallback.data_source_id(),
-            "cold_jsonl",
+            StorageBackend::DoubleWrite.data_source_id(),
+            "double_write",
         );
     }
 
     /// Source-of-truth agreement check, mirrors
     /// `capability_canonical_map_agreement` for the storage axis.
     ///
-    /// For every `(Statistic, AccuracyTarget, StorageBackend)` triple:
-    /// 1. The returned backend list is non-empty.
-    /// 2. The first element matches the expected head per the routing matrix
-    ///    in `compatible_storage_backends`'s docstring (kept sync'd by hand).
-    /// 3. Every list ends in something the router can dispatch — either the
-    ///    archive (Gorilla-only deploys) or `ColdJsonlFallback` (every
-    ///    other deploy shape).
+    /// For every `(Statistic, AccuracyTarget, StorageBackend)` triple
+    /// the returned backend list must be non-empty and its head must
+    /// match the routing matrix in `compatible_storage_backends`'s
+    /// docstring.
     #[test]
     fn capability_storage_backend_agreement() {
         let stats = [
@@ -1247,7 +1218,6 @@ mod tests {
         let configs = [
             StorageBackend::SketchWarmTier,
             StorageBackend::GorillaS3Archive,
-            StorageBackend::ColdJsonlFallback,
             StorageBackend::DoubleWrite,
         ];
 
@@ -1262,16 +1232,15 @@ mod tests {
                     );
                     let last = *backends.last().unwrap();
                     assert!(
-                        last == StorageBackend::ColdJsonlFallback
+                        last == StorageBackend::SketchWarmTier
                             || last == StorageBackend::GorillaS3Archive,
                         "backend list for ({stat:?}, {acc:?}, {cfg:?}) must terminate in a \
-                         dispatchable failover (ColdJsonlFallback or GorillaS3Archive); got {last:?}",
+                         dispatchable failover (SketchWarmTier or GorillaS3Archive); got {last:?}",
                     );
                     // The expected head is determined by `(metric_storage_config, accuracy)`:
                     let expected_head = match (cfg, acc) {
                         (StorageBackend::GorillaS3Archive, _) => StorageBackend::GorillaS3Archive,
                         (StorageBackend::SketchWarmTier, _) => StorageBackend::SketchWarmTier,
-                        (StorageBackend::ColdJsonlFallback, _) => StorageBackend::ColdJsonlFallback,
                         (StorageBackend::DoubleWrite, AccuracyTarget::Exact) => {
                             StorageBackend::GorillaS3Archive
                         }

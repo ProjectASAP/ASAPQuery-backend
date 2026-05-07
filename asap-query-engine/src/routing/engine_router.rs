@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 use asap_types::{compatible_storage_backends, AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
 
-use super::{EngineError, QueryResult};
+use crate::engines::{EngineError, QueryResult};
 
 // ---------------------------------------------------------------------------
 // `QueryEngine` trait — the abstraction the router holds.
@@ -304,10 +304,10 @@ mod tests {
     async fn router_dispatches_to_warm_tier_for_sketch_metrics() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
-        let (jsonl, jsonl_calls) =
-            StubEngine::new(StorageBackend::ColdJsonlFallback, Outcome::Ok);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
         router.register(warm);
-        router.register(jsonl);
+        router.register(archive);
 
         let result = router
             .execute(
@@ -319,7 +319,11 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(jsonl_calls.load(Ordering::SeqCst), 0, "JSONL must not run when warm-tier succeeds");
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            0,
+            "archive must not run for a warm-tier-only metric (Step-1 deleted the JSONL fallback slot)",
+        );
     }
 
     #[tokio::test]
@@ -349,18 +353,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_falls_back_to_jsonl_when_archive_fails() {
-        // Double-write deploy: archive fails, warm-tier fails too, JSONL answers.
+    async fn router_falls_back_to_warm_when_archive_fails_on_double_write() {
+        // Double-write deploy with `Exact` head: archive head fails,
+        // router falls through to the warm-tier sketch (the only
+        // remaining failover after Step-1 deleted JSONL).
         let mut router = EngineRouter::new();
         let (gorilla, gorilla_calls) =
             StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Backend);
         let (warm, warm_calls) =
-            StubEngine::new(StorageBackend::SketchWarmTier, Outcome::CapabilityMiss);
-        let (jsonl, jsonl_calls) =
-            StubEngine::new(StorageBackend::ColdJsonlFallback, Outcome::Ok);
+            StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
         router.register(gorilla);
         router.register(warm);
-        router.register(jsonl);
 
         let result = router
             .execute(
@@ -370,10 +373,12 @@ mod tests {
                 StorageBackend::DoubleWrite,
             )
             .await;
-        assert!(result.is_ok(), "router must reach JSONL on archive+warm failure");
+        assert!(
+            result.is_ok(),
+            "router must reach warm-tier when the archive head fails",
+        );
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
         assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(jsonl_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -389,13 +394,9 @@ mod tests {
             .await;
         match result {
             Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
-                assert_eq!(
-                    tried,
-                    vec![
-                        StorageBackend::SketchWarmTier,
-                        StorageBackend::ColdJsonlFallback,
-                    ]
-                );
+                // Step-1 deleted the JSONL failover slot, so the
+                // SketchWarmTier failover sequence is just itself.
+                assert_eq!(tried, vec![StorageBackend::SketchWarmTier]);
                 assert!(registered.is_empty());
             }
             other => panic!("expected NoEngineRegistered, got {other:?}"),
@@ -404,11 +405,12 @@ mod tests {
 
     #[tokio::test]
     async fn router_returns_all_failed_when_every_engine_errors() {
+        // After Step-1 deleted JSONL, the SketchWarmTier failover
+        // sequence is just `[SketchWarmTier]`. A failing warm-tier
+        // engine is the only error path on this metric.
         let mut router = EngineRouter::new();
         let (warm, _) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Backend);
-        let (jsonl, _) = StubEngine::new(StorageBackend::ColdJsonlFallback, Outcome::Backend);
         router.register(warm);
-        router.register(jsonl);
 
         let result = router
             .execute(
@@ -420,7 +422,6 @@ mod tests {
             .await;
         match result {
             Err(EngineRouterError::AllFailed { last }) => {
-                // The deepest failure (JSONL) is what the caller sees.
                 assert!(matches!(last, EngineError::Backend { .. }));
             }
             other => panic!("expected AllFailed, got {other:?}"),

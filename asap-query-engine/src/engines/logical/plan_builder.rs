@@ -18,7 +18,7 @@ use promql_parser::parser::token::{self, T_ADD, T_DIV, T_MOD, T_MUL, T_POW, T_SU
 use promql_utilities::query_logics::enums::{AggregationType, Statistic};
 use std::sync::Arc;
 
-use crate::engines::simple_engine::{QueryExecutionContext, StoreQueryParams};
+use crate::engines::simple::engine::{QueryExecutionContext, StoreQueryParams};
 
 /// Extension trait for building DataFusion logical plans from QueryExecutionContext
 impl QueryExecutionContext {
@@ -355,7 +355,7 @@ pub fn build_scalar_plan(
 mod tests {
     use super::*;
     use crate::data_model::AggregationIdInfo;
-    use crate::engines::simple_engine::{QueryMetadata, StoreQueryParams, StoreQueryPlan};
+    use crate::engines::simple::engine::{QueryMetadata, StoreQueryParams, StoreQueryPlan};
     use promql_utilities::data_model::KeyByLabelNames;
 
     use std::collections::HashMap;

@@ -81,21 +81,6 @@ struct Args {
     #[arg(long)]
     forward_unsupported_queries: bool,
 
-    /// Root directory of the §5.2 cold-tier raw-sample store.
-    /// When set, capability-miss queries first try the
-    /// hour-bucketed JSONL layout under this root
-    /// (`raw/<metric>/YYYY/MM/DD/HH/part-NNNNNN.jsonl` —
-    /// byte-identical to the S3 key layout, see
-    /// `drivers::query::fallback::cold_store::format`) and only
-    /// fall through to Prometheus when the cold adapter can't
-    /// answer the query shape. Combine with
-    /// `--forward-unsupported-queries` to keep Prom as the tail
-    /// of the chain; without it, unsupported shapes return empty
-    /// instead of forwarding. Also reads from `ASAP_COLD_STORE_ROOT`
-    /// so containerised deploys can wire it via env.
-    #[arg(long, env = "ASAP_COLD_STORE_ROOT")]
-    cold_store_root: Option<std::path::PathBuf>,
-
     /// Kafka broker address
     #[arg(long, default_value = "localhost:9092")]
     kafka_broker: String,
@@ -624,17 +609,13 @@ async fn main() -> Result<()> {
     //);
 
     // Original Prometheus config (commented out temporarily):
-    if let Some(root) = args.cold_store_root.as_deref() {
-        info!(
-            cold_store_root = %root.display(),
-            prom_tail = args.forward_unsupported_queries,
-            "Cold-tier fallback enabled (§5.2 cold store)",
-        );
-    }
-    let adapter_config = AdapterConfig::from_prom_with_optional_cold(
+    // Step-1 of the JSONL deprecation deleted the local-FS cold
+    // store + the §5.2 `ColdFallback` adapter; the surviving
+    // fallback chain is just Prometheus (when
+    // `--forward-unsupported-queries` is set).
+    let adapter_config = AdapterConfig::prometheus_promql(
         args.prometheus_server.clone(),
         args.forward_unsupported_queries,
-        args.cold_store_root.as_deref(),
     );
 
     let http_config = HttpServerConfig {
@@ -727,32 +708,31 @@ async fn main() -> Result<()> {
     // handler, which is the correct fail-loud behaviour: a deploy
     // that pins `GorillaS3Archive` without provisioning the cold
     // store is a configuration bug.
-    match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3Config::from_env() {
+    match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
         Ok(s3_cfg) => {
-            match query_engine_rust::drivers::query::fallback::cold_store::GorillaS3ColdStore::with_default_backend(s3_cfg) {
-                Ok(cold_store) => {
-                    use query_engine_rust::engines::{
-                        GorillaEngineConfig, GorillaQueryEngine, QueryEngine,
-                    };
+            match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
+                Ok(store) => {
+                    use query_engine_rust::engines::{GorillaEngineConfig, GorillaQueryEngine};
+                    use query_engine_rust::routing::QueryEngine;
                     let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
-                        Arc::new(cold_store),
+                        Arc::new(store),
                         GorillaEngineConfig::default(),
                     ));
                     info!(
-                        "Phase-6: registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
+                        "Registering GorillaQueryEngine on the capability router (data_source_id=gorilla_archive)",
                     );
                     server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
                 }
                 Err(e) => {
                     warn!(
-                        "ASAP_GORILLA_S3_* env vars present but GorillaS3ColdStore failed to build ({e}); router will not have a cold-archive engine",
+                        "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
                     );
                 }
             }
         }
         Err(_) => {
             info!(
-                "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable cold-archive routing)",
+                "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing)",
             );
         }
     }
@@ -1005,52 +985,27 @@ fn setup_logging(
 mod tests {
     use query_engine_rust::drivers::AdapterConfig;
 
+    // Step-1 of the JSONL deprecation refactor deleted the
+    // §5.2 `ColdFallback` adapter and the
+    // `from_prom_with_optional_cold` constructor. The surviving
+    // fallback chain is just Prometheus (gated by
+    // `forward_unsupported_queries`).
+
     #[test]
-    fn no_cold_no_forward_yields_no_fallback() {
-        let cfg =
-            AdapterConfig::from_prom_with_optional_cold("http://prom:9090".into(), false, None);
+    fn no_forward_yields_no_fallback() {
+        let cfg = AdapterConfig::prometheus_promql("http://prom:9090".into(), false);
         assert!(
             cfg.fallback.is_none(),
-            "without cold-store and without forward, no fallback should be installed",
+            "forward_unsupported=false must leave the fallback slot empty",
         );
     }
 
     #[test]
-    fn no_cold_with_forward_yields_prom_fallback() {
-        let cfg =
-            AdapterConfig::from_prom_with_optional_cold("http://prom:9090".into(), true, None);
+    fn forward_yields_prom_fallback() {
+        let cfg = AdapterConfig::prometheus_promql("http://prom:9090".into(), true);
         assert!(
             cfg.fallback.is_some(),
-            "forward_unsupported=true must install Prom fallback",
+            "forward_unsupported=true must install the Prom fallback",
         );
-    }
-
-    #[test]
-    fn cold_store_set_installs_fallback_even_without_forward() {
-        // Key wiring claim: setting --cold-store-root alone is
-        // sufficient to engage the §5.2 cold path. The only thing
-        // forward_unsupported_queries adds in that case is the Prom
-        // tail of the chain.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = AdapterConfig::from_prom_with_optional_cold(
-            "http://prom:9090".into(),
-            false,
-            Some(tmp.path()),
-        );
-        assert!(
-            cfg.fallback.is_some(),
-            "cold-store-root must install ColdFallback regardless of forward_unsupported",
-        );
-    }
-
-    #[test]
-    fn cold_store_with_forward_installs_full_chain() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let cfg = AdapterConfig::from_prom_with_optional_cold(
-            "http://prom:9090".into(),
-            true,
-            Some(tmp.path()),
-        );
-        assert!(cfg.fallback.is_some());
     }
 }

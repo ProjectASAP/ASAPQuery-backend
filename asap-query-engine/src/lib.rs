@@ -5,6 +5,7 @@ pub mod planner_client;
 pub mod precompute_engine;
 pub mod precompute_operators;
 pub mod query_tracker;
+pub mod routing;
 pub mod stores;
 
 #[cfg(test)]

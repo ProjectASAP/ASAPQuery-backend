@@ -8,9 +8,8 @@
 //!
 //! * **Hot** = the `SimpleEngine` handled the query from live
 //!   sketch-backed state.
-//! * **Cold** = the query fell through to a
-//!   [`ColdFallback`](super::s3_adapter::ColdFallback) and was
-//!   answered from the raw cold tier.
+//! * **Cold** = the query was answered from the Gorilla archive
+//!   tier ([`crate::engines::gorilla::GorillaQueryEngine`]).
 //!
 //! The "shape" label is the parsed query's root op (`sum`,
 //! `count`, `avg`, `selector`, ...) — low-cardinality by design,
@@ -33,9 +32,9 @@ lazy_static! {
     )
     .unwrap();
 
-    /// Queries served by the cold (raw S3 / local-FS) path, keyed
+    /// Queries served by the cold (Gorilla archive) path, keyed
     /// by `(metric, shape)`. Incremented once per successful
-    /// `ColdFallback::execute_query`.
+    /// archive answer.
     pub static ref QUERIES_COLD_TOTAL: CounterVec = register_counter_vec!(
         "queryengine_cold_queries_total",
         "Queries answered from the cold raw-sample path, keyed by metric + query shape",

@@ -83,12 +83,8 @@ mod clickhouse;
 mod elastic;
 mod prometheus;
 
-pub mod cold_store;
 pub mod metrics;
-pub mod s3_adapter;
 
 pub use clickhouse::ClickHouseHttpFallback;
-pub use cold_store::{ColdStore, ColdStoreError, LocalFsColdStore, RawSample};
 pub use elastic::ElasticHttpFallback;
 pub use prometheus::PrometheusHttpFallback;
-pub use s3_adapter::ColdFallback;

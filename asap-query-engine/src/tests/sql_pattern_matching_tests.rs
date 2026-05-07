@@ -9,7 +9,7 @@ mod tests {
         AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
         QueryConfig, QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
     };
-    use crate::engines::simple_engine::SimpleEngine;
+    use crate::engines::simple::engine::SimpleEngine;
     use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use promql_utilities::data_model::KeyByLabelNames;
     use sql_utilities::sqlhelper::{SQLSchema, Table};
