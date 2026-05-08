@@ -186,6 +186,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         streaming_config.get_all_aggregation_configs().len()
     );
 
+    // Phase ε.3 (Option-B validation): build ONE
+    // `HotReloadStreamingConfig` handle and share it between the HTTP
+    // server (so `POST /api/v1/streaming-config` can swap the active
+    // config at runtime) and the precompute engine (so the swap
+    // actually takes effect on subsequent ingest batches). Without
+    // the shared handle, an HTTP swap would leave the engine reading
+    // the original Arc and the controller's typed-stage-split push
+    // would silently no-op.
+    let hot_reload_streaming_config =
+        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(
+            streaming_config.clone(),
+        );
+
     // Create the store
     let store: Arc<dyn query_engine_rust::stores::Store> = if args.persistence_enabled {
         use query_engine_rust::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
@@ -277,6 +290,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             adapter_config,
         };
         let mut http_server = HttpServer::new(http_config, query_engine, store.clone());
+
+        // Phase ε.3 (Option-B validation): wire the hot-reload
+        // streaming-config handle so `POST /api/v1/streaming-config`
+        // can swap in the controller's emitted JSON at runtime. Without
+        // this call the handler returns 503 ("hot-reload handle not
+        // attached; backend was built without
+        // HttpServer::with_hot_reload_config") and the controller's
+        // typed-stage-split push from `handle_bootstrap_agent_config`
+        // / `handle_plan` fails. Mirrors the wiring `src/main.rs`
+        // already had — this is the deployed binary
+        // (Dockerfile.backend builds `precompute_engine`), so this is
+        // where it must live. The handle is shared with the engine
+        // (built below) so an HTTP-driven swap reaches both surfaces.
+        http_server =
+            http_server.with_hot_reload_config(hot_reload_streaming_config.clone());
 
         // Per-metric storage-backend routing table (issue #46
         // criterion ⑤). When provided, the HTTP handler consults this
@@ -446,9 +474,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Build the engine. Snapshot `ingest_state` BEFORE starting the
     // engine — once `engine.run()` is awaited it owns the engine
     // and we can't pull the handle out for the OTLP receiver.
+    //
+    // Reuse the shared `hot_reload_streaming_config` so an HTTP
+    // `POST /api/v1/streaming-config` swap reaches both the HTTP query
+    // surface and the engine's ingest path (Phase ε.3 / Option B).
     let engine = PrecomputeEngine::new(
         engine_config,
-        query_engine_rust::data_model::HotReloadStreamingConfig::from_arc(streaming_config),
+        hot_reload_streaming_config,
         output_sink,
     );
     let ingest_state = if args.enable_otel_ingest {
