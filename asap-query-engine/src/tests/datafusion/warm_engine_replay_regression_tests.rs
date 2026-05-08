@@ -36,6 +36,8 @@ mod tests {
     };
     use crate::engines::simple::engine::SimpleEngine;
     use crate::engines::QueryResult;
+    use crate::data_model::Measurement;
+    use crate::precompute_operators::increase_accumulator::IncreaseAccumulator;
     use crate::precompute_operators::sum_accumulator::SumAccumulator;
     use crate::precompute_operators::DDSketchAccumulator;
     use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
@@ -306,6 +308,96 @@ mod tests {
                 assert!(
                     (v - 50.5).abs() < 5.0,
                     "expected ~50.5 from DDSketch.quantile(0.5), got {v}"
+                );
+            }
+            other => panic!("expected instant vector, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // (4) Instant `sum by (zone) (counter)` backed by IncreaseAccumulator
+    //
+    //     This is the actual demo failure shape from
+    //     ProjectASAP/ASAPCollector#46: the warm-tier ingest path
+    //     stores OTel-`Sum`/monotonic counters as
+    //     `IncreaseAccumulator`, not `SumAccumulator`. Pre-fix, this
+    //     query class capability-missed because `IncreaseAccumulator`
+    //     did not implement `Statistic::Sum`. Post-fix:
+    //
+    //       a) `compatible_agg_types(Statistic::Sum)` lists
+    //          `Increase` / `MultipleIncrease`, so capability matching
+    //          accepts the counter-shaped configs.
+    //       b) `IncreaseAccumulator::query(Sum, ..)` returns the
+    //          latest cumulative value of the series, matching
+    //          Prometheus' `sum(<counter>)` instant semantics.
+    //       c) The engine's outer `sum by (zone) (...)` aggregation
+    //          groups + sums those per-series totals across keys.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn sum_by_zone_instant_over_increase_accumulator_does_not_error() {
+        init_tracing_for_test();
+        let query = "sum by (zone) (http_requests_total)";
+
+        // Two zones, two cumulative-counter series. Each
+        // IncreaseAccumulator's `last_seen_measurement` is the latest
+        // cumulative value the series has reported.
+        let east = IncreaseAccumulator::new(
+            Measurement::new(10.0),
+            (WINDOW_END_MS - WINDOW_LEN_MS) as i64,
+            Measurement::new(123.0),
+            WINDOW_END_MS as i64,
+        );
+        let west = IncreaseAccumulator::new(
+            Measurement::new(0.0),
+            (WINDOW_END_MS - WINDOW_LEN_MS) as i64,
+            Measurement::new(45.0),
+            WINDOW_END_MS as i64,
+        );
+
+        let engine = build_engine_with_window(
+            "http_requests_total",
+            AggregationType::Increase,
+            vec!["zone"],
+            vec![
+                (Some(vec!["us-east-1".to_string()]), Box::new(east)),
+                (Some(vec!["us-west-2".to_string()]), Box::new(west)),
+            ],
+            query,
+        );
+
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        let (_labels, qr) = result.expect(
+            "warm engine must answer instant `sum by (zone) (counter)` against IncreaseAccumulator",
+        );
+
+        match qr {
+            QueryResult::Vector(iv) => {
+                assert_eq!(
+                    iv.values.len(),
+                    2,
+                    "expected 2 zones, got {} values",
+                    iv.values.len()
+                );
+                let mut by_zone = std::collections::HashMap::new();
+                for el in &iv.values {
+                    let zone = el
+                        .labels
+                        .labels
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "<missing>".to_string());
+                    by_zone.insert(zone, el.value);
+                }
+                // Per-zone Sum is the latest cumulative value of that
+                // series (Prometheus semantics for sum(<counter>)).
+                assert!(
+                    (by_zone.get("us-east-1").copied().unwrap_or(f64::NAN) - 123.0).abs() < 1e-9,
+                    "us-east-1 should be 123.0 (latest cumulative), by_zone={by_zone:?}"
+                );
+                assert!(
+                    (by_zone.get("us-west-2").copied().unwrap_or(f64::NAN) - 45.0).abs() < 1e-9,
+                    "us-west-2 should be 45.0 (latest cumulative), by_zone={by_zone:?}"
                 );
             }
             other => panic!("expected instant vector, got {other:?}"),

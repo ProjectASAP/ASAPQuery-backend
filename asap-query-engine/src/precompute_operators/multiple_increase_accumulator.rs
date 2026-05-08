@@ -432,11 +432,52 @@ mod tests {
         // Test rate query (15.0 increase over 1 second = 15.0 per second)
         assert_eq!(acc.query(Statistic::Rate, &key, None).unwrap(), 15.0);
 
-        // Test error cases
-        assert!(acc.query(Statistic::Sum, &key, None).is_err());
+        // Sum returns the latest cumulative counter value for the
+        // queried key (per-series Prometheus `sum(<counter>)` semantics;
+        // see issue ProjectASAP/ASAPCollector#46 and PR #108 diagnosis).
+        // The series here was created with last_seen=25.0.
+        assert_eq!(acc.query(Statistic::Sum, &key, None).unwrap(), 25.0);
+
+        // Unsupported statistic still errors.
+        assert!(acc.query(Statistic::Min, &key, None).is_err());
 
         let unknown_key = KeyByLabelValues::new();
         assert!(acc.query(Statistic::Increase, &unknown_key, None).is_err());
+    }
+
+    #[test]
+    fn test_multiple_increase_accumulator_sum_per_key() {
+        // `sum by (zone) (counter)` reaches MultipleIncreaseAccumulator
+        // only when the warm-tier ingest groups multiple series under
+        // a single accumulator (the `Multiple*` variant). In that case
+        // each per-key Sum should be the series' latest cumulative
+        // value; the engine's outer `by` aggregation does the cross-key
+        // grouping. (Issue ProjectASAP/ASAPCollector#46.)
+        let mut acc = MultipleIncreaseAccumulator::new();
+        let east = KeyByLabelValues::new_with_labels(vec!["us-east-1".to_string()]);
+        let west = KeyByLabelValues::new_with_labels(vec!["us-west-2".to_string()]);
+
+        acc.update(
+            east.clone(),
+            IncreaseAccumulator::new(
+                Measurement::new(10.0),
+                1000,
+                Measurement::new(100.0),
+                2000,
+            ),
+        );
+        acc.update(
+            west.clone(),
+            IncreaseAccumulator::new(
+                Measurement::new(5.0),
+                1000,
+                Measurement::new(50.0),
+                2000,
+            ),
+        );
+
+        assert_eq!(acc.query(Statistic::Sum, &east, None).unwrap(), 100.0);
+        assert_eq!(acc.query(Statistic::Sum, &west, None).unwrap(), 50.0);
     }
 
     #[test]
