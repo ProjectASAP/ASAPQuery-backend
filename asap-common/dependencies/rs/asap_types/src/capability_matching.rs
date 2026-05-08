@@ -146,10 +146,20 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
         // Count: exact via MultipleSum (the planner's canonical pick for
         // Count-Exact uses `MultipleSum` with sub_type="count"); approximate
         // via CountMinSketch / CountMinSketchWithHeap.
+        //
+        // HLL is also valid here: the warm-tier MVP demo
+        // (ProjectASAP/ASAPCollector#46) plans `unique_users_per_min`
+        // as an HLL agg and the replay client queries it with
+        // `count(unique_users_per_min)`. `HllSketchAccumulator`
+        // answers `Statistic::Count` as a cardinality alias —
+        // see `precompute_operators/hll_sketch_accumulator.rs:220`.
+        // Without HLL listed here the warm engine returns `status=error`
+        // for every count-of-HLL replay row.
         Statistic::Count => &[
             AggregationType::MultipleSum,
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
+            AggregationType::HLL,
         ],
         Statistic::Min | Statistic::Max => {
             &[AggregationType::MinMax, AggregationType::MultipleMinMax]
@@ -190,7 +200,19 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::DeltaSetAggregator,
             AggregationType::HLL,
         ],
-        Statistic::Topk => &[AggregationType::CountMinSketchWithHeap],
+        // Topk: `CountMinSketchWithHeap` is the canonical CMS-Heap
+        // pattern. CountSketch is the second-tier reservoir-style
+        // approximator the MVP demo's controller plans for
+        // `top_endpoint_qps` (median-of-row estimator over a
+        // signed-counter matrix). `CountSketchAccumulator` answers
+        // `Statistic::Topk` directly — see
+        // `precompute_operators/count_sketch_accumulator.rs:284`.
+        // Without CountSketch listed here, `topk(K, top_endpoint_qps)`
+        // capability-misses and the warm engine returns `status=error`.
+        Statistic::Topk => &[
+            AggregationType::CountMinSketchWithHeap,
+            AggregationType::CountSketch,
+        ],
     }
 }
 
@@ -295,11 +317,29 @@ pub fn window_compatible(config: &AggregationConfig, data_range_ms: Option<u64>)
     }
 }
 
-/// Label compatibility: strict exact match.
-/// TODO: relax to superset (config.grouping_labels ⊇ req.grouping_labels) for
-/// simple accumulators (Sum, MinMax, Increase).
+/// Label compatibility: config can serve a query whose grouping is a
+/// **subset** (including equality) of the config's grouping_labels.
+///
+/// Pre-fix this was strict-exact: `config_labels == req_labels`. The
+/// MVP demo (ProjectASAP/ASAPCollector#46) replays
+/// `count(unique_users_per_min)` / `topk(5, top_endpoint_qps)` with
+/// no `by (...)` modifier, which translates to `req.grouping_labels =
+/// []`. The corresponding agg configs are per-zone (`[zone]` grouping).
+/// Pre-fix every such replay row capability-missed and the warm engine
+/// returned `status=error`. Post-fix the engine accepts the agg, runs
+/// the per-zone accumulators through the merge path
+/// (`execute_and_merge_store_queries` produces a per-key map; the
+/// downstream merge collapses them to the requested `[]` grouping —
+/// HLL/CMS/CountSketch all support natural across-key merge, and
+/// scalar accumulators like Sum / Increase reduce by addition).
+///
+/// Direction is asymmetric: `config ⊇ req` is OK (engine merges away
+/// the extra labels), but `req ⊃ config` is NOT — the engine cannot
+/// invent a label that the materialised agg never partitioned by.
 pub fn labels_compatible(config_labels: &KeyByLabelNames, req_labels: &KeyByLabelNames) -> bool {
-    config_labels == req_labels
+    let req: std::collections::HashSet<&String> = req_labels.labels.iter().collect();
+    let cfg: std::collections::HashSet<&String> = config_labels.labels.iter().collect();
+    req.is_subset(&cfg)
 }
 
 /// Spatial filter compatibility.
@@ -725,8 +765,17 @@ mod tests {
     }
 
     #[test]
-    fn label_strict_superset_rejected() {
-        // Config has {job, instance}, query wants only {job} — strict mode rejects
+    fn label_superset_config_accepts_subset_query() {
+        // Config has `{job, instance}`, query wants only `{job}`.
+        //
+        // Pre-fix `labels_compatible` did strict-eq and rejected this,
+        // which broke the MVP demo (ProjectASAP/ASAPCollector#46): the
+        // agent's per-zone HLL agg has `grouping_labels = [zone]`, the
+        // replay client's `count(unique_users_per_min)` has no `by`
+        // modifier (req grouping = `[]`). Post-fix the agg can serve
+        // the broader-aggregation query — the engine's merge path
+        // collapses the extra label dimension before the result
+        // surface. See `labels_compatible` rustdoc.
         let configs = single_config(make_config(
             1,
             "cpu",
@@ -740,6 +789,38 @@ mod tests {
         let result = find_compatible_aggregation(
             &configs,
             &req("cpu", &[Statistic::Sum], Some(300_000), &["job"], ""),
+        );
+        assert!(
+            result.is_some(),
+            "post-fix: a config with `[job, instance]` grouping must serve a `[job]`-only req \
+             via the merge path",
+        );
+    }
+
+    #[test]
+    fn label_subset_config_rejects_superset_query() {
+        // Config has only `[job]`, query wants `[job, instance]`.
+        // The engine cannot invent a partition the agg never
+        // materialised, so this remains incompatible.
+        let configs = single_config(make_config(
+            1,
+            "cpu",
+            "Sum",
+            "",
+            300,
+            "tumbling",
+            &["job"],
+            "",
+        ));
+        let result = find_compatible_aggregation(
+            &configs,
+            &req(
+                "cpu",
+                &[Statistic::Sum],
+                Some(300_000),
+                &["job", "instance"],
+                "",
+            ),
         );
         assert!(result.is_none());
     }
@@ -1112,6 +1193,29 @@ mod tests {
             compatible_agg_types(Statistic::Topk)
                 .contains(&AggregationType::CountMinSketchWithHeap),
             "CountMinSketchWithHeap must be a compatible type for Topk",
+        );
+        // CountSketch → Topk (warm-engine-error-on-replay-queries fix).
+        // Required so the MVP demo's `topk(5, top_endpoint_qps)` —
+        // which routes through the agent's `countsketchprocessor`
+        // and lands as a CountSketch-only config — resolves
+        // through capability matching. Without this, the warm
+        // engine returned `status=error` for every topk replay row.
+        assert!(
+            compatible_agg_types(Statistic::Topk).contains(&AggregationType::CountSketch),
+            "CountSketch must be a compatible type for Topk (warm-engine-error fix)",
+        );
+        // HLL → Count (warm-engine-error-on-replay-queries fix). The
+        // MVP demo's `count(unique_users_per_min)` is structurally a
+        // PromQL `Statistic::Count` (the AggregationOperator::Count
+        // → Statistic::Count mapping in
+        // `promql_utilities::query_logics::enums`); the
+        // `HllSketchAccumulator` answers it as a cardinality alias
+        // (`hll_sketch_accumulator.rs:220`). Without HLL listed
+        // here, capability matching missed and the warm engine
+        // returned `status=error` for every count-of-HLL replay row.
+        assert!(
+            compatible_agg_types(Statistic::Count).contains(&AggregationType::HLL),
+            "HLL must be a compatible type for Count (warm-engine-error fix)",
         );
     }
 
