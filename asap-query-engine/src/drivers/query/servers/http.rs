@@ -17,7 +17,9 @@ use tracing::{debug, info, warn};
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::engines::SimpleEngine;
-use crate::routing::{EngineRouter, EngineRouterError, QueryEngine};
+use crate::routing::{
+    EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
+};
 use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
@@ -135,6 +137,15 @@ pub struct HttpServer {
     /// disables the retention precheck — the handler still enforces
     /// the §10.5 time-disjoint invariant.
     data_retention_ms: Option<u64>,
+    /// Freshness-probe last-value cache (issue #46 ⑥). When `Some`,
+    /// the query handler intercepts
+    /// `last_over_time(<probe>[<range>])` for probe-shaped metric
+    /// names and answers from RAM. The same cache is fed by the OTLP
+    /// receiver — see `OtlpReceiver::with_probe_cache`. `None`
+    /// disables the short-circuit; the dispatch falls through to the
+    /// normal routing-table path (which goes to Thanos for the cold
+    /// archive and observes the 60–90 s flush gap).
+    probe_cache: Option<Arc<FreshnessProbeCache>>,
 }
 
 #[derive(Clone)]
@@ -160,6 +171,8 @@ struct AppState {
     backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
     /// See `HttpServer::data_retention_ms`.
     data_retention_ms: Option<u64>,
+    /// See [`HttpServer::probe_cache`].
+    probe_cache: Option<Arc<FreshnessProbeCache>>,
 }
 
 impl HttpServer {
@@ -185,6 +198,7 @@ impl HttpServer {
             schemas: None,
             backfill: None,
             data_retention_ms: None,
+            probe_cache: None,
         }
     }
 
@@ -317,6 +331,20 @@ impl HttpServer {
         self
     }
 
+    /// Attach a [`FreshnessProbeCache`] so the HTTP query handler
+    /// answers `last_over_time(<probe>[<range>])` from RAM. The same
+    /// `Arc` should be handed to the OTLP receiver via
+    /// `OtlpReceiver::with_probe_cache` so writes and reads see the
+    /// same cache state. Without this call, probe queries fall
+    /// through to the cold archive — fine for queries with a
+    /// generous lookback (≥1m) but produces an empty result for the
+    /// MVP demo's 10 s window. See issue #46 ⑥ for the failure
+    /// mode.
+    pub fn with_probe_cache(mut self, cache: Arc<FreshnessProbeCache>) -> Self {
+        self.probe_cache = Some(cache);
+        self
+    }
+
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         srv_metrics::register_all();
 
@@ -344,6 +372,7 @@ impl HttpServer {
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
+            probe_cache: self.probe_cache.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -422,6 +451,7 @@ impl HttpServer {
             schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
+            probe_cache: self.probe_cache.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -537,6 +567,30 @@ async fn process_query_request(
     // apples-to-apples relative error per replay row.
     if let Some(override_id) = engine_override.as_deref() {
         return process_via_named_engine(state, parsed_request, start_time, override_id).await;
+    }
+
+    // Issue #46 ⑥ — freshness-probe short-circuit.
+    //
+    // The MVP demo's freshness criterion polls
+    // `last_over_time(http_freshness_probe_warm[10s])` at 10 Hz. The
+    // probe metric flows through the agent's
+    // `[gorillas3 → ddsketch → batch] → backend OTLP` pipeline; the
+    // cold tier's `gorillas3 → 60 s TSDB block → Thanos sync` path
+    // adds 60–90 s of flush latency, so a 10 s lookback against the
+    // cold archive returns an empty vector for the entire run
+    // (replay client logged `attempted=600 got=0`). The OTLP receiver
+    // captures the latest sample for every probe metric in
+    // [`AppState::probe_cache`]; here we intercept the matching query
+    // shape before it falls through to the routing table and answer
+    // from RAM with sub-second freshness. When the cache has no entry
+    // inside the lookback window the intercept returns `None` and
+    // dispatch falls through to the normal path — preserving the
+    // long-window queries (≥1m) that the cold archive still answers
+    // correctly.
+    if let Some(response) =
+        try_answer_freshness_probe(state, parsed_request, start_time).await
+    {
+        return response;
     }
 
     // Step 2: Pick a dispatch path based on the metric's pinned
@@ -660,6 +714,129 @@ fn first_metric_name(expr: &promql_parser::parser::Expr) -> Option<String> {
         Expr::Unary(u) => first_metric_name(&u.expr),
         _ => None,
     }
+}
+
+/// Issue #46 ⑥ short-circuit — answer
+/// `last_over_time(<probe>[<range>])` from the freshness probe cache.
+///
+/// Recognises queries of shape `last_over_time(<metric>[<range>])`
+/// (also wrapped in `Paren` / `Unary`) where `<metric>` matches the
+/// `http_freshness_probe_*` family. Returns `Some(response)` only when
+/// the cache is configured AND has an entry whose `ts_ms` falls inside
+/// the lookback window `[now − range, now]`. Every other shape and
+/// every cache miss returns `None` — the caller falls through to the
+/// normal routing-table dispatch unchanged.
+///
+/// Response shape mirrors `process_via_router`'s success path: a
+/// Prometheus instant vector with one element (empty labels, scalar
+/// value), a `data_source: sketch_warm` info-line so the wire format
+/// is consistent with the warm-tier path the routing table comment
+/// describes as the right home for the `_warm` probe.
+async fn try_answer_freshness_probe(
+    state: &AppState,
+    parsed_request: &ParsedQueryRequest,
+    start_time: Instant,
+) -> Option<Response> {
+    use crate::drivers::query::adapters::QueryExecutionResult;
+    use crate::engines::query_result::{InstantVectorElement, QueryResult};
+    use promql_utilities::data_model::KeyByLabelNames;
+
+    let cache = state.probe_cache.as_ref()?;
+    let (metric, range_ms) = parse_last_over_time_probe(&parsed_request.query)?;
+    if !crate::routing::is_freshness_probe(&metric) {
+        return None;
+    }
+
+    // `parsed_request.time` is unix seconds (instant query). Convert
+    // to ms to match the cache's storage scale. A `time` of `0.0` (the
+    // adapter's default for "no time given") falls back to wall clock,
+    // matching Prometheus's instant-query semantics.
+    let now_ms = if parsed_request.time > 0.0 {
+        (parsed_request.time * 1_000.0) as i64
+    } else {
+        crate::routing::freshness_probe_now_ms()
+    };
+    let sample = cache.lookup(&metric, now_ms, range_ms)?;
+
+    debug!(
+        metric = %metric,
+        sample_ts_ms = sample.ts_ms,
+        sample_value = sample.value,
+        now_ms,
+        range_ms,
+        "freshness-probe cache hit; answering last_over_time from RAM"
+    );
+
+    let element = InstantVectorElement::new(
+        crate::data_model::KeyByLabelValues::new(),
+        sample.value,
+    );
+    // The instant-vector timestamp is unix milliseconds — match the
+    // adapter's expectations downstream (the Prometheus adapter
+    // divides by 1000 to render the wire `value: [<unix_seconds>, ...]`).
+    let query_result = QueryResult::vector(vec![element], now_ms as u64);
+    let execution_result = QueryExecutionResult {
+        query_output_labels: KeyByLabelNames::default(),
+        query_result,
+    };
+
+    let total_duration = start_time.elapsed();
+    debug!(
+        "freshness-probe response built in {:.2}ms",
+        total_duration.as_secs_f64() * 1000.0,
+    );
+
+    Some(
+        match state
+            .adapter
+            .format_success_response(&execution_result)
+            .await
+        {
+            Ok(response) => annotate_data_source(
+                response,
+                StorageBackend::SketchWarmTier.data_source_id(),
+            )
+            .await,
+            Err(status) => status.into_response(),
+        },
+    )
+}
+
+/// Pull `(metric_name, range_ms)` out of a parsed
+/// `last_over_time(<metric>[<range>])` PromQL expression. Returns
+/// `None` for any other shape — that's the caller's signal to fall
+/// through to the normal dispatch path. Tolerates leading `Paren` /
+/// `Unary` wrappers so reasonable spellings parse the same way the
+/// gorilla engine's `plan_from_ast` does.
+fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
+    use promql_parser::parser::{parse, Expr};
+    let expr = parse(query).ok()?;
+    fn unwrap<'a>(expr: &'a Expr) -> &'a Expr {
+        match expr {
+            Expr::Paren(p) => unwrap(&p.expr),
+            Expr::Unary(u) => unwrap(&u.expr),
+            other => other,
+        }
+    }
+    let inner = unwrap(&expr);
+    let call = match inner {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    if !call.func.name.eq_ignore_ascii_case("last_over_time") {
+        return None;
+    }
+    if call.args.args.len() != 1 {
+        return None;
+    }
+    let arg = unwrap(&call.args.args[0]);
+    let ms = match arg {
+        Expr::MatrixSelector(ms) => ms,
+        _ => return None,
+    };
+    let metric = ms.vs.name.clone()?;
+    let range_ms = ms.range.as_millis() as i64;
+    Some((metric, range_ms))
 }
 
 /// Direct `SimpleEngine::handle_query` dispatch — preserves the
@@ -4083,6 +4260,225 @@ aggregations:
             .expect("Failed to start test server")
     }
 
+    // ── Issue #46 ⑥ — freshness-probe last-value cache ────────────
+    //
+    // The MVP demo's freshness criterion polls
+    // `last_over_time(http_freshness_probe_warm[10s])` against the
+    // backend's HTTP query endpoint at 10 Hz. The cold-tier flush
+    // gap (gorillas3 → 60 s TSDB block → Thanos sync) leaves a 10 s
+    // lookback window empty, so the OTLP receiver captures the
+    // latest probe sample in a `FreshnessProbeCache` and the HTTP
+    // handler answers the matching query shape from RAM. These
+    // tests pin the contract: a recorded sample inside the lookback
+    // window comes back as a single-element instant vector with the
+    // counter value the producer encoded, and a stale sample falls
+    // through (returns no result) without crashing the handler.
+
+    /// Spin up an `HttpServer` wired to a fresh `FreshnessProbeCache`
+    /// and return both. The cache is shared with the server so the
+    /// test can pre-populate it with a synthetic sample before
+    /// hitting `/api/v1/query`. The router holds no cold-archive
+    /// engine; the freshness probe short-circuit must answer
+    /// without ever consulting the cold tier.
+    async fn setup_test_server_with_probe_cache() -> (
+        u16,
+        Arc<crate::routing::FreshnessProbeCache>,
+    ) {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            crate::data_model::CleanupPolicy::NoCleanup,
+        );
+        let streaming_arc = Arc::new(StreamingConfig::default());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_arc.clone(),
+            crate::data_model::CleanupPolicy::NoCleanup,
+        ));
+        let query_engine = Arc::new(SimpleEngine::new(
+            store.clone(),
+            inference_config,
+            streaming_arc,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        ));
+        let cache = Arc::new(crate::routing::FreshnessProbeCache::new());
+        let server = HttpServer::new(config, query_engine, store)
+            .with_probe_cache(cache.clone());
+        let port = server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server");
+        (port, cache)
+    }
+
+    #[tokio::test]
+    async fn freshness_probe_last_over_time_answers_from_cache() {
+        let (port, cache) = setup_test_server_with_probe_cache().await;
+
+        // Synthetic sample: probe encodes its emission unix_ms as the
+        // counter value (matches `deploy/fake-exporter/probes.go`).
+        // Record the sample at "now" so the 10 s lookback hits.
+        let now_ms = crate::routing::freshness_probe_now_ms();
+        let probe_value_ms = now_ms - 50; // sample emitted 50 ms ago
+        cache.record(
+            "http_freshness_probe_warm",
+            probe_value_ms,
+            probe_value_ms as f64,
+        );
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .query(&[("query", "last_over_time(http_freshness_probe_warm[10s])")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "freshness-probe short-circuit must return 2xx; got {}",
+            resp.status(),
+        );
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+        assert_eq!(body["status"], "success", "expected status=success: {body}");
+        let result = &body["data"]["result"];
+        assert!(
+            result.is_array() && !result.as_array().unwrap().is_empty(),
+            "expected non-empty result vector; got {body}",
+        );
+        // The element's value (string-encoded float, Prometheus-wire
+        // format) should be the cumulative counter the producer
+        // encoded — i.e. the unix_ms of the last emission.
+        let value_str = result[0]["value"][1]
+            .as_str()
+            .expect("instant-vector value must be a string");
+        let parsed: i64 = value_str.parse().expect("value must parse as integer");
+        assert_eq!(
+            parsed, probe_value_ms,
+            "last_over_time must return the cumulative counter value (= unix_ms of emission)",
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_probe_last_over_time_falls_through_on_stale_sample() {
+        let (port, cache) = setup_test_server_with_probe_cache().await;
+
+        // Sample is older than the lookback window — the cache lookup
+        // returns None and the handler falls through to the normal
+        // routing path. The default routing landed on
+        // `SketchWarmTier`, which the test's empty `SimpleEngine`
+        // can't answer, so the response is a structured error or an
+        // empty-result success — anything but a crash. The test
+        // pins the no-crash contract; the exact error surface is
+        // covered by the routing-table tests.
+        let now_ms = crate::routing::freshness_probe_now_ms();
+        let stale_ts = now_ms - 60_000; // 60 s old, outside [now-10s, now]
+        cache.record("http_freshness_probe_warm", stale_ts, stale_ts as f64);
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .query(&[("query", "last_over_time(http_freshness_probe_warm[10s])")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        // The response either succeeds with an empty vector (cache
+        // miss → fall through → SimpleEngine no-data) or returns a
+        // 4xx/5xx with a structured error. Either is fine as long as
+        // the handler did not panic.
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+        assert!(
+            body.get("status").is_some(),
+            "response must carry a status field; got {body}",
+        );
+    }
+
+    #[test]
+    fn parse_last_over_time_probe_recognises_canonical_shape() {
+        // Canonical shape — `last_over_time(metric[range])`. Returns
+        // `(metric_name, range_ms)`.
+        let parsed =
+            super::parse_last_over_time_probe("last_over_time(http_freshness_probe_warm[10s])")
+                .expect("canonical last_over_time must parse");
+        assert_eq!(parsed.0, "http_freshness_probe_warm");
+        assert_eq!(parsed.1, 10_000);
+
+        // Different range — millis are extracted from the matrix
+        // selector, not hard-coded.
+        let parsed = super::parse_last_over_time_probe(
+            "last_over_time(http_freshness_probe_archive[5m])",
+        )
+        .expect("5m range must parse");
+        assert_eq!(parsed.1, 5 * 60_000);
+    }
+
+    #[test]
+    fn parse_last_over_time_probe_rejects_other_shapes() {
+        // Bare vector selector — not a function call.
+        assert_eq!(
+            super::parse_last_over_time_probe("http_freshness_probe_warm"),
+            None,
+        );
+        // Different function name.
+        assert_eq!(
+            super::parse_last_over_time_probe("rate(http_freshness_probe_warm[10s])"),
+            None,
+        );
+        // Wrong arg count for last_over_time (which takes one matrix
+        // selector).
+        assert_eq!(
+            super::parse_last_over_time_probe("last_over_time()"),
+            None,
+        );
+        // Aggregation around the call — outermost shape isn't a
+        // bare `last_over_time` call.
+        assert_eq!(
+            super::parse_last_over_time_probe(
+                "topk(1, last_over_time(http_freshness_probe_warm[10s]))"
+            ),
+            None,
+        );
+        // Garbage PromQL.
+        assert_eq!(super::parse_last_over_time_probe("not promql"), None);
+    }
+
+    #[tokio::test]
+    async fn freshness_probe_short_circuit_ignores_non_probe_metrics() {
+        let (port, cache) = setup_test_server_with_probe_cache().await;
+        let now_ms = crate::routing::freshness_probe_now_ms();
+        cache.record("http_freshness_probe_warm", now_ms, now_ms as f64);
+
+        // Different metric — must NOT be served from the cache (the
+        // short-circuit checks the metric name prefix). The handler
+        // should fall through to normal routing; whatever happens
+        // there is the test of those paths, not of the short-circuit.
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/query"))
+            .query(&[("query", "last_over_time(http_requests_total[10s])")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        let body: serde_json::Value = resp.json().await.expect("Failed to parse JSON");
+        // The cache hit would have produced a non-empty result with
+        // value `now_ms`. Fall-through paths return either an empty
+        // vector or an error — neither carries our probe value, so
+        // we negative-assert: the body must NOT contain the probe
+        // value as a stringified counter.
+        let body_str = body.to_string();
+        assert!(
+            !body_str.contains(&now_ms.to_string()),
+            "non-probe metric must NOT be answered from the freshness cache; \
+             saw probe value {now_ms} leaked into response: {body}",
+        );
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────

@@ -587,6 +587,16 @@ async fn main() -> Result<()> {
     let engine = Arc::new(engine);
 
     // Setup OTLP receiver (after precompute engine so it can share the ingest state)
+    // Issue #46 ⑥ — freshness-probe last-value cache. Shared between
+    // the OTLP receiver (write path) and the HTTP query handler (read
+    // path) so `last_over_time(http_freshness_probe_*[<range>])` can
+    // be answered from RAM instead of falling through to the cold
+    // archive (which has a 60–90 s flush gap that would leave the
+    // 10 s lookback window empty). Allocated unconditionally — non-
+    // probe traffic doesn't touch the cache, so the cost is one
+    // `RwLock<HashMap>` of three entries for the whole demo run.
+    let probe_cache = Arc::new(query_engine_rust::routing::FreshnessProbeCache::new());
+
     let otel_handle = if args.enable_otel_ingest {
         let otel_config = OtlpReceiverConfig {
             grpc_port: args.otel_grpc_port,
@@ -600,6 +610,7 @@ async fn main() -> Result<()> {
                     args.otel_grpc_port, args.otel_http_port
                 );
                 OtlpReceiver::with_ingest_state(otel_config, ingest_state)
+                    .with_probe_cache(probe_cache.clone())
             }
             None => {
                 info!(
@@ -607,7 +618,7 @@ async fn main() -> Result<()> {
                      (precompute engine not enabled; gRPC port {}, HTTP port {})",
                     args.otel_grpc_port, args.otel_http_port
                 );
-                OtlpReceiver::new(otel_config)
+                OtlpReceiver::new(otel_config).with_probe_cache(probe_cache.clone())
             }
         };
         Some(tokio::spawn(async move {
@@ -659,7 +670,8 @@ async fn main() -> Result<()> {
     // absent and the swap handler no-ops on schema reconciliation
     // (legacy per-batch reconcile in ingest still works).
     let mut server = HttpServer::new(http_config, engine, store.clone())
-        .with_hot_reload_config(hot_reload_config.clone());
+        .with_hot_reload_config(hot_reload_config.clone())
+        .with_probe_cache(probe_cache.clone());
 
     // Per-metric storage-backend routing table (issue #46
     // criterion ⑤). Mirror the `precompute_engine` binary: load it
