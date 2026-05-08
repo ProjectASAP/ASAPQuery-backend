@@ -495,6 +495,78 @@ impl SimpleEngine {
         result
     }
 
+    /// Resolve the canonical "all labels" set for a metric, with a
+    /// streaming-config fallback for schema-empty deploys.
+    ///
+    /// The user-facing `inference_config.schema` is the source of truth
+    /// for "what labels does this metric carry" — but the production
+    /// warm-tier deploy launches with `--streaming-config` only and no
+    /// `--config`, so the schema is empty. Pre-fix every query lookup
+    /// in `build_promql_execution_context_tail` and
+    /// `build_query_requirements_promql` returned `None` /
+    /// `KeyByLabelNames::empty()` for that metric, killing capability
+    /// matching (`req.grouping_labels = []` strict-mismatches every
+    /// agg config's `[zone]`) and the downstream context build (the
+    /// `None` short-circuits the whole query). See
+    /// `tests::warm_engine_replay_regression_tests::production_conditions_*`.
+    ///
+    /// Fallback rules:
+    /// 1. Look up the metric in `inference_config.schema`. Return its
+    ///    labels if present.
+    /// 2. Otherwise scan the current `StreamingConfig` snapshot for
+    ///    every agg config whose `metric == name`. Union their
+    ///    `grouping_labels` (the per-series partition the agg
+    ///    materialises) and return that. The union preserves order
+    ///    of first-appearance and de-dupes — `KeyByLabelNames`
+    ///    equality is strict, so we have to keep insertion order
+    ///    deterministic across config swaps.
+    /// 3. Returns `None` only if no agg config references the metric
+    ///    AND the schema is empty. Callers translate that into the
+    ///    same "metric unknown" outcome as before this helper landed.
+    fn resolve_metric_labels(&self, metric: &str) -> Option<KeyByLabelNames> {
+        // (1) schema lookup — user-supplied source of truth.
+        if let SchemaConfig::PromQL(schema) = &self.inference_config.schema {
+            if let Some(labels) = schema.get_labels(metric).cloned() {
+                return Some(labels);
+            }
+        }
+
+        // (2) streaming-config fallback — derived from whatever agg
+        // configs the controller / static YAML registered for the
+        // metric. Produces the union of `grouping_labels` across all
+        // matching aggs in deterministic insertion order.
+        let snap = self.streaming_config_snapshot();
+        let mut seen = std::collections::HashSet::new();
+        let mut union: Vec<String> = Vec::new();
+        // Sort by aggregation_id so the resulting label vector is
+        // stable across re-runs even though `aggregation_configs` is
+        // a `HashMap`. Without this ordering, two engines holding
+        // bit-identical configs could produce different
+        // `KeyByLabelNames` instances and `labels_compatible`'s
+        // strict-eq would flake intermittently.
+        let mut agg_ids: Vec<u64> = snap.aggregation_configs.keys().copied().collect();
+        agg_ids.sort_unstable();
+        for id in agg_ids {
+            let cfg = match snap.get_aggregation_config(id) {
+                Some(c) => c,
+                None => continue,
+            };
+            if cfg.metric != metric {
+                continue;
+            }
+            for label in &cfg.grouping_labels.labels {
+                if seen.insert(label.clone()) {
+                    union.push(label.clone());
+                }
+            }
+        }
+        if union.is_empty() {
+            None
+        } else {
+            Some(KeyByLabelNames::new(union))
+        }
+    }
+
     /// Convert query timestamp (seconds) to data timestamp (milliseconds)
     pub fn convert_query_time_to_data_time(query_time: f64) -> u64 {
         (query_time * 1000.0) as u64
@@ -1502,11 +1574,15 @@ impl SimpleEngine {
     ) -> Option<QueryExecutionContext> {
         let (metric, spatial_filter) = get_metric_and_spatial_filter(match_result);
 
-        let promql_schema = match &self.inference_config.schema {
-            SchemaConfig::PromQL(schema) => schema,
-            _ => return None,
-        };
-        let all_labels = match promql_schema.get_labels(&metric).cloned() {
+        // Resolve the metric's "all labels" set. Falls back to a
+        // streaming-config-derived label union when the schema is
+        // empty for this metric — the production warm-tier deploy
+        // launches with `--streaming-config` only and an empty
+        // schema, and pre-fix every query for a streaming-config-
+        // registered metric blew up here on the schema lookup. See
+        // `Self::resolve_metric_labels` and the
+        // `production_conditions_*` regression tests for context.
+        let all_labels = match self.resolve_metric_labels(&metric) {
             Some(labels) => labels,
             None => {
                 warn!("No metric configuration found for '{}'", metric);
@@ -1952,13 +2028,16 @@ impl SimpleEngine {
                 .map(|d| d.num_seconds() as u64 * 1000),
         };
 
-        let all_labels = match &self.inference_config.schema {
-            SchemaConfig::PromQL(schema) => schema
-                .get_labels(&metric)
-                .cloned()
-                .unwrap_or_else(KeyByLabelNames::empty),
-            _ => KeyByLabelNames::empty(),
-        };
+        // Resolve the metric's "all labels" set with the same
+        // schema-empty fallback used by
+        // `build_promql_execution_context_tail`. Without this
+        // fallback the schema-empty production deploy returns
+        // `KeyByLabelNames::empty()` for every metric, and
+        // `labels_compatible`'s strict-eq mismatches every agg
+        // config's `[zone]` → capability-miss → `status=error`.
+        let all_labels = self
+            .resolve_metric_labels(&metric)
+            .unwrap_or_else(KeyByLabelNames::empty);
 
         let grouping_labels = match query_pattern_type {
             QueryPatternType::OnlyTemporal => all_labels,

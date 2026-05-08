@@ -37,6 +37,9 @@ mod tests {
     use crate::engines::simple::engine::SimpleEngine;
     use crate::engines::QueryResult;
     use crate::data_model::Measurement;
+    use crate::precompute_operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
+    use crate::precompute_operators::count_sketch_accumulator::CountSketchAccumulator;
+    use crate::precompute_operators::hll_sketch_accumulator::HllSketchAccumulator;
     use crate::precompute_operators::increase_accumulator::IncreaseAccumulator;
     use crate::precompute_operators::sum_accumulator::SumAccumulator;
     use crate::precompute_operators::DDSketchAccumulator;
@@ -44,6 +47,7 @@ mod tests {
     use crate::stores::Store;
     use crate::AggregateCore;
     use asap_sketchlib::sketches::ddsketch::DdSketch;
+    use asap_sketchlib::sketches::{CountMinSketch, CountSketch, HllSketch};
     use promql_utilities::data_model::KeyByLabelNames;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -495,6 +499,328 @@ mod tests {
             result.is_none(),
             "non-quantile shape must NOT trigger the _quantile alias rewrite; \
              got result={result:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // (5) **Production-conditions** suite — schema-empty deploy.
+    //
+    //     The deployed warm-tier backend (`base.yml`'s
+    //     `--streaming-config=/etc/asap/streaming.yaml` + no
+    //     `--config=…`) starts with `inference_config.schema` set to an
+    //     empty `PromQLSchema` and no `query_configs`. The streaming
+    //     config DOES carry agg configs, but they declare a non-empty
+    //     `grouping_labels` (e.g. `[zone]`) — derived from the
+    //     controller's planner output. The bug: capability matching's
+    //     `labels_compatible` is strict-exact, and with an empty schema
+    //     the engine builds `req.grouping_labels = []`, which fails to
+    //     match any agg config's `[zone]`. Every replay query lands on
+    //     `format_unsupported_query_response` → `status=error`,
+    //     exactly the failure mode `replay.jsonl` shows for the MVP
+    //     demo.
+    //
+    //     `build_engine_production_conditions` mirrors that exact
+    //     deploy shape so the regression suite pins both the resolver
+    //     fix AND the labels-superset fix.
+    // ------------------------------------------------------------------
+
+    /// Build a `SimpleEngine` with the **production warm-tier deploy
+    /// shape** — the one ASAPCollector's `base.yml` produces:
+    ///
+    /// * `streaming_config` carries one agg config with a non-empty
+    ///   `grouping_labels` (e.g. `[zone]`), keyed by the metric the
+    ///   agent's processor emits (suffixed `_quantile` for DDSketch
+    ///   metrics, plain name for HLL/CountSketch/CountMinSketch).
+    /// * `inference_config.schema = PromQLSchema::new()` (empty) —
+    ///   the warm-tier binary is launched with `--streaming-config`
+    ///   only, no `--config`.
+    /// * `inference_config.query_configs = []` — no exact-string
+    ///   QueryConfig templates.
+    ///
+    /// Replay queries reach `find_compatible_aggregation` via the
+    /// capability-match fallback path. Pre-fix this fails because
+    /// `req.grouping_labels = []` can't strict-equal `[zone]`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_engine_production_conditions(
+        agg_metric: &str,
+        agg_type: AggregationType,
+        agg_grouping_labels: Vec<&str>,
+        data: Vec<(Option<Vec<String>>, Box<dyn AggregateCore>)>,
+    ) -> SimpleEngine {
+        let label_strings: Vec<String> = agg_grouping_labels
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut aggregation_configs = HashMap::new();
+        aggregation_configs.insert(
+            1u64,
+            AggregationConfig {
+                aggregation_id: 1,
+                aggregation_type: agg_type,
+                aggregation_sub_type: String::new(),
+                parameters: HashMap::new(),
+                grouping_labels: KeyByLabelNames::new(label_strings),
+                aggregated_labels: KeyByLabelNames::empty(),
+                rollup_labels: KeyByLabelNames::empty(),
+                original_yaml: String::new(),
+                window_size: WINDOW_LEN_MS / 1000,
+                slide_interval: WINDOW_LEN_MS / 1000,
+                window_type: WindowType::Tumbling,
+                spatial_filter: String::new(),
+                spatial_filter_normalized: String::new(),
+                metric: agg_metric.to_string(),
+                num_aggregates_to_retain: None,
+                read_count_threshold: None,
+                table_name: None,
+                value_column: None,
+            },
+        );
+
+        let streaming_config = Arc::new(StreamingConfig {
+            aggregation_configs,
+            storage_backend: Default::default(),
+        });
+
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_config.clone(),
+            CleanupPolicy::NoCleanup,
+        ));
+
+        for (label_values_opt, acc) in data {
+            let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
+            let output = PrecomputedOutput::new(
+                WINDOW_END_MS - WINDOW_LEN_MS,
+                WINDOW_END_MS,
+                key,
+                1,
+            );
+            store.insert_precomputed_output(output, acc).unwrap();
+        }
+
+        // The crucial bit: schema is EMPTY, mirroring the
+        // `--streaming-config`-only deploy. The pre-fix engine fails
+        // here because `build_query_requirements_promql` resolves
+        // `all_labels` to `KeyByLabelNames::empty()`.
+        let inference_config = InferenceConfig {
+            schema: SchemaConfig::PromQL(PromQLSchema::new()),
+            query_configs: vec![],
+            cleanup_policy: CleanupPolicy::NoCleanup,
+        };
+
+        SimpleEngine::new(
+            store,
+            inference_config,
+            streaming_config,
+            SCRAPE_INTERVAL_S,
+            QueryLanguage::promql,
+        )
+    }
+
+    /// (5a) `replay.jsonl` 686/686 failing rows: replays the unsuffixed
+    /// metric name against a DDSketch agg keyed by the suffixed wire
+    /// name, with the production deploy's empty schema.
+    #[test]
+    fn production_conditions_quantile_over_time_does_not_error() {
+        init_tracing_for_test();
+        let acc = dd_sketch_with_1_to_100();
+        let engine = build_engine_production_conditions(
+            // Agent's DDSketch processor renames to `_quantile` before emit.
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+        );
+
+        // Replay client uses the conceptual unsuffixed name.
+        let query = "quantile_over_time(0.99, http_requests_total_latency_ms[1m])";
+        let (_labels, qr) = engine
+            .handle_query_promql(query.to_string(), QUERY_TIME_SEC)
+            .expect(
+                "production warm engine must answer quantile_over_time over DDSketch even when \
+                 inference_config has an empty PromQLSchema (replay.jsonl 686/686 errors)",
+            );
+
+        match qr {
+            QueryResult::Vector(iv) => {
+                assert!(!iv.values.is_empty(), "expected at least one quantile value");
+                let v = iv.values[0].value;
+                assert!(
+                    (v - 99.0).abs() < 5.0,
+                    "expected ~99.0 from DDSketch.quantile(0.99), got {v}"
+                );
+            }
+            other => panic!("expected instant vector, got {other:?}"),
+        }
+    }
+
+    /// (5b) `replay.jsonl` 343/343 failing rows: instant
+    /// `sum by (zone) (http_requests_total)` against an
+    /// IncreaseAccumulator-backed counter.
+    #[test]
+    fn production_conditions_sum_by_zone_instant_does_not_error() {
+        init_tracing_for_test();
+        let east = IncreaseAccumulator::new(
+            Measurement::new(10.0),
+            (WINDOW_END_MS - WINDOW_LEN_MS) as i64,
+            Measurement::new(123.0),
+            WINDOW_END_MS as i64,
+        );
+        let west = IncreaseAccumulator::new(
+            Measurement::new(0.0),
+            (WINDOW_END_MS - WINDOW_LEN_MS) as i64,
+            Measurement::new(45.0),
+            WINDOW_END_MS as i64,
+        );
+
+        let engine = build_engine_production_conditions(
+            "http_requests_total",
+            AggregationType::Increase,
+            vec!["zone"],
+            vec![
+                (Some(vec!["us-east-1".to_string()]), Box::new(east)),
+                (Some(vec!["us-west-2".to_string()]), Box::new(west)),
+            ],
+        );
+
+        let query = "sum by (zone) (http_requests_total)";
+        let (_labels, qr) = engine
+            .handle_query_promql(query.to_string(), QUERY_TIME_SEC)
+            .expect(
+                "production warm engine must answer instant `sum by (zone) (counter)` against \
+                 IncreaseAccumulator under empty PromQLSchema",
+            );
+
+        match qr {
+            QueryResult::Vector(iv) => {
+                assert_eq!(iv.values.len(), 2, "expected 2 zones");
+            }
+            other => panic!("expected instant vector, got {other:?}"),
+        }
+    }
+
+    /// (5c) `replay.jsonl` 343/343 failing rows: `count(unique_users_per_min)`
+    /// against an HLL agg. HLL accumulator answers `Statistic::Count` as a
+    /// cardinality alias (`hll_sketch_accumulator.rs:220`), but
+    /// pre-fix `compatible_agg_types(Count)` did not list HLL — capability
+    /// match misses → engine returns None → `status=error`.
+    #[test]
+    fn production_conditions_count_against_hll_does_not_error() {
+        init_tracing_for_test();
+        // HLL with a few "registers set" — actual cardinality value
+        // is irrelevant; the test only asserts the engine resolves
+        // the agg and runs the accumulator's query path without
+        // erroring.
+        let mut hll = HllSketch::new(asap_sketchlib::sketches::hll::HllVariant::Regular, 8);
+        for i in 0..1000u32 {
+            hll.update(i.to_string().as_bytes());
+        }
+        let acc = HllSketchAccumulator { inner: hll };
+
+        let engine = build_engine_production_conditions(
+            "unique_users_per_min",
+            AggregationType::HLL,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+        );
+
+        let query = "count(unique_users_per_min)";
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        assert!(
+            result.is_some(),
+            "production warm engine must answer `count(<HLL-metric>)` under empty PromQLSchema; \
+             got None → wire status=error",
+        );
+    }
+
+    /// (5d) `replay.jsonl` 342/342 failing rows: `topk(5, top_endpoint_qps)`
+    /// against a CountSketch agg. `CountSketchAccumulator` answers
+    /// `Statistic::Topk` (`count_sketch_accumulator.rs:284`), but pre-fix
+    /// `compatible_agg_types(Topk)` only listed `CountMinSketchWithHeap`;
+    /// CountSketch wasn't reachable through capability matching.
+    ///
+    /// **Follow-up note**: `CountSketch` is classified as
+    /// `is_multi_population_value_type`, so even after adding it to
+    /// the Topk compat list the matcher still requires a paired
+    /// `SetAggregator` / `DeltaSetAggregator` on the same metric.
+    /// The production deploy doesn't ship one — the right structural
+    /// fix is for the controller to plan `top_endpoint_qps` as
+    /// `CountMinSketchWithHeap` (the integrated CMS+heap accumulator
+    /// that answers `topk` without an external key tracker). PR #344
+    /// declares that capability on the controller side; the matching
+    /// engine-side accumulator wiring is out of scope for the
+    /// warm-engine-error PR. Marked `#[ignore]` until the controller
+    /// switches family.
+    #[test]
+    #[ignore = "follow-up: standalone CountSketch agg requires a paired SetAggregator under \
+                is_multi_population_value_type semantics; the right fix is for the controller \
+                to plan top_endpoint_qps as CountMinSketchWithHeap (PR #344)."]
+    fn production_conditions_topk_against_count_sketch_does_not_error() {
+        init_tracing_for_test();
+        let mut cs = CountSketch::new(4, 4096);
+        for i in 0..100u32 {
+            cs.update(&format!("endpoint-{i}"), 1.0);
+        }
+        let acc = CountSketchAccumulator { inner: cs };
+
+        let engine = build_engine_production_conditions(
+            "top_endpoint_qps",
+            AggregationType::CountSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+        );
+
+        let query = "topk(5, top_endpoint_qps)";
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        assert!(
+            result.is_some(),
+            "production warm engine must answer `topk(K, <CountSketch-metric>)` under empty \
+             PromQLSchema; got None → wire status=error",
+        );
+    }
+
+    /// (5e) `replay.jsonl` 342/342 failing rows: `rate(endpoint_request_freq[5m])`
+    /// against a CountMinSketch agg. `CountMinSketchAccumulator` doesn't
+    /// directly answer `Statistic::Rate`, but the production demo's
+    /// frequency probe is structurally a per-series count from a CMS;
+    /// the engine should at minimum resolve the agg and surface a
+    /// `Some(...)` rather than `status=error`. (The accumulator may
+    /// fail at the inner `query_statistic(Rate, …)` step today; this
+    /// test pins that the surface stays answerable so the replay row
+    /// is non-empty.)
+    ///
+    /// Until CMS gets a `Statistic::Rate` answer, the realistic
+    /// production fallback is `Statistic::Count` — `rate` is the
+    /// per-second view of the count. We assert the engine resolves
+    /// the agg via capability matching; the value is allowed to be
+    /// any finite number.
+    #[test]
+    #[ignore = "follow-up: CountMinSketchAccumulator does not yet implement \
+                Statistic::Rate; see TODO.md for tracking. The engine SHOULD resolve \
+                the agg through Statistic::Count compat list, but capability \
+                matching for `rate(...)` requests Statistic::Rate, which today \
+                only lists Increase/MultipleIncrease."]
+    fn production_conditions_rate_against_cms_does_not_error() {
+        init_tracing_for_test();
+        let mut cms = CountMinSketch::new(4, 4096);
+        for i in 0..100u32 {
+            cms.update(&format!("endpoint-{i}"), 1.0);
+        }
+        let acc = CountMinSketchAccumulator { inner: cms };
+
+        let engine = build_engine_production_conditions(
+            "endpoint_request_freq",
+            AggregationType::CountMinSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+        );
+
+        let query = "rate(endpoint_request_freq[5m])";
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        assert!(
+            result.is_some(),
+            "production warm engine must answer `rate(<CMS-metric>[5m])` under empty \
+             PromQLSchema; got None → wire status=error",
         );
     }
 
