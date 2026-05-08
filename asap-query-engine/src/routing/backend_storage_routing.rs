@@ -307,6 +307,11 @@ struct RouteYaml {
 /// [`BackendStorageRouting`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct BackendStorageRoutingYaml {
+    /// Tenant id this routing table services. Optional; defaults to
+    /// [`DEFAULT_TENANT`] for single-tenant deployments / existing
+    /// YAMLs that predate the per-tenant routing field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
     /// Fallback storage backend for any metric not explicitly listed.
     /// Optional; defaults to `SketchWarmTier`.
     #[serde(default)]
@@ -362,11 +367,38 @@ impl RoutingTarget {
     }
 }
 
+/// Tenant id used when the deploy is single-tenant (no `X-ASAP-Tenant`
+/// header on the request and no explicit `tenant` field on the
+/// controller-emitted JSON). Multi-tenant deployments thread an
+/// explicit non-`default` id through both surfaces.
+pub const DEFAULT_TENANT: &str = "default";
+
 /// In-memory routing table consulted by the HTTP handler at request
 /// time. Build via [`Self::from_yaml_file`] / [`Self::from_yaml_str`]
 /// or [`Self::empty`] (everything routes to `SketchWarmTier`).
+///
+/// ## Tenant scope (per-tenant routing, follow-up to PR #333)
+///
+/// Each `BackendStorageRouting` is scoped to a single tenant —
+/// identified by the [`Self::tenant`] field. The table services
+/// requests carrying `X-ASAP-Tenant: <tenant>` (default
+/// [`DEFAULT_TENANT`] when the header is missing). Multi-tenant
+/// deployments hold a `tenant → BackendStorageRouting` map in
+/// [`HotReloadBackendStorageRouting`] and look up per-tenant tables
+/// at request time, falling back to the [`DEFAULT_TENANT`] table when
+/// the request's tenant has no entry.
+///
+/// **MVP scope:** the `tenant` field is unauthenticated — anyone can
+/// pick any tenant by setting the header. Tenant-aware AUTH is
+/// out-of-scope for this MVP and will be added before any
+/// multi-tenant deploy is considered production-ready. Sketch state
+/// is still global; only the routing table is tenant-scoped.
 #[derive(Debug, Clone)]
 pub struct BackendStorageRouting {
+    /// Tenant id this routing table services. Defaults to
+    /// [`DEFAULT_TENANT`] for single-tenant deployments and existing
+    /// call sites that never specify a tenant.
+    tenant: String,
     default: StorageBackend,
     /// For each metric, the ordered list of targets the HTTP handler
     /// walks to pick a backend. v6.1 single-target rows come in as a
@@ -378,17 +410,49 @@ impl BackendStorageRouting {
     /// Build an empty router — every metric resolves to
     /// `SketchWarmTier`. Equivalent to "no routing config at all" and
     /// preserves pre-Phase-5 dispatch (`SimpleEngine` direct path).
+    /// Scoped to the [`DEFAULT_TENANT`] tenant.
     pub fn empty() -> Self {
         Self {
+            tenant: DEFAULT_TENANT.to_string(),
+            default: StorageBackend::default(),
+            metrics: HashMap::new(),
+        }
+    }
+
+    /// Build an empty router scoped to a specific tenant. Used by
+    /// per-tenant hot-reload to bootstrap a tenant slot before its
+    /// first push lands.
+    pub fn empty_for_tenant(tenant: impl Into<String>) -> Self {
+        Self {
+            tenant: tenant.into(),
             default: StorageBackend::default(),
             metrics: HashMap::new(),
         }
     }
 
     /// Construct directly from an explicit map. Used by tests; production
-    /// callers go through [`Self::from_yaml_file`].
+    /// callers go through [`Self::from_yaml_file`]. Scoped to the
+    /// [`DEFAULT_TENANT`] tenant — use [`Self::with_tenant`] to
+    /// re-scope.
     pub fn new(default: StorageBackend, metrics: HashMap<String, Vec<RoutingTarget>>) -> Self {
-        Self { default, metrics }
+        Self {
+            tenant: DEFAULT_TENANT.to_string(),
+            default,
+            metrics,
+        }
+    }
+
+    /// Return a copy of this routing table re-scoped to `tenant`.
+    /// Used by tests / per-tenant hot-reload to retag a table built
+    /// from a tenant-agnostic JSON / YAML payload.
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
+    }
+
+    /// Read-only view of the tenant id this routing table services.
+    pub fn tenant(&self) -> &str {
+        &self.tenant
     }
 
     /// Construct from the v6.1 single-target map shape. Each entry
@@ -403,7 +467,11 @@ impl BackendStorageRouting {
             .into_iter()
             .map(|(k, v)| (k, vec![RoutingTarget::always(v)]))
             .collect();
-        Self { default, metrics }
+        Self {
+            tenant: DEFAULT_TENANT.to_string(),
+            default,
+            metrics,
+        }
     }
 
     /// Parse YAML text. See module docs for the schema.
@@ -439,6 +507,7 @@ impl BackendStorageRouting {
         }
 
         Ok(Self {
+            tenant: parsed.tenant.unwrap_or_else(|| DEFAULT_TENANT.to_string()),
             default: parsed.default,
             metrics,
         })
@@ -498,6 +567,11 @@ impl BackendStorageRouting {
     /// for operator inspection are ignored — the JSON parser pulls only
     /// `default_engine` and `metrics:[...]`.
     pub fn from_json_payload(value: &JsonValue) -> Result<Self> {
+        let tenant = value
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let default_engine = value
             .get("default_engine")
             .and_then(|v| v.as_str())
@@ -575,7 +649,11 @@ impl BackendStorageRouting {
             metrics.insert(name, targets);
         }
 
-        Ok(Self { default, metrics })
+        Ok(Self {
+            tenant,
+            default,
+            metrics,
+        })
     }
 
     /// Atomically replace this routing table's contents with `new_table`.
@@ -841,79 +919,198 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 // Phase α: HotReloadBackendStorageRouting — atomic-swap wrapper
 // ---------------------------------------------------------------------------
 
-/// Atomic-swap wrapper around `BackendStorageRouting`, mirroring
-/// [`crate::data_model::HotReloadStreamingConfig`]. Lets the
-/// `POST /api/v1/storage_routing` HTTP handler swap the table at
-/// runtime without restarting the backend. Cloneable; clones share the
-/// underlying `ArcSwap` so all holders see the same swaps.
+/// Per-tenant atomic-swap wrapper around `BackendStorageRouting`,
+/// mirroring [`crate::data_model::HotReloadStreamingConfig`]. Lets the
+/// `POST /api/v1/storage_routing` HTTP handler swap one tenant's table
+/// at runtime without restarting the backend or touching any other
+/// tenant's table. Cloneable; clones share the underlying `ArcSwap` so
+/// all holders see the same swaps.
+///
+/// ## Multi-tenant model
+///
+/// Internally holds a `HashMap<tenant_id, Arc<BackendStorageRouting>>`
+/// behind a single `ArcSwap`. The HTTP layer reads the
+/// `X-ASAP-Tenant` header off each request (default
+/// [`DEFAULT_TENANT`]) and snapshots that tenant's table; the request
+/// path falls back to the [`DEFAULT_TENANT`] table when the requested
+/// tenant has no entry. Per-tenant push is a copy-on-write swap — the
+/// writer clones the current map, replaces only the named tenant's
+/// entry, and CASes the new map in. Other tenants' tables are
+/// unaffected.
 ///
 /// ## Read path
 ///
-/// HTTP query handler calls [`Self::snapshot`] once per request to get
-/// a stable `Arc<BackendStorageRouting>` it can call
-/// `lookup_with_shape` on. The snapshot is cheap (single atomic load)
-/// and lock-free; concurrent swaps don't block readers.
+/// HTTP query handler calls [`Self::snapshot_for_tenant`] once per
+/// request with the tenant id from the header. Returns a stable
+/// `Arc<BackendStorageRouting>` the handler can call
+/// `lookup_with_shape` on. The snapshot is cheap (single atomic load
+/// + map clone of the relevant `Arc`) and lock-free; concurrent swaps
+/// don't block readers.
 ///
 /// ## Write path
 ///
-/// The swap handler calls [`Self::swap`] with the new table parsed from
-/// the controller's JSON. The previous `Arc` is dropped when the last
-/// in-flight reader goes out of scope.
+/// The swap handler calls [`Self::swap_tenant`] with the tenant id
+/// and the new table parsed from the controller's JSON. The previous
+/// `Arc` is dropped when the last in-flight reader goes out of scope.
 ///
 /// ## Bootstrap
 ///
 /// Built at backend startup from either:
-/// * `Self::from_yaml_file(path)` — load the static
+/// * `Self::from_arc(initial)` — install a single-tenant
+///   `DEFAULT_TENANT` table loaded from
 ///   `deploy/configs/backend-storage-routing.yaml` (legacy
 ///   bootstrap; preserved for dev / standalone deployments).
 /// * `Self::empty()` — start with an empty table; the controller's
 ///   first push fills it.
 #[derive(Clone)]
 pub struct HotReloadBackendStorageRouting {
-    inner: std::sync::Arc<arc_swap::ArcSwap<BackendStorageRouting>>,
+    /// Map keyed by tenant id. Wrapped in `Arc<HashMap>` so swaps can
+    /// publish a fresh map atomically; readers snapshot the whole map
+    /// once and pick the tenant's `Arc<BackendStorageRouting>`.
+    inner: std::sync::Arc<
+        arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>,
+    >,
 }
 
 impl HotReloadBackendStorageRouting {
-    /// Construct with an initial routing table.
+    /// Construct with a single-tenant initial routing table. The
+    /// table's `tenant` field decides the map key; existing
+    /// single-tenant call sites that pass a `BackendStorageRouting`
+    /// built from `empty()` / `from_yaml_*` get
+    /// [`DEFAULT_TENANT`] semantics for free.
     pub fn new(initial: BackendStorageRouting) -> Self {
+        let mut map: HashMap<String, std::sync::Arc<BackendStorageRouting>> = HashMap::new();
+        map.insert(initial.tenant.clone(), std::sync::Arc::new(initial));
         Self {
-            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(initial))),
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(map))),
         }
     }
 
-    /// Construct with an empty table — every metric resolves to
-    /// `SketchWarmTier` until the first push lands.
+    /// Construct with an empty table — every tenant resolves to a
+    /// freshly-allocated empty `BackendStorageRouting` until the
+    /// first push lands. Specifically, the [`DEFAULT_TENANT`]
+    /// entry is pre-populated with an empty table so single-tenant
+    /// deploys never see a "tenant unknown" miss before the first
+    /// controller push.
     pub fn empty() -> Self {
         Self::new(BackendStorageRouting::empty())
     }
 
     /// Construct from a pre-built `Arc<BackendStorageRouting>` —
     /// avoids a redundant clone when the caller already holds one.
+    /// The resulting wrapper has exactly one tenant entry, keyed by
+    /// the table's [`BackendStorageRouting::tenant`] field.
     pub fn from_arc(initial: std::sync::Arc<BackendStorageRouting>) -> Self {
+        let mut map: HashMap<String, std::sync::Arc<BackendStorageRouting>> = HashMap::new();
+        map.insert(initial.tenant.clone(), initial);
         Self {
-            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(initial)),
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(map))),
         }
     }
 
-    /// Cheap, cloneable snapshot of the current table. Stable for the
+    /// Cheap, cloneable snapshot of the [`DEFAULT_TENANT`] tenant's
+    /// table — the single-tenant convenience accessor. Stable for the
     /// caller's lifetime; concurrent swaps don't invalidate it.
+    /// Returns an empty default-tenant table when no entry exists
+    /// (preserves the original `snapshot()` contract for callers
+    /// that haven't been threaded with a tenant id yet).
     pub fn snapshot(&self) -> std::sync::Arc<BackendStorageRouting> {
-        self.inner.load_full()
+        self.snapshot_for_tenant(DEFAULT_TENANT)
     }
 
-    /// Atomically replace the current table. Returns the `Arc` that
-    /// was just replaced for callers that want to log the diff.
-    pub fn swap(&self, new: BackendStorageRouting) -> std::sync::Arc<BackendStorageRouting> {
-        self.inner.swap(std::sync::Arc::new(new))
+    /// Cheap, cloneable snapshot of the named tenant's routing table.
+    /// Falls back to the [`DEFAULT_TENANT`] table when the named
+    /// tenant has no entry; falls back to a freshly-allocated empty
+    /// table when even the default tenant is missing. Stable for the
+    /// caller's lifetime; concurrent swaps don't invalidate it.
+    pub fn snapshot_for_tenant(&self, tenant: &str) -> std::sync::Arc<BackendStorageRouting> {
+        let map = self.inner.load_full();
+        if let Some(t) = map.get(tenant) {
+            return t.clone();
+        }
+        if let Some(t) = map.get(DEFAULT_TENANT) {
+            debug!(
+                requested = tenant,
+                "backend-storage-routing: tenant not found, falling back to default tenant",
+            );
+            return t.clone();
+        }
+        debug!(
+            requested = tenant,
+            "backend-storage-routing: tenant not found and no default tenant entry; \
+             returning fresh empty table",
+        );
+        std::sync::Arc::new(BackendStorageRouting::empty())
+    }
+
+    /// Atomically replace the [`DEFAULT_TENANT`] tenant's table —
+    /// the single-tenant convenience accessor. Returns the `Arc`
+    /// that was just replaced (or `None` when no prior entry
+    /// existed) for callers that want to log the diff.
+    pub fn swap(
+        &self,
+        new: BackendStorageRouting,
+    ) -> std::sync::Arc<BackendStorageRouting> {
+        // Preserve the original return type (always returns the
+        // previous Arc, fabricating an empty one when none existed)
+        // so callers depending on the old contract don't break.
+        let tenant = new.tenant.clone();
+        match self.swap_tenant(&tenant, new) {
+            Some(prev) => prev,
+            None => std::sync::Arc::new(BackendStorageRouting::empty_for_tenant(tenant)),
+        }
+    }
+
+    /// Atomically replace only the named tenant's table, leaving
+    /// every other tenant's table unchanged. Returns the previous
+    /// `Arc` for that tenant (or `None` if the tenant had no prior
+    /// entry). The new table's `tenant` field is overwritten with
+    /// the `tenant` argument so the map key and table-internal
+    /// tenant id are guaranteed to agree.
+    pub fn swap_tenant(
+        &self,
+        tenant: &str,
+        mut new: BackendStorageRouting,
+    ) -> Option<std::sync::Arc<BackendStorageRouting>> {
+        new.tenant = tenant.to_string();
+        let new_arc = std::sync::Arc::new(new);
+        // CAS-loop over the ArcSwap so concurrent per-tenant pushes
+        // for *different* tenants don't lose updates.
+        loop {
+            let cur = self.inner.load_full();
+            let mut next: HashMap<String, std::sync::Arc<BackendStorageRouting>> =
+                (*cur).clone();
+            let prev = next.insert(tenant.to_string(), new_arc.clone());
+            let next_arc = std::sync::Arc::new(next);
+            // `compare_and_swap` returns the value that was actually
+            // stored before the attempt — equality with `cur`
+            // (Arc-pointer-eq) means our swap won.
+            let observed = self.inner.compare_and_swap(&cur, next_arc);
+            if std::sync::Arc::ptr_eq(&observed, &cur) {
+                return prev;
+            }
+            // Another writer beat us; retry with the new map.
+        }
+    }
+
+    /// Read-only iterator over all tenant ids currently registered
+    /// in the wrapper. Used by operator diagnostics / tests; the
+    /// HTTP read-path does not iterate.
+    pub fn tenant_ids(&self) -> Vec<String> {
+        let map = self.inner.load_full();
+        let mut ids: Vec<String> = map.keys().cloned().collect();
+        ids.sort();
+        ids
     }
 }
 
 impl std::fmt::Debug for HotReloadBackendStorageRouting {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let snap = self.snapshot();
+        let map = self.inner.load_full();
+        let total_entries: usize = map.values().map(|t| t.metrics.len()).sum();
         f.debug_struct("HotReloadBackendStorageRouting")
-            .field("entries", &snap.metrics.len())
-            .field("default", &snap.default)
+            .field("tenants", &map.len())
+            .field("total_entries", &total_entries)
             .finish()
     }
 }
@@ -1495,5 +1692,187 @@ routes:
     fn classifies_absent_correctly() {
         let e = parse("absent(http_requests_total{job=\"x\"})");
         assert_eq!(classify_query_shape(&e), QueryShape::Absent);
+    }
+
+    // ── Per-tenant routing tests (follow-up to PR #333) ───────────────
+
+    #[test]
+    fn empty_routing_carries_default_tenant() {
+        let r = BackendStorageRouting::empty();
+        assert_eq!(r.tenant(), DEFAULT_TENANT);
+    }
+
+    #[test]
+    fn json_payload_tenant_field_is_optional_and_defaults_to_default() {
+        // A JSON without a `tenant` field — the existing single-tenant
+        // controller emit shape — must parse cleanly and resolve to
+        // the [`DEFAULT_TENANT`] tenant.
+        let r = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        assert_eq!(r.tenant(), DEFAULT_TENANT);
+    }
+
+    #[test]
+    fn json_payload_tenant_field_is_picked_up_when_present() {
+        let value = serde_json::json!({
+            "tenant": "tenant-a",
+            "default_engine": "sketch_warm_tier",
+            "metrics": [
+                { "name": "http_requests_total",
+                  "targets": [{ "engine": "sketch_warm_tier" }] }
+            ]
+        });
+        let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
+        assert_eq!(r.tenant(), "tenant-a");
+    }
+
+    #[test]
+    fn yaml_tenant_field_is_optional_and_defaults_to_default() {
+        // Existing YAMLs in the wild don't have `tenant:` — they
+        // must keep parsing and resolve to [`DEFAULT_TENANT`].
+        let yaml = r#"
+default: sketch_warm_tier
+metrics:
+  http_requests_total: gorilla_s3_archive
+"#;
+        let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
+        assert_eq!(r.tenant(), DEFAULT_TENANT);
+    }
+
+    #[test]
+    fn yaml_tenant_field_is_picked_up_when_present() {
+        let yaml = r#"
+tenant: tenant-b
+default: sketch_warm_tier
+metrics:
+  http_requests_total: gorilla_s3_archive
+"#;
+        let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
+        assert_eq!(r.tenant(), "tenant-b");
+    }
+
+    #[test]
+    fn hot_reload_swap_tenant_replaces_only_one_tenant() {
+        // Bootstrap with two tenants. swap_tenant("tenant-a") must
+        // leave tenant-b intact.
+        let hr = HotReloadBackendStorageRouting::empty();
+        // Push tenant-a's table.
+        let table_a = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "metric_a".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        hr.swap_tenant("tenant-a", table_a);
+        // Push tenant-b's table.
+        let table_b = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "metric_b".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        hr.swap_tenant("tenant-b", table_b);
+
+        // Replace tenant-a only.
+        let table_a_v2 = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "metric_a_v2".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        hr.swap_tenant("tenant-a", table_a_v2);
+
+        // tenant-a now reflects v2; tenant-b is unchanged.
+        let snap_a = hr.snapshot_for_tenant("tenant-a");
+        assert_eq!(snap_a.lookup("metric_a"), StorageBackend::SketchWarmTier);
+        assert_eq!(snap_a.lookup("metric_a_v2"), StorageBackend::GorillaS3Archive);
+        let snap_b = hr.snapshot_for_tenant("tenant-b");
+        assert_eq!(snap_b.lookup("metric_b"), StorageBackend::GorillaS3Archive);
+        assert_eq!(snap_b.lookup("metric_a_v2"), StorageBackend::SketchWarmTier);
+    }
+
+    #[test]
+    fn hot_reload_unknown_tenant_falls_back_to_default_tenant() {
+        // When a request asks for a tenant that has no entry, we
+        // fall back to the [`DEFAULT_TENANT`] table.
+        let hr = HotReloadBackendStorageRouting::empty();
+        // Default tenant has an explicit override.
+        let default_table = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "shared_metric".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        hr.swap_tenant(DEFAULT_TENANT, default_table);
+
+        // Unknown tenant: fallback to default's table.
+        let snap = hr.snapshot_for_tenant("nonexistent-tenant");
+        assert_eq!(
+            snap.lookup("shared_metric"),
+            StorageBackend::GorillaS3Archive,
+        );
+        // Default tenant: same answer.
+        let snap_default = hr.snapshot_for_tenant(DEFAULT_TENANT);
+        assert_eq!(
+            snap_default.lookup("shared_metric"),
+            StorageBackend::GorillaS3Archive,
+        );
+    }
+
+    #[test]
+    fn hot_reload_swap_tenant_overwrites_table_internal_tenant_id() {
+        // swap_tenant("X", table) must overwrite table.tenant = "X"
+        // even when the table was built with a different tenant id —
+        // the map key is the source of truth.
+        let hr = HotReloadBackendStorageRouting::empty();
+        let mut table = BackendStorageRouting::new_from_single_targets(
+            StorageBackend::SketchWarmTier,
+            HashMap::from([(
+                "m".to_string(),
+                StorageBackend::GorillaS3Archive,
+            )]),
+        );
+        table = table.with_tenant("WRONG-TENANT");
+        hr.swap_tenant("right-tenant", table);
+        let snap = hr.snapshot_for_tenant("right-tenant");
+        assert_eq!(snap.tenant(), "right-tenant");
+    }
+
+    #[test]
+    fn hot_reload_tenant_ids_lists_all_registered_tenants() {
+        let hr = HotReloadBackendStorageRouting::empty();
+        // Bootstrap (default tenant only).
+        assert_eq!(hr.tenant_ids(), vec![DEFAULT_TENANT.to_string()]);
+
+        let table = BackendStorageRouting::empty();
+        hr.swap_tenant("tenant-a", table.clone());
+        hr.swap_tenant("tenant-b", table);
+
+        let mut ids = hr.tenant_ids();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec![
+                DEFAULT_TENANT.to_string(),
+                "tenant-a".to_string(),
+                "tenant-b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn hot_reload_legacy_swap_routes_to_default_tenant() {
+        // The original `swap()` API (no tenant arg) replaces the
+        // [`DEFAULT_TENANT`] table — preserved so existing callers
+        // (and the existing test suite below) keep working.
+        let hr = HotReloadBackendStorageRouting::empty();
+        let new = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
+        hr.swap(new);
+
+        let snap = hr.snapshot_for_tenant(DEFAULT_TENANT);
+        assert_eq!(snap.len(), 2);
     }
 }

@@ -27,7 +27,7 @@ pub mod engine_router;
 
 pub use backend_storage_routing::{
     classify_query_shape, routing_table_hash, BackendStorageRouting,
-    HotReloadBackendStorageRouting, QueryShape, RoutingTarget,
+    HotReloadBackendStorageRouting, QueryShape, RoutingTarget, DEFAULT_TENANT,
 };
 pub use engine_router::{
     EngineCapabilities, EngineRouter, EngineRouterError, QueryEngine,
