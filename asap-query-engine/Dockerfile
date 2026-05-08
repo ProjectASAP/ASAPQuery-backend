@@ -24,7 +24,6 @@ COPY asap-query-engine/Cargo.toml ./asap-query-engine/
 # All explicit [[bin]] targets in Cargo.toml must have stubs here for the dependency cache layer
 RUN mkdir -p asap-query-engine/src/bin \
     && echo "fn main() {}" > asap-query-engine/src/main.rs \
-    && echo "fn main() {}" > asap-query-engine/src/bin/precompute_engine.rs \
     && echo "fn main() {}" > asap-query-engine/src/bin/test_e2e_precompute.rs \
     && echo "fn main() {}" > asap-query-engine/src/bin/bench_precompute_sketch.rs \
     && echo "fn main() {}" > asap-query-engine/src/bin/e2e_quickstart_resource_test.rs \

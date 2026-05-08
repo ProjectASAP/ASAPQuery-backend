@@ -72,8 +72,11 @@ ASAPQuery-backend/
 ├── asap-query-engine/        # The backend (this is the binary)
 │   └── src/
 │       ├── main.rs              # Entrypoint; wires engines and routing
-│       ├── bin/
-│       │   └── precompute_engine.rs   # Production binary (Docker entry)
+│       │                        # (also the Docker production entry —
+│       │                        # see deploy/docker/Dockerfile.backend
+│       │                        # in ASAPCollector)
+│       ├── bin/                 # auxiliary binaries (offline tests,
+│       │                        # logical-plan dumper)
 │       ├── engines/
 │       │   ├── simple/                # warm tier — SimpleEngine
 │       │   │                          # (33 PromQL pattern matchers)

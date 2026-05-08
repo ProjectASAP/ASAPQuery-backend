@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use query_engine_rust::data_model::enums::{InputFormat, LockStrategy, StreamingEngine};
+use query_engine_rust::data_model::enums::{CleanupPolicy, InputFormat, LockStrategy, StreamingEngine};
+use query_engine_rust::data_model::InferenceConfig;
 use query_engine_rust::drivers::AdapterConfig;
 use query_engine_rust::precompute_engine::config::LateDataPolicy;
 use query_engine_rust::precompute_engine::PrecomputeWorkerDiagnostics;
@@ -35,25 +36,49 @@ struct Args {
     #[arg(long, value_enum)]
     input_format: Option<InputFormat>,
 
-    /// Configuration file path
-    #[arg(long)]
-    config: String,
+    /// Path to the inference config YAML — maps query patterns to
+    /// aggregation IDs so the query engine can pick the right
+    /// stored sketch for an incoming PromQL. Both spellings are
+    /// accepted; `--inference-config` is the canonical name kept
+    /// from the legacy `precompute_engine` binary's flag set, so
+    /// the existing compose / docker-compose `command:` blocks
+    /// continue to work after the binary unification (see
+    /// PR aligning the deployed-binary flag set).
+    #[arg(long, alias = "inference-config")]
+    config: Option<String>,
 
     /// File path for streaming_config
     #[arg(long)]
     streaming_config: String,
 
-    /// Streaming engine to use
-    #[arg(long, value_enum, default_value = "arroyo")]
+    /// Streaming engine to use. Default `precompute` matches the
+    /// formerly-deployed `precompute_engine` binary's behavior;
+    /// override to `arroyo` (Kafka consumer) only when needed.
+    #[arg(long, value_enum, default_value = "precompute")]
     streaming_engine: StreamingEngine,
 
-    /// Prometheus scrape interval in seconds
-    #[arg(long)]
+    /// Prometheus scrape interval (seconds). Default 30 matches
+    /// the e2e harness's 30s window. SimpleEngine uses this as the
+    /// instant-query lookback window — for tumbling-window
+    /// aggregations it must be ≥ the window size in
+    /// `streaming-config`.
+    #[arg(long, default_value = "30")]
     prometheus_scrape_interval: u64,
 
-    /// HTTP server port
-    #[arg(long, default_value = "8088")]
+    /// HTTP server port for the PromQL-compatible query surface.
+    /// `--query-port` is accepted as an alias for compatibility with
+    /// the legacy `precompute_engine` binary's flag (whose default
+    /// was 8080). Compose stacks pass `--query-port=9091`.
+    #[arg(long, alias = "query-port", default_value = "8088")]
     http_port: u16,
+
+    /// Deprecated/no-op: the backend's only HTTP listener is the
+    /// PromQL query surface (`--http-port` / `--query-port`). The
+    /// old PRW ingest port was deleted in PR #100; this flag is
+    /// accepted for compose backwards compatibility (some overlays
+    /// still pass `--ingest-port=9090`) and silently ignored.
+    #[arg(long, hide = true)]
+    ingest_port: Option<u16>,
 
     /// Prometheus server URL
     #[arg(long, default_value = "http://localhost:9090")]
@@ -94,7 +119,7 @@ struct Args {
     delete_existing_db: bool,
 
     /// Output directory for logs
-    #[arg(long)]
+    #[arg(long, default_value = "/var/log/asap")]
     output_dir: String,
 
     /// Log level
@@ -113,12 +138,14 @@ struct Args {
     #[arg(long)]
     dump_precomputes: bool,
 
-    /// Differentiate between query languages of input query
-    #[arg(long, value_enum)]
+    /// Differentiate between query languages of input query.
+    /// Default `promql` matches every production deploy.
+    #[arg(long, value_enum, default_value = "promql")]
     query_language: QueryLanguage,
 
-    /// Lock strategy for SimpleMapStore: "global" for single mutex, "per-key" for fine-grained locking
-    #[arg(long, value_enum)]
+    /// Lock strategy for SimpleMapStore: "global" for single mutex,
+    /// "per-key" for fine-grained locking. Default `per-key`.
+    #[arg(long, value_enum, default_value = "per-key")]
     lock_strategy: LockStrategy,
 
     /// Path to promsketch configuration YAML file (optional; uses defaults if omitted)
@@ -141,8 +168,11 @@ struct Args {
     #[arg(long, default_value = "4")]
     precompute_num_workers: usize,
 
-    /// Maximum allowed lateness for out-of-order samples (milliseconds)
-    #[arg(long, default_value = "5000")]
+    /// Maximum allowed lateness for out-of-order samples
+    /// (milliseconds). `--allowed-lateness-ms` is accepted as an
+    /// alias for compatibility with the legacy `precompute_engine`
+    /// binary's flag spelling.
+    #[arg(long, alias = "allowed-lateness-ms", default_value = "5000")]
     precompute_allowed_lateness_ms: i64,
 
     /// Maximum buffered samples per series before eviction
@@ -272,15 +302,44 @@ async fn main() -> Result<()> {
     let _log_guard = setup_logging(&args.output_dir, &args.log_level)?;
 
     info!("Starting Query Engine Rust");
-    info!("Config file: {}", args.config);
+    info!("Config file: {:?}", args.config);
     info!("Output directory: {}", args.output_dir);
 
-    // Read config (equivalent to utils.file_io.read_inference_config)
-    let inference_config = read_inference_config(&args.config, args.query_language)?;
-    info!(
-        "Loaded inference config with {} query configs",
-        inference_config.query_configs.len()
-    );
+    if let Some(ingest_port) = args.ingest_port {
+        warn!(
+            "--ingest-port={ingest_port} is deprecated and ignored: the backend's only HTTP \
+             listener is the PromQL query surface (PRW ingest was removed in PR #100). \
+             Drop the flag from your compose `command:` block."
+        );
+    }
+
+    // Read config (equivalent to utils.file_io.read_inference_config).
+    // When `--config` / `--inference-config` is omitted (the
+    // default-deploy compose case — `base.yml` only passes
+    // `--streaming-config`), build an empty `InferenceConfig` so
+    // the engine starts with no query-pattern table. This matches
+    // the legacy `precompute_engine` binary's behavior; queries
+    // that don't match a pattern fall through to the Prometheus
+    // fallback when `--forward-unsupported-queries` is set.
+    let inference_config = match args.config.as_deref() {
+        Some(path) => {
+            let cfg = read_inference_config(path, args.query_language)?;
+            info!(
+                "Loaded inference config from {} with {} query configs",
+                path,
+                cfg.query_configs.len()
+            );
+            cfg
+        }
+        None => {
+            info!(
+                "--config / --inference-config not set — starting with empty InferenceConfig \
+                 (queries with no matching pattern fall through to the Prometheus fallback when \
+                 --forward-unsupported-queries is set)"
+            );
+            InferenceConfig::new(args.query_language, CleanupPolicy::CircularBuffer)
+        }
+    };
     info!("Inference config: {:?}", inference_config);
 
     let streaming_config = Arc::new(read_streaming_config(
