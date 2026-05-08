@@ -41,6 +41,36 @@ use promql_utilities::query_logics::enums::Statistic;
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
 
+/// Per-request tenant header (per-tenant `BackendStorageRouting`,
+/// follow-up to PR #333).
+///
+/// Multi-tenant deployments scope the per-metric routing table per
+/// tenant. The HTTP query handler reads this header on every
+/// request, snapshots that tenant's table off
+/// `HotReloadBackendStorageRouting`, and falls back to the
+/// `default` tenant's table when the header is missing or the
+/// requested tenant has no entry. Sketch state is still global —
+/// only routing is tenant-scoped.
+///
+/// **MVP scope:** the header is unauthenticated. Anyone can pick any
+/// tenant by setting it. Tenant-aware AUTH is deferred to a follow-up
+/// before any multi-tenant deploy is considered production-ready.
+pub const TENANT_HEADER: &str = "X-ASAP-Tenant";
+
+/// Extract the tenant id from the per-request `X-ASAP-Tenant`
+/// header, or fall back to [`crate::routing::DEFAULT_TENANT`] when
+/// the header is missing / empty / not valid UTF-8. Used by the
+/// instant-query and range-query handlers to scope per-tenant
+/// routing-table lookup.
+fn extract_tenant(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(TENANT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::routing::DEFAULT_TENANT.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
     pub port: u16,
@@ -461,6 +491,7 @@ async fn process_query_request(
     start_time: Instant,
     headers: HashMap<String, String>,
     engine_override: Option<String>,
+    tenant: &str,
 ) -> Response {
     // Check if handling is enabled
     if !state.config.handle_http_requests {
@@ -533,10 +564,11 @@ async fn process_query_request(
     // empty labels, so dropping `KeyByLabelNames` is acceptable; the
     // response carries `accuracy` + `data_source` via the
     // wire-extension annotations.
-    let metric_storage = resolve_metric_storage(state, &parsed_request.query);
+    let metric_storage = resolve_metric_storage(state, &parsed_request.query, tenant);
     debug!(
-        "Dispatch axis: metric_storage={:?} (from backend-storage-routing: {}, hot-reload: {})",
+        "Dispatch axis: metric_storage={:?} tenant={} (from backend-storage-routing: {}, hot-reload: {})",
         metric_storage,
+        tenant,
         state.backend_storage_routing.is_some(),
         state.hot_reload_config.is_some(),
     );
@@ -568,21 +600,24 @@ async fn process_query_request(
 /// the target whose `applies_to_query_shape` matches. v6.1
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
-fn resolve_metric_storage(state: &AppState, query: &str) -> StorageBackend {
+fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> StorageBackend {
     if let Some(routing_handle) = state.backend_storage_routing.as_ref() {
-        // Phase α: snapshot the hot-reload handle once per request.
-        // Concurrent swaps from `POST /api/v1/storage_routing` produce
-        // a fresh `Arc`; this snapshot remains valid for the rest of
-        // the dispatch (no torn read).
-        let routing = routing_handle.snapshot();
+        // Phase α: snapshot the hot-reload handle once per request,
+        // scoped to this request's tenant. The snapshot resolves to
+        // the named tenant's table when present, else the
+        // `default` tenant's table. Concurrent per-tenant swaps from
+        // `POST /api/v1/storage_routing` produce a fresh `Arc`; this
+        // snapshot remains valid for the rest of the dispatch (no
+        // torn read).
+        let routing = routing_handle.snapshot_for_tenant(tenant);
         match promql_parser::parser::parse(query) {
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
                     let shape = crate::data_model::classify_query_shape(&expr);
                     let backend = routing.lookup_with_shape(&metric_name, shape);
                     debug!(
-                        "resolve_metric_storage: routing-table hit for metric={} shape={:?} → {:?}",
-                        metric_name, shape, backend,
+                        "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
+                        tenant, metric_name, shape, backend,
                     );
                     return backend;
                 }
@@ -1047,6 +1082,10 @@ async fn handle_instant_query(
     // strips the param out (it doesn't, but reading the source of
     // truth keeps this robust to adapter changes).
     let engine_override = extract_engine_override(&headers, &query_params.0);
+    // Per-tenant `BackendStorageRouting`: read the tenant id from the
+    // `X-ASAP-Tenant` header (default `"default"`). Captured before
+    // `parse_get_request` consumes `query_params`.
+    let tenant = extract_tenant(&headers);
 
     let parsed_request = match state.adapter.parse_get_request(query_params).await {
         Ok(req) => {
@@ -1070,7 +1109,7 @@ async fn handle_instant_query(
     };
 
     let response =
-        process_query_request(&state, &parsed_request, start_time, HashMap::new(), engine_override)
+        process_query_request(&state, &parsed_request, start_time, HashMap::new(), engine_override, &tenant)
             .await;
     srv_metrics::record_query_outcome(
         srv_metrics::QUERY_TYPE_INSTANT,
@@ -1136,6 +1175,11 @@ async fn handle_instant_query_post(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    // Per-tenant `BackendStorageRouting` (POST path): read the
+    // tenant id from the `X-ASAP-Tenant` header (default
+    // `"default"`).
+    let tenant = extract_tenant(&headers);
 
     let parsed_request = if content_type.contains("application/json") {
         // Handle JSON POST (Elasticsearch)
@@ -1233,6 +1277,7 @@ async fn handle_instant_query_post(
         start_time,
         forwarding_headers,
         engine_override,
+        &tenant,
     )
     .await;
 
@@ -3654,6 +3699,131 @@ aggregations:
         assert_eq!(snap_hash, live_hash);
     }
 
+    /// Per-tenant push: a body with `tenant: tenant-a` lands in the
+    /// `tenant-a` slot; the `default` tenant table is unaffected.
+    /// Subsequent GETs with `X-ASAP-Tenant: tenant-a` see the new
+    /// table; GETs with no header (default tenant) see an empty
+    /// table.
+    #[tokio::test]
+    async fn storage_routing_post_per_tenant_isolates_tenants() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+
+        // Push tenant-a's table.
+        let mut tenant_a_body = fixture_routing_json();
+        tenant_a_body["tenant"] = serde_json::json!("tenant-a");
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body(tenant_a_body.to_string())
+            .send()
+            .await
+            .expect("send ok");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["tenant"], "tenant-a");
+        assert_eq!(body["metrics_count"], 1);
+
+        // Default tenant table is unchanged (still empty).
+        let snap_default = handle.snapshot_for_tenant(crate::routing::DEFAULT_TENANT);
+        assert_eq!(snap_default.len(), 0);
+        // Tenant-a table has the new entry.
+        let snap_a = handle.snapshot_for_tenant("tenant-a");
+        assert_eq!(snap_a.len(), 1);
+    }
+
+    /// Per-tenant push via `X-ASAP-Tenant` header (when the body
+    /// leaves `tenant` implicit). The header acts as a fallback
+    /// signal when the controller emits a tenant-agnostic body.
+    #[tokio::test]
+    async fn storage_routing_post_per_tenant_via_header_when_body_implicit() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+
+        // Body has no `tenant` field — controller emit shape today.
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .header("X-ASAP-Tenant", "tenant-b")
+            .body(fixture_routing_json().to_string())
+            .send()
+            .await
+            .expect("send ok");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        // The header steered the swap to tenant-b.
+        assert_eq!(body["tenant"], "tenant-b");
+        let snap_b = handle.snapshot_for_tenant("tenant-b");
+        assert_eq!(snap_b.len(), 1);
+        // Default tenant is still empty.
+        let snap_default = handle.snapshot_for_tenant(crate::routing::DEFAULT_TENANT);
+        assert_eq!(snap_default.len(), 0);
+    }
+
+    /// Per-tenant push when neither the body's `tenant` field nor
+    /// the `X-ASAP-Tenant` header are set: the swap lands in the
+    /// `default` tenant slot — preserves the legacy single-tenant
+    /// contract for existing controllers that haven't been updated
+    /// yet.
+    #[tokio::test]
+    async fn storage_routing_post_no_tenant_falls_back_to_default() {
+        let (port, handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("Content-Type", "application/json")
+            .body(fixture_routing_json().to_string())
+            .send()
+            .await
+            .expect("send ok");
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["tenant"], crate::routing::DEFAULT_TENANT);
+        let snap_default = handle.snapshot_for_tenant(crate::routing::DEFAULT_TENANT);
+        assert_eq!(snap_default.len(), 1);
+    }
+
+    /// GET reports the tenant scope inferred from the request's
+    /// `X-ASAP-Tenant` header. Operators can issue
+    /// `curl -H 'X-ASAP-Tenant: tenant-a' /api/v1/storage_routing`
+    /// to inspect that one tenant's table; the `tenants` field
+    /// always lists every registered tenant for fleet-level
+    /// diagnostics.
+    #[tokio::test]
+    async fn storage_routing_get_per_tenant_lists_all_tenants() {
+        let (port, _handle) = setup_test_server_for_storage_routing().await;
+        let client = Client::new();
+        // Push two tenants.
+        for tenant in ["tenant-a", "tenant-b"] {
+            let mut body = fixture_routing_json();
+            body["tenant"] = serde_json::json!(tenant);
+            let _ = client
+                .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+                .header("Content-Type", "application/json")
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+        }
+        // GET tenant-a's view.
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
+            .header("X-ASAP-Tenant", "tenant-a")
+            .send()
+            .await
+            .expect("send ok");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["tenant"], "tenant-a");
+        assert_eq!(body["metrics_count"], 1);
+        let tenants = body["tenants"].as_array().expect("tenants array");
+        let names: Vec<String> = tenants
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(names.contains(&"tenant-a".to_string()));
+        assert!(names.contains(&"tenant-b".to_string()));
+    }
+
     #[tokio::test]
     async fn storage_routing_swap_observed_by_subsequent_query_dispatch() {
         // End-to-end production-path test: POST a routing table, then
@@ -4157,7 +4327,10 @@ async fn handle_post_streaming_config(
 /// routing-table handle (legacy deploys that loaded the YAML directly
 /// can still hit `/api/v1/streaming-config` — this endpoint is for
 /// the Phase α JSON path).
-async fn handle_get_storage_routing(State(state): State<AppState>) -> axum::response::Response {
+async fn handle_get_storage_routing(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
@@ -4168,12 +4341,20 @@ async fn handle_get_storage_routing(State(state): State<AppState>) -> axum::resp
         });
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
-    let snap = handle.snapshot();
+    // Per-tenant scope: the GET reports the tenant inferred from the
+    // request's `X-ASAP-Tenant` header (default `"default"`). The
+    // `tenants` field lists every tenant id currently registered so
+    // operators can spot-check the multi-tenant map without a
+    // separate endpoint.
+    let tenant = extract_tenant(&headers);
+    let snap = handle.snapshot_for_tenant(&tenant);
     let body = serde_json::json!({
         "status": "success",
+        "tenant": tenant,
         "default_engine": snap.default_backend().data_source_id(),
         "metrics_count": snap.len(),
         "table_hash": crate::routing::routing_table_hash(snap.as_ref()),
+        "tenants": handle.tenant_ids(),
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -4198,6 +4379,7 @@ async fn handle_get_storage_routing(State(state): State<AppState>) -> axum::resp
 /// the existing `POST /api/v1/streaming-config` swap contract.
 async fn handle_post_storage_routing(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
@@ -4242,17 +4424,32 @@ async fn handle_post_storage_routing(
         }
     };
 
+    // Per-tenant push: the new table's tenant id is the source of
+    // truth (the body's `tenant` field, defaulting to `default`).
+    // The `X-ASAP-Tenant` header is honoured as a fallback when the
+    // body left the tenant field implicit — it's the controller's
+    // primary signal for "which tenant am I pushing for".
+    let tenant_from_body = new_table.tenant().to_string();
+    let tenant = if tenant_from_body == crate::routing::DEFAULT_TENANT {
+        // Body left it implicit; honour the header.
+        extract_tenant(&headers)
+    } else {
+        tenant_from_body
+    };
+
     let entries = new_table.len();
     let hash = crate::routing::routing_table_hash(&new_table);
-    let _old = handle.swap(new_table);
+    let _old = handle.swap_tenant(&tenant, new_table);
     info!(
+        tenant = %tenant,
         entries,
         table_hash = %hash,
-        "storage-routing JSON hot-reload swap completed",
+        "storage-routing JSON hot-reload swap completed (per-tenant)",
     );
 
     let body = serde_json::json!({
         "status": "success",
+        "tenant": tenant,
         "metrics_count": entries,
         "table_hash": hash,
     });
