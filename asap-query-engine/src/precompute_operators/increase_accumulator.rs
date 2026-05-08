@@ -293,6 +293,18 @@ impl SingleSubpopulationAggregate for IncreaseAccumulator {
                 let value_diff = self.last_seen_measurement.value - self.starting_measurement.value;
                 Ok(value_diff / time_diff * 1000.0)
             }
+            // For instant `sum [by (...)] (counter_metric)` Prometheus
+            // sums the latest cumulative value of each matching series.
+            // The IncreaseAccumulator already tracks that latest value
+            // in `last_seen_measurement`, so per-series Sum is just
+            // that scalar; the engine's outer aggregation groups by the
+            // `by` labels and adds the per-series totals across keys.
+            //
+            // See PR #108 audit conclusion (commit 4359e10) and issue
+            // ProjectASAP/ASAPCollector#46: pre-fix the warm tier ingested
+            // counters as IncreaseAccumulator and bare `sum by (...) (<counter>)`
+            // capability-missed because this trait did not answer Sum.
+            Statistic::Sum => Ok(self.last_seen_measurement.value),
             _ => Err(format!("Unsupported statistic in IncreaseAccumulator: {statistic:?}").into()),
         }
     }
@@ -404,7 +416,37 @@ mod tests {
             7.5
         ); // 15.0 / 2.0
 
-        assert!(crate::SingleSubpopulationAggregate::query(&acc, Statistic::Sum, None).is_err());
+        // Statistic::Sum returns the latest cumulative counter value,
+        // matching Prometheus semantics for instant `sum(<counter>)`.
+        // (Issue ProjectASAP/ASAPCollector#46, PR #108 diagnosis.)
+        assert_eq!(
+            crate::SingleSubpopulationAggregate::query(&acc, Statistic::Sum, None).unwrap(),
+            25.0
+        );
+
+        // Unsupported statistics still error.
+        assert!(crate::SingleSubpopulationAggregate::query(&acc, Statistic::Min, None).is_err());
+    }
+
+    #[test]
+    fn test_increase_accumulator_sum_is_latest_cumulative_value() {
+        // Instant `sum (<counter>)` semantics: the per-series summand is
+        // the latest cumulative counter value. Two series with latest
+        // values 100 and 50 (started at 10 and 5 respectively) should
+        // each report Sum = 100 and Sum = 50 — the engine's `sum by`
+        // outer aggregation does the cross-series total.
+        let acc_a =
+            IncreaseAccumulator::new(Measurement::new(10.0), 1000, Measurement::new(100.0), 2000);
+        let acc_b =
+            IncreaseAccumulator::new(Measurement::new(5.0), 1000, Measurement::new(50.0), 2000);
+        assert_eq!(
+            crate::SingleSubpopulationAggregate::query(&acc_a, Statistic::Sum, None).unwrap(),
+            100.0
+        );
+        assert_eq!(
+            crate::SingleSubpopulationAggregate::query(&acc_b, Statistic::Sum, None).unwrap(),
+            50.0
+        );
     }
 
     #[test]

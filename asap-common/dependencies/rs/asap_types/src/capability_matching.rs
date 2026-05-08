@@ -131,6 +131,17 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::Sum,
             AggregationType::MultipleSum,
             AggregationType::CountMinSketch,
+            // Counters: warm-tier ingest stores counter metrics
+            // (OTel `Sum` / monotonic=true) as Increase /
+            // MultipleIncrease accumulators, whose `query`
+            // implementation answers `Statistic::Sum` with the
+            // latest cumulative value per series — matching
+            // Prometheus' instant `sum(<counter>)` semantics.
+            // Without these here, `sum by (zone) (http_requests_total)`
+            // capability-misses (issue ProjectASAP/ASAPCollector#46;
+            // diagnosis in PR #108).
+            AggregationType::Increase,
+            AggregationType::MultipleIncrease,
         ],
         // Count: exact via MultipleSum (the planner's canonical pick for
         // Count-Exact uses `MultipleSum` with sub_type="count"); approximate
