@@ -42,6 +42,66 @@ use elastic_dsl_utilities::types::{EsDslQueryPattern, GroupBySpec, MetricAggType
 // Type alias for merged outputs (single aggregate per key after merging)
 type MergedOutputsMap = HashMap<Option<KeyByLabelValues>, Box<dyn AggregateCore>>;
 
+/// Replace every standalone occurrence of the PromQL identifier
+/// `needle` with `replacement` in `haystack`. An occurrence is
+/// "standalone" iff its surrounding characters can't be part of a
+/// PromQL identifier (`[A-Za-z0-9_:]`). Used by the DDSketch
+/// `_quantile` alias resolver so e.g. rewriting `http_latency_ms`
+/// in `quantile_over_time(0.99, http_latency_ms[1m])` doesn't also
+/// touch a hypothetical `http_latency_ms_total` elsewhere in the
+/// query.
+fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    // PromQL identifiers are ASCII; bound the byte-level scan to
+    // ASCII-only `is_ident` predicates and let multi-byte UTF-8
+    // sequences (which can only occur inside string literals or
+    // comments) pass through untouched. The needle bytes are
+    // ASCII-only by construction (callers pass identifiers).
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + needle_bytes.len() <= bytes.len() && &bytes[i..i + needle_bytes.len()] == needle_bytes
+        {
+            let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
+            let next_idx = i + needle_bytes.len();
+            let next_ok = next_idx >= bytes.len() || !is_ident(bytes[next_idx]);
+            if prev_ok && next_ok {
+                out.push_str(replacement);
+                i = next_idx;
+                continue;
+            }
+        }
+        // Advance one UTF-8 char at a time (works for ASCII fast
+        // path AND multi-byte sequences inside e.g. label-value
+        // strings).
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&haystack[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Length of the UTF-8 character starting at `b` (the first byte).
+/// Returns 1 for invalid leading bytes, never panics.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        1 // continuation byte mid-sequence — defensive fallback
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+}
+
 /// Metadata extracted from a query, independent of query language
 #[derive(Debug, Clone)]
 pub struct QueryMetadata {
@@ -446,6 +506,123 @@ impl SimpleEngine {
             .query_configs
             .iter()
             .find(|config| config.query == query)
+    }
+
+    /// Resolve the DDSketch INGEST-side `_quantile` rename for a
+    /// quantile-shape PromQL query.
+    ///
+    /// The agent's DDSketch processor renames raw input metrics to
+    /// the suffixed wire form (`http_latency_ms` →
+    /// `http_latency_ms_quantile`) before emitting to the warm
+    /// tier — so the engine's streaming config and sketch store
+    /// register the suffixed name, but the user's PromQL still
+    /// references the conceptual unsuffixed name. Without
+    /// resolution the warm engine looks up `http_latency_ms`,
+    /// finds nothing, and returns `status=error`.
+    ///
+    /// When the parsed query is shape-classified as `Quantile`
+    /// (`quantile_over_time(...)` or `quantile(...)` aggregation)
+    /// AND the bare metric isn't registered locally but the
+    /// `_quantile`-suffixed variant IS, this returns the rewritten
+    /// query string with the metric replaced. Otherwise returns
+    /// `None` so the caller leaves the query untouched.
+    ///
+    /// Rewrite is performed by string substitution of the metric
+    /// identifier — sufficient for the production query shapes the
+    /// MVP demo replays (`quantile_over_time(q, M[range])` where
+    /// `M` is a bare metric name) and avoids the AST-to-string
+    /// round-trip that the promql-parser library doesn't fully
+    /// support. Fallback: if substitution fails to produce a
+    /// parseable result, returns `None` and the original query
+    /// flows through unchanged.
+    fn resolve_quantile_metric_alias(&self, query: &str) -> Option<String> {
+        // Parse + classify shape; only quantile-shaped queries are
+        // affected by the INGEST rename.
+        let ast = promql_parser::parser::parse(query).ok()?;
+        if !matches!(
+            crate::routing::classify_query_shape(&ast),
+            crate::routing::QueryShape::Quantile
+        ) {
+            return None;
+        }
+
+        // Pull the first metric name from the AST.
+        fn first_metric(expr: &promql_parser::parser::Expr) -> Option<String> {
+            use promql_parser::parser::Expr;
+            match expr {
+                Expr::VectorSelector(vs) => vs.name.clone(),
+                Expr::MatrixSelector(ms) => ms.vs.name.clone(),
+                Expr::Call(call) => call.args.args.iter().find_map(|a| first_metric(a)),
+                Expr::Aggregate(agg) => first_metric(&agg.expr),
+                Expr::Binary(bin) => {
+                    first_metric(&bin.lhs).or_else(|| first_metric(&bin.rhs))
+                }
+                Expr::Subquery(sq) => first_metric(&sq.expr),
+                Expr::Paren(p) => first_metric(&p.expr),
+                Expr::Unary(u) => first_metric(&u.expr),
+                _ => None,
+            }
+        }
+        let metric = first_metric(&ast)?;
+
+        // If already in the suffixed form, nothing to do.
+        if metric.ends_with("_quantile") {
+            return None;
+        }
+        let suffixed = format!("{metric}_quantile");
+
+        // Helper: does a metric name appear as the `metric` field
+        // of any aggregation config in the streaming-config
+        // snapshot? The DDSketch processor's rename is what would
+        // surface the suffixed name in the warm tier's
+        // streaming-config in the first place.
+        let streaming_config = self.streaming_config_snapshot();
+        let metric_known = |name: &str| {
+            streaming_config
+                .aggregation_configs
+                .values()
+                .any(|c| c.metric == name)
+        };
+
+        // Cross-check against the PromQL schema too so a deployment
+        // with a schema-defined-but-aggregation-less metric still
+        // passes through unchanged.
+        let metric_in_schema = |name: &str| match &self.inference_config.schema {
+            SchemaConfig::PromQL(s) => s.get_labels(name).is_some(),
+            _ => false,
+        };
+
+        let bare_present = metric_known(&metric) || metric_in_schema(&metric);
+        let suffixed_present = metric_known(&suffixed) || metric_in_schema(&suffixed);
+
+        if bare_present || !suffixed_present {
+            // Either the bare metric is locally known (no rename
+            // applied for this deployment) or no suffixed variant
+            // exists to redirect to.
+            return None;
+        }
+
+        // Naive but precise substitution: replace `<metric>` only
+        // when surrounded by characters that can't be part of a
+        // PromQL identifier (i.e. not `[A-Za-z0-9_:]`). This
+        // avoids accidentally matching `metric` inside e.g.
+        // `metric_other`.
+        let rewritten = replace_metric_token(query, &metric, &suffixed);
+        // Sanity-check: parses cleanly.
+        if promql_parser::parser::parse(&rewritten).is_err() {
+            warn!(
+                "resolve_quantile_metric_alias: rewrite to '{}' failed to re-parse; \
+                 leaving query untouched",
+                rewritten
+            );
+            return None;
+        }
+        debug!(
+            "resolve_quantile_metric_alias: rewriting '{}' -> '{}' \
+             (DDSketch _quantile ingest rename)",
+            metric, suffixed
+        );
+        Some(rewritten)
     }
 
     /// Finds the query configuration for a SQL query using structural pattern matching.
@@ -2789,6 +2966,38 @@ impl SimpleEngine {
     ) -> Option<(KeyByLabelNames, QueryResult)> {
         let query_start_time = Instant::now();
         debug!("Handling query: {} at time {}", query, time);
+
+        // Resolve the DDSketch-processor INGEST-side `_quantile` rename.
+        //
+        // The agent's DDSketch processor renames raw input metrics
+        // (e.g. `http_latency_ms`) to a sketched-form wire name
+        // (`http_latency_ms_quantile`) before emitting to the warm
+        // tier. The replay client / PromQL caller still references
+        // the conceptual unsuffixed metric in
+        // `quantile_over_time(q, X[range])`, so the warm engine sees
+        // a query for `X` while its sketch store only holds
+        // `X_quantile`. Without this resolution step the store
+        // lookup misses and the engine returns `status=error` to a
+        // query that is logically answerable.
+        //
+        // We rewrite ONLY when:
+        //   * the query's classified shape is `Quantile` (i.e. a
+        //     `quantile_over_time(...)` or PromQL `quantile(...)`
+        //     aggregation — the only shapes whose data lives behind
+        //     the DDSketch / KLL `_quantile` rename), AND
+        //   * the bare metric is NOT registered in the engine's
+        //     streaming config but the `_quantile`-suffixed variant
+        //     IS — so for any deployment that didn't apply the
+        //     INGEST-side rename, the query string passes through
+        //     unchanged.
+        //
+        // The rewrite happens once at the entry point so every
+        // downstream stage (pattern match, `QueryConfig` lookup,
+        // capability matching, `StoreQueryParams.metric`, schema
+        // label lookup) sees the same suffixed name.
+        let query = self
+            .resolve_quantile_metric_alias(&query)
+            .unwrap_or(query);
 
         // Check for binary arithmetic before attempting single-query dispatch.
         // Binary expressions won't have a matching query_config, so we handle them here.

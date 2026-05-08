@@ -403,4 +403,133 @@ mod tests {
             other => panic!("expected instant vector, got {other:?}"),
         }
     }
+
+    // ------------------------------------------------------------------
+    // (4) DDSketch INGEST-side `_quantile` rename — the production bug
+    //     pinned by ProjectASAP/ASAPCollector#46. The agent renames
+    //     `http_latency_ms` → `http_latency_ms_quantile` before warm-tier
+    //     emit, but the replay client queries with the un-suffixed
+    //     conceptual name. This test pins that the warm engine resolves
+    //     the alias and answers the quantile rather than returning
+    //     `status=error`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn quantile_over_time_resolves_unsuffixed_metric_to_quantile_state() {
+        init_tracing_for_test();
+        let acc = dd_sketch_with_1_to_100();
+
+        // Engine + store know the sketched-form name only. The
+        // streaming config's agg has `metric =
+        // "http_latency_ms_quantile"`, mirroring what the
+        // controller emits after the DDSketch processor's INGEST
+        // rename.
+        let engine = build_engine_with_window(
+            "http_latency_ms_quantile",
+            AggregationType::DDSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+            // QueryConfig template carries the suffixed name too —
+            // matches what the controller would emit alongside the
+            // streaming config. The engine is expected to resolve
+            // the un-suffixed form to this template via the alias
+            // rewrite.
+            "quantile_over_time(0.99, http_latency_ms_quantile[1m])",
+        );
+
+        // Replay client queries with the CONCEPTUAL un-suffixed
+        // name — this is the exact failure case from
+        // ProjectASAP/ASAPCollector#46.
+        let query = "quantile_over_time(0.99, http_latency_ms[1m])";
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        let (_labels, qr) = result.expect(
+            "warm engine must resolve un-suffixed `http_latency_ms` to \
+             `http_latency_ms_quantile` and answer the quantile",
+        );
+
+        match qr {
+            QueryResult::Vector(iv) => {
+                assert!(
+                    !iv.values.is_empty(),
+                    "alias-resolved quantile_over_time should produce a value"
+                );
+                let v = iv.values[0].value;
+                assert!(
+                    (v - 99.0).abs() < 5.0,
+                    "expected ~99.0 from DDSketch.quantile(0.99), got {v}"
+                );
+            }
+            other => panic!("expected instant vector, got {other:?}"),
+        }
+    }
+
+    /// Cross-check: a non-quantile-shaped query for a metric whose
+    /// `_quantile` variant happens to exist must NOT be rewritten —
+    /// the alias resolver is shape-gated.
+    #[test]
+    fn non_quantile_query_does_not_rewrite_metric() {
+        init_tracing_for_test();
+        // Seed only the suffixed form so a successful rewrite
+        // would erroneously route the `sum(...)` query at the
+        // DDSketch state. The engine should leave the query
+        // untouched, look up the un-suffixed name, find no agg,
+        // and return None — but critically NOT panic / mis-route
+        // through the alias.
+        let acc = dd_sketch_with_1_to_100();
+        let engine = build_engine_with_window(
+            "lookup_latency_ms_quantile",
+            AggregationType::DDSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+            "quantile_over_time(0.99, lookup_latency_ms_quantile[1m])",
+        );
+
+        // sum_over_time is shape `Sum`, not `Quantile`, so the
+        // alias resolver must leave the metric name alone. The
+        // engine has no agg for `lookup_latency_ms` (no `_quantile`
+        // suffix in its configs), so the result is `None` rather
+        // than a quantile masquerading as a sum.
+        let query = "sum_over_time(lookup_latency_ms[1m])";
+        let result = engine.handle_query_promql(query.to_string(), QUERY_TIME_SEC);
+        assert!(
+            result.is_none(),
+            "non-quantile shape must NOT trigger the _quantile alias rewrite; \
+             got result={result:?}"
+        );
+    }
+
+    /// Sanity: when a deployment registers the bare metric name
+    /// (no DDSketch INGEST rename applied), the alias resolver
+    /// must leave the query unchanged — both forms might coexist
+    /// in tests but the bare form should win when present.
+    #[test]
+    fn quantile_query_without_ingest_rename_passes_through() {
+        init_tracing_for_test();
+        let acc = dd_sketch_with_1_to_100();
+        // Bare metric IS in streaming config — exactly the
+        // pre-rename case from PR #108's existing tests.
+        let engine = build_engine_with_window(
+            "request_latency_ms",
+            AggregationType::DDSketch,
+            vec!["zone"],
+            vec![(Some(vec!["us-east-1".to_string()]), Box::new(acc))],
+            "quantile_over_time(0.99, request_latency_ms[1m])",
+        );
+
+        let query = "quantile_over_time(0.99, request_latency_ms[1m])";
+        let (_labels, qr) = engine
+            .handle_query_promql(query.to_string(), QUERY_TIME_SEC)
+            .expect("bare-metric quantile_over_time should answer normally");
+        match qr {
+            QueryResult::Vector(iv) => {
+                assert!(!iv.values.is_empty(), "expected at least one value");
+                let v = iv.values[0].value;
+                assert!(
+                    (v - 99.0).abs() < 5.0,
+                    "expected ~99.0, got {v} (alias resolver must not have rewritten this)"
+                );
+            }
+            other => panic!("expected instant vector, got {other:?}"),
+        }
+    }
 }
