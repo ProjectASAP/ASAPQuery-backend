@@ -12,3 +12,4 @@ pub mod plan_execution_dual_input_tests;
 pub mod plan_execution_temporal_tests;
 pub mod plan_execution_tests;
 pub mod structural_matching_tests;
+pub mod warm_engine_replay_regression_tests;
