@@ -24,6 +24,7 @@
 
 pub mod backend_storage_routing;
 pub mod engine_router;
+pub mod freshness_probe_cache;
 
 pub use backend_storage_routing::{
     classify_query_shape, routing_table_hash, BackendStorageRouting,
@@ -31,4 +32,7 @@ pub use backend_storage_routing::{
 };
 pub use engine_router::{
     EngineCapabilities, EngineRouter, EngineRouterError, QueryEngine,
+};
+pub use freshness_probe_cache::{
+    is_freshness_probe, now_ms as freshness_probe_now_ms, FreshnessProbeCache, ProbeSample,
 };

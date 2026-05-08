@@ -28,6 +28,7 @@ use crate::data_model::AggregateCore;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::precompute_operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
+use crate::routing::FreshnessProbeCache;
 use asap_otel_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService, ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
@@ -57,12 +58,20 @@ struct OtlpSharedState {
     /// OTLP metrics and sketches are routed through the engine; when
     /// `None` the receiver accepts data but only logs it (no storage).
     ingest_state: Option<Arc<IngestState>>,
+    /// Freshness-probe last-value cache (issue #46 ⑥). When `Some`,
+    /// every received `http_freshness_probe_*` data point updates the
+    /// cache so the HTTP query handler can answer
+    /// `last_over_time(<probe>[<range>])` from RAM with sub-second
+    /// freshness — bypassing the 60–90 s cold-tier flush gap that
+    /// would otherwise leave a 10 s lookback window empty.
+    probe_cache: Option<Arc<FreshnessProbeCache>>,
 }
 
 /// OTLP receiver that accepts metrics via gRPC and HTTP.
 pub struct OtlpReceiver {
     config: OtlpReceiverConfig,
     ingest_state: Option<Arc<IngestState>>,
+    probe_cache: Option<Arc<FreshnessProbeCache>>,
 }
 
 impl OtlpReceiver {
@@ -72,6 +81,7 @@ impl OtlpReceiver {
         Self {
             config,
             ingest_state: None,
+            probe_cache: None,
         }
     }
 
@@ -83,7 +93,24 @@ impl OtlpReceiver {
         Self {
             config,
             ingest_state: Some(ingest_state),
+            probe_cache: None,
         }
+    }
+
+    /// Attach a [`FreshnessProbeCache`] so the receiver captures the
+    /// latest sample for every `http_freshness_probe_*` metric it
+    /// sees. Builder-style; chains with [`Self::with_ingest_state`]
+    /// at the binary's wiring site. Without this call, probe-shaped
+    /// metrics still reach the precompute engine and the cold-tier
+    /// TSDB write path — only the in-memory query short-circuit is
+    /// disabled.
+    pub fn with_probe_cache(mut self, cache: Arc<FreshnessProbeCache>) -> Self {
+        debug!(
+            "OTLP receiver attached freshness-probe cache for issue #46 \
+             criterion ⑥ short-circuit"
+        );
+        self.probe_cache = Some(cache);
+        self
     }
 
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -92,6 +119,7 @@ impl OtlpReceiver {
 
         let shared = Arc::new(OtlpSharedState {
             ingest_state: self.ingest_state.clone(),
+            probe_cache: self.probe_cache.clone(),
         });
 
         let grpc_svc = MetricsServiceImpl {
@@ -154,6 +182,9 @@ impl MetricsService for MetricsServiceImpl {
         debug!("OTLP received request via gRPC");
         let req = request.into_inner();
         process_otlp_request(&req, "gRPC");
+        if let Some(cache) = &self.shared.probe_cache {
+            capture_freshness_probe_samples(&req, cache);
+        }
         if let Some(state) = &self.shared.ingest_state {
             route_otlp_to_precompute(&req, state).await;
             route_modified_otlp_sketches_to_precompute(&req, state).await;
@@ -201,6 +232,9 @@ async fn handle_otlp_http(
         )
     })?;
     process_otlp_request(&req, "HTTP");
+    if let Some(cache) = &shared.probe_cache {
+        capture_freshness_probe_samples(&req, cache);
+    }
     if let Some(state) = &shared.ingest_state {
         route_otlp_to_precompute(&req, state).await;
         route_modified_otlp_sketches_to_precompute(&req, state).await;
@@ -289,6 +323,42 @@ fn log_sketch_envelope_type(attr_name: &str, payload: &[u8], metric_name: &str) 
                 e
             );
         }
+    }
+}
+
+/// Capture every `http_freshness_probe_*` data point in the request
+/// into the [`FreshnessProbeCache`]. Walks the parsed `MetricPoint`s
+/// and only stores those whose metric name matches the probe prefix
+/// — the cache itself enforces the prefix check via
+/// [`FreshnessProbeCache::record`], so non-probe points are
+/// short-circuited cheaply.
+///
+/// Issue #46 ⑥ — without this hook, the cold-tier flush latency
+/// (gorillas3 → 60 s TSDB block → Thanos sync) leaves the
+/// `last_over_time(probe[10s])` query empty for the entire MVP demo
+/// run. The cache lets the HTTP query handler answer the same query
+/// from RAM with sub-second freshness.
+fn capture_freshness_probe_samples(
+    request: &ExportMetricsServiceRequest,
+    cache: &FreshnessProbeCache,
+) {
+    let (points, _sketches) = otlp_to_metric_points_and_sketches(request);
+    let mut updated = 0usize;
+    for point in &points {
+        // The cache filters by metric-name prefix internally; calling
+        // `record` for every point is fine — non-probes are cheap
+        // string-prefix rejections and do not touch the lock.
+        let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
+        if cache.record(&point.name, ts_ms, point.value) {
+            updated += 1;
+        }
+    }
+    if updated > 0 {
+        debug!(
+            updated_probes = updated,
+            cache_size = cache.len(),
+            "freshness-probe cache updated"
+        );
     }
 }
 
