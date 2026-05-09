@@ -400,23 +400,51 @@ impl AggregateCore for CountMinSketchAccumulator {
         // each insert increments exactly one cell per row, so every row
         // sums to the true insert count (modulo collisions, which CMS
         // never *underestimates*; min is the tightest upper bound).
-        match statistic {
-            Statistic::Count | Statistic::Sum => {
-                let matrix = self.inner.sketch();
-                if matrix.is_empty() || matrix[0].is_empty() {
-                    return Ok(0.0);
-                }
-                let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
-                let min_total = row_totals.fold(f64::INFINITY, f64::min);
-                Ok(if min_total.is_finite() {
-                    min_total
-                } else {
-                    0.0
-                })
+        let total_events = || -> f64 {
+            let matrix = self.inner.sketch();
+            if matrix.is_empty() || matrix[0].is_empty() {
+                return 0.0;
             }
+            let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
+            let min_total = row_totals.fold(f64::INFINITY, f64::min);
+            if min_total.is_finite() {
+                min_total
+            } else {
+                0.0
+            }
+        };
+        match statistic {
+            Statistic::Count | Statistic::Sum => Ok(total_events()),
+            // PR #111 honest-gap closure (in-the-bag for warm tier).
+            // CMS records insert counts but not timestamps, so per-second
+            // `rate(metric[range])` requires the engine to push the
+            // range duration via `query_kwargs["range_ms"]`. When
+            // present, divide the min-row-sum by `range_ms / 1000`. When
+            // absent (the engine has not been wired to inject range_ms
+            // for this query, e.g. instant `rate` calls outside the
+            // PromQL range-vector pattern), fall back to the raw event
+            // count so the answer is at least non-empty — the caller's
+            // caveat is that the units are events/window rather than
+            // events/second. Increase carries the same caveat.
+            Statistic::Rate => {
+                let total = total_events();
+                let range_ms_str = query_kwargs.get("range_ms").map(String::as_str);
+                let Some(s) = range_ms_str else {
+                    return Ok(total);
+                };
+                let range_ms: f64 = s.parse().map_err(|e| {
+                    format!("CountMinSketchAccumulator: bad range_ms='{s}': {e}")
+                })?;
+                if range_ms <= 0.0 {
+                    return Err("CountMinSketchAccumulator: range_ms must be positive".into());
+                }
+                Ok(total * 1000.0 / range_ms)
+            }
+            Statistic::Increase => Ok(total_events()),
             other => Err(format!(
                 "CountMinSketchAccumulator: statistic {:?} not supported \
-                 without a key (only Count / Sum aggregate over the whole sketch)",
+                 without a key (only Count / Sum / Rate / Increase aggregate \
+                 over the whole sketch)",
                 other,
             )
             .into()),
@@ -850,5 +878,97 @@ mod tests {
     fn test_apply_proto_delta_bytes_rejects_garbage() {
         let mut acc = CountMinSketchAccumulator::new(2, 3);
         assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // Statistic::Rate / Statistic::Increase — PR #111 honest-gap closure.
+    // CMS records insert counts but not timestamps. The Rate readout
+    // requires the engine to push `range_ms` via query_kwargs; without
+    // it the accumulator falls back to the raw event count (units of
+    // events/window) so the answer is at least non-empty.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_query_statistic_rate_with_range_ms() {
+        // Build a CMS whose min-row-sum is 100 events. With a 5-minute
+        // (300_000 ms) range, the per-second rate is 100 / 300 ≈ 0.333.
+        let cms = CountMinSketchAccumulator {
+            inner: CountMinSketch::from_legacy_matrix(
+                vec![vec![100.0, 0.0], vec![100.0, 0.0]],
+                2,
+                2,
+            ),
+        };
+        let mut kwargs = HashMap::new();
+        kwargs.insert("range_ms".to_string(), "300000".to_string());
+        let trait_obj: &dyn AggregateCore = &cms;
+        let v = trait_obj
+            .query_statistic(Statistic::Rate, &None, &kwargs)
+            .expect("Rate with range_ms is supported");
+        assert!(
+            (v - (100.0 / 300.0)).abs() < 1e-9,
+            "expected 100/300 = {}, got {v}",
+            100.0 / 300.0,
+        );
+    }
+
+    #[test]
+    fn test_query_statistic_rate_without_range_ms_falls_back_to_count() {
+        // Without `range_ms` in kwargs the accumulator returns the raw
+        // event volume (events/window units). Caller is responsible for
+        // surfacing that caveat to the user; this avoids `status=error`
+        // for instant rate-shape queries that bypass the matrix-selector
+        // code path.
+        let cms = CountMinSketchAccumulator {
+            inner: CountMinSketch::from_legacy_matrix(
+                vec![vec![42.0, 0.0], vec![42.0, 0.0]],
+                2,
+                2,
+            ),
+        };
+        let trait_obj: &dyn AggregateCore = &cms;
+        let v = trait_obj
+            .query_statistic(Statistic::Rate, &None, &HashMap::new())
+            .expect("Rate without range_ms still answers (fallback)");
+        assert_eq!(v, 42.0);
+    }
+
+    #[test]
+    fn test_query_statistic_increase_returns_total_count() {
+        // Increase semantics on CMS: total events in the window — the
+        // same min-row-sum as Sum / Count. Differs from Rate only in
+        // that it never divides by range.
+        let cms = CountMinSketchAccumulator {
+            inner: CountMinSketch::from_legacy_matrix(
+                vec![vec![5.0, 7.0], vec![3.0, 9.0]],
+                2,
+                2,
+            ),
+        };
+        let trait_obj: &dyn AggregateCore = &cms;
+        let v = trait_obj
+            .query_statistic(Statistic::Increase, &None, &HashMap::new())
+            .expect("Increase is supported");
+        // min-row-sum: row0 = 12, row1 = 12, min = 12.
+        assert_eq!(v, 12.0);
+    }
+
+    #[test]
+    fn test_query_statistic_rate_rejects_invalid_range_ms() {
+        let cms = CountMinSketchAccumulator::new(2, 2);
+        let mut kwargs = HashMap::new();
+        kwargs.insert("range_ms".to_string(), "0".to_string());
+        let trait_obj: &dyn AggregateCore = &cms;
+        let err = trait_obj
+            .query_statistic(Statistic::Rate, &None, &kwargs)
+            .expect_err("range_ms=0 should error");
+        assert!(err.to_string().contains("positive"));
+
+        let mut kwargs = HashMap::new();
+        kwargs.insert("range_ms".to_string(), "not-a-number".to_string());
+        let err = trait_obj
+            .query_statistic(Statistic::Rate, &None, &kwargs)
+            .expect_err("non-numeric range_ms should error");
+        assert!(err.to_string().contains("bad range_ms"));
     }
 }

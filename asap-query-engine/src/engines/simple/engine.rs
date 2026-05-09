@@ -580,43 +580,53 @@ impl SimpleEngine {
             .find(|config| config.query == query)
     }
 
-    /// Resolve the DDSketch INGEST-side `_quantile` rename for a
-    /// quantile-shape PromQL query.
+    /// Resolve agent-side INGEST renames (`_quantile`, `_hll`,
+    /// `_count_unique`) so a user PromQL query that names the
+    /// conceptual unsuffixed metric still finds the suffixed series
+    /// the warm tier actually holds.
     ///
-    /// The agent's DDSketch processor renames raw input metrics to
-    /// the suffixed wire form (`http_latency_ms` →
-    /// `http_latency_ms_quantile`) before emitting to the warm
-    /// tier — so the engine's streaming config and sketch store
-    /// register the suffixed name, but the user's PromQL still
-    /// references the conceptual unsuffixed name. Without
-    /// resolution the warm engine looks up `http_latency_ms`,
-    /// finds nothing, and returns `status=error`.
+    /// The agent's per-family sketch processors rename the raw input
+    /// metric on egress:
     ///
-    /// When the parsed query is shape-classified as `Quantile`
-    /// (`quantile_over_time(...)` or `quantile(...)` aggregation)
-    /// AND the bare metric isn't registered locally but the
-    /// `_quantile`-suffixed variant IS, this returns the rewritten
-    /// query string with the metric replaced. Otherwise returns
-    /// `None` so the caller leaves the query untouched.
+    /// | Processor   | Suffix         | Query shapes that consume it     |
+    /// |-------------|----------------|----------------------------------|
+    /// | DDSketch    | `_quantile`    | `Quantile`                       |
+    /// | KLL         | `_quantile`    | `Quantile`                       |
+    /// | HLL         | `_hll`         | `Count` (cardinality) / `Other`  |
     ///
-    /// Rewrite is performed by string substitution of the metric
-    /// identifier — sufficient for the production query shapes the
-    /// MVP demo replays (`quantile_over_time(q, M[range])` where
-    /// `M` is a bare metric name) and avoids the AST-to-string
-    /// round-trip that the promql-parser library doesn't fully
-    /// support. Fallback: if substitution fails to produce a
-    /// parseable result, returns `None` and the original query
-    /// flows through unchanged.
-    fn resolve_quantile_metric_alias(&self, query: &str) -> Option<String> {
-        // Parse + classify shape; only quantile-shaped queries are
-        // affected by the INGEST rename.
+    /// CountSketch / CountMin processors do NOT rename today (the
+    /// agent's `metric_suffix` is empty), so this resolver is a no-op
+    /// for `Topk` / `RatePostHoc` shapes. If a future agent wires
+    /// `_topk` / `_freq` renames the same shape→suffix table grows.
+    ///
+    /// Rewrite happens only when:
+    ///   * the parsed query's shape matches one of the renaming
+    ///     processors above (so a `count(...)` over a non-HLL metric
+    ///     never gets an `_hll` redirect by accident), AND
+    ///   * the bare metric is NOT in the streaming config / schema
+    ///     but the suffixed variant IS — guaranteeing the redirect
+    ///     points at a series the warm tier can actually answer.
+    ///
+    /// Substitution is byte-level identifier replacement
+    /// (`replace_metric_token`); the rewritten string is re-parsed
+    /// to guard against PromQL syntax breakage. On any failure the
+    /// caller's original query string is returned untouched.
+    fn resolve_sketch_metric_alias(&self, query: &str) -> Option<String> {
+        // Parse + classify shape; only sketch-renaming-capable
+        // shapes are eligible for this resolver. Any other shape
+        // falls through unchanged.
         let ast = promql_parser::parser::parse(query).ok()?;
-        if !matches!(
-            crate::routing::classify_query_shape(&ast),
-            crate::routing::QueryShape::Quantile
-        ) {
-            return None;
-        }
+        let shape = crate::routing::classify_query_shape(&ast);
+        let suffixes: &[&str] = match shape {
+            crate::routing::QueryShape::Quantile => &["_quantile"],
+            // `count(metric)` against an HLL-backed agg is the
+            // cardinality readout — see `compatible_agg_types(Count)`
+            // and `HllSketchAccumulator::query_statistic`. Capture it
+            // here so the wire-side `_hll` rename is invisible to
+            // user PromQL.
+            crate::routing::QueryShape::Count => &["_hll"],
+            _ => return None,
+        };
 
         // Pull the first metric name from the AST.
         fn first_metric(expr: &promql_parser::parser::Expr) -> Option<String> {
@@ -637,17 +647,6 @@ impl SimpleEngine {
         }
         let metric = first_metric(&ast)?;
 
-        // If already in the suffixed form, nothing to do.
-        if metric.ends_with("_quantile") {
-            return None;
-        }
-        let suffixed = format!("{metric}_quantile");
-
-        // Helper: does a metric name appear as the `metric` field
-        // of any aggregation config in the streaming-config
-        // snapshot? The DDSketch processor's rename is what would
-        // surface the suffixed name in the warm tier's
-        // streaming-config in the first place.
         let streaming_config = self.streaming_config_snapshot();
         let metric_known = |name: &str| {
             streaming_config
@@ -655,7 +654,6 @@ impl SimpleEngine {
                 .values()
                 .any(|c| c.metric == name)
         };
-
         // Cross-check against the PromQL schema too so a deployment
         // with a schema-defined-but-aggregation-less metric still
         // passes through unchanged.
@@ -663,38 +661,48 @@ impl SimpleEngine {
             SchemaConfig::PromQL(s) => s.get_labels(name).is_some(),
             _ => false,
         };
-
         let bare_present = metric_known(&metric) || metric_in_schema(&metric);
-        let suffixed_present = metric_known(&suffixed) || metric_in_schema(&suffixed);
-
-        if bare_present || !suffixed_present {
-            // Either the bare metric is locally known (no rename
-            // applied for this deployment) or no suffixed variant
-            // exists to redirect to.
+        if bare_present {
+            // Bare metric is locally known — no rename applied for
+            // this deployment.
             return None;
         }
 
-        // Naive but precise substitution: replace `<metric>` only
-        // when surrounded by characters that can't be part of a
-        // PromQL identifier (i.e. not `[A-Za-z0-9_:]`). This
-        // avoids accidentally matching `metric` inside e.g.
-        // `metric_other`.
-        let rewritten = replace_metric_token(query, &metric, &suffixed);
-        // Sanity-check: parses cleanly.
-        if promql_parser::parser::parse(&rewritten).is_err() {
-            warn!(
-                "resolve_quantile_metric_alias: rewrite to '{}' failed to re-parse; \
-                 leaving query untouched",
-                rewritten
+        // Walk the candidate suffixes in declared order; the first
+        // one whose suffixed form is known wins. Skip any suffix the
+        // metric already wears (idempotent under repeated calls).
+        for suffix in suffixes {
+            if metric.ends_with(suffix) {
+                continue;
+            }
+            let suffixed = format!("{metric}{suffix}");
+            if !(metric_known(&suffixed) || metric_in_schema(&suffixed)) {
+                continue;
+            }
+
+            // Naive but precise substitution: replace `<metric>` only
+            // when surrounded by characters that can't be part of a
+            // PromQL identifier (i.e. not `[A-Za-z0-9_:]`). This
+            // avoids accidentally matching `metric` inside e.g.
+            // `metric_other`.
+            let rewritten = replace_metric_token(query, &metric, &suffixed);
+            // Sanity-check: parses cleanly.
+            if promql_parser::parser::parse(&rewritten).is_err() {
+                warn!(
+                    "resolve_sketch_metric_alias: rewrite to '{}' failed to re-parse; \
+                     leaving query untouched",
+                    rewritten
+                );
+                return None;
+            }
+            debug!(
+                "resolve_sketch_metric_alias: rewriting '{}' -> '{}' \
+                 (shape={:?}, suffix='{}')",
+                metric, suffixed, shape, suffix
             );
-            return None;
+            return Some(rewritten);
         }
-        debug!(
-            "resolve_quantile_metric_alias: rewriting '{}' -> '{}' \
-             (DDSketch _quantile ingest rename)",
-            metric, suffixed
-        );
-        Some(rewritten)
+        None
     }
 
     /// Finds the query configuration for a SQL query using structural pattern matching.
@@ -925,6 +933,28 @@ impl SimpleEngine {
                 let k = self.extract_topk_param(query_pattern_type, match_result)?;
                 debug!("Extracted k value: {:?}", k);
                 query_kwargs.insert("k".to_string(), k);
+            }
+            // PR #111 honest-gap closure for `rate(...)` over a
+            // CountMinSketch-backed agg: the CMS accumulator records
+            // event counts but not per-event timestamps, so it can't
+            // derive the range duration locally. The engine knows
+            // the range from the matrix selector and pushes it down
+            // here so `CountMinSketchAccumulator::query_statistic`
+            // can divide events by seconds. Increase carries the
+            // same divisor (it falls back to raw count when
+            // range_ms is absent).
+            Statistic::Rate | Statistic::Increase => {
+                if let Some(d) = match_result.get_range_duration() {
+                    let range_ms = (d.num_seconds() as u64) * 1000;
+                    if range_ms > 0 {
+                        query_kwargs.insert("range_ms".to_string(), range_ms.to_string());
+                        debug!(
+                            "Rate/Increase query: pushed range_ms={} into kwargs \
+                             for CMS-style accumulators",
+                            range_ms
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -3046,36 +3076,20 @@ impl SimpleEngine {
         let query_start_time = Instant::now();
         debug!("Handling query: {} at time {}", query, time);
 
-        // Resolve the DDSketch-processor INGEST-side `_quantile` rename.
-        //
-        // The agent's DDSketch processor renames raw input metrics
-        // (e.g. `http_latency_ms`) to a sketched-form wire name
-        // (`http_latency_ms_quantile`) before emitting to the warm
-        // tier. The replay client / PromQL caller still references
-        // the conceptual unsuffixed metric in
-        // `quantile_over_time(q, X[range])`, so the warm engine sees
-        // a query for `X` while its sketch store only holds
-        // `X_quantile`. Without this resolution step the store
-        // lookup misses and the engine returns `status=error` to a
-        // query that is logically answerable.
-        //
-        // We rewrite ONLY when:
-        //   * the query's classified shape is `Quantile` (i.e. a
-        //     `quantile_over_time(...)` or PromQL `quantile(...)`
-        //     aggregation — the only shapes whose data lives behind
-        //     the DDSketch / KLL `_quantile` rename), AND
-        //   * the bare metric is NOT registered in the engine's
-        //     streaming config but the `_quantile`-suffixed variant
-        //     IS — so for any deployment that didn't apply the
-        //     INGEST-side rename, the query string passes through
-        //     unchanged.
+        // Resolve agent-side INGEST-time metric renames so the
+        // user's bare-metric PromQL still finds the suffixed series
+        // the warm tier actually holds. Today: DDSketch / KLL
+        // (`_quantile` for `quantile_over_time` / `quantile`) and
+        // HLL (`_hll` for `count(...)` cardinality). See
+        // `resolve_sketch_metric_alias` for the full shape→suffix
+        // table.
         //
         // The rewrite happens once at the entry point so every
         // downstream stage (pattern match, `QueryConfig` lookup,
         // capability matching, `StoreQueryParams.metric`, schema
         // label lookup) sees the same suffixed name.
         let query = self
-            .resolve_quantile_metric_alias(&query)
+            .resolve_sketch_metric_alias(&query)
             .unwrap_or(query);
 
         // Check for binary arithmetic before attempting single-query dispatch.
@@ -6245,6 +6259,411 @@ mod forced_agg_id_tests {
         assert_eq!(
             auto.agg_info.aggregation_type_for_value,
             forced.agg_info.aggregation_type_for_value
+        );
+    }
+}
+
+// ===========================================================================
+// `resolve_sketch_metric_alias` — agent-side INGEST suffix rewrites.
+//
+// The agent's per-family sketch processors rename raw input metrics on
+// egress (DDSketch / KLL → `_quantile`, HLL → `_hll`). The user's
+// PromQL still references the conceptual unsuffixed name, so the
+// engine has to rewrite to whatever the warm-tier sketch store
+// actually holds. These tests pin the contract:
+//
+//   * Quantile-shape queries redirect bare `M` → `M_quantile` when only
+//     the suffixed variant exists in streaming-config.
+//   * Count-shape queries redirect bare `M` → `M_hll` (HLL ingest
+//     rename) — closes the wire gap for `count(unique_users_per_min)`
+//     against an HLL-backed agg.
+//   * No-op when the bare metric is locally known (no rename was
+//     applied for this deployment) or when no suffixed variant exists.
+//   * Topk / RatePostHoc shapes are NOT touched (CountSketch /
+//     CountMin processors don't suffix-rename today).
+// ===========================================================================
+#[cfg(test)]
+mod sketch_alias_resolver_tests {
+    use super::*;
+    use crate::data_model::{
+        AggregationConfig, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig,
+        PromQLSchema, QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
+    };
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use std::sync::Arc;
+
+    fn agg_for(id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
+        AggregationConfig::new(
+            id,
+            agg_type,
+            String::new(),
+            HashMap::new(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            30,
+            30,
+            WindowType::Tumbling,
+            String::new(),
+            metric.to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Build a SimpleEngine whose streaming-config holds the supplied
+    /// (metric, agg_type) pairs and whose schema is empty (matches the
+    /// production warm-tier deploy where the controller drives the
+    /// label set).
+    fn engine_with(metrics: &[(&str, AggregationType)]) -> SimpleEngine {
+        let mut configs = HashMap::new();
+        for (i, (m, t)) in metrics.iter().enumerate() {
+            configs.insert((i + 1) as u64, agg_for((i + 1) as u64, m, *t));
+        }
+        let streaming_config = StreamingConfig::new(configs);
+        let store = Arc::new(SimpleMapStore::new(
+            Arc::new(streaming_config.clone()),
+            CleanupPolicy::NoCleanup,
+        ));
+        let inference_config = InferenceConfig {
+            schema: SchemaConfig::PromQL(PromQLSchema::new()),
+            query_configs: vec![],
+            cleanup_policy: CleanupPolicy::NoCleanup,
+        };
+        let hot_reload = HotReloadStreamingConfig::from_arc(Arc::new(streaming_config));
+        SimpleEngine::new_with_hot_reload(
+            store,
+            inference_config,
+            hot_reload,
+            1,
+            QueryLanguage::promql,
+        )
+    }
+
+    #[test]
+    fn quantile_query_rewrites_bare_to_quantile_suffix() {
+        let engine = engine_with(&[("http_latency_ms_quantile", AggregationType::DDSketch)]);
+        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
+        let rewritten = engine
+            .resolve_sketch_metric_alias(q)
+            .expect("DDSketch _quantile rewrite should fire");
+        assert!(
+            rewritten.contains("http_latency_ms_quantile"),
+            "expected suffixed name in rewrite, got: {rewritten}"
+        );
+        // Bare metric must not appear as a standalone token any more.
+        assert!(!rewritten.contains("http_latency_ms[")); // matrix-selector form
+    }
+
+    #[test]
+    fn quantile_query_passes_through_when_bare_is_known() {
+        // Both names registered → bare metric is locally known → no
+        // rewrite. Pre-fix this leaked the suffix even when the deploy
+        // never applied the rename.
+        let engine = engine_with(&[
+            ("http_latency_ms", AggregationType::DDSketch),
+            ("http_latency_ms_quantile", AggregationType::DDSketch),
+        ]);
+        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
+        assert!(engine.resolve_sketch_metric_alias(q).is_none());
+    }
+
+    #[test]
+    fn quantile_query_passes_through_when_suffixed_missing() {
+        // Bare unknown AND suffixed not registered → no place to
+        // redirect → return None and let the caller surface the
+        // capability miss.
+        let engine = engine_with(&[("other_metric_quantile", AggregationType::DDSketch)]);
+        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
+        assert!(engine.resolve_sketch_metric_alias(q).is_none());
+    }
+
+    #[test]
+    fn count_query_rewrites_bare_to_hll_suffix() {
+        // The MVP demo's HLL-routing path: agent's HLL processor
+        // renames `unique_users_per_min` → `unique_users_per_min_hll`
+        // on egress. User's `count(unique_users_per_min)` must
+        // resolve to the suffixed series.
+        let engine = engine_with(&[("unique_users_per_min_hll", AggregationType::HLL)]);
+        let q = "count(unique_users_per_min)";
+        let rewritten = engine
+            .resolve_sketch_metric_alias(q)
+            .expect("HLL _hll rewrite should fire for count(...) shape");
+        assert!(
+            rewritten.contains("unique_users_per_min_hll"),
+            "expected suffixed name in rewrite, got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn count_query_passes_through_when_bare_known() {
+        // `count(metric)` against a non-HLL deploy: the metric is
+        // locally known by its bare name, so no _hll redirect.
+        let engine = engine_with(&[("series_count", AggregationType::Sum)]);
+        let q = "count(series_count)";
+        assert!(engine.resolve_sketch_metric_alias(q).is_none());
+    }
+
+    #[test]
+    fn topk_query_is_not_touched() {
+        // CountSketch processor doesn't rename today; a `topk(...)`
+        // query must pass through unchanged even if a hypothetical
+        // `_hll` suffixed variant happens to exist in config.
+        let engine = engine_with(&[
+            ("top_endpoint_qps_hll", AggregationType::HLL), // distractor
+            ("top_endpoint_qps", AggregationType::CountSketch),
+        ]);
+        let q = "topk(5, top_endpoint_qps)";
+        assert!(engine.resolve_sketch_metric_alias(q).is_none());
+    }
+
+    #[test]
+    fn rate_query_is_not_touched() {
+        // CountMin processor doesn't rename today; `rate(metric[5m])`
+        // must pass through unchanged.
+        let engine =
+            engine_with(&[("endpoint_request_freq", AggregationType::CountMinSketch)]);
+        let q = "rate(endpoint_request_freq[5m])";
+        assert!(engine.resolve_sketch_metric_alias(q).is_none());
+    }
+
+    #[test]
+    fn rewrite_preserves_other_query_text() {
+        // The substitution must be identifier-token-aware: only the
+        // standalone `http_latency_ms` token gets rewritten, not
+        // any other tokens that happen to share a substring.
+        let engine = engine_with(&[("http_latency_ms_quantile", AggregationType::DDSketch)]);
+        let q = "quantile_over_time(0.95, http_latency_ms{zone=\"us\"}[1m])";
+        let rewritten = engine
+            .resolve_sketch_metric_alias(q)
+            .expect("rewrite should succeed");
+        assert!(rewritten.contains("http_latency_ms_quantile{zone=\"us\"}"));
+        assert!(rewritten.contains("0.95"));
+    }
+}
+
+// ===========================================================================
+// HLL count() — capability matching + accumulator query round-trip.
+//
+// Pins that the warm engine answers `count(metric)` from an HLL-backed
+// aggregation: capability matching picks HLL (per
+// `compatible_agg_types(Statistic::Count)`), and the HLL accumulator's
+// `query_statistic` returns the cardinality estimate. This is the
+// runtime contract the wire-side _hll alias resolver above relies on.
+// ===========================================================================
+#[cfg(test)]
+mod hll_count_query_tests {
+    use super::*;
+    use crate::precompute_operators::HllSketchAccumulator;
+    use crate::tests::test_utilities::engine_factories::create_engine_single_pop;
+    use asap_sketchlib::sketches::hll::HllVariant;
+
+    fn hll_with_observations(observations: &[u64]) -> HllSketchAccumulator {
+        // Build an HLL with precision 8 (256 registers) and populate
+        // its register array directly. Backend's `HllSketch` is a
+        // pure data carrier (no `insert_with_hash` surface) — the
+        // wire decoder unpacks raw registers from the modified-OTLP
+        // proto, and queries read those registers via the canonical
+        // `α_m × m² / Σ 2^(-r)` HLL estimator. To exercise the
+        // estimator we mimic what the agent's hashing pipeline would
+        // produce: for each observation, derive a (bucket, leading-
+        // zeros) pair from a SplitMix64-style spread of the input
+        // and write `max(register[bucket], leading_zeros)`. This is
+        // exactly the math `HyperLogLogImpl::insert_with_hash` uses,
+        // performed inline.
+        let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 8);
+        let m = 1u64 << 8; // 256 registers
+        for &v in observations {
+            let h = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let bucket = (h >> (64 - 8)) as usize; // top 8 bits
+            // Remaining 56 bits — count leading zeros + 1 (capped at 64).
+            let rem = h << 8;
+            let lz = if rem == 0 { 64 - 8 } else { rem.leading_zeros() } as u8 + 1;
+            if (bucket as u64) < m {
+                let r = &mut acc.inner.registers[bucket];
+                if lz > *r {
+                    *r = lz;
+                }
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn count_over_hll_returns_cardinality() {
+        // Insert 100 distinct observations and verify HLL's
+        // `query_statistic(Count)` returns a cardinality estimate
+        // close to the truth. ε ≈ 1.04/√m for HLL precision 8 → m=256
+        // → ≈ 6.5 % standard error, generous bound below.
+        let acc = hll_with_observations(&(1..=100).collect::<Vec<u64>>());
+        let trait_obj: &dyn AggregateCore = &acc;
+        let v = trait_obj
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("HLL answers Statistic::Count");
+        assert!(
+            (v - 100.0).abs() < 30.0,
+            "HLL cardinality estimate diverged: got {v} for n=100"
+        );
+    }
+
+    #[test]
+    fn count_over_empty_hll_returns_zero() {
+        let acc = HllSketchAccumulator::new(HllVariant::Regular, 8);
+        let trait_obj: &dyn AggregateCore = &acc;
+        let v = trait_obj
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("empty HLL still answers Count");
+        // Linear-counting branch returns 0 when all registers are 0.
+        assert!(
+            v.abs() < 1e-9,
+            "empty HLL cardinality should be 0, got {v}"
+        );
+    }
+
+    #[test]
+    fn cardinality_is_an_alias_of_count() {
+        let acc = hll_with_observations(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let trait_obj: &dyn AggregateCore = &acc;
+        let by_count = trait_obj
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .unwrap();
+        let by_card = trait_obj
+            .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
+            .unwrap();
+        assert!(
+            (by_count - by_card).abs() < 1e-9,
+            "Cardinality and Count must produce the same HLL estimate"
+        );
+    }
+
+    #[test]
+    fn capability_matching_resolves_count_to_hll() {
+        // End-to-end through the SimpleEngine: register an HLL agg for
+        // `unique_users_per_min_hll`, run the `count(...)` query
+        // through `build_query_execution_context_promql`, and assert
+        // the resolved agg is the HLL one. Regression guard for the
+        // PR #111 honest-gap closure on HLL-Count capability.
+        let acc = hll_with_observations(&(1..=50).collect::<Vec<u64>>());
+        let data = vec![(
+            None,
+            Box::new(acc) as Box<dyn AggregateCore>,
+        )];
+        // No `by (...)` modifier on the query → empty grouping. The
+        // engine factory's HLL agg is registered with empty grouping
+        // labels; this matches the warm-tier production shape.
+        let engine = create_engine_single_pop(
+            "unique_users_per_min_hll",
+            AggregationType::HLL,
+            vec![],
+            data,
+            "count(unique_users_per_min_hll)",
+        );
+        let ctx = engine
+            .build_query_execution_context_promql(
+                "count(unique_users_per_min_hll)".to_string(),
+                1.0,
+            )
+            .expect("count(HLL_metric) should produce a context");
+        assert_eq!(
+            ctx.agg_info.aggregation_type_for_value,
+            AggregationType::HLL
+        );
+        assert_eq!(ctx.metadata.statistic_to_compute, Statistic::Count);
+    }
+}
+
+// ===========================================================================
+// KLL quantile — pin that DatasketchesKLL is in the Quantile capability
+// list and the accumulator answers `Statistic::Quantile`. Mirrors the
+// HLL-Count contract; closes the wire-side ingest gap diagnosis.
+// ===========================================================================
+#[cfg(test)]
+mod kll_quantile_query_tests {
+    use super::*;
+    use crate::precompute_operators::DatasketchesKLLAccumulator;
+    use crate::tests::test_utilities::engine_factories::create_engine_single_pop;
+
+    #[test]
+    fn capability_matching_resolves_quantile_to_kll() {
+        // KLL is one of the canonical quantile approximators (along
+        // with HydraKLL and DDSketch). Register a KLL agg for
+        // `request_size_bytes_quantile` and verify
+        // `quantile_over_time(0.99, ...)` resolves to it.
+        let acc = DatasketchesKLLAccumulator::new(200);
+        let data = vec![(
+            None,
+            Box::new(acc) as Box<dyn AggregateCore>,
+        )];
+        let engine = create_engine_single_pop(
+            "request_size_bytes_quantile",
+            AggregationType::DatasketchesKLL,
+            vec![],
+            data,
+            "quantile_over_time(0.99, request_size_bytes_quantile[30s])",
+        );
+        let ctx = engine
+            .build_query_execution_context_promql(
+                "quantile_over_time(0.99, request_size_bytes_quantile[30s])".to_string(),
+                30.0,
+            )
+            .expect("quantile_over_time(KLL_metric) should produce a context");
+        assert_eq!(
+            ctx.agg_info.aggregation_type_for_value,
+            AggregationType::DatasketchesKLL
+        );
+        assert_eq!(ctx.metadata.statistic_to_compute, Statistic::Quantile);
+        assert_eq!(
+            ctx.metadata.query_kwargs.get("quantile").map(String::as_str),
+            Some("0.99")
+        );
+    }
+}
+
+// ===========================================================================
+// Capability matching — Rate over CountMinSketch (PR #111 honest-gap
+// closure). With the new `Statistic::Rate` arm in
+// `compatible_agg_types`, `rate(<metric>[<range>])` against a CMS-only
+// agg config now matches.
+// ===========================================================================
+#[cfg(test)]
+mod cms_rate_capability_tests {
+    use super::*;
+    use crate::precompute_operators::CountMinSketchAccumulator;
+    use crate::tests::test_utilities::engine_factories::create_engine_single_pop;
+
+    #[test]
+    fn capability_matching_resolves_rate_to_count_min_sketch() {
+        let acc = CountMinSketchAccumulator::new(4, 64);
+        let data = vec![(
+            None,
+            Box::new(acc) as Box<dyn AggregateCore>,
+        )];
+        let engine = create_engine_single_pop(
+            "endpoint_request_freq",
+            AggregationType::CountMinSketch,
+            vec![],
+            data,
+            "rate(endpoint_request_freq[60s])",
+        );
+        let ctx = engine
+            .build_query_execution_context_promql(
+                "rate(endpoint_request_freq[60s])".to_string(),
+                60.0,
+            )
+            .expect("rate over CMS should produce a context");
+        assert_eq!(
+            ctx.agg_info.aggregation_type_for_value,
+            AggregationType::CountMinSketch
+        );
+        assert_eq!(ctx.metadata.statistic_to_compute, Statistic::Rate);
+        // The engine pushes range_ms into kwargs so the CMS
+        // accumulator can divide events by seconds at query time.
+        assert_eq!(
+            ctx.metadata.query_kwargs.get("range_ms").map(String::as_str),
+            Some("60000")
         );
     }
 }

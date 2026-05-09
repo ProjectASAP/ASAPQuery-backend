@@ -183,9 +183,25 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::HydraKLL,
             AggregationType::DDSketch,
         ],
-        Statistic::Rate | Statistic::Increase => {
-            &[AggregationType::Increase, AggregationType::MultipleIncrease]
-        }
+        // Rate / Increase: the canonical exact accumulators are the
+        // counter-shaped Increase / MultipleIncrease, but `rate(...)`
+        // and `increase(...)` over a CountMinSketch-backed agg are
+        // also valid — CMS records every insert and answers
+        // `Statistic::Rate` natively (events / range_ms when the
+        // engine passes `range_ms` in query_kwargs; raw event count
+        // as a units-of-events/window fallback otherwise — see
+        // `precompute_operators/count_min_sketch_accumulator.rs`).
+        // Without CMS / CMSWithHeap listed here, `rate(metric[5m])`
+        // against a CMS-only config — the canonical MVP demo
+        // CountMin path — capability-misses and the warm engine
+        // returns `status=error`. Closes the PR #111 honest-gap
+        // call-out for `Statistic::Rate` not implemented.
+        Statistic::Rate | Statistic::Increase => &[
+            AggregationType::Increase,
+            AggregationType::MultipleIncrease,
+            AggregationType::CountMinSketch,
+            AggregationType::CountMinSketchWithHeap,
+        ],
         // Cardinality: SetAggregator / DeltaSetAggregator are the
         // exact key trackers; HLL is the canonical approximator
         // whose accumulator answers `Statistic::Cardinality` (and
