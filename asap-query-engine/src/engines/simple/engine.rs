@@ -518,10 +518,9 @@ impl SimpleEngine {
     ///    same "metric unknown" outcome as before this helper landed.
     fn resolve_metric_labels(&self, metric: &str) -> Option<KeyByLabelNames> {
         // (1) schema lookup — user-supplied source of truth.
-        if let SchemaConfig::PromQL(schema) = &self.inference_config.schema {
-            if let Some(labels) = schema.get_labels(metric).cloned() {
-                return Some(labels);
-            }
+        let SchemaConfig::PromQL(schema) = &self.inference_config.schema;
+        if let Some(labels) = schema.get_labels(metric).cloned() {
+            return Some(labels);
         }
 
         // (2) streaming-config fallback — derived from whatever agg
@@ -650,9 +649,9 @@ impl SimpleEngine {
         // Cross-check against the PromQL schema too so a deployment
         // with a schema-defined-but-aggregation-less metric still
         // passes through unchanged.
-        let metric_in_schema = |name: &str| match &self.inference_config.schema {
-            SchemaConfig::PromQL(s) => s.get_labels(name).is_some(),
-            _ => false,
+        let metric_in_schema = |name: &str| {
+            let SchemaConfig::PromQL(s) = &self.inference_config.schema;
+            s.get_labels(name).is_some()
         };
         let bare_present = metric_known(&metric) || metric_in_schema(&metric);
         if bare_present {
@@ -2091,20 +2090,11 @@ impl SimpleEngine {
 
     /// Handle a query following Python's unified architecture.
     ///
-    /// SQL / Elasticsearch query languages were removed during the
-    /// dead-code cleanup (only PromQL is wired in production); the
-    /// legacy variants remain on the `QueryLanguage` enum but resolve
-    /// to a logged `None` here.
+    /// Only PromQL is wired in production; the SQL / Elasticsearch
+    /// variants were removed entirely during the dead-code cleanup.
     pub fn handle_query(&self, query: String, time: f64) -> Option<(KeyByLabelNames, QueryResult)> {
         match self.query_language {
             QueryLanguage::promql => self.handle_query_promql(query, time),
-            QueryLanguage::sql | QueryLanguage::elastic_querydsl | QueryLanguage::elastic_sql => {
-                warn!(
-                    "handle_query: query language {:?} is no longer supported; returning None",
-                    self.query_language
-                );
-                None
-            }
         }
     }
 

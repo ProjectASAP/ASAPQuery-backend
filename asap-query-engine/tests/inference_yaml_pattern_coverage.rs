@@ -101,36 +101,7 @@ fn promql_inference_yaml_loads_all_pattern_families() {
     assert!(has("quantile by (label_0) (0.99, fake_metric)"));
 }
 
-// ─── 2. SQL YAML expansion parity ──────────────────────────────────────
-
-#[test]
-fn sql_inference_yaml_loads_expanded_patterns() {
-    let cfg = read_inference_config("examples/sql/inference_config.yaml", QueryLanguage::sql)
-        .expect("sql inference_config.yaml must parse");
-
-    let queries: Vec<&str> = cfg
-        .query_configs
-        .iter()
-        .map(|q| q.query.as_str())
-        .collect();
-
-    assert!(
-        queries.len() >= 6,
-        "SQL YAML did not expand: {} entries",
-        queries.len()
-    );
-
-    let has = |needle: &str| queries.iter().any(|q| q.contains(needle));
-    assert!(has("quantile(0.5)(cpu_usage)"));
-    assert!(has("quantile(0.9)(cpu_usage)"));
-    assert!(has("quantile(0.95)(cpu_usage)"));
-    assert!(has("quantile(0.99)(cpu_usage)"));
-    assert!(has("SUM(cpu_usage)"));
-    assert!(has("COUNT(cpu_usage)"));
-    assert!(has("AVG(cpu_usage)"));
-}
-
-// ─── 3. Per-family runtime routing tests ───────────────────────────────
+// ─── 2. Per-family runtime routing tests ───────────────────────────────
 //
 // Each test below exercises the full warm-tier path for one pattern
 // family: the engine finds the YAML entry exactly, pattern-matches

@@ -4,10 +4,8 @@
 //! PromQL and SQL queries produce equivalent internal logic in the QueryEngine.
 
 pub mod comparison;
-pub mod config_builders;
 pub mod engine_factories;
 
 // Re-export commonly used items
 pub use comparison::*;
-pub use config_builders::*;
 pub use engine_factories::*;
