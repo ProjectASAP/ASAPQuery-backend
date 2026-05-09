@@ -64,18 +64,20 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Metric-name prefix the cache filters on. Only metrics whose
-/// name starts with this string are captured. Matches the three
-/// probe metric names emitted by `deploy/fake-exporter/probes.go`
-/// (`http_freshness_probe_raw` / `_warm` / `_archive`).
-const PROBE_NAME_PREFIX: &str = "http_freshness_probe_";
+/// Substring the cache filters on. Any metric name containing this
+/// token (with the trailing underscore to keep the tier suffix
+/// disambiguated) is captured. The MVP fake-exporter emits three
+/// probes named `http_freshness_probe_{raw,warm,archive}`; user-
+/// extensible probes (e.g. `latency_freshness_probe_*`) are matched
+/// without a code change.
+const PROBE_NAME_TOKEN: &str = "freshness_probe_";
 
 /// Returns `true` iff the metric name belongs to the freshness-probe
 /// family — used by both the ingest write path (filter before
 /// storing) and the query read path (intercept before normal
 /// routing).
 pub fn is_freshness_probe(metric: &str) -> bool {
-    metric.starts_with(PROBE_NAME_PREFIX)
+    metric.contains(PROBE_NAME_TOKEN)
 }
 
 /// One cached entry: the most-recent `(timestamp, value)` for a
