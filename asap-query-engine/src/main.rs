@@ -704,10 +704,13 @@ async fn main() -> Result<()> {
     //   verbatim until Phase δ deletes it after Path A2 is verified
     //   end-to-end.
     //
-    // When neither env-var family is configured we leave the router
-    // single-engine — non-`SketchWarmTier` metrics surface a
-    // `503 NoEngineRegistered` from the HTTP handler, which is the
-    // correct fail-loud behaviour for a misconfigured deploy.
+    // When neither env-var family is configured the binary registers
+    // a `NoDataArchiveEngine` stub under the `gorilla_archive` alias
+    // so cold queries succeed with an empty result instead of
+    // surfacing as `503 NoEngineRegistered`. Operators that want the
+    // original fail-loud behaviour can opt back in by setting
+    // `ASAP_REQUIRE_ARCHIVE_ENGINE=1`.
+    let mut archive_registered = false;
     match query_engine_rust::engines::gorilla::thanos_engine_from_env() {
         Ok(Some(thanos)) => {
             use query_engine_rust::engines::gorilla::DATA_SOURCE_THANOS_ARCHIVE_ID;
@@ -716,11 +719,6 @@ async fn main() -> Result<()> {
                 upstream = thanos.base_url(),
                 "Path A2: registering ThanosForwardEngine for the archive tier (data_source_id=thanos_archive, alias=gorilla_archive); legacy in-process GorillaQueryEngine skipped",
             );
-            // Two registrations of the same engine instance: one
-            // under its native id (explicit overrides) and one
-            // aliased onto the legacy archive slot so the
-            // `compatible_storage_backends` failover sequence finds
-            // it transparently.
             let thanos_arc: Arc<dyn QueryEngine> = Arc::new(thanos);
             server = server
                 .with_query_engine_aliased(
@@ -731,10 +729,9 @@ async fn main() -> Result<()> {
                     asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
                     thanos_arc,
                 );
+            archive_registered = true;
         }
         Ok(None) => {
-            // Legacy path: register the in-process Gorilla engine
-            // when its env vars are present.
             match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
                 Ok(s3_cfg) => {
                     match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
@@ -749,6 +746,7 @@ async fn main() -> Result<()> {
                                 "Registering legacy in-process GorillaQueryEngine on the capability router (data_source_id=gorilla_archive); set ASAP_THANOS_QUERY_URL to switch to Path A2 thanos forwarding",
                             );
                             server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
+                            archive_registered = true;
                         }
                         Err(e) => {
                             warn!(
@@ -767,6 +765,32 @@ async fn main() -> Result<()> {
         Err(e) => {
             warn!(
                 "ASAP_THANOS_QUERY_URL set but ThanosForwardEngine failed to build ({e}); router will not have an archive engine",
+            );
+        }
+    }
+
+    // No archive engine configured — register a `NoDataArchiveEngine`
+    // stub under the `gorilla_archive` alias so cold queries succeed
+    // with an empty result. `ASAP_REQUIRE_ARCHIVE_ENGINE=1` opts back
+    // into the original fail-loud (`503 NoEngineRegistered`) behaviour.
+    if !archive_registered {
+        let require_archive = std::env::var("ASAP_REQUIRE_ARCHIVE_ENGINE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if require_archive {
+            warn!(
+                "ASAP_REQUIRE_ARCHIVE_ENGINE=1 set and no archive engine configured — cold queries will return 503 NoEngineRegistered",
+            );
+        } else {
+            use query_engine_rust::engines::NoDataArchiveEngine;
+            use query_engine_rust::routing::QueryEngine;
+            info!(
+                "Registering NoDataArchiveEngine stub on the archive slot (data_source_id=no_data_archive, alias=gorilla_archive); set ASAP_REQUIRE_ARCHIVE_ENGINE=1 to disable",
+            );
+            let stub: Arc<dyn QueryEngine> = Arc::new(NoDataArchiveEngine::new());
+            server = server.with_query_engine_aliased(
+                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                stub,
             );
         }
     }

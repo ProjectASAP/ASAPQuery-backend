@@ -25,6 +25,7 @@
 
 pub mod gorilla;
 pub mod logical;
+pub mod no_data_archive;
 pub mod physical;
 pub mod prometheus;
 pub mod query_result;
@@ -35,6 +36,7 @@ pub mod window_merger;
 pub use gorilla::{
     EngineError as GorillaEngineError, GorillaEngineConfig, GorillaQueryEngine,
 };
+pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
 pub use prometheus::{PrometheusForwardConfig, PrometheusForwardEngine, PrometheusForwardError};
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
 pub use simple::SimpleEngine;
