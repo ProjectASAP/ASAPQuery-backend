@@ -91,7 +91,11 @@ struct Args {
     /// can generate a new sketch plan. When unset (default),
     /// capability misses fall through to the §5.2 fallback silently.
     /// Example: `http://controller.svc:8080/api/v1/plan`
-    #[arg(long)]
+    ///
+    /// Falls back to the `ASAP_CONTROLLER_URL` env var when the flag
+    /// is not passed — `deploy/docker-compose/base.yml` sets the env
+    /// var so the MVP demo doesn't need a per-arg overlay.
+    #[arg(long, env = "ASAP_CONTROLLER_URL")]
     controller_endpoint: Option<String>,
 
     /// Wire protocol for `--controller-endpoint`. `generic` (default)
