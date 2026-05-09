@@ -28,16 +28,9 @@ use promql_utilities::query_logics::parsing::{
     get_metric_and_spatial_filter, get_spatial_aggregation_output_labels, get_statistics_to_compute,
 };
 
-use sql_utilities::ast_matching::QueryType;
-use sql_utilities::ast_matching::{SQLPatternMatcher, SQLPatternParser, SQLQuery};
-use sql_utilities::sqlhelper::{AggregationInfo, SQLQueryData};
-use sqlparser::dialect::*;
-use sqlparser::parser::Parser as parser;
 
 // SQL issue: refactor simpleengine to create matchresult similar to SQLquerydata
 
-use elastic_dsl_utilities::pattern::parse_and_classify;
-use elastic_dsl_utilities::types::{EsDslQueryPattern, GroupBySpec, MetricAggType};
 
 // Type alias for merged outputs (single aggregate per key after merging)
 type MergedOutputsMap = HashMap<Option<KeyByLabelValues>, Box<dyn AggregateCore>>;
@@ -711,27 +704,6 @@ impl SimpleEngine {
     /// each template in query_configs and compares it structurally against the incoming
     /// query_data — ignoring absolute timestamps and comparing only metric, aggregation,
     /// labels, time column name, and duration.
-    fn find_query_config_sql(&self, query_data: &SQLQueryData) -> Option<&QueryConfig> {
-        let schema = match &self.inference_config.schema {
-            SchemaConfig::SQL(sql_schema) => sql_schema,
-            _ => return None,
-        };
-
-        self.inference_config.query_configs.iter().find(|config| {
-            let template_statements =
-                match parser::parse_sql(&GenericDialect {}, config.query.as_str()) {
-                    Ok(stmts) => stmts,
-                    Err(_) => return false,
-                };
-            let template_data =
-                match SQLPatternParser::new(schema, 0.0).parse_query(&template_statements) {
-                    Some(data) => data,
-                    None => return false,
-                };
-            query_data.matches_sql_pattern(&template_data)
-        })
-    }
-
     /// Validates and potentially aligns end timestamp based on query pattern
     fn validate_and_align_end_timestamp(
         &self,
@@ -782,37 +754,6 @@ impl SimpleEngine {
     }
 
     /// Calculates start timestamp for SQL queries
-    fn calculate_start_timestamp_sql(
-        &self,
-        end_timestamp: u64,
-        query_pattern_type: QueryPatternType,
-        match_result: &SQLQuery,
-    ) -> u64 {
-        match query_pattern_type {
-            QueryPatternType::OnlyTemporal => {
-                let scrape_intervals = match_result
-                    .outer_data()
-                    .expect("OnlyTemporal pattern guarantees outer_data is present")
-                    .time_info
-                    .clone()
-                    .get_duration() as u64;
-                end_timestamp - (scrape_intervals * self.prometheus_scrape_interval * 1000)
-            }
-            QueryPatternType::OneTemporalOneSpatial => {
-                let scrape_intervals = match_result
-                    .inner_data()
-                    .expect("OneTemporalOneSpatial pattern guarantees inner_data is present")
-                    .time_info
-                    .clone()
-                    .get_duration() as u64;
-                end_timestamp - (scrape_intervals * self.prometheus_scrape_interval * 1000)
-            }
-            QueryPatternType::OnlySpatial => {
-                end_timestamp - (self.prometheus_scrape_interval * 1000)
-            }
-        }
-    }
-
     /// Calculates and validates query timestamps for PromQL
     fn calculate_query_timestamps_promql(
         &self,
@@ -834,24 +775,6 @@ impl SimpleEngine {
         end_timestamp = self.validate_and_align_end_timestamp(end_timestamp, query_pattern_type);
         let start_timestamp =
             self.calculate_start_timestamp_promql(end_timestamp, query_pattern_type, match_result);
-
-        QueryTimestamps {
-            start_timestamp,
-            end_timestamp,
-        }
-    }
-
-    /// Calculates and validates query timestamps for SQL
-    fn calculate_query_timestamps_sql(
-        &self,
-        query_time: u64,
-        query_pattern_type: QueryPatternType,
-        match_result: &SQLQuery,
-    ) -> QueryTimestamps {
-        let mut end_timestamp = query_time;
-        end_timestamp = self.validate_and_align_end_timestamp(end_timestamp, query_pattern_type);
-        let start_timestamp =
-            self.calculate_start_timestamp_sql(end_timestamp, query_pattern_type, match_result);
 
         QueryTimestamps {
             start_timestamp,
@@ -881,14 +804,6 @@ impl SimpleEngine {
         };
 
         quantile_value.map(|s| s.to_string())
-    }
-
-    /// Extracts quantile parameter from SQL match result
-    fn extract_quantile_param_sql(&self, match_result: &SQLQuery) -> Option<String> {
-        match_result
-            .query_data
-            .first()
-            .map(|data| data.aggregation_info.get_args()[0].to_string())
     }
 
     /// Extracts topk k parameter from PromQL match result
@@ -963,24 +878,6 @@ impl SimpleEngine {
     }
 
     /// Builds query kwargs for SQL queries
-    fn build_query_kwargs_sql(
-        &self,
-        statistic: &Statistic,
-        match_result: &SQLQuery,
-    ) -> Result<HashMap<String, String>, String> {
-        let mut query_kwargs = HashMap::new();
-
-        if *statistic == Statistic::Quantile {
-            let quantile = self
-                .extract_quantile_param_sql(match_result)
-                .ok_or_else(|| "Missing quantile parameter for quantile query".to_string())?;
-            query_kwargs.insert("quantile".to_string(), quantile);
-        }
-        // Note: SQL doesn't support topk limiting yet
-
-        Ok(query_kwargs)
-    }
-
     /// Creates query parameters for separate keys query
     fn create_keys_query_params(
         &self,
@@ -2024,22 +1921,6 @@ impl SimpleEngine {
             .collect()
     }
 
-    fn sql_get_is_collapsable(
-        &self,
-        temporal_aggregation: &AggregationInfo,
-        spatial_aggregation: &AggregationInfo,
-    ) -> bool {
-        match spatial_aggregation.get_name() {
-            "SUM" => matches!(
-                temporal_aggregation.get_name(),
-                "SUM" | "COUNT" // Note: "increase" and "rate" are commented out in Python
-            ),
-            "MIN" => temporal_aggregation.get_name() == "MIN",
-            "MAX" => temporal_aggregation.get_name() == "MAX",
-            _ => false,
-        }
-    }
-
     /// Extract QueryRequirements from a parsed PromQL match result.
     /// Used as the fallback path when no query_configs entry is found.
     fn build_query_requirements_promql(
@@ -2082,86 +1963,6 @@ impl SimpleEngine {
             data_range_ms,
             grouping_labels,
             spatial_filter_normalized: normalize_spatial_filter(&spatial_filter),
-        }
-    }
-
-    /// Parse a lowercase aggregation name into exactly one `Statistic`.
-    ///
-    /// Returns `None` (with a warning) if the name is not a recognised
-    /// `AggregationOperator` or if it maps to a number of statistics other
-    /// than one. Centralises the three previously-scattered copies of this
-    /// logic, which had inconsistent error handling (silent empty vec, panic,
-    /// and warn+return-None).
-    fn parse_single_statistic(statistic_name: &str) -> Option<Statistic> {
-        let stats = statistic_name
-            .parse::<AggregationOperator>()
-            .map(|o| o.to_statistics())
-            .unwrap_or_else(|_| {
-                warn!("Unsupported statistic name: '{}'", statistic_name);
-                vec![]
-            });
-        if stats.len() != 1 {
-            warn!(
-                "Expected exactly one statistic for '{}', found {}",
-                statistic_name,
-                stats.len()
-            );
-            return None;
-        }
-        stats.into_iter().next()
-    }
-
-    /// Extract QueryRequirements from a parsed SQL match result.
-    /// Used as the fallback path when no query_configs entry is found.
-    fn build_query_requirements_sql(
-        &self,
-        match_result: &SQLQuery,
-        query_pattern_type: QueryPatternType,
-    ) -> QueryRequirements {
-        let query_data = match_result
-            .outer_data()
-            .expect("build_query_requirements_sql called on valid SQLQuery");
-        let metric = query_data.metric.clone();
-
-        let statistic_name = match query_pattern_type {
-            QueryPatternType::OneTemporalOneSpatial => match_result
-                .inner_data()
-                .expect("OneTemporalOneSpatial pattern guarantees inner_data is present")
-                .aggregation_info
-                .get_name()
-                .to_lowercase(),
-            _ => query_data.aggregation_info.get_name().to_lowercase(),
-        };
-
-        let statistics: Vec<Statistic> = Self::parse_single_statistic(&statistic_name)
-            .into_iter()
-            .collect();
-
-        let data_range_ms = match query_pattern_type {
-            QueryPatternType::OnlySpatial => None,
-            QueryPatternType::OnlyTemporal => {
-                let scrape_intervals = query_data.time_info.clone().get_duration() as u64;
-                Some(scrape_intervals * self.prometheus_scrape_interval * 1000)
-            }
-            QueryPatternType::OneTemporalOneSpatial => {
-                let scrape_intervals = match_result
-                    .inner_data()
-                    .expect("OneTemporalOneSpatial pattern guarantees inner_data is present")
-                    .time_info
-                    .clone()
-                    .get_duration() as u64;
-                Some(scrape_intervals * self.prometheus_scrape_interval * 1000)
-            }
-        };
-
-        let grouping_labels = KeyByLabelNames::new(query_data.labels.clone().into_iter().collect());
-
-        QueryRequirements {
-            metric,
-            statistics,
-            data_range_ms,
-            grouping_labels,
-            spatial_filter_normalized: normalize_spatial_filter(""),
         }
     }
 
@@ -2244,18 +2045,9 @@ impl SimpleEngine {
         })
     }
 
-    pub fn handle_query_sql(
-        &self,
-        query: String,
-        time: f64,
-    ) -> Option<(KeyByLabelNames, QueryResult)> {
-        let context = self.build_query_execution_context_sql(query, time)?;
-        self.execute_context(context, false)
-    }
-
     /// Execute the query pipeline for an already-built context.
     ///
-    /// Shared by `handle_query_sql`, `handle_query_elastic`, and `handle_query_promql`.
+    /// Shared by all `handle_query_*` entry points.
     fn execute_context(
         &self,
         context: QueryExecutionContext,
@@ -2297,538 +2089,22 @@ impl SimpleEngine {
         ))
     }
 
-    pub fn build_query_execution_context_sql(
-        &self,
-        query: String,
-        time: f64,
-    ) -> Option<QueryExecutionContext> {
-        // Get SQL schema from inference config
-        let schema = match &self.inference_config.schema {
-            SchemaConfig::SQL(sql_schema) => sql_schema.clone(),
-            SchemaConfig::PromQL(_) => {
-                warn!("SQL query requested but config has PromQL schema");
-                return None;
-            }
-            &SchemaConfig::ElasticQueryDSL => todo!(),
-            SchemaConfig::ElasticSQL(sql_schema) => sql_schema.clone(),
-        };
-
-        let statements = parser::parse_sql(&GenericDialect {}, query.as_str()).unwrap();
-        let query_data = SQLPatternParser::new(&schema, time).parse_query(&statements);
-
-        let query_data = match query_data {
-            Some(data) => data,
-            None => {
-                debug!("Could not parse query");
-                return None;
-            }
-        };
-
-        let matcher = SQLPatternMatcher::new(schema, self.prometheus_scrape_interval as f64);
-        let match_result = matcher.query_info_to_pattern(&query_data);
-
-        debug!("Match result: {:?}", match_result);
-        debug!("Validity: {}", match_result.is_valid());
-
-        if !match_result.is_valid() {
-            return None;
-        }
-
-        // Handle SpatioTemporal queries separately - they bypass QueryPatternType mapping
-        if match_result.query_type == vec![QueryType::SpatioTemporal] {
-            let query_time = Self::convert_query_time_to_data_time(
-                query_data.time_info.get_start() + query_data.time_info.get_duration(),
-            );
-            return self.build_spatiotemporal_context(&match_result, query_time, &query_data);
-        }
-
-        let query_pattern_type = match &match_result.query_type[..] {
-            [x] => match x {
-                QueryType::Spatial => QueryPatternType::OnlySpatial,
-                QueryType::TemporalGeneric => QueryPatternType::OnlyTemporal,
-                QueryType::TemporalQuantile => QueryPatternType::OnlyTemporal,
-                QueryType::SpatioTemporal => unreachable!("SpatioTemporal handled above"),
-            },
-            [x, y] => match (x, y) {
-                (QueryType::Spatial, QueryType::TemporalGeneric) => {
-                    QueryPatternType::OneTemporalOneSpatial
-                }
-                (QueryType::Spatial, QueryType::TemporalQuantile) => {
-                    QueryPatternType::OneTemporalOneSpatial
-                }
-                _ => panic!("Unsupported query type found"),
-            },
-            _ => panic!("Unsupported query type found"),
-        };
-
-        // For nested queries (spatial of temporal), the outer query has no time clause,
-        // so we need to use the inner (temporal) query's time_info to compute query_time
-        let query_time = match query_pattern_type {
-            QueryPatternType::OneTemporalOneSpatial => {
-                let inner_time_info = &match_result.inner_data()?.time_info;
-                Self::convert_query_time_to_data_time(
-                    inner_time_info.get_start() + inner_time_info.get_duration(),
-                )
-            }
-            _ => Self::convert_query_time_to_data_time(
-                query_data.time_info.get_start() + query_data.time_info.get_duration(),
-            ),
-        };
-
-        //     self.handle_sql_temporal_aggregation(
-        //         query_config,
-        //         &match_result,
-        //         query_time,
-        //         query_pattern_type,
-        //     )
-        // }
-
-        // fn handle_sql_temporal_aggregation(
-        //     &self,
-        //     query_config: &QueryConfig,
-        //     match_result: &SQLQuery,
-        //     query_time: u64,
-        //     query_pattern_type: QueryPatternType,
-        // ) -> Option<(KeyByLabelNames, QueryResult)> {
-        // Labels
-
-        let query_output_labels = match &match_result.query_type.len() {
-            // Potentially change SQLQueryType
-            1 => {
-                // For non-nested queries, output associated labels
-                let labels = &match_result.outer_data()?.labels;
-
-                KeyByLabelNames::new(labels.clone().into_iter().collect())
-            }
-            2 => {
-                // Extract spatial aggregation output labels using AST-based approach
-                let temporal_labels = &match_result.inner_data()?.labels;
-                let spatial_labels = &match_result.outer_data()?.labels;
-
-                let temporal_aggregation = &match_result.inner_data()?.aggregation_info;
-                let spatial_aggregation = &match_result.outer_data()?.aggregation_info;
-
-                match self.sql_get_is_collapsable(temporal_aggregation, spatial_aggregation) {
-                    // If false: get all labels, which are all temporal labels. If true, get only spatial labels
-                    false => KeyByLabelNames::new(temporal_labels.clone().into_iter().collect()),
-                    true => KeyByLabelNames::new(spatial_labels.clone().into_iter().collect()),
-                }
-            }
-            _ => {
-                warn!("Invalid query type: {}", query_pattern_type);
-                KeyByLabelNames::new(Vec::new())
-            }
-        };
-
-        // Statistic - determine based on query pattern type
-        let statistic_name = match query_pattern_type {
-            QueryPatternType::OnlyTemporal => {
-                // Use the temporal aggregation (first subquery)
-                match_result
-                    .outer_data()?
-                    .aggregation_info
-                    .get_name()
-                    .to_lowercase()
-            }
-            QueryPatternType::OneTemporalOneSpatial => {
-                // Use the temporal aggregation (second subquery contains temporal)
-                match_result
-                    .inner_data()?
-                    .aggregation_info
-                    .get_name()
-                    .to_lowercase()
-            }
-            QueryPatternType::OnlySpatial => {
-                // Use the spatial aggregation (first subquery)
-                match_result
-                    .outer_data()?
-                    .aggregation_info
-                    .get_name()
-                    .to_lowercase()
-            }
-        };
-
-        let statistic_to_compute = Self::parse_single_statistic(&statistic_name)?;
-
-        let query_kwargs = self
-            .build_query_kwargs_sql(&statistic_to_compute, &match_result)
-            .map_err(|e| {
-                warn!("{}", e);
-                e
-            })
-            .ok()?;
-
-        // Create query metadata
-        let metadata = QueryMetadata {
-            query_output_labels: query_output_labels.clone(),
-            statistic_to_compute,
-            query_kwargs: query_kwargs.clone(),
-        };
-
-        // Time
-        let timestamps =
-            self.calculate_query_timestamps_sql(query_time, query_pattern_type, &match_result);
-
-        // Resolve aggregation: try pre-configured query_configs first, fall back to capability matching.
-        let agg_info: AggregationIdInfo = if let Some(config) =
-            self.find_query_config_sql(&query_data)
-        {
-            self.get_aggregation_id_info(config)
-                .map_err(|e| {
-                    warn!("{}", e);
-                    e
-                })
-                .ok()?
-        } else {
-            warn!("No query_config entry for SQL query. Attempting capability-based matching.");
-            let requirements = self.build_query_requirements_sql(&match_result, query_pattern_type);
-            self.find_compatible_aggregation_with_miss_notify(&requirements)?
-        };
-
-        let metric = &match_result.outer_data()?.metric;
-
-        let spatial_filter = if query_pattern_type == QueryPatternType::OneTemporalOneSpatial {
-            match_result
-                .outer_data()?
-                .labels
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        } else {
-            String::new()
-        };
-
-        let do_merge = query_pattern_type == QueryPatternType::OnlyTemporal
-            || query_pattern_type == QueryPatternType::OneTemporalOneSpatial;
-
-        self.build_sql_execution_context_tail(
-            metric,
-            &timestamps,
-            metadata,
-            agg_info,
-            do_merge,
-            spatial_filter,
-            query_time,
-        )
-    }
-
-    /// Shared context-building tail for both SQL context builders.
+    /// Handle a query following Python's unified architecture.
     ///
-    /// Called by `build_query_execution_context_sql` and `build_spatiotemporal_context`
-    /// after labels, statistic, metadata, timestamps, and `agg_info` are resolved.
-    /// Builds the query plan, derives grouping/aggregated labels, and returns the
-    /// final `QueryExecutionContext`.
-    #[allow(clippy::too_many_arguments)]
-    fn build_sql_execution_context_tail(
-        &self,
-        metric: &str,
-        timestamps: &QueryTimestamps,
-        metadata: QueryMetadata,
-        agg_info: AggregationIdInfo,
-        do_merge: bool,
-        spatial_filter: String,
-        query_time: u64,
-    ) -> Option<QueryExecutionContext> {
-        let query_plan = self
-            .create_store_query_plan(metric, timestamps, &agg_info)
-            .map_err(|e| {
-                warn!("Failed to create store query plan: {}", e);
-                e
-            })
-            .ok()?;
-
-        let streaming_config = self.streaming_config_snapshot();
-        let grouping_labels = streaming_config
-            .get_aggregation_config(agg_info.aggregation_id_for_value)
-            .map(|config| config.grouping_labels.clone())
-            .unwrap_or_else(|| metadata.query_output_labels.clone());
-
-        let aggregated_labels = streaming_config
-            .get_aggregation_config(agg_info.aggregation_id_for_key)
-            .map(|config| config.aggregated_labels.clone())
-            .unwrap_or_else(KeyByLabelNames::empty);
-
-        Some(QueryExecutionContext {
-            metric: metric.to_string(),
-            metadata,
-            store_plan: query_plan,
-            agg_info,
-            do_merge,
-            spatial_filter,
-            query_time,
-            grouping_labels,
-            aggregated_labels,
-        })
-    }
-
-    /// Build execution context for SpatioTemporal queries.
-    /// These queries span multiple scrape intervals but GROUP BY a subset of labels.
-    fn build_spatiotemporal_context(
-        &self,
-        match_result: &SQLQuery,
-        query_time: u64,
-        query_data: &SQLQueryData,
-    ) -> Option<QueryExecutionContext> {
-        // Output labels are the GROUP BY columns (subset of all labels)
-        let query_output_labels = KeyByLabelNames::new(
-            match_result
-                .outer_data()?
-                .labels
-                .clone()
-                .into_iter()
-                .collect(),
-        );
-
-        // Get the statistic from the aggregation
-        let statistic_name = match_result
-            .outer_data()?
-            .aggregation_info
-            .get_name()
-            .to_lowercase();
-
-        let statistic_to_compute = Self::parse_single_statistic(&statistic_name)?;
-
-        let query_kwargs = self
-            .build_query_kwargs_sql(&statistic_to_compute, match_result)
-            .map_err(|e| {
-                warn!("{}", e);
-                e
-            })
-            .ok()?;
-
-        let metadata = QueryMetadata {
-            query_output_labels: query_output_labels.clone(),
-            statistic_to_compute,
-            query_kwargs: query_kwargs.clone(),
-        };
-
-        // Calculate timestamps - similar to OnlyTemporal
-        let end_timestamp =
-            self.validate_and_align_end_timestamp(query_time, QueryPatternType::OnlyTemporal);
-        let scrape_intervals = match_result.outer_data()?.time_info.get_duration() as u64;
-        let start_timestamp =
-            end_timestamp - (scrape_intervals * self.prometheus_scrape_interval * 1000);
-
-        let timestamps = QueryTimestamps {
-            start_timestamp,
-            end_timestamp,
-        };
-
-        // Resolve aggregation: try pre-configured query_configs first, fall back to capability matching.
-        let agg_info: AggregationIdInfo = if let Some(config) =
-            self.find_query_config_sql(query_data)
-        {
-            self.get_aggregation_id_info(config)
-                .map_err(|e| {
-                    warn!("{}", e);
-                    e
-                })
-                .ok()?
-        } else {
-            warn!(
-                    "No query_config entry for SQL spatio-temporal query. Attempting capability-based matching."
-                );
-            let requirements =
-                self.build_query_requirements_sql(match_result, QueryPatternType::OnlyTemporal);
-            self.find_compatible_aggregation_with_miss_notify(&requirements)?
-        };
-        let metric = &match_result.outer_data()?.metric;
-
-        self.build_sql_execution_context_tail(
-            metric,
-            &timestamps,
-            metadata,
-            agg_info,
-            true,
-            String::new(),
-            query_time,
-        )
-    }
-
-    /// Handle a query following Python's unified architecture
-    // pub async fn handle_query(
+    /// SQL / Elasticsearch query languages were removed during the
+    /// dead-code cleanup (only PromQL is wired in production); the
+    /// legacy variants remain on the `QueryLanguage` enum but resolve
+    /// to a logged `None` here.
     pub fn handle_query(&self, query: String, time: f64) -> Option<(KeyByLabelNames, QueryResult)> {
         match self.query_language {
             QueryLanguage::promql => self.handle_query_promql(query, time),
-            QueryLanguage::sql => self.handle_query_sql(query, time),
-            QueryLanguage::elastic_querydsl => self.handle_query_elastic(query, time),
-            QueryLanguage::elastic_sql => self.handle_query_sql(query, time),
-        }
-    }
-
-    pub fn handle_query_elastic(
-        &self,
-        query: String,
-        time: f64,
-    ) -> Option<(KeyByLabelNames, QueryResult)> {
-        let context = self.build_query_execution_context_elastic(query, time)?;
-        debug!(
-            "Built execution context for ElasticSearch query {:?}",
-            context
-        );
-        self.execute_context(context, false)
-    }
-
-    pub fn build_query_execution_context_elastic(
-        &self,
-        query: String,
-        time: f64,
-    ) -> Option<QueryExecutionContext> {
-        let query_time = Self::convert_query_time_to_data_time(time);
-
-        // 1. Parse query DSL somehow. Elasticsearch DSL crate does not support deserializing, but maybe can use Opensearch instead?
-        // 2. Determine whether query is supported using some AST representation or hardcoded pattern matching.
-        let query_pattern: EsDslQueryPattern =
-            parse_and_classify(&query).unwrap_or(EsDslQueryPattern::Unknown);
-        match query_pattern {
-            EsDslQueryPattern::Unknown => {
-                debug!("Could not parse query into known pattern");
-                return None;
-            }
-            _ => {
-                debug!("Parsed query pattern: {:?}", query_pattern);
-            }
-        }
-
-        // 3. Convert parsed query into execution context components (labels, statistic, kwargs, metadata, store query plan, etc.)
-
-        // TODO: Figure out how to handle query configuration for ElasticSearch queries.
-        let query_config = self.find_query_config(&query)?;
-        let agg_info = self
-            .get_aggregation_id_info(query_config)
-            .map_err(|e| {
-                warn!("{}", e);
-                e
-            })
-            .ok()?;
-
-        let do_merge = true; // No "instant" queries in ElasticSearch supported for now, so we always need to merge.
-
-        let (metric, query_metadata) = self.build_query_metadata_elastic(&query_pattern)?;
-
-        let spatial_filter = String::new(); // Placeholder - extract from query if applicable
-
-        // TODO: Need way to parse ES DSL "date math".
-        let timestamps = self.resolve_query_time_range_elastic(query_time, query_pattern);
-
-        let query_plan = self
-            .create_store_query_plan(&metric, &timestamps, &agg_info)
-            .map_err(|e| {
-                warn!("Failed to create store query plan: {}", e);
-                e
-            })
-            .ok()?;
-
-        let streaming_config = self.streaming_config_snapshot();
-        let grouping_labels = streaming_config
-            .get_aggregation_config(agg_info.aggregation_id_for_value)
-            .map(|config| config.grouping_labels.clone())
-            .unwrap_or_else(|| query_metadata.query_output_labels.clone());
-
-        let aggregated_labels = streaming_config
-            .get_aggregation_config(agg_info.aggregation_id_for_key)
-            .map(|config| config.aggregated_labels.clone())
-            .unwrap_or_else(KeyByLabelNames::empty);
-
-        Some(QueryExecutionContext {
-            metric,
-            metadata: query_metadata,
-            store_plan: query_plan.clone(),
-            agg_info: agg_info.clone(),
-            do_merge,
-            spatial_filter,
-            query_time,
-            grouping_labels,
-            aggregated_labels,
-        })
-    }
-
-    fn build_query_metadata_elastic(
-        &self,
-        query_pattern: &EsDslQueryPattern,
-    ) -> Option<(String, QueryMetadata)> {
-        // Constructs QueryMetadata based on the parsed ES DSL query pattern. This includes determining the
-        // metric to query, the statistic to compute, and any relevant query kwargs (e.g. quantile value for percentiles).
-
-        // Figure out aggregation type and what labels are included in output.
-        // By default, we only include grouping labels in the output for ES DSL.
-
-        // Take first aggregation by default since current engine doesn't support multiple aggregations in a single query.
-        let aggregation = query_pattern.get_metric_aggs()?.first()?.clone();
-
-        // By default, we only include grouping labels in the output for ES DSL.
-        let query_output_labels = match query_pattern.get_groupby_spec() {
-            Some(GroupBySpec::Terms { field }) => KeyByLabelNames::new(vec![field.clone()]),
-            Some(GroupBySpec::MultiTerms { fields }) => KeyByLabelNames::new(fields.to_vec()),
-            None => KeyByLabelNames::empty(),
-        };
-
-        let metric = aggregation.field.clone();
-
-        // Map ElasticSearch aggregation types to our internal Statistic enum.
-        let statistic_to_compute = match aggregation.agg_type {
-            MetricAggType::Percentiles => Statistic::Quantile,
-            MetricAggType::Avg => Statistic::Rate,
-            MetricAggType::Sum => Statistic::Sum,
-            MetricAggType::Min => Statistic::Min,
-            MetricAggType::Max => Statistic::Max,
-        };
-
-        let mut query_kwargs = HashMap::new(); // Placeholder - build based on query and statistic
-        if aggregation.agg_type == MetricAggType::Percentiles {
-            // Extract quantile value from aggregation parameters and add to query_kwargs
-            if let Some(params) = &aggregation.params {
-                if let Some(percents) = params.get("percents") {
-                    // Get first value from percents array since we only support one quantile argument for now.
-                    let quantile = percents
-                        .as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_f64());
-                    // ES percentiles are specified as values between 0 and 100, but we want to convert to 0-1 range for our internal representation.
-                    query_kwargs.insert("quantile".to_string(), (quantile? / 100.0).to_string());
-                }
-            }
-        }
-
-        let metadata = QueryMetadata {
-            query_output_labels: query_output_labels.clone(),
-            statistic_to_compute,
-            query_kwargs: query_kwargs.clone(),
-        };
-        Some((metric, metadata))
-    }
-
-    pub fn resolve_query_time_range_elastic(
-        &self,
-        query_time: u64,
-        query_pattern: EsDslQueryPattern,
-    ) -> QueryTimestamps {
-        // Resolves the actual start and end timestamps into milliseconds for an ElasticSearch query
-        // based on the provided query_time and the time range specified in the ES DSL query pattern (if any).
-        // If no time range is specified, default to entire history up to query_time.
-
-        let mut start_timestamp: u64 = 0;
-        let mut end_timestamp: u64 = query_time;
-
-        let time_range = query_pattern.get_time_range();
-        if let Some(tr) = time_range {
-            if let Some(resolved_range) = tr.resolve_epoch_millis(query_time as i64) {
-                debug!(
-                    "Parsed time range from query: start={} end={}",
-                    resolved_range.gte_ms.unwrap_or(0),
-                    resolved_range.lte_ms.unwrap_or(0)
+            QueryLanguage::sql | QueryLanguage::elastic_querydsl | QueryLanguage::elastic_sql => {
+                warn!(
+                    "handle_query: query language {:?} is no longer supported; returning None",
+                    self.query_language
                 );
-                start_timestamp = resolved_range.gte_ms.unwrap_or(0) as u64;
-                end_timestamp = resolved_range.lte_ms.unwrap_or(query_time as i64) as u64;
-            } else {
-                debug!("Failed to resolve time range from query");
+                None
             }
-        };
-
-        QueryTimestamps {
-            start_timestamp,
-            end_timestamp,
         }
     }
 

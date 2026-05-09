@@ -79,12 +79,8 @@ pub trait FallbackClient: Send + Sync {
     }
 }
 
-mod clickhouse;
-mod elastic;
 mod prometheus;
 
 pub mod metrics;
 
-pub use clickhouse::ClickHouseHttpFallback;
-pub use elastic::ElasticHttpFallback;
 pub use prometheus::PrometheusHttpFallback;

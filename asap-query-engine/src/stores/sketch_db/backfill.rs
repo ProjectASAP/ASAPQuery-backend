@@ -69,8 +69,6 @@ pub enum BackfillSource {
     /// Prometheus (or VictoriaMetrics / Thanos / Cortex) via the
     /// HTTP range-query API.
     Prometheus { url: String },
-    /// ClickHouse via native HTTP / SQL.
-    ClickHouse { url: String, table: String },
     /// Rebuild from a different sketch already in the store. Used for
     /// lossless schema widenings (e.g. CMS(256) → CMS(2048)) where
     /// the source sketch is a strict subset of the target's
@@ -1119,10 +1117,6 @@ mod tests {
             BackfillSource::S3Gorilla {
                 bucket: "b".to_string(),
                 prefix: "p".to_string(),
-            },
-            BackfillSource::ClickHouse {
-                url: "ch://x".to_string(),
-                table: "t".to_string(),
             },
             BackfillSource::OtherSketch { source_agg_id: 17 },
         ] {
