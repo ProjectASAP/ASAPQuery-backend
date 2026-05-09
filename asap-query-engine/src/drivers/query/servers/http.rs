@@ -9,7 +9,7 @@ use axum::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
@@ -23,6 +23,73 @@ use crate::routing::{
 use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
+
+// ─── Controller-pushed precompute job registry ────────────────────────────
+//
+// The controller's `PrecomputeClient` (controller/src/config/precompute.rs)
+// registers / cancels precompute jobs via:
+//
+// * `POST   /api/v1/precompute/jobs` — body
+//   `{query, granularity, source, sketch_type, store_path}`; response
+//   `{job_id, status, created_at}`.
+// * `DELETE /api/v1/precompute/jobs/{job_id}` — 204 on success, 404
+//   when the id is unknown.
+//
+// The handler is intentionally minimal: it tracks the spec in an
+// in-memory map and acknowledges the call. No precompute work is
+// scheduled — that's a later wiring. The goal is to make the
+// controller's calls succeed instead of 404 so the controller can
+// progress its plan-push loop end-to-end.
+
+/// Body shape posted by the controller's `PrecomputeClient::register`.
+/// Matches `controller/src/config/precompute.rs::JobRequest`.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct PrecomputeJobSpec {
+    pub query: String,
+    pub granularity: String,
+    pub source: String,
+    pub sketch_type: String,
+    pub store_path: String,
+}
+
+/// In-memory map of `job_id → spec`, populated by the
+/// `POST /api/v1/precompute/jobs` handler and drained by the matching
+/// DELETE handler. Wrapped in an `Arc<RwLock<...>>` so the axum state
+/// can clone freely; the lock is held briefly per request and is
+/// uncontended in practice (job count is small).
+#[derive(Clone, Default)]
+pub struct PrecomputeJobRegistry {
+    inner: Arc<RwLock<HashMap<String, PrecomputeJobSpec>>>,
+}
+
+impl PrecomputeJobRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert a new job with a fresh UUID. Returns the generated id.
+    pub fn insert(&self, spec: PrecomputeJobSpec) -> String {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let mut guard = self.inner.write().expect("poisoned");
+        guard.insert(job_id.clone(), spec);
+        job_id
+    }
+
+    /// Remove a job. Returns `true` when the id was present.
+    pub fn remove(&self, job_id: &str) -> bool {
+        let mut guard = self.inner.write().expect("poisoned");
+        guard.remove(job_id).is_some()
+    }
+}
+
+impl std::fmt::Debug for PrecomputeJobRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.inner.read().map(|g| g.len()).unwrap_or(0);
+        f.debug_struct("PrecomputeJobRegistry")
+            .field("jobs", &n)
+            .finish()
+    }
+}
 
 /// Per-query engine override header (Phase-6 accuracy reducer).
 ///
@@ -146,6 +213,12 @@ pub struct HttpServer {
     /// normal routing-table path (which goes to Thanos for the cold
     /// archive and observes the 60–90 s flush gap).
     probe_cache: Option<Arc<FreshnessProbeCache>>,
+    /// In-memory job-spec map populated by the controller's
+    /// `POST /api/v1/precompute/jobs` calls. Always present (an empty
+    /// `Default` registry is fine for binaries that never wire the
+    /// controller). Future PRs will plumb this into the precompute
+    /// engine; today the handler just acks the call.
+    precompute_jobs: PrecomputeJobRegistry,
 }
 
 #[derive(Clone)]
@@ -173,6 +246,8 @@ struct AppState {
     data_retention_ms: Option<u64>,
     /// See [`HttpServer::probe_cache`].
     probe_cache: Option<Arc<FreshnessProbeCache>>,
+    /// See [`HttpServer::precompute_jobs`].
+    precompute_jobs: PrecomputeJobRegistry,
 }
 
 impl HttpServer {
@@ -199,6 +274,7 @@ impl HttpServer {
             backfill: None,
             data_retention_ms: None,
             probe_cache: None,
+            precompute_jobs: PrecomputeJobRegistry::new(),
         }
     }
 
@@ -345,6 +421,15 @@ impl HttpServer {
         self
     }
 
+    /// Attach a [`PrecomputeJobRegistry`] used by the controller-pushed
+    /// `POST /api/v1/precompute/jobs` and matching `DELETE` endpoints.
+    /// Callers that don't override this share the per-server default
+    /// (an empty in-memory map populated by the registration handler).
+    pub fn with_precompute_jobs(mut self, registry: PrecomputeJobRegistry) -> Self {
+        self.precompute_jobs = registry;
+        self
+    }
+
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         srv_metrics::register_all();
 
@@ -373,6 +458,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
+            precompute_jobs: self.precompute_jobs.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -391,6 +477,18 @@ impl HttpServer {
             .route("/internal/s3_cost.csv", get(handle_s3_cost_csv))
             // Controller integration endpoints
             .route("/api/v1/precompute", post(handle_precompute_job))
+            // Controller's `PrecomputeClient` (controller/src/config/precompute.rs)
+            // posts to `/jobs` and DELETEs by job_id. Tracks the spec
+            // in memory; the `/api/v1/precompute` route stays for
+            // legacy `{query_expr, granularity_secs, start, end}` callers.
+            .route(
+                "/api/v1/precompute/jobs",
+                post(handle_post_precompute_job_register),
+            )
+            .route(
+                "/api/v1/precompute/jobs/:job_id",
+                axum::routing::delete(handle_delete_precompute_job),
+            )
             .route("/api/v1/health", get(handle_health))
             .route("/api/v1/store/metrics", get(handle_store_metrics))
             .route(
@@ -452,6 +550,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
+            precompute_jobs: self.precompute_jobs.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -488,6 +587,14 @@ impl HttpServer {
             .route(
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
+            )
+            .route(
+                "/api/v1/precompute/jobs",
+                post(handle_post_precompute_job_register),
+            )
+            .route(
+                "/api/v1/precompute/jobs/:job_id",
+                axum::routing::delete(handle_delete_precompute_job),
             )
             .with_state(app_state);
 
@@ -4478,6 +4585,87 @@ aggregations:
              saw probe value {now_ms} leaked into response: {body}",
         );
     }
+
+    // ── Controller-pushed precompute job registry tests ───────────────────
+
+    /// `POST /api/v1/precompute/jobs` returns 200 + a `job_id`; the
+    /// matching DELETE returns 204 the first time and 404 on the
+    /// second call.
+    #[tokio::test]
+    async fn http_precompute_jobs_register_then_delete_roundtrip() {
+        let port = setup_test_server_with_router(
+            StorageBackend::SketchWarmTier,
+            Vec::new(),
+        )
+        .await;
+        let client = Client::new();
+
+        let body = serde_json::json!({
+            "query": "quantile_over_time(0.99, http_requests_total[5m])",
+            "granularity": "60s",
+            "source": "backend:4317",
+            "sketch_type": "ddsketch",
+            "store_path": "precomputed/http_requests_total/p99/5m",
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/precompute/jobs"))
+            .json(&body)
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(resp.status().as_u16(), 200, "register must 200");
+        let resp_body: serde_json::Value = resp.json().await.expect("json");
+        let job_id = resp_body["job_id"].as_str().expect("job_id").to_string();
+        assert!(!job_id.is_empty(), "job_id must be non-empty");
+        assert_eq!(resp_body["status"], "created");
+
+        let resp = client
+            .delete(format!(
+                "http://127.0.0.1:{port}/api/v1/precompute/jobs/{job_id}"
+            ))
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(
+            resp.status().as_u16(),
+            204,
+            "first delete must 204, got {}",
+            resp.status()
+        );
+
+        let resp = client
+            .delete(format!(
+                "http://127.0.0.1:{port}/api/v1/precompute/jobs/{job_id}"
+            ))
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "second delete must 404 (job already removed)",
+        );
+    }
+
+    /// `DELETE /api/v1/precompute/jobs/{unknown}` returns 404.
+    #[tokio::test]
+    async fn http_precompute_jobs_delete_unknown_id_returns_404() {
+        let port = setup_test_server_with_router(
+            StorageBackend::SketchWarmTier,
+            Vec::new(),
+        )
+        .await;
+        let client = Client::new();
+        let resp = client
+            .delete(format!(
+                "http://127.0.0.1:{port}/api/v1/precompute/jobs/{}",
+                "never-registered"
+            ))
+            .send()
+            .await
+            .expect("send ok");
+        assert_eq!(resp.status().as_u16(), 404);
+    }
 }
 
 // ── Controller integration: PrecomputeJob execution ──────────────────────────
@@ -4551,6 +4739,44 @@ async fn handle_precompute_job(
             });
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
+    }
+}
+
+/// `POST /api/v1/precompute/jobs` — register a controller-pushed
+/// precompute job. Body matches `controller/src/config/precompute.rs`'s
+/// `JobRequest` (`{query, granularity, source, sketch_type, store_path}`).
+/// Returns `200 OK` with `{job_id, status, created_at}`.
+///
+/// The handler is intentionally minimal: it stores the spec in an
+/// in-memory map and acknowledges. No precompute work is scheduled —
+/// future PRs will plumb this into the precompute engine.
+async fn handle_post_precompute_job_register(
+    State(state): State<AppState>,
+    axum::Json(spec): axum::Json<PrecomputeJobSpec>,
+) -> Response {
+    let job_id = state.precompute_jobs.insert(spec);
+    let body = serde_json::json!({
+        "job_id": job_id,
+        "status": "created",
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// `DELETE /api/v1/precompute/jobs/:job_id` — drop a registered job.
+/// Returns `204 No Content` on success and `404` when unknown.
+async fn handle_delete_precompute_job(
+    State(state): State<AppState>,
+    axum::extract::Path(job_id): axum::extract::Path<String>,
+) -> Response {
+    if state.precompute_jobs.remove(&job_id) {
+        (StatusCode::NO_CONTENT, ()).into_response()
+    } else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": format!("precompute job '{job_id}' not found"),
+        });
+        (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
     }
 }
 
