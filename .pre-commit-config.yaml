@@ -34,37 +34,11 @@ repos:
         language_version: python3
         files: \.(py|pyi)$
 
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2 # last version of isort that supports python 3.8
-    hooks:
-      - id: isort
-        name: isort (python)
-        files: ^asap-tools/data-sources/prometheus-exporters/.*\.py$
-        args: ["--settings-file", "asap-tools/data-sources/prometheus-exporters/.isort.cfg"]
-
   - repo: https://github.com/pycqa/flake8
     rev: 6.1.0
     hooks:
       - id: flake8
         files: \.(py|pyi)$
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: "v1.14.1"
-    hooks:
-      - id: mypy
-        files: ^asap-tools/data-sources/prometheus-exporters/.*\.py$
-        args: [--config-file=asap-tools/data-sources/prometheus-exporters/.mypy.ini]
-
-      - id: mypy
-        files: ^asap-tools/queriers/prometheus-client/
-        args: [--config-file=asap-tools/queriers/prometheus-client/pyproject.toml]
-        additional_dependencies:
-          - types-requests
-          - types-PyYAML
-          - typing-extensions
-          - numpy
-          - prometheus-client
-          - urllib3
 
   # Rust formatting, linting, and tests (workspace-level)
   - repo: local

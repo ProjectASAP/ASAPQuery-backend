@@ -1864,8 +1864,7 @@ mod tests {
 
         // POST a new config with two aggregation_ids. The YAML shape
         // matches what `StreamingConfig::from_yaml_data` parses — see
-        // `asap-common/dependencies/rs/asap_types/src/streaming_config.rs`
-        // and the sample files in `asap-tools/execution-utilities/`.
+        // `asap-common/dependencies/rs/asap_types/src/streaming_config.rs`.
         let new_config_yaml = r#"
 aggregations:
   - aggregationId: 101
