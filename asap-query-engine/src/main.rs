@@ -17,14 +17,6 @@ use query_engine_rust::{
     SimpleMapStore, StoreOutputSink,
 };
 
-/// Wire protocol selector for `--controller-endpoint`. See the flag
-/// doc in `Args` for semantics.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum ControllerProtocolCli {
-    Generic,
-    Datacollector,
-}
-
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -97,14 +89,6 @@ struct Args {
     /// var so the MVP demo doesn't need a per-arg overlay.
     #[arg(long, env = "ASAP_CONTROLLER_URL")]
     controller_endpoint: Option<String>,
-
-    /// Wire protocol for `--controller-endpoint`. `generic` (default)
-    /// POSTs the backend-native `CapabilityMissPayload` and expects a
-    /// controller with a matching endpoint; `datacollector` translates
-    /// each notification into a DC `QuerySpec` and POSTs to the DC
-    /// controller's `/api/v1/plan`.
-    #[arg(long, value_enum, default_value = "generic")]
-    controller_protocol: ControllerProtocolCli,
 
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
@@ -448,23 +432,16 @@ async fn main() -> Result<()> {
         );
         if let Some(controller_endpoint) = args.controller_endpoint.as_ref() {
             info!(
-                "Capability-miss notifications enabled → {} (protocol={:?})",
-                controller_endpoint, args.controller_protocol
+                "Capability-miss notifications enabled → {}",
+                controller_endpoint
             );
             let client: Arc<
                 dyn query_engine_rust::drivers::query::controller_client::ControllerClient,
-            > = match args.controller_protocol {
-                ControllerProtocolCli::Generic => Arc::new(
-                    query_engine_rust::drivers::query::controller_client::HttpControllerClient::new(
-                        controller_endpoint.clone(),
-                    ),
+            > = Arc::new(
+                query_engine_rust::drivers::query::controller_client::HttpControllerClient::new(
+                    controller_endpoint.clone(),
                 ),
-                ControllerProtocolCli::Datacollector => Arc::new(
-                    query_engine_rust::drivers::query::controller_client::DcControllerClient::new(
-                        controller_endpoint.clone(),
-                    ),
-                ),
-            };
+            );
             engine = engine.with_controller_client(client);
         } else {
             info!(
@@ -634,17 +611,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    //info!("=== TEMPORARY: Using ClickHouse HTTP adapter ===");
-    //info!("ClickHouse endpoint will be available at: /clickhouse/query");
-    //info!("ClickHouse fallback URL: http://localhost:8123/?database=default");
-
-    //let adapter_config = AdapterConfig::clickhouse_sql(
-    //    "http://localhost:8123".to_string(), // ClickHouse server URL
-    //    "default".to_string(),               // Database name
-    //    true,                                // Always forward (fallback for every query)
-    //);
-
-    // Original Prometheus config (commented out temporarily):
     // Step-1 of the JSONL deprecation deleted the local-FS cold
     // store + the §5.2 `ColdFallback` adapter; the surviving
     // fallback chain is just Prometheus (when
@@ -887,7 +853,7 @@ async fn main() -> Result<()> {
             query_engine_rust::stores::sketch_db::BackfillServiceConfig::default(),
         );
         info!(
-            "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/ClickHouse/OtherSketch fail fast)"
+            "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
         );
         Some(service.spawn())
     } else {

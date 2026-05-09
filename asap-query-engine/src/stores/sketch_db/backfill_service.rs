@@ -24,7 +24,7 @@
 //!
 //! ## Reader factory
 //!
-//! The service doesn't know how to talk to Prometheus / S3 / ClickHouse
+//! The service doesn't know how to talk to Prometheus / S3
 //! — those are network-backed and deployment-specific. Instead, the
 //! caller provides a [`ReaderFactory`] that takes a `BackfillSource`
 //! and returns an `Arc<dyn RawSampleReader>`. When no factory is
@@ -270,10 +270,10 @@ pub fn noop_reader_factory() -> ReaderFactory {
 /// * [`BackfillSource::Prometheus`] — routed to
 ///   [`super::prometheus_reader::PrometheusReader`].
 ///
-/// All other variants (`S3Gorilla`, `ClickHouse`, `OtherSketch`)
-/// return a clear "not yet implemented" error, which the worker
-/// surfaces on `BackfillJob::error_message` so the controller
-/// / operator sees exactly which reader is missing.
+/// All other variants (`S3Gorilla`, `OtherSketch`) return a clear
+/// "not yet implemented" error, which the worker surfaces on
+/// `BackfillJob::error_message` so the controller / operator sees
+/// exactly which reader is missing.
 pub fn default_reader_factory() -> ReaderFactory {
     Arc::new(|source| {
         match source {
@@ -282,7 +282,6 @@ pub fn default_reader_factory() -> ReaderFactory {
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
         BackfillSource::S3Gorilla { .. }
-        | BackfillSource::ClickHouse { .. }
         | BackfillSource::OtherSketch { .. } => Err(format!(
             "reader for {source:?} not yet implemented; only Prometheus is wired in-tree as of Phase 5h"
         )

@@ -17,11 +17,6 @@ pub use promql_utilities::query_logics::enums::AggregationType;
 pub enum QueryProtocol {
     #[value(alias = "PROMETHEUS_HTTP")]
     PrometheusHttp,
-    #[value(alias = "CLICKHOUSE_HTTP")]
-    ClickHouseHttp,
-    #[value(alias = "ELASTIC_HTTP")]
-    ElasticHttp,
-    // Future: DuckDbHttp, etc.
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Copy, PartialEq)]

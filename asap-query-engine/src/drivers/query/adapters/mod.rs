@@ -1,6 +1,4 @@
-pub mod clickhouse_http;
 pub mod config;
-pub mod elastic_http;
 pub mod factory;
 pub mod prometheus_http;
 pub mod traits;
