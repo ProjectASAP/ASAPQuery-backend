@@ -88,7 +88,7 @@ crc32fast = "1.4"
 # `default-features = false` + `tokio-rustls-tls` so it shares the
 # rustls backend already pulled in by `reqwest`. `lru` powers the
 # Phase 3 `ChunkCache` keyed on chunk object key.
-asap-gorilla = { path = "../../ASAPCollector/asap-gorilla" }
+asap-gorilla = { path = "../../ASAPCollector/asap-gorilla-rust" }
 # mvp/v5 NOTE FOR REVIEWERS: this PR depends on the matching
 # `mvp/v5-postings-compactor` PR in ASAPCollector — specifically the
 # `asap_gorilla::Postings` type and the `IndexEntry::byte_offset /
