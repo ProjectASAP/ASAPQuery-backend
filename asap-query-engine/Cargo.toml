@@ -6,7 +6,6 @@ edition.workspace = true
 [dependencies]
 # Internal crates (workspace)
 promql_utilities.workspace = true
-sql_utilities.workspace = true
 asap_types.workspace = true
 datafusion_summary_library.workspace = true
 
@@ -40,7 +39,6 @@ async-trait = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
 base64 = "0.21"
 hex = "0.4"
-sqlparser = "0.59.0"
 datafusion = "43"
 arrow = "53.4.1"
 futures = "0.3"
@@ -57,7 +55,6 @@ prometheus = "0.13"
 lazy_static = "1.4"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tracing-appender = "0.2"
-elastic_dsl_utilities.workspace = true
 asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 # Phase 3 step 3: backend ingest path consumes asap-precompute-rs for the
 # SHARED envelope-parsing / delta-apply / sketch-reconstruction / merge

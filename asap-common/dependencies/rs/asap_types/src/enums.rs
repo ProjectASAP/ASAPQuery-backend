@@ -7,14 +7,8 @@ pub use promql_utilities::query_logics::enums::AggregationType;
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
 #[allow(non_camel_case_types)]
 pub enum QueryLanguage {
-    #[value(alias = "SQL")]
-    sql,
     #[value(alias = "PROMQL")]
     promql,
-    #[value(alias = "ElasticQueryDSL")]
-    elastic_querydsl,
-    #[value(alias = "ElasticSQL")]
-    elastic_sql,
 }
 
 /// Policy for cleaning up old aggregates from the store.

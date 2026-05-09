@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde_yaml::Value;
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 
@@ -9,15 +8,13 @@ use crate::enums::{CleanupPolicy, QueryLanguage};
 use crate::promql_schema::PromQLSchema;
 use crate::query_config::QueryConfig;
 use promql_utilities::data_model::KeyByLabelNames;
-use sql_utilities::sqlhelper::{SQLSchema, Table};
 
-/// Schema configuration that can be either PromQL or SQL format
+/// Schema configuration. Only PromQL is wired in production after the
+/// SQL/Elastic dead-code cleanup; the variant is preserved to keep the
+/// `inference_config.schema` field shape stable for future schemas.
 #[derive(Debug, Clone)]
 pub enum SchemaConfig {
     PromQL(PromQLSchema),
-    SQL(SQLSchema),
-    ElasticQueryDSL,
-    ElasticSQL(SQLSchema),
 }
 
 #[derive(Debug, Clone)]
@@ -31,9 +28,6 @@ impl InferenceConfig {
     pub fn new(query_language: QueryLanguage, cleanup_policy: CleanupPolicy) -> Self {
         let schema = match query_language {
             QueryLanguage::promql => SchemaConfig::PromQL(PromQLSchema::new()),
-            QueryLanguage::sql => SchemaConfig::SQL(SQLSchema::new(Vec::new())),
-            QueryLanguage::elastic_querydsl => SchemaConfig::ElasticQueryDSL,
-            QueryLanguage::elastic_sql => SchemaConfig::ElasticSQL(SQLSchema::new(Vec::new())),
         };
         Self {
             schema,
@@ -55,15 +49,6 @@ impl InferenceConfig {
             QueryLanguage::promql => {
                 let promql_schema = Self::parse_promql_schema(data)?;
                 SchemaConfig::PromQL(promql_schema)
-            }
-            QueryLanguage::sql => {
-                let sql_schema = Self::parse_sql_schema(data)?;
-                SchemaConfig::SQL(sql_schema)
-            }
-            QueryLanguage::elastic_querydsl => SchemaConfig::ElasticQueryDSL,
-            QueryLanguage::elastic_sql => {
-                let sql_schema = Self::parse_sql_schema(data)?;
-                SchemaConfig::SQL(sql_schema)
             }
         };
 
@@ -99,58 +84,6 @@ impl InferenceConfig {
             }
         }
         Ok(promql_schema)
-    }
-
-    /// Parse SQL schema from YAML data (tables: key at top level, matching ArroyoSketch format)
-    fn parse_sql_schema(data: &Value) -> Result<SQLSchema> {
-        let tables_data = data
-            .get("tables")
-            .and_then(|v| v.as_sequence())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing or invalid tables field for SQL query language")
-            })?;
-
-        let mut tables = Vec::new();
-        for table_data in tables_data {
-            let name = table_data
-                .get("name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing name field in table"))?
-                .to_string();
-
-            let time_column = table_data
-                .get("time_column")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing time_column field in table {}", name))?
-                .to_string();
-
-            let value_columns: HashSet<String> = table_data
-                .get("value_columns")
-                .and_then(|v| v.as_sequence())
-                .ok_or_else(|| anyhow::anyhow!("Missing value_columns field in table {}", name))?
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect();
-
-            let metadata_columns: HashSet<String> = table_data
-                .get("metadata_columns")
-                .and_then(|v| v.as_sequence())
-                .ok_or_else(|| anyhow::anyhow!("Missing metadata_columns field in table {}", name))?
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect();
-
-            tables.push(Table::new(
-                name,
-                time_column,
-                value_columns,
-                metadata_columns,
-            ));
-        }
-
-        Ok(SQLSchema::new(tables))
     }
 
     /// Parse cleanup policy from YAML data. Errors if not specified.

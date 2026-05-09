@@ -287,7 +287,7 @@ impl AggregationConfig {
             .unwrap_or("")
             .to_string();
 
-        // Handle PromQL (metric) vs SQL (table_name/value_column) based on query_language
+        // Only PromQL is supported after the dead-code cleanup.
         let (metric, table_name, value_column) = match query_language {
             QueryLanguage::promql => {
                 let metric = aggregation_data["metric"]
@@ -295,29 +295,6 @@ impl AggregationConfig {
                     .ok_or_else(|| anyhow::anyhow!("Missing metric for PromQL query language"))?
                     .to_string();
                 (metric, None, None)
-            }
-            QueryLanguage::sql => {
-                let table_name = aggregation_data
-                    .get("table_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("Missing table_name for SQL query language"))?
-                    .to_string();
-                let value_column = aggregation_data
-                    .get("value_column")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("value")
-                    .to_string();
-                // Derive metric from table_name.value_column for internal use
-                let metric = format!("{}.{}", table_name, value_column);
-                (metric, Some(table_name), Some(value_column))
-            }
-            QueryLanguage::elastic_querydsl => {
-                // Elastic doesn't use metric/table_name in aggregations
-                (String::new(), None, None)
-            }
-            QueryLanguage::elastic_sql => {
-                // Elastic doesn't use metric/table_name in aggregations
-                (String::new(), None, None)
             }
         };
 

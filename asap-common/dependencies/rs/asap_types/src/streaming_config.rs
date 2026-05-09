@@ -100,9 +100,6 @@ impl StreamingConfig {
         let query_language = inference_config
             .map(|ic| match &ic.schema {
                 SchemaConfig::PromQL(_) => QueryLanguage::promql,
-                SchemaConfig::SQL(_) => QueryLanguage::sql,
-                SchemaConfig::ElasticQueryDSL => QueryLanguage::elastic_querydsl,
-                SchemaConfig::ElasticSQL(_) => QueryLanguage::elastic_sql,
             })
             .unwrap_or(QueryLanguage::promql); // Default to promql if no inference_config
 
