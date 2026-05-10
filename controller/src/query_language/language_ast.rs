@@ -17,7 +17,6 @@ pub enum LanguageAst {
     PromQL(PromQLAst),
     // Future backends (kept commented to surface intent):
     // Sql(SqlAst),
-    // DataFusion(DfAst),
     // ElasticDsl(EsAst),
 }
 

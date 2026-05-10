@@ -36,9 +36,8 @@ use serde::{Deserialize, Serialize};
 /// parser the controller dispatches to.
 ///
 /// Today the controller only consumes `PromQL` and `Sql` (see
-/// `query_parser/{promql,sql}.rs`); `DataFusion` and `ElasticDsl` are
-/// reserved for the future asap-fusion + ElasticDSL deployment models
-/// described in `design.md` §3.
+/// `query_parser/{promql,sql}.rs`); `ElasticDsl` is reserved for the
+/// future ElasticDSL deployment model described in `design.md` §3.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryLanguage {
@@ -47,9 +46,6 @@ pub enum QueryLanguage {
     PromQL,
     /// SQL. Parsed via `sqlparser`.
     Sql,
-    /// A pre-built DataFusion `LogicalPlan`. Reserved — asap-fusion's
-    /// L1 happens upstream in the caller's `SessionContext`.
-    DataFusion,
     /// Elasticsearch DSL. Reserved — no L1 parser yet.
     ElasticDsl,
 }
@@ -148,7 +144,7 @@ pub enum QueryShape {
 #[serde(rename_all = "snake_case")]
 pub enum DataShape {
     /// Bounded relation, fully materialised at plan time. SQL tables,
-    /// Parquet / CSV files, DataFusion in-process tables.
+    /// Parquet / CSV files, in-process columnar tables.
     Batch,
     /// Append-only stream — events arrive over time, never updated or
     /// deleted. Metrics, logs, event streams. The common case for the
@@ -277,7 +273,6 @@ mod tests {
         for variant in [
             QueryLanguage::PromQL,
             QueryLanguage::Sql,
-            QueryLanguage::DataFusion,
             QueryLanguage::ElasticDsl,
         ] {
             let json = serde_json::to_string(&variant).unwrap();

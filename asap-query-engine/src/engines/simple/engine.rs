@@ -289,7 +289,7 @@ pub struct SimpleEngine {
     /// EngineRouter's archive failover (Phase 6). When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
-    sketch_index: Option<Arc<crate::stores::sketch_index::SketchIndex>>,
+    sketch_index: Option<Arc<crate::stores::sketch_db::sketch_index::SketchIndex>>,
 }
 
 impl SimpleEngine {
@@ -481,7 +481,7 @@ impl SimpleEngine {
     /// query through `handle_query`).
     pub fn with_sketch_index(
         mut self,
-        index: Arc<crate::stores::sketch_index::SketchIndex>,
+        index: Arc<crate::stores::sketch_db::sketch_index::SketchIndex>,
     ) -> Self {
         self.sketch_index = Some(index);
         self
@@ -1346,162 +1346,6 @@ impl SimpleEngine {
         Ok((results, chosen_window))
     }
 
-    /// Execute a query using the plan-based approach (for testing)
-    ///
-    /// This is an alternative execution path that uses DataFusion logical/physical
-    /// plans instead of the existing execute_query_pipeline.
-    ///
-    /// # Arguments
-    /// * `context` - The query execution context
-    ///
-    /// # Returns
-    /// A Result containing the query results or an error
-    #[allow(dead_code)]
-    pub async fn execute_plan(
-        &self,
-        context: &QueryExecutionContext,
-    ) -> Result<Vec<InstantVectorElement>, String> {
-        use datafusion::execution::context::SessionContext;
-        use datafusion::physical_plan::collect;
-
-        use crate::engines::physical::conversion::record_batch_to_result_map;
-
-        let total_start = Instant::now();
-
-        // 1. Build logical plan from context
-        let plan_build_start = Instant::now();
-        let logical_plan = context
-            .to_logical_plan()
-            .map_err(|e| format!("Failed to build logical plan: {}", e))?;
-        debug!(
-            "[LATENCY] DataFusion: logical plan build: {:.2}ms",
-            plan_build_start.elapsed().as_secs_f64() * 1000.0
-        );
-        debug!(
-            "DataFusion logical plan:\n{}",
-            logical_plan.display_indent()
-        );
-
-        // 2. Create session context with our custom extension planner
-        let physical_plan_start = Instant::now();
-        let session_ctx = SessionContext::new();
-        #[allow(deprecated)]
-        let state = session_ctx.state().with_query_planner(std::sync::Arc::new(
-            crate::engines::physical::CustomQueryPlanner::new(self.store.clone()),
-        ));
-
-        // 3. Create physical plan
-        let physical_plan = state
-            .create_physical_plan(&logical_plan)
-            .await
-            .map_err(|e| format!("Failed to create physical plan: {}", e))?;
-        debug!(
-            "[LATENCY] DataFusion: physical plan creation: {:.2}ms",
-            physical_plan_start.elapsed().as_secs_f64() * 1000.0
-        );
-
-        // 4. Execute
-        let execute_start = Instant::now();
-        let task_ctx = session_ctx.task_ctx();
-        let batches = collect(physical_plan, task_ctx)
-            .await
-            .map_err(|e| format!("Failed to execute plan: {}", e))?;
-        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        debug!(
-            "[LATENCY] DataFusion: plan execution: {:.2}ms, {} batch(es), {} total rows",
-            execute_start.elapsed().as_secs_f64() * 1000.0,
-            batches.len(),
-            total_rows
-        );
-
-        // 5. Convert results
-        let convert_start = Instant::now();
-        let label_names: Vec<&str> = context
-            .metadata
-            .query_output_labels
-            .labels
-            .iter()
-            .map(String::as_str)
-            .collect();
-
-        let mut all_results: HashMap<Option<KeyByLabelValues>, f64> = HashMap::new();
-        for batch in &batches {
-            let batch_results = record_batch_to_result_map(batch, &label_names, "value")
-                .map_err(|e| format!("Failed to convert results: {}", e))?;
-            all_results.extend(batch_results);
-        }
-        debug!(
-            "[LATENCY] DataFusion: result conversion: {:.2}ms, {} output rows",
-            convert_start.elapsed().as_secs_f64() * 1000.0,
-            all_results.len()
-        );
-
-        // 6. Format results
-        let format_start = Instant::now();
-        let results = self.format_final_results(
-            all_results,
-            &context.metadata.statistic_to_compute,
-            &context.metric,
-            false,
-        );
-        debug!(
-            "[LATENCY] DataFusion: result formatting: {:.2}ms, {} results",
-            format_start.elapsed().as_secs_f64() * 1000.0,
-            results.len()
-        );
-
-        debug!(
-            "[LATENCY] DataFusion: total execute_plan: {:.2}ms",
-            total_start.elapsed().as_secs_f64() * 1000.0
-        );
-
-        Ok(results)
-    }
-
-    /// Executes a pre-built DataFusion logical plan and returns results.
-    ///
-    /// This is the shared execution kernel used by both `execute_plan` (for single-metric
-    /// queries) and the binary arithmetic dispatch path.
-    pub async fn execute_logical_plan(
-        &self,
-        logical_plan: datafusion::logical_expr::LogicalPlan,
-        label_names: Vec<String>,
-        metric: &str,
-        statistic: &Statistic,
-    ) -> Result<Vec<InstantVectorElement>, String> {
-        use datafusion::execution::context::SessionContext;
-        use datafusion::physical_plan::collect;
-
-        use crate::engines::physical::conversion::record_batch_to_result_map;
-
-        // Create session context with our custom extension planner
-        let session_ctx = SessionContext::new();
-        #[allow(deprecated)]
-        let state = session_ctx.state().with_query_planner(std::sync::Arc::new(
-            crate::engines::physical::CustomQueryPlanner::new(self.store.clone()),
-        ));
-
-        let physical_plan = state
-            .create_physical_plan(&logical_plan)
-            .await
-            .map_err(|e| format!("Failed to create physical plan: {}", e))?;
-
-        let task_ctx = session_ctx.task_ctx();
-        let batches = collect(physical_plan, task_ctx)
-            .await
-            .map_err(|e| format!("Failed to execute plan: {}", e))?;
-
-        let label_name_strs: Vec<&str> = label_names.iter().map(String::as_str).collect();
-        let mut all_results: HashMap<Option<KeyByLabelValues>, f64> = HashMap::new();
-        for batch in &batches {
-            let batch_results = record_batch_to_result_map(batch, &label_name_strs, "value")
-                .map_err(|e| format!("Failed to convert results: {}", e))?;
-            all_results.extend(batch_results);
-        }
-
-        Ok(self.format_final_results(all_results, statistic, metric, false))
-    }
-
     /// Finds a query config by structurally comparing `arm_ast` against each
     /// config's parsed query.
     ///
@@ -1682,111 +1526,6 @@ impl SimpleEngine {
             grouping_labels,
             aggregated_labels,
         })
-    }
-
-    /// Recursively builds a DataFusion logical plan for one arm of a binary
-    /// arithmetic expression.
-    ///
-    /// - Leaf arm (supported PromQL pattern): look up config structurally, build
-    ///   context, return its `to_logical_plan()` together with the output label names.
-    /// - Binary arm: recursively build both sub-arms and combine with
-    ///   `build_binary_vector_plan`.
-    /// - Scalar literal: returns `None` (handled by the caller separately).
-    fn build_arm_logical_plan(
-        &self,
-        arm_ast: &promql_parser::parser::Expr,
-        time: f64,
-    ) -> Option<(datafusion::logical_expr::LogicalPlan, Vec<String>)> {
-        use crate::engines::logical::plan_builder::build_binary_vector_plan;
-        use promql_parser::parser::Expr;
-
-        match arm_ast {
-            Expr::NumberLiteral(_) => None, // caller handles scalars
-            Expr::Paren(paren) => self.build_arm_logical_plan(&paren.expr, time),
-            Expr::Binary(binary) => {
-                // Nested binary expression — recurse on both sides
-                let (lhs_plan, lhs_labels) = self.build_arm_logical_plan(&binary.lhs, time)?;
-                let (rhs_plan, _) = self.build_arm_logical_plan(&binary.rhs, time)?;
-                let combined =
-                    build_binary_vector_plan(lhs_plan, rhs_plan, &binary.op, lhs_labels.clone())
-                        .ok()?;
-                Some((combined, lhs_labels))
-            }
-            other => {
-                // Leaf pattern: structural config lookup + context + plan
-                let config = self.find_query_config_promql_structural(other)?;
-                let ctx = self.build_query_execution_context_from_ast(other, config, time)?;
-                let label_names = ctx.metadata.query_output_labels.labels.clone();
-                let plan = ctx.to_logical_plan().ok()?;
-                Some((plan, label_names))
-            }
-        }
-    }
-
-    /// Handles a binary arithmetic PromQL expression by building a combined
-    /// DataFusion plan (vector–vector join or scalar projection) and executing it.
-    ///
-    /// Returns `None` if any arm is not acceleratable (caller falls back to Prometheus).
-    fn handle_binary_expr_promql(
-        &self,
-        ast: &promql_parser::parser::Expr,
-        time: f64,
-    ) -> Option<(KeyByLabelNames, QueryResult)> {
-        use crate::engines::logical::plan_builder::{build_binary_vector_plan, build_scalar_plan};
-        use promql_parser::parser::Expr;
-
-        let query_time = Self::convert_query_time_to_data_time(time);
-
-        let binary = match ast {
-            Expr::Binary(b) => b,
-            _ => return None,
-        };
-
-        let lhs = binary.lhs.as_ref();
-        let rhs = binary.rhs.as_ref();
-        let op = &binary.op;
-
-        // Scalar case: either side may be a numeric literal
-        let scalar_case: Option<(f64, &Expr, bool)> = match (lhs, rhs) {
-            (_, Expr::NumberLiteral(nl)) => Some((nl.val, lhs, false)),
-            (Expr::NumberLiteral(nl), _) => Some((nl.val, rhs, true)),
-            _ => None,
-        };
-        if let Some((scalar, vector_arm, scalar_on_left)) = scalar_case {
-            let (vector_plan, label_names) = self.build_arm_logical_plan(vector_arm, time)?;
-            let combined =
-                build_scalar_plan(vector_plan, scalar, op, scalar_on_left, label_names.clone())
-                    .ok()?;
-            let results = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(self.execute_logical_plan(
-                    combined,
-                    label_names.clone(),
-                    "",
-                    &Statistic::Sum,
-                ))
-            })
-            .ok()?;
-            return Some((
-                KeyByLabelNames::new(label_names),
-                QueryResult::vector(results, query_time),
-            ));
-        }
-
-        // Vector–vector
-        let (lhs_plan, lhs_labels) = self.build_arm_logical_plan(lhs, time)?;
-        let (rhs_plan, _) = self.build_arm_logical_plan(rhs, time)?;
-        let combined = build_binary_vector_plan(lhs_plan, rhs_plan, op, lhs_labels.clone()).ok()?;
-        let results = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.execute_logical_plan(
-                combined,
-                lhs_labels.clone(),
-                "",
-                &Statistic::Sum,
-            ))
-        })
-        .ok()?;
-        let output_labels = KeyByLabelNames::new(lhs_labels);
-        Some((output_labels, QueryResult::vector(results, query_time)))
     }
 
     /// Applies a PromQL binary arithmetic operator to two f64 values.
@@ -2437,19 +2176,13 @@ impl SimpleEngine {
             .resolve_sketch_metric_alias(&query)
             .unwrap_or(query);
 
-        // Check for binary arithmetic before attempting single-query dispatch.
-        // Binary expressions won't have a matching query_config, so we handle them here.
-        if let Ok(ast) = promql_parser::parser::parse(&query) {
-            if matches!(&ast, promql_parser::parser::Expr::Binary(_)) {
-                let result = self.handle_binary_expr_promql(&ast, time);
-                let total_query_duration = query_start_time.elapsed();
-                debug!(
-                    "Binary arithmetic query handling took: {:.2}ms",
-                    total_query_duration.as_secs_f64() * 1000.0
-                );
-                return result;
-            }
-        }
+        // Binary arithmetic dispatch was previously handled here via a
+        // DataFusion-based plan combiner. That path was removed alongside
+        // the datafusion crate; binary arithmetic on warm-tier sketches
+        // will be reintroduced as part of the PromQL-evaluator-on-Gorilla
+        // follow-up. For now binary expressions fall through to the
+        // normal dispatch path (which will not match and trigger the
+        // router's CapabilityMiss failover to the archive engine).
 
         // Try the §7 schema-timeline dispatch first. Returns Some
         // only when the query's [t1, t2] range crosses a
@@ -3786,9 +3519,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                 let mut all_hit = true;
                 for sid in &candidates {
                     match idx.classify(*sid) {
-                        crate::stores::sketch_index::SidLookup::Hit => {}
-                        crate::stores::sketch_index::SidLookup::Ghost
-                        | crate::stores::sketch_index::SidLookup::Unknown => {
+                        crate::stores::sketch_db::sketch_index::SidLookup::Hit => {}
+                        crate::stores::sketch_db::sketch_index::SidLookup::Ghost
+                        | crate::stores::sketch_db::sketch_index::SidLookup::Unknown => {
                             all_hit = false;
                             break;
                         }
@@ -6086,7 +5819,7 @@ mod warm_tier_classify_tests {
     use crate::engines::EngineError;
     use crate::routing::engine_router::QueryEngine as _;
     use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
-    use crate::stores::sketch_index::{
+    use crate::stores::sketch_db::sketch_index::{
         AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState,
     };
@@ -6191,7 +5924,7 @@ mod warm_tier_classify_tests {
             (1_000, 1_010),
             SketchSampleState {
                 bytes: vec![0],
-                encoding: crate::stores::sketch_index::SketchEncoding::ProtoFull,
+                encoding: crate::stores::sketch_db::sketch_index::SketchEncoding::ProtoFull,
             },
         );
 

@@ -441,7 +441,7 @@ async fn main() -> Result<()> {
     let series_resolver = Arc::new(
         query_engine_rust::drivers::ingest::series_resolver::SeriesIdResolver::new(),
     );
-    let sketch_index = Arc::new(query_engine_rust::stores::sketch_index::SketchIndex::new());
+    let sketch_index = Arc::new(query_engine_rust::stores::sketch_db::sketch_index::SketchIndex::new());
 
     // Setup query engine. SimpleEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST

@@ -2,7 +2,7 @@
 //!
 //! See `controller/docs/design.md` §6 `core::query_language`.
 //!
-//! Every backend (PromQL, SQL, DataFusion, ElasticDSL) implements
+//! Every backend (PromQL, SQL, ElasticDSL) implements
 //! [`Language`] and returns a [`LanguageAst`] variant tagged with the
 //! same [`QueryLanguage`] enum the public `QuerySpec` carries.
 

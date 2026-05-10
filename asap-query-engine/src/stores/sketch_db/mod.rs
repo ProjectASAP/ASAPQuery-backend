@@ -34,12 +34,14 @@ pub mod backfill_processor;
 pub mod backfill_service;
 pub mod backfill_window_builder;
 pub mod backfill_worker;
+pub mod epoch_columnar;
 pub mod metrics;
 pub mod prometheus_reader;
 pub mod raw_sample_reader;
 pub mod schema;
 pub mod schema_eviction;
 pub mod simple_map_store;
+pub mod sketch_index;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{

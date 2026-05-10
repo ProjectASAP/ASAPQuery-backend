@@ -4,7 +4,6 @@ members = [
     "crates/promql_utilities",
     "crates/asap_otel_proto",
     "crates/asap_types",
-    "crates/datafusion_summary_library",
     "asap-query-engine",
     "controller",
 ]
@@ -47,6 +46,5 @@ arc-swap = "1.7"
 # Internal crates
 promql_utilities = { path = "crates/promql_utilities" }
 asap_types = { path = "crates/asap_types" }
-datafusion_summary_library = { path = "crates/datafusion_summary_library" }
 asap_otel_proto = { path = "crates/asap_otel_proto" }
 indexmap = { version = "2.0", features = ["serde"] }

@@ -24,9 +24,7 @@
 //!   `crate::routing::QueryEngine` impl returns.
 
 pub mod gorilla;
-pub mod logical;
 pub mod no_data_archive;
-pub mod physical;
 pub mod prometheus;
 pub mod query_result;
 pub mod simple;
