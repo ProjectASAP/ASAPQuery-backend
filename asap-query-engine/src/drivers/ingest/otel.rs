@@ -185,9 +185,11 @@ impl MetricsService for MetricsServiceImpl {
         if let Some(cache) = &self.shared.probe_cache {
             capture_freshness_probe_samples(&req, cache);
         }
+        let mut unknown_series_ids: Vec<u64> = Vec::new();
         if let Some(state) = &self.shared.ingest_state {
             route_otlp_to_precompute(&req, state).await;
-            route_modified_otlp_sketches_to_precompute(&req, state).await;
+            unknown_series_ids =
+                route_modified_otlp_sketches_to_precompute(&req, state).await;
         }
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -196,12 +198,47 @@ impl MetricsService for MetricsServiceImpl {
             // this field; not yet wired (PR B will populate it when the
             // backend learns to mint series_ids).
             series_assignments: Vec::new(),
-            // Refactor-2026-05: backend signals senders to evict cached sids
-            // here. Empty for now — populated by Phase 4 (centralized
-            // ResolveSeriesIDs resolver) when sid-cache divergence is
-            // detected (e.g., backend restart without persistence).
-            unknown_series_ids: Vec::new(),
+            // Phase 4 — backend signals senders to evict cached sids here
+            // when this Export carried a sid the resolver does not
+            // recognize (sid-cache divergence — e.g. after a backend
+            // restart without persistence, or when the sender's sid
+            // disagrees with the resolved sid for the same attrs).
+            unknown_series_ids,
         }))
+    }
+
+    async fn resolve_series_i_ds(
+        &self,
+        request: Request<
+            asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsRequest,
+        >,
+    ) -> Result<
+        Response<asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsResponse>,
+        Status,
+    > {
+        use asap_otel_proto::tonic::collector::metrics::v1::{
+            ResolveSeriesIDsResponse, SeriesAssignment,
+        };
+        let req = request.into_inner();
+        let mut assignments = Vec::with_capacity(req.queries.len());
+        if let Some(state) = &self.shared.ingest_state {
+            for q in req.queries {
+                // The fingerprint travels as opaque bytes on the wire, but
+                // the resolver hashes it as a string (the sender's
+                // canonical fingerprint algorithm matches our
+                // `canonical_attrs_fingerprint`). UTF-8 is lossy here only
+                // for malformed inputs — those produce a degraded but
+                // deterministic key, never a panic.
+                let fp = String::from_utf8_lossy(&q.attributes_fingerprint).into_owned();
+                let sid = state.series_resolver.resolve(&q.metric_name, &fp);
+                assignments.push(SeriesAssignment {
+                    attributes_fingerprint: q.attributes_fingerprint,
+                    series_id: sid,
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(Response::new(ResolveSeriesIDsResponse { assignments }))
     }
 }
 
@@ -240,12 +277,16 @@ async fn handle_otlp_http(
     if let Some(cache) = &shared.probe_cache {
         capture_freshness_probe_samples(&req, cache);
     }
+    let mut unknown_series_ids: Vec<u64> = Vec::new();
     if let Some(state) = &shared.ingest_state {
         route_otlp_to_precompute(&req, state).await;
-        route_modified_otlp_sketches_to_precompute(&req, state).await;
+        unknown_series_ids = route_modified_otlp_sketches_to_precompute(&req, state).await;
     }
     debug!("OTLP sending response via HTTP");
-    Ok(Json(serde_json::json!({"rejected": 0})))
+    Ok(Json(serde_json::json!({
+        "rejected": 0,
+        "unknown_series_ids": unknown_series_ids,
+    })))
 }
 
 /// A parsed metric data point: name, labels, timestamp (nanos), and numeric value.
@@ -629,7 +670,7 @@ async fn route_otlp_to_precompute(
 async fn route_modified_otlp_sketches_to_precompute(
     request: &ExportMetricsServiceRequest,
     ingest_state: &Arc<IngestState>,
-) {
+) -> Vec<u64> {
     use asap_otel_proto::tonic::metrics::v1::metric::Data;
 
     let ingest_received_at = Instant::now();
@@ -643,6 +684,12 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
     let mut barrier_drops: HashMap<u64, u64> = HashMap::new();
+    // Phase 4 — sids the receiver did not recognize this Export. Returned
+    // to the caller so the gRPC / HTTP handler can stamp them into
+    // `ExportMetricsServiceResponse.unknown_series_ids`. Senders evict
+    // these sids and re-emit with attributes; backend re-resolves and
+    // returns fresh `series_assignments`.
+    let mut unknown_sids: Vec<u64> = Vec::new();
 
     for resource_metrics in &request.resource_metrics {
         let resource_attrs = resource_metrics
@@ -673,67 +720,219 @@ async fn route_modified_otlp_sketches_to_precompute(
                 // time_unix_nano, sketch_bytes, encoding_i32) tuples. We
                 // then route each tuple through the same dispatcher.
                 let dps: Vec<ModifiedOtlpSketchDp> = match &metric.data {
-                    Some(Data::Ddsketch(d)) => d
-                        .data_points
-                        .iter()
-                        .map(|dp| ModifiedOtlpSketchDp {
-                            kind: SketchKind::DdSketch,
-                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
-                            time_unix_nano: dp.time_unix_nano,
-                            sketch: dp.sketch.clone(),
-                            encoding: dp.encoding,
-                        })
-                        .collect(),
-                    Some(Data::Kllsketch(k)) => k
-                        .data_points
-                        .iter()
-                        .map(|dp| ModifiedOtlpSketchDp {
-                            kind: SketchKind::Kll,
-                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
-                            time_unix_nano: dp.time_unix_nano,
-                            sketch: dp.sketch.clone(),
-                            encoding: dp.encoding,
-                        })
-                        .collect(),
-                    Some(Data::Countsketch(c)) => c
-                        .data_points
-                        .iter()
-                        .map(|dp| ModifiedOtlpSketchDp {
-                            kind: SketchKind::CountSketch,
-                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
-                            time_unix_nano: dp.time_unix_nano,
-                            sketch: dp.sketch.clone(),
-                            encoding: dp.encoding,
-                        })
-                        .collect(),
-                    Some(Data::Countminsketch(c)) => c
-                        .data_points
-                        .iter()
-                        .map(|dp| ModifiedOtlpSketchDp {
-                            kind: SketchKind::CountMin,
-                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
-                            time_unix_nano: dp.time_unix_nano,
-                            sketch: dp.sketch.clone(),
-                            encoding: dp.encoding,
-                        })
-                        .collect(),
-                    Some(Data::Hllsketch(h)) => h
-                        .data_points
-                        .iter()
-                        .map(|dp| ModifiedOtlpSketchDp {
-                            kind: SketchKind::Hll,
-                            attrs: merge_point_attributes(&base_labels, &dp.attributes),
-                            time_unix_nano: dp.time_unix_nano,
-                            sketch: dp.sketch.clone(),
-                            encoding: dp.encoding,
-                        })
-                        .collect(),
+                    Some(Data::Ddsketch(d)) => {
+                        let cfg = crate::stores::sketch_index::SketchConfig::DDSketch {
+                            relative_accuracy: d.relative_accuracy,
+                        };
+                        d.data_points
+                            .iter()
+                            .map(|dp| ModifiedOtlpSketchDp {
+                                kind: SketchKind::DdSketch,
+                                attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                                time_unix_nano: dp.time_unix_nano,
+                                sketch: dp.sketch.clone(),
+                                encoding: dp.encoding,
+                                series_id: dp.series_id,
+                                start_time_unix_nano: dp.start_time_unix_nano,
+                                container_config: cfg.clone(),
+                            })
+                            .collect()
+                    }
+                    Some(Data::Kllsketch(k)) => {
+                        let cfg = crate::stores::sketch_index::SketchConfig::Kll { k: k.k };
+                        k.data_points
+                            .iter()
+                            .map(|dp| ModifiedOtlpSketchDp {
+                                kind: SketchKind::Kll,
+                                attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                                time_unix_nano: dp.time_unix_nano,
+                                sketch: dp.sketch.clone(),
+                                encoding: dp.encoding,
+                                series_id: dp.series_id,
+                                start_time_unix_nano: dp.start_time_unix_nano,
+                                container_config: cfg.clone(),
+                            })
+                            .collect()
+                    }
+                    Some(Data::Countsketch(c)) => {
+                        let cfg = crate::stores::sketch_index::SketchConfig::CountSketch {
+                            rows: c.rows,
+                            cols: c.cols,
+                        };
+                        c.data_points
+                            .iter()
+                            .map(|dp| ModifiedOtlpSketchDp {
+                                kind: SketchKind::CountSketch,
+                                attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                                time_unix_nano: dp.time_unix_nano,
+                                sketch: dp.sketch.clone(),
+                                encoding: dp.encoding,
+                                series_id: dp.series_id,
+                                start_time_unix_nano: dp.start_time_unix_nano,
+                                container_config: cfg.clone(),
+                            })
+                            .collect()
+                    }
+                    Some(Data::Countminsketch(c)) => {
+                        let cfg = crate::stores::sketch_index::SketchConfig::CountMin {
+                            rows: c.rows,
+                            cols: c.cols,
+                        };
+                        c.data_points
+                            .iter()
+                            .map(|dp| ModifiedOtlpSketchDp {
+                                kind: SketchKind::CountMin,
+                                attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                                time_unix_nano: dp.time_unix_nano,
+                                sketch: dp.sketch.clone(),
+                                encoding: dp.encoding,
+                                series_id: dp.series_id,
+                                start_time_unix_nano: dp.start_time_unix_nano,
+                                container_config: cfg.clone(),
+                            })
+                            .collect()
+                    }
+                    Some(Data::Hllsketch(h)) => {
+                        let cfg = crate::stores::sketch_index::SketchConfig::Hll {
+                            precision: h.precision,
+                        };
+                        h.data_points
+                            .iter()
+                            .map(|dp| ModifiedOtlpSketchDp {
+                                kind: SketchKind::Hll,
+                                attrs: merge_point_attributes(&base_labels, &dp.attributes),
+                                time_unix_nano: dp.time_unix_nano,
+                                sketch: dp.sketch.clone(),
+                                encoding: dp.encoding,
+                                series_id: dp.series_id,
+                                start_time_unix_nano: dp.start_time_unix_nano,
+                                container_config: cfg.clone(),
+                            })
+                            .collect()
+                    }
                     _ => continue,
                 };
 
                 for dp in dps {
                     let series_key = format_series_key(&metric.name, &dp.attrs);
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
+
+                    // Phase 4 — sid resolution gate. The four cases mirror
+                    // the design doc §5.4 invariant:
+                    //   (sid=0, attrs)        → mint a fresh sid and use it
+                    //   (sid!=0, attrs)       → trust attrs; if cached value
+                    //                           disagrees, the sender's sid
+                    //                           is stale → push to
+                    //                           `unknown_sids` so the
+                    //                           response evicts it
+                    //   (sid!=0, no attrs)    → reverse-lookup; if unknown,
+                    //                           push to `unknown_sids` and
+                    //                           drop this DP (sender will
+                    //                           re-emit with attrs next pass)
+                    //   (sid=0, no attrs)     → invalid wire shape, drop
+                    let attrs_pairs: Vec<(&str, &str)> =
+                        dp.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&attrs_pairs);
+                    let resolved_sid: Option<u64> = if attrs_pairs.is_empty() {
+                        // No attrs on the wire — sid alone must be
+                        // recognized, otherwise signal stale.
+                        match dp.series_id {
+                            0 => None,
+                            sid => {
+                                if ingest_state.series_resolver.is_known(sid) {
+                                    Some(sid)
+                                } else {
+                                    unknown_sids.push(sid);
+                                    None
+                                }
+                            }
+                        }
+                    } else if dp.series_id == 0 {
+                        // Attrs present, no sid yet → mint or fetch.
+                        Some(
+                            ingest_state
+                                .series_resolver
+                                .resolve(&metric.name, &fp),
+                        )
+                    } else {
+                        // Both populated: attrs are the source of truth.
+                        // Backend-resolved value wins; mismatched sender
+                        // sid is signalled stale.
+                        let cached = ingest_state
+                            .series_resolver
+                            .resolve(&metric.name, &fp);
+                        if cached != dp.series_id {
+                            unknown_sids.push(dp.series_id);
+                        }
+                        Some(cached)
+                    };
+                    let Some(sid) = resolved_sid else {
+                        continue;
+                    };
+
+                    // Phase 5 — register a `SketchInstanceMetadata` on
+                    // first sight of `sid` and append this DP's sketch
+                    // state to the per-sid columnar storage. The instance
+                    // is keyed by sid, so subsequent DPs on the same sid
+                    // skip the register step. `group_by_keys` is
+                    // `dp.attrs.keys()` — after the agent's `AggregateBy`
+                    // rollup, `attributes` is the group-by VALUES vector,
+                    // and its key set IS the group-by KEY set.
+                    {
+                        use crate::stores::sketch_index::{
+                            AccuracyBound, Capability, SketchEncoding, SketchInstanceMetadata,
+                            SketchKindHandle, SketchSampleState,
+                        };
+                        use std::collections::{BTreeMap, BTreeSet};
+
+                        if ingest_state.sketch_index.instance(sid).is_none() {
+                            let kind = sketch_kind_handle_for(&dp);
+                            let cap = match kind {
+                                SketchKindHandle::DDSketch | SketchKindHandle::Kll => {
+                                    Capability::QuantileApprox(kind)
+                                }
+                                SketchKindHandle::Hll => Capability::CardinalityApprox,
+                                SketchKindHandle::CountSketch
+                                | SketchKindHandle::CountMin => {
+                                    Capability::FrequencyTopk(kind)
+                                }
+                            };
+                            let group_by_keys: BTreeSet<String> =
+                                dp.attrs.keys().cloned().collect();
+                            let cfg = dp.container_config.clone();
+                            ingest_state.sketch_index.register(SketchInstanceMetadata {
+                                sid,
+                                metric_name: metric.name.clone(),
+                                group_by_keys,
+                                capability: cap,
+                                sketch_kind: kind,
+                                sketch_config: cfg.clone(),
+                                accuracy: AccuracyBound::from_config(&cfg),
+                                first_seen_unix_ms: ts_ms,
+                            });
+                        }
+
+                        let label_values: BTreeMap<String, String> = dp
+                            .attrs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        let window: crate::stores::epoch_columnar::TimestampRange = (
+                            dp.start_time_unix_nano / 1_000_000,
+                            dp.time_unix_nano / 1_000_000,
+                        );
+                        let encoding = encoding_to_handle(dp.encoding)
+                            .unwrap_or(SketchEncoding::ProtoFull);
+                        ingest_state.sketch_index.append_sample(
+                            sid,
+                            label_values,
+                            window,
+                            SketchSampleState {
+                                bytes: dp.sketch.clone(),
+                                encoding,
+                            },
+                        );
+                    }
 
                     // Encoding dispatch: full frames (PROTO /
                     // MSGPACK) decode standalone and refresh the
@@ -827,6 +1026,13 @@ async fn route_modified_otlp_sketches_to_precompute(
                             continue;
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
+                        // DEPRECATED: aggregation_id-keyed write — remove
+                        // after warm-tier validation. The Phase 5
+                        // SketchIndex above is the new write path; this
+                        // legacy router push stays in tandem until the
+                        // query path's warm-tier reducer is wired
+                        // end-to-end and the streaming-config /
+                        // SimpleMapStore call sites can be deleted.
                         messages.push(WorkerMessage::AccumulatorInput {
                             agg_id: config.aggregation_id,
                             group_key,
@@ -864,6 +1070,39 @@ async fn route_modified_otlp_sketches_to_precompute(
             routed, decoded_failed, unconfigured
         );
     }
+
+    unknown_sids
+}
+
+/// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
+/// `SketchKindHandle` so registration and capability classification
+/// share one source of truth.
+fn sketch_kind_handle_for(
+    dp: &ModifiedOtlpSketchDp,
+) -> crate::stores::sketch_index::SketchKindHandle {
+    use crate::stores::sketch_index::SketchKindHandle;
+    match dp.kind {
+        SketchKind::DdSketch => SketchKindHandle::DDSketch,
+        SketchKind::Kll => SketchKindHandle::Kll,
+        SketchKind::Hll => SketchKindHandle::Hll,
+        SketchKind::CountSketch => SketchKindHandle::CountSketch,
+        SketchKind::CountMin => SketchKindHandle::CountMin,
+    }
+}
+
+/// Phase 5 helper — translate the wire-format `encoding` integer to the
+/// SketchIndex's `SketchEncoding` enum. Returns `None` for the unset
+/// (0) encoding so callers can default to `ProtoFull` (the dominant
+/// case for full-state frames).
+fn encoding_to_handle(encoding: i32) -> Option<crate::stores::sketch_index::SketchEncoding> {
+    use crate::stores::sketch_index::SketchEncoding;
+    match encoding {
+        ENCODING_PROTO => Some(SketchEncoding::ProtoFull),
+        ENCODING_PROTO_DELTA => Some(SketchEncoding::ProtoDelta),
+        ENCODING_MSGPACK => Some(SketchEncoding::MsgpackFull),
+        ENCODING_MSGPACK_DELTA => Some(SketchEncoding::MsgpackDelta),
+        _ => None,
+    }
 }
 
 /// Sketch family carried by a modified-OTLP `*SketchDataPoint`. Used by
@@ -886,6 +1125,19 @@ struct ModifiedOtlpSketchDp {
     time_unix_nano: u64,
     sketch: Vec<u8>,
     encoding: i32,
+    /// Phase 4 — sender-supplied series_id, 0 when unset / first emit.
+    /// Backend's resolver mints a fresh sid when this is 0 with attrs
+    /// populated; pushes the sid into `unknown_series_ids` when this is
+    /// non-zero with empty attrs and the resolver doesn't recognize it.
+    series_id: u64,
+    /// Phase 5 — DataPoint-level start of the sketch window. Combined
+    /// with `time_unix_nano` to form the `(start_ms, end_ms)` window
+    /// the SketchIndex's columnar storage keys on.
+    start_time_unix_nano: u64,
+    /// Phase 5 — sketch-instance configuration lifted off the parent
+    /// container. Drives `SketchInstanceMetadata.sketch_config` and the
+    /// derived `AccuracyBound`.
+    container_config: crate::stores::sketch_index::SketchConfig,
 }
 
 /// Decode the typed `sketch` bytes from a modified-OTLP
@@ -1573,5 +1825,194 @@ mod dispatcher_tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("apply_modified_otlp_delta_bytes"));
+    }
+}
+
+/// Phase 4 — sid-resolution gate tests. Construct an OTLP DDSketch
+/// Export with one DataPoint per scenario, run it through
+/// `route_modified_otlp_sketches_to_precompute`, and assert on the
+/// returned `unknown_series_ids` plus the SeriesIdResolver / SketchIndex
+/// state on the shared IngestState.
+#[cfg(test)]
+mod sid_resolution_tests {
+    use super::*;
+    use crate::data_model::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+    use crate::precompute_engine::series_router::SeriesRouter;
+    use crate::stores::sketch_db::SchemaRegistry;
+    use crate::stores::sketch_index::SketchIndex;
+    use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
+    use asap_otel_proto::tonic::metrics::v1::{
+        metric::Data, DdSketch as PbDDSketch, DdSketchDataPoint, Metric as PbMetric,
+        ResourceMetrics, ScopeMetrics,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    async fn make_state() -> (Arc<IngestState>, tokio::task::JoinHandle<()>) {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let router = SeriesRouter::new(vec![tx]);
+        let streaming = StreamingConfig::new(std::collections::HashMap::new());
+        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
+        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+        let state = Arc::new(IngestState {
+            router,
+            samples_ingested: std::sync::atomic::AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
+            hot_reload_config: hot_reload,
+            schemas,
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(SeriesIdResolver::new()),
+            sketch_index: Arc::new(SketchIndex::new()),
+        });
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        (state, drain)
+    }
+
+    fn kv(k: &str, v: &str) -> KeyValue {
+        KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::StringValue(v.to_string())),
+            }),
+        }
+    }
+
+    fn build_request(metric_name: &str, dp: DdSketchDataPoint) -> ExportMetricsServiceRequest {
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![PbMetric {
+                        name: metric_name.to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Ddsketch(PbDDSketch {
+                            data_points: vec![dp],
+                            aggregation_temporality: 0,
+                            relative_accuracy: 0.01,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_sid_minted_when_sender_supplies_zero_with_attrs() {
+        let (state, drain) = make_state().await;
+        let dp = DdSketchDataPoint {
+            attributes: vec![kv("zone", "z0")],
+            start_time_unix_nano: 1_000_000,
+            time_unix_nano: 11_000_000,
+            sketch: vec![1, 2, 3],
+            encoding: 1,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 0,
+        };
+        let req = build_request("http_latency_ms", dp);
+
+        let unknown = route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        assert!(unknown.is_empty(), "no unknown sids on a fresh-attrs DP");
+        assert_eq!(state.series_resolver.len(), 1, "resolver minted one sid");
+        assert_eq!(
+            state.sketch_index.instance_count(),
+            1,
+            "SketchIndex registered one instance"
+        );
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    #[tokio::test]
+    async fn unknown_sid_with_empty_attrs_is_returned_in_response() {
+        let (state, drain) = make_state().await;
+        // sid != 0, no attrs — resolver doesn't know it; should land in
+        // unknown_sids and the DP must be dropped (no instance registered).
+        let dp = DdSketchDataPoint {
+            attributes: Vec::new(),
+            start_time_unix_nano: 0,
+            time_unix_nano: 5_000_000,
+            sketch: vec![9],
+            encoding: 1,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 7777,
+        };
+        let req = build_request("http_latency_ms", dp);
+
+        let unknown = route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        assert_eq!(unknown, vec![7777]);
+        assert_eq!(state.series_resolver.len(), 0);
+        assert_eq!(state.sketch_index.instance_count(), 0);
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    #[tokio::test]
+    async fn sid_attrs_disagreement_signals_stale_sid_but_uses_resolved_value() {
+        let (state, drain) = make_state().await;
+        // First, mint the resolver's view by sending sid=0 with attrs.
+        let dp_seed = DdSketchDataPoint {
+            attributes: vec![kv("zone", "z0")],
+            start_time_unix_nano: 1_000_000,
+            time_unix_nano: 11_000_000,
+            sketch: vec![1],
+            encoding: 1,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 0,
+        };
+        let _ = route_modified_otlp_sketches_to_precompute(
+            &build_request("http_latency_ms", dp_seed),
+            &state,
+        )
+        .await;
+        let resolved_sid = state.series_resolver.lookup(
+            "http_latency_ms",
+            &crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", "z0")]),
+        );
+        let resolved_sid = resolved_sid.expect("seed mints");
+
+        // Now arrive with the same attrs but a STALE sid.
+        let stale = resolved_sid.wrapping_add(123);
+        let dp_disagree = DdSketchDataPoint {
+            attributes: vec![kv("zone", "z0")],
+            start_time_unix_nano: 1_000_000,
+            time_unix_nano: 12_000_000,
+            sketch: vec![2],
+            encoding: 1,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: stale,
+        };
+        let unknown = route_modified_otlp_sketches_to_precompute(
+            &build_request("http_latency_ms", dp_disagree),
+            &state,
+        )
+        .await;
+        assert_eq!(unknown, vec![stale], "stale sid should be signalled");
+        // Cache stays at the originally-resolved value — the second call
+        // returns the same sid via the canonical fingerprint.
+        let still_resolved = state
+            .series_resolver
+            .lookup(
+                "http_latency_ms",
+                &crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", "z0")]),
+            )
+            .expect("still cached");
+        assert_eq!(still_resolved, resolved_sid);
+
+        drop(state);
+        let _ = drain.await;
     }
 }

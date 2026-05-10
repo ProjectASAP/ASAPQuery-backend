@@ -53,6 +53,18 @@ pub struct IngestState {
     /// timestamp so long-running deployments don't leak memory
     /// on retired series.
     pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::data_model::AggregateCore>>,
+    /// Phase 4 — centralized series_id resolver. Shared across the OTLP
+    /// receive path (sid resolution + `unknown_series_ids` population) and
+    /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
+    /// exporter). Holding it on `IngestState` lets every ingest source
+    /// reach the same idempotent compute-or-mint cache.
+    pub series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    /// Phase 5 — two-level sketch warm tier (instance metadata +
+    /// per-sid columnar state). Populated by the OTLP ingest path on
+    /// every modified-OTLP first-class sketch DataPoint; queried by
+    /// the `SimpleEngine` query path (warm-tier hit / ghost / unknown
+    /// classification drives the Phase 6 archive failover).
+    pub sketch_index: Arc<crate::stores::sketch_index::SketchIndex>,
 }
 
 impl IngestState {
@@ -168,6 +180,10 @@ mod tests {
             schemas,
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(
+                crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
+            ),
+            sketch_index: Arc::new(crate::stores::sketch_index::SketchIndex::new()),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

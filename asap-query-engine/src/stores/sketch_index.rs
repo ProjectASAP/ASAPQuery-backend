@@ -328,6 +328,31 @@ impl SketchIndex {
             .collect()
     }
 
+    /// Find every registered sid whose instance matches `metric_name` and
+    /// whose `group_by_keys` is a superset of (or equal to) the user's
+    /// requested label-key set. Phase 5 query path uses this to pick
+    /// candidate sids for warm-tier dispatch — a sid whose group-by KEYS
+    /// don't cover the user's PromQL label matchers can't answer the
+    /// query and must fall through to archive.
+    ///
+    /// Returns `Vec<u64>` rather than an iterator so callers can release
+    /// the read lock immediately. The `instances` map is read-mostly
+    /// (one write per first-seen sid), so taking the lock per query is
+    /// inexpensive.
+    pub fn instances_matching(
+        &self,
+        metric_name: &str,
+        required_keys: &BTreeSet<String>,
+    ) -> Vec<u64> {
+        let g = self.instances.read().unwrap();
+        g.iter()
+            .filter(|(_, m)| {
+                m.metric_name == metric_name && required_keys.is_subset(&m.group_by_keys)
+            })
+            .map(|(sid, _)| *sid)
+            .collect()
+    }
+
     /// Number of distinct sids carrying state (excludes ghosts).
     pub fn series_len(&self) -> usize {
         self.series.len()

@@ -428,6 +428,21 @@ async fn main() -> Result<()> {
         ))
     };
 
+    // Phase 4 + 5 wire-in (refactor 2026-05): allocate the shared
+    // SeriesIdResolver + SketchIndex once. The OTLP receive path
+    // (sid resolution + unknown_series_ids stamping; SketchIndex
+    // .append_sample on every modified-OTLP sketch DP) AND the
+    // SimpleEngine query path (SketchIndex.classify / query_range
+    // for warm-tier reads) hold clones of these Arcs. Allocated
+    // here before BOTH the SimpleEngine and the precompute engine
+    // are constructed so both can be wired with a single canonical
+    // instance — even when precompute is disabled, the engine still
+    // needs the index for the Phase 6 archive failover trigger.
+    let series_resolver = Arc::new(
+        query_engine_rust::drivers::ingest::series_resolver::SeriesIdResolver::new(),
+    );
+    let sketch_index = Arc::new(query_engine_rust::stores::sketch_index::SketchIndex::new());
+
     // Setup query engine. SimpleEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
     // to /api/v1/streaming-config is observable by the next query
@@ -441,7 +456,13 @@ async fn main() -> Result<()> {
             hot_reload_config.clone(),
             args.prometheus_scrape_interval,
             args.query_language,
-        );
+        )
+        // Phase 5 wire-in (refactor 2026-05): hand the warm-tier
+        // SketchIndex to the query engine so SidLookup classification
+        // drives the Phase 6 archive failover via
+        // EngineError::CapabilityMiss when the warm tier is empty
+        // / ghost / unknown.
+        .with_sketch_index(sketch_index.clone());
         if let Some(controller_endpoint) = args.controller_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",
@@ -542,8 +563,13 @@ async fn main() -> Result<()> {
             schema_persist_path: args.schema_persist_path.clone(),
         };
         let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
-        let engine =
-            PrecomputeEngine::new(precompute_config, hot_reload_config.clone(), output_sink);
+        let engine = PrecomputeEngine::new(
+            precompute_config,
+            hot_reload_config.clone(),
+            output_sink,
+            series_resolver.clone(),
+            sketch_index.clone(),
+        );
         let worker_diagnostics = engine.diagnostics();
         let ingest_state = engine.ingest_state();
         info!("Starting precompute engine (OTLP-fed; no HTTP ingest port)");
