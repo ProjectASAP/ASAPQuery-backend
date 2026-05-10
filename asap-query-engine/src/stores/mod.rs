@@ -16,6 +16,7 @@
 //! callers should not care whether it lives under `sketch_db` or
 //! at the `stores` top level.
 
+pub mod epoch_columnar;
 pub mod promsketch_store;
 pub mod sketch_db;
 pub mod sketch_index;

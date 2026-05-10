@@ -1,17 +1,14 @@
 //! Sketch index — Phase 5 of the controller-into-backend refactor (2026-05).
 //!
-//! Two-level index that the SimpleStore migrates to. Replaces the
-//! aggregation_id-keyed lookup with a content-addressable design where
-//! the index key is the `(raw_metric_name, group_by_keys, capability)`
-//! tuple — represented compactly by the centrally-assigned `series_id`
-//! (Phase 4) when one is available.
-//!
-//! Two levels:
+//! Two-level index:
 //! - `instances`: sid → SketchInstanceMetadata (one entry per logical
 //!   sketch instance — its metric name, group-by KEY set, capability,
 //!   sketch_type, sketch_config, accuracy bound).
-//! - `series`: sid → Vec<SketchTimeSeries> (per-series time-windowed
-//!   sketch state; one entry per distinct group-by VALUES vector).
+//! - `series`: sid → per-sid storage (`SidStoreData`) carrying the
+//!   per-window sketch state. Intern table per sid maps the group-by
+//!   VALUES vector to a compact `LabelValuesId = u32`; columnar
+//!   `MutableEpoch` + sealed-epoch ring delivers the legacy
+//!   SimpleMapStore's six storage optimizations end-to-end.
 //!
 //! Ghost sids (registered but never carrying state) are valid — they
 //! exist when an agent registers a pre-merge identity that the gateway
@@ -23,6 +20,11 @@
 //! `docs/design-controller-into-backend.md`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
+
+use dashmap::DashMap;
+
+use super::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
 
 /// Capability the controller's plan made for this sketch instance.
 /// Mirrors the design-doc Capability enum (§4.5). One Capability variant
@@ -127,7 +129,7 @@ impl AccuracyBound {
 /// Populated at ingest time when a sketch DataPoint with a fresh sid
 /// arrives (or `(metric, attrs)` produces a fresh sid via the
 /// SeriesIdResolver). Subsequent emits of the same sid append to the
-/// associated `SketchTimeSeries` without re-touching this metadata.
+/// associated `SidStoreData` without re-touching this metadata.
 #[derive(Debug, Clone)]
 pub struct SketchInstanceMetadata {
     pub sid: u64,
@@ -142,18 +144,8 @@ pub struct SketchInstanceMetadata {
     pub first_seen_unix_ms: i64,
 }
 
-/// Per-series time-windowed sketch state. One `SketchTimeSeries` per
-/// distinct group-by VALUES vector under a single sid.
-#[derive(Debug, Default)]
-pub struct SketchTimeSeries {
-    pub sid: u64,
-    /// The group-by VALUES (one value per key in
-    /// `SketchInstanceMetadata.group_by_keys`).
-    pub series_label_values: BTreeMap<String, String>,
-    /// `window_end_unix_ms → sketch payload bytes + encoding tag`.
-    pub samples: BTreeMap<i64, SketchSampleState>,
-}
-
+/// Per-sample sketch state. Stored as the payload column inside the
+/// per-sid `SidStoreData` columnar storage.
 #[derive(Debug, Clone)]
 pub struct SketchSampleState {
     pub bytes: Vec<u8>,
@@ -170,19 +162,39 @@ pub enum SketchEncoding {
     MsgpackDelta,
 }
 
+/// One materialized series row returned by the query path. Resolved
+/// from the per-sid intern table at read time.
+#[derive(Debug, Clone)]
+pub struct SketchTimeSeries {
+    pub sid: u64,
+    pub series_label_values: BTreeMap<String, String>,
+    /// `window_end_unix_ms → sketch payload`. BTreeMap so the query
+    /// path can iterate in time order without an extra sort.
+    pub samples: BTreeMap<i64, SketchSampleState>,
+}
+
+/// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
+/// outer DashMap stays read-mostly and per-sid writes don't block one
+/// another.
+type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, SketchSampleState>>>;
+
 /// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
 /// SimpleStore lookup once Phase 5 wiring lands at the streaming engine
 /// ingest path and the query path.
-#[derive(Debug, Default)]
+///
+/// `instances` is keyed under a `RwLock<HashMap>` because the registration
+/// rate is low (one write per first-seen sid) and reads dominate;
+/// `series` is a `DashMap` because per-sid writes happen on every DP.
+#[derive(Default)]
 pub struct SketchIndex {
     /// sid → metadata. May contain ghost sids (registered identities
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
-    pub instances: HashMap<u64, SketchInstanceMetadata>,
-    /// sid → per-series time-windowed state. Empty `Vec` (or absent
+    instances: RwLock<HashMap<u64, SketchInstanceMetadata>>,
+    /// sid → per-sid columnar storage. Empty `SidStoreData` (or absent
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
-    pub series: HashMap<u64, Vec<SketchTimeSeries>>,
+    series: DashMap<u64, SidStore>,
 }
 
 /// Three possible outcomes of looking up a sid in the SketchIndex.
@@ -205,47 +217,125 @@ impl SketchIndex {
         Self::default()
     }
 
+    /// Classify a sid for query routing. See `SidLookup` for semantics.
     pub fn classify(&self, sid: u64) -> SidLookup {
-        match (self.instances.get(&sid), self.series.get(&sid)) {
-            (Some(_), Some(series)) if !series.is_empty() => SidLookup::Hit,
-            (Some(_), _) => SidLookup::Ghost,
-            (None, _) => SidLookup::Unknown,
+        let known = self.instances.read().unwrap().contains_key(&sid);
+        if !known {
+            return SidLookup::Unknown;
+        }
+        match self.series.get(&sid) {
+            Some(store) => {
+                let g = store.read().unwrap();
+                if !g.current_epoch.is_empty() || !g.sealed_epochs.is_empty() {
+                    SidLookup::Hit
+                } else {
+                    SidLookup::Ghost
+                }
+            }
+            None => SidLookup::Ghost,
         }
     }
 
     /// Insert metadata for a freshly-resolved sid.
-    pub fn register(&mut self, meta: SketchInstanceMetadata) {
-        self.instances.insert(meta.sid, meta);
+    pub fn register(&self, meta: SketchInstanceMetadata) {
+        self.instances.write().unwrap().insert(meta.sid, meta);
+    }
+
+    /// Look up the metadata for a sid (cloned because callers usually
+    /// release the index lock before working with it).
+    pub fn instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
+        self.instances.read().unwrap().get(&sid).cloned()
     }
 
     /// Append a window's sketch state under `sid`. Caller is responsible
     /// for ensuring the corresponding `SketchInstanceMetadata` was
     /// registered (or the sketch arrives orphan and the caller chooses
     /// to drop / reject / register-on-the-fly).
+    ///
+    /// `window` is the OTLP DataPoint's `(start_time_unix_ms, time_unix_ms)`.
     pub fn append_sample(
-        &mut self,
+        &self,
         sid: u64,
         series_label_values: BTreeMap<String, String>,
-        window_end_unix_ms: i64,
+        window: TimestampRange,
         sample: SketchSampleState,
     ) {
-        let series_vec = self.series.entry(sid).or_default();
-        // Find or create the SketchTimeSeries for this label-values vector.
-        let ts = match series_vec
-            .iter_mut()
-            .find(|s| s.series_label_values == series_label_values)
-        {
-            Some(s) => s,
-            None => {
-                series_vec.push(SketchTimeSeries {
-                    sid,
-                    series_label_values,
-                    samples: BTreeMap::new(),
-                });
-                series_vec.last_mut().unwrap()
-            }
+        let store = self
+            .series
+            .entry(sid)
+            .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
+            .clone();
+        let mut guard = store.write().unwrap();
+        guard.insert(window, series_label_values, sample);
+    }
+
+    /// Range-query the warm-tier state for one sid. Window-end-keyed
+    /// time series result, one entry per distinct group-by VALUES
+    /// vector. `(start, end)` is the inclusive query window; entries
+    /// whose `(window_start, window_end)` lies fully within the query
+    /// range are returned.
+    pub fn query_range(
+        &self,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Vec<SketchTimeSeries> {
+        let store = match self.series.get(&sid) {
+            Some(s) => s.clone(),
+            None => return Vec::new(),
         };
-        ts.samples.insert(window_end_unix_ms, sample);
+        let guard = store.write().unwrap(); // exact_query may build the lazy index
+        let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
+            HashMap::new();
+
+        let mut buf: Vec<(TimestampRange, LabelValuesId, &SketchSampleState)> = Vec::new();
+        guard
+            .current_epoch
+            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+        for (win, label_id, payload) in &buf {
+            by_label_id
+                .entry(*label_id)
+                .or_default()
+                .insert(win.1 as i64, (*payload).clone());
+        }
+        buf.clear();
+
+        for sealed in guard.sealed_epochs.values() {
+            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            for (win, label_id, payload) in &buf {
+                by_label_id
+                    .entry(*label_id)
+                    .or_default()
+                    .insert(win.1 as i64, (*payload).clone());
+            }
+            buf.clear();
+        }
+
+        by_label_id
+            .into_iter()
+            .map(|(label_id, samples)| {
+                let label_values = guard
+                    .intern
+                    .resolve(label_id)
+                    .cloned()
+                    .unwrap_or_default();
+                SketchTimeSeries {
+                    sid,
+                    series_label_values: label_values,
+                    samples,
+                }
+            })
+            .collect()
+    }
+
+    /// Number of distinct sids carrying state (excludes ghosts).
+    pub fn series_len(&self) -> usize {
+        self.series.len()
+    }
+
+    /// Number of registered instances (includes ghosts).
+    pub fn instance_count(&self) -> usize {
+        self.instances.read().unwrap().len()
     }
 }
 
@@ -253,50 +343,84 @@ impl SketchIndex {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ghost_classification() {
-        let mut idx = SketchIndex::new();
-        let meta = SketchInstanceMetadata {
-            sid: 42,
+    fn meta(sid: u64) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+        SketchInstanceMetadata {
+            sid,
             metric_name: "m".into(),
             group_by_keys: BTreeSet::new(),
             capability: Capability::QuantileApprox(SketchKindHandle::DDSketch),
             sketch_kind: SketchKindHandle::DDSketch,
-            sketch_config: SketchConfig::DDSketch { relative_accuracy: 0.01 },
-            accuracy: AccuracyBound::from_config(&SketchConfig::DDSketch {
-                relative_accuracy: 0.01,
-            }),
+            sketch_config: cfg.clone(),
+            accuracy: AccuracyBound::from_config(&cfg),
             first_seen_unix_ms: 0,
-        };
-        idx.register(meta);
-        // Metadata exists but no series state — ghost.
+        }
+    }
+
+    fn sample(b: u8) -> SketchSampleState {
+        SketchSampleState { bytes: vec![b], encoding: SketchEncoding::ProtoFull }
+    }
+
+    #[test]
+    fn ghost_classification() {
+        let idx = SketchIndex::new();
+        idx.register(meta(42));
         assert_eq!(idx.classify(42), SidLookup::Ghost);
-        // Unregistered sid — unknown.
         assert_eq!(idx.classify(999), SidLookup::Unknown);
     }
 
     #[test]
     fn hit_after_append() {
-        let mut idx = SketchIndex::new();
-        let cfg = SketchConfig::Hll { precision: 14 };
-        let meta = SketchInstanceMetadata {
-            sid: 7,
-            metric_name: "m".into(),
-            group_by_keys: BTreeSet::new(),
-            capability: Capability::CardinalityApprox,
-            sketch_kind: SketchKindHandle::Hll,
-            sketch_config: cfg.clone(),
-            accuracy: AccuracyBound::from_config(&cfg),
-            first_seen_unix_ms: 0,
-        };
-        idx.register(meta);
-        idx.append_sample(
-            7,
-            BTreeMap::new(),
-            1000,
-            SketchSampleState { bytes: vec![1, 2, 3], encoding: SketchEncoding::ProtoFull },
-        );
+        let idx = SketchIndex::new();
+        idx.register(meta(7));
+        idx.append_sample(7, BTreeMap::new(), (1000, 1010), sample(1));
         assert_eq!(idx.classify(7), SidLookup::Hit);
+    }
+
+    #[test]
+    fn range_query_returns_distinct_series() {
+        let idx = SketchIndex::new();
+        idx.register(meta(11));
+        let mut lv_a = BTreeMap::new();
+        lv_a.insert("host".to_string(), "a".to_string());
+        let mut lv_b = BTreeMap::new();
+        lv_b.insert("host".to_string(), "b".to_string());
+
+        idx.append_sample(11, lv_a.clone(), (0, 10), sample(1));
+        idx.append_sample(11, lv_a.clone(), (10, 20), sample(2));
+        idx.append_sample(11, lv_b.clone(), (10, 20), sample(3));
+        idx.append_sample(11, lv_b.clone(), (20, 30), sample(4));
+
+        let mut series = idx.query_range(11, 0, 30);
+        series.sort_by(|x, y| x.series_label_values.cmp(&y.series_label_values));
+        assert_eq!(series.len(), 2);
+
+        let s_a = &series[0];
+        assert_eq!(s_a.series_label_values, lv_a);
+        assert_eq!(s_a.samples.len(), 2);
+        assert_eq!(s_a.samples[&10].bytes, vec![1]);
+        assert_eq!(s_a.samples[&20].bytes, vec![2]);
+
+        let s_b = &series[1];
+        assert_eq!(s_b.series_label_values, lv_b);
+        assert_eq!(s_b.samples.len(), 2);
+    }
+
+    #[test]
+    fn range_query_clips_to_window_bounds() {
+        let idx = SketchIndex::new();
+        idx.register(meta(13));
+        let lv = BTreeMap::new();
+        idx.append_sample(13, lv.clone(), (0, 10), sample(1));
+        idx.append_sample(13, lv.clone(), (10, 20), sample(2));
+        idx.append_sample(13, lv.clone(), (20, 30), sample(3));
+
+        // Only the middle window is fully within [5, 25].
+        let series = idx.query_range(13, 5, 25);
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        assert_eq!(s.samples.len(), 1);
+        assert!(s.samples.contains_key(&20));
     }
 
     #[test]
@@ -306,5 +430,31 @@ mod tests {
         });
         assert!((bound.epsilon - 0.01).abs() < 1e-9);
         assert!((bound.confidence - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn epoch_rotation_is_visible_to_query() {
+        let idx = SketchIndex::new();
+        idx.register(meta(17));
+
+        // Force aggressive rotation by touching the SidStoreData
+        // capacity *after* the entry is created. We do this by
+        // first appending one sample to materialize the entry, then
+        // mutating its config, then appending more.
+        idx.append_sample(17, BTreeMap::new(), (0, 10), sample(1));
+        if let Some(s) = idx.series.get(&17) {
+            let mut g = s.write().unwrap();
+            g.epoch_capacity = Some(2);
+            g.max_epochs = 4;
+        }
+        idx.append_sample(17, BTreeMap::new(), (10, 20), sample(2));
+        idx.append_sample(17, BTreeMap::new(), (20, 30), sample(3));
+        idx.append_sample(17, BTreeMap::new(), (30, 40), sample(4));
+
+        // All four windows should still be query-visible across the
+        // mutable + sealed boundary.
+        let series = idx.query_range(17, 0, 40);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].samples.len(), 4);
     }
 }
