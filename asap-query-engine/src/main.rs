@@ -1,3 +1,15 @@
+// Phase 9 (controller-into-backend refactor):
+// The `controller` crate is now a path-dep of this binary
+// (`../controller` in `asap-query-engine/Cargo.toml`). It is NOT yet
+// started in-process here; the in-process OpAMP server + capability-map
+// exposure are a follow-up that will land after Phase 4 (centralized
+// series_id resolver). For now we only verify that the crate compiles
+// inside this workspace and is importable from `main.rs`.
+//
+// When that follow-up lands, the OpAMP WS endpoint (port 4320) and the
+// RuntimeSamples gRPC endpoint (port 4321) will be served from inside
+// this same backend process — there is no longer a separate
+// `asap-controller` container in `mvp-multinode/run_demo.sh`.
 use clap::Parser;
 use query_engine_rust::data_model::QueryLanguage;
 use std::fs;
