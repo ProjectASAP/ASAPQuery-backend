@@ -29,6 +29,34 @@ option go_package = "go.opentelemetry.io/proto/otlp/collector/metrics/v1";
 // central collector.
 service MetricsService {
   rpc Export(ExportMetricsServiceRequest) returns (ExportMetricsServiceResponse) {}
+
+  // Refactor-2026-05 (Phase 4): Eager batch resolution of series identifiers.
+  // Senders that have an attribute-only batch ready before the next Export
+  // can pre-resolve sids in one round-trip, then attach the returned sids
+  // to subsequent Exports without sending attributes again. The resolver
+  // is idempotent: same `(metric_name, attributes_fingerprint)` always
+  // produces the same sid for the lifetime of the cache (see design doc
+  // §5.4 "Idempotency invariant on `ResolveSeriesIDs`").
+  rpc ResolveSeriesIDs(ResolveSeriesIDsRequest) returns (ResolveSeriesIDsResponse) {}
+}
+
+message ResolveSeriesIDsRequest {
+  repeated SeriesQuery queries = 1;
+}
+
+message SeriesQuery {
+  // The metric this attribute set belongs to.
+  string metric_name = 1;
+  // Opaque fingerprint of the attribute set. Senders MUST use the same
+  // canonical fingerprint algorithm as the receiver (sorted keys joined
+  // by `key=value;`); the receiver re-derives the cache key from this
+  // bytes blob, so any disagreement on canonicalization produces a
+  // cache miss and a fresh sid.
+  bytes attributes_fingerprint = 2;
+}
+
+message ResolveSeriesIDsResponse {
+  repeated SeriesAssignment assignments = 1;
 }
 
 message ExportMetricsServiceRequest {

@@ -38,6 +38,8 @@ impl PrecomputeEngine {
         config: PrecomputeEngineConfig,
         hot_reload_config: HotReloadStreamingConfig,
         output_sink: Arc<dyn OutputSink>,
+        series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+        sketch_index: Arc<crate::stores::sketch_index::SketchIndex>,
     ) -> Self {
         let worker_group_counts = (0..config.num_workers)
             .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -92,6 +94,8 @@ impl PrecomputeEngine {
             schemas,
             pass_raw_samples: config.pass_raw_samples,
             sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver,
+            sketch_index,
         });
 
         Self {

@@ -79,6 +79,64 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
     out
 }
 
+/// Phase 5 helper — extract `(metric_name, label_matcher_key_set)` from a
+/// PromQL query for warm-tier candidate selection. Walks the AST to find
+/// the first `VectorSelector` / `MatrixSelector`, returns its metric name
+/// (drawn either from `vs.name` or from a `__name__=...` matcher) and
+/// the user-specified label-matcher KEYS (excluding the synthetic
+/// `__name__`). Returns `None` for queries that don't reference a
+/// concrete metric.
+///
+/// Intentionally lightweight: callers use the result to filter warm-tier
+/// candidates via `SketchIndex::instances_matching`. Any over-approximation
+/// is tolerable — the candidates are subsequently classified, and on
+/// `Ghost` / `Unknown` outcomes the query falls through to the archive
+/// engine via the EngineRouter's `CapabilityMiss` failover.
+fn extract_metric_and_label_keys(
+    query: &str,
+) -> Option<(String, std::collections::BTreeSet<String>)> {
+    use promql_parser::parser::Expr;
+    let ast = promql_parser::parser::parse(query).ok()?;
+
+    fn walk(
+        expr: &Expr,
+    ) -> Option<(
+        String,
+        std::collections::BTreeSet<String>,
+    )> {
+        match expr {
+            Expr::VectorSelector(vs) => {
+                let mut keys = std::collections::BTreeSet::new();
+                let mut metric = vs.name.clone().unwrap_or_default();
+                for m in &vs.matchers.matchers {
+                    if m.name == "__name__" {
+                        if metric.is_empty() {
+                            metric = m.value.clone();
+                        }
+                        continue;
+                    }
+                    keys.insert(m.name.clone());
+                }
+                if metric.is_empty() {
+                    None
+                } else {
+                    Some((metric, keys))
+                }
+            }
+            Expr::MatrixSelector(ms) => walk(&Expr::VectorSelector(ms.vs.clone())),
+            Expr::Call(call) => call.args.args.iter().find_map(|a| walk(a)),
+            Expr::Aggregate(agg) => walk(&agg.expr),
+            Expr::Binary(bin) => walk(&bin.lhs).or_else(|| walk(&bin.rhs)),
+            Expr::Subquery(sq) => walk(&sq.expr),
+            Expr::Paren(p) => walk(&p.expr),
+            Expr::Unary(u) => walk(&u.expr),
+            _ => None,
+        }
+    }
+
+    walk(&ast)
+}
+
 /// Length of the UTF-8 character starting at `b` (the first byte).
 /// Returns 1 for invalid leading bytes, never panics.
 fn utf8_char_len(b: u8) -> usize {
@@ -224,6 +282,14 @@ pub struct SimpleEngine {
     /// [`Self::with_schema_registry`] to share the same registry the
     /// ingest path is reconciling.
     schema_registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
+    /// Phase 5 — warm-tier sketch index. When `Some`, the trait's
+    /// `execute` adapter classifies the query's metric/group-by against
+    /// the index and short-circuits to `EngineError::CapabilityMiss` when
+    /// no warm-tier identity covers the request — driving the
+    /// EngineRouter's archive failover (Phase 6). When `None`, the
+    /// engine behaves as it did before Phase 5 wire-in (every query
+    /// goes through `handle_query`'s legacy path).
+    sketch_index: Option<Arc<crate::stores::sketch_index::SketchIndex>>,
 }
 
 impl SimpleEngine {
@@ -405,7 +471,20 @@ impl SimpleEngine {
             query_language,
             controller_client: None,
             schema_registry: Arc::new(crate::stores::sketch_db::SchemaRegistry::empty()),
+            sketch_index: None,
         }
+    }
+
+    /// Phase 5 — attach the shared `SketchIndex` so the `QueryEngine`
+    /// trait adapter's classify+failover logic is active. Without this
+    /// call, the engine keeps the pre-Phase-5 behavior (route every
+    /// query through `handle_query`).
+    pub fn with_sketch_index(
+        mut self,
+        index: Arc<crate::stores::sketch_index::SketchIndex>,
+    ) -> Self {
+        self.sketch_index = Some(index);
+        self
     }
 
     /// Take a fresh snapshot of the current `StreamingConfig`. Each
@@ -3672,6 +3751,65 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
         &self,
         query: &str,
     ) -> Result<crate::engines::query_result::QueryResult, crate::engines::EngineError> {
+        // Phase 5 wire-in (refactor 2026-05) — classify against the
+        // sketch-warm-tier index BEFORE handing the query to
+        // `handle_query`. The classification is intentionally crude
+        // because the warm-tier sketch reducer is still a stub: as soon
+        // as ANY sid is `Ghost` / `Unknown`, OR no instance even matches
+        // the metric / group-by KEY set, we surface
+        // `EngineError::CapabilityMiss(SketchWarmTier, ...)` so the
+        // EngineRouter (Phase 6) fails over to the archive engine.
+        //
+        // When `instances_matching` returns sids that all classify as
+        // `Hit`, we still fall through to `handle_query`'s legacy code
+        // path — wiring per-Capability sketch reducers on top of
+        // `SketchIndex.query_range` is out of scope for this PR and
+        // tracked as a follow-up. The "hybrid stitch" covering
+        // `[t0..t1']` from warm + `[t1'..t1]` from archive is also
+        // deferred (`QueryResult` would need timestamp coverage
+        // metadata to express it).
+        if let Some(idx) = self.sketch_index.as_ref() {
+            if let Some((metric_name, required_keys)) =
+                extract_metric_and_label_keys(query)
+            {
+                let candidates = idx.instances_matching(&metric_name, &required_keys);
+                if candidates.is_empty() {
+                    return Err(crate::engines::EngineError::capability_miss(
+                        asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                        format!(
+                            "SketchWarmTier has no instance for metric `{metric_name}` \
+                             with group_by_keys ⊇ {:?}",
+                            required_keys
+                        ),
+                    ));
+                }
+                let mut all_hit = true;
+                for sid in &candidates {
+                    match idx.classify(*sid) {
+                        crate::stores::sketch_index::SidLookup::Hit => {}
+                        crate::stores::sketch_index::SidLookup::Ghost
+                        | crate::stores::sketch_index::SidLookup::Unknown => {
+                            all_hit = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_hit {
+                    return Err(crate::engines::EngineError::capability_miss(
+                        asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                        format!(
+                            "SketchWarmTier ghost/unknown sid for metric `{metric_name}` \
+                             — failing over to archive"
+                        ),
+                    ));
+                }
+                // All sids `Hit` → fall through to the legacy path.
+                // Per-Capability reducer over `query_range` is a
+                // follow-up; for now `handle_query` answers from the
+                // legacy `SimpleMapStore`. See block comment above.
+            }
+        }
+
         // `handle_query` is sync + needs a `time: f64` (epoch millis as float).
         // The router doesn't pass a query time, so we use wall-clock now —
         // matches `GorillaQueryEngine::execute`'s convention.
@@ -5931,5 +6069,144 @@ mod cms_rate_capability_tests {
             ctx.metadata.query_kwargs.get("range_ms").map(String::as_str),
             Some("60000")
         );
+    }
+}
+
+/// Phase 5 — `QueryEngine::execute` warm-tier classification tests.
+/// Pre-Phase-5 the trait adapter unconditionally delegated to
+/// `handle_query`. After Phase 5 wire-in, when a `SketchIndex` is
+/// attached, the adapter classifies first and surfaces
+/// `EngineError::CapabilityMiss(SketchWarmTier, ...)` on Ghost / Unknown
+/// / no-instance outcomes so the EngineRouter (Phase 6) can fall
+/// through to the archive engine.
+#[cfg(test)]
+mod warm_tier_classify_tests {
+    use super::*;
+    use crate::data_model::{CleanupPolicy, HotReloadStreamingConfig, InferenceConfig};
+    use crate::engines::EngineError;
+    use crate::routing::engine_router::QueryEngine as _;
+    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_index::{
+        AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,
+        SketchKindHandle, SketchSampleState,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn build_engine_with_index(idx: Arc<SketchIndex>) -> SimpleEngine {
+        let streaming_config = Arc::new(crate::data_model::StreamingConfig::default());
+        let store = Arc::new(SimpleMapStore::new(
+            streaming_config.clone(),
+            CleanupPolicy::NoCleanup,
+        ));
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
+        let inference_config = InferenceConfig::new(
+            crate::data_model::QueryLanguage::promql,
+            CleanupPolicy::NoCleanup,
+        );
+        SimpleEngine::new_with_hot_reload(
+            store,
+            inference_config,
+            hot_reload,
+            15000,
+            crate::data_model::QueryLanguage::promql,
+        )
+        .with_sketch_index(idx)
+    }
+
+    fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: group_by.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            capability: Capability::QuantileApprox(SketchKindHandle::DDSketch),
+            sketch_kind: SketchKindHandle::DDSketch,
+            sketch_config: cfg.clone(),
+            accuracy: AccuracyBound::from_config(&cfg),
+            first_seen_unix_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_returns_capability_miss_when_no_instance_matches() {
+        // No instance for `unknown_metric` is registered → adapter must
+        // capability-miss rather than burn a `handle_query` round-trip.
+        let idx = Arc::new(SketchIndex::new());
+        let engine = build_engine_with_index(idx);
+        let err = engine.execute("unknown_metric{zone=\"z0\"}").await.expect_err(
+            "warm-tier with no matching instance must yield CapabilityMiss",
+        );
+        match err {
+            EngineError::CapabilityMiss { engine_id, .. } => {
+                assert_eq!(
+                    engine_id,
+                    asap_types::StorageBackend::SketchWarmTier.data_source_id()
+                );
+            }
+            other => panic!("expected CapabilityMiss, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_returns_capability_miss_when_classify_is_ghost() {
+        // Register instance metadata but never call append_sample → the
+        // sid classifies as Ghost. Adapter must short-circuit to
+        // CapabilityMiss so the EngineRouter (Phase 6) fails over.
+        let idx = Arc::new(SketchIndex::new());
+        idx.register(dd_meta(1, "http_latency_ms", &["zone"]));
+        let engine = build_engine_with_index(idx);
+        let err = engine
+            .execute("http_latency_ms{zone=\"z0\"}")
+            .await
+            .expect_err("ghost classification must yield CapabilityMiss");
+        match err {
+            EngineError::CapabilityMiss { engine_id, detail } => {
+                assert_eq!(
+                    engine_id,
+                    asap_types::StorageBackend::SketchWarmTier.data_source_id()
+                );
+                assert!(
+                    detail.contains("ghost") || detail.contains("Ghost") || detail.contains("unknown"),
+                    "detail mentions ghost/unknown: {detail}"
+                );
+            }
+            other => panic!("expected CapabilityMiss, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_proceeds_to_handle_query_when_all_sids_hit() {
+        // Register an instance AND append a sample so the sid Hits. The
+        // adapter then falls through to `handle_query`; with an empty
+        // store + no inference-config patterns, that path returns its
+        // own CapabilityMiss — but the failure mode is the legacy "no
+        // compatible aggregation" detail, distinct from the warm-tier
+        // ghost/unknown detail. The contract verified here is "Hit
+        // does NOT short-circuit to the warm-tier-specific miss".
+        let idx = Arc::new(SketchIndex::new());
+        idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
+        idx.append_sample(
+            2,
+            BTreeMap::from([("zone".to_string(), "z0".to_string())]),
+            (1_000, 1_010),
+            SketchSampleState {
+                bytes: vec![0],
+                encoding: crate::stores::sketch_index::SketchEncoding::ProtoFull,
+            },
+        );
+
+        let engine = build_engine_with_index(idx);
+        let result = engine.execute("http_latency_ms{zone=\"z0\"}").await;
+        match result {
+            Err(EngineError::CapabilityMiss { detail, .. }) => {
+                assert!(
+                    detail.contains("no compatible aggregation"),
+                    "Hit path delegated to handle_query, which produced legacy miss: {detail}"
+                );
+            }
+            other => panic!(
+                "expected handle_query's legacy CapabilityMiss after Hit, got {other:?}"
+            ),
+        }
     }
 }
