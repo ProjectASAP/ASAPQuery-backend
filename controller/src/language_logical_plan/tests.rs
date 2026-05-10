@@ -63,7 +63,7 @@ fn lower_promql_topk_extracts_groupby() {
 #[test]
 fn lower_unsupported_language_errors_cleanly() {
     // Build a stub LanguageAst variant by hand — we cannot construct
-    // SQL/DataFusion/ElasticDsl variants because LanguageAst doesn't
+    // SQL/ElasticDsl variants because LanguageAst doesn't
     // expose those yet (PromQL is the only variant). So the equivalent
     // smoke test is: stub backends fail at L1 with `Unimplemented`, and
     // the type system rules out passing them to L2 lowering. We assert

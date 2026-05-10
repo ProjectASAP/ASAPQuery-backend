@@ -17,7 +17,6 @@
 //!   ├── language_ast.rs   — LanguageAst sum type
 //!   ├── promql/           — PromQL backend (active; wraps query_parser::promql)
 //!   ├── sql/              — SQL backend (stub; Unimplemented)
-//!   ├── datafusion/       — DataFusion backend (stub; Unimplemented)
 //!   └── elastic_dsl/      — ElasticDSL backend (stub; Unimplemented)
 //! ```
 //!
@@ -33,7 +32,6 @@ pub mod language_ast;
 
 pub mod promql;
 pub mod sql;
-pub mod datafusion;
 pub mod elastic_dsl;
 
 pub use language::{Language, ParseError};
@@ -41,7 +39,6 @@ pub use language_ast::LanguageAst;
 
 pub use promql::PromQLLanguage;
 pub use sql::SqlLanguage;
-pub use datafusion::DataFusionLanguage;
 pub use elastic_dsl::ElasticDslLanguage;
 
 #[cfg(test)]

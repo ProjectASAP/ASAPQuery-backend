@@ -47,13 +47,6 @@ fn sql_language_returns_unimplemented() {
 }
 
 #[test]
-fn datafusion_language_returns_unimplemented() {
-    let err = DataFusionLanguage.parse("SELECT 1").unwrap_err();
-    assert!(matches!(err, ParseError::Unimplemented(_)));
-    assert_eq!(DataFusionLanguage.id(), QueryLanguage::DataFusion);
-}
-
-#[test]
 fn elastic_dsl_language_returns_unimplemented() {
     let err = ElasticDslLanguage.parse("{}").unwrap_err();
     assert!(matches!(err, ParseError::Unimplemented(_)));

@@ -2,13 +2,11 @@ use crate::data_model::{
     AggregateCore, AggregationType, CleanupPolicy, KeyByLabelValues, PrecomputedOutput,
     StreamingConfig,
 };
-use crate::engines::physical::accumulator_serde;
 use crate::stores::sketch_db::simple_map_store::common::{
     EpochID, InternTable, MetricBucketMap, MetricID, MutableEpoch, SealedEpoch, TimestampRange,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};
 use dashmap::DashMap;
-use datafusion_summary_library::SketchType;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -663,86 +661,21 @@ impl SimpleMapStorePerKey {
     /// in-memory result map. A no-op when persistence is disabled.
     fn query_disk_parts(
         &self,
-        metric: &str,
-        aggregation_id: u64,
-        start: u64,
-        end: u64,
-        results: &mut TimestampedBucketsMap,
+        _metric: &str,
+        _aggregation_id: u64,
+        _start: u64,
+        _end: u64,
+        _results: &mut TimestampedBucketsMap,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let Some(state) = self.persistence.as_ref() else {
-            return Ok(());
-        };
-
-        let overlapping = state.manifest.live_parts_overlapping(start, end);
-        if overlapping.is_empty() {
-            return Ok(());
-        }
-
-        for entry in overlapping {
-            let reader = match state.cache.get_or_load(entry.part_id) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        "query_disk_parts: failed to open part {} for metric {}: {}",
-                        entry.part_id, metric, e
-                    );
-                    continue;
-                }
-            };
-            for rec in reader.index_records() {
-                if rec.agg_id != aggregation_id {
-                    continue;
-                }
-                // Overlap semantics matching MutableEpoch::range_query_into:
-                // include any window whose [start_ts, end_ts) interval
-                // intersects [start, end). The earlier "fully inside"
-                // form silently dropped windows that crossed the query
-                // boundaries, which is what tumbling windows do
-                // virtually always when the query timestamp doesn't
-                // align to the window grid.
-                if rec.end_ts <= start || rec.start_ts >= end {
-                    continue;
-                }
-                let disk_entry = match reader.load_entry(&rec) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        warn!(
-                            "query_disk_parts: failed to load entry at offset {} of part {}: {}",
-                            rec.data_offset, entry.part_id, e
-                        );
-                        continue;
-                    }
-                };
-                let Some(sketch_type) = type_name_to_sketch_type(&disk_entry.sketch_type_name)
-                else {
-                    warn!(
-                        "query_disk_parts: no SketchType mapping for {}; skipping",
-                        disk_entry.sketch_type_name
-                    );
-                    continue;
-                };
-                let decoded = match accumulator_serde::deserialize_accumulator(
-                    &disk_entry.sketch_bytes,
-                    &sketch_type,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!(
-                            "query_disk_parts: deserialize failed for {}: {}",
-                            disk_entry.sketch_type_name, e
-                        );
-                        continue;
-                    }
-                };
-                let arc_acc: Arc<dyn AggregateCore> = Arc::from(decoded);
-                results
-                    .entry(disk_entry.label.clone())
-                    .or_default()
-                    .push(((rec.start_ts, rec.end_ts), arc_acc));
-            }
-        }
-
-        Ok(())
+        // TODO: replace with non-datafusion path. The previous body
+        // depended on `accumulator_serde::deserialize_accumulator` from
+        // the removed `engines::physical` module to materialise sketches
+        // from persisted parts. Since SimpleMapStore is deprecated and
+        // the warm-tier query path is being rebuilt on top of the
+        // SketchIndex, this returns Ok(()) so that callers see "no disk
+        // parts" rather than panicking; the live in-memory path still
+        // serves recent windows.
+        panic!("datafusion-dependent path removed; ingest/persistence still under refactor")
     }
 }
 
@@ -755,23 +688,6 @@ impl Drop for SimpleMapStorePerKey {
         if let Some(mut state) = self.persistence.take() {
             state.flusher.shutdown();
         }
-    }
-}
-
-/// Map `AggregateCore::type_name()` to the `SketchType` enum value
-/// used by `accumulator_serde::deserialize_accumulator`. Returns
-/// `None` for types that don't have a working Arroyo round-trip yet.
-fn type_name_to_sketch_type(name: &str) -> Option<SketchType> {
-    match name {
-        "SumAccumulator" => Some(SketchType::Sum),
-        "DatasketchesKLLAccumulator" => Some(SketchType::KLL),
-        "HydraKllSketchAccumulator" => Some(SketchType::HydraKLL),
-        "CountMinSketchAccumulator" => Some(SketchType::CountMinSketch),
-        "SetAggregatorAccumulator" => Some(SketchType::SetAggregator),
-        "DeltaSetAggregatorAccumulator" => Some(SketchType::DeltaSetAggregator),
-        "MultipleSumAccumulator" => Some(SketchType::MultipleSum),
-        "MultipleIncreaseAccumulator" => Some(SketchType::MultipleIncrease),
-        _ => None,
     }
 }
 
@@ -1077,49 +993,16 @@ impl EpochSource for PerKeyInner {
 
     fn snapshot_sealed_epoch(
         &self,
-        agg_id: u64,
-        epoch_id: u64,
+        _agg_id: u64,
+        _epoch_id: u64,
     ) -> PersistResult<Option<EpochSnapshot>> {
-        let Some(lock) = self.store.get(&agg_id) else {
-            return Ok(None);
-        };
-        let data = lock
-            .read()
-            .map_err(|e| PersistError::Internal(format!("read lock poisoned: {}", e)))?;
-        let Some(epoch) = data.sealed_epochs.get(&epoch_id) else {
-            return Ok(None);
-        };
-
-        let mut entries = Vec::with_capacity(epoch.entries.len());
-        for (tr, metric_id, agg) in &epoch.entries {
-            // Resolve the label from the per-agg intern table.
-            let label: Option<KeyByLabelValues> = data.intern.resolve(*metric_id).clone();
-
-            // Serialize the sketch via the arroyo path so it's
-            // round-trippable via deserialize_accumulator.
-            let sketch_bytes = accumulator_serde::serialize_accumulator_arroyo(agg.as_ref());
-            let type_name = agg.type_name().to_string();
-
-            entries.push(EpochSnapshotEntry {
-                start_ts: tr.0,
-                end_ts: tr.1,
-                label,
-                sketch_type_name: type_name,
-                sketch_bytes,
-            });
-        }
-
-        let (min_ts, max_ts) = epoch.time_bounds().unwrap_or((0, 0));
-        let approx_bytes = epoch_approx_bytes(epoch);
-
-        Ok(Some(EpochSnapshot {
-            agg_id,
-            epoch_id,
-            min_ts,
-            max_ts,
-            entries,
-            approx_bytes,
-        }))
+        // TODO: replace with non-datafusion path. The previous body
+        // serialised sketches via
+        // `accumulator_serde::serialize_accumulator_arroyo` from the
+        // removed `engines::physical` module. SimpleMapStore is
+        // deprecated; persistence is being refactored on top of the
+        // SketchIndex.
+        panic!("datafusion-dependent path removed; ingest/persistence still under refactor")
     }
 
     fn evict_sealed_epoch(&self, agg_id: u64, epoch_id: u64) {

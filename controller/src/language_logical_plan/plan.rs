@@ -51,7 +51,6 @@ pub enum LanguageLogicalPlan {
     },
     // Future variants (kept commented to surface intent):
     // Sql        { source: String, tree: SqlTree,  summary: ... },
-    // DataFusion { source: String, tree: DfPlan,   summary: ... },
     // ElasticDsl { source: String, tree: EsTree,   summary: ... },
 }
 

@@ -156,7 +156,7 @@ pub enum Placement {
     BackendCollector,
     /// PromSketch store (ASAPQuery).
     PromSketchStore,
-    /// General query engine (ASAPQuery / DataFusion).
+    /// General query engine (ASAPQuery).
     QueryEngine,
     /// Database (ClickHouse, TimescaleDB, etc.).
     Database,
