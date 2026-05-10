@@ -44,7 +44,21 @@
 //! Phase-5 hybrid stitching (warm `[t0..t1']` + archive
 //! `[t1'..t1]`) and per-window iteration (rather than today's
 //! per-sample evaluate-then-merge) remain follow-ups.
+//!
+//! 2026-05 follow-ups landed here:
+//! * **TODO 1**: CMS-with-heap top-k. `Capability::FrequencyTopk(CmsWithHeap)`
+//!   reads the embedded heap directly; CMS / CountSketch without a heap
+//!   surface as `WarmTierError::MissingHeap` and fail over to archive.
+//! * **TODO 2**: Delta encoding stitching. `ProtoDelta` / `MsgpackDelta`
+//!   are now applied via [`delta_apply`] — see that module's docs for the
+//!   per-window vs cumulative modes (selected by function name).
+//! * **TODO 3**: Hybrid warm+archive stitch. [`WarmTierResult::coverage`]
+//!   reports the actual `(min_window_start_ms, max_window_end_ms)` the
+//!   reducer covered so `SimpleEngine` can stitch the missing prefix /
+//!   suffix from the archive engine.
 
+pub mod decoders;
+pub mod delta_apply;
 pub mod promql_extract;
 pub mod sketch_reducer;
 

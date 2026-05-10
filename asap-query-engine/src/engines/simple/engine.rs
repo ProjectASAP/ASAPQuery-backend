@@ -290,6 +290,18 @@ pub struct SimpleEngine {
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
     sketch_index: Option<Arc<crate::stores::sketch_db::sketch_index::SketchIndex>>,
+    /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
+    /// `main.rs`'s engine builder. When the warm-tier reducer reports a
+    /// `WarmTierResult.coverage` narrower than the requested
+    /// `[t0, t1]`, the engine calls into this archive engine to fetch
+    /// the missing prefix / suffix and stitches the two answers by
+    /// `(label_values, timestamp)`. Warm-tier values win on overlap.
+    ///
+    /// When `None` (no archive engine wired), the engine returns the
+    /// warm answer as-is; the existing `EngineRouter` failover handles
+    /// the rest of the routing matrix.
+    archive_engine:
+        Option<Arc<dyn crate::routing::engine_router::QueryEngine>>,
 }
 
 impl SimpleEngine {
@@ -472,7 +484,20 @@ impl SimpleEngine {
             controller_client: None,
             schema_registry: Arc::new(crate::stores::sketch_db::SchemaRegistry::empty()),
             sketch_index: None,
+            archive_engine: None,
         }
+    }
+
+    /// Phase-5 hybrid-stitch builder — attach an archive engine the
+    /// `QueryEngine` trait adapter will dispatch to when the warm-tier
+    /// reducer reports a coverage narrower than the requested range.
+    /// When `None`, the engine returns whatever the warm tier covers.
+    pub fn with_archive_engine(
+        mut self,
+        archive: Arc<dyn crate::routing::engine_router::QueryEngine>,
+    ) -> Self {
+        self.archive_engine = Some(archive);
+        self
     }
 
     /// Phase 5 — attach the shared `SketchIndex` so the `QueryEngine`
@@ -3487,6 +3512,70 @@ impl SimpleEngine {
 /// `now_ms` is unused for the matrix variant (each sample carries its
 /// own window-end timestamp); it's plumbed for future extension to
 /// the instant-vector case (latest-pane projection).
+/// Merge a warm-tier `QueryResult::Matrix` with an archive
+/// `QueryResult::Matrix` by `(label_values, timestamp)`. Samples whose
+/// timestamps fall inside the warm coverage `(cov_lo, cov_hi)` keep
+/// the warm value (warm is approximate but more recent); samples
+/// outside that window come from the archive answer. For
+/// labels-not-present-in-warm series the archive series is taken in
+/// full. Used by `SimpleEngine`'s hybrid-stitch path when the
+/// warm-tier reducer reports `coverage` narrower than the request.
+fn stitch_warm_and_archive(
+    warm: crate::engines::query_result::QueryResult,
+    archive: crate::engines::query_result::QueryResult,
+    cov_lo: u64,
+    cov_hi: u64,
+) -> crate::engines::query_result::QueryResult {
+    use crate::engines::query_result::{QueryResult, RangeVectorElement, Sample};
+    use std::collections::BTreeMap;
+
+    let warm_matrix = match &warm {
+        QueryResult::Matrix(m) => m.values.clone(),
+        _ => return archive,
+    };
+    let archive_matrix = match &archive {
+        QueryResult::Matrix(m) => m.values.clone(),
+        QueryResult::Vector(_) => return warm,
+    };
+
+    // Index warm series by labels for fast lookup.
+    let mut by_labels: BTreeMap<Vec<String>, RangeVectorElement> = BTreeMap::new();
+    for el in warm_matrix {
+        by_labels.insert(el.labels.labels.clone(), el);
+    }
+
+    // For each archive series, merge into by_labels.
+    for arch_el in archive_matrix {
+        let entry = by_labels.entry(arch_el.labels.labels.clone()).or_insert_with(
+            || RangeVectorElement::new(arch_el.labels.clone()),
+        );
+        // Build a set of warm timestamps inside coverage (kept).
+        let warm_ts: std::collections::HashSet<u64> = entry
+            .samples
+            .iter()
+            .filter(|s| s.timestamp >= cov_lo && s.timestamp <= cov_hi)
+            .map(|s| s.timestamp)
+            .collect();
+        // Drop any warm samples that ended up outside coverage —
+        // archive will replace them.
+        entry
+            .samples
+            .retain(|s| s.timestamp >= cov_lo && s.timestamp <= cov_hi);
+        for s in arch_el.samples {
+            // Skip archive samples whose timestamps fall inside warm
+            // coverage AND warm produced a value there (warm wins).
+            if s.timestamp >= cov_lo && s.timestamp <= cov_hi && warm_ts.contains(&s.timestamp) {
+                continue;
+            }
+            entry.samples.push(Sample::new(s.timestamp, s.value));
+        }
+        entry.samples.sort_by_key(|s| s.timestamp);
+    }
+
+    let elements: Vec<RangeVectorElement> = by_labels.into_values().collect();
+    QueryResult::matrix(elements)
+}
+
 fn warm_tier_result_to_query_result(
     result: crate::engines::warm_tier::WarmTierResult,
     _now_ms: u64,
@@ -3639,7 +3728,34 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                     now_ms,
                 ) {
                     Ok(result) => {
-                        return Ok(warm_tier_result_to_query_result(result, now_ms));
+                        // Phase-5 hybrid stitch — if the warm tier
+                        // only covers a sub-range of `[t0, t1]` and an
+                        // archive engine is wired, fetch the missing
+                        // prefix / suffix and merge by
+                        // `(label_values, timestamp)`. Warm-tier
+                        // values win on overlap (warm is approximate
+                        // but more recent; archive is the source of
+                        // truth for older data).
+                        let warm_qr = warm_tier_result_to_query_result(result.clone(), now_ms);
+                        if let (Some((cov_lo, cov_hi)), Some(archive)) =
+                            (result.coverage, self.archive_engine.as_ref())
+                        {
+                            if cov_lo > t0_ms || cov_hi < now_ms {
+                                let archive_qr = archive.execute(query).await;
+                                if let Ok(archive_qr) = archive_qr {
+                                    return Ok(stitch_warm_and_archive(
+                                        warm_qr,
+                                        archive_qr,
+                                        cov_lo,
+                                        cov_hi,
+                                    ));
+                                }
+                                // On archive error, fall back to the
+                                // warm-only answer (router can decide
+                                // on a higher-level retry).
+                            }
+                        }
+                        return Ok(warm_qr);
                     }
                     Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(
                         name,
@@ -3686,6 +3802,24 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             format!(
                                 "SketchWarmTier reducer found no samples for metric \
                                  `{m}` in window — failing over to archive"
+                            ),
+                        ));
+                    }
+                    Err(crate::engines::warm_tier::WarmTierError::MissingHeap {
+                        sid,
+                        sketch_kind,
+                    }) => {
+                        // Top-k against a vanilla CMS / CountSketch
+                        // (no embedded heap) — the reducer can't
+                        // enumerate heavy hitters without the
+                        // external item universe. Fall over to
+                        // archive, which can scan raw samples.
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer cannot enumerate top-k for sid \
+                                 {sid} (sketch_kind={sketch_kind:?}, no heap) — \
+                                 failing over to archive"
                             ),
                         ));
                     }
@@ -6103,5 +6237,112 @@ mod warm_tier_classify_tests {
                 "expected post-Hit CapabilityMiss, got {other:?}"
             ),
         }
+    }
+}
+
+// ===========================================================================
+// Hybrid warm + archive stitch tests (TODO 3 of the warm-tier follow-ups).
+// Exercise `stitch_warm_and_archive` directly with synthetic
+// `QueryResult::Matrix` payloads and assert the merged result honors
+// the "warm wins on overlap; archive fills gaps" contract.
+// ===========================================================================
+#[cfg(test)]
+mod hybrid_stitch_tests {
+    use super::stitch_warm_and_archive;
+    use crate::data_model::KeyByLabelValues;
+    use crate::engines::query_result::{QueryResult, RangeVectorElement, Sample};
+
+    fn matrix_with_samples(label: &str, samples: Vec<(u64, f64)>) -> QueryResult {
+        let labels = KeyByLabelValues::new_with_labels(vec![label.to_string()]);
+        let mut el = RangeVectorElement::new(labels);
+        for (t, v) in samples {
+            el.samples.push(Sample::new(t, v));
+        }
+        QueryResult::matrix(vec![el])
+    }
+
+    #[test]
+    fn stitch_fills_archive_prefix_and_suffix() {
+        // Warm covers [100, 200] with timestamps 100, 150, 200.
+        let warm = matrix_with_samples(
+            "host=a",
+            vec![(100, 10.0), (150, 11.0), (200, 12.0)],
+        );
+        // Archive covers [50, 250] with timestamps every 50ms.
+        let archive = matrix_with_samples(
+            "host=a",
+            vec![
+                (50, 1.0),
+                (100, 99.0), // overlap: warm wins
+                (150, 99.0), // overlap: warm wins
+                (200, 99.0), // overlap: warm wins
+                (250, 2.0),
+            ],
+        );
+        let merged = stitch_warm_and_archive(warm, archive, 100, 200);
+        let m = match merged {
+            QueryResult::Matrix(m) => m,
+            _ => panic!("expected matrix"),
+        };
+        assert_eq!(m.values.len(), 1, "one series");
+        let samples = &m.values[0].samples;
+        // Five distinct timestamps in the merged answer.
+        assert_eq!(samples.len(), 5);
+        // Warm values preserved on overlap.
+        let mut by_ts: std::collections::HashMap<u64, f64> =
+            samples.iter().map(|s| (s.timestamp, s.value)).collect();
+        assert_eq!(by_ts.remove(&100), Some(10.0));
+        assert_eq!(by_ts.remove(&150), Some(11.0));
+        assert_eq!(by_ts.remove(&200), Some(12.0));
+        // Archive prefix / suffix preserved.
+        assert_eq!(by_ts.remove(&50), Some(1.0));
+        assert_eq!(by_ts.remove(&250), Some(2.0));
+    }
+
+    #[test]
+    fn stitch_keeps_archive_only_series_in_full() {
+        // Warm has series "a"; archive has series "a" + "b". Both
+        // need to make it into the merged answer; "b" comes from
+        // archive in full.
+        let warm = matrix_with_samples("host=a", vec![(150, 5.0)]);
+        let archive = {
+            let a = {
+                let labels = KeyByLabelValues::new_with_labels(vec!["host=a".to_string()]);
+                let mut el = RangeVectorElement::new(labels);
+                el.samples.push(Sample::new(100, 1.0));
+                el.samples.push(Sample::new(150, 99.0)); // warm wins
+                el.samples.push(Sample::new(200, 2.0));
+                el
+            };
+            let b = {
+                let labels = KeyByLabelValues::new_with_labels(vec!["host=b".to_string()]);
+                let mut el = RangeVectorElement::new(labels);
+                el.samples.push(Sample::new(100, 7.0));
+                el.samples.push(Sample::new(200, 8.0));
+                el
+            };
+            QueryResult::matrix(vec![a, b])
+        };
+        let merged = stitch_warm_and_archive(warm, archive, 150, 150);
+        let m = match merged {
+            QueryResult::Matrix(m) => m,
+            _ => panic!("expected matrix"),
+        };
+        assert_eq!(m.values.len(), 2, "two series after merge");
+        let by_label: std::collections::HashMap<Vec<String>, &RangeVectorElement> = m
+            .values
+            .iter()
+            .map(|e| (e.labels.labels.clone(), e))
+            .collect();
+        let a = by_label.get(&vec!["host=a".to_string()]).expect("series a");
+        assert_eq!(a.samples.len(), 3);
+        let a_at_150 = a
+            .samples
+            .iter()
+            .find(|s| s.timestamp == 150)
+            .expect("warm value at 150 preserved");
+        assert_eq!(a_at_150.value, 5.0, "warm wins on overlap");
+        let b = by_label.get(&vec!["host=b".to_string()]).expect("series b");
+        assert_eq!(b.samples.len(), 2);
     }
 }

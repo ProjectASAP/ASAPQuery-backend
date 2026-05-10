@@ -55,6 +55,14 @@ pub enum SketchKindHandle {
     Hll,
     CountSketch,
     CountMin,
+    /// CMS-with-heap. Detected at the application level via the
+    /// precompute_operators `count_min_sketch_with_heap_accumulator`
+    /// flow — the OTLP `CountMinSketch` wire struct doesn't carry the
+    /// heap natively, so the gateway/precompute layer marks the
+    /// sid with this variant when the parent container's heap field
+    /// is non-empty. The warm-tier reducer reads the heap directly
+    /// when answering `topk` / `topk_over_time`.
+    CmsWithHeap,
 }
 
 /// Sketch-instance configuration carried per-Metric on the OTLP wire
