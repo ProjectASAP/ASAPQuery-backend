@@ -57,6 +57,10 @@ use asap_sketchlib::sketches::kll::KllSketch;
 use asap_sketchlib::sketches::countminsketch::CountMinSketch;
 use asap_sketchlib::sketches::countsketch::CountSketch;
 
+use crate::engines::warm_tier::decoders::decode_cms_with_heap_from_msgpack;
+use crate::engines::warm_tier::delta_apply::{
+    cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
+};
 use crate::stores::sketch_db::sketch_index::{
     Capability, SketchEncoding, SketchIndex, SketchInstanceMetadata, SketchKindHandle,
     SketchSampleState,
@@ -73,13 +77,26 @@ pub struct SketchReducer<'a> {
 /// can't answer this; archive can". `DeserializeFailure` → "the
 /// warm-tier state didn't decode; defensive fallback". `NoData` →
 /// "the sketch index has no samples in `[t0, t1]`; archive may have
-/// older history".
+/// older history". `MissingHeap` → "the sid is FrequencyTopk-classed
+/// but the underlying sketch family carries no heap (vanilla
+/// CountSketch / CountMinSketch without `CmsWithHeap`), so the
+/// reducer can't materialize top-k items without an external item
+/// universe".
 #[derive(Debug)]
 pub enum WarmTierError {
     UnsupportedFunction(String),
     UnsupportedCapability {
         function: String,
         capability: Capability,
+    },
+    /// Top-k requested against a `FrequencyTopk(CountMin)` or
+    /// `FrequencyTopk(CountSketch)` sid (i.e. the sketch shape
+    /// supports point queries but not heavy-hitter enumeration). The
+    /// router falls over to archive — an archive scan can materialize
+    /// the full item universe and compute the true top-k.
+    MissingHeap {
+        sid: u64,
+        sketch_kind: SketchKindHandle,
     },
     DeserializeFailure {
         sid: u64,
@@ -104,6 +121,13 @@ impl std::fmt::Display for WarmTierError {
                 f,
                 "warm-tier reducer cannot answer `{function}` against capability {capability:?}"
             ),
+            WarmTierError::MissingHeap { sid, sketch_kind } => write!(
+                f,
+                "warm-tier reducer cannot enumerate top-k for sid {sid}: \
+                 sketch kind {sketch_kind:?} carries no top-k heap \
+                 (CountMin / CountSketch only support point-frequency queries; \
+                 use CmsWithHeap for top-k)"
+            ),
             WarmTierError::DeserializeFailure {
                 sid,
                 encoding,
@@ -124,11 +148,23 @@ impl std::fmt::Display for WarmTierError {
 impl std::error::Error for WarmTierError {}
 
 /// Per-series, per-window scalar results.
+///
+/// `coverage` is the actual `(min_window_start_ms, max_window_end_ms)`
+/// the reducer covered. `None` when the reducer didn't observe any
+/// in-range window (defensive default). The caller (`SimpleEngine`)
+/// compares `coverage` against the requested `[t0, t1]` and, on a
+/// partial hit (`cov_lo > t0 || cov_hi < t1`), falls over to archive
+/// for the missing range and stitches the two answers. See TODO 3 in
+/// the warm-tier follow-up PR.
 #[derive(Debug, Clone, Default)]
 pub struct WarmTierResult {
     /// `(label_values, samples)` where `samples` is
     /// `(window_end_unix_ms, value)`.
     pub series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
+    /// Effective coverage `(min_window_start_ms, max_window_end_ms)`.
+    /// Set whenever the reducer observed at least one window; left
+    /// `None` when `series` is empty.
+    pub coverage: Option<(u64, u64)>,
 }
 
 impl WarmTierResult {
@@ -192,6 +228,26 @@ impl<'a> SketchReducer<'a> {
     /// verified to classify as `Hit` against `self.index`. We
     /// re-resolve metadata (via `instance(sid)`) but don't
     /// re-classify.
+    ///
+    /// ## Delta-stitching modes
+    ///
+    /// For DD / KLL / HLL the reducer walks per-window samples in
+    /// time order via [`delta_apply`](super::delta_apply). The function
+    /// name decides between:
+    /// - **per-window**: `quantile`, `histogram_quantile`,
+    ///   `cardinality_estimate` — one scalar per window-end.
+    /// - **cumulative**: `quantile_over_time`,
+    ///   `count_distinct_over_time` — single scalar covering the
+    ///   full `[t0, t1]` range (Full + every subsequent Delta merged).
+    ///
+    /// ## Top-k mode
+    ///
+    /// For `topk` / `topk_over_time` against a CmsWithHeap sid, the
+    /// reducer reads the heap directly from the most-recent window's
+    /// `CountMinSketchWithHeap` state and emits one
+    /// `(label_values={"item": <key>}, [(window_end, count)])` entry
+    /// per top-k item, truncated to the user's `k`. CountMin /
+    /// CountSketch (no heap) surface as `MissingHeap`.
     pub fn evaluate(
         &self,
         sids: &[u64],
@@ -201,11 +257,17 @@ impl<'a> SketchReducer<'a> {
         t1_ms: u64,
     ) -> Result<WarmTierResult, WarmTierError> {
         let family = Self::function_to_family(function_name)?;
+        let is_cumulative = matches!(
+            function_name,
+            "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
+        );
 
         // Per-(sid, label-values) → time-stamped scalar values.
         let mut out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = Vec::new();
         let mut metric_name_for_err = String::new();
         let mut any_window = false;
+        let mut cov_lo: u64 = u64::MAX;
+        let mut cov_hi: u64 = 0;
 
         for &sid in sids {
             let meta = match self.index.instance(sid) {
@@ -220,21 +282,132 @@ impl<'a> SketchReducer<'a> {
                 continue;
             }
 
-            for ts in series_list {
-                let mut samples: Vec<(i64, f64)> = Vec::with_capacity(ts.samples.len());
-                for (window_end, state) in &ts.samples {
+            // Top-k is a different shape — one entry per top-k item.
+            if family == QueryFamily::FrequencyTopk {
+                let k = function_args
+                    .first()
+                    .copied()
+                    .filter(|k| *k > 0.0)
+                    .map(|k| k as usize)
+                    .unwrap_or(10);
+                for ts in series_list {
+                    // Find latest window's CMS-with-heap state.
+                    let Some((window_end, state)) = ts.samples.iter().next_back() else {
+                        continue;
+                    };
                     any_window = true;
-                    let value = self.evaluate_one_state(
-                        sid,
-                        family,
-                        meta.sketch_kind,
-                        function_args,
-                        state,
-                    )?;
-                    samples.push((*window_end, value));
+                    let w_end_u64 = if *window_end >= 0 { *window_end as u64 } else { 0 };
+                    if w_end_u64 < cov_lo {
+                        cov_lo = w_end_u64;
+                    }
+                    if w_end_u64 > cov_hi {
+                        cov_hi = w_end_u64;
+                    }
+                    let cms_heap = match meta.sketch_kind {
+                        SketchKindHandle::CmsWithHeap => {
+                            decode_cms_with_heap_from_msgpack(&state.bytes).map_err(|e| {
+                                WarmTierError::DeserializeFailure {
+                                    sid,
+                                    encoding: state.encoding,
+                                    reason: e,
+                                }
+                            })?
+                        }
+                        SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
+                            return Err(WarmTierError::MissingHeap {
+                                sid,
+                                sketch_kind: meta.sketch_kind,
+                            });
+                        }
+                        other => {
+                            return Err(WarmTierError::UnsupportedCapability {
+                                function: function_name.to_string(),
+                                capability: Capability::FrequencyTopk(other),
+                            });
+                        }
+                    };
+                    let mut items = cms_heap.topk_heap_items();
+                    // Sort descending by estimated count.
+                    items.sort_by(|a, b| {
+                        b.value
+                            .partial_cmp(&a.value)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    for item in items.into_iter().take(k) {
+                        let mut lv = ts.series_label_values.clone();
+                        lv.insert("item".to_string(), item.key);
+                        out_series.push((lv, vec![(*window_end, item.value)]));
+                    }
                 }
-                samples.sort_by_key(|(t, _)| *t);
-                out_series.push((ts.series_label_values, samples));
+                continue;
+            }
+
+            // Quantile / Cardinality with delta stitching.
+            let delta_kind = match (family, meta.sketch_kind) {
+                (QueryFamily::Quantile, SketchKindHandle::DDSketch) => DeltaSketchKind::DDSketch,
+                (QueryFamily::Quantile, SketchKindHandle::Kll) => DeltaSketchKind::Kll,
+                (QueryFamily::Cardinality, SketchKindHandle::Hll) => DeltaSketchKind::Hll,
+                _ => {
+                    return Err(WarmTierError::UnsupportedCapability {
+                        function: function_name.to_string(),
+                        capability: meta.capability.clone(),
+                    });
+                }
+            };
+            let q = function_args
+                .first()
+                .copied()
+                .filter(|q| (0.0..=1.0).contains(q))
+                .unwrap_or(0.99);
+            let evaluator: Box<dyn Fn(&super::delta_apply::RollingState) -> f64> = match family {
+                QueryFamily::Quantile => Box::new(move |rs| rs.quantile(q)),
+                QueryFamily::Cardinality => Box::new(|rs| rs.cardinality()),
+                _ => unreachable!(),
+            };
+
+            for ts in series_list {
+                // Build sorted-by-window-end slice of refs.
+                let samples_vec: Vec<(i64, &SketchSampleState)> =
+                    ts.samples.iter().map(|(t, s)| (*t, s)).collect();
+                // BTreeMap iteration is already sorted by key; the
+                // collect preserves order. Track coverage from raw
+                // window-end timestamps before delta evaluation
+                // (skipped leading deltas still count toward the
+                // covered range).
+                for (w_end, _) in &samples_vec {
+                    any_window = true;
+                    let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
+                    if w < cov_lo {
+                        cov_lo = w;
+                    }
+                    if w > cov_hi {
+                        cov_hi = w;
+                    }
+                }
+
+                let samples_out: Vec<(i64, f64)> = if is_cumulative {
+                    let (one, _skipped) =
+                        cumulative_evaluate(&samples_vec, delta_kind, &evaluator)
+                            .map_err(|e| WarmTierError::DeserializeFailure {
+                                sid,
+                                encoding: SketchEncoding::ProtoFull,
+                                reason: e,
+                            })?;
+                    match one {
+                        Some(s) => vec![s],
+                        None => Vec::new(),
+                    }
+                } else {
+                    let (per_win, _skipped) =
+                        per_window_evaluate(&samples_vec, delta_kind, &evaluator)
+                            .map_err(|e| WarmTierError::DeserializeFailure {
+                                sid,
+                                encoding: SketchEncoding::ProtoFull,
+                                reason: e,
+                            })?;
+                    per_win
+                };
+                out_series.push((ts.series_label_values, samples_out));
             }
         }
 
@@ -244,11 +417,27 @@ impl<'a> SketchReducer<'a> {
             });
         }
 
-        Ok(WarmTierResult { series: out_series })
+        let coverage = if cov_lo <= cov_hi {
+            Some((cov_lo, cov_hi))
+        } else {
+            None
+        };
+        Ok(WarmTierResult {
+            series: out_series,
+            coverage,
+        })
     }
 
     /// Decode one window's sketch state and run the family-appropriate
     /// reduction.
+    ///
+    /// Retained as `#[allow(dead_code)]` after the delta-stitching
+    /// follow-up moved the per-window decode-then-evaluate flow into
+    /// [`super::delta_apply`]. Callers that want a one-shot evaluate
+    /// without delta-state plumbing can still reach this entry point;
+    /// the warm-tier reducer's main loop now goes through
+    /// [`per_window_evaluate`] / [`cumulative_evaluate`].
+    #[allow(dead_code)]
     fn evaluate_one_state(
         &self,
         sid: u64,
@@ -287,6 +476,7 @@ impl<'a> SketchReducer<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn evaluate_quantile(
         &self,
         sid: u64,
@@ -310,6 +500,7 @@ impl<'a> SketchReducer<'a> {
         }
     }
 
+    #[allow(dead_code)]
     fn evaluate_cardinality(
         &self,
         sid: u64,
@@ -336,6 +527,7 @@ impl<'a> SketchReducer<'a> {
 // surface as decode failure.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn decode_ddsketch(
     sid: u64,
     state: &SketchSampleState,
@@ -368,6 +560,7 @@ fn decode_ddsketch(
     }
 }
 
+#[allow(dead_code)]
 fn decode_kll(
     sid: u64,
     state: &SketchSampleState,
@@ -398,6 +591,7 @@ fn decode_kll(
     }
 }
 
+#[allow(dead_code)]
 fn decode_hll(
     sid: u64,
     state: &SketchSampleState,
@@ -433,7 +627,7 @@ fn decode_hll(
 // proto envelope wrapping (from DataCollector's `*processor`) is a
 // product of the OTLP wire layer, not the sketch library.
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 fn DdSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<DdSketch, String> {
     use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
     use prost::Message;
@@ -464,7 +658,7 @@ fn DdSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<DdSketch, String
     ))
 }
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 fn KllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<KllSketch, String> {
     use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
     use prost::Message;
@@ -494,7 +688,7 @@ fn KllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<KllSketch, Stri
     Ok(sk)
 }
 
-#[allow(non_snake_case)]
+#[allow(non_snake_case, dead_code)]
 fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, String> {
     use asap_sketchlib::proto::sketchlib::{
         sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,

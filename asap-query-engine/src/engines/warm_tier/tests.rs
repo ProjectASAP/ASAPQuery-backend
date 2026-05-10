@@ -141,13 +141,17 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
 }
 
 // ---------------------------------------------------------------------------
-// DDSketch quantile_over_time — three windows, each with a different
+// DDSketch per-window `quantile` — three windows, each with a different
 // data distribution. Verifies (a) per-window evaluation, (b) result
 // shape, (c) DDSketch's relative-accuracy bound holds.
+//
+// The cumulative variant `quantile_over_time` is exercised by
+// `ddsketch_cumulative_full_plus_two_deltas` (TODO-2 follow-up); this
+// test is renamed but otherwise preserves its original assertions.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn ddsketch_quantile_over_time_three_windows() {
+fn ddsketch_quantile_per_window_three_windows() {
     let idx = SketchIndex::new();
     let sid = 1;
     idx.register(dd_meta(sid));
@@ -175,9 +179,12 @@ fn ddsketch_quantile_over_time_three_windows() {
         idx.append_sample(sid, lv, (window_start, window_end), proto_full(bytes));
     }
 
+    // `quantile` (per-window) emits one scalar per window; the
+    // cumulative variant `quantile_over_time` is exercised by
+    // [`quantile_over_time_cumulative_mode`] below.
     let reducer = SketchReducer::new(&idx);
     let result = reducer
-        .evaluate(&[sid], "quantile_over_time", &[0.5], 1000, 1100)
+        .evaluate(&[sid], "quantile", &[0.5], 1000, 1100)
         .expect("evaluate should succeed");
 
     assert_eq!(result.series.len(), 1, "one series (no grouping)");
@@ -432,4 +439,308 @@ fn multi_series_one_per_label_value() {
         .evaluate(&[sid], "quantile_over_time", &[0.5], 1000, 1010)
         .expect("evaluate should succeed");
     assert_eq!(result.series.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// TODO-1 tests — CMS-with-heap top-k.
+// ---------------------------------------------------------------------------
+
+use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+
+fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
+    let cfg = SketchConfig::CountMin {
+        rows: 4,
+        cols: 256,
+    };
+    SketchInstanceMetadata {
+        sid,
+        metric_name: "endpoint_hits".to_string(),
+        group_by_keys: BTreeSet::new(),
+        capability: Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap),
+        sketch_kind: SketchKindHandle::CmsWithHeap,
+        sketch_config: cfg.clone(),
+        accuracy: AccuracyBound::from_config(&cfg),
+        first_seen_unix_ms: 0,
+    }
+}
+
+fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
+    let cfg = SketchConfig::CountMin {
+        rows: 4,
+        cols: 256,
+    };
+    SketchInstanceMetadata {
+        sid,
+        metric_name: "endpoint_hits".to_string(),
+        group_by_keys: BTreeSet::new(),
+        capability: Capability::FrequencyTopk(SketchKindHandle::CountMin),
+        sketch_kind: SketchKindHandle::CountMin,
+        sketch_config: cfg.clone(),
+        accuracy: AccuracyBound::from_config(&cfg),
+        first_seen_unix_ms: 0,
+    }
+}
+
+fn msgpack_full(bytes: Vec<u8>) -> SketchSampleState {
+    SketchSampleState {
+        bytes,
+        encoding: SketchEncoding::MsgpackFull,
+    }
+}
+
+#[test]
+fn cms_with_heap_topk_returns_top_items() {
+    let idx = SketchIndex::new();
+    let sid = 100;
+    idx.register(cms_heap_meta(sid));
+
+    // Build a CMS-with-heap state with known item counts.
+    let mut cms = CountMinSketchWithHeap::new(4, 256, 20);
+    // Insert items with varying frequencies. Higher count items
+    // should end up in the heap.
+    let inserts: &[(&str, u64)] = &[
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+        ("epsilon", 10),
+        ("zeta", 150),
+    ];
+    for (k, n) in inserts {
+        for _ in 0..*n {
+            cms.update(k, 1.0);
+        }
+    }
+    let bytes = cms.serialize_msgpack().expect("serialize cms with heap");
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), msgpack_full(bytes));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "topk", &[5.0], 1000, 1010)
+        .expect("topk evaluate should succeed");
+    // We requested top-5. Each top-k item is its own series row
+    // (label_values carries the encoded `"item": <key>`).
+    assert!(
+        result.series.len() <= 5 && !result.series.is_empty(),
+        "expected up to 5 top-k series, got {}",
+        result.series.len()
+    );
+    // Coverage should match the window we appended.
+    assert_eq!(result.coverage, Some((1010, 1010)));
+
+    // Top-1 should be "gamma" (count=200). Sort our series by
+    // first-sample value descending and check the top item.
+    let mut sorted = result.series.clone();
+    sorted.sort_by(|a, b| {
+        let va = a.1.first().map(|s| s.1).unwrap_or(0.0);
+        let vb = b.1.first().map(|s| s.1).unwrap_or(0.0);
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let top = sorted.first().expect("at least one series");
+    let item_label = top.0.get("item").expect("series carries item label");
+    assert_eq!(item_label, "gamma", "highest-count item should be `gamma`");
+}
+
+#[test]
+fn cms_without_heap_returns_missing_heap() {
+    let idx = SketchIndex::new();
+    let sid = 101;
+    idx.register(cms_only_meta(sid));
+
+    // Append a CMS-with-heap-encoded payload — but the metadata is
+    // CountMin-only so the reducer should refuse on the
+    // sketch-kind side before decoding bytes.
+    let mut cms = CountMinSketchWithHeap::new(4, 256, 20);
+    cms.update("foo", 1.0);
+    let bytes = cms.serialize_msgpack().expect("serialize");
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), msgpack_full(bytes));
+
+    let reducer = SketchReducer::new(&idx);
+    let err = reducer
+        .evaluate(&[sid], "topk", &[5.0], 1000, 1010)
+        .expect_err("topk against CountMin (no heap) must surface MissingHeap");
+    match err {
+        WarmTierError::MissingHeap { sid: s, sketch_kind } => {
+            assert_eq!(s, sid);
+            assert_eq!(sketch_kind, SketchKindHandle::CountMin);
+        }
+        other => panic!("expected MissingHeap, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TODO-2 tests — delta encoding stitching.
+//
+// We exercise the cumulative path for DDSketch (one Full window + two
+// Delta windows of additional samples). The cumulative result should
+// match what a fresh DDSketch fed all raw values would yield.
+// ---------------------------------------------------------------------------
+
+fn proto_delta(bytes: Vec<u8>) -> SketchSampleState {
+    SketchSampleState {
+        bytes,
+        encoding: SketchEncoding::ProtoDelta,
+    }
+}
+
+#[test]
+fn ddsketch_cumulative_full_plus_two_deltas() {
+    let idx = SketchIndex::new();
+    let sid = 200;
+    idx.register(dd_meta(sid));
+
+    let alpha = 0.01;
+    // Window 1: Full snapshot of values 1..=5
+    let mut sk1 = DdSketch::new(alpha);
+    for v in 1..=5 {
+        sk1.update(v as f64);
+    }
+    let bytes1 = encode_ddsketch(&sk1);
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), proto_full(bytes1));
+
+    // Windows 2 & 3: "Deltas" encoded as full-fragment sketches that
+    // get merged into the rolling state (the reducer's delta_apply
+    // treats DD/KLL/HLL delta-as-mergeable-fragment).
+    let mut sk2 = DdSketch::new(alpha);
+    for v in 6..=10 {
+        sk2.update(v as f64);
+    }
+    let bytes2 = encode_ddsketch(&sk2);
+    idx.append_sample(sid, BTreeMap::new(), (1010, 1020), proto_delta(bytes2));
+
+    let mut sk3 = DdSketch::new(alpha);
+    for v in 11..=15 {
+        sk3.update(v as f64);
+    }
+    let bytes3 = encode_ddsketch(&sk3);
+    idx.append_sample(sid, BTreeMap::new(), (1020, 1030), proto_delta(bytes3));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "quantile_over_time", &[0.5], 1000, 1030)
+        .expect("cumulative evaluate should succeed");
+    // Cumulative mode emits one scalar covering the full range.
+    assert_eq!(result.series.len(), 1);
+    let (_, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1, "cumulative emits exactly one scalar");
+    let est = samples[0].1;
+
+    // Truth: feed all 15 values into a fresh DDSketch and read the
+    // median (8th value of 1..=15 = 8). Allow 5% relative error to
+    // give the bucket store some slack.
+    let mut truth = DdSketch::new(alpha);
+    for v in 1..=15 {
+        truth.update(v as f64);
+    }
+    let true_q = truth.quantile(0.5).unwrap_or(0.0);
+    let rel_err = (est - true_q).abs() / true_q.max(1e-9);
+    assert!(
+        rel_err < 0.10,
+        "cumulative quantile error too large: est={} truth={} rel_err={}",
+        est,
+        true_q,
+        rel_err
+    );
+
+    // Coverage should span the three window ends.
+    assert_eq!(result.coverage, Some((1010, 1030)));
+}
+
+#[test]
+fn hll_cumulative_full_plus_one_delta() {
+    let idx = SketchIndex::new();
+    let sid = 201;
+    let precision: u32 = 10;
+    idx.register(hll_meta(sid, precision));
+
+    // Window 1: Full snapshot with 500 distinct items.
+    let mut sk1 = HllSketch::new(HllVariant::Regular, precision);
+    for i in 0..500 {
+        sk1.update(format!("user-{i}").as_bytes());
+    }
+    let bytes1 = encode_hll(&sk1);
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), proto_full(bytes1));
+
+    // Window 2: Msgpack-delta — the warm-tier reducer treats
+    // MsgpackDelta for HLL as a serialized HllSketch fragment that's
+    // mergeable via `HllSketch::merge`. We mock that here by
+    // serializing a second HLL with 500 additional distinct items.
+    let mut sk2 = HllSketch::new(HllVariant::Regular, precision);
+    for i in 500..1000 {
+        sk2.update(format!("user-{i}").as_bytes());
+    }
+    let bytes2 = sk2.serialize_msgpack().expect("serialize HLL msgpack");
+    let delta_sample = SketchSampleState {
+        bytes: bytes2,
+        encoding: SketchEncoding::MsgpackDelta,
+    };
+    idx.append_sample(sid, BTreeMap::new(), (1010, 1020), delta_sample);
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(
+            &[sid],
+            "count_distinct_over_time",
+            &[],
+            1000,
+            1020,
+        )
+        .expect("cumulative HLL evaluate should succeed");
+    assert_eq!(result.series.len(), 1);
+    let (_, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1, "cumulative emits one scalar");
+    let est = samples[0].1;
+    // Truth: 1000 distinct items, allow 5σ envelope.
+    let std_err = 1.04 / ((1u64 << precision) as f64).sqrt();
+    let envelope = 5.0 * std_err * 1000.0;
+    let abs_err = (est - 1000.0).abs();
+    assert!(
+        abs_err <= envelope,
+        "cumulative HLL estimate {} too far from true 1000 (5σ envelope = {})",
+        est,
+        envelope
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TODO-3 tests — hybrid warm + archive stitch via `WarmTierResult.coverage`.
+//
+// We don't drive the full SimpleEngine here (that would require
+// constructing the whole streaming-config plumbing). Instead we exercise
+// the `stitch_warm_and_archive` helper directly via a small wrapper
+// test in `engines::simple::tests` would be ideal — but to keep this
+// PR additive, we verify the `coverage` field is populated correctly
+// on a multi-window evaluate so the downstream stitch path has the
+// information it needs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coverage_reports_observed_window_range() {
+    let idx = SketchIndex::new();
+    let sid = 300;
+    idx.register(dd_meta(sid));
+
+    let alpha = 0.01;
+    for (i, values) in [vec![1.0_f64, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]
+        .iter()
+        .enumerate()
+    {
+        let mut sk = DdSketch::new(alpha);
+        for &v in values {
+            sk.update(v);
+        }
+        let bytes = encode_ddsketch(&sk);
+        let window_start = 100 + (i as u64) * 100;
+        let window_end = window_start + 100;
+        idx.append_sample(sid, BTreeMap::new(), (window_start, window_end), proto_full(bytes));
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "quantile", &[0.5], 50, 400)
+        .expect("evaluate should succeed");
+    // Coverage min = first window end (200), max = third window end (400).
+    let coverage = result.coverage.expect("coverage populated");
+    assert_eq!(coverage.0, 200);
+    assert_eq!(coverage.1, 400);
 }

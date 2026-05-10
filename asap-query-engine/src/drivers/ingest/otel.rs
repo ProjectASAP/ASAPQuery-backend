@@ -893,7 +893,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 }
                                 SketchKindHandle::Hll => Capability::CardinalityApprox,
                                 SketchKindHandle::CountSketch
-                                | SketchKindHandle::CountMin => {
+                                | SketchKindHandle::CountMin
+                                | SketchKindHandle::CmsWithHeap => {
                                     Capability::FrequencyTopk(kind)
                                 }
                             };
@@ -1077,6 +1078,16 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
 /// `SketchKindHandle` so registration and capability classification
 /// share one source of truth.
+///
+/// CMS-with-heap detection: the OTLP `CountMinSketch` wire struct
+/// itself doesn't carry a top-k heap field (see metrics.proto
+/// `CountMinSketch`/`CountMinSketchDataPoint`). The heap is embedded
+/// inside the msgpack-encoded `CountMinSketchWithHeapSerialized`
+/// payload (an outer `{sketch, topk_heap, heap_size}` wrapper). When
+/// the encoding is MSGPACK and the bytes round-trip via
+/// `CountMinSketchWithHeap::deserialize_msgpack`, we classify the sid
+/// as `CmsWithHeap` so the warm-tier reducer can later read the heap
+/// directly for `topk` / `topk_over_time` queries.
 fn sketch_kind_handle_for(
     dp: &ModifiedOtlpSketchDp,
 ) -> crate::stores::sketch_db::sketch_index::SketchKindHandle {
@@ -1086,7 +1097,24 @@ fn sketch_kind_handle_for(
         SketchKind::Kll => SketchKindHandle::Kll,
         SketchKind::Hll => SketchKindHandle::Hll,
         SketchKind::CountSketch => SketchKindHandle::CountSketch,
-        SketchKind::CountMin => SketchKindHandle::CountMin,
+        SketchKind::CountMin => {
+            // Try a no-cost peek: msgpack-encoded CMS-with-heap payloads
+            // round-trip through asap_sketchlib's
+            // `CountMinSketchWithHeap::deserialize_msgpack`. If the
+            // sketch bytes decode against that wrapper *and* the
+            // resulting heap is non-empty, treat the sid as
+            // CmsWithHeap so warm-tier `topk` can read the heap.
+            // Otherwise stay with vanilla `CountMin`.
+            if dp.encoding == ENCODING_MSGPACK {
+                use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+                if let Ok(cms) = CountMinSketchWithHeap::deserialize_msgpack(&dp.sketch) {
+                    if !cms.topk_heap_items().is_empty() {
+                        return SketchKindHandle::CmsWithHeap;
+                    }
+                }
+            }
+            SketchKindHandle::CountMin
+        }
     }
 }
 
