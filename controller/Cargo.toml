@@ -1,0 +1,46 @@
+[package]
+name = "controller"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "controller"
+path = "src/lib.rs"
+
+[[bin]]
+name = "controller"
+path = "src/main.rs"
+
+[dependencies]
+tokio       = { version = "1",    features = ["full"] }
+axum        = { version = "0.7",  features = ["ws"] }
+futures-util = "0.3"
+serde       = { version = "1",    features = ["derive"] }
+serde_json  = "1"
+serde_yaml  = "0.9"
+reqwest     = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+anyhow      = "1"
+thiserror   = "1"
+tracing     = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono      = { version = "0.4",  features = ["serde"] }
+sqlparser      = "0.61"
+promql-parser  = "0.8"
+prost          = "0.13"
+bytes          = "1"
+zstd           = "0.13"
+parking_lot    = "0.12"
+prometheus     = { version = "0.13", default-features = false, features = ["process"] }
+tonic          = { version = "0.12", features = ["gzip"] }
+tokio-stream   = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.4", features = ["util"] }
+axum = { version = "0.7", features = ["ws"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.21"
+
+[build-dependencies]
+prost-build = "0.13"
+tonic-build = "0.12"

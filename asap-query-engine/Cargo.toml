@@ -8,6 +8,12 @@ edition.workspace = true
 promql_utilities.workspace = true
 asap_types.workspace = true
 datafusion_summary_library.workspace = true
+# Phase 9: controller is now an in-process library inside the backend
+# binary. Wiring up the in-process OpAMP server + capability-map
+# exposure is a follow-up after Phase 4 (centralized series_id
+# resolver). For now this dep just makes the controller crate
+# compile in the workspace and importable from main.rs.
+controller = { path = "../controller" }
 
 # Shared external (workspace)
 serde.workspace = true
@@ -47,7 +53,7 @@ prost = "0.13"
 # variants from DataCollector (DDSketch / KLLSketch / CountSketch /
 # CountMinSketch / HLLSketch). See docs/pipeline-query-catalog.md §5.4 in the
 # DataCollector repo for the rationale.
-asap_otel_proto = { path = "../asap-common/dependencies/rs/asap_otel_proto" }
+asap_otel_proto.workspace = true
 tonic = "0.12"
 tokio-stream = "0.1"
 regex = "1"

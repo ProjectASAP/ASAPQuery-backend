@@ -196,6 +196,11 @@ impl MetricsService for MetricsServiceImpl {
             // this field; not yet wired (PR B will populate it when the
             // backend learns to mint series_ids).
             series_assignments: Vec::new(),
+            // Refactor-2026-05: backend signals senders to evict cached sids
+            // here. Empty for now — populated by Phase 4 (centralized
+            // ResolveSeriesIDs resolver) when sid-cache divergence is
+            // detected (e.g., backend restart without persistence).
+            unknown_series_ids: Vec::new(),
         }))
     }
 }

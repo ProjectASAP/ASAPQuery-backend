@@ -13,8 +13,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the asap-common directory
-COPY asap-common ./asap-common
+# Copy the workspace's shared crates (formerly under asap-common/, moved to
+# crates/ in the Phase 8 refactor — 2026-05-10).
+COPY crates ./crates
 
 COPY Cargo.toml ./
 COPY Cargo.lock ./

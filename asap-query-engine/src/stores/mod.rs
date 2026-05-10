@@ -18,8 +18,13 @@
 
 pub mod promsketch_store;
 pub mod sketch_db;
+pub mod sketch_index;
 pub mod traits;
 
 // pub use promsketch_store::PromSketchStore;
 pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry, SimpleMapStore};
+pub use sketch_index::{
+    AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchIndex,
+    SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
+};
 pub use traits::*;
