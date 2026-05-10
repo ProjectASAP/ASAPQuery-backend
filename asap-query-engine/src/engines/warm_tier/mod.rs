@@ -4,7 +4,7 @@
 //! [`crate::engines::simple::engine::SimpleEngine`]'s
 //! `QueryEngine::execute` adapter: parse the PromQL, extract
 //! `(metric_name, label_keys)`, look up candidate sids via
-//! [`crate::stores::sketch_index::SketchIndex::instances_matching`],
+//! [`crate::stores::sketch_db::sketch_index::SketchIndex::instances_matching`],
 //! and classify each sid. On `Ghost`/`Unknown`, return
 //! `EngineError::CapabilityMiss(SketchWarmTier, …)` so the
 //! `EngineRouter` fails over to the archive engine.
@@ -14,7 +14,7 @@
 //! that fall-through with **direct sketch evaluation** from
 //! [`SketchIndex::query_range`]'s output: deserialize each
 //! window's sketch state, dispatch on the per-instance
-//! [`crate::stores::sketch_index::Capability`], and reduce to a
+//! [`crate::stores::sketch_db::sketch_index::Capability`], and reduce to a
 //! per-window scalar via the canonical sketch query (DDSketch /
 //! KLL → quantile, HLL → cardinality estimate, CMS / CountSketch
 //! → frequency point query, CMS-with-heap → top-k items).
