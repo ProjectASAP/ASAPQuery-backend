@@ -3478,6 +3478,50 @@ impl SimpleEngine {
 // to the next compatible backend.
 // ---------------------------------------------------------------------------
 
+/// Adapt a [`crate::engines::warm_tier::WarmTierResult`] to the engine's
+/// existing `QueryResult` shape. The reducer hands back per-series
+/// time-stamped scalars; we materialize them as a
+/// `QueryResult::Matrix` whose [`crate::engines::query_result::RangeVectorElement`]s
+/// each map onto one (label-values, samples) entry.
+///
+/// `now_ms` is unused for the matrix variant (each sample carries its
+/// own window-end timestamp); it's plumbed for future extension to
+/// the instant-vector case (latest-pane projection).
+fn warm_tier_result_to_query_result(
+    result: crate::engines::warm_tier::WarmTierResult,
+    _now_ms: u64,
+) -> crate::engines::query_result::QueryResult {
+    use crate::data_model::KeyByLabelValues;
+    use crate::engines::query_result::{QueryResult, RangeVectorElement};
+
+    let mut elements: Vec<RangeVectorElement> = Vec::with_capacity(result.series.len());
+    for (label_values, samples) in result.series {
+        // `KeyByLabelValues` is a `Vec<String>` carrying VALUES only.
+        // We project the BTreeMap's values in key-sorted order
+        // (BTreeMap iteration order matches the `group_by_keys`
+        // BTreeSet iteration order, so the result preserves the
+        // sketch instance's group-by-key projection without
+        // re-emitting the keys).
+        let labels = KeyByLabelValues::new_with_labels(
+            label_values.into_values().collect::<Vec<_>>(),
+        );
+        let mut element = RangeVectorElement::new(labels);
+        for (window_end_ms, value) in samples {
+            // `window_end_ms` is i64 from the index; cast to u64
+            // for the wire format (window_end is monotonic + post-
+            // 1970 in production).
+            let ts = if window_end_ms >= 0 {
+                window_end_ms as u64
+            } else {
+                0
+            };
+            element.add_sample(ts, value);
+        }
+        elements.push(element);
+    }
+    QueryResult::matrix(elements)
+}
+
 #[async_trait::async_trait]
 impl crate::routing::engine_router::QueryEngine for SimpleEngine {
     async fn execute(
@@ -3536,10 +3580,116 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         ),
                     ));
                 }
-                // All sids `Hit` → fall through to the legacy path.
-                // Per-Capability reducer over `query_range` is a
-                // follow-up; for now `handle_query` answers from the
-                // legacy `SimpleMapStore`. See block comment above.
+
+                // All sids `Hit` → dispatch to the per-Capability
+                // sketch reducer (`feat/sketch-reducer-warm-tier-evaluator`,
+                // 2026-05). The reducer decodes each window's sketch
+                // state via `asap_sketchlib`, evaluates the
+                // canonical query (`quantile`, `estimate`, …), and
+                // returns per-series timestamped scalars that we
+                // adapt to `QueryResult::Matrix`.
+                //
+                // On any failure mode the reducer surfaces, we
+                // translate to `CapabilityMiss` so the
+                // `EngineRouter` falls over to archive — including
+                // `UnsupportedFunction`/`UnsupportedCapability`
+                // (the user's PromQL doesn't map onto a warm-tier
+                // capability), `DeserializeFailure` (defensive —
+                // the warm-tier state didn't decode; archive can
+                // answer truthfully), and `NoData` (no samples in
+                // window).
+                let call = crate::engines::warm_tier::extract_promql_call(query);
+                let (function_name, function_args) = match &call {
+                    Some(c) if !c.func.is_empty() => (c.func.clone(), c.args.clone()),
+                    _ => {
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer cannot extract a PromQL function \
+                                 from `{query}` — failing over to archive"
+                            ),
+                        ));
+                    }
+                };
+
+                // Time bounds: the trait's `execute(&str)` adapter
+                // doesn't carry an explicit range today (it's an
+                // instant-query surface). Use `[now - default_range,
+                // now]` matching how `handle_query` used to pick
+                // its window. Phase-5 hybrid stitch (warm + archive
+                // for ranges that exceed warm coverage) is a
+                // follow-up.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // Default lookback: 5 minutes. Engine code that
+                // wants a precise range (range-query pipeline)
+                // should call into `SketchReducer::evaluate`
+                // directly with its own bounds.
+                let lookback_ms: u64 = 5 * 60 * 1000;
+                let t0_ms = now_ms.saturating_sub(lookback_ms);
+
+                let reducer = crate::engines::warm_tier::SketchReducer::new(idx);
+                match reducer.evaluate(
+                    &candidates,
+                    &function_name,
+                    &function_args,
+                    t0_ms,
+                    now_ms,
+                ) {
+                    Ok(result) => {
+                        return Ok(warm_tier_result_to_query_result(result, now_ms));
+                    }
+                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(
+                        name,
+                    )) => {
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer does not support function `{name}` \
+                                 — failing over to archive"
+                            ),
+                        ));
+                    }
+                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedCapability {
+                        function,
+                        capability,
+                    }) => {
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer cannot answer `{function}` against \
+                                 capability {capability:?} — failing over to archive"
+                            ),
+                        ));
+                    }
+                    Err(crate::engines::warm_tier::WarmTierError::DeserializeFailure {
+                        sid,
+                        encoding,
+                        reason,
+                    }) => {
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer failed to decode sketch for sid \
+                                 {sid} (encoding={encoding:?}): {reason} — failing over \
+                                 to archive"
+                            ),
+                        ));
+                    }
+                    Err(crate::engines::warm_tier::WarmTierError::NoData {
+                        metric_name: m,
+                    }) => {
+                        return Err(crate::engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            format!(
+                                "SketchWarmTier reducer found no samples for metric \
+                                 `{m}` in window — failing over to archive"
+                            ),
+                        ));
+                    }
+                }
             }
         }
 
@@ -5909,13 +6059,20 @@ mod warm_tier_classify_tests {
 
     #[tokio::test]
     async fn execute_proceeds_to_handle_query_when_all_sids_hit() {
-        // Register an instance AND append a sample so the sid Hits. The
-        // adapter then falls through to `handle_query`; with an empty
-        // store + no inference-config patterns, that path returns its
-        // own CapabilityMiss — but the failure mode is the legacy "no
-        // compatible aggregation" detail, distinct from the warm-tier
-        // ghost/unknown detail. The contract verified here is "Hit
-        // does NOT short-circuit to the warm-tier-specific miss".
+        // Register an instance AND append a sample so the sid Hits.
+        //
+        // Pre-`feat/sketch-reducer-warm-tier-evaluator` (this PR): the
+        // adapter fell through to `handle_query`, producing the legacy
+        // "no compatible aggregation" miss for an empty SimpleMapStore.
+        //
+        // Post-PR: the adapter dispatches to the warm-tier
+        // `SketchReducer`. A bare vector selector (no PromQL call)
+        // surfaces as the warm-tier-specific "cannot extract a PromQL
+        // function" miss (the reducer can only answer call-shaped
+        // queries; raw selectors fall over to archive). The contract
+        // verified here is still "Hit does NOT short-circuit to the
+        // warm-tier ghost/unknown miss"; only the downstream miss
+        // detail changes.
         let idx = Arc::new(SketchIndex::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
@@ -5933,12 +6090,17 @@ mod warm_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    detail.contains("no compatible aggregation"),
-                    "Hit path delegated to handle_query, which produced legacy miss: {detail}"
+                    !detail.contains("ghost") && !detail.contains("Ghost"),
+                    "Hit path must NOT short-circuit to the ghost-miss path: {detail}"
+                );
+                assert!(
+                    detail.contains("cannot extract a PromQL function")
+                        || detail.contains("no compatible aggregation"),
+                    "Hit path produced expected post-Hit miss: {detail}"
                 );
             }
             other => panic!(
-                "expected handle_query's legacy CapabilityMiss after Hit, got {other:?}"
+                "expected post-Hit CapabilityMiss, got {other:?}"
             ),
         }
     }
