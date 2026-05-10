@@ -57,7 +57,7 @@ use asap_sketchlib::sketches::kll::KllSketch;
 use asap_sketchlib::sketches::countminsketch::CountMinSketch;
 use asap_sketchlib::sketches::countsketch::CountSketch;
 
-use crate::stores::sketch_index::{
+use crate::stores::sketch_db::sketch_index::{
     Capability, SketchEncoding, SketchIndex, SketchInstanceMetadata, SketchKindHandle,
     SketchSampleState,
 };
