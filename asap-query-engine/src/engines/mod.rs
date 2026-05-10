@@ -31,6 +31,7 @@ pub mod prometheus;
 pub mod query_result;
 pub mod simple;
 pub mod timeline_dispatch;
+pub mod warm_tier;
 pub mod window_merger;
 
 pub use gorilla::{

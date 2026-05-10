@@ -1,0 +1,55 @@
+//! Warm-tier sketch query evaluator (Phase 5 follow-up to PR #122).
+//!
+//! PR #122 wired the warm-tier classification hook in
+//! [`crate::engines::simple::engine::SimpleEngine`]'s
+//! `QueryEngine::execute` adapter: parse the PromQL, extract
+//! `(metric_name, label_keys)`, look up candidate sids via
+//! [`crate::stores::sketch_index::SketchIndex::instances_matching`],
+//! and classify each sid. On `Ghost`/`Unknown`, return
+//! `EngineError::CapabilityMiss(SketchWarmTier, …)` so the
+//! `EngineRouter` fails over to the archive engine.
+//!
+//! That hook today still falls through to `handle_query` (legacy
+//! datafusion path) on the all-`Hit` case. This module replaces
+//! that fall-through with **direct sketch evaluation** from
+//! [`SketchIndex::query_range`]'s output: deserialize each
+//! window's sketch state, dispatch on the per-instance
+//! [`crate::stores::sketch_index::Capability`], and reduce to a
+//! per-window scalar via the canonical sketch query (DDSketch /
+//! KLL → quantile, HLL → cardinality estimate, CMS / CountSketch
+//! → frequency point query, CMS-with-heap → top-k items).
+//!
+//! The deserialize + query glue mirrors the per-Capability paths
+//! already exercised by `precompute_operators::*_accumulator.rs` —
+//! same `asap_sketchlib` library calls so behavior matches the
+//! precompute (ingest-side) path bit-for-bit.
+//!
+//! ## Public surface
+//!
+//! * [`SketchReducer`] — wraps a `&SketchIndex`, takes a
+//!   pre-classified slice of all-`Hit` sids + a function name +
+//!   args + time bounds, returns a [`WarmTierResult`].
+//! * [`WarmTierError`] — distinguishes "warm-tier doesn't support
+//!   this function/capability" (router falls over to archive)
+//!   from "decode failure" (defensive — also fall over) and
+//!   "no data in window" (router falls over).
+//! * [`WarmTierResult`] — per-series timestamped scalar samples
+//!   matching the shape of [`crate::engines::query_result::QueryResult::Matrix`].
+//! * [`extract_promql_call`] — small AST walker that pulls the
+//!   outermost call's function name + numeric args. Lives here
+//!   rather than in `simple/engine.rs` because the existing
+//!   `extract_metric_and_label_keys` already handles the
+//!   metric-and-keys side; this is the function-name + args side.
+//!
+//! Phase-5 hybrid stitching (warm `[t0..t1']` + archive
+//! `[t1'..t1]`) and per-window iteration (rather than today's
+//! per-sample evaluate-then-merge) remain follow-ups.
+
+pub mod promql_extract;
+pub mod sketch_reducer;
+
+#[cfg(test)]
+pub mod tests;
+
+pub use promql_extract::{extract_promql_call, PromqlCall};
+pub use sketch_reducer::{SketchReducer, WarmTierError, WarmTierResult};
