@@ -1,22 +1,22 @@
 use controller::accuracy;
-use controller::algebra;
-use controller::analyzer;
 use controller::backend_client;
-use controller::config;
+use controller::emit;
 use controller::intent_algebra;
 use controller::language_logical_plan;
 use controller::metrics_exposer;
 use controller::monitor;
 use controller::opamp;
-use controller::planner;
+use controller::optimizer;
+use controller::physical;
+use controller::pipeline;
 use controller::query_parser;
 use controller::replan;
 use controller::runtime_samples;
 use controller::sketch_algebra;
-use controller::stage_split;
 use controller::store;
 use controller::types;
 use controller::types_v2;
+use controller::workload;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,23 +32,27 @@ use axum::{
 use serde_json::json;
 use tracing::{info, warn};
 
-use algebra::{QueryOptimizer, SketchAllocator};
-use analyzer::{Analyzer, QuerySpec};
-use config::{generate_agent_config, generate_backend_config, build_precompute_jobs};
-use config::WorkloadRegistry;
-use config::{AgentRuntime, emit_for_runtime};
+use optimizer::engine::QueryOptimizer;
+use physical::allocator::SketchAllocator;
+use pipeline::{Analyzer, QuerySpec};
+use emit::{generate_agent_config, generate_backend_config, build_precompute_jobs};
+use workload::WorkloadRegistry;
+use emit::{AgentRuntime, emit_for_runtime};
 use types::AgentCollectorConfig;
-use config::generate_backend_config_staged;
+use emit::generate_backend_config_staged;
 use monitor::{Endpoint, Scraper, ScrapedData, Thresholds, Violation};
 use opamp::{AgentRole, OpampServer, RemoteConfig};
-use planner::{CostModelPlanner, BaselinePlanner, ObjectiveWeights, OnlineMetricsStore, init_online_store, pareto_frontier, select_best};
-use planner::online_cost_model;
-use planner::stage_split::split_expr_by_stage;
-use planner::tco;
-use algebra::physical::physical_plan_to_staged;
+use optimizer::cost::CostModelPlanner;
+use optimizer::baseline::BaselinePlanner;
+use optimizer::cost::pareto::{ObjectiveWeights, pareto_frontier, select_best};
+use optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStore};
+use optimizer::cost::online as online_cost_model;
+use physical::stage_split::split_expr_by_stage;
+use optimizer::cost::tco;
+use physical::planner::physical_plan_to_staged;
 use query_parser::parse_query_expr;
 use replan::Replanner;
-use stage_split::BackendStageConfig;
+use physical::colored_dag::emitter::BackendStageConfig;
 use store::{PlanStore, WorkloadStore};
 use types::StageResourceBudgets;
 
@@ -166,7 +170,7 @@ async fn main() {
                 if let (Some(st), Some(cpu)) = (data.sketch_type, data.cpu_micros_per_sample) {
                     let ema = Arc::clone(&ema);
                     tokio::spawn(async move {
-                        planner::online_cost_model::update(
+                        online_cost_model::update(
                             &ema, &st, data.sketch_size_bytes, cpu,
                         ).await;
                     });
@@ -260,7 +264,7 @@ async fn main() {
     {
         let analyzer = Analyzer::new();
         for entry in workload_registry.entries() {
-            let spec = analyzer::QuerySpec {
+            let spec = pipeline::QuerySpec {
                 query_string:    entry.query_string.clone(),
                 metric_name:     entry.metric_name.clone(),
                 label_filters:   Default::default(),
@@ -466,7 +470,7 @@ async fn handle_plan(
             Ok(qe) => {
                 let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
                 let budgets = StageResourceBudgets::from_workload_chars(&wc);
-                let constraints = algebra::optimizer::DeploymentConstraints::from_budgets(&budgets);
+                let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
                 let (opt_qe, _) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
                 let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
                 plan.staged_plan = Some(staged);
@@ -510,13 +514,13 @@ async fn handle_plan(
     // per-stage config is materialised into wire bytes via the emitters
     // in `config::stage_config`. Phase C will plumb deployment-aware
     // endpoint resolution + a real backend POST.
-    if planner::stage_split::typed_stage_split_enabled() {
-        if let Some(sketch_expr) = planner::rules::bind_workload_typed(&workload) {
-            if let Some(configs) = planner::stage_split::split_typed_three_stage(&sketch_expr) {
+    if physical::stage_split::typed_stage_split_enabled() {
+        if let Some(sketch_expr) = optimizer::rules::bind_workload_typed(&workload) {
+            if let Some(configs) = physical::stage_split::split_typed_three_stage(&sketch_expr) {
                 for (stage_id, stage_cfg) in configs {
                     match stage_cfg {
-                        crate::stage_split::StageConfig::Edge(edge) => {
-                            match config::emit_edge_yaml(&edge, &st.opamp_endpoint) {
+                        crate::physical::colored_dag::StageConfig::Edge(edge) => {
+                            match emit::emit_edge_yaml(&edge, &st.opamp_endpoint) {
                                 Ok(yaml) => {
                                     let hash = short_hash(&yaml);
                                     info!(
@@ -531,13 +535,13 @@ async fn handle_plan(
                                 Err(e) => warn!(error = %e, "emit_edge_yaml failed"),
                             }
                         }
-                        crate::stage_split::StageConfig::Gateway(gw) => {
+                        crate::physical::colored_dag::StageConfig::Gateway(gw) => {
                             // Phase C: AgentRole::Gateway is now wired
                             // through the OpAMP role-routing path, so
                             // the gateway YAML is pushed to gateway-role
                             // collectors the same way the edge YAML is
                             // pushed to agent-role collectors above.
-                            match config::emit_gateway_yaml(&gw, &st.opamp_endpoint) {
+                            match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint) {
                                 Ok(yaml) => {
                                     let hash = short_hash(&yaml);
                                     info!(
@@ -552,14 +556,14 @@ async fn handle_plan(
                                 Err(e) => warn!(error = %e, "emit_gateway_yaml failed"),
                             }
                         }
-                        crate::stage_split::StageConfig::Backend(be) => {
+                        crate::physical::colored_dag::StageConfig::Backend(be) => {
                             // Phase C: post the typed L5 streaming-config
                             // JSON to ASAPQuery-backend via the shared
                             // BackendClient when configured. Without a
                             // configured endpoint this still no-ops
                             // silently — same fire-and-forget contract
                             // as the existing Replanner path.
-                            match config::emit_backend_config_json(&be) {
+                            match emit::emit_backend_config_json(&be) {
                                 Ok(json_doc) => {
                                     info!(
                                         stage = "backend",
@@ -600,7 +604,7 @@ async fn handle_plan(
                             // backend's `/api/v1/storage_routing`
                             // endpoint via the BackendClient sibling
                             // method. The classification rules live in
-                            // `config::stage_config::emit_backend_storage_routing`
+                            // `config::stage_emit::emit_backend_storage_routing`
                             // — see that function's doc-comment for the
                             // sketch-family → query-shape mapping.
                             //
@@ -640,7 +644,7 @@ async fn handle_plan(
                                     .iter()
                                     .map(|(k, v)| (k.clone(), v))
                                     .collect();
-                            match config::emit_backend_storage_routing(&routing_input) {
+                            match emit::emit_backend_storage_routing(&routing_input) {
                                 Ok(routing_doc) => {
                                     info!(
                                         stage = "backend",
@@ -709,7 +713,7 @@ async fn handle_plan(
             }
             Ok(qe) => {
                 let budgets = StageResourceBudgets::from_workload_chars(&wc_for_algebra);
-                let constraints = algebra::optimizer::DeploymentConstraints::from_budgets(&budgets);
+                let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
                 let (opt_qe, _iters) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
                 let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(opt_qe);
                 Some(plan_node.summarise(raw_bps))
@@ -897,7 +901,7 @@ async fn handle_bootstrap_agent_config(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    if planner::stage_split::typed_stage_split_enabled() {
+    if physical::stage_split::typed_stage_split_enabled() {
         match emit_bootstrap_typed(&st, runtime, pinned_metric.as_deref()).await {
             Ok(yaml) => {
                 info!(
@@ -1027,7 +1031,7 @@ async fn emit_bootstrap_typed(
     let mut chosen: Option<(String, crate::sketch_algebra::SketchExpr)> = None;
     for cand in &candidates {
         let Some((wl, _wc)) = st.workload_store.get(cand) else { continue };
-        if let Some(expr) = planner::rules::bind_workload_typed(&wl) {
+        if let Some(expr) = optimizer::rules::bind_workload_typed(&wl) {
             chosen = Some((cand.clone(), expr));
             break;
         }
@@ -1038,7 +1042,7 @@ async fn emit_bootstrap_typed(
             candidates.len()
         )
     })?;
-    let configs = planner::stage_split::split_typed_three_stage(&sketch_expr)
+    let configs = physical::stage_split::split_typed_three_stage(&sketch_expr)
         .ok_or_else(|| anyhow!("split_typed_three_stage returned None for `{metric}`"))?;
 
     // 4. Pick the Edge stage config and emit per-runtime. The
@@ -1046,7 +1050,7 @@ async fn emit_bootstrap_typed(
     //    configs go to other roles via OpAMP role-routing, not
     //    through this handler.
     let mut edge_cfg = configs.into_iter().find_map(|(_, cfg)| match cfg {
-        crate::stage_split::StageConfig::Edge(edge) => Some(edge),
+        crate::physical::colored_dag::StageConfig::Edge(edge) => Some(edge),
         _ => None,
     }).ok_or_else(|| anyhow!("typed three-stage map has no Edge entry for `{metric}`"))?;
 
@@ -1073,7 +1077,7 @@ async fn emit_bootstrap_typed(
     //    Both extensions are bootstrap-scope only — the live planner
     //    stays free to plan per-metric without these defaults bleeding
     //    in. The actual extension lives in the shared
-    //    [`config::extend_edge_with_demo_plumbing`] helper so the
+    //    [`emit::extend_edge_with_demo_plumbing`] helper so the
     //    typed-replan push path (`replan::Replanner::push_config_to_agent`)
     //    can apply the same extension without duplicating the logic.
     let registry_metrics = st
@@ -1081,7 +1085,7 @@ async fn emit_bootstrap_typed(
         .entries()
         .iter()
         .map(|e| e.metric_name.clone());
-    config::extend_edge_with_demo_plumbing(&mut edge_cfg, registry_metrics);
+    emit::extend_edge_with_demo_plumbing(&mut edge_cfg, registry_metrics);
 
     // 6. Stitch PR #339 (planner) → PR #340 (5-sketch routing emitter).
     //
@@ -1102,7 +1106,7 @@ async fn emit_bootstrap_typed(
     //    where the agent IS pinned to a single metric. Replan path
     //    (`replan::Replanner::try_emit_typed_edge_yaml_for_workload`)
     //    applies the same stitch via the same shared helper.
-    edge_cfg.metric_to_family = config::collect_metric_to_family(
+    edge_cfg.metric_to_family = emit::collect_metric_to_family(
         &st.workload_registry,
         &st.workload_store,
     );
@@ -1609,7 +1613,7 @@ mod api_tests {
 
         // Pre-populate plan store (simulating what main() does with workload registry).
         let analyzer = Analyzer::new();
-        let spec = analyzer::QuerySpec {
+        let spec = pipeline::QuerySpec {
             query_string:    None,
             metric_name:     "http_latency".into(),
             label_filters:   Default::default(),
@@ -1686,7 +1690,7 @@ mod api_tests {
         let registry = Arc::new(WorkloadRegistry::load("/nonexistent")); // empty
         // We'll create one inline with the correct metric name.
         let yaml = "- metric_name: http_latency\n  accuracy_sla: 0.01\n  assign_to_role: agent\n";
-        let entries: Vec<crate::config::workloads::WorkloadEntry> =
+        let entries: Vec<crate::workload::WorkloadEntry> =
             serde_yaml::from_str(yaml).unwrap();
         // WorkloadRegistry doesn't have a public constructor from entries, so we
         // test via the first_for_role interface that the on_connect path uses.
@@ -1739,7 +1743,7 @@ mod api_tests {
 
         // Seed workload + plan for "metric_a".
         let analyzer = Analyzer::new();
-        let spec = analyzer::QuerySpec {
+        let spec = pipeline::QuerySpec {
             query_string:    None,
             metric_name:     "metric_a".into(),
             label_filters:   Default::default(),
@@ -1968,7 +1972,7 @@ mod api_tests {
         // 3. Pre-populate workload_store + plan_store the same way
         //    main()'s startup loop does.
         let analyzer = Analyzer::new();
-        let spec = analyzer::QuerySpec {
+        let spec = pipeline::QuerySpec {
             query_string:    None,
             metric_name:     metric.to_string(),
             label_filters:   Default::default(),
@@ -2019,7 +2023,7 @@ mod api_tests {
     /// so deployments that haven't migrated keep working.
     #[tokio::test]
     async fn bootstrap_legacy_path_when_env_unset() {
-        let _env = EnvVarGuard::unset(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT);
+        let _env = EnvVarGuard::unset(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT);
 
         let (_, app) = test_app();
         let req = Request::builder()
@@ -2042,7 +2046,7 @@ mod api_tests {
     /// rather than the legacy default DDSketch shape.
     #[tokio::test]
     async fn bootstrap_typed_path_when_env_set() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app, tmp) = test_app_with_workload("http_latency", 0.01);
         let req = Request::builder()
@@ -2067,7 +2071,7 @@ mod api_tests {
     /// otap-dataflow DAG version token.
     #[tokio::test]
     async fn bootstrap_typed_path_asap_otap_runtime_dispatch() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app, tmp) = test_app_with_workload("rtt_otap", 0.01);
         let req = Request::builder()
@@ -2091,7 +2095,7 @@ mod api_tests {
     /// `emit_telegraf_toml` and produces TOML rather than YAML.
     #[tokio::test]
     async fn bootstrap_typed_path_asap_telegraf_runtime_dispatch() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app, tmp) = test_app_with_workload("rtt_tg", 0.01);
         let req = Request::builder()
@@ -2117,7 +2121,7 @@ mod api_tests {
     /// NOT 500 just because the typed path hit a gap.
     #[tokio::test]
     async fn bootstrap_typed_path_falls_back_to_legacy_when_no_workload() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app) = test_app(); // empty registry + empty stores
         let req = Request::builder()
@@ -2186,7 +2190,7 @@ mod api_tests {
         //    main()'s startup loop does.
         let analyzer = Analyzer::new();
         for m in metrics.iter() {
-            let spec = analyzer::QuerySpec {
+            let spec = pipeline::QuerySpec {
                 query_string:    None,
                 metric_name:     (*m).into(),
                 label_filters:   Default::default(),
@@ -2238,7 +2242,7 @@ mod api_tests {
     ///     `name == "..."`.
     #[tokio::test]
     async fn bootstrap_emits_5sketch_routing_for_six_contract_metrics() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app, tmp) = test_app_with_six_contract_metrics();
         let req = Request::builder()
@@ -2380,7 +2384,7 @@ mod api_tests {
 
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
-            let spec = analyzer::QuerySpec {
+            let spec = pipeline::QuerySpec {
                 query_string:    entry.query_string.clone(),
                 metric_name:     entry.metric_name.clone(),
                 label_filters:   Default::default(),
@@ -2430,12 +2434,12 @@ mod api_tests {
     /// (DDSketch + KLL); HLL / CountSketch / CountMinSketch silently drop.
     #[tokio::test]
     async fn bootstrap_routing_table_covers_all_five_sketches_for_live_mvp_yaml() {
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (state, app, tmp) = test_app_with_live_mvp_workload_metrics();
 
         // ── Direct check: collect_metric_to_family produces 5 entries ────
-        let map = config::collect_metric_to_family(
+        let map = emit::collect_metric_to_family(
             &state.workload_registry,
             &state.workload_store,
         );
@@ -2510,7 +2514,7 @@ mod api_tests {
     async fn storage_routing_cumulative_push_covers_all_5_sketched_metrics() {
         // Activate the typed-stage-split path (the only path that
         // emits storage-routing JSON; the legacy path no-ops).
-        let _env = EnvVarGuard::set(planner::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         // Mock backend that captures every storage-routing body.
         // We re-use the mock pattern from `backend_client::tests` —
