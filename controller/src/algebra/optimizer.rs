@@ -32,6 +32,9 @@ use std::collections::HashMap;
 
 use super::expr::{QueryExpr, ScalarExpr, SetOpKind, SortKey};
 use super::expr::{AggIntent, PartitionKeys, SourceSpec};
+use crate::sketch_algebra::capability::{
+    default_capability_table, load_capability_overrides, SketchCapability,
+};
 
 // ── Cost model interface ──────────────────────────────────────────────────────
 
@@ -54,177 +57,47 @@ pub trait CostModel: Send + Sync {
 }
 
 // ── Sketch capabilities ─────────────────────────────────────────────────────
+//
+// Per the Step 2a consolidation, `SketchCapability` / `SupportedIntent` and
+// the YAML-loader logic now live in `crate::sketch_algebra::capability`.
+// The optimizer re-exports `sketch_capability(SketchType)` and
+// `load_sketch_capabilities(path)` as thin shims so existing callers
+// (`algebra::physical`, `main.rs`) keep building while the legacy
+// `crate::types::SketchType` key continues to be the lookup key.
 
-/// Performance and capability profile for a single sketch implementation.
-///
-/// Used by the optimizer to compare candidates and by the physical planner
-/// to check whether a sketch fits within a stage's budget.
-#[derive(Debug, Clone)]
-pub struct SketchCapability {
-    /// Insertion throughput (samples/sec at 1 core).
-    pub insert_throughput: f64,
-    /// Query throughput (queries/sec at 1 core).
-    pub query_throughput: f64,
-    /// Memory footprint per series (bytes).
-    pub memory_bytes_per_series: u64,
-    /// CPU cost per insert (µs/sample).
-    pub cpu_micros_per_insert: f64,
-    /// Transmission size per flush (bytes).
-    pub transmission_bytes: u64,
-    /// Which logical aggregation intents this sketch supports.
-    pub supported_intents: Vec<SupportedIntent>,
-    /// Whether the sketch supports merge (sketch(A∪B) = merge(sketch(A), sketch(B))).
-    pub mergeable: bool,
-    /// Whether the sketch supports delta encoding.
-    pub supports_delta: bool,
-    /// Whether the sketch supports sliding windows natively.
-    pub supports_sliding_window: bool,
-}
-
-/// A logical aggregation intent that a sketch can serve.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SupportedIntent {
-    Quantile,
-    Cardinality,
-    Frequency,
-    Extrema,
-}
-
-/// YAML-serializable capability profile (for loading from config).
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SketchCapabilityYaml {
-    insert_throughput: f64,
-    query_throughput: f64,
-    memory_bytes_per_series: u64,
-    cpu_micros_per_insert: f64,
-    transmission_bytes: u64,
-    supported_intents: Vec<String>,
-    mergeable: bool,
-    supports_delta: bool,
-    supports_sliding_window: bool,
-}
-
-impl SketchCapabilityYaml {
-    fn to_capability(&self) -> SketchCapability {
-        let intents = self.supported_intents.iter().filter_map(|s| match s.as_str() {
-            "quantile" => Some(SupportedIntent::Quantile),
-            "cardinality" => Some(SupportedIntent::Cardinality),
-            "frequency" => Some(SupportedIntent::Frequency),
-            "extrema" => Some(SupportedIntent::Extrema),
-            _ => None,
-        }).collect();
-        SketchCapability {
-            insert_throughput: self.insert_throughput,
-            query_throughput: self.query_throughput,
-            memory_bytes_per_series: self.memory_bytes_per_series,
-            cpu_micros_per_insert: self.cpu_micros_per_insert,
-            transmission_bytes: self.transmission_bytes,
-            supported_intents: intents,
-            mergeable: self.mergeable,
-            supports_delta: self.supports_delta,
-            supports_sliding_window: self.supports_sliding_window,
-        }
-    }
-}
-
-/// YAML file structure for all sketch capabilities.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct SketchCapabilitiesFile {
-    ddsketch: SketchCapabilityYaml,
-    kll: SketchCapabilityYaml,
-    hll: SketchCapabilityYaml,
-    count_sketch: SketchCapabilityYaml,
-    count_min_sketch: SketchCapabilityYaml,
-}
-
-/// Load sketch capabilities from a YAML file.
+/// Load sketch capabilities from a YAML file. Thin shim — the real
+/// loader lives in `sketch_algebra::capability::load_capability_overrides`
+/// and is keyed by `SketchKind`. This shim translates the result to the
+/// legacy `SketchType` key used by call sites that haven't migrated.
 ///
 /// Falls back to built-in defaults if the file is missing or malformed.
-pub fn load_sketch_capabilities(path: &str) -> std::collections::HashMap<crate::types::SketchType, SketchCapability> {
+pub fn load_sketch_capabilities(
+    path: &str,
+) -> std::collections::HashMap<crate::types::SketchType, SketchCapability> {
     use crate::types::SketchType;
-    if let Ok(contents) = std::fs::read_to_string(path) {
-        if let Ok(file) = serde_yaml::from_str::<SketchCapabilitiesFile>(&contents) {
-            let mut map = std::collections::HashMap::new();
-            map.insert(SketchType::DDSketch, file.ddsketch.to_capability());
-            map.insert(SketchType::KLL, file.kll.to_capability());
-            map.insert(SketchType::HLL, file.hll.to_capability());
-            map.insert(SketchType::CountSketch, file.count_sketch.to_capability());
-            map.insert(SketchType::CountMinSketch, file.count_min_sketch.to_capability());
-            return map;
-        }
+    let by_kind = load_capability_overrides(path);
+    let mut out = std::collections::HashMap::new();
+    for (k, v) in by_kind {
+        out.insert(SketchType::from(k), v);
     }
-    // Fallback: built-in defaults.
-    let mut map = std::collections::HashMap::new();
-    for st in &[SketchType::DDSketch, SketchType::KLL, SketchType::HLL, SketchType::CountSketch, SketchType::CountMinSketch] {
-        map.insert(st.clone(), sketch_capability(st));
-    }
-    map
+    out
 }
 
-/// Built-in capability profiles for known sketch types.
-///
-/// These are compiled-in defaults. For deployment-specific values, load from
-/// `sketch_capabilities.yml` via [`load_sketch_capabilities`], or run benchmarks
-/// with `e2esdkbench` and update the YAML.
+/// Built-in capability profile for a known sketch type. Thin shim —
+/// the real defaults live in `sketch_algebra::capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
+    use crate::sketch_algebra::params::SketchKind;
     use crate::types::SketchType;
-    match st {
-        SketchType::DDSketch => SketchCapability {
-            insert_throughput: 10_000_000.0,
-            query_throughput: 50_000_000.0,
-            memory_bytes_per_series: 4_096,
-            cpu_micros_per_insert: 0.1,
-            transmission_bytes: 4_096,
-            supported_intents: vec![SupportedIntent::Quantile, SupportedIntent::Extrema],
-            mergeable: true,
-            supports_delta: true,
-            supports_sliding_window: false,
-        },
-        SketchType::KLL => SketchCapability {
-            insert_throughput: 5_000_000.0,
-            query_throughput: 20_000_000.0,
-            memory_bytes_per_series: 8_192,
-            cpu_micros_per_insert: 0.2,
-            transmission_bytes: 8_192,
-            supported_intents: vec![SupportedIntent::Quantile, SupportedIntent::Extrema],
-            mergeable: true,
-            supports_delta: false,
-            supports_sliding_window: false,
-        },
-        SketchType::HLL => SketchCapability {
-            insert_throughput: 20_000_000.0,
-            query_throughput: 100_000_000.0,
-            memory_bytes_per_series: 16_384,
-            cpu_micros_per_insert: 0.05,
-            transmission_bytes: 16_384,
-            supported_intents: vec![SupportedIntent::Cardinality],
-            mergeable: true,
-            supports_delta: true,
-            supports_sliding_window: false,
-        },
-        SketchType::CountSketch => SketchCapability {
-            insert_throughput: 8_000_000.0,
-            query_throughput: 10_000_000.0,
-            memory_bytes_per_series: 80_000,
-            cpu_micros_per_insert: 0.5,
-            transmission_bytes: 80_000,
-            supported_intents: vec![SupportedIntent::Frequency],
-            mergeable: true,
-            supports_delta: true,
-            supports_sliding_window: false,
-        },
-        SketchType::CountMinSketch => SketchCapability {
-            insert_throughput: 8_000_000.0,
-            query_throughput: 10_000_000.0,
-            memory_bytes_per_series: 80_000,
-            cpu_micros_per_insert: 0.5,
-            transmission_bytes: 80_000,
-            supported_intents: vec![SupportedIntent::Frequency],
-            mergeable: true,
-            supports_delta: true,
-            supports_sliding_window: false,
-        },
-    }
+    let kind: SketchKind = match st {
+        SketchType::DDSketch => SketchKind::DDSketch,
+        SketchType::KLL => SketchKind::Kll,
+        SketchType::HLL => SketchKind::Hll,
+        SketchType::CountSketch => SketchKind::CountSketch,
+        SketchType::CountMinSketch => SketchKind::Cms,
+    };
+    default_capability_table()
+        .remove(&kind)
+        .expect("default_capability_table covers every SketchKind variant")
 }
 
 // ── Stage budgets ───────────────────────────────────────────────────────────

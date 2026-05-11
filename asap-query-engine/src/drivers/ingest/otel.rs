@@ -897,6 +897,15 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 | SketchKindHandle::CmsWithHeap => {
                                     Capability::FrequencyTopk(kind)
                                 }
+                                // `Any` is the controller-side analysis-
+                                // time wildcard — it should never appear
+                                // on the ingest path (which detects a
+                                // concrete sketch kind from the OTLP
+                                // wire variant). Default defensively to
+                                // QuantileApprox so a stray `Any`
+                                // doesn't panic; the analyzer's
+                                // `is_satisfied_by` rejects mismatches.
+                                SketchKindHandle::Any => Capability::QuantileApprox(kind),
                             };
                             let group_by_keys: BTreeSet<String> =
                                 dp.attrs.keys().cloned().collect();
