@@ -24,7 +24,7 @@
 //! - `SUM(col)` → exact
 //! - ORDER BY … DESC LIMIT k → heavy-hitter CountSketch
 //! - Multiple aggs in one SELECT → all ops collected (Merge)
-//! - JOIN … ON key → JoinSketch push-down
+//! - JOIN … ON key → backend-side Join (sketch-aware push-down: see physical planner)
 //! - UNION ALL → Merge (sketch linearity)
 
 pub mod promql;
@@ -188,13 +188,9 @@ impl QeCollector {
                 self.visit(input);
                 self.inside_topk = prev;
             }
-            QueryExpr::Dedup { input, .. } => self.visit(input),
+            QueryExpr::Distinct { input, .. } => self.visit(input),
             QueryExpr::Merge { inputs } => {
                 for i in inputs { self.visit(i); }
-            }
-            QueryExpr::JoinSketch { outer, inner, .. } => {
-                self.visit(outer);
-                self.visit(inner);
             }
             QueryExpr::Aggregate { keys, aggs, input, .. } => {
                 for k in keys {
@@ -212,15 +208,13 @@ impl QeCollector {
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
             | QueryExpr::HistogramQuantile { input, .. }
-            | QueryExpr::PromQLSubquery { input, .. }
-            | QueryExpr::WindowFunc { input, .. } => self.visit(input),
+            | QueryExpr::PromQLSubquery { input, .. } => self.visit(input),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
                 self.visit(left);
                 self.visit(right);
             }
-            QueryExpr::Subquery { expr, .. } => self.visit(expr),
             QueryExpr::LetBinding { expr, body, .. } => {
                 self.visit(expr);
                 self.visit(body);

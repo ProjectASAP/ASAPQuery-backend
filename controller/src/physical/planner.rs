@@ -343,10 +343,11 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        QueryExpr::Dedup { col, input } => {
+        QueryExpr::Distinct { cols, input } => {
             let child = plan_node(input, config);
+            let pred = format!("distinct({})", display_distinct_cols(cols));
             let mut node = PhysicalNode {
-                op: PhysicalOp::Filter { pred: format!("dedup({col})") },
+                op: PhysicalOp::Filter { pred },
                 placement: Placement::BackendCollector,
                 cost: PhysicalCost::default(),
                 children: vec![child],
@@ -423,8 +424,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         QueryExpr::Sort { input, .. }
         | QueryExpr::Limit { input, .. }
         | QueryExpr::Project { input, .. }
-        | QueryExpr::Window { input, .. }
-        | QueryExpr::WindowFunc { input, .. } => {
+        | QueryExpr::Window { input, .. } => {
             let child = plan_node(input, config);
             PhysicalNode {
                 op: PhysicalOp::Passthrough,
@@ -436,7 +436,6 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── Join: both children, QueryEngine placement ──────────────
         QueryExpr::Join { left, right, .. }
-        | QueryExpr::JoinSketch { outer: left, inner: right, .. }
         | QueryExpr::SetOp { left, right, .. } => {
             let l = plan_node(left, config);
             let r = plan_node(right, config);
@@ -448,8 +447,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        // ── Subquery / LetBinding ───────────────────────────────────
-        QueryExpr::Subquery { expr, .. } => plan_node(expr, config),
+        // ── LetBinding ──────────────────────────────────────────────
         QueryExpr::LetBinding { body, .. } => plan_node(body, config),
         QueryExpr::Ref(_) => PhysicalNode {
             op: PhysicalOp::Passthrough,
@@ -485,6 +483,23 @@ fn decide_sketch_placement(resolved: &PhysicalAggOp, config: &PhysicalPlannerCon
 }
 
 /// If a node's child is at a different stage, insert an Exchange node between them.
+/// Render a `Distinct { cols }` column tuple into a human-readable display
+/// string for the `Filter { pred }` rationale. `Distinct { cols: [] }` is
+/// whole-row SQL DISTINCT and prints as `*`.
+fn display_distinct_cols(cols: &[ColumnRef]) -> String {
+    if cols.is_empty() {
+        return "*".into();
+    }
+    cols.iter()
+        .map(|c| match c {
+            ColumnRef::Named(s) => s.clone(),
+            ColumnRef::SampleValue => "@value".into(),
+            ColumnRef::Wildcard => "*".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn insert_exchange_if_needed(node: &mut PhysicalNode) {
     let parent_placement = node.placement.clone();
     for child in &mut node.children {

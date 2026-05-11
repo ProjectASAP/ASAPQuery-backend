@@ -68,8 +68,8 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
             keys,
             input: Box::new(lower_to_sketch_algebra(*input)),
         },
-        QueryExpr::Dedup { col, input } => QueryExpr::Dedup {
-            col,
+        QueryExpr::Distinct { cols, input } => QueryExpr::Distinct {
+            cols,
             input: Box::new(lower_to_sketch_algebra(*input)),
         },
         QueryExpr::TopK { k, by, input } => QueryExpr::TopK {
@@ -84,13 +84,6 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
         QueryExpr::Limit { n, offset, input } => QueryExpr::Limit {
             n,
             offset,
-            input: Box::new(lower_to_sketch_algebra(*input)),
-        },
-        QueryExpr::WindowFunc { func, partition_by, order_by, frame, input } => QueryExpr::WindowFunc {
-            func,
-            partition_by,
-            order_by,
-            frame,
             input: Box::new(lower_to_sketch_algebra(*input)),
         },
         QueryExpr::HistogramQuantile { phi, input } => QueryExpr::HistogramQuantile {
@@ -116,11 +109,6 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
             left:  Box::new(lower_to_sketch_algebra(*left)),
             right: Box::new(lower_to_sketch_algebra(*right)),
         },
-        QueryExpr::JoinSketch { join_key, outer, inner } => QueryExpr::JoinSketch {
-            join_key,
-            outer: Box::new(lower_to_sketch_algebra(*outer)),
-            inner: Box::new(lower_to_sketch_algebra(*inner)),
-        },
         QueryExpr::SetOp { kind, all, left, right } => QueryExpr::SetOp {
             kind,
             all,
@@ -131,10 +119,6 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
         // ── Multi-input / container nodes ─────��──────────────────────────
         QueryExpr::Merge { inputs } => QueryExpr::Merge {
             inputs: inputs.into_iter().map(lower_to_sketch_algebra).collect(),
-        },
-        QueryExpr::Subquery { alias, expr } => QueryExpr::Subquery {
-            alias,
-            expr: Box::new(lower_to_sketch_algebra(*expr)),
         },
         QueryExpr::LetBinding { name, expr, body } => QueryExpr::LetBinding {
             name,

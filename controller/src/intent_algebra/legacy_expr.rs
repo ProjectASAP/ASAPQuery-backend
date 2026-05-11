@@ -241,17 +241,6 @@ pub enum FilterVal {
     Null,
 }
 
-/// How completely a query can be served by sketches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SketchCoverage {
-    /// All aggregation columns are sketch-mapped.
-    Full,
-    /// Some columns are sketch-mapped; others require exact passthrough.
-    Partial,
-    /// No sketch applicable; query requires exact execution.
-    None,
-}
-
 // ── Relational algebra ────────────────────────────────────────────────────────
 
 /// Full relational + sketch algebra — the sole query IR.
@@ -334,9 +323,11 @@ pub enum QueryExpr {
         input: Box<QueryExpr>,
     },
 
-    /// δ — deduplicate on `col` before sketch ingestion.
-    Dedup {
-        col:   String,
+    /// δ — deduplicate on `cols` (a tuple of columns) before sketch ingestion.
+    /// SQL `SELECT DISTINCT` lowers to this; the column set may be empty
+    /// (full-row distinct) or multi-column. PromQL has no direct analog.
+    Distinct {
+        cols:  Vec<ColumnRef>,
         input: Box<QueryExpr>,
     },
 
@@ -360,13 +351,6 @@ pub enum QueryExpr {
         pred:  Option<ScalarExpr>,
         left:  Box<QueryExpr>,
         right: Box<QueryExpr>,
-    },
-
-    /// Sketch-aware join push-down: pre-aggregate on inner side then merge.
-    JoinSketch {
-        join_key: String,
-        outer:    Box<QueryExpr>,
-        inner:    Box<QueryExpr>,
     },
 
     // ── Set operators ─────────────────────────────────────────────────────
@@ -396,28 +380,11 @@ pub enum QueryExpr {
 
     // ── Subquery / CTE ────────────────────────────────────────────────────
 
-    /// Inline subquery with an alias (SQL `(SELECT ...) AS alias`).
-    Subquery {
-        alias: String,
-        expr:  Box<QueryExpr>,
-    },
-
     /// SQL `WITH name AS (expr) IN body` or PromQL recording rule binding.
     LetBinding {
         name: String,
         expr: Box<QueryExpr>,
         body: Box<QueryExpr>,
-    },
-
-    // ── Window functions (analytic functions) ─────────────────────────────
-
-    /// OVER (PARTITION BY … ORDER BY … frame) analytic functions.
-    WindowFunc {
-        func:         WindowFuncKind,
-        partition_by: Vec<String>,
-        order_by:     Vec<SortKey>,
-        frame:        Option<WindowFrame>,
-        input:        Box<QueryExpr>,
     },
 
     // ── PromQL-specific operators ─────────────────────────────────────────
@@ -467,12 +434,6 @@ pub enum ScalarExpr {
         rhs: Box<ScalarExpr>,
     },
 
-    /// Unary prefix operator (`NOT`, `-`, `+`).
-    UnaryOp {
-        op:    UnaryOpKind,
-        input: Box<ScalarExpr>,
-    },
-
     /// Named function call (e.g. `ABS(x)`, `DATE_TRUNC('hour', ts)`).
     FunctionCall {
         name: String,
@@ -489,13 +450,6 @@ pub enum ScalarExpr {
         negated: bool,
     },
 
-    /// `expr IN (SELECT …)` / `NOT IN (SELECT …)`.
-    InSubquery {
-        expr:     Box<ScalarExpr>,
-        subquery: Box<QueryExpr>,
-        negated:  bool,
-    },
-
     /// `expr BETWEEN low AND high` or `NOT BETWEEN …`.
     Between {
         expr:    Box<ScalarExpr>,
@@ -508,28 +462,6 @@ pub enum ScalarExpr {
     IsNull {
         expr:    Box<ScalarExpr>,
         negated: bool,
-    },
-
-    /// CASE WHEN … THEN … [ELSE …] END.
-    Case {
-        operand:   Option<Box<ScalarExpr>>,
-        when_then: Vec<(ScalarExpr, ScalarExpr)>,
-        else_:     Option<Box<ScalarExpr>>,
-    },
-
-    /// CAST(expr AS type).
-    Cast {
-        expr: Box<ScalarExpr>,
-        to:   DataType,
-    },
-
-    /// PromQL vector binary op between two instant-vector expressions where one
-    /// or both sides produce a scalar in the final result (e.g. `rate(…) > 0.5`).
-    VectorBinaryOp {
-        op:           BinaryOpKind,
-        lhs:          Box<QueryExpr>,
-        rhs:          Box<QueryExpr>,
-        vector_match: Option<VectorMatch>,
     },
 }
 
@@ -659,14 +591,6 @@ pub enum BinaryOpKind {
     Atan2,
 }
 
-/// Unary prefix operators.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnaryOpKind {
-    Negate,
-    Not,
-    BitwiseNot,
-}
-
 /// JOIN variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JoinKind {
@@ -725,48 +649,6 @@ pub struct SortKey {
     pub nulls_first: Option<bool>,
 }
 
-/// Analytic window function kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WindowFuncKind {
-    RowNumber,
-    Rank,
-    DenseRank,
-    PercentRank,
-    CumeDist,
-    NTile { n: u64 },
-    Lag  { offset: u64 },
-    Lead { offset: u64 },
-    FirstValue,
-    LastValue,
-    NthValue { n: u64 },
-    /// User-defined analytic function.
-    Custom(String),
-}
-
-/// ROWS / RANGE frame clause for analytic functions.
-#[derive(Debug, Clone)]
-pub struct WindowFrame {
-    pub unit:  FrameUnit,
-    pub start: FrameBound,
-    pub end:   Option<FrameBound>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameUnit {
-    Rows,
-    Range,
-    Groups,
-}
-
-#[derive(Debug, Clone)]
-pub enum FrameBound {
-    UnboundedPreceding,
-    Preceding(u64),
-    CurrentRow,
-    Following(u64),
-    UnboundedFollowing,
-}
-
 /// Scalar literal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
@@ -776,30 +658,6 @@ pub enum LiteralValue {
     Float(f64),
     Str(String),
     Duration(Duration),
-}
-
-/// SQL / Arrow data types used in CAST expressions.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DataType {
-    Boolean,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    Float32,
-    Float64,
-    Utf8,
-    Binary,
-    Timestamp,
-    Date,
-    Interval,
-    List(Box<DataType>),
-    Struct(Vec<(String, DataType)>),
-    Custom(String),
 }
 
 impl QueryExpr {
@@ -814,11 +672,10 @@ impl QueryExpr {
             | QueryExpr::SketchAgg { input, .. }
             | QueryExpr::WindowedAgg { input, .. }
             | QueryExpr::Partition { input, .. }
-            | QueryExpr::Dedup { input, .. }
+            | QueryExpr::Distinct { input, .. }
             | QueryExpr::TopK { input, .. }
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
-            | QueryExpr::WindowFunc { input, .. }
             | QueryExpr::HistogramQuantile { input, .. }
             | QueryExpr::PromQLSubquery { input, .. } => input.walk(f),
 
@@ -828,13 +685,11 @@ impl QueryExpr {
                 for i in inputs { i.walk(f); }
             }
             QueryExpr::Join { left, right, .. }
-            | QueryExpr::JoinSketch { outer: left, inner: right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
                 left.walk(f);
                 right.walk(f);
             }
-            QueryExpr::Subquery { expr, .. } => expr.walk(f),
             QueryExpr::LetBinding { expr, body, .. } => {
                 expr.walk(f);
                 body.walk(f);
@@ -864,20 +719,17 @@ impl QueryExpr {
             | QueryExpr::SketchAgg { input, .. }
             | QueryExpr::WindowedAgg { input, .. }
             | QueryExpr::Partition { input, .. }
-            | QueryExpr::Dedup { input, .. }
+            | QueryExpr::Distinct { input, .. }
             | QueryExpr::TopK { input, .. }
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
             | QueryExpr::Aggregate { input, .. }
-            | QueryExpr::WindowFunc { input, .. }
             | QueryExpr::HistogramQuantile { input, .. }
             | QueryExpr::PromQLSubquery { input, .. } => input.source_name(),
             QueryExpr::Merge { inputs } => inputs.first()?.source_name(),
             QueryExpr::Join { left, .. }
-            | QueryExpr::JoinSketch { outer: left, .. }
             | QueryExpr::SetOp { left, .. }
             | QueryExpr::BinaryOp { lhs: left, .. } => left.source_name(),
-            QueryExpr::Subquery { expr, .. } => expr.source_name(),
             QueryExpr::LetBinding { body, .. } => body.source_name(),
             QueryExpr::Ref(_) => None,
         }
@@ -1212,19 +1064,4 @@ mod tests {
         assert!(!AggIntent::default_cardinality().is_exact());
     }
 
-    #[test]
-    fn sketch_coverage_classification() {
-        let ops: Vec<AggIntent> = vec![
-            AggIntent::default_cardinality(),
-            AggIntent::Exact(ExactAgg::Sum),
-        ];
-        let has_sketch = ops.iter().any(|o| !o.is_exact());
-        let has_exact  = ops.iter().any(|o|  o.is_exact());
-        let cov = match (has_sketch, has_exact) {
-            (true, false) => SketchCoverage::Full,
-            (true, true)  => SketchCoverage::Partial,
-            _             => SketchCoverage::None,
-        };
-        assert_eq!(cov, SketchCoverage::Partial);
-    }
 }

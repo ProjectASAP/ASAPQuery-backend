@@ -15,17 +15,17 @@
 //!
 //! | Node type | Default stage | Condition |
 //! |-----------|---------------|-----------|
-//! | Source, Filter, Window, Partition, Dedup | Agent | Always |
+//! | Source, Filter, Window, Partition, Distinct | Agent | Always |
 //! | SketchAgg (sketachable op, mergeable) | Agent | budget OK |
 //! | SketchAgg (sketchable, mergeable) | Backend | agent budget exceeded |
 //! | SketchAgg (sketchable, not mergeable: Avg) | Db | always |
 //! | SketchAgg (exact: Sum/Count/Min/Max) | Backend | mergeable |
 //! | TopK | Precompute | always |
-//! | Merge, JoinSketch | Backend | always |
+//! | Merge | Backend | always |
 //! | Aggregate, Project, Sort, Limit | Db | always |
-//! | WindowFunc, HistogramQuantile | Db | always |
+//! | HistogramQuantile | Db | always |
 //! | PromQLSubquery, BinaryOp | Precompute | has sketch children |
-//! | LetBinding, Subquery | same as body/inner | propagated |
+//! | LetBinding | same as body | propagated |
 
 use crate::intent_algebra::legacy_expr::QueryExpr;
 use super::plan::{
@@ -166,18 +166,18 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Dedup { col, input } => {
+            QueryExpr::Distinct { cols, input } => {
                 let child = self.alloc_node(*input, budget);
                 PlanNode {
-                    expr: QueryExpr::Dedup {
-                        col,
+                    expr: QueryExpr::Distinct {
+                        cols,
                         input: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
                     mode:  ExecutionMode::Passthrough,
                     cost:  CostEstimate::default(),
                     annotation: NodeAnnotation {
-                        rationale: "Dedup at Agent before sketch build".into(),
+                        rationale: "Distinct at Agent before sketch build".into(),
                         ..Default::default()
                     },
                     children: vec![child],
@@ -243,29 +243,6 @@ impl SketchAllocator {
                         ..Default::default()
                     },
                     children,
-                }
-            }
-
-            QueryExpr::JoinSketch { join_key, outer, inner } => {
-                let outer_node = self.alloc_node(*outer, budget);
-                let inner_node = self.alloc_node(*inner, budget);
-                PlanNode {
-                    expr: QueryExpr::JoinSketch {
-                        join_key,
-                        outer: Box::new(outer_node.expr.clone()),
-                        inner: Box::new(inner_node.expr.clone()),
-                    },
-                    stage: PipelineStage::Backend,
-                    mode:  ExecutionMode::Passthrough,
-                    cost:  CostEstimate {
-                        bytes_per_sec: self.raw_bytes_per_sec * 0.2,
-                        ..Default::default()
-                    },
-                    annotation: NodeAnnotation {
-                        rationale: "JoinSketch at Backend: pre-agg inner then merge".into(),
-                        ..Default::default()
-                    },
-                    children: vec![outer_node, inner_node],
                 }
             }
 
@@ -388,24 +365,6 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::WindowFunc { func, partition_by, order_by, frame, input } => {
-                let child = self.alloc_node(*input, budget);
-                PlanNode {
-                    expr: QueryExpr::WindowFunc {
-                        func, partition_by, order_by, frame,
-                        input: Box::new(child.expr.clone()),
-                    },
-                    stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate::default(),
-                    annotation: NodeAnnotation {
-                        rationale: "Analytic window function at Db".into(),
-                        ..Default::default()
-                    },
-                    children: vec![child],
-                }
-            }
-
             // ── PromQL-specific ───────────────────────────────────────────
             QueryExpr::HistogramQuantile { phi, input } => {
                 let child = self.alloc_node(*input, budget);
@@ -490,26 +449,6 @@ impl SketchAllocator {
             }
 
             // ── Scoping constructs — propagate body's stage ───────────────
-            QueryExpr::Subquery { alias, expr } => {
-                let child = self.alloc_node(*expr, budget);
-                let stage = child.stage.clone();
-                let mode  = child.mode.clone();
-                PlanNode {
-                    expr: QueryExpr::Subquery {
-                        alias,
-                        expr: Box::new(child.expr.clone()),
-                    },
-                    stage,
-                    mode,
-                    cost:       CostEstimate::default(),
-                    annotation: NodeAnnotation {
-                        rationale: "Subquery inherits inner stage".into(),
-                        ..Default::default()
-                    },
-                    children: vec![child],
-                }
-            }
-
             QueryExpr::LetBinding { name, expr, body } => {
                 let expr_node = self.alloc_node(*expr, budget);
                 let body_node = self.alloc_node(*body, budget);
