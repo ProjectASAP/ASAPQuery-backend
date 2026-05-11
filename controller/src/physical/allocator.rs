@@ -31,7 +31,7 @@ use crate::intent_algebra::legacy_expr::QueryExpr;
 use super::plan::{
     CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode,
 };
-use crate::intent_algebra::legacy_expr::{AggIntent, ExactAgg};
+use crate::intent_algebra::legacy_expr::{agg_is_exact, AggIntent};
 use crate::types::{SketchType, StageResourceBudgets};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
@@ -483,7 +483,7 @@ impl SketchAllocator {
         budget: &mut BudgetState,
     ) -> PlanNode {
         // Exact non-mergeable (Avg) → always Db.
-        if let AggIntent::Exact(ExactAgg::Avg) = &op {
+        if matches!(&op, AggIntent::Avg) {
             return PlanNode {
                 expr: QueryExpr::SketchAgg {
                     op,
@@ -497,7 +497,7 @@ impl SketchAllocator {
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    rationale: "Exact(Avg) is not mergeable — must run at Db".into(),
+                    rationale: "Avg is not mergeable — must run at Db".into(),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -505,7 +505,7 @@ impl SketchAllocator {
         }
 
         // Exact mergeable (Sum, Count, Min, Max) → Backend.
-        if let AggIntent::Exact(_) = &op {
+        if agg_is_exact(&op) {
             return PlanNode {
                 expr: QueryExpr::SketchAgg {
                     op,
@@ -627,7 +627,10 @@ mod tests {
     use super::*;
     use crate::intent_algebra::legacy_expr::QueryExpr;
     use crate::physical::plan::{ExecutionMode, PipelineStage};
-    use crate::intent_algebra::legacy_expr::{AggIntent, ColumnRef, PartitionKeys, SourceSpec};
+    use crate::intent_algebra::legacy_expr::{
+        default_cardinality, default_frequency, default_quantile, AggIntent, ColumnRef,
+        PartitionKeys, SourceSpec,
+    };
     use crate::types::{SketchType, StageResourceBudgets};
     use std::time::Duration;
 
@@ -685,7 +688,7 @@ mod tests {
     #[test]
     fn ddsketch_within_budget_goes_to_agent() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(src("latency")),
         };
@@ -700,7 +703,7 @@ mod tests {
     #[test]
     fn ddsketch_agent_budget_exceeded_goes_to_backend() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(src("latency")),
         };
@@ -714,7 +717,7 @@ mod tests {
     #[test]
     fn ddsketch_all_budgets_exceeded_goes_to_precompute() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(src("latency")),
         };
@@ -728,7 +731,7 @@ mod tests {
     #[test]
     fn exact_avg_goes_to_db() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::Exact(ExactAgg::Avg),
+            op:    AggIntent::Avg,
             col:   ColumnRef::Named("price".into()),
             input: Box::new(src("trades")),
         };
@@ -742,7 +745,7 @@ mod tests {
     #[test]
     fn exact_sum_goes_to_backend() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::Exact(ExactAgg::Sum),
+            op:    AggIntent::Sum,
             col:   ColumnRef::Named("bytes".into()),
             input: Box::new(src("network")),
         };
@@ -781,7 +784,7 @@ mod tests {
     #[test]
     fn hll_within_budget_at_agent() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_cardinality(),
+            op:    default_cardinality(),
             col:   ColumnRef::Named("uid".into()),
             input: Box::new(src("events")),
         };
@@ -795,7 +798,7 @@ mod tests {
     #[test]
     fn frequency_within_budget_at_agent() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_frequency(),
+            op:    default_frequency(),
             col:   ColumnRef::Wildcard,
             input: Box::new(src("requests")),
         };
@@ -826,7 +829,7 @@ mod tests {
         let expr = QueryExpr::HistogramQuantile {
             phi:   0.95,
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::default_quantile(vec![0.95]),
+                op:    default_quantile(0.95),
                 col:   ColumnRef::SampleValue,
                 input: Box::new(src("hist")),
             }),
@@ -856,13 +859,13 @@ mod tests {
 
     #[test]
     fn cardinality_memory_estimate() {
-        let mem = estimated_sketch_memory(&AggIntent::default_cardinality());
+        let mem = estimated_sketch_memory(&default_cardinality());
         assert!(mem > 0.0);
     }
 
     #[test]
     fn frequency_memory_estimate() {
-        let op = AggIntent::default_frequency();
+        let op = default_frequency();
         let mem = estimated_sketch_memory(&op);
         assert!(mem > 0.0);
     }
@@ -872,7 +875,7 @@ mod tests {
     #[test]
     fn plan_summary_shows_bandwidth_saved() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(src("latency")),
         };

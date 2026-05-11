@@ -662,7 +662,7 @@ mod tests {
 
     #[test]
     fn resolve_quantile() {
-        let p = resolve(&AggIntent::default_quantile(vec![0.99]));
+        let p = resolve(&crate::intent_algebra::legacy_expr::default_quantile(0.99));
         assert_eq!(p.sketch_type, SketchType::DDSketch);
         assert!(matches!(p.sketch_params, SketchParams::DDSketch { .. }));
         assert!(p.estimated_memory_bytes > 0);
@@ -670,21 +670,25 @@ mod tests {
 
     #[test]
     fn resolve_cardinality() {
-        let p = resolve(&AggIntent::default_cardinality());
+        let p = resolve(&crate::intent_algebra::legacy_expr::default_cardinality());
         assert_eq!(p.sketch_type, SketchType::HLL);
         assert!(matches!(p.sketch_params, SketchParams::HLL { .. }));
     }
 
     #[test]
     fn resolve_frequency() {
-        let p = resolve(&AggIntent::default_frequency());
+        let p = resolve(&crate::intent_algebra::legacy_expr::default_frequency());
         assert_eq!(p.sketch_type, SketchType::CountSketch);
         assert!(matches!(p.sketch_params, SketchParams::CountSketch { .. }));
     }
 
     #[test]
     fn resolve_preserves_intent() {
-        let intent = AggIntent::Quantile { quantiles: vec![0.5, 0.99], accuracy: 0.005 };
+        use crate::types_v2::AccuracyTarget;
+        // Canonical Quantile is single-φ; multi-φ legacy intent is now
+        // a Merge of multiple single-φ SketchAgg siblings at construction
+        // time. The resolve() boundary sees a single intent.
+        let intent = AggIntent::Quantile { q: 0.99, accuracy: AccuracyTarget::Epsilon(0.005) };
         let p = resolve(&intent);
         assert_eq!(p.intent, intent);
     }
@@ -749,7 +753,7 @@ mod tests {
     fn plan_simple_sketch_at_agent() {
         // SketchAgg { Quantile, Source } → Agent placement
         let expr = QueryExpr::SketchAgg {
-            op: AggIntent::default_quantile(vec![0.99]),
+            op: crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col: ColumnRef::SampleValue,
             input: Box::new(src("m")),
         };
@@ -762,7 +766,7 @@ mod tests {
     #[test]
     fn plan_windowed_agg_has_window() {
         let expr = QueryExpr::WindowedAgg {
-            agg: AggIntent::default_quantile(vec![0.5]),
+            agg: crate::intent_algebra::legacy_expr::default_quantile(0.5),
             window: WindowSpec { kind: WindowKind::Tumbling { size: Duration::from_secs(300) }, time_col: None },
             col: ColumnRef::SampleValue,
             input: Box::new(src("m")),
@@ -783,7 +787,7 @@ mod tests {
             k: 10,
             by: vec!["svc".into()],
             input: Box::new(QueryExpr::SketchAgg {
-                op: AggIntent::default_frequency(),
+                op: crate::intent_algebra::legacy_expr::default_frequency(),
                 col: ColumnRef::SampleValue,
                 input: Box::new(src("m")),
             }),
@@ -800,7 +804,7 @@ mod tests {
             k: 5,
             by: vec![],
             input: Box::new(QueryExpr::SketchAgg {
-                op: AggIntent::default_frequency(),
+                op: crate::intent_algebra::legacy_expr::default_frequency(),
                 col: ColumnRef::SampleValue,
                 input: Box::new(src("m")),
             }),
@@ -814,7 +818,7 @@ mod tests {
         let expr = QueryExpr::Partition {
             keys: PartitionKeys::By(vec!["region".into()]),
             input: Box::new(QueryExpr::SketchAgg {
-                op: AggIntent::default_cardinality(),
+                op: crate::intent_algebra::legacy_expr::default_cardinality(),
                 col: ColumnRef::SampleValue,
                 input: Box::new(src("m")),
             }),
@@ -850,7 +854,7 @@ mod tests {
             input: Box::new(QueryExpr::Partition {
                 keys: PartitionKeys::By(vec!["svc".into()]),
                 input: Box::new(QueryExpr::WindowedAgg {
-                    agg: AggIntent::default_frequency(),
+                    agg: crate::intent_algebra::legacy_expr::default_frequency(),
                     window: WindowSpec { kind: WindowKind::Tumbling { size: Duration::from_secs(60) }, time_col: None },
                     col: ColumnRef::SampleValue,
                     input: Box::new(QueryExpr::Filter {
@@ -880,7 +884,7 @@ mod tests {
             budgets,
         };
         let expr = QueryExpr::SketchAgg {
-            op: AggIntent::default_quantile(vec![0.99]),
+            op: crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col: ColumnRef::SampleValue,
             input: Box::new(src("m")),
         };
@@ -894,7 +898,7 @@ mod tests {
     #[test]
     fn staged_plan_simple_sketch() {
         let expr = QueryExpr::WindowedAgg {
-            agg: AggIntent::Quantile { quantiles: vec![0.99], accuracy: 0.01 },
+            agg: AggIntent::Quantile { q: 0.99, accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01) },
             window: WindowSpec { kind: WindowKind::Tumbling { size: Duration::from_secs(300) }, time_col: None },
             col: ColumnRef::SampleValue,
             input: Box::new(src("m")),
@@ -914,7 +918,7 @@ mod tests {
             input: Box::new(QueryExpr::Partition {
                 keys: PartitionKeys::By(vec!["svc".into()]),
                 input: Box::new(QueryExpr::WindowedAgg {
-                    agg: AggIntent::default_frequency(),
+                    agg: crate::intent_algebra::legacy_expr::default_frequency(),
                     window: WindowSpec { kind: WindowKind::Tumbling { size: Duration::from_secs(60) }, time_col: None },
                     col: ColumnRef::SampleValue,
                     input: Box::new(src("m")),

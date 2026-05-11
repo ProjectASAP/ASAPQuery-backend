@@ -9,7 +9,7 @@
 //!
 //! All callers now go through this module.
 
-use crate::intent_algebra::legacy_expr::{AggIntent, ExactAgg};
+use crate::intent_algebra::legacy_expr::{agg_accuracy, AggIntent, PerPartitionWrap};
 use crate::types::{
     AggType, SketchDefaults,
     SketchParams, SketchType,
@@ -71,12 +71,23 @@ pub fn sketch_type_for_agg(aggs: &[AggType]) -> SketchType {
 /// Resolve the concrete [`SketchType`] for an [`AggIntent`] IR node.
 pub fn sketch_type_for_op(op: &AggIntent) -> SketchType {
     match op {
-        AggIntent::Quantile { .. } | AggIntent::Extrema { .. } => SketchType::DDSketch,
+        AggIntent::Quantile { .. } => SketchType::DDSketch,
         AggIntent::Cardinality { .. } => SketchType::HLL,
         AggIntent::Frequency { .. } => SketchType::CountSketch,
-        AggIntent::PerPartition { inner, .. } => sketch_type_for_op(inner),
-        AggIntent::Exact(_) => SketchType::DDSketch,
+        // Min/Max/Sum/Count/Avg/TopK/Rate/Increase + archive-only — all
+        // historically rode the "DDSketch / exact passthrough" rails in
+        // the legacy resolver. Keep that mapping until Step γ migrates the
+        // physical planner onto canonical L4 binding.
+        _ => SketchType::DDSketch,
     }
+}
+
+/// Resolve the concrete [`SketchType`] for a `PerPartitionWrap` shape —
+/// delegates to the wrapped inner intent. Kept as a separate function so
+/// that the PerPartition structural collapse (Step γ) is a focused
+/// removal rather than a recursion-tracking refactor.
+pub fn sketch_type_for_per_partition(wrap: &PerPartitionWrap) -> SketchType {
+    sketch_type_for_op(&wrap.inner)
 }
 
 // ── AggIntent → SketchParams ────────────────────────────────────────────────
@@ -84,30 +95,45 @@ pub fn sketch_type_for_op(op: &AggIntent) -> SketchType {
 /// Derive [`SketchParams`] from an [`AggIntent`] IR node.
 pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
     match op {
-        AggIntent::Quantile { quantiles, accuracy } => SketchParams::DDSketch {
-            relative_accuracy: *accuracy,
-            quantiles: quantiles.clone(),
+        AggIntent::Quantile { q, .. } => SketchParams::DDSketch {
+            relative_accuracy: agg_accuracy(op),
+            // Canonical Quantile is single-φ post Step α. Multi-φ
+            // fan-out lives at construction time (Merge of SketchAgg
+            // siblings), so this carrier always reports its single q.
+            quantiles: vec![*q],
         },
-        AggIntent::Cardinality { accuracy } => {
+        AggIntent::Cardinality { .. } => {
+            let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
             // registers ≈ (1.04/accuracy)^2, precision = log2(registers)
-            let registers = ((1.04 / accuracy).powi(2) as u32).next_power_of_two();
+            let registers = ((1.04 / acc).powi(2) as u32).next_power_of_two();
             let precision = (registers as f64).log2() as u32;
             SketchParams::HLL { precision }
         },
-        AggIntent::Frequency { accuracy } => {
-            let width = (std::f64::consts::E / accuracy) as u32;
+        AggIntent::Frequency { .. } => {
+            let acc = agg_accuracy(op);
             SketchParams::CountSketch {
-                epsilon: *accuracy,
+                epsilon: acc,
                 delta: 0.01,
             }
         },
-        AggIntent::PerPartition { inner, .. } => sketch_params_for_op(inner),
-        AggIntent::Extrema { .. } => SketchParams::DDSketch {
+        // Min / Max — preserve the legacy `Extrema` mapping (DDSketch over
+        // the 0.0 / 1.0 boundary quantiles).
+        AggIntent::Min | AggIntent::Max => SketchParams::DDSketch {
             relative_accuracy: 0.01,
             quantiles: vec![0.0, 1.0],
         },
-        AggIntent::Exact(_) => SketchParams::default(),
+        // Sum / Count / Avg / TopK / Rate / Increase / archive-only — no
+        // sketch-specific params; the legacy `Exact(_)` arm returned
+        // `SketchParams::default()` and we preserve that.
+        _ => SketchParams::default(),
     }
+}
+
+/// Derive [`SketchParams`] for a `PerPartitionWrap` — delegates to the
+/// inner intent. Kept separate for the same Step γ reason as
+/// [`sketch_type_for_per_partition`].
+pub fn sketch_params_for_per_partition(wrap: &PerPartitionWrap) -> SketchParams {
+    sketch_params_for_op(&wrap.inner)
 }
 
 /// Combined (type, params) lookup — convenience for callers that need both.
@@ -124,23 +150,32 @@ pub fn sketch_type_and_params(op: &AggIntent) -> (SketchType, SketchParams) {
 pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
     match op {
         AggIntent::Quantile { .. } => 4_096,
-        AggIntent::Cardinality { accuracy } => {
+        AggIntent::Cardinality { .. } => {
+            let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
             // HLL: registers ≈ (1.04/accuracy)^2, memory = registers
-            let registers = ((1.04 / accuracy).powi(2) as u64).next_power_of_two();
+            let registers = ((1.04 / acc).powi(2) as u64).next_power_of_two();
             registers.max(16)
         },
-        AggIntent::Frequency { accuracy } => {
+        AggIntent::Frequency { .. } => {
+            let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
             // CMS: width ≈ e/accuracy, depth ≈ 5, memory = width*depth*8
-            let width = (std::f64::consts::E / accuracy) as u64;
+            let width = (std::f64::consts::E / acc) as u64;
             width * 5 * 8
         },
-        AggIntent::Extrema { .. } => 16,
-        AggIntent::PerPartition { inner, keys } => {
-            let factor = 1u64 << keys.len().min(10);
-            estimated_sketch_memory_bytes(inner).saturating_mul(factor)
-        },
-        AggIntent::Exact(_) => 8,
+        // Legacy `Extrema { .. }` (now canonical Min / Max) — 16 bytes.
+        AggIntent::Min | AggIntent::Max => 16,
+        // Sum / Count / Avg / TopK / Rate / Increase / archive-only — no
+        // sketch state; preserve the legacy `Exact(_) → 8` mapping.
+        _ => 8,
     }
+}
+
+/// Memory estimate for a `PerPartitionWrap` — scales the inner-intent
+/// estimate by `2 ** keys.len()` (capped at 2**10), matching the legacy
+/// `PerPartition` formula.
+pub fn estimated_sketch_memory_per_partition(wrap: &PerPartitionWrap) -> u64 {
+    let factor = 1u64 << wrap.keys.len().min(10);
+    estimated_sketch_memory_bytes(&wrap.inner).saturating_mul(factor)
 }
 
 // ── SketchType + accuracy SLA → SketchParams (configurable defaults) ─────────
@@ -223,7 +258,8 @@ mod tests {
 
     #[test]
     fn op_quantile_yields_ddsketch_type_and_params() {
-        let op = AggIntent::Quantile { quantiles: vec![0.5], accuracy: 0.01 };
+        use crate::types_v2::AccuracyTarget;
+        let op = AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) };
         let (st, p) = sketch_type_and_params(&op);
         assert_eq!(st, SketchType::DDSketch);
         assert!(matches!(p, SketchParams::DDSketch { .. }));
@@ -231,40 +267,41 @@ mod tests {
 
     #[test]
     fn op_cardinality_yields_hll_type() {
-        let op = AggIntent::default_cardinality();
+        let op = crate::intent_algebra::legacy_expr::default_cardinality();
         assert_eq!(sketch_type_for_op(&op), SketchType::HLL);
     }
 
     #[test]
     fn op_frequency_yields_countsketch() {
-        let op = AggIntent::default_frequency();
+        let op = crate::intent_algebra::legacy_expr::default_frequency();
         assert_eq!(sketch_type_for_op(&op), SketchType::CountSketch);
     }
 
     #[test]
     fn per_partition_delegates_to_inner() {
-        let op = AggIntent::PerPartition {
-            inner: Box::new(AggIntent::default_cardinality()),
-            keys: vec!["k".into()],
+        let wrap = PerPartitionWrap {
+            inner: crate::intent_algebra::legacy_expr::default_cardinality(),
+            keys:  vec!["k".into()],
         };
-        assert_eq!(sketch_type_for_op(&op), SketchType::HLL);
+        assert_eq!(sketch_type_for_per_partition(&wrap), SketchType::HLL);
     }
 
     #[test]
     fn memory_quantile() {
-        let op = AggIntent::Quantile { quantiles: vec![0.5], accuracy: 0.01 };
+        use crate::types_v2::AccuracyTarget;
+        let op = AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) };
         assert_eq!(estimated_sketch_memory_bytes(&op), 4096);
     }
 
     #[test]
     fn memory_per_partition_scales_by_keys() {
-        let inner = AggIntent::default_cardinality();
+        let inner = crate::intent_algebra::legacy_expr::default_cardinality();
         let base_mem = estimated_sketch_memory_bytes(&inner);
-        let op = AggIntent::PerPartition {
-            inner: Box::new(inner),
-            keys: vec!["a".into(), "b".into()],
+        let wrap = PerPartitionWrap {
+            inner,
+            keys:  vec!["a".into(), "b".into()],
         };
-        assert_eq!(estimated_sketch_memory_bytes(&op), base_mem * 4);
+        assert_eq!(estimated_sketch_memory_per_partition(&wrap), base_mem * 4);
     }
 
     #[test]

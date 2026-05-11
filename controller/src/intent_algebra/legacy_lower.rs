@@ -132,6 +132,16 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
 }
 
 /// Try to lower a single `Aggregate` node to `SketchAgg`.
+///
+/// # Fan-out
+///
+/// Step α replaced the legacy `AggIntent` with the canonical single-φ form
+/// and dropped the `Extrema { min, max }` enum (split into `Min` / `Max`).
+/// The two multi-intent legacy `AggFunc`s — `StdDev` and `Variance`, which
+/// historically lowered to a `Quantile { quantiles: vec![0.25, 0.75] }` —
+/// now fan out into two sibling `SketchAgg` (or `WindowedAgg`) nodes
+/// wrapped in a `QueryExpr::Merge`. The F1 strategy lets every consumer
+/// keep matching single-intent `SketchAgg::op` patterns unchanged.
 fn lower_aggregate(
     keys:   Vec<String>,
     aggs:   Vec<AggItem>,
@@ -147,30 +157,44 @@ fn lower_aggregate(
             return QueryExpr::Aggregate { keys, aggs, having, input };
         }
 
-        if let Some(intent) = agg_func_to_intent(&agg.func) {
-            // If the input is a Window, fuse into WindowedAgg (the window
-            // defines the sketch lifecycle — flush/reset/merge semantics).
-            let sketch = if let QueryExpr::Window { duration, slide, input: win_input } = *input {
-                let window = WindowSpec {
-                    kind: match slide {
-                        Some(s) => WindowKind::Sliding { size: duration, slide: s },
-                        None    => WindowKind::Tumbling { size: duration },
-                    },
-                    time_col: None,
-                };
-                QueryExpr::WindowedAgg {
-                    agg:    intent,
-                    window,
-                    col:    agg.col.clone(),
-                    input:  win_input,
+        let intents = agg_func_to_intents(&agg.func);
+        if !intents.is_empty() {
+            // Build one SketchAgg / WindowedAgg per fanned-out intent. The
+            // input subtree is cloned for each sibling (Merge children own
+            // their own input) so the structure mirrors what a sketch
+            // physical planner would emit for a multi-intent aggregate.
+            let col = agg.col.clone();
+            let sketch_nodes: Vec<QueryExpr> = match *input {
+                QueryExpr::Window { duration, slide, input: ref win_input } => {
+                    let window = WindowSpec {
+                        kind: match slide {
+                            Some(s) => WindowKind::Sliding { size: duration, slide: s },
+                            None    => WindowKind::Tumbling { size: duration },
+                        },
+                        time_col: None,
+                    };
+                    intents.into_iter().map(|intent| QueryExpr::WindowedAgg {
+                        agg:    intent,
+                        window: window.clone(),
+                        col:    col.clone(),
+                        input:  win_input.clone(),
+                    }).collect()
                 }
-            } else {
-                QueryExpr::SketchAgg {
-                    op:    intent,
-                    col:   agg.col.clone(),
-                    input,
+                ref other => {
+                    let inp_boxed: Box<QueryExpr> = Box::new(other.clone());
+                    intents.into_iter().map(|intent| QueryExpr::SketchAgg {
+                        op:    intent,
+                        col:   col.clone(),
+                        input: inp_boxed.clone(),
+                    }).collect()
                 }
             };
+            let sketch = if sketch_nodes.len() == 1 {
+                sketch_nodes.into_iter().next().unwrap()
+            } else {
+                QueryExpr::Merge { inputs: sketch_nodes }
+            };
+
             if keys.is_empty() {
                 return sketch;
             } else {
@@ -186,31 +210,37 @@ fn lower_aggregate(
     QueryExpr::Aggregate { keys, aggs, having, input }
 }
 
-/// Map an [`AggFunc`] to an [`AggIntent`] for sketch execution.
-fn agg_func_to_intent(func: &AggFunc) -> Option<AggIntent> {
+/// Map an [`AggFunc`] to the canonical [`AggIntent`]s needed for sketch
+/// execution. Returns an empty vec for non-sketchable functions
+/// (`Custom`), one intent for single-statistic functions, and N intents
+/// for the StdDev / Variance fan-out (Step α F1 strategy: callers wrap
+/// the resulting list in a `QueryExpr::Merge` of sibling SketchAggs).
+fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
+    use crate::intent_algebra::legacy_expr::{
+        default_cardinality, default_frequency, default_quantile,
+    };
+    use crate::types_v2::AccuracyTarget;
     match func {
-        AggFunc::Quantile(phi) => Some(AggIntent::default_quantile(vec![*phi])),
-        AggFunc::CountDistinct => Some(AggIntent::default_cardinality()),
-        AggFunc::HeavyHitters { .. } => Some(AggIntent::default_frequency()),
-        AggFunc::Count => Some(AggIntent::default_frequency()),
-        AggFunc::Avg => Some(AggIntent::Quantile {
-            quantiles: vec![0.5],
-            accuracy:  0.01,
-        }),
-        AggFunc::Min => Some(AggIntent::Extrema { min: true, max: false }),
-        AggFunc::Max => Some(AggIntent::Extrema { min: false, max: true }),
-        AggFunc::StdDev { .. } => Some(AggIntent::Quantile {
-            quantiles: vec![0.25, 0.75],
-            accuracy:  0.01,
-        }),
-        AggFunc::Variance { .. } => Some(AggIntent::Quantile {
-            quantiles: vec![0.25, 0.75],
-            accuracy:  0.01,
-        }),
+        AggFunc::Quantile(phi) => vec![default_quantile(*phi)],
+        AggFunc::CountDistinct => vec![default_cardinality()],
+        AggFunc::HeavyHitters { .. } => vec![default_frequency()],
+        AggFunc::Count => vec![default_frequency()],
+        AggFunc::Avg => vec![AggIntent::Quantile {
+            q: 0.5,
+            accuracy: AccuracyTarget::Epsilon(0.01),
+        }],
+        AggFunc::Min => vec![AggIntent::Min],
+        AggFunc::Max => vec![AggIntent::Max],
+        // StdDev / Variance: legacy carried two quantiles in a single
+        // Quantile intent; Step α F1 fans them out into two siblings.
+        AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![
+            AggIntent::Quantile { q: 0.25, accuracy: AccuracyTarget::Epsilon(0.01) },
+            AggIntent::Quantile { q: 0.75, accuracy: AccuracyTarget::Epsilon(0.01) },
+        ],
         AggFunc::Sum | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
-            Some(AggIntent::Exact(ExactAgg::Sum))
+            vec![AggIntent::Sum]
         }
-        AggFunc::Custom(_) => None,
+        AggFunc::Custom(_) => vec![],
     }
 }
 
@@ -290,10 +320,10 @@ mod tests {
     }
 
     #[test]
-    fn sum_lowered_to_exact() {
+    fn sum_lowered_to_sum() {
         let expr = make_agg(AggFunc::Sum, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
-        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Exact(ExactAgg::Sum), .. }));
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
     }
 
     #[test]
@@ -301,36 +331,45 @@ mod tests {
         let expr = make_agg(AggFunc::Avg, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
         match &lowered {
-            QueryExpr::SketchAgg { op: AggIntent::Quantile { quantiles, .. }, .. } => {
-                assert_eq!(quantiles, &[0.5]);
+            QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => {
+                assert!((*q - 0.5).abs() < 1e-9);
             }
             other => panic!("expected SketchAgg(Quantile), got {other:?}"),
         }
     }
 
     #[test]
-    fn min_lowered_to_extrema() {
+    fn min_lowered_to_min() {
         let expr = make_agg(AggFunc::Min, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
-        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Extrema { min: true, max: false }, .. }));
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Min, .. }));
     }
 
     #[test]
-    fn max_lowered_to_extrema() {
+    fn max_lowered_to_max() {
         let expr = make_agg(AggFunc::Max, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
-        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Extrema { min: false, max: true }, .. }));
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Max, .. }));
     }
 
     #[test]
-    fn stddev_lowered_to_iqr_quantile() {
+    fn stddev_fans_out_to_merge_of_quantile_siblings() {
+        // StdDev / Variance historically carried two quantiles in a
+        // single legacy intent; Step α's F1 fan-out emits a Merge of two
+        // single-φ SketchAgg siblings.
         let expr = make_agg(AggFunc::StdDev { population: false }, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
         match &lowered {
-            QueryExpr::SketchAgg { op: AggIntent::Quantile { quantiles, .. }, .. } => {
-                assert!(quantiles.contains(&0.25) && quantiles.contains(&0.75));
+            QueryExpr::Merge { inputs } => {
+                assert_eq!(inputs.len(), 2);
+                let mut qs: Vec<f64> = inputs.iter().filter_map(|node| match node {
+                    QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => Some(*q),
+                    _ => None,
+                }).collect();
+                qs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                assert_eq!(qs, vec![0.25, 0.75]);
             }
-            other => panic!("expected SketchAgg(Quantile), got {other:?}"),
+            other => panic!("expected Merge of two SketchAgg, got {other:?}"),
         }
     }
 
@@ -446,7 +485,7 @@ mod tests {
         let lowered = lower_to_sketch_algebra(expr);
         match &lowered {
             QueryExpr::BinaryOp { lhs, rhs, .. } => {
-                assert!(matches!(lhs.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Exact(_), .. }));
+                assert!(matches!(lhs.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
                 assert!(matches!(rhs.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Cardinality { .. }, .. }));
             }
             other => panic!("expected BinaryOp, got {other:?}"),
@@ -491,16 +530,16 @@ mod tests {
     }
 
     #[test]
-    fn rate_lowered_to_exact_sum() {
+    fn rate_lowered_to_sum() {
         let expr = make_agg(AggFunc::Rate, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
-        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Exact(ExactAgg::Sum), .. }));
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
     }
 
     #[test]
-    fn delta_lowered_to_exact_sum() {
+    fn delta_lowered_to_sum() {
         let expr = make_agg(AggFunc::Delta, src("m"));
         let lowered = lower_to_sketch_algebra(expr);
-        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Exact(ExactAgg::Sum), .. }));
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
     }
 }

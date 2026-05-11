@@ -26,6 +26,61 @@
 use std::time::Duration;
 
 use crate::types::AggType;
+use crate::types_v2::AccuracyTarget;
+
+// ── AggIntent harmonization (Step α of legacy_expr migration) ────────────────
+//
+// The legacy `AggIntent` / `ExactAgg` enums that historically lived here have
+// been deleted in favor of the canonical `intent_algebra::agg_intent::AggIntent`
+// vocabulary. The translation table is documented in the migration spec; in
+// short:
+//
+//   Legacy Quantile { quantiles, accuracy }  → fan-out into multiple
+//                                              canonical Quantile { q, accuracy }
+//                                              siblings (callers wrap them
+//                                              in a Merge node).
+//   Legacy Cardinality { accuracy: f64 }    → canonical Cardinality
+//                                              { accuracy: AccuracyTarget }
+//   Legacy Frequency  { accuracy: f64 }     → canonical Frequency
+//                                              { accuracy: AccuracyTarget }
+//   Legacy Extrema { min: true, max: false } → canonical Min
+//   Legacy Extrema { min: false, max: true } → canonical Max
+//   Legacy Extrema { min: true, max: true }  → fan-out into Min + Max siblings.
+//   Legacy Extrema { min: false, max: false } → translation error.
+//   Legacy Exact(Sum)   → canonical Sum
+//   Legacy Exact(Count) → canonical Count { accuracy: AccuracyTarget::Exact }
+//   Legacy Exact(Avg)   → canonical Avg
+//   Legacy Exact(Min)   → canonical Min
+//   Legacy Exact(Max)   → canonical Max
+//   Legacy PerPartition { inner, keys } → recurse on inner, then wrap in the
+//                                          `PerPartitionWrap` shape below.
+//                                          (PerPartition structural collapse
+//                                          to `Aggregate { by, aggs }` is
+//                                          Step γ's job.)
+//
+// `SketchAgg.op` / `WindowedAgg.agg` carry canonical `AggIntent` directly;
+// PerPartition semantics ride on `PerPartitionWrap` (a thin legacy-only
+// wrapper consumed by the four sites that still build it). Free helpers
+// (`agg_to_legacy_agg_type`, `agg_is_mergeable`, etc.) mirror what the old
+// `AggIntent::method()` API used to provide so the migration is a typed
+// search-and-replace rather than a semantic rewrite.
+
+/// Canonical L3 aggregation intent. Re-exported here so existing
+/// `legacy_expr::AggIntent` references keep working — the type is now the
+/// single canonical [`crate::intent_algebra::agg_intent::AggIntent`].
+pub use crate::intent_algebra::agg_intent::AggIntent;
+
+/// Per-partition wrapper that historically lived on the legacy `AggIntent`
+/// enum as a `PerPartition { inner, keys }` variant. Canonical L3 represents
+/// this shape via `QueryExpr::Aggregate { by: keys, aggs: [inner] }`, but
+/// the legacy carriers (`SketchAgg` / `WindowedAgg`) still need an inline
+/// place for `keys` until Step γ collapses them. This wrapper sits exactly
+/// where the variant used to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerPartitionWrap {
+    pub inner: AggIntent,
+    pub keys:  Vec<String>,
+}
 
 // ── Shared sketch / predicate types ───────────────────────────────────────────
 
@@ -76,102 +131,125 @@ pub enum ColumnRef {
     Wildcard,
 }
 
-/// Layer 3 — Sketch logical plan aggregation intent.
-/// Describes WHAT to compute, not HOW (no sketch implementation names).
-#[derive(Debug, Clone, PartialEq)]
-pub enum AggIntent {
-    /// Quantile estimation (DDSketch, KLL, t-digest, etc. at physical layer).
-    Quantile { quantiles: Vec<f64>, accuracy: f64 },
+// ── AggIntent helpers ────────────────────────────────────────────────────────
+//
+// These free functions replace the legacy `AggIntent::method()` API. They
+// operate on the canonical re-exported `AggIntent` and preserve the old
+// semantics one-to-one. After Step γ moves consumers onto the canonical
+// surface they can switch to canonical `impl AggIntent` methods or new
+// L4-bound accessors; for now this is the minimal-churn shim.
 
-    /// Cardinality / distinct count (HLL, UnivMon, etc. at physical layer).
-    Cardinality { accuracy: f64 },
-
-    /// Frequency estimation / heavy-hitters (CountSketch, CountMinSketch, etc.).
-    Frequency { accuracy: f64 },
-
-    /// Min/max extrema.
-    Extrema { min: bool, max: bool },
-
-    /// Per-partition wrapper: "run inner intent once per distinct key tuple".
-    PerPartition {
-        inner: Box<AggIntent>,
-        keys:  Vec<String>,
-    },
-
-    /// Exact passthrough — no sketch benefit (SUM, global COUNT, AVG, etc.).
-    Exact(ExactAgg),
+/// Map a canonical [`AggIntent`] to the coarse [`AggType`] used by the
+/// legacy planner. Preserves the old `AggIntent::to_agg_type()` semantics:
+/// quantile / extrema / exact all collapse onto `AggType::Quantile`,
+/// `Cardinality` → `AggType::Cardinality`, `Frequency` → `AggType::Frequency`.
+pub fn agg_to_legacy_agg_type(op: &AggIntent) -> AggType {
+    match op {
+        AggIntent::Cardinality { .. } => AggType::Cardinality,
+        AggIntent::Frequency { .. } => AggType::Frequency,
+        // Quantile / Min / Max / Sum / Count / Avg / TopK / Rate / Increase
+        // all rode the legacy "Quantile" bucket in the AggType taxonomy.
+        _ => AggType::Quantile,
+    }
 }
 
-/// Exact (non-sketch) aggregation kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExactAgg {
-    Count,
-    Sum,
-    /// **Not mergeable** — carries `(sum, count)` in distributed contexts.
-    Avg,
-    Min,
-    Max,
+/// Two instances of this sketch can be merged
+/// (`sketch(A ∪ B) = merge(sketch(A), sketch(B))`). Preserves the old
+/// `AggIntent::is_mergeable()` rule: Avg is the only non-mergeable case.
+pub fn agg_is_mergeable(op: &AggIntent) -> bool {
+    !matches!(op, AggIntent::Avg)
 }
 
-impl AggIntent {
-    /// Returns `true` when two instances of this sketch can be merged
-    /// (i.e., `sketch(A ∪ B) = merge(sketch(A), sketch(B))`).
-    pub fn is_mergeable(&self) -> bool {
-        match self {
-            AggIntent::Exact(ExactAgg::Avg) => false,
-            AggIntent::PerPartition { inner, .. } => inner.is_mergeable(),
-            _ => true,
-        }
+/// Quantile φ values carried by a `Quantile` intent (empty for non-quantile).
+/// Canonical `AggIntent::Quantile` is single-φ post Step α (fan-out happens
+/// at construction time); this returns a single-element vec.
+pub fn agg_quantiles(op: &AggIntent) -> Vec<f64> {
+    match op {
+        AggIntent::Quantile { q, .. } => vec![*q],
+        _ => vec![],
     }
+}
 
-    /// Map to the coarse [`AggType`] used by the legacy planner.
-    pub fn to_agg_type(&self) -> AggType {
-        match self {
-            AggIntent::Cardinality { .. } => AggType::Cardinality,
-            AggIntent::Frequency { .. } => AggType::Frequency,
-            AggIntent::Quantile { .. } | AggIntent::Extrema { .. } => AggType::Quantile,
-            AggIntent::PerPartition { inner, .. } => inner.to_agg_type(),
-            AggIntent::Exact(_) => AggType::Quantile,
-        }
-    }
+/// Whether this op implies `exact_required` (no sketch benefit). Preserves
+/// the legacy `AggIntent::is_exact()` rule: the legacy `Exact(_)` and
+/// `Extrema { .. }` cases now map to canonical `Sum / Count / Avg / Min /
+/// Max` — those are the cases that flip this flag.
+pub fn agg_is_exact(op: &AggIntent) -> bool {
+    matches!(
+        op,
+        AggIntent::Sum
+            | AggIntent::Count { .. }
+            | AggIntent::Avg
+            | AggIntent::Min
+            | AggIntent::Max
+    )
+}
 
-    /// Extract quantile φ values for Quantile operators.
-    pub fn quantiles(&self) -> Vec<f64> {
-        match self {
-            AggIntent::Quantile { quantiles, .. } => quantiles.clone(),
-            AggIntent::PerPartition { inner, .. } => inner.quantiles(),
-            _ => vec![],
-        }
+/// Accuracy parameter as a fractional ε (0.0 for exact ops). Preserves the
+/// legacy `AggIntent::accuracy() -> f64` accessor by unpacking the typed
+/// `AccuracyTarget` carried on canonical Quantile / Cardinality / Frequency
+/// / Count / TopK.
+pub fn agg_accuracy(op: &AggIntent) -> f64 {
+    match op {
+        AggIntent::Quantile { accuracy, .. }
+        | AggIntent::Cardinality { accuracy }
+        | AggIntent::Frequency { accuracy }
+        | AggIntent::Count { accuracy }
+        | AggIntent::TopK { accuracy, .. } => accuracy_target_to_f64(accuracy),
+        _ => 0.0,
     }
+}
 
-    /// Whether this op implies `exact_required` (no sketch benefit).
-    pub fn is_exact(&self) -> bool {
-        matches!(self, AggIntent::Exact(_) | AggIntent::Extrema { .. })
+fn accuracy_target_to_f64(t: &AccuracyTarget) -> f64 {
+    match t {
+        AccuracyTarget::Exact => 0.0,
+        AccuracyTarget::Epsilon(eps) | AccuracyTarget::EpsilonDelta { eps, .. } => *eps,
     }
+}
 
-    /// Accuracy parameter (0.0 for exact ops).
-    pub fn accuracy(&self) -> f64 {
-        match self {
-            AggIntent::Quantile { accuracy, .. }
-            | AggIntent::Cardinality { accuracy, .. }
-            | AggIntent::Frequency { accuracy, .. } => *accuracy,
-            AggIntent::PerPartition { inner, .. } => inner.accuracy(),
-            _ => 0.0,
-        }
+/// Translate a legacy `accuracy: f64` field into the typed
+/// `AccuracyTarget`. `0.0` round-trips to `Exact` (matching the old "0.0
+/// → exact" sentinel); anything else becomes `Epsilon(eps)`.
+pub fn accuracy_target_from_legacy(accuracy: f64) -> AccuracyTarget {
+    if accuracy == 0.0 {
+        AccuracyTarget::Exact
+    } else {
+        AccuracyTarget::Epsilon(accuracy)
     }
+}
 
-    // ── Default constructors (backward compat) ──────────────────────────────
+// ── Default constructors (backward compat) ───────────────────────────────────
+//
+// These mirror the old `AggIntent::default_*` constructors. After Step γ
+// the call sites that still need defaults migrate to canonical L4-aware
+// builders (sketch_algebra::params + AccuracyTarget on the L3 intent).
 
-    pub fn default_frequency() -> Self {
-        AggIntent::Frequency { accuracy: std::f64::consts::E / 2000.0 }
+/// Default Frequency intent — `accuracy = e / 2000`, matching the legacy
+/// `AggIntent::default_frequency` constant.
+pub fn default_frequency() -> AggIntent {
+    AggIntent::Frequency {
+        accuracy: AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0),
     }
-    pub fn default_cardinality() -> Self {
-        AggIntent::Cardinality { accuracy: hll_accuracy(14) }
-    }
-    pub fn default_quantile(quantiles: Vec<f64>) -> Self {
-        AggIntent::Quantile { quantiles, accuracy: 0.01 }
-    }
+}
 
+/// Default Cardinality intent — `accuracy = hll_accuracy(14)`, matching the
+/// legacy `AggIntent::default_cardinality` constant.
+pub fn default_cardinality() -> AggIntent {
+    AggIntent::Cardinality {
+        accuracy: AccuracyTarget::Epsilon(hll_accuracy(14)),
+    }
+}
+
+/// Default Quantile intent. Canonical Quantile is single-φ; callers that
+/// historically passed `vec![0.5, 0.99]` to `AggIntent::default_quantile`
+/// now invoke this helper once per φ and wrap the results in a
+/// `QueryExpr::Merge` of `SketchAgg` siblings (F1 fan-out per the Step α
+/// translation spec).
+pub fn default_quantile(q: f64) -> AggIntent {
+    AggIntent::Quantile {
+        q,
+        accuracy: AccuracyTarget::Epsilon(0.01),
+    }
 }
 
 // ── Accuracy helpers ─────────────────────────────────────────────────────────
@@ -565,16 +643,21 @@ impl AggFunc {
     }
 
     /// Suggest the appropriate [`AggIntent`] for this function, if any.
+    ///
+    /// Canonical Quantile is single-φ post Step α; this helper returns one
+    /// canonical intent. Callers that need multi-φ behaviour build the
+    /// merge fan-out themselves (cf. the construction sites in
+    /// `legacy_lower::agg_func_to_intent`).
     pub fn to_sketch_op(&self) -> Option<AggIntent> {
         match self {
-            AggFunc::Quantile(phi) => Some(AggIntent::default_quantile(vec![*phi])),
-            AggFunc::CountDistinct => Some(AggIntent::default_cardinality()),
-            AggFunc::HeavyHitters { .. } => Some(AggIntent::default_frequency()),
-            AggFunc::Count   => Some(AggIntent::Exact(ExactAgg::Count)),
-            AggFunc::Sum     => Some(AggIntent::Exact(ExactAgg::Sum)),
-            AggFunc::Avg     => Some(AggIntent::Exact(ExactAgg::Avg)),
-            AggFunc::Min     => Some(AggIntent::Extrema { min: true,  max: false }),
-            AggFunc::Max     => Some(AggIntent::Extrema { min: false, max: true  }),
+            AggFunc::Quantile(phi) => Some(default_quantile(*phi)),
+            AggFunc::CountDistinct => Some(default_cardinality()),
+            AggFunc::HeavyHitters { .. } => Some(default_frequency()),
+            AggFunc::Count   => Some(AggIntent::Count { accuracy: AccuracyTarget::Exact }),
+            AggFunc::Sum     => Some(AggIntent::Sum),
+            AggFunc::Avg     => Some(AggIntent::Avg),
+            AggFunc::Min     => Some(AggIntent::Min),
+            AggFunc::Max     => Some(AggIntent::Max),
             _                => None,
         }
     }
@@ -874,7 +957,7 @@ mod tests {
     #[test]
     fn has_sketch_work_true_when_ddsketch_present() {
         let qe = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.5]),
+            op:    default_quantile(0.5),
             col:   ColumnRef::SampleValue,
             input: Box::new(src("m")),
         };
@@ -985,7 +1068,7 @@ mod tests {
                     duration: Duration::from_secs(300),
                     slide:    None,
                     input:    Box::new(QueryExpr::SketchAgg {
-                        op:    AggIntent::default_frequency(),
+                        op:    default_frequency(),
                         col:   ColumnRef::Wildcard,
                         input: Box::new(src("price")),
                     }),
@@ -1045,26 +1128,22 @@ mod tests {
 
     #[test]
     fn agg_intent_cardinality_is_mergeable() {
-        assert!(AggIntent::default_cardinality().is_mergeable());
+        assert!(agg_is_mergeable(&default_cardinality()));
     }
 
     #[test]
-    fn agg_intent_exact_avg_not_mergeable() {
-        assert!(!AggIntent::Exact(ExactAgg::Avg).is_mergeable());
+    fn agg_intent_avg_not_mergeable() {
+        assert!(!agg_is_mergeable(&AggIntent::Avg));
     }
 
     #[test]
-    fn agg_intent_per_partition_mergeability_from_inner() {
-        let pp_card = AggIntent::PerPartition {
-            inner: Box::new(AggIntent::default_cardinality()),
+    fn per_partition_wrap_carries_inner_and_keys() {
+        let wrap = PerPartitionWrap {
+            inner: default_cardinality(),
             keys:  vec!["region".into()],
         };
-        assert!(pp_card.is_mergeable());
-        let pp_avg = AggIntent::PerPartition {
-            inner: Box::new(AggIntent::Exact(ExactAgg::Avg)),
-            keys:  vec!["region".into()],
-        };
-        assert!(!pp_avg.is_mergeable());
+        assert_eq!(wrap.keys, vec!["region".to_string()]);
+        assert!(agg_is_mergeable(&wrap.inner));
     }
 
     #[test]
@@ -1075,18 +1154,19 @@ mod tests {
     }
 
     #[test]
-    fn agg_intent_to_agg_type() {
+    fn agg_intent_to_legacy_agg_type() {
         use crate::types::AggType;
-        assert_eq!(AggIntent::default_cardinality().to_agg_type(), AggType::Cardinality);
-        assert_eq!(AggIntent::default_frequency().to_agg_type(),   AggType::Frequency);
-        assert_eq!(AggIntent::default_quantile(vec![0.5]).to_agg_type(), AggType::Quantile);
+        assert_eq!(agg_to_legacy_agg_type(&default_cardinality()), AggType::Cardinality);
+        assert_eq!(agg_to_legacy_agg_type(&default_frequency()),   AggType::Frequency);
+        assert_eq!(agg_to_legacy_agg_type(&default_quantile(0.5)), AggType::Quantile);
     }
 
     #[test]
     fn agg_intent_is_exact() {
-        assert!(AggIntent::Exact(ExactAgg::Sum).is_exact());
-        assert!(AggIntent::Extrema { min: true, max: false }.is_exact());
-        assert!(!AggIntent::default_cardinality().is_exact());
+        assert!(agg_is_exact(&AggIntent::Sum));
+        assert!(agg_is_exact(&AggIntent::Min));
+        assert!(agg_is_exact(&AggIntent::Max));
+        assert!(!agg_is_exact(&default_cardinality()));
     }
 
 }

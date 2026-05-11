@@ -295,6 +295,12 @@ impl QeCollector {
     }
 
     fn collect_op(&mut self, op: &AggIntent) {
+        // Canonical Quantile is single-φ post Step α (multi-φ legacy
+        // intents fan out into sibling SketchAggs at construction time —
+        // each one routes through this collector independently). The
+        // legacy `Extrema { min, max }` enum split into `Min` / `Max`
+        // canonical variants; map each to the corresponding boundary
+        // quantile for legacy compat.
         match op {
             AggIntent::Cardinality { .. } => {
                 if !self.agg_types.contains(&AggType::Cardinality) {
@@ -306,24 +312,28 @@ impl QeCollector {
                     self.agg_types.push(AggType::Frequency);
                 }
             }
-            AggIntent::Quantile { quantiles, .. } => {
+            AggIntent::Quantile { q, .. } => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
-                for &q in quantiles {
-                    if !self.quantiles.contains(&q) { self.quantiles.push(q); }
-                }
+                if !self.quantiles.contains(q) { self.quantiles.push(*q); }
             }
-            AggIntent::Extrema { min, max } => {
+            AggIntent::Min => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
-                // Extrema map to boundary quantiles for legacy compat.
-                if *min && !self.quantiles.contains(&0.0) { self.quantiles.push(0.0); }
-                if *max && !self.quantiles.contains(&1.0) { self.quantiles.push(1.0); }
+                if !self.quantiles.contains(&0.0) { self.quantiles.push(0.0); }
             }
-            AggIntent::Exact(_) => { self.exact_required = true; }
-            AggIntent::PerPartition { inner, .. } => self.collect_op(inner),
+            AggIntent::Max => {
+                if !self.agg_types.contains(&AggType::Quantile) {
+                    self.agg_types.push(AggType::Quantile);
+                }
+                if !self.quantiles.contains(&1.0) { self.quantiles.push(1.0); }
+            }
+            // Sum / Count / Avg / TopK / Rate / Increase / archive-only —
+            // all flip the exact_required flag (no sketch benefit at the
+            // legacy planner's level).
+            _ => { self.exact_required = true; }
         }
     }
 
