@@ -11,13 +11,18 @@
 //! Within-query CTE / let-binding fan-in *is* expressible here via
 //! [`QueryExpr::LetBinding`] + [`QueryExpr::Ref`].
 //!
-//! Variant set (Phase B subset): `Scan`, `Window`, `Aggregate`,
-//! `LetBinding`, `Ref`. The full design.md list is larger (`Filter`,
-//! `Project`, `Partition`, `Distinct`, `Merge`, `Join`, `SetOp`, `Sort`,
-//! `Limit`, `Subquery`, `WindowFunc`, `BinaryOp`); they are deferred to
-//! follow-up phases as the planner grows consumers for them. The shape
-//! defined here is forward-compatible — adding more variants is purely
-//! additive.
+//! Variant set. Phase B shipped `Scan`, `Window`, `Aggregate`,
+//! `LetBinding`, `Ref`. Batch 2 of the legacy_expr migration adds the ten
+//! "A-classified" structurally-canonical variants from `design.md` §6:
+//! `Filter`, `Project`, `Partition`, `Distinct`, `Merge`, `Join`,
+//! `SetOp`, `Sort`, `Limit`, `BinaryOp`. The remaining design.md nodes
+//! (`Subquery`, `WindowFunc`) are deferred to follow-up phases as the
+//! planner grows consumers for them. The shape defined here is forward-
+//! compatible — adding more variants is purely additive.
+//!
+//! Single-input variants here use `child:` (matching the existing
+//! `Window`, `Aggregate`, `LetBinding` shape). Legacy `input:` survives in
+//! `legacy_expr::QueryExpr` until its consumers redirect through here.
 
 #![allow(dead_code)]
 
@@ -48,6 +53,14 @@ pub enum QueryExprError {
     /// `design.md` §6 schema-flow table.
     #[error("Window requires a time_index on input schema")]
     WindowMissingTimeIndex,
+    /// `Merge` requires at least one child to derive its output schema.
+    #[error("Merge requires at least one child")]
+    EmptyMerge,
+    /// A legacy `ScalarExpr` variant has no canonical `Predicate` counterpart
+    /// yet. Surfaces from [`from_legacy_scalar`] for the deferred E-variants
+    /// (`FunctionCall` / `ScalarSubquery` / `InList` / `Between`).
+    #[error("legacy ScalarExpr variant `{0}` is not yet representable in canonical Predicate")]
+    UnsupportedLegacyScalar(&'static str),
 }
 
 /// Streaming / time-window kind. PromQL `[5m]` is `Sliding`; SQL `TUMBLE`
@@ -99,6 +112,211 @@ pub struct LabelFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HavingPredicate(pub String);
 
+// ── Supporting types lifted from legacy_expr ─────────────────────────────────
+//
+// Per Batch 2 of the legacy_expr migration: these are structural copies of
+// the legacy supporting enums so the canonical [`QueryExpr`] variants below
+// can reference them without rooting the canonical IR in `legacy_expr`.
+// Field shapes mirror `design.md` §6.
+
+/// Which column / field a sketch / projection / DISTINCT operation targets.
+/// Survives at L3 as a name-keyed alias (design.md §6.1) even though
+/// canonical schema uses positional [`ColumnId`] — intents like
+/// `AggIntent::TopK { by: Vec<ColumnRef> }` consume it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnRef {
+    /// Explicit column name (SQL: `AVG(price)` → `Named("price")`).
+    Named(String),
+    /// The implicit metric sample value (PromQL — always the series value).
+    SampleValue,
+    /// All rows / COUNT(*).
+    Wildcard,
+}
+
+/// Partition-key spec — `by (k1, k2, …)` or `without (k1, k2, …)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionKeys {
+    /// `by (k1, k2, ...)` — explicit key list.
+    By(Vec<String>),
+    /// `without (k1, k2, ...)` — complement; resolved against schema at plan time.
+    Without(Vec<String>),
+}
+
+impl PartitionKeys {
+    pub fn keys(&self) -> &[String] {
+        match self {
+            PartitionKeys::By(k) | PartitionKeys::Without(k) => k,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys().is_empty()
+    }
+}
+
+/// Binary operator kinds — used in both [`Predicate::BinaryOp`] (scalar
+/// composition) and [`QueryExpr::BinaryOp`] (PromQL instant-vector
+/// arithmetic between two relational sub-expressions).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryOpKind {
+    // Arithmetic
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    // Comparison
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    // Logical
+    And,
+    Or,
+    // Bitwise
+    BitAnd,
+    BitOr,
+    BitXor,
+    // String / pattern
+    Concat,
+    Like,
+    NotLike,
+    Regex,
+    NotRegex,
+    // PromQL-specific
+    Unless,
+    Atan2,
+}
+
+/// JOIN variant. design.md §6 lists Inner / LeftOuter / RightOuter /
+/// FullOuter / Cross / Semi / AntiSemi.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JoinKind {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+    Cross,
+    /// Semi-join: return only left rows that have a match (WHERE EXISTS).
+    Semi,
+    /// Anti-join: return only left rows that have no match (WHERE NOT EXISTS).
+    AntiSemi,
+}
+
+/// Set-operation variant — UNION / INTERSECT / EXCEPT.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// ORDER BY sort key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SortKey {
+    pub col: String,
+    pub desc: bool,
+    /// NULLS FIRST / NULLS LAST (None → database default).
+    #[serde(default)]
+    pub nulls_first: Option<bool>,
+}
+
+/// PromQL vector matching semantics (`on (…)` / `ignoring (…)` plus
+/// `group_left` / `group_right`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorMatch {
+    pub kind: VectorMatchKind,
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub grouping: Option<VectorGrouping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorMatchKind {
+    On,
+    Ignoring,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorGrouping {
+    pub side: GroupSide,
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupSide {
+    Left,
+    Right,
+}
+
+/// Scalar literal value. Subset of values used by the canonical
+/// [`Predicate`] — extended literal kinds (durations, intervals) stay in
+/// `legacy_expr::LiteralValue` until the E-variants migrate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiteralValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/// One item in a SELECT projection list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectItem {
+    /// Output column name (SQL `AS alias`; None → use expression name).
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Projected expression. Modeled as a [`Predicate`] for the four
+    /// covered scalar shapes (column / literal / binary op / is-null);
+    /// the legacy E-variants (`FunctionCall`, `ScalarSubquery`, `InList`,
+    /// `Between`) stay in `legacy_expr::ScalarExpr` and live in
+    /// [`ProjectItem::raw_expr`] until they migrate.
+    pub expr: Predicate,
+}
+
+// ── Typed Predicate ──────────────────────────────────────────────────────────
+
+/// Minimal typed scalar predicate. Covers the four
+/// `legacy_expr::ScalarExpr` variants that have a structurally clean canonical
+/// shape: column / literal / binary-op / is-null. The deferred E-variants
+/// (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) remain in
+/// `legacy_expr::ScalarExpr` until their own migration batch — they require
+/// either a typed scalar function catalog (FunctionCall) or recursive
+/// `QueryExpr` (ScalarSubquery) which is out of scope for Batch 2.
+///
+/// See [`from_legacy_scalar`] for the migration helper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Predicate {
+    /// Column reference (by name).
+    Column(ColumnRef),
+    /// Constant literal.
+    Literal(LiteralValue),
+    /// Binary operator (=, !=, <, <=, >, >=, AND, OR, …).
+    BinaryOp {
+        op: BinaryOpKind,
+        lhs: Box<Predicate>,
+        rhs: Box<Predicate>,
+    },
+    /// IS NULL / IS NOT NULL.
+    IsNull {
+        expr: Box<Predicate>,
+        negated: bool,
+    },
+}
+
 /// L3 algebra node. See module doc for the variant subset rationale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "node", rename_all = "snake_case")]
@@ -143,6 +361,93 @@ pub enum QueryExpr {
     /// schema = the named binding's expression's output schema.
     Ref {
         name: BindingName,
+    },
+
+    // ── A-classified variants lifted in Batch 2 of the legacy_expr migration ──
+    //
+    // Each is a structural copy of the legacy variant of the same name in
+    // `legacy_expr::QueryExpr`. Single-input variants here use `child:` to
+    // match the existing canonical `Window`/`Aggregate`/`LetBinding` shape,
+    // whereas legacy spells them `input:`. Consumers that haven't migrated
+    // yet keep using `legacy_expr::QueryExpr::*` — the legacy variants stay
+    // in place until the consumer-side redirect lands in subsequent batches.
+
+    /// σ — row-level filter (WHERE / PromQL label matchers). Uses the new
+    /// typed [`Predicate`] (only Column / Literal / BinaryOp / IsNull at L3
+    /// for now; `FunctionCall` / `ScalarSubquery` / `InList` / `Between`
+    /// stay in `legacy_expr::ScalarExpr` until their own batch).
+    Filter {
+        pred: Predicate,
+        child: Box<QueryExpr>,
+    },
+
+    /// π — column projection (SELECT list).
+    Project {
+        cols: Vec<ProjectItem>,
+        child: Box<QueryExpr>,
+    },
+
+    /// Partition the stream by key tuple (`GROUP BY` / PromQL `by (dims)`).
+    /// Logical-only marker — carries a sharding hint for L5's stage allocator.
+    Partition {
+        keys: PartitionKeys,
+        child: Box<QueryExpr>,
+    },
+
+    /// δ — SQL `DISTINCT` / row deduplication on `cols`.
+    Distinct {
+        cols: Vec<ColumnRef>,
+        child: Box<QueryExpr>,
+    },
+
+    /// ⊕ — union of sub-results from independent stages or shards (the
+    /// exact-merge case). Sketch unions live in `SketchExpr`, not here.
+    Merge {
+        children: Vec<QueryExpr>,
+    },
+
+    /// Logical join. L4 picks the physical alternative
+    /// (`HashJoin` / `SortMergeJoin` / `SketchJoin`).
+    Join {
+        kind: JoinKind,
+        pred: Predicate,
+        left: Box<QueryExpr>,
+        right: Box<QueryExpr>,
+    },
+
+    /// UNION / INTERSECT / EXCEPT, with or without ALL.
+    SetOp {
+        kind: SetOpKind,
+        all: bool,
+        left: Box<QueryExpr>,
+        right: Box<QueryExpr>,
+    },
+
+    /// Generic ORDER BY — survives L3 for non-heavy-hitter cases
+    /// (`ORDER BY name LIMIT 10`, `ORDER BY ts DESC LIMIT 1`). The heavy-
+    /// hitter shape (`ORDER BY count DESC LIMIT k`, PromQL `topk(k, …)`)
+    /// produces [`AggIntent::TopK`] rather than `Sort + Limit`.
+    Sort {
+        keys: Vec<SortKey>,
+        child: Box<QueryExpr>,
+    },
+
+    /// `LIMIT n OFFSET k`. Generic case only — see `Sort`'s doc-comment.
+    Limit {
+        n: usize,
+        offset: usize,
+        child: Box<QueryExpr>,
+    },
+
+    /// Arithmetic / comparison / boolean composition between two relational
+    /// sub-expressions (PromQL `+`, `/`, `and`, `or`, `unless`; SQL boolean
+    /// composition between sub-relations).
+    BinaryOp {
+        op: BinaryOpKind,
+        lhs: Box<QueryExpr>,
+        rhs: Box<QueryExpr>,
+        #[serde(default)]
+        vector_match: Option<VectorMatch>,
     },
 }
 
@@ -230,6 +535,50 @@ impl QueryExpr {
                 .lookup(name)
                 .cloned()
                 .ok_or_else(|| QueryExprError::UnresolvedRef(name.as_str().into())),
+
+            // ── A-variants — schema-flow per design.md §6 ────────────────
+            // Filter / Partition / Sort / Limit pass the child's schema
+            // through unchanged.
+            QueryExpr::Filter { child, .. }
+            | QueryExpr::Partition { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. } => child.output_schema_in(scope),
+
+            // Project: schema-flow says "the input schema projected to
+            // `cols`". Phase-B placeholder — return the child schema until
+            // the planner consumes Project's column-mapping output.
+            QueryExpr::Project { child, .. } => child.output_schema_in(scope),
+
+            // Distinct: tighten unique_keys with the named cols. Schema is
+            // otherwise pass-through (design.md §6 schema-flow table).
+            QueryExpr::Distinct { cols, child } => {
+                let in_schema = child.output_schema_in(scope)?;
+                let mut out = in_schema.clone();
+                let mut key_ids: Vec<ColumnId> = Vec::with_capacity(cols.len());
+                for c in cols {
+                    if let ColumnRef::Named(name) = c {
+                        if let Some(id) = in_schema.column_id(name) {
+                            key_ids.push(id);
+                        }
+                    }
+                }
+                if !key_ids.is_empty() {
+                    out.add_unique_key(key_ids);
+                }
+                Ok(out)
+            }
+
+            // Merge / SetOp / Join / BinaryOp: take the left/first child's
+            // schema as the representative (design.md §6 schema-flow).
+            // Full union-compatibility checks land when the type-checker
+            // consumes them; structural lift only here.
+            QueryExpr::Merge { children } => children
+                .first()
+                .ok_or(QueryExprError::EmptyMerge)
+                .and_then(|c| c.output_schema_in(scope)),
+            QueryExpr::SetOp { left, .. }
+            | QueryExpr::Join { left, .. } => left.output_schema_in(scope),
+            QueryExpr::BinaryOp { lhs, .. } => lhs.output_schema_in(scope),
         }
     }
 }
@@ -261,6 +610,89 @@ impl BindingScope {
     /// Look up `name` in the current scope. `None` if unbound.
     pub fn lookup(&self, name: &BindingName) -> Option<&Schema> {
         self.bindings.get(name.as_str())
+    }
+}
+
+// ── legacy_expr::ScalarExpr → canonical Predicate translation ────────────────
+
+/// Translate a [`legacy_expr::ScalarExpr`](crate::intent_algebra::legacy_expr::ScalarExpr)
+/// into the canonical typed [`Predicate`]. Returns
+/// [`QueryExprError::UnsupportedLegacyScalar`] for the deferred E-variants
+/// (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) — those keep
+/// living in `legacy_expr::ScalarExpr` until their own migration batch.
+///
+/// `LiteralValue::Duration` is folded into a `Predicate::Literal(Int)`
+/// carrying the nanosecond count, because the canonical [`LiteralValue`]
+/// is deliberately narrower than the legacy spelling (no `Duration` literal
+/// at this layer — see design.md §6 schema-flow `DataType` list).
+pub fn from_legacy_scalar(
+    se: &crate::intent_algebra::legacy_expr::ScalarExpr,
+) -> Result<Predicate, QueryExprError> {
+    use crate::intent_algebra::legacy_expr as l;
+    match se {
+        l::ScalarExpr::Column(name) => Ok(Predicate::Column(ColumnRef::Named(name.clone()))),
+        l::ScalarExpr::Literal(lit) => Ok(Predicate::Literal(literal_from_legacy(lit))),
+        l::ScalarExpr::BinaryOp { op, lhs, rhs } => Ok(Predicate::BinaryOp {
+            op: binary_op_from_legacy(op),
+            lhs: Box::new(from_legacy_scalar(lhs)?),
+            rhs: Box::new(from_legacy_scalar(rhs)?),
+        }),
+        l::ScalarExpr::IsNull { expr, negated } => Ok(Predicate::IsNull {
+            expr: Box::new(from_legacy_scalar(expr)?),
+            negated: *negated,
+        }),
+        l::ScalarExpr::FunctionCall { .. } => {
+            Err(QueryExprError::UnsupportedLegacyScalar("FunctionCall"))
+        }
+        l::ScalarExpr::ScalarSubquery(_) => {
+            Err(QueryExprError::UnsupportedLegacyScalar("ScalarSubquery"))
+        }
+        l::ScalarExpr::InList { .. } => Err(QueryExprError::UnsupportedLegacyScalar("InList")),
+        l::ScalarExpr::Between { .. } => Err(QueryExprError::UnsupportedLegacyScalar("Between")),
+    }
+}
+
+fn literal_from_legacy(lit: &crate::intent_algebra::legacy_expr::LiteralValue) -> LiteralValue {
+    use crate::intent_algebra::legacy_expr as l;
+    match lit {
+        l::LiteralValue::Null => LiteralValue::Null,
+        l::LiteralValue::Bool(b) => LiteralValue::Bool(*b),
+        l::LiteralValue::Int(i) => LiteralValue::Int(*i),
+        l::LiteralValue::Float(f) => LiteralValue::Float(*f),
+        l::LiteralValue::Str(s) => LiteralValue::Str(s.clone()),
+        // Durations fold to nanoseconds-as-Int — canonical LiteralValue
+        // has no Duration variant (narrower by design).
+        l::LiteralValue::Duration(d) => LiteralValue::Int(d.as_nanos() as i64),
+    }
+}
+
+fn binary_op_from_legacy(op: &crate::intent_algebra::legacy_expr::BinaryOpKind) -> BinaryOpKind {
+    use crate::intent_algebra::legacy_expr as l;
+    match op {
+        l::BinaryOpKind::Add => BinaryOpKind::Add,
+        l::BinaryOpKind::Sub => BinaryOpKind::Sub,
+        l::BinaryOpKind::Mul => BinaryOpKind::Mul,
+        l::BinaryOpKind::Div => BinaryOpKind::Div,
+        l::BinaryOpKind::Mod => BinaryOpKind::Mod,
+        l::BinaryOpKind::Pow => BinaryOpKind::Pow,
+        l::BinaryOpKind::Eq => BinaryOpKind::Eq,
+        l::BinaryOpKind::Ne => BinaryOpKind::Ne,
+        l::BinaryOpKind::Lt => BinaryOpKind::Lt,
+        l::BinaryOpKind::Le => BinaryOpKind::Le,
+        l::BinaryOpKind::Gt => BinaryOpKind::Gt,
+        l::BinaryOpKind::Ge => BinaryOpKind::Ge,
+        l::BinaryOpKind::And => BinaryOpKind::And,
+        l::BinaryOpKind::Or => BinaryOpKind::Or,
+        l::BinaryOpKind::BitAnd => BinaryOpKind::BitAnd,
+        l::BinaryOpKind::BitOr => BinaryOpKind::BitOr,
+        l::BinaryOpKind::BitXor => BinaryOpKind::BitXor,
+        l::BinaryOpKind::Concat => BinaryOpKind::Concat,
+        l::BinaryOpKind::Like => BinaryOpKind::Like,
+        l::BinaryOpKind::NotLike => BinaryOpKind::NotLike,
+        l::BinaryOpKind::Regex => BinaryOpKind::Regex,
+        l::BinaryOpKind::NotRegex => BinaryOpKind::NotRegex,
+        l::BinaryOpKind::Unless => BinaryOpKind::Unless,
+        l::BinaryOpKind::Atan2 => BinaryOpKind::Atan2,
     }
 }
 
@@ -460,5 +892,197 @@ mod tests {
         // downstream rewrites of the schema-flow rules can't silently
         // break it.
         assert_ne!(s1.has_unique_key(), s2.has_unique_key());
+    }
+
+    // ── A-variant lift (Batch 2) ─────────────────────────────────────────
+
+    #[test]
+    fn filter_passes_child_schema_through() {
+        let expr = QueryExpr::Filter {
+            pred: Predicate::Literal(LiteralValue::Bool(true)),
+            child: Box::new(ts_scan()),
+        };
+        let s = expr.output_schema().unwrap();
+        // Filter is row-level — schema unchanged.
+        assert_eq!(s.columns.len(), 3);
+        assert_eq!(s.columns[2].name, "value");
+        assert!(s.time_index.is_some());
+    }
+
+    #[test]
+    fn distinct_tightens_unique_keys() {
+        // Scan over a tabular source with no unique keys, then DISTINCT on
+        // `a`. Output schema should now have unique_keys=[[0]].
+        let scan = QueryExpr::Scan {
+            source: Source::Table {
+                table_ref: "t".into(),
+            },
+            label_filters: vec![],
+            schema: Schema::new(vec![
+                col("a", DataType::Int64),
+                col("b", DataType::Utf8),
+            ]),
+        };
+        let expr = QueryExpr::Distinct {
+            cols: vec![ColumnRef::Named("a".into())],
+            child: Box::new(scan),
+        };
+        let s = expr.output_schema().unwrap();
+        assert!(s.has_unique_key());
+        assert_eq!(s.unique_keys, vec![vec![0]]);
+    }
+
+    #[test]
+    fn merge_uses_first_child_schema_or_errors_empty() {
+        let scan = ts_scan();
+        let expr = QueryExpr::Merge {
+            children: vec![scan.clone(), scan.clone()],
+        };
+        let s = expr.output_schema().unwrap();
+        assert_eq!(s.columns.len(), 3);
+
+        let empty = QueryExpr::Merge { children: vec![] };
+        let err = empty.output_schema().unwrap_err();
+        assert!(matches!(err, QueryExprError::EmptyMerge));
+    }
+
+    #[test]
+    fn limit_and_sort_pass_schema_through() {
+        let expr = QueryExpr::Limit {
+            n: 10,
+            offset: 0,
+            child: Box::new(QueryExpr::Sort {
+                keys: vec![SortKey {
+                    col: "ts".into(),
+                    desc: false,
+                    nulls_first: None,
+                }],
+                child: Box::new(ts_scan()),
+            }),
+        };
+        let s = expr.output_schema().unwrap();
+        assert_eq!(s.columns.len(), 3);
+    }
+
+    #[test]
+    fn binary_op_uses_lhs_schema() {
+        let expr = QueryExpr::BinaryOp {
+            op: BinaryOpKind::Add,
+            lhs: Box::new(ts_scan()),
+            rhs: Box::new(ts_scan()),
+            vector_match: None,
+        };
+        let s = expr.output_schema().unwrap();
+        assert_eq!(s.columns.len(), 3);
+    }
+
+    #[test]
+    fn join_uses_left_child_schema() {
+        let expr = QueryExpr::Join {
+            kind: JoinKind::Inner,
+            pred: Predicate::Literal(LiteralValue::Bool(true)),
+            left: Box::new(ts_scan()),
+            right: Box::new(ts_scan()),
+        };
+        let s = expr.output_schema().unwrap();
+        assert_eq!(s.columns.len(), 3);
+    }
+
+    #[test]
+    fn a_variant_serde_roundtrip_filter() {
+        let expr = QueryExpr::Filter {
+            pred: Predicate::BinaryOp {
+                op: BinaryOpKind::Eq,
+                lhs: Box::new(Predicate::Column(ColumnRef::Named("service".into()))),
+                rhs: Box::new(Predicate::Literal(LiteralValue::Str("api".into()))),
+            },
+            child: Box::new(ts_scan()),
+        };
+        let json = serde_json::to_string(&expr).unwrap();
+        let back: QueryExpr = serde_json::from_str(&json).unwrap();
+        assert_eq!(expr, back);
+    }
+
+    // ── from_legacy_scalar → Predicate translation ───────────────────────
+
+    #[test]
+    fn from_legacy_scalar_column() {
+        use crate::intent_algebra::legacy_expr as l;
+        let s = l::ScalarExpr::Column("foo".into());
+        let p = from_legacy_scalar(&s).unwrap();
+        assert!(matches!(
+            p,
+            Predicate::Column(ColumnRef::Named(ref n)) if n == "foo"
+        ));
+    }
+
+    #[test]
+    fn from_legacy_scalar_literal_bool() {
+        use crate::intent_algebra::legacy_expr as l;
+        let s = l::ScalarExpr::Literal(l::LiteralValue::Bool(true));
+        let p = from_legacy_scalar(&s).unwrap();
+        assert!(matches!(p, Predicate::Literal(LiteralValue::Bool(true))));
+    }
+
+    #[test]
+    fn from_legacy_scalar_binary_op_and_is_null() {
+        use crate::intent_algebra::legacy_expr as l;
+        let s = l::ScalarExpr::BinaryOp {
+            op: l::BinaryOpKind::Eq,
+            lhs: Box::new(l::ScalarExpr::Column("a".into())),
+            rhs: Box::new(l::ScalarExpr::Literal(l::LiteralValue::Int(1))),
+        };
+        let p = from_legacy_scalar(&s).unwrap();
+        assert!(matches!(
+            p,
+            Predicate::BinaryOp {
+                op: BinaryOpKind::Eq,
+                ..
+            }
+        ));
+
+        let s2 = l::ScalarExpr::IsNull {
+            expr: Box::new(l::ScalarExpr::Column("c".into())),
+            negated: true,
+        };
+        let p2 = from_legacy_scalar(&s2).unwrap();
+        assert!(matches!(
+            p2,
+            Predicate::IsNull { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn from_legacy_scalar_unsupported_variants_error() {
+        use crate::intent_algebra::legacy_expr as l;
+        let f = l::ScalarExpr::FunctionCall {
+            name: "abs".into(),
+            args: vec![l::ScalarExpr::Column("x".into())],
+        };
+        assert!(matches!(
+            from_legacy_scalar(&f).unwrap_err(),
+            QueryExprError::UnsupportedLegacyScalar("FunctionCall")
+        ));
+
+        let il = l::ScalarExpr::InList {
+            expr: Box::new(l::ScalarExpr::Column("x".into())),
+            list: vec![l::ScalarExpr::Literal(l::LiteralValue::Int(1))],
+            negated: false,
+        };
+        assert!(matches!(
+            from_legacy_scalar(&il).unwrap_err(),
+            QueryExprError::UnsupportedLegacyScalar("InList")
+        ));
+
+        let bt = l::ScalarExpr::Between {
+            expr: Box::new(l::ScalarExpr::Column("x".into())),
+            low: Box::new(l::ScalarExpr::Literal(l::LiteralValue::Int(0))),
+            high: Box::new(l::ScalarExpr::Literal(l::LiteralValue::Int(10))),
+            negated: false,
+        };
+        assert!(matches!(
+            from_legacy_scalar(&bt).unwrap_err(),
+            QueryExprError::UnsupportedLegacyScalar("Between")
+        ));
     }
 }

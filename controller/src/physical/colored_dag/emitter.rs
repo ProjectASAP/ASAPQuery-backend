@@ -607,6 +607,27 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
             extract_edge_facts(child, edge);
         }
         QE::Ref { .. } => {}
+        // A-variants lifted in Batch 2 of the legacy_expr migration. No
+        // canonical-side consumer constructs them yet — recurse into
+        // children so we still surface edge facts (source metric, label
+        // filters, window size) from any leaves below.
+        QE::Filter { child, .. }
+        | QE::Project { child, .. }
+        | QE::Partition { child, .. }
+        | QE::Distinct { child, .. }
+        | QE::Sort { child, .. }
+        | QE::Limit { child, .. } => extract_edge_facts(child, edge),
+        QE::Merge { children } => {
+            for c in children {
+                extract_edge_facts(c, edge);
+            }
+        }
+        QE::Join { left, right, .. }
+        | QE::SetOp { left, right, .. }
+        | QE::BinaryOp { lhs: left, rhs: right, .. } => {
+            extract_edge_facts(left, edge);
+            extract_edge_facts(right, edge);
+        }
     }
 }
 

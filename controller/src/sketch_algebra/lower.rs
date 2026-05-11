@@ -79,5 +79,11 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> SketchExpr {
         QueryExpr::Aggregate { .. } | QueryExpr::Scan { .. } | QueryExpr::Window { .. } => {
             SketchExpr::Logical(expr.clone())
         }
+        // A-variants lifted in Batch 2 of the legacy_expr migration. No
+        // sketch binding rule applies to these shapes today — wrap as a
+        // logical pass-through, matching the policy for `Aggregate` /
+        // `Scan` / `Window`. Rule extensions can specialise individual
+        // variants as the catalog grows.
+        _ => SketchExpr::Logical(expr.clone()),
     }
 }

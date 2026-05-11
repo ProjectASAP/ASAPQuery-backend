@@ -248,6 +248,31 @@ pub enum FilterVal {
 /// Every variant is a *node* in the logical query plan tree.  Leaves are
 /// [`QueryExpr::Source`] or [`QueryExpr::Ref`].  Interior nodes combine their
 /// `input` child(ren) through the operator they implement.
+///
+/// # Migration status (legacy_expr migration, Batch 2)
+///
+/// The ten "A-classified" variants — `Filter`, `Project`, `Partition`,
+/// `Distinct`, `Merge`, `Join`, `SetOp`, `Sort`, `Limit`, `BinaryOp` —
+/// have canonical structural twins in
+/// [`crate::intent_algebra::query_expr::QueryExpr`]. The canonical spelling
+/// uses `child:` where these legacy variants use `input:`; the typed
+/// [`crate::intent_algebra::Predicate`] replaces [`ScalarExpr`] in `Filter`
+/// / `Join` / `Aggregate::having` (translation via
+/// [`crate::intent_algebra::from_legacy_scalar`] for the four supported
+/// scalar shapes).
+///
+/// These legacy variants stay here for now because:
+///   1. [`legacy_lower`] (Batch 13's target) reshape paths still construct
+///      them internally.
+///   2. The legacy [`ScalarExpr`] retains four E-deferred variants
+///      (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) that the
+///      canonical `Predicate` doesn't cover yet — deleting the legacy
+///      `Filter` would lose `ScalarExpr` expressiveness from consumers
+///      that haven't migrated.
+///
+/// Consumer-side redirect (legacy → canonical, with `input:` → `child:` and
+/// `ScalarExpr` → `Predicate`) lands in subsequent batches once Batch 2's
+/// additive lift is in place.
 #[derive(Debug, Clone)]
 pub enum QueryExpr {
     // ── Base relations ────────────────────────────────────────────────────
