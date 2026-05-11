@@ -2,9 +2,9 @@
 //! cold tier.
 //!
 //! This rule is the L4 catch for [`AggIntent`]s that don't have a warm-
-//! tier streaming sketch family today (`HistogramQuantile`, `Absent`,
-//! `Delta`, `Deriv`, `PredictLinear`, `HoltWinters`, `Idelta`, `Irate`,
-//! `Resets`, `Changes`, `Present`). It matches a single-intent
+//! tier streaming sketch family today (`Absent`, `Present`, `Delta`,
+//! `Deriv`, `PredictLinear`, `HoltWinters`, `Idelta`, `Irate`, `Resets`,
+//! `Changes`). It matches a single-intent
 //! `Aggregate` carrying any of those, and emits an
 //! [`SketchExpr::Logical`] pass-through. The L5 emitter looks at the
 //! enclosed [`AggIntent::archive_only`] flag and routes the corresponding
@@ -123,11 +123,18 @@ mod tests {
     }
 
     #[test]
-    fn binds_histogram_quantile() {
-        let expr = agg_with(AggIntent::HistogramQuantile { q: 0.99 });
+    fn binds_absent_archive_only() {
+        // `histogram_quantile(...)` is no longer an L3 intent — it's a
+        // PromQL operator that the controller's PromQL parser lowers via
+        // `legacy_expr::QueryExpr::HistogramQuantile`. The L3 mapping
+        // `histogram_quantile(q, bucket_metric) → Quantile{q,...}` is a
+        // semantic-only documented contract; the canonical archive-only
+        // anchor for this test is `Absent` (which has no warm-tier sketch
+        // family).
+        let expr = agg_with(AggIntent::Absent);
         let out = BindArchiveOnly
             .apply(&expr, &AccuracyTarget::Epsilon(0.01))
-            .expect("rule should match histogram_quantile");
+            .expect("rule should match Absent");
         match out {
             SketchExpr::Logical(inner) => assert_eq!(inner, expr),
             other => panic!("expected Logical pass-through, got {other:?}"),
@@ -137,7 +144,6 @@ mod tests {
     #[test]
     fn binds_each_archive_only_intent() {
         let intents = vec![
-            AggIntent::HistogramQuantile { q: 0.5 },
             AggIntent::Absent,
             AggIntent::Present,
             AggIntent::Delta {

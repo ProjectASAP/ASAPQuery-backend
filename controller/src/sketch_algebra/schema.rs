@@ -42,16 +42,25 @@ pub struct SketchStateSchema {
     /// Parameter payload — must match across all inputs to a `SketchMerge`.
     pub params: SketchParams,
     /// Capability flags from the sketch catalog.
-    pub caps: SketchCapabilities,
+    pub caps: SketchStateMetadata,
 }
 
-/// Catalog capability flags. Populated from the sketch catalog at
-/// `Bind*`-rule time. `mergeable` gates `SketchMerge`; `subtractable`
-/// gates `SketchSubtract`; `deletable` gates `SketchDelete`. See design.md
-/// §6 line ~646 ("catalog is the single source of truth for these flags;
-/// binding rules consult it before producing the node").
+/// L4 type-system catalog flags for a sketch state. Populated from the
+/// sketch catalog at `Bind*`-rule time. `mergeable` gates `SketchMerge`;
+/// `subtractable` gates `SketchSubtract`; `deletable` gates
+/// `SketchDelete`. See design.md §6 line ~646 ("catalog is the single
+/// source of truth for these flags; binding rules consult it before
+/// producing the node").
+///
+/// Renamed from `SketchCapabilities` in May 2026 to disambiguate from
+/// [`crate::sketch_algebra::capability::SketchCapability`] (perf /
+/// cost-model profile). The two structs live side-by-side: this one is
+/// the **L4 type-system / plan-time** surface — sealed onto every
+/// `SketchExpr` edge by the binding rule and consulted by the type
+/// checker. `SketchCapability` is the **perf / feasibility / intent-
+/// routing** surface — consumed by the optimizer and cost model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SketchCapabilities {
+pub struct SketchStateMetadata {
     /// Whether two states of this family + params can be unioned —
     /// catalog default for KLL / HLL / DDSketch / CMS / CountSketch.
     pub mergeable: bool,
@@ -70,27 +79,27 @@ impl SketchStateSchema {
     /// truth that downstream rules must consult.
     pub fn for_kind(kind: SketchKind, params: SketchParams) -> Self {
         let caps = match kind {
-            SketchKind::Kll => SketchCapabilities {
+            SketchKind::Kll => SketchStateMetadata {
                 mergeable: true,
                 subtractable: false,
                 deletable: false,
             },
-            SketchKind::DDSketch => SketchCapabilities {
+            SketchKind::DDSketch => SketchStateMetadata {
                 mergeable: true,
                 subtractable: false,
                 deletable: false,
             },
-            SketchKind::Hll => SketchCapabilities {
+            SketchKind::Hll => SketchStateMetadata {
                 mergeable: true,
                 subtractable: false,
                 deletable: false,
             },
-            SketchKind::Cms => SketchCapabilities {
+            SketchKind::Cms => SketchStateMetadata {
                 mergeable: true,
                 subtractable: true,
                 deletable: true,
             },
-            SketchKind::CountSketch => SketchCapabilities {
+            SketchKind::CountSketch => SketchStateMetadata {
                 mergeable: true,
                 subtractable: true,
                 deletable: false,

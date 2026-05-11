@@ -57,7 +57,10 @@ use asap_sketchlib::sketches::kll::KllSketch;
 use asap_sketchlib::sketches::countminsketch::CountMinSketch;
 use asap_sketchlib::sketches::countsketch::CountSketch;
 
-use crate::engines::warm_tier::decoders::decode_cms_with_heap_from_msgpack;
+use crate::engines::warm_tier::decoders::{
+    decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
+    decode_cs_from_msgpack, decode_cs_from_proto,
+};
 use crate::engines::warm_tier::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
@@ -179,7 +182,13 @@ impl WarmTierResult {
 pub(crate) enum QueryFamily {
     Quantile,
     Cardinality,
+    /// Heap-BEARING heavy-hitter top-k. Requires `CmsWithHeap` or
+    /// `CountSketchWithHeap` to enumerate items.
     FrequencyTopk,
+    /// Heap-LESS bare frequency point query. Answered by `CountMin` /
+    /// `CountSketch` (and ALSO by `CmsWithHeap` / `CountSketchWithHeap`,
+    /// since the heap is additional info layered over the matrix).
+    FrequencyEstimate,
 }
 
 impl<'a> SketchReducer<'a> {
@@ -209,6 +218,13 @@ impl<'a> SketchReducer<'a> {
             | "cardinality_estimate"
             | "count_distinct" => Ok(QueryFamily::Cardinality),
             "topk" | "topk_over_time" | "bottomk" => Ok(QueryFamily::FrequencyTopk),
+            // Bare frequency point queries — the MetricsQL surface for
+            // `sum by (item) (rate(m[r]))` with epsilon accuracy. The
+            // reducer answers these by decoding the CMS / CountSketch
+            // matrix directly (no heap needed). `frequency` is the
+            // canonical name; `count_over_time` is accepted as an alias
+            // for back-compat with PromQL counter-style point queries.
+            "frequency" | "frequency_estimate" => Ok(QueryFamily::FrequencyEstimate),
             other => Err(WarmTierError::UnsupportedFunction(other.to_string())),
         }
     }
@@ -224,6 +240,7 @@ impl<'a> SketchReducer<'a> {
             Capability::QuantileApprox(_) => QueryFamily::Quantile,
             Capability::CardinalityApprox => QueryFamily::Cardinality,
             Capability::FrequencyTopk(_) => QueryFamily::FrequencyTopk,
+            Capability::FrequencyEstimate(_) => QueryFamily::FrequencyEstimate,
         }
     }
 
@@ -238,7 +255,13 @@ impl<'a> SketchReducer<'a> {
         match (family, &meta.capability) {
             (QueryFamily::Quantile, Capability::QuantileApprox(_))
             | (QueryFamily::Cardinality, Capability::CardinalityApprox)
-            | (QueryFamily::FrequencyTopk, Capability::FrequencyTopk(_)) => {
+            | (QueryFamily::FrequencyTopk, Capability::FrequencyTopk(_))
+            | (QueryFamily::FrequencyEstimate, Capability::FrequencyEstimate(_))
+            // A heap-bearing `FrequencyTopk` sid ALSO answers bare frequency
+            // point queries — the heap is additional info layered over the
+            // sketch matrix, so the underlying CMS / CountSketch matrix can
+            // be queried point-wise without consulting it.
+            | (QueryFamily::FrequencyEstimate, Capability::FrequencyTopk(_)) => {
                 Ok(meta.capability.clone())
             }
             (_, other) => Err(WarmTierError::UnsupportedCapability {
@@ -308,6 +331,40 @@ impl<'a> SketchReducer<'a> {
                 continue;
             }
 
+            // Bare frequency point query — heap-LESS dispatch. Decode
+            // each window's CMS / CountSketch (or the underlying matrix
+            // of a heap-bearing sid) and emit one (window_end, total_count)
+            // sample per window. The CMS / CountSketch substrate carries
+            // ALL items inserted via `bulk_insert`, so the per-window
+            // total count is the sum-of-all-rates contribution from that
+            // window — the natural answer to bare `sum by (item)
+            // (rate(m[r]))` when no specific item key is supplied.
+            //
+            // Per-item lookup (estimate(key)) is a follow-up — it requires
+            // plumbing a string-keyed `function_arg` through the reducer
+            // entry point, which the current `&[f64]` signature can't carry.
+            if family == QueryFamily::FrequencyEstimate {
+                for ts in series_list {
+                    let mut samples_out: Vec<(i64, f64)> =
+                        Vec::with_capacity(ts.samples.len());
+                    for (w_end, state) in ts.samples.iter() {
+                        any_window = true;
+                        let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
+                        if w < cov_lo {
+                            cov_lo = w;
+                        }
+                        if w > cov_hi {
+                            cov_hi = w;
+                        }
+                        let total =
+                            decode_frequency_total(sid, meta.sketch_kind, state)?;
+                        samples_out.push((*w_end, total));
+                    }
+                    out_series.push((ts.series_label_values, samples_out));
+                }
+                continue;
+            }
+
             // Top-k is a different shape — one entry per top-k item.
             if family == QueryFamily::FrequencyTopk {
                 let k = function_args
@@ -330,7 +387,13 @@ impl<'a> SketchReducer<'a> {
                         cov_hi = w_end_u64;
                     }
                     let cms_heap = match meta.sketch_kind {
-                        SketchKindHandle::CmsWithHeap => {
+                        SketchKindHandle::CmsWithHeap
+                        | SketchKindHandle::CountSketchWithHeap => {
+                            // Both heap-bearing variants serialize the
+                            // outer `CountMinSketchWithHeap` envelope via
+                            // msgpack (`CountSketchWithHeap` reuses the
+                            // same wire shape since the heap is the
+                            // distinguishing payload).
                             decode_cms_with_heap_from_msgpack(&state.bytes).map_err(|e| {
                                 WarmTierError::DeserializeFailure {
                                     sid,
@@ -340,6 +403,9 @@ impl<'a> SketchReducer<'a> {
                             })?
                         }
                         SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
+                            // Heap-LESS variants can't enumerate top-k —
+                            // they support point-frequency only (which
+                            // routes through QueryFamily::FrequencyEstimate).
                             return Err(WarmTierError::MissingHeap {
                                 sid,
                                 sketch_kind: meta.sketch_kind,
@@ -483,20 +549,26 @@ impl<'a> SketchReducer<'a> {
             }
             QueryFamily::Cardinality => self.evaluate_cardinality(sid, sketch_kind, state),
             QueryFamily::FrequencyTopk => {
-                // CMS / CountSketch frequency point query needs a
-                // key. The PromQL `topk(k, foo)` shape doesn't
-                // pass an explicit key — the canonical answer
-                // would draw from a CMS-with-heap (heavy-hitter
-                // sketch). PR #122's `Capability::FrequencyTopk`
-                // doesn't yet wire the heap through, so surface
-                // as `UnsupportedCapability` and let the router
-                // fall through to archive. This is a documented
-                // follow-up: once `SketchKindHandle` carries a
-                // CmsWithHeap variant, route to a heap-walking
-                // estimator that returns the top-k items.
+                // Top-k materialization is handled in-line by the main
+                // `evaluate` loop via `decode_cms_with_heap_from_msgpack`;
+                // this legacy one-shot entry never participates in the
+                // top-k path. Surface as `UnsupportedCapability` so a
+                // stray caller falls over to archive.
                 Err(WarmTierError::UnsupportedCapability {
                     function: "topk".to_string(),
                     capability: Capability::FrequencyTopk(sketch_kind),
+                })
+            }
+            QueryFamily::FrequencyEstimate => {
+                // Bare frequency point query — handled in-line by the
+                // main `evaluate` loop via `decode_frequency_total`.
+                // This legacy one-shot entry doesn't drive the
+                // FrequencyEstimate path; surface as a defensive
+                // `UnsupportedCapability` so a stray caller falls over
+                // to archive rather than silently misroutes.
+                Err(WarmTierError::UnsupportedCapability {
+                    function: "frequency".to_string(),
+                    capability: Capability::FrequencyEstimate(sketch_kind),
                 })
             }
         }
@@ -763,12 +835,10 @@ fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, Stri
     ))
 }
 
-// CMS / CountSketch decoders are not yet wired through the reducer
-// because the warm-tier `topk` capability requires CMS-with-heap
-// (see `evaluate_one_state`'s FrequencyTopk arm). The decoders
-// themselves exist on `precompute_operators::{count_min_sketch,
-// count_sketch}_accumulator.rs::from_sketchlib_proto_bytes` and are
-// trivially liftable when the heap variant lands.
+// CMS / CountSketch decoders are wired through the reducer's
+// `FrequencyEstimate` dispatch arm (bare-frequency point queries).
+// `FrequencyTopk` continues to require a heap-bearing variant (handled
+// inline in the FrequencyTopk branch via `decode_cms_with_heap_from_msgpack`).
 #[allow(dead_code)]
 fn _unused_cms_kept_for_future_topk(buffer: &[u8]) -> Option<CountMinSketch> {
     CountMinSketch::deserialize_msgpack(buffer).ok()
@@ -776,4 +846,96 @@ fn _unused_cms_kept_for_future_topk(buffer: &[u8]) -> Option<CountMinSketch> {
 #[allow(dead_code)]
 fn _unused_count_sketch_kept_for_future_topk(buffer: &[u8]) -> Option<CountSketch> {
     CountSketch::deserialize_msgpack(buffer).ok()
+}
+
+/// Decode a sid's per-window frequency sketch and emit a per-window
+/// total-count summary. The CMS / CountSketch matrix sums row 0 (the
+/// first hash row); for a CMS, row r's column-wise sum equals the total
+/// weighted insert volume into that row (each insert contributes once
+/// per row), so row 0's sum is the natural per-window total-frequency
+/// scalar.
+///
+/// Heap-bearing variants (`CmsWithHeap` / `CountSketchWithHeap`) are
+/// decoded via the same wrapper and the underlying CMS matrix is used.
+///
+/// Returns `WarmTierError::DeserializeFailure` if the bytes don't decode
+/// against the sid's declared sketch kind. Heap-less CMS / CountSketch
+/// are NOT a `MissingHeap` error here — bare frequency is exactly what
+/// heap-less variants are designed to answer.
+fn decode_frequency_total(
+    sid: u64,
+    sketch_kind: SketchKindHandle,
+    state: &SketchSampleState,
+) -> Result<f64, WarmTierError> {
+    let to_err = |e: String, encoding: SketchEncoding| WarmTierError::DeserializeFailure {
+        sid,
+        encoding,
+        reason: e,
+    };
+    match sketch_kind {
+        SketchKindHandle::CountMin => {
+            let cms = match state.encoding {
+                SketchEncoding::ProtoFull => {
+                    decode_cms_from_proto(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
+                SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                    return Err(to_err(
+                        "CMS delta encodings not implemented in warm-tier reducer".to_string(),
+                        state.encoding,
+                    ));
+                }
+            };
+            Ok(row0_sum_cms(&cms))
+        }
+        SketchKindHandle::CountSketch => {
+            let cs = match state.encoding {
+                SketchEncoding::ProtoFull => {
+                    decode_cs_from_proto(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
+                SketchEncoding::MsgpackFull => decode_cs_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                    return Err(to_err(
+                        "CountSketch delta encodings not implemented in warm-tier reducer"
+                            .to_string(),
+                        state.encoding,
+                    ));
+                }
+            };
+            Ok(row0_sum_cs(&cs))
+        }
+        // Heap-bearing variants: decode via the CMS-with-heap envelope
+        // and read the underlying CMS matrix the same way.
+        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
+            let heap = decode_cms_with_heap_from_msgpack(&state.bytes)
+                .map_err(|e| to_err(e, state.encoding))?;
+            let matrix = heap.sketch_matrix();
+            Ok(row0_sum_from_matrix(&matrix))
+        }
+        // Quantile / cardinality handles can't answer frequency — caller
+        // should have rejected at `require_capability`. Defensive arm.
+        other => Err(WarmTierError::UnsupportedCapability {
+            function: "frequency".to_string(),
+            capability: Capability::FrequencyEstimate(other),
+        }),
+    }
+}
+
+fn row0_sum_cms(cms: &CountMinSketch) -> f64 {
+    let matrix = cms.sketch();
+    row0_sum_from_matrix(&matrix)
+}
+
+fn row0_sum_cs(cs: &CountSketch) -> f64 {
+    let matrix = cs.sketch();
+    row0_sum_from_matrix(matrix)
+}
+
+fn row0_sum_from_matrix(matrix: &[Vec<f64>]) -> f64 {
+    matrix
+        .first()
+        .map(|row| row.iter().copied().sum::<f64>())
+        .unwrap_or(0.0)
 }

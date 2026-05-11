@@ -473,15 +473,21 @@ fn phase_b_pattern_temporal_and_spatial_combined() {
     assert!(matches!(bound, SketchExpr::Logical(_)));
 }
 
-/// `histogram_quantile(φ, …)` — Phase β archive-only addition (not in
-/// `patterns.rs`'s 5 entries; the legacy planner refused these via
-/// `is_supported() == false`). Controller path: `BindArchiveOnly` matches
-/// → `Logical` pass-through, and the L5 emitter / Phase α routing reads
+/// Phase β archive-only intent: any of the no-warm-tier-family entries
+/// (`Absent`, `Present`, `Delta`, …) matches `BindArchiveOnly` → `Logical`
+/// pass-through, and the L5 emitter / Phase α routing reads
 /// `AggIntent::archive_only() == true` to flag the StreamingConfig entry
 /// for the archive tier.
+///
+/// `histogram_quantile(...)` was previously an L3 intent here but is no
+/// longer — it's a PromQL/MetricsQL language-level operator (carried by
+/// `legacy_expr::QueryExpr::HistogramQuantile`), NOT a semantic intent.
+/// The L1→L3 lowerer's documented contract is
+/// `histogram_quantile(q, bucket_metric) → AggIntent::Quantile { q, .. }`;
+/// bucket-aware reduction is a physical-planner concern.
 #[test]
-fn phase_b_pattern_histogram_quantile_routes_to_archive() {
-    let intent = AggIntent::HistogramQuantile { q: 0.99 };
+fn phase_b_pattern_archive_only_routes_to_archive() {
+    let intent = AggIntent::Absent;
     assert!(intent.archive_only(), "Phase β intent must flag archive");
     let expr = QueryExpr::Aggregate {
         by: vec![],
@@ -496,7 +502,7 @@ fn phase_b_pattern_histogram_quantile_routes_to_archive() {
         SketchExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
             assert_eq!(aggs, vec![intent]);
         }
-        other => panic!("expected Logical(Aggregate(HistogramQuantile)), got {other:?}"),
+        other => panic!("expected Logical(Aggregate(Absent)), got {other:?}"),
     }
 }
 
@@ -703,19 +709,21 @@ fn phase_b_e2e_topk_well_formed() {
     let _ = collect_sketch_kinds(&bound);
 }
 
-/// `histogram_quantile` — Phase β archive routing through the full L1→
-/// L3→L4 pipeline. Asserts the expected functional equivalent of
-/// asap-planner-rs's previous `is_supported() == false` behavior
-/// (refused outright); the controller now lifts these to L3 with
-/// `archive_only() == true` and the binder emits a Logical pass-through.
+/// Archive-only routing through the full L1→L3→L4 pipeline. Asserts the
+/// expected functional equivalent of asap-planner-rs's previous
+/// `is_supported() == false` behavior (refused outright); the controller
+/// now lifts these to L3 with `archive_only() == true` and the binder
+/// emits a Logical pass-through.
+///
+/// Replaces the prior `phase_b_e2e_histogram_quantile_e2e_through_parser`
+/// — `histogram_quantile(...)` is now a PromQL/MetricsQL language-level
+/// operator carried by `legacy_expr::QueryExpr::HistogramQuantile`, NOT
+/// an L3 intent. The L1→L3 contract maps it semantically to `Quantile{q}`;
+/// the archive-only routing this test exercises uses `Absent` as a
+/// stable proxy (every archive-only variant follows the same code path).
 #[test]
-fn phase_b_e2e_histogram_quantile_e2e_through_parser() {
-    // The PromQL parser produces a `HistogramQuantile` QueryExpr node
-    // (not a flat `Aggregate{Quantile}`), so the L3 lowering of
-    // ParsedQuery cannot fully express it via the legacy AggType axis.
-    // We assert the SHAPE of the bound expression directly here: an
-    // archive-only intent under any `Aggregate` survives through bind.
-    let intent = AggIntent::HistogramQuantile { q: 0.99 };
+fn phase_b_e2e_archive_only_e2e_binding() {
+    let intent = AggIntent::Absent;
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![intent.clone()],
@@ -725,9 +733,9 @@ fn phase_b_e2e_histogram_quantile_e2e_through_parser() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     assert!(
         binding_is_archive(&bound),
-        "histogram_quantile must surface archive flag through L4 binding"
+        "archive-only intent must surface archive flag through L4 binding"
     );
-    // No warm-tier sketch fires for HistogramQuantile.
+    // No warm-tier sketch fires for archive-only intents.
     assert!(collect_sketch_kinds(&bound).is_empty());
 }
 
@@ -739,7 +747,6 @@ fn phase_b_e2e_histogram_quantile_e2e_through_parser() {
 #[test]
 fn phase_b_archive_only_intents_round_trip_through_binder() {
     let intents = vec![
-        AggIntent::HistogramQuantile { q: 0.5 },
         AggIntent::Absent,
         AggIntent::Present,
         AggIntent::Delta {
