@@ -176,7 +176,7 @@ impl WarmTierResult {
 /// Family of sketch query the user's function maps onto. Determined
 /// once per call so the per-sid loop doesn't re-string-match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryFamily {
+pub(crate) enum QueryFamily {
     Quantile,
     Cardinality,
     FrequencyTopk,
@@ -188,16 +188,42 @@ impl<'a> SketchReducer<'a> {
     }
 
     /// Map a PromQL function name to the warm-tier query family it
-    /// addresses. Returns `Err(UnsupportedFunction)` for anything
-    /// outside the dispatch table.
+    /// addresses. After the Step 2a refactor the canonical dispatch is
+    /// off the analyzer's `Capability` (see [`capability_to_family`]);
+    /// this string-based fallback exists ONLY for the
+    /// `SketchReducer::evaluate` entry point's `function_name: &str`
+    /// API surface, which is preserved for the existing call sites.
+    /// Unrecognised names route to the canonical family via the
+    /// downstream `require_capability` check.
     fn function_to_family(function_name: &str) -> Result<QueryFamily, WarmTierError> {
         match function_name {
             "quantile_over_time" | "histogram_quantile" | "quantile" => Ok(QueryFamily::Quantile),
-            "count_distinct_over_time" | "cardinality_estimate" | "count_distinct" => {
-                Ok(QueryFamily::Cardinality)
-            }
+            // `distinct_over_time` (MetricsQL) is the canonical
+            // distinct-count-over-window name. `cardinality_estimate`
+            // and `count_distinct_over_time` are accepted as historical
+            // aliases for back-compat with PR #128's reducer tests; new
+            // callers should pass the analyzer's `required_capability`
+            // and dispatch via [`capability_to_family`] instead.
+            "distinct_over_time"
+            | "count_distinct_over_time"
+            | "cardinality_estimate"
+            | "count_distinct" => Ok(QueryFamily::Cardinality),
             "topk" | "topk_over_time" | "bottomk" => Ok(QueryFamily::FrequencyTopk),
             other => Err(WarmTierError::UnsupportedFunction(other.to_string())),
+        }
+    }
+
+    /// Map a [`Capability`] to a [`QueryFamily`]. This is the canonical
+    /// dispatch path after Step 2a: the controller's analyzer hands
+    /// each `WarmTierCandidate` a `required_capability`, and the
+    /// reducer picks a family without ever matching on the PromQL
+    /// function-name string.
+    #[allow(dead_code)]
+    pub(crate) fn capability_to_family(cap: &Capability) -> QueryFamily {
+        match cap {
+            Capability::QuantileApprox(_) => QueryFamily::Quantile,
+            Capability::CardinalityApprox => QueryFamily::Cardinality,
+            Capability::FrequencyTopk(_) => QueryFamily::FrequencyTopk,
         }
     }
 
@@ -513,7 +539,7 @@ impl<'a> SketchReducer<'a> {
                 Ok(sk.estimate())
             }
             other => Err(WarmTierError::UnsupportedCapability {
-                function: "cardinality_estimate".to_string(),
+                function: "cardinality".to_string(),
                 capability: Capability::QuantileApprox(other),
             }),
         }

@@ -3736,10 +3736,12 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                 }
 
                 // Verify each sid carries the analyzer's required
-                // capability (the controller's
-                // `Capability::is_satisfied_by` honors `Any` semantics).
+                // capability. After Step 2a there's exactly one
+                // `Capability` enum (defined in the controller and
+                // re-exported by `sketch_index`), so no `From`
+                // conversion is needed — just clone.
                 let required: crate::stores::sketch_db::sketch_index::Capability =
-                    candidate.required_capability.clone().into();
+                    candidate.required_capability.clone();
                 let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
                 for sid in &sids {
                     match idx.classify(*sid) {
