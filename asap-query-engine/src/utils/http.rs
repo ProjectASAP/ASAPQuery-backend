@@ -175,9 +175,19 @@ pub fn convert_range_result_to_prometheus(
                 .values
                 .iter()
                 .map(|element| {
-                    // Build metric labels object
+                    // Build metric labels object. Per-element override
+                    // (`element.label_keys_override`) wins when the
+                    // adapter knows the keys at materialization time —
+                    // e.g. warm-tier `topk` synthesizes an `"item"` key
+                    // that's not in the query's group-by clause, so the
+                    // outer `label_names` doesn't carry it. Falls back
+                    // to the query-scoped key list for everyone else.
                     let mut metric = serde_json::Map::new();
-                    for (i, label_name) in label_names.labels.iter().enumerate() {
+                    let effective_keys: &[String] = element
+                        .label_keys_override
+                        .as_deref()
+                        .unwrap_or(&label_names.labels);
+                    for (i, label_name) in effective_keys.iter().enumerate() {
                         if i < element.labels.labels.len() {
                             metric.insert(
                                 label_name.clone(),
