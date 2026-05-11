@@ -103,13 +103,13 @@ pub enum AggIntent {
     // sketch family for any of these is a follow-up — the L3 vocabulary
     // captures the intent so the routing decision is layered above intent.
     //
-    /// `histogram_quantile(φ, le_bucketed_metric)`. Operates on Prometheus
-    /// histogram buckets — semantically a quantile readout but the input
-    /// shape (per-bucket counter) requires bucket-aware aggregation that
-    /// the existing KLL / DDSketch rules don't model. Archive-only today.
-    HistogramQuantile {
-        q: f64,
-    },
+    // Note: `histogram_quantile(φ, …)` is NOT an L3 intent — it's a PromQL
+    // /MetricsQL language-level operator (a query-expression node carried
+    // by `legacy_expr::QueryExpr::HistogramQuantile`). The L1→L3 lowerer
+    // maps `histogram_quantile(q, bucket_metric)` semantically to
+    // `AggIntent::Quantile { q, accuracy }`; bucket-aware handling is a
+    // physical-planner concern, not an L3 intent.
+    //
     /// `absent(vector_selector)` — 1 iff the selector matched no series in
     /// the evaluation window, no value otherwise. Routed to archive: the
     /// engine answers it directly off the index.
@@ -168,17 +168,21 @@ impl AggIntent {
     /// today. `false` means a `Bind*` rule may match. `true` means the
     /// L5 emitter routes the intent to the cold-store / archive tier.
     ///
-    /// Per Phase β orchestrator spec, the new `HistogramQuantile` plus the
-    /// PromQL functions that were previously refused outright by
-    /// `asap-planner-rs::single_query::is_supported()` (everything outside
-    /// the 5 patterns) all return `true` here. Adding a sketch family for
-    /// any of them is a future PR — flipping the flag to `false` is the
-    /// single point of change.
+    /// Per Phase β orchestrator spec, the PromQL functions that were
+    /// previously refused outright by `asap-planner-rs::single_query::
+    /// is_supported()` (everything outside the 5 patterns) all return
+    /// `true` here. Adding a sketch family for any of them is a future
+    /// PR — flipping the flag to `false` is the single point of change.
+    ///
+    /// Note: `histogram_quantile(...)` was previously listed as
+    /// archive-only here but is no longer an `AggIntent` variant —
+    /// it's a PromQL/MetricsQL language-level operator (carried by
+    /// `legacy_expr::QueryExpr::HistogramQuantile`). The L1→L3
+    /// lowerer maps it semantically to `AggIntent::Quantile { q, .. }`.
     pub fn archive_only(&self) -> bool {
         matches!(
             self,
-            AggIntent::HistogramQuantile { .. }
-                | AggIntent::Absent
+            AggIntent::Absent
                 | AggIntent::Present
                 | AggIntent::Delta { .. }
                 | AggIntent::Deriv { .. }
@@ -265,11 +269,6 @@ impl AggIntent {
             // the StreamingConfig emitter and Phase α routing entry can
             // locate them. All are Float64 except the boolean Absent /
             // Present, which surface as Int64 (1 / 0) per PromQL convention.
-            AggIntent::HistogramQuantile { q } => Column {
-                name: format!("histogram_quantile_{}", quantile_suffix(*q)),
-                dtype: DataType::Float64,
-                nullable: false,
-            },
             AggIntent::Absent => Column {
                 name: "absent".into(),
                 dtype: DataType::Int64,
@@ -458,7 +457,6 @@ mod tests {
     fn archive_only_flag_partitions_intents() {
         // Archive-only — every Phase β migration target.
         let archive: Vec<AggIntent> = vec![
-            AggIntent::HistogramQuantile { q: 0.99 },
             AggIntent::Absent,
             AggIntent::Present,
             AggIntent::Delta {
@@ -541,7 +539,6 @@ mod tests {
     #[test]
     fn archive_only_intent_serde_roundtrip() {
         let cases = vec![
-            AggIntent::HistogramQuantile { q: 0.99 },
             AggIntent::Absent,
             AggIntent::Present,
             AggIntent::Delta {
@@ -582,12 +579,6 @@ mod tests {
     #[test]
     fn archive_only_output_column_names() {
         let v = col("value", DataType::Float64);
-        assert_eq!(
-            AggIntent::HistogramQuantile { q: 0.99 }
-                .output_column(&v)
-                .name,
-            "histogram_quantile_0_99"
-        );
         assert_eq!(AggIntent::Absent.output_column(&v).name, "absent");
         assert_eq!(AggIntent::Present.output_column(&v).name, "present");
         assert_eq!(

@@ -262,7 +262,6 @@ fn intent_kind_label(intent: &AggIntent) -> &'static str {
         AggIntent::Frequency { .. } => "frequency",
         AggIntent::Rate { .. } => "rate",
         AggIntent::Increase { .. } => "increase",
-        AggIntent::HistogramQuantile { .. } => "histogram_quantile",
         AggIntent::Absent => "absent",
         AggIntent::Present => "present",
         AggIntent::Delta { .. } => "delta",
@@ -415,13 +414,14 @@ mod tests {
 
     #[test]
     fn analyze_histogram_quantile_is_rejected() {
-        // `histogram_quantile(...)` is either rejected by the
-        // controller's PromQL parser (because its second-arg shape
-        // requires a `rate(bucket[r])` that the analyzer rejects as
-        // an exact-counter intent) or lowered to the archive-only
-        // `AggIntent::HistogramQuantile` (which `capability_for`
-        // returns None for). Either path is the right "not warm-tier
-        // answerable" answer; assert SOME unsupported reason.
+        // `histogram_quantile(...)` is a PromQL/MetricsQL language-level
+        // operator (a `legacy_expr::QueryExpr::HistogramQuantile` node),
+        // NOT an L3 intent. The inner argument shape requires a
+        // `rate(bucket[r])` which the analyzer rejects as an exact-counter
+        // intent, so the analyzer returns SOME unsupported reason. The
+        // architectural mapping `histogram_quantile(q, bucket_metric)` →
+        // `AggIntent::Quantile{q,...}` is documented but the bucket-aware
+        // physical reduction is not yet wired into the warm-tier path.
         let a = analyze_promql_for_warm_tier(
             "histogram_quantile(0.99, sum(rate(http_latency_bucket[5m])) by (le))",
         );

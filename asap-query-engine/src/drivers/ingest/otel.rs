@@ -892,9 +892,24 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     Capability::QuantileApprox(kind)
                                 }
                                 SketchKindHandle::Hll => Capability::CardinalityApprox,
+                                // Heap-LESS frequency sketches answer bare
+                                // frequency point queries (no top-k); index
+                                // them as FrequencyEstimate so a `topk(...)`
+                                // query routes to archive (or to a different
+                                // sid that carries a heap-bearing variant).
                                 SketchKindHandle::CountSketch
-                                | SketchKindHandle::CountMin
-                                | SketchKindHandle::CmsWithHeap => {
+                                | SketchKindHandle::CountMin => {
+                                    Capability::FrequencyEstimate(kind)
+                                }
+                                // Heap-BEARING frequency sketches answer
+                                // both point-frequency AND top-k. We register
+                                // them under FrequencyTopk (top-k is the
+                                // strongest claim); the analyzer-side
+                                // `is_satisfied_by` for FrequencyEstimate
+                                // explicitly accepts heap-bearing variants,
+                                // so bare-frequency queries still route here.
+                                SketchKindHandle::CmsWithHeap
+                                | SketchKindHandle::CountSketchWithHeap => {
                                     Capability::FrequencyTopk(kind)
                                 }
                                 // `Any` is the controller-side analysis-

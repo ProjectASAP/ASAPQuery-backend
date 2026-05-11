@@ -2118,7 +2118,7 @@ mod tests {
 
     // ── Phase β: emit_backend_config_json snapshot for new pattern coverage ──
     //
-    // The new archive-only L3 intents (HistogramQuantile, Absent, Delta, …)
+    // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
     // bind to `SketchExpr::Logical` rather than producing a `BackendAggregation`,
     // so they correctly stay OUT of the warm-tier StreamingConfig the
     // backend's SimpleEngine receives. Phase α wires the archive routing

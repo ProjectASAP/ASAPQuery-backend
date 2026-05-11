@@ -34,10 +34,16 @@
 pub mod capability;
 pub mod capability_matching;
 pub mod lower;
-pub mod params;
 pub mod rules;
 pub mod schema;
 pub mod sketch_expr;
+pub mod sketch_params;
+
+// Back-compat alias. External call sites that imported
+// `controller::sketch_algebra::params::*` (and the in-tree
+// `crate::sketch_algebra::params::SketchKind` use sites that this
+// touch-up didn't migrate) keep compiling.
+pub use sketch_params as params;
 
 #[cfg(test)]
 mod tests;
@@ -51,8 +57,8 @@ pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
 pub use lower::{bind_query_expr, BindingError};
-pub use params::{
+pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
-pub use schema::{SketchCapabilities, SketchStateSchema};
+pub use schema::{SketchStateMetadata, SketchStateSchema};
 pub use sketch_expr::{EstimateOp, MergeAlgebra, SketchExpr};

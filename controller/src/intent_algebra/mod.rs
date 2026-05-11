@@ -14,12 +14,12 @@
 //! | `ONLY_TEMPORAL` funcs (`{sum,count,avg,min,max}_over_time`, `rate`, `increase`) | [`AggIntent::Sum`] / [`AggIntent::Count`] / [`AggIntent::Avg`] / [`AggIntent::Min`] / [`AggIntent::Max`] under `Window`, plus [`AggIntent::Rate`] / [`AggIntent::Increase`] for the counter-reset variants |
 //! | `ONLY_SPATIAL` (`agg_op(metric)`) | `Aggregate{by, [intent]}` over a bare `Scan` (no `Window`) — the spatial `agg_op` is the [`AggIntent`] |
 //! | `ONE_TEMPORAL_ONE_SPATIAL` (`agg_op(temporal_func(m[range]))`) | combined `Aggregate{by, [intent]}` over a `Window` — single-rooted L3 captures both axes natively |
-//! | `histogram_quantile(φ, …)` (not a `patterns.rs` entry but the legacy planner refused these) | [`AggIntent::HistogramQuantile`] — flagged archive-only via [`AggIntent::archive_only`] |
+//! | `histogram_quantile(φ, …)` (not a `patterns.rs` entry but the legacy planner refused these) | [`AggIntent::Quantile`] — the lowerer maps `histogram_quantile(q, bucket_metric)` to `Quantile { q, accuracy }`; bucket-aware reduction is a physical-planner concern, not an L3 intent. |
 //!
 //! Phase β additionally lifts these archive-only intents from the legacy
 //! planner's "unsupported" branch into the L3 vocabulary so they get a
 //! StreamingConfig entry (routed to the cold tier rather than the warm
-//! sketch tier): [`AggIntent::HistogramQuantile`], [`AggIntent::Absent`],
+//! sketch tier): [`AggIntent::Absent`],
 //! [`AggIntent::Present`], [`AggIntent::Delta`], [`AggIntent::Deriv`],
 //! [`AggIntent::PredictLinear`], [`AggIntent::HoltWinters`],
 //! [`AggIntent::Idelta`], [`AggIntent::Irate`], [`AggIntent::Resets`],

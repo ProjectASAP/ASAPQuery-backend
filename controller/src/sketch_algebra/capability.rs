@@ -12,7 +12,10 @@
 //!   profile (insert / memory / CPU / transmission costs + the logical
 //!   intents the sketch can serve). Read by `algebra/optimizer.rs` for
 //!   cost-based plan rewriting and by `algebra/physical.rs` for stage
-//!   placement.
+//!   placement. Disambiguation: distinct from `schema.rs::SketchStateMetadata`
+//!   (which carries L4 type-system flags `mergeable` / `subtractable` /
+//!   `deletable`) — `SketchCapability` here is the perf / cost-model surface,
+//!   `SketchStateMetadata` is the L4 catalog-flag surface.
 //! - [`Capability`] / [`SketchKindHandle`] — query-side capability tag,
 //!   used by the warm-tier reducer in `asap-query-engine` to dispatch
 //!   PromQL → per-Capability sketch evaluation.
@@ -68,11 +71,18 @@ pub enum Capability {
     /// No inner handle — cardinality has a single canonical family
     /// today (HLL).
     CardinalityApprox,
-    /// Heavy-hitter top-k via CMS-with-heap (or CountSketch + heap).
-    /// `CmsWithHeap` is the canonical handle today; the
-    /// `Any` variant is unused for top-k because the wire format
-    /// distinguishes the heap-bearing variant from raw CMS at ingest
-    /// time.
+    /// Bare per-item frequency estimate (CMS / CountSketch point query,
+    /// no top-k extraction). Heap-LESS — answers `sum by (item) (rate(m[r]))`
+    /// with epsilon accuracy. Distinct from [`Capability::FrequencyTopk`]:
+    /// any heap-bearing variant ALSO satisfies bare frequency (the heap is
+    /// additional info layered on top of the sketch matrix), so
+    /// `is_satisfied_by` allows {CountMin, CountSketch, CmsWithHeap,
+    /// CountSketchWithHeap} on the available side.
+    FrequencyEstimate(SketchKindHandle),
+    /// Heavy-hitter top-k via CMS-with-heap or CountSketch-with-heap.
+    /// Heap-BEARING — only handles that carry an item universe in their
+    /// wire format can answer this. `Any` required matches either
+    /// `CmsWithHeap` or `CountSketchWithHeap`.
     FrequencyTopk(SketchKindHandle),
 }
 
@@ -91,6 +101,10 @@ pub enum SketchKindHandle {
     /// heap is what lets the warm-tier reducer enumerate top-k items
     /// without an external item list.
     CmsWithHeap,
+    /// CountSketch paired with a heavy-hitter heap. Same role as
+    /// `CmsWithHeap` but on the CountSketch substrate (balanced /
+    /// zero-mean error instead of CMS's one-sided bias).
+    CountSketchWithHeap,
     /// "Any implementation that satisfies the family". Analysis-time
     /// wildcard, never indexed against a concrete sketch instance.
     /// Consumed by [`Capability::is_satisfied_by`].
@@ -116,10 +130,24 @@ impl Capability {
             }
             // Cardinality has no inner handle; family match is total.
             (Capability::CardinalityApprox, Capability::CardinalityApprox) => true,
-            // Top-k family: same Any / concrete-match semantics as
-            // quantile.
+            // Top-k family: only heap-bearing handles (CmsWithHeap or
+            // CountSketchWithHeap) qualify on the available side. `Any`
+            // required matches either; a concrete required handle must
+            // match exactly.
             (Capability::FrequencyTopk(req), Capability::FrequencyTopk(have)) => {
-                handles_compatible(*req, *have)
+                is_heap_bearing(*have) && handles_compatible_for_topk(*req, *have)
+            }
+            // Bare frequency: any frequency-family handle works on the
+            // available side — heap-LESS (CountMin / CountSketch) AND
+            // heap-bearing (CmsWithHeap / CountSketchWithHeap) all answer
+            // a point-frequency query (heap is additional info layered on
+            // the sketch matrix). A heap-bearing `FrequencyTopk` indexed
+            // capability ALSO satisfies a bare-frequency required capability.
+            (Capability::FrequencyEstimate(req), Capability::FrequencyEstimate(have)) => {
+                is_frequency_family(*have) && handles_compatible(*req, *have)
+            }
+            (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
+                is_heap_bearing(*have) && handles_compatible(*req, *have)
             }
             _ => false,
         }
@@ -130,6 +158,37 @@ impl Capability {
 /// available handle exactly. Used by [`Capability::is_satisfied_by`].
 fn handles_compatible(required: SketchKindHandle, available: SketchKindHandle) -> bool {
     matches!(required, SketchKindHandle::Any) || required == available
+}
+
+/// `Any` required for top-k means "any heap-bearing handle"; concrete
+/// required must match exactly.
+fn handles_compatible_for_topk(
+    required: SketchKindHandle,
+    available: SketchKindHandle,
+) -> bool {
+    matches!(required, SketchKindHandle::Any) || required == available
+}
+
+/// True when the handle carries a heavy-hitter heap (i.e. it can
+/// enumerate top-k items without an external item list).
+fn is_heap_bearing(h: SketchKindHandle) -> bool {
+    matches!(
+        h,
+        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap
+    )
+}
+
+/// True when the handle belongs to the frequency family — any of
+/// `CountMin` / `CountSketch` (heap-less) or `CmsWithHeap` /
+/// `CountSketchWithHeap` (heap-bearing).
+fn is_frequency_family(h: SketchKindHandle) -> bool {
+    matches!(
+        h,
+        SketchKindHandle::CountMin
+            | SketchKindHandle::CountSketch
+            | SketchKindHandle::CmsWithHeap
+            | SketchKindHandle::CountSketchWithHeap
+    )
 }
 
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
@@ -152,12 +211,14 @@ fn handles_compatible(required: SketchKindHandle, available: SketchKindHandle) -
 /// |---|---|
 /// | `Quantile { q, accuracy }` (accuracy not `Exact`) | `Some(QuantileApprox(Any))` |
 /// | `Quantile { q, accuracy: Exact }` | `None` (exact must use HashAgg/SortAgg) |
+/// | `Min` / `Max` | `Some(QuantileApprox(Any))` — quantile sketches answer min = q(0), max = q(1) |
 /// | `Cardinality { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
 /// | `Cardinality { accuracy: Exact }` | `None` |
 /// | `Count { accuracy }` (same logic as Cardinality) | `Some(CardinalityApprox)` / `None` |
-/// | `TopK { k, accuracy }` | `Some(FrequencyTopk(CmsWithHeap))` |
-/// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
-/// | `Sum` / `Min` / `Max` / `Avg` / `Rate` / `Increase` | `None` |
+/// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
+/// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
+/// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
+/// | `Sum` / `Avg` / `Rate` / `Increase` | `None` |
 /// | Every archive-only intent | `None` |
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     match intent {
@@ -188,34 +249,49 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
                 Some(Capability::CardinalityApprox)
             }
         }
-        AggIntent::TopK { .. } => {
-            // Top-k is intrinsically heavy-hitter — only the
-            // CMS-with-heap variant can enumerate the items. CountMin /
-            // CountSketch without a heap can answer point-frequency but
-            // not top-k.
-            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
-        }
-        AggIntent::Frequency { accuracy } => {
+        AggIntent::TopK { accuracy, .. } => {
             if is_exact(accuracy) {
+                // Exact top-k must use HashAgg+Heap; no warm-tier sketch.
                 None
             } else {
-                // Frequency point-queries use CMS-with-heap as the
-                // canonical family (lets a single sketch family answer
-                // both Frequency and TopK on the same metric).
+                // Top-k is intrinsically heavy-hitter — only heap-bearing
+                // handles can enumerate the items. `CmsWithHeap` is the
+                // canonical handle today; `is_satisfied_by` accepts
+                // either heap-bearing variant against an `Any` required.
                 Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
             }
         }
+        AggIntent::Frequency { accuracy } => {
+            if is_exact(accuracy) {
+                // Exact aggregation — sketch fallback is only meaningful
+                // when raw counters aren't kept at the ingest tier; with
+                // accuracy=Exact the caller wants exact `sum by (label)
+                // (rate(...))`, which routes to archive.
+                None
+            } else {
+                // Bare frequency point-query uses a frequency-family
+                // sketch — any of CMS / CountSketch / CmsWithHeap /
+                // CountSketchWithHeap works (the heap is additional
+                // info that the FrequencyTopk path uses). `Any` here
+                // means the optimizer picks the cheapest indexed sid.
+                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            }
+        }
+        // ── Min / Max via quantile sketches ──────────────────────────
+        // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
+        // out of the box. No dedicated extrema sketch is needed; route
+        // these through the quantile-family handler.
+        AggIntent::Min | AggIntent::Max => {
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        }
         // ── No warm-tier sketch ──────────────────────────────────────
         AggIntent::Sum
-        | AggIntent::Min
-        | AggIntent::Max
         | AggIntent::Avg
         | AggIntent::Rate { .. }
         | AggIntent::Increase { .. } => None,
         // Archive-only intents — never bind to a warm-tier capability;
         // routed to the cold tier (Gorilla / Thanos).
-        AggIntent::HistogramQuantile { .. }
-        | AggIntent::Absent
+        AggIntent::Absent
         | AggIntent::Present
         | AggIntent::Delta { .. }
         | AggIntent::Deriv { .. }
@@ -242,6 +318,17 @@ fn is_exact(accuracy: &AccuracyTarget) -> bool {
 /// planner to check whether a sketch fits within a stage's budget.
 /// Populated from compiled-in defaults via [`default_capability_table`]
 /// or overridden at runtime via [`load_capability_overrides`].
+///
+/// Distinct from
+/// [`crate::sketch_algebra::schema::SketchStateMetadata`] — this struct
+/// is the **perf / feasibility / intent-routing** profile consumed by
+/// the cost model and the optimizer's binding rules. The schema-side
+/// `SketchStateMetadata` carries the **L4 type-system flags**
+/// (`mergeable` / `subtractable` / `deletable`) that gate `SketchMerge` /
+/// `SketchSubtract` / `SketchDelete` at plan-time. The two have
+/// different consumers and different lifecycles — `SketchCapability`
+/// is read at every plan-rewrite call site; `SketchStateMetadata`
+/// is sealed onto each `SketchExpr` edge once the binding rule fires.
 #[derive(Debug, Clone)]
 pub struct SketchCapability {
     /// Insertion throughput (samples/sec at 1 core).
@@ -542,10 +629,30 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_min_max_avg_return_none() {
-        assert_eq!(capability_for(&AggIntent::Min), None);
-        assert_eq!(capability_for(&AggIntent::Max), None);
+    fn capability_for_avg_returns_none() {
+        // Avg is exact at L3 — no warm-tier sketch substitutes for it
+        // today (a sketch-bound `Avg` would fold onto `Quantile{q=0.5}`
+        // only when the cost model allows the relaxation, which is a
+        // follow-up).
         assert_eq!(capability_for(&AggIntent::Avg), None);
+    }
+
+    #[test]
+    fn capability_for_min_returns_quantile_approx() {
+        // Min = quantile(0); DDSketch / KLL answer it directly.
+        assert_eq!(
+            capability_for(&AggIntent::Min),
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        );
+    }
+
+    #[test]
+    fn capability_for_max_returns_quantile_approx() {
+        // Max = quantile(1); DDSketch / KLL answer it directly.
+        assert_eq!(
+            capability_for(&AggIntent::Max),
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        );
     }
 
     #[test]
@@ -577,23 +684,53 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_frequency_approximate_returns_topk_cms_with_heap() {
+    fn capability_for_topk_exact_returns_none() {
+        // Exact top-k must use HashAgg+Heap; no warm-tier sketch.
+        let intent = AggIntent::TopK {
+            k: 10,
+            accuracy: AccuracyTarget::Exact,
+        };
+        assert_eq!(capability_for(&intent), None);
+    }
+
+    #[test]
+    fn frequency_estimate_with_epsilon_returns_frequency_estimate_approx() {
         let intent = AggIntent::Frequency {
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         );
+    }
+
+    #[test]
+    fn frequency_estimate_with_epsilon_delta_returns_frequency_estimate_approx() {
+        let intent = AggIntent::Frequency {
+            accuracy: AccuracyTarget::EpsilonDelta {
+                eps: 0.01,
+                delta: 0.001,
+            },
+        };
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        );
+    }
+
+    #[test]
+    fn frequency_estimate_with_exact_returns_none() {
+        // Exact aggregation routes to archive (sketch fallback only
+        // meaningful when raw counters aren't kept).
+        let intent = AggIntent::Frequency {
+            accuracy: AccuracyTarget::Exact,
+        };
+        assert_eq!(capability_for(&intent), None);
     }
 
     #[test]
     fn capability_for_archive_only_intents_return_none() {
         // Spot-check each archive-only variant.
-        assert_eq!(
-            capability_for(&AggIntent::HistogramQuantile { q: 0.99 }),
-            None,
-        );
         assert_eq!(capability_for(&AggIntent::Absent), None);
         assert_eq!(capability_for(&AggIntent::Present), None);
         assert_eq!(
@@ -663,6 +800,79 @@ mod tests {
             Capability::FrequencyTopk(SketchKindHandle::CountMin);
         assert!(required.is_satisfied_by(&indexed_with_heap));
         assert!(!required.is_satisfied_by(&indexed_no_heap));
+    }
+
+    #[test]
+    fn is_satisfied_by_frequency_topk_rejects_heapless() {
+        // Top-k REQUIRES a heap-bearing handle. Even when the available
+        // capability declares itself as `FrequencyTopk(CountMin)` (an
+        // ill-formed catalog entry), the satisfaction check must reject
+        // it — top-k cannot enumerate items off a heap-less sketch.
+        let required_any = Capability::FrequencyTopk(SketchKindHandle::Any);
+        let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        let indexed_heapless = Capability::FrequencyTopk(SketchKindHandle::CountMin);
+        let indexed_heapless_cs = Capability::FrequencyTopk(SketchKindHandle::CountSketch);
+        assert!(!required_any.is_satisfied_by(&indexed_heapless));
+        assert!(!required_any.is_satisfied_by(&indexed_heapless_cs));
+        assert!(!required_concrete.is_satisfied_by(&indexed_heapless));
+    }
+
+    #[test]
+    fn is_satisfied_by_frequency_topk_any_matches_either_heap() {
+        // `Any` required for top-k accepts either heap-bearing handle.
+        let required = Capability::FrequencyTopk(SketchKindHandle::Any);
+        let cms_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        let cs_heap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        assert!(required.is_satisfied_by(&cms_heap));
+        assert!(required.is_satisfied_by(&cs_heap));
+    }
+
+    #[test]
+    fn is_satisfied_by_frequency_estimate_accepts_heap_bearing() {
+        // Bare frequency point queries can be answered by ANY
+        // frequency-family sketch — heap-less AND heap-bearing both work
+        // (the heap is additional metadata; the underlying CMS / CS
+        // matrix answers the point query either way).
+        let required = Capability::FrequencyEstimate(SketchKindHandle::Any);
+        let cms = Capability::FrequencyEstimate(SketchKindHandle::CountMin);
+        let cs = Capability::FrequencyEstimate(SketchKindHandle::CountSketch);
+        let cms_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        let cs_heap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        assert!(required.is_satisfied_by(&cms));
+        assert!(required.is_satisfied_by(&cs));
+        assert!(required.is_satisfied_by(&cms_heap));
+        assert!(required.is_satisfied_by(&cs_heap));
+    }
+
+    #[test]
+    fn is_satisfied_by_frequency_estimate_rejects_non_frequency_family() {
+        let required = Capability::FrequencyEstimate(SketchKindHandle::Any);
+        // QuantileApprox / CardinalityApprox don't answer frequency.
+        let q = Capability::QuantileApprox(SketchKindHandle::DDSketch);
+        let c = Capability::CardinalityApprox;
+        // FrequencyEstimate with a non-frequency-family handle on the
+        // available side is also rejected (defensive).
+        let bad = Capability::FrequencyEstimate(SketchKindHandle::Hll);
+        assert!(!required.is_satisfied_by(&q));
+        assert!(!required.is_satisfied_by(&c));
+        assert!(!required.is_satisfied_by(&bad));
+    }
+
+    #[test]
+    fn count_sketch_with_heap_handle_round_trips() {
+        // `CountSketchWithHeap` is the CountSketch counterpart to
+        // `CmsWithHeap`. Construct a `FrequencyTopk` capability around
+        // it and verify it satisfies an `Any`-required top-k.
+        let cap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        let required = Capability::FrequencyTopk(SketchKindHandle::Any);
+        assert!(required.is_satisfied_by(&cap));
+        // And the concrete-against-concrete must match exactly.
+        let required_concrete =
+            Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        assert!(required_concrete.is_satisfied_by(&cap));
+        // A different concrete heap-bearing handle must NOT match.
+        let required_cms = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        assert!(!required_cms.is_satisfied_by(&cap));
     }
 
     // ── default_capability_table ─────────────────────────────────────────
