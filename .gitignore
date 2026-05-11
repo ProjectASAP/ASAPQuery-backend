@@ -7,6 +7,6 @@ metadata/
 preprocessed_configs/
 status
 uuid
-store/
+/store/
 
 .claude/
