@@ -35,11 +35,19 @@
 //!   "no data in window" (router falls over).
 //! * [`WarmTierResult`] — per-series timestamped scalar samples
 //!   matching the shape of [`crate::engines::query_result::QueryResult::Matrix`].
-//! * [`extract_promql_call`] — small AST walker that pulls the
-//!   outermost call's function name + numeric args. Lives here
-//!   rather than in `simple/engine.rs` because the existing
-//!   `extract_metric_and_label_keys` already handles the
-//!   metric-and-keys side; this is the function-name + args side.
+//!
+//! ## Controller unification (PromQL-shape recognition)
+//!
+//! The PromQL → `(function_name, args)` AST walker that used to live
+//! here in `promql_extract.rs` has been folded into
+//! [`controller::warm_tier_analysis::analyze_promql_for_warm_tier`].
+//! That function is the single owner of "is this PromQL
+//! warm-tier-answerable" knowledge — it returns a
+//! [`controller::warm_tier_analysis::WarmTierAnalysis`] enumerating
+//! the warm-tier-servable sub-expressions and the explicit
+//! [`controller::warm_tier_analysis::UnsupportedReason`] for the rest.
+//! The reducer keys off the analyzer's `required_capability` rather
+//! than re-string-matching the PromQL function name.
 //!
 //! Phase-5 hybrid stitching (warm `[t0..t1']` + archive
 //! `[t1'..t1]`) and per-window iteration (rather than today's
@@ -59,11 +67,9 @@
 
 pub mod decoders;
 pub mod delta_apply;
-pub mod promql_extract;
 pub mod sketch_reducer;
 
 #[cfg(test)]
 pub mod tests;
 
-pub use promql_extract::{extract_promql_call, PromqlCall};
 pub use sketch_reducer::{SketchReducer, WarmTierError, WarmTierResult};
