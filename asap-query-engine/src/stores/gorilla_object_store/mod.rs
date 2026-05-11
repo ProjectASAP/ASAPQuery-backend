@@ -7,7 +7,7 @@
 //!
 //! ## Module layout (post Step-1 refactor)
 //!
-//! * [`query_engine`] — query planner + per-statistic exact executor (the
+//! * [`archive_query`] — query planner + per-statistic exact executor (the
 //!   merged form of the previous `query_planner.rs` +
 //!   `exact_executor.rs`).
 //! * [`store`] — `GorillaS3Store` (the only `Store` impl after
@@ -30,7 +30,7 @@
 //!
 //! ## Two execution strategies
 //!
-//! Per-statistic dispatch in [`query_engine::ExactExecutor`]:
+//! Per-statistic dispatch in [`archive_query::ExactExecutor`]:
 //!
 //! * **Streaming-additive** — `Sum`, `Count`, `Min`, `Max`, `Rate`,
 //!   `Increase` (and `Avg` derived as Sum/Count). One chunk at a
@@ -41,8 +41,8 @@
 //!   [`GorillaEngineConfig::max_buffered_samples`]; over-budget
 //!   queries fail fast with [`EngineError::TooManySamples`].
 
+pub mod archive_query;
 pub mod postings;
-pub mod query_engine;
 pub mod s3_cost;
 pub mod store;
 
@@ -60,7 +60,7 @@ use crate::data_model::KeyByLabelValues;
 use crate::engines::query_result::{InstantVectorElement, QueryResult};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
-pub use query_engine::{
+pub use archive_query::{
     plan_query, plan_query_at, AdditiveOp, ExactExecutor, LabelMatcher, QueryPlan, QueryStatistic,
 };
 pub use postings::PostingsHits;
@@ -105,7 +105,7 @@ impl Default for GorillaEngineConfig {
 #[derive(Debug, Error)]
 pub enum EngineError {
     /// PromQL string failed to parse, or used a construct outside
-    /// the engine's supported surface (see [`query_engine`]).
+    /// the archive query supported surface (see [`archive_query`]).
     #[error("query planning failed: {0}")]
     Plan(String),
     /// Archive-store fetch / decode failed.
@@ -181,7 +181,7 @@ impl GorillaQueryEngine {
 
     /// Execute a parsed PromQL query against the archive tier.
     ///
-    /// The query string is parsed via [`query_engine::plan_query`],
+    /// The query string is parsed via [`archive_query::plan_query`],
     /// the resulting plan dispatches to either the streaming
     /// additive or the buffered execution path, and the answer is
     /// wrapped with the exact-accuracy envelope + the
@@ -206,7 +206,7 @@ impl GorillaQueryEngine {
     }
 
     async fn execute_inner(&self, query: &str, now_ms: i64) -> Result<QueryResult, EngineError> {
-        let plan = query_engine::plan_query_at(query, now_ms).map_err(EngineError::Plan)?;
+        let plan = archive_query::plan_query_at(query, now_ms).map_err(EngineError::Plan)?;
         debug!(
             metric = plan.metric.as_str(),
             stat = ?plan.statistic,
@@ -326,7 +326,7 @@ impl ExecutionOutcome {
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
-impl crate::routing::engine_router::QueryEngine for GorillaQueryEngine {
+impl crate::routing::query_engine_routing::QueryEngine for GorillaQueryEngine {
     async fn execute(&self, query: &str) -> Result<QueryResult, crate::engines::EngineError> {
         match GorillaQueryEngine::execute(self, query).await {
             Ok(result) => Ok(result),
@@ -341,8 +341,8 @@ impl crate::routing::engine_router::QueryEngine for GorillaQueryEngine {
         }
     }
 
-    fn capabilities(&self) -> crate::routing::engine_router::EngineCapabilities {
-        crate::routing::engine_router::EngineCapabilities {
+    fn capabilities(&self) -> crate::routing::query_engine_routing::EngineCapabilities {
+        crate::routing::query_engine_routing::EngineCapabilities {
             data_source_id: asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
             storage_backend: asap_types::StorageBackend::GorillaObjectStore,
             // The buffered-aggregate budget gives a natural ceiling: each

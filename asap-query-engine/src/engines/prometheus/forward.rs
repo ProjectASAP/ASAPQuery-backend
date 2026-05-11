@@ -45,7 +45,7 @@ use tracing::{debug, warn};
 
 use crate::data_model::KeyByLabelValues;
 use crate::engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
-use crate::routing::engine_router::{EngineCapabilities, QueryEngine};
+use crate::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
 // ---------------------------------------------------------------------------
@@ -667,7 +667,7 @@ mod tests {
     };
     use super::*;
     use crate::engines::query_result::QueryResult;
-    use crate::routing::engine_router::{EngineRouter, QueryEngine as RouterQueryEngine};
+    use crate::routing::query_engine_routing::{EngineRouter, QueryEngine as RouterQueryEngine};
     use std::sync::Arc;
 
     fn config_for(url: &str) -> PrometheusForwardConfig {

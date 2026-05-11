@@ -1,9 +1,9 @@
-//! `GorillaQueryEngine` planner + per-statistic exact executor.
+//! Gorilla archive query planner + per-statistic exact executor.
 //!
 //! Step-1 of the JSONL-deprecation refactor merged the previous
 //! `query_planner.rs` (PromQL → [`QueryPlan`]) and `exact_executor.rs`
 //! (per-statistic `[`ExactExecutor`]` dispatch) into a single
-//! `engine.rs` so the engine's data flow is readable top-to-bottom
+//! `archive_query.rs` so the archive data flow is readable top-to-bottom
 //! in one file: parse PromQL → plan → execute.
 //!
 //! The two halves keep their existing structure inside the merged

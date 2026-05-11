@@ -26,7 +26,6 @@ pub mod prometheus;
 pub mod query_result;
 pub mod thanos_query;
 pub mod timeline_dispatch;
-pub mod warm_tier;
 pub mod window_merger;
 
 pub use asap_query::{ASAPQueryEngine, SimpleEngine};

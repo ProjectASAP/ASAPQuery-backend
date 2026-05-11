@@ -1353,7 +1353,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Phase-5: storage-backend routing
     //
-    // The Phase-5 `EngineRouter` (see `asap-query-engine/src/engines/router.rs`)
+    // The Phase-5 `EngineRouter` (see `asap-query-engine/src/routing/query_engine_routing.rs`)
     // consults `compatible_storage_backends(stat, accuracy, metric_storage)`
     // to pick a backend. These tests pin the routing matrix so the dispatcher
     // stays in lock-step with the design doc §8.
@@ -1515,7 +1515,9 @@ mod tests {
                     );
                     // The expected head is determined by `(metric_storage_config, accuracy)`:
                     let expected_head = match (cfg, acc) {
-                        (StorageBackend::GorillaObjectStore, _) => StorageBackend::GorillaObjectStore,
+                        (StorageBackend::GorillaObjectStore, _) => {
+                            StorageBackend::GorillaObjectStore
+                        }
                         (StorageBackend::SketchStore, _) => StorageBackend::SketchStore,
                         (StorageBackend::DoubleWrite, AccuracyTarget::Exact) => {
                             StorageBackend::GorillaObjectStore

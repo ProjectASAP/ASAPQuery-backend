@@ -57,11 +57,11 @@ use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::HllSketch;
 use asap_sketchlib::sketches::kll::KllSketch;
 
-use crate::engines::warm_tier::decoders::{
+use crate::engines::asap_query::warm_tier::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
     decode_cs_from_msgpack, decode_cs_from_proto,
 };
-use crate::engines::warm_tier::delta_apply::{
+use crate::engines::asap_query::warm_tier::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
 use crate::stores::sketch_db::sketch_index::{
@@ -345,8 +345,7 @@ impl<'a> SketchReducer<'a> {
             // entry point, which the current `&[f64]` signature can't carry.
             if family == QueryFamily::FrequencyEstimate {
                 for ts in series_list {
-                    let mut samples_out: Vec<(i64, f64)> =
-                        Vec::with_capacity(ts.samples.len());
+                    let mut samples_out: Vec<(i64, f64)> = Vec::with_capacity(ts.samples.len());
                     for (w_end, state) in ts.samples.iter() {
                         any_window = true;
                         let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
@@ -356,8 +355,7 @@ impl<'a> SketchReducer<'a> {
                         if w > cov_hi {
                             cov_hi = w;
                         }
-                        let total =
-                            decode_frequency_total(sid, meta.sketch_kind, state)?;
+                        let total = decode_frequency_total(sid, meta.sketch_kind, state)?;
                         samples_out.push((*w_end, total));
                     }
                     out_series.push((ts.series_label_values, samples_out));
@@ -391,8 +389,7 @@ impl<'a> SketchReducer<'a> {
                         cov_hi = w_end_u64;
                     }
                     let cms_heap = match meta.sketch_kind {
-                        SketchKindHandle::CmsWithHeap
-                        | SketchKindHandle::CountSketchWithHeap => {
+                        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
                             // Both heap-bearing variants serialize the
                             // outer `CountMinSketchWithHeap` envelope via
                             // msgpack (`CountSketchWithHeap` reuses the
@@ -876,19 +873,19 @@ fn decode_frequency_total(
     };
     match sketch_kind {
         SketchKindHandle::CountMin => {
-            let cms = match state.encoding {
-                SketchEncoding::ProtoFull => {
-                    decode_cms_from_proto(&state.bytes).map_err(|e| to_err(e, state.encoding))?
-                }
-                SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
-                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-                    return Err(to_err(
-                        "CMS delta encodings not implemented in warm-tier reducer".to_string(),
-                        state.encoding,
-                    ));
-                }
-            };
+            let cms =
+                match state.encoding {
+                    SketchEncoding::ProtoFull => decode_cms_from_proto(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                        return Err(to_err(
+                            "CMS delta encodings not implemented in warm-tier reducer".to_string(),
+                            state.encoding,
+                        ));
+                    }
+                };
             Ok(row0_sum_cms(&cms))
         }
         SketchKindHandle::CountSketch => {
@@ -896,8 +893,9 @@ fn decode_frequency_total(
                 SketchEncoding::ProtoFull => {
                     decode_cs_from_proto(&state.bytes).map_err(|e| to_err(e, state.encoding))?
                 }
-                SketchEncoding::MsgpackFull => decode_cs_from_msgpack(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackFull => {
+                    decode_cs_from_msgpack(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
                 SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
                     return Err(to_err(
                         "CountSketch delta encodings not implemented in warm-tier reducer"

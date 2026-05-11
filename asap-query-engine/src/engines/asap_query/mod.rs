@@ -14,6 +14,7 @@
 //! `ASAPQueryEngine`.
 
 pub mod engine;
+pub mod warm_tier;
 
 #[cfg(test)]
 pub mod tests;
@@ -22,3 +23,4 @@ pub use engine::{
     ASAPQueryEngine, QueryExecutionContext, QueryMetadata, QueryTimestamps, SimpleEngine,
     StoreQueryParams, StoreQueryPlan,
 };
+pub use warm_tier::{SketchReducer, WarmTierError, WarmTierResult};

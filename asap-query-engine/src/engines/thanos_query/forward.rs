@@ -41,7 +41,7 @@ use tracing::{debug, warn};
 
 use crate::data_model::KeyByLabelValues;
 use crate::engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
-use crate::routing::engine_router::{EngineCapabilities, QueryEngine};
+use crate::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
 // ---------------------------------------------------------------------------
@@ -559,7 +559,7 @@ pub fn engine_from_env() -> Result<Option<ThanosQueryEngine>, ThanosQueryError> 
 pub mod test_support {
     //! Test-only helpers for spinning up an in-process mock
     //! `thanos-query` sidecar. Used by the unit + integration
-    //! tests below and by the `routing/engine_router.rs` tests
+    //! tests below and by the `routing/query_engine_routing.rs` tests
     //! once they grow Path A2 coverage.
 
     use std::net::SocketAddr;

@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use crate::engines::query_result::QueryResult;
 use crate::stores::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
 
-use super::query_engine::{plan_query_at, QueryStatistic};
+use super::archive_query::{plan_query_at, QueryStatistic};
 use super::store::{ChunkRef, RawSample, Store, StoreError};
 use super::{
     wrap_result, EngineError, ExactExecutor, ExecutionOutcome, GorillaEngineConfig,

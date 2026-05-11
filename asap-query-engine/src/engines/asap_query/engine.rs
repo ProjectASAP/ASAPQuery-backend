@@ -303,7 +303,7 @@ pub struct SimpleEngine {
     /// When `None` (no archive engine wired), the engine returns the
     /// warm answer as-is; the existing `EngineRouter` failover handles
     /// the rest of the routing matrix.
-    archive_engine: Option<Arc<dyn crate::routing::engine_router::QueryEngine>>,
+    archive_engine: Option<Arc<dyn crate::routing::query_engine_routing::QueryEngine>>,
 }
 
 /// Public production name for the warm-tier sketch query engine.
@@ -502,7 +502,7 @@ impl SimpleEngine {
     /// When `None`, the engine returns whatever the warm tier covers.
     pub fn with_archive_engine(
         mut self,
-        archive: Arc<dyn crate::routing::engine_router::QueryEngine>,
+        archive: Arc<dyn crate::routing::query_engine_routing::QueryEngine>,
     ) -> Self {
         self.archive_engine = Some(archive);
         self
@@ -3507,7 +3507,7 @@ impl SimpleEngine {
 // to the next compatible backend.
 // ---------------------------------------------------------------------------
 
-/// Adapt a [`crate::engines::warm_tier::WarmTierResult`] to the engine's
+/// Adapt a [`crate::engines::asap_query::warm_tier::WarmTierResult`] to the engine's
 /// existing `QueryResult` shape. The reducer hands back per-series
 /// time-stamped scalars; we materialize them as a
 /// `QueryResult::Matrix` whose [`crate::engines::query_result::RangeVectorElement`]s
@@ -3581,7 +3581,7 @@ fn stitch_warm_and_archive(
 }
 
 fn warm_tier_result_to_query_result(
-    result: crate::engines::warm_tier::WarmTierResult,
+    result: crate::engines::asap_query::warm_tier::WarmTierResult,
     _now_ms: u64,
 ) -> crate::engines::query_result::QueryResult {
     use crate::data_model::KeyByLabelValues;
@@ -3621,7 +3621,7 @@ fn warm_tier_result_to_query_result(
 }
 
 #[async_trait::async_trait]
-impl crate::routing::engine_router::QueryEngine for SimpleEngine {
+impl crate::routing::query_engine_routing::QueryEngine for SimpleEngine {
     async fn execute(
         &self,
         query: &str,
@@ -3701,14 +3701,15 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
             // for instant-vector candidates (range_seconds == 0).
             const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
 
-            let reducer = crate::engines::warm_tier::SketchReducer::new(idx);
+            let reducer = crate::engines::asap_query::warm_tier::SketchReducer::new(idx);
             // Multi-candidate aggregation is deferred (single-result
             // shapes today). On the first reducer error we surface
             // CapabilityMiss; on Ok we keep the result for the
             // hybrid-stitch path below. (When more than one
             // candidate is supported, a follow-up will fold
             // per-candidate WarmTierResults.)
-            let mut combined_result: Option<crate::engines::warm_tier::WarmTierResult> = None;
+            let mut combined_result: Option<crate::engines::asap_query::warm_tier::WarmTierResult> =
+                None;
             let mut combined_t0: u64 = u64::MAX;
 
             for candidate in &analysis.candidates {
@@ -3787,7 +3788,11 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                     now_ms,
                 ) {
                     Ok(r) => r,
-                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(name)) => {
+                    Err(
+                        crate::engines::asap_query::warm_tier::WarmTierError::UnsupportedFunction(
+                            name,
+                        ),
+                    ) => {
                         return Err(crate::engines::EngineError::capability_miss(
                             asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
@@ -3796,7 +3801,7 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             ),
                         ));
                     }
-                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedCapability {
+                    Err(crate::engines::asap_query::warm_tier::WarmTierError::UnsupportedCapability {
                         function,
                         capability,
                     }) => {
@@ -3808,7 +3813,7 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             ),
                         ));
                     }
-                    Err(crate::engines::warm_tier::WarmTierError::DeserializeFailure {
+                    Err(crate::engines::asap_query::warm_tier::WarmTierError::DeserializeFailure {
                         sid,
                         encoding,
                         reason,
@@ -3822,7 +3827,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             ),
                         ));
                     }
-                    Err(crate::engines::warm_tier::WarmTierError::NoData { metric_name: m }) => {
+                    Err(crate::engines::asap_query::warm_tier::WarmTierError::NoData {
+                        metric_name: m,
+                    }) => {
                         return Err(crate::engines::EngineError::capability_miss(
                             asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
@@ -3831,7 +3838,7 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             ),
                         ));
                     }
-                    Err(crate::engines::warm_tier::WarmTierError::MissingHeap {
+                    Err(crate::engines::asap_query::warm_tier::WarmTierError::MissingHeap {
                         sid,
                         sketch_kind,
                     }) => {
@@ -3891,8 +3898,8 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
         }
     }
 
-    fn capabilities(&self) -> crate::routing::engine_router::EngineCapabilities {
-        crate::routing::engine_router::EngineCapabilities {
+    fn capabilities(&self) -> crate::routing::query_engine_routing::EngineCapabilities {
+        crate::routing::query_engine_routing::EngineCapabilities {
             data_source_id: asap_types::StorageBackend::SketchStore.data_source_id(),
             storage_backend: asap_types::StorageBackend::SketchStore,
             // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
@@ -6147,7 +6154,7 @@ mod warm_tier_classify_tests {
     use super::*;
     use crate::data_model::{CleanupPolicy, HotReloadStreamingConfig, InferenceConfig};
     use crate::engines::EngineError;
-    use crate::routing::engine_router::QueryEngine as _;
+    use crate::routing::query_engine_routing::QueryEngine as _;
     use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use crate::stores::sketch_db::sketch_index::{
         AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,

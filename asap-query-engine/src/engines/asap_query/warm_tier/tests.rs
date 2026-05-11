@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
 
-use crate::engines::warm_tier::{SketchReducer, WarmTierError};
+use crate::engines::asap_query::warm_tier::{SketchReducer, WarmTierError};
 use crate::stores::sketch_db::sketch_index::{
     AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchIndex, SketchInstanceMetadata,
     SketchKindHandle, SketchSampleState,
