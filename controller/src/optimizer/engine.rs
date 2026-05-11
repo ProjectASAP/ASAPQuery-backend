@@ -992,6 +992,92 @@ fn default_rules() -> Vec<Box<dyn RewriteRule>> {
     ]
 }
 
+/// Identical to [`default_rules`] but typed as `Vec<Box<dyn OptimizerRule>>`
+/// so callers that want the shared rule metadata surface (`name` +
+/// `category`) can iterate over the same concrete rule set without
+/// duplicating the list. Used by the future deployment-model rule-set
+/// selection table (see `crate::deployment_model::DeploymentModel::rules`).
+pub fn default_rules_as_optimizer_rules()
+    -> Vec<Box<dyn crate::optimizer::trait_def::OptimizerRule>>
+{
+    vec![
+        Box::new(PredicatePushDown),
+        Box::new(FilterWindowSwap),
+        Box::new(HLLDedupElim),
+        Box::new(WindowMerge),
+        Box::new(PartitionElim),
+        Box::new(TopKFusion),
+        Box::new(HistogramQuantileFusion),
+        Box::new(MergeLifting),
+        Box::new(SetOpFusion),
+        Box::new(HydraConversion),
+        Box::new(SubqueryDecorrelation),
+        Box::new(CommonSubexprElim),
+    ]
+}
+
+// ── OptimizerRule blanket impls for engine rules ───────────────────────────────
+//
+// The legacy `RewriteRule` trait's surface (`try_rewrite` over the legacy
+// `QueryExpr`) is unique to the legacy IR — it can't be unified with the
+// canonical-IR Phase-C `Rule` trait at the `try_rewrite`/`apply` level.
+// What CAN be unified is the rule-metadata surface (`name`, `category`).
+// Per-rule `OptimizerRule` impls below lift each concrete engine rule
+// into the shared metadata surface so driver code can iterate over a
+// `&[Box<dyn OptimizerRule>]` regardless of which family the rule
+// belongs to.
+
+use crate::optimizer::trait_def::{OptimizerRule, RuleCategory};
+
+impl OptimizerRule for PredicatePushDown {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::PushDown }
+}
+impl OptimizerRule for FilterWindowSwap {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::PushDown }
+}
+impl OptimizerRule for HLLDedupElim {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Elim }
+}
+impl OptimizerRule for WindowMerge {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
+}
+impl OptimizerRule for PartitionElim {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Elim }
+}
+impl OptimizerRule for TopKFusion {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
+}
+impl OptimizerRule for HistogramQuantileFusion {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
+}
+impl OptimizerRule for MergeLifting {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::PushDown }
+}
+impl OptimizerRule for SetOpFusion {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
+}
+impl OptimizerRule for HydraConversion {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
+}
+impl OptimizerRule for SubqueryDecorrelation {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Decorrelate }
+}
+impl OptimizerRule for CommonSubexprElim {
+    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
+    fn category(&self) -> RuleCategory { RuleCategory::Cse }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

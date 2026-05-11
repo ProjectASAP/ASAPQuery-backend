@@ -80,101 +80,14 @@ pub mod types;
 pub mod types_v2;
 pub mod workload;
 
-/// Back-compat alias — the legacy `crate::config` module surface,
-/// re-exported from its new homes ([`emit`] for the per-deployment-model
-/// emitters and [`workload`] for `WorkloadRegistry`). Refactor 2026-05
-/// introduced this so `main.rs` keeps using `controller::config::*`
-/// without source churn.
-pub use emit as config;
-
-// Refactor 2026-05: the legacy `analyzer` and `planner` module paths
-// resolve into `pipeline` and the new `optimizer` + `physical` split
-// respectively. Keeping `analyzer` as a module alias preserves the
-// historical name on the `crate::analyzer::*` path for downstream
-// callers (`controller::analyzer::QuerySpec` is the JSON-facing type
-// in `main.rs` and the HTTP route handlers).
-pub use pipeline as analyzer;
-
-/// Back-compat shim — the legacy `crate::algebra` module surface,
-/// re-exported from its new homes (`intent_algebra::legacy_expr`,
-/// `intent_algebra::legacy_lower`, `optimizer::engine`,
-/// `physical::sketch_catalog`, `physical::planner`,
-/// `physical::allocator`, `physical::plan`).
-///
-/// Refactor 2026-05 introduced this shim so `main.rs` and other
-/// consumers can keep using `algebra::QueryOptimizer`,
-/// `algebra::SketchAllocator`, `algebra::physical::*`,
-/// `algebra::optimizer::DeploymentConstraints`, etc. without source
-/// churn. Future cleanup should migrate call sites to the new paths
-/// and delete this shim.
-pub mod algebra {
-    pub use crate::intent_algebra::legacy_expr as expr;
-    pub use crate::intent_algebra::legacy_lower as lower;
-    pub use crate::physical::sketch_catalog as directory;
-    pub use crate::physical::planner as physical;
-    pub use crate::physical::allocator;
-    pub use crate::physical::plan;
-    pub use crate::optimizer::engine as optimizer;
-
-    pub use crate::physical::allocator::SketchAllocator;
-    pub use crate::physical::plan::{
-        CostEstimate, ExecutionMode, PipelineStage, PlanNode, PlanSummary,
-    };
-    pub use crate::optimizer::engine::QueryOptimizer;
-    pub use crate::intent_algebra::legacy_expr::{
-        AggFunc, AggIntent, BinaryOpKind, QueryExpr, ScalarExpr, WindowKind, WindowSpec,
-    };
-}
-
-/// Back-compat shim — the legacy `crate::stage_split` module surface,
-/// re-exported from its new home [`physical::colored_dag`].
-///
-/// Refactor 2026-05 moved `controller/src/stage_split/` into
-/// `controller/src/physical/colored_dag/` so the L5 typed colouring
-/// framework sits beneath the `physical` umbrella. The alias preserves
-/// `controller::stage_split::*` and `crate::stage_split::*` paths.
-pub use physical::colored_dag as stage_split;
-
-/// Back-compat shim — the legacy `crate::planner` module surface,
-/// re-exported from its new homes:
-///
-/// - `planner::cost_model`, `planner::delta_cost_model`,
-///   `planner::online_cost_model`, `planner::pareto`, `planner::tco`,
-///   `planner::wire_cost` → [`optimizer::cost`] (+ submodules).
-/// - `planner::rules` → [`optimizer::rules`].
-/// - `planner::baseline_planner` → [`optimizer::baseline`].
-/// - `planner::stage_split` → [`physical::stage_split`].
-///
-/// Refactor 2026-05 introduced this shim to avoid touching ~40
-/// `crate::planner::*` sites in `main.rs` / `replan.rs` / tests.
-/// Future cleanup should migrate call sites to the new paths and
-/// delete this shim.
-pub mod planner {
-    pub use crate::optimizer::baseline as baseline_planner;
-    pub use crate::optimizer::cost as cost_model;
-    pub use crate::optimizer::cost::delta as delta_cost_model;
-    pub use crate::optimizer::cost::online as online_cost_model;
-    pub use crate::optimizer::cost::pareto;
-    pub use crate::optimizer::cost::tco;
-    pub use crate::optimizer::cost::wire as wire_cost;
-    pub use crate::optimizer::rules;
-    pub use crate::physical::stage_split;
-
-    // Top-level convenience re-exports that historically lived at
-    // `crate::planner::*`. The legacy `planner/mod.rs` was 19 lines —
-    // these are the symbols it surfaced.
-    pub use crate::optimizer::baseline::BaselinePlanner;
-    pub use crate::optimizer::cost::CostModelPlanner;
-    pub use crate::optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStore};
-    pub use crate::optimizer::cost::pareto::{
-        pareto_frontier, select_best, ObjectiveWeights, ParetoPoint,
-    };
-    pub use crate::optimizer::cost::wire::{
-        break_even_samples, est_wire_bytes_per_window_per_series, select_bind_mode, BindMode,
-        SketchWireCost, WireCostTable, WireWorkload,
-    };
-    pub use crate::optimizer::rules::RulesPlanner;
-}
+// 2026-05 layered-cleanup follow-up: the back-compat shims previously
+// defined here (`pub use emit as config`, `pub use pipeline as analyzer`,
+// `pub mod algebra { … }`, `pub use physical::colored_dag as stage_split`,
+// `pub mod planner { … }`) have been removed. `main.rs` and other
+// consumers now reference the canonical module names directly
+// (`emit`, `pipeline`, `intent_algebra::legacy_expr`, `optimizer`,
+// `physical`, `physical::colored_dag`, etc.) per the layered-cleanup
+// follow-up task.
 /// PromQL → warm-tier candidate analyzer. Phase-9 unification of the
 /// per-`Capability` dispatch knowledge that previously lived in
 /// `asap-query-engine/src/engines/warm_tier/promql_extract.rs`. See

@@ -36,7 +36,10 @@ pub use stage_config::{
 };
 pub use otap::emit_otap_dag_yaml;
 pub use telegraf::emit_telegraf_toml;
-pub use trait_def::PlanEmitter;
+pub use trait_def::{
+    InferenceConfigEmitter, InferenceConfigInput, OpampEmitter, OpampGatewayEmitter,
+    PlanEmitter, StreamingConfigEmitter,
+};
 
 // Refactor 2026-05: design.md §5 puts `WorkloadRegistry` next to
 // `emit`, not inside it. The new home is `crate::workload`; we re-export
@@ -284,7 +287,7 @@ pub fn collect_metric_to_family(
         let Some((workload, _wc)) = workload_store.get(&entry.metric_name) else {
             continue;
         };
-        let Some(sketch_expr) = crate::planner::rules::bind_workload_typed(&workload) else {
+        let Some(sketch_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
             // `http_requests_total` and other raw-passthrough metrics
             // land here — correctly excluded so they fall through to
             // the routing connector's default `metrics/raw_passthrough`
