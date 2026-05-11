@@ -11,7 +11,9 @@ fn promql_language_id_is_promql() {
 
 #[test]
 fn promql_language_parses_basic() {
-    let ast = PromQLLanguage.parse("up").expect("PromQL parse should succeed");
+    let ast = PromQLLanguage
+        .parse("up")
+        .expect("PromQL parse should succeed");
     assert!(ast.is_promql(), "expected PromQL variant");
     let promql = ast.as_promql().unwrap();
     assert_eq!(promql.summary().metric_name, "up");

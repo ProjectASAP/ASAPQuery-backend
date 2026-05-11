@@ -17,8 +17,8 @@ use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
 
 use crate::engines::warm_tier::{SketchReducer, WarmTierError};
 use crate::stores::sketch_db::sketch_index::{
-    AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchIndex,
-    SketchInstanceMetadata, SketchKindHandle, SketchSampleState,
+    AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchIndex, SketchInstanceMetadata,
+    SketchKindHandle, SketchSampleState,
 };
 
 // ---------------------------------------------------------------------------
@@ -448,10 +448,7 @@ fn multi_series_one_per_label_value() {
 use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
 
 fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
-    let cfg = SketchConfig::CountMin {
-        rows: 4,
-        cols: 256,
-    };
+    let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
     SketchInstanceMetadata {
         sid,
         metric_name: "endpoint_hits".to_string(),
@@ -465,10 +462,7 @@ fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
 }
 
 fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
-    let cfg = SketchConfig::CountMin {
-        rows: 4,
-        cols: 256,
-    };
+    let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
     SketchInstanceMetadata {
         sid,
         metric_name: "endpoint_hits".to_string(),
@@ -560,7 +554,10 @@ fn cms_without_heap_returns_missing_heap() {
         .evaluate(&[sid], "topk", &[5.0], 1000, 1010)
         .expect_err("topk against CountMin (no heap) must surface MissingHeap");
     match err {
-        WarmTierError::MissingHeap { sid: s, sketch_kind } => {
+        WarmTierError::MissingHeap {
+            sid: s,
+            sketch_kind,
+        } => {
             assert_eq!(s, sid);
             assert_eq!(sketch_kind, SketchKindHandle::CountMin);
         }
@@ -678,13 +675,7 @@ fn hll_cumulative_full_plus_one_delta() {
 
     let reducer = SketchReducer::new(&idx);
     let result = reducer
-        .evaluate(
-            &[sid],
-            "count_distinct_over_time",
-            &[],
-            1000,
-            1020,
-        )
+        .evaluate(&[sid], "count_distinct_over_time", &[], 1000, 1020)
         .expect("cumulative HLL evaluate should succeed");
     assert_eq!(result.series.len(), 1);
     let (_, samples) = &result.series[0];
@@ -708,7 +699,7 @@ fn hll_cumulative_full_plus_one_delta() {
 // We don't drive the full SimpleEngine here (that would require
 // constructing the whole streaming-config plumbing). Instead we exercise
 // the `stitch_warm_and_archive` helper directly via a small wrapper
-// test in `engines::simple::tests` would be ideal — but to keep this
+// test in `engines::asap_query::tests` would be ideal — but to keep this
 // PR additive, we verify the `coverage` field is populated correctly
 // on a multi-window evaluate so the downstream stitch path has the
 // information it needs.
@@ -732,7 +723,12 @@ fn coverage_reports_observed_window_range() {
         let bytes = encode_ddsketch(&sk);
         let window_start = 100 + (i as u64) * 100;
         let window_end = window_start + 100;
-        idx.append_sample(sid, BTreeMap::new(), (window_start, window_end), proto_full(bytes));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (window_start, window_end),
+            proto_full(bytes),
+        );
     }
 
     let reducer = SketchReducer::new(&idx);

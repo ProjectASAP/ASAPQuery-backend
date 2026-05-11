@@ -4,10 +4,8 @@
 
 use std::time::Duration;
 
-use crate::intent_algebra::{
-    AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind,
-};
 use crate::intent_algebra::schema::{Column, DataType};
+use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::{
@@ -69,9 +67,7 @@ fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
 
 #[test]
 fn sketch_expr_serde_roundtrip() {
-    use crate::sketch_algebra::params::{
-        CmsParams, CountSketchParams, DDSketchParams, HllParams,
-    };
+    use crate::sketch_algebra::params::{CmsParams, CountSketchParams, DDSketchParams, HllParams};
     let cases = vec![
         SketchExpr::Logical(windowed_scan()),
         SketchExpr::SketchAgg {
@@ -154,7 +150,10 @@ fn bind_kll_quantile_basic() {
                 } => {
                     assert_eq!(sketch_type, SketchKind::Kll);
                     assert_eq!(params, SketchParams::Kll(KllParams { k: 200 }));
-                    assert!(matches!(*child, SketchExpr::Logical(QueryExpr::Window { .. })));
+                    assert!(matches!(
+                        *child,
+                        SketchExpr::Logical(QueryExpr::Window { .. })
+                    ));
                 }
                 other => panic!("expected SketchAgg, got {other:?}"),
             }
@@ -198,8 +197,8 @@ fn bind_ddsketch_quantile_basic() {
 #[test]
 fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
-    let bound =
-        bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("bind_query_expr should not error");
+    let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
+        .expect("bind_query_expr should not error");
     match bound {
         SketchExpr::SketchEstimate { child, .. } => match *child {
             SketchExpr::SketchAgg { sketch_type, .. } => {
@@ -249,7 +248,10 @@ fn bind_cms_topk_basic() {
                     assert_eq!(sketch_type, SketchKind::CountSketch);
                     match params {
                         SketchParams::CountSketch(p) => {
-                            assert!(p.with_heap, "TopK binding must enable the heavy-hitter heap");
+                            assert!(
+                                p.with_heap,
+                                "TopK binding must enable the heavy-hitter heap"
+                            );
                             assert!(p.w >= 2);
                             assert!(p.d >= 1);
                         }
@@ -526,8 +528,8 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
 /// it under the supplied accuracy target; `bind_query_expr` is the L3→L4
 /// bottom-up walk.
 fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> SketchExpr {
-    let parsed = crate::query_parser::parse_query(query)
-        .unwrap_or_else(|e| panic!("parse {query}: {e}"));
+    let parsed =
+        crate::query_parser::parse_query(query).unwrap_or_else(|e| panic!("parse {query}: {e}"));
     let qe = crate::intent_algebra::lower_parsed_query(&parsed, accuracy.clone())
         .unwrap_or_else(|e| panic!("lower {query}: {e}"));
     bind_query_expr(&qe, accuracy).unwrap_or_else(|e| panic!("bind {query}: {e}"))
@@ -540,7 +542,9 @@ fn collect_sketch_kinds(expr: &SketchExpr) -> Vec<SketchKind> {
     let mut out = Vec::new();
     fn walk(e: &SketchExpr, out: &mut Vec<SketchKind>) {
         match e {
-            SketchExpr::SketchAgg { sketch_type, child, .. } => {
+            SketchExpr::SketchAgg {
+                sketch_type, child, ..
+            } => {
                 out.push(sketch_type.clone());
                 walk(child, out);
             }
@@ -684,7 +688,10 @@ fn phase_b_e2e_rate_falls_through_to_logical() {
         AccuracyTarget::Epsilon(0.01),
     );
     assert!(collect_sketch_kinds(&bound).is_empty());
-    assert!(!binding_is_archive(&bound), "Rate is warm-tier, not archive");
+    assert!(
+        !binding_is_archive(&bound),
+        "Rate is warm-tier, not archive"
+    );
 }
 
 /// `topk.yaml` — `topk(10, sum by (label) (rate(...))`. The legacy

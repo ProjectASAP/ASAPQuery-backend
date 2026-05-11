@@ -21,11 +21,11 @@
 //! | [`topology`] | Re-exports `StageId` + `Topology` from [`colored_dag::stage_id`] — design.md §5 entry point for deployment-topology descriptors |
 
 pub mod allocator;
+pub mod colored_dag;
 pub mod plan;
 pub mod planner;
 pub mod sketch_catalog;
 pub mod stage_split;
-pub mod colored_dag;
 pub mod topology;
 
 // Convenience re-exports — preserve the surface that consumers of the

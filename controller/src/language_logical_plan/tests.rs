@@ -7,7 +7,9 @@ use crate::types::AggType;
 use crate::types_v2::QueryLanguage;
 
 fn parse_promql(src: &str) -> LanguageAst {
-    PromQLLanguage.parse(src).expect("PromQL parse should succeed")
+    PromQLLanguage
+        .parse(src)
+        .expect("PromQL parse should succeed")
 }
 
 #[test]
@@ -22,9 +24,7 @@ fn lower_promql_to_logical_plan_basic() {
 
 #[test]
 fn lower_promql_quantile_preserves_summary() {
-    let ast = parse_promql(
-        "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
-    );
+    let ast = parse_promql("quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])");
     let plan = lower_to_logical_plan(&ast).unwrap();
     let s = plan.summary();
     assert_eq!(s.metric_name, "http_request_duration");
@@ -38,22 +38,21 @@ fn lower_promql_quantile_preserves_summary() {
 fn lower_promql_keeps_algebra_tree_for_l3() {
     // The PromQL L2 tree IS the existing `QueryExpr`; assert that the
     // tree shape matches what `parse_query_expr` would have produced.
-    let ast = parse_promql(
-        "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
-    );
+    let ast = parse_promql("quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])");
     let plan = lower_to_logical_plan(&ast).unwrap();
     let tree = plan.as_promql_tree().expect("PromQL plan");
     assert!(matches!(
         tree,
-        QueryExpr::WindowedAgg { agg: AggIntent::Quantile { .. }, .. }
+        QueryExpr::WindowedAgg {
+            agg: AggIntent::Quantile { .. },
+            ..
+        }
     ));
 }
 
 #[test]
 fn lower_promql_topk_extracts_groupby() {
-    let ast = parse_promql(
-        "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))",
-    );
+    let ast = parse_promql("topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))");
     let plan = lower_to_logical_plan(&ast).unwrap();
     let s = plan.summary();
     assert_eq!(s.metric_name, "requests");
@@ -68,7 +67,9 @@ fn lower_unsupported_language_errors_cleanly() {
     // smoke test is: stub backends fail at L1 with `Unimplemented`, and
     // the type system rules out passing them to L2 lowering. We assert
     // that contract here.
-    let err = crate::query_parser::language::SqlLanguage.parse("SELECT 1").unwrap_err();
+    let err = crate::query_parser::language::SqlLanguage
+        .parse("SELECT 1")
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::query_parser::language::ParseError::Unimplemented(_)

@@ -9,7 +9,7 @@
 //! * **Hot** = the `SimpleEngine` handled the query from live
 //!   sketch-backed state.
 //! * **Cold** = the query was answered from the Gorilla archive
-//!   tier ([`crate::engines::gorilla::GorillaQueryEngine`]).
+//!   tier ([`crate::stores::gorilla_object_store::GorillaQueryEngine`]).
 //!
 //! The "shape" label is the parsed query's root op (`sum`,
 //! `count`, `avg`, `selector`, ...) — low-cardinality by design,

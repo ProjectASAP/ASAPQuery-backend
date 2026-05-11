@@ -182,8 +182,7 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
         handle_http_requests: true,
         adapter_config,
     };
-    let server =
-        HttpServer::new(config, engine, store).with_hot_reload_config(hot_reload.clone());
+    let server = HttpServer::new(config, engine, store).with_hot_reload_config(hot_reload.clone());
     server
         .start_test_server()
         .await

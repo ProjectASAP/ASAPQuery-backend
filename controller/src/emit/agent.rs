@@ -71,7 +71,8 @@ pub fn generate_agent_config(
     // OpAMP extension — allows the controller to push config updates at runtime.
     let opamp_ext: Value = serde_yaml::from_str(&format!(
         "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n"
-    )).unwrap();
+    ))
+    .unwrap();
 
     let doc = CollectorYaml {
         extensions: [("opamp".to_string(), opamp_ext)].into(),
@@ -145,13 +146,17 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
     }
     if !cfg.label_matchers.is_empty() {
         // Go processors expect []LabelMatcher{Key, Value}, not flat strings.
-        let matchers: Vec<Value> = cfg.label_matchers.iter().filter_map(|s| {
-            let (k, v) = s.split_once('=')?;
-            let mut map = serde_yaml::Mapping::new();
-            map.insert("key".into(), Value::String(k.to_string()));
-            map.insert("value".into(), Value::String(v.to_string()));
-            Some(Value::Mapping(map))
-        }).collect();
+        let matchers: Vec<Value> = cfg
+            .label_matchers
+            .iter()
+            .filter_map(|s| {
+                let (k, v) = s.split_once('=')?;
+                let mut map = serde_yaml::Mapping::new();
+                map.insert("key".into(), Value::String(k.to_string()));
+                map.insert("value".into(), Value::String(v.to_string()));
+                Some(Value::Mapping(map))
+            })
+            .collect();
         if !matchers.is_empty() {
             m.insert("label_matchers".into(), Value::Sequence(matchers));
         }
@@ -174,20 +179,38 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
 
     // Sketch-type-specific params.
     match &cfg.sketch_params {
-        SketchParams::DDSketch { relative_accuracy, quantiles } => {
-            m.insert("relative_accuracy".into(), Value::Number((*relative_accuracy).into()));
+        SketchParams::DDSketch {
+            relative_accuracy,
+            quantiles,
+        } => {
+            m.insert(
+                "relative_accuracy".into(),
+                Value::Number((*relative_accuracy).into()),
+            );
             if !quantiles.is_empty() {
-                m.insert("quantiles".into(), Value::Sequence(
-                    quantiles.iter().map(|q| Value::Number((*q).into())).collect(),
-                ));
+                m.insert(
+                    "quantiles".into(),
+                    Value::Sequence(
+                        quantiles
+                            .iter()
+                            .map(|q| Value::Number((*q).into()))
+                            .collect(),
+                    ),
+                );
             }
         }
         SketchParams::KLL { k, quantiles } => {
             m.insert("k".into(), Value::Number((*k as u64).into()));
             if !quantiles.is_empty() {
-                m.insert("quantiles".into(), Value::Sequence(
-                    quantiles.iter().map(|q| Value::Number((*q).into())).collect(),
-                ));
+                m.insert(
+                    "quantiles".into(),
+                    Value::Sequence(
+                        quantiles
+                            .iter()
+                            .map(|q| Value::Number((*q).into()))
+                            .collect(),
+                    ),
+                );
             }
         }
         SketchParams::HLL { .. } => {
@@ -197,7 +220,11 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
             m.insert("epsilon".into(), Value::Number((*epsilon).into()));
             m.insert("delta".into(), Value::Number((*delta).into()));
         }
-        SketchParams::CountMinSketch { rows, cols, metric_name } => {
+        SketchParams::CountMinSketch {
+            rows,
+            cols,
+            metric_name,
+        } => {
             m.insert("metric_name".into(), Value::String(metric_name.clone()));
             m.insert("rows".into(), Value::Number((*rows as u64).into()));
             m.insert("columns".into(), Value::Number((*cols as u64).into()));
@@ -235,8 +262,8 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
+            enable_series_id: true,
+            series_id_ttl_secs: 0,
             // Pre-existing fixture tests (`contains_prometheus_exporter`,
             // `pipeline_has_receivers_and_exporters`) assert the legacy
             // prometheus exporter on :8889 — keep the test semantics by
@@ -318,12 +345,15 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
+            enable_series_id: true,
+            series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
         let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
-        assert!(yaml.contains("HLL:"), "YAML should contain HLL processor key\n{yaml}");
+        assert!(
+            yaml.contains("HLL:"),
+            "YAML should contain HLL processor key\n{yaml}"
+        );
         assert!(
             yaml.contains("- HLL"),
             "pipeline should reference HLL processor\n{yaml}"
@@ -353,8 +383,8 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
+            enable_series_id: true,
+            series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
         let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
@@ -458,14 +488,20 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
+            enable_series_id: true,
+            series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
         let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(yaml.contains("KLL:"), "YAML should contain 'KLL:'\n{yaml}");
-        assert!(yaml.contains("k:"), "YAML should contain 'k:' param\n{yaml}");
-        assert!(!yaml.contains("ddsketch:"), "YAML must not contain wrong processor key\n{yaml}");
+        assert!(
+            yaml.contains("k:"),
+            "YAML should contain 'k:' param\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("ddsketch:"),
+            "YAML must not contain wrong processor key\n{yaml}"
+        );
     }
 
     #[test]
@@ -486,8 +522,8 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
+            enable_series_id: true,
+            series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
         let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
@@ -508,11 +544,40 @@ mod tests {
     #[test]
     fn all_sketch_types_processor_key_matches_pipeline_ref() {
         let cases: &[(&str, SketchType, SketchParams)] = &[
-            ("ddsketch",    SketchType::DDSketch,      SketchParams::DDSketch { relative_accuracy: 0.01, quantiles: vec![0.5] }),
-            ("KLL",         SketchType::KLL,           SketchParams::KLL { k: 200, quantiles: vec![0.5] }),
-            ("HLL",         SketchType::HLL,           SketchParams::HLL { precision: 14 }),
-            ("countsketch", SketchType::CountSketch,   SketchParams::CountSketch { epsilon: CountSketchDefaults::default().epsilon, delta: CountSketchDefaults::default().delta }),
-            ("countmin",    SketchType::CountMinSketch, SketchParams::CountMinSketch { rows: 5, cols: 2048, metric_name: "m".into() }),
+            (
+                "ddsketch",
+                SketchType::DDSketch,
+                SketchParams::DDSketch {
+                    relative_accuracy: 0.01,
+                    quantiles: vec![0.5],
+                },
+            ),
+            (
+                "KLL",
+                SketchType::KLL,
+                SketchParams::KLL {
+                    k: 200,
+                    quantiles: vec![0.5],
+                },
+            ),
+            ("HLL", SketchType::HLL, SketchParams::HLL { precision: 14 }),
+            (
+                "countsketch",
+                SketchType::CountSketch,
+                SketchParams::CountSketch {
+                    epsilon: CountSketchDefaults::default().epsilon,
+                    delta: CountSketchDefaults::default().delta,
+                },
+            ),
+            (
+                "countmin",
+                SketchType::CountMinSketch,
+                SketchParams::CountMinSketch {
+                    rows: 5,
+                    cols: 2048,
+                    metric_name: "m".into(),
+                },
+            ),
         ];
 
         for (expected_key, sketch_type, sketch_params) in cases {
@@ -547,7 +612,9 @@ mod tests {
             );
             // No other sketch type key should appear as a processor.
             for (other_key, _, _) in cases {
-                if other_key == expected_key { continue; }
+                if other_key == expected_key {
+                    continue;
+                }
                 assert!(
                     !yaml.contains(&format!("{other_key}:")),
                     "sketch_type={expected_key}: YAML must not contain foreign key '{other_key}:'\n{yaml}"

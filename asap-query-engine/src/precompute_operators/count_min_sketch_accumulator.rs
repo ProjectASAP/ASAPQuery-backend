@@ -432,9 +432,9 @@ impl AggregateCore for CountMinSketchAccumulator {
                 let Some(s) = range_ms_str else {
                     return Ok(total);
                 };
-                let range_ms: f64 = s.parse().map_err(|e| {
-                    format!("CountMinSketchAccumulator: bad range_ms='{s}': {e}")
-                })?;
+                let range_ms: f64 = s
+                    .parse()
+                    .map_err(|e| format!("CountMinSketchAccumulator: bad range_ms='{s}': {e}"))?;
                 if range_ms <= 0.0 {
                     return Err("CountMinSketchAccumulator: range_ms must be positive".into());
                 }
@@ -920,11 +920,7 @@ mod tests {
         // for instant rate-shape queries that bypass the matrix-selector
         // code path.
         let cms = CountMinSketchAccumulator {
-            inner: CountMinSketch::from_legacy_matrix(
-                vec![vec![42.0, 0.0], vec![42.0, 0.0]],
-                2,
-                2,
-            ),
+            inner: CountMinSketch::from_legacy_matrix(vec![vec![42.0, 0.0], vec![42.0, 0.0]], 2, 2),
         };
         let trait_obj: &dyn AggregateCore = &cms;
         let v = trait_obj
@@ -939,11 +935,7 @@ mod tests {
         // same min-row-sum as Sum / Count. Differs from Rate only in
         // that it never divides by range.
         let cms = CountMinSketchAccumulator {
-            inner: CountMinSketch::from_legacy_matrix(
-                vec![vec![5.0, 7.0], vec![3.0, 9.0]],
-                2,
-                2,
-            ),
+            inner: CountMinSketch::from_legacy_matrix(vec![vec![5.0, 7.0], vec![3.0, 9.0]], 2, 2),
         };
         let trait_obj: &dyn AggregateCore = &cms;
         let v = trait_obj

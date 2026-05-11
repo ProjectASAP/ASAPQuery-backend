@@ -3,7 +3,7 @@
 //! Provides assertion helpers for deep equality checking of query execution contexts.
 
 use crate::data_model::{AggregationIdInfo, AggregationType};
-use crate::engines::simple::engine::{
+use crate::engines::asap_query::engine::{
     QueryExecutionContext, QueryMetadata, StoreQueryParams, StoreQueryPlan,
 };
 use promql_utilities::data_model::KeyByLabelNames;

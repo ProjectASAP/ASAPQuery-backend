@@ -95,7 +95,11 @@ pub struct PlanScore {
 }
 
 /// Estimates resource costs for a given plan + workload using the provided cost table.
-pub fn score_with(plan: &CollectionPlan, w: &QueryWorkload, table: &HashMap<SketchType, SketchCosts>) -> PlanScore {
+pub fn score_with(
+    plan: &CollectionPlan,
+    w: &QueryWorkload,
+    table: &HashMap<SketchType, SketchCosts>,
+) -> PlanScore {
     let st = &plan.agent_config.sketch_type;
     let Some(&costs) = table.get(st) else {
         return PlanScore {
@@ -111,7 +115,11 @@ pub fn score_with(plan: &CollectionPlan, w: &QueryWorkload, table: &HashMap<Sket
     let bandwidth = costs.bytes_per_series_per_sec * dim_multiplier;
     let memory = costs.base_memory_bytes * dim_multiplier;
     let err = estimate_error(st, &plan.agent_config.sketch_params, costs);
-    let sla = if w.accuracy_sla <= 0.0 { 0.01 } else { w.accuracy_sla };
+    let sla = if w.accuracy_sla <= 0.0 {
+        0.01
+    } else {
+        w.accuracy_sla
+    };
 
     PlanScore {
         bandwidth_bytes_per_sec: bandwidth,
@@ -161,9 +169,13 @@ pub fn score(plan: &CollectionPlan, w: &QueryWorkload) -> PlanScore {
 
 fn estimate_error(_st: &SketchType, p: &SketchParams, costs: SketchCosts) -> f64 {
     match p {
-        SketchParams::DDSketch { relative_accuracy, .. } if *relative_accuracy > 0.0 => *relative_accuracy,
+        SketchParams::DDSketch {
+            relative_accuracy, ..
+        } if *relative_accuracy > 0.0 => *relative_accuracy,
         SketchParams::KLL { k, .. } if *k > 0 => 1.0 / *k as f64,
-        SketchParams::HLL { precision } if *precision > 0 => 1.04 / (2.0f64.powi(*precision as i32)).sqrt(),
+        SketchParams::HLL { precision } if *precision > 0 => {
+            1.04 / (2.0f64.powi(*precision as i32)).sqrt()
+        }
         _ => costs.relative_error_at_default,
     }
 }
@@ -177,13 +189,16 @@ fn estimate_error(_st: &SketchType, p: &SketchParams, costs: SketchCosts) -> f64
 /// the planner blends live EMA observations into the cost table used for scoring,
 /// so that real-world behaviour gradually supersedes the static benchmark defaults.
 pub struct CostModelPlanner {
-    inner:        RulesPlanner,
+    inner: RulesPlanner,
     online_store: Option<online::OnlineMetricsStore>,
 }
 
 impl CostModelPlanner {
     pub fn new() -> Self {
-        Self { inner: RulesPlanner::new(), online_store: None }
+        Self {
+            inner: RulesPlanner::new(),
+            online_store: None,
+        }
     }
 
     pub fn with_sketch_defaults(mut self, defaults: SketchDefaults) -> Self {
@@ -201,7 +216,7 @@ impl CostModelPlanner {
     fn cost_table(&self) -> HashMap<SketchType, SketchCosts> {
         match &self.online_store {
             Some(s) => online::effective_table(s),
-            None    => benchmark_table_pub(),
+            None => benchmark_table_pub(),
         }
     }
 
@@ -212,11 +227,7 @@ impl CostModelPlanner {
     /// CPU / memory overhead, and raw vs. sketch bandwidth comparison.
     /// Pass `None` to use conservative defaults (1 000 series, 100 Hz,
     /// 100 B/sample, Zipf distribution, no memory budget).
-    pub fn plan(
-        &self,
-        w: &QueryWorkload,
-        wc: Option<&WorkloadCharacteristics>,
-    ) -> CollectionPlan {
+    pub fn plan(&self, w: &QueryWorkload, wc: Option<&WorkloadCharacteristics>) -> CollectionPlan {
         let default_wc;
         let wc = match wc {
             Some(c) => c,
@@ -280,9 +291,9 @@ impl CostModelPlanner {
 
 /// Runs the delta cost model and writes the decision into the plan using a provided cost table.
 fn apply_delta_decision_with(
-    plan:  &mut CollectionPlan,
-    w:     &QueryWorkload,
-    wc:    &WorkloadCharacteristics,
+    plan: &mut CollectionPlan,
+    w: &QueryWorkload,
+    wc: &WorkloadCharacteristics,
     table: &HashMap<SketchType, SketchCosts>,
 ) {
     let bytes_per_series_per_sec = table
@@ -782,7 +793,8 @@ mod workload_cost_tests {
         let wc = workload_cost(&plan).unwrap();
 
         // Per-root breakdown reports the standalone cost of `q`.
-        let standalone = subtree_cost_standalone(&q, &HashMap::new(), &BindingScope::new()).unwrap();
+        let standalone =
+            subtree_cost_standalone(&q, &HashMap::new(), &BindingScope::new()).unwrap();
         assert_eq!(wc.per_root_breakdown.len(), 1);
         assert_eq!(wc.per_root_breakdown[0].0, QueryId::new("q1"));
         assert!((wc.per_root_breakdown[0].1 - standalone).abs() < 1e-9);
@@ -819,12 +831,18 @@ mod workload_cost_tests {
     #[test]
     fn workload_cost_two_roots_shared_window_credits_once() {
         let shared = windowed_scan();
-        let q1 = quantile_root(0.99, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
-        let q2 = quantile_root(0.95, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
+        let q1 = quantile_root(
+            0.99,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
+        let q2 = quantile_root(
+            0.95,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
 
         let plan = WorkloadCostPlan {
             bindings: vec![(BindingName::new("w"), &shared)],
@@ -862,12 +880,18 @@ mod workload_cost_tests {
     #[test]
     fn workload_cost_three_roots_two_share_partial() {
         let shared = windowed_scan();
-        let q1 = quantile_root(0.99, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
-        let q2 = quantile_root(0.95, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
+        let q1 = quantile_root(
+            0.99,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
+        let q2 = quantile_root(
+            0.95,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
         // q3 builds its own scan + window — no shared producer.
         let q3 = max_root(windowed_scan());
 
@@ -899,12 +923,18 @@ mod workload_cost_tests {
     #[test]
     fn workload_cost_three_roots_all_share_one_binding() {
         let shared = windowed_scan();
-        let q1 = quantile_root(0.99, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
-        let q2 = quantile_root(0.95, QueryExpr::Ref {
-            name: BindingName::new("w"),
-        });
+        let q1 = quantile_root(
+            0.99,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
+        let q2 = quantile_root(
+            0.95,
+            QueryExpr::Ref {
+                name: BindingName::new("w"),
+            },
+        );
         let q3 = max_root(QueryExpr::Ref {
             name: BindingName::new("w"),
         });
@@ -951,9 +981,12 @@ mod workload_cost_tests {
     /// can refuse the plan rather than under-quote it.
     #[test]
     fn workload_cost_unresolved_ref_errors() {
-        let q = quantile_root(0.99, QueryExpr::Ref {
-            name: BindingName::new("missing"),
-        });
+        let q = quantile_root(
+            0.99,
+            QueryExpr::Ref {
+                name: BindingName::new("missing"),
+            },
+        );
         let plan = WorkloadCostPlan {
             bindings: vec![],
             roots: vec![(QueryId::new("q1"), &q)],

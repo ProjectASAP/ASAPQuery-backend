@@ -30,6 +30,6 @@ pub use traits::*;
 // `crate::data_model::BackendStorageRouting` compiling for any
 // transitive caller that hasn't been migrated yet.
 pub use crate::routing::{
-    classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting,
-    QueryShape, RoutingTarget,
+    classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting, QueryShape,
+    RoutingTarget,
 };

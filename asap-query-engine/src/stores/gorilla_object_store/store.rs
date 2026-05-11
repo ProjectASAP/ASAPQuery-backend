@@ -367,14 +367,10 @@ mod rust_s3_backend {
                     .map_err(|e| StoreError::Backend(format!("region parse: {e}")))?,
             };
             let creds = match (&cfg.access_key_id, &cfg.secret_access_key) {
-                (Some(ak), Some(sk)) => {
-                    Credentials::new(Some(ak), Some(sk), None, None, None).map_err(|e| {
-                        StoreError::Backend(format!("credentials: {e}"))
-                    })?
-                }
-                _ => Credentials::default().map_err(|e| {
-                    StoreError::Backend(format!("default credentials: {e}"))
-                })?,
+                (Some(ak), Some(sk)) => Credentials::new(Some(ak), Some(sk), None, None, None)
+                    .map_err(|e| StoreError::Backend(format!("credentials: {e}")))?,
+                _ => Credentials::default()
+                    .map_err(|e| StoreError::Backend(format!("default credentials: {e}")))?,
             };
             let bucket = Bucket::new(&cfg.bucket, region, creds)
                 .map_err(|e| StoreError::Backend(format!("bucket: {e}")))?;
@@ -400,9 +396,7 @@ mod rust_s3_backend {
                 .await
                 .map_err(|e| StoreError::Backend(format!("s3 get {key}: {e}")))?;
             if resp.status_code() == 404 {
-                return Err(StoreError::Backend(format!(
-                    "s3 get {key}: not found"
-                )));
+                return Err(StoreError::Backend(format!("s3 get {key}: not found")));
             }
             if !(200..300).contains(&resp.status_code()) {
                 return Err(StoreError::Backend(format!(
@@ -463,8 +457,7 @@ impl GorillaS3Store {
         // mvp/v5: postings + index caches scale with the chunk
         // cache (one entry per hour-bucket, mirrors typical query
         // cardinality).
-        let pc_cap = NonZeroUsize::new(cap.get().max(64))
-            .unwrap_or(NonZeroUsize::new(64).unwrap());
+        let pc_cap = NonZeroUsize::new(cap.get().max(64)).unwrap_or(NonZeroUsize::new(64).unwrap());
         Self {
             object_store,
             config,
@@ -570,9 +563,8 @@ impl GorillaS3Store {
     async fn fetch_index(&self, metric: &str, hour_ms: i64) -> Result<IndexFile, StoreError> {
         let key = self.index_key(metric, hour_ms);
         match self.object_store.get_object(&key).await {
-            Ok(bytes) => IndexFile::read(bytes.as_slice()).map_err(|e| {
-                StoreError::Malformed(format!("index.json at {key}: {e}"))
-            }),
+            Ok(bytes) => IndexFile::read(bytes.as_slice())
+                .map_err(|e| StoreError::Malformed(format!("index.json at {key}: {e}"))),
             Err(e) if self.object_store.object_missing(&e) => {
                 debug!(key = %key, "gorilla-s3: index.json missing for hour bucket; skipping");
                 Ok(IndexFile::new(0))
@@ -867,7 +859,10 @@ mod tests {
             },
             IndexEntry {
                 key: key_b.clone(),
-                time_range: ((h0 + 5_000) as u64 * 1_000_000, (h0 + 6_000) as u64 * 1_000_000),
+                time_range: (
+                    (h0 + 5_000) as u64 * 1_000_000,
+                    (h0 + 6_000) as u64 * 1_000_000,
+                ),
                 sample_count: 11,
                 label_hash: 0xBBBB,
                 size_bytes: 110,
@@ -877,7 +872,10 @@ mod tests {
             },
             IndexEntry {
                 key: key_c.clone(),
-                time_range: ((h0 + 10_000) as u64 * 1_000_000, (h0 + 11_000) as u64 * 1_000_000),
+                time_range: (
+                    (h0 + 10_000) as u64 * 1_000_000,
+                    (h0 + 11_000) as u64 * 1_000_000,
+                ),
                 sample_count: 12,
                 label_hash: 0xCCCC,
                 size_bytes: 120,
@@ -954,8 +952,14 @@ mod tests {
         assert_eq!(samples[1].value, 0.7);
         assert_eq!(samples[2].ts_ms, h0 + 3_000);
         assert_eq!(samples[2].value, 0.7);
-        assert_eq!(samples[0].labels.get("instance").map(String::as_str), Some("i-1"));
-        assert_eq!(samples[0].labels.get("mode").map(String::as_str), Some("user"));
+        assert_eq!(
+            samples[0].labels.get("instance").map(String::as_str),
+            Some("i-1")
+        );
+        assert_eq!(
+            samples[0].labels.get("mode").map(String::as_str),
+            Some("user")
+        );
     }
 
     #[tokio::test]
@@ -1013,7 +1017,10 @@ mod tests {
             let block = make_block(
                 "m",
                 &[("i", &i.to_string())],
-                &[(h0 + i * 1_000, i as f64), (h0 + i * 1_000 + 100, i as f64 + 0.5)],
+                &[
+                    (h0 + i * 1_000, i as f64),
+                    (h0 + i * 1_000 + 100, i as f64 + 0.5),
+                ],
             );
             let key = format!("tenant1/m/2026/05/06/12/part-{i}.gor");
             store.put(key.clone(), block.clone()).await;
@@ -1100,7 +1107,10 @@ mod tests {
         let store = InMemoryObjectStore::new();
         let cs = GorillaS3Store::new(Arc::new(store), cfg());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
-        let chunks = cs.list_chunks("never_written", h0, h0 + 60_000).await.unwrap();
+        let chunks = cs
+            .list_chunks("never_written", h0, h0 + 60_000)
+            .await
+            .unwrap();
         assert!(chunks.is_empty());
         let samples = cs.scan("never_written", h0, h0 + 60_000).await.unwrap();
         assert!(samples.is_empty());
@@ -1110,11 +1120,7 @@ mod tests {
     async fn scan_filters_to_requested_range() {
         let store = Arc::new(InMemoryObjectStore::new());
         let h0 = ms(2026, 5, 6, 12, 0, 0);
-        let block = make_block(
-            "m",
-            &[],
-            &[(h0 + 1_000, 1.0), (h0 + 10_000, 2.0)],
-        );
+        let block = make_block("m", &[], &[(h0 + 1_000, 1.0), (h0 + 10_000, 2.0)]);
         let key = "tenant1/m/2026/05/06/12/part-Z.gor".to_string();
         store.put(key.clone(), block.clone()).await;
         store
@@ -1214,10 +1220,7 @@ mod tests {
         let store = InMemoryObjectStore::new();
         let cs = GorillaS3Store::new(Arc::new(store), config);
         let key = cs.bucket_prefix("http_freshness_probe_archive", ms(2026, 5, 7, 4, 0, 0));
-        assert_eq!(
-            key,
-            "tenant1/http_freshness_probe_archive/2026/05/07/04/",
-        );
+        assert_eq!(key, "tenant1/http_freshness_probe_archive/2026/05/07/04/",);
     }
 
     #[test]

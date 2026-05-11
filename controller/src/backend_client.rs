@@ -312,8 +312,7 @@ mod tests {
     #[tokio::test]
     async fn json_post_non_2xx_is_error() {
         let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
-        let url =
-            start_mock_backend(sink.clone(), axum::http::StatusCode::BAD_REQUEST).await;
+        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::BAD_REQUEST).await;
 
         let client = BackendClient::new(url);
         let result = client.post_streaming_config_json("{}".to_string()).await;
@@ -346,10 +345,7 @@ mod tests {
             "http://127.0.0.1:1/api/v1/storage_routing"
         );
         // Unrelated path passes through too — no surprise rewriting.
-        assert_eq!(
-            derive_storage_routing_url("http://x/foo"),
-            "http://x/foo"
-        );
+        assert_eq!(derive_storage_routing_url("http://x/foo"), "http://x/foo");
     }
 
     /// Phase α: full happy path. A mock backend hosts the storage
@@ -388,9 +384,8 @@ mod tests {
         let url = start_mock_routing_backend(sink.clone(), axum::http::StatusCode::OK).await;
 
         let client = BackendClient::new(url);
-        let json =
-            r#"{"default_engine":"sketch_warm_tier","metrics":[{"name":"x","targets":[]}]}"#
-                .to_string();
+        let json = r#"{"default_engine":"sketch_store","metrics":[{"name":"x","targets":[]}]}"#
+            .to_string();
         client
             .post_storage_routing_json(json.clone())
             .await
@@ -404,11 +399,9 @@ mod tests {
     #[tokio::test]
     async fn storage_routing_post_non_2xx_is_error() {
         let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
-        let url = start_mock_routing_backend(
-            sink.clone(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        )
-        .await;
+        let url =
+            start_mock_routing_backend(sink.clone(), axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await;
         let client = BackendClient::new(url);
         let result = client.post_storage_routing_json("{}".to_string()).await;
         assert!(result.is_err(), "expected error on 500, got {result:?}");

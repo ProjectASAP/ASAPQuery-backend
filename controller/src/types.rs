@@ -330,26 +330,45 @@ impl Default for SketchDefaults {
 }
 
 impl Default for DDSketchDefaults {
-    fn default() -> Self { Self { relative_accuracy: 0.01 } }
+    fn default() -> Self {
+        Self {
+            relative_accuracy: 0.01,
+        }
+    }
 }
 
 impl Default for KLLDefaults {
-    fn default() -> Self { Self { min_k: 32 } }
+    fn default() -> Self {
+        Self { min_k: 32 }
+    }
 }
 
 impl Default for HLLDefaults {
     fn default() -> Self {
-        Self { precision_coarse: 10, precision_fine: 14, precision_threshold: 0.02 }
+        Self {
+            precision_coarse: 10,
+            precision_fine: 14,
+            precision_threshold: 0.02,
+        }
     }
 }
 
 impl Default for CountSketchDefaults {
-    fn default() -> Self { Self { epsilon: 0.022, delta: 0.007 } }
+    fn default() -> Self {
+        Self {
+            epsilon: 0.022,
+            delta: 0.007,
+        }
+    }
 }
 
 impl Default for CountMinSketchDefaults {
     fn default() -> Self {
-        Self { rows: 5, cols: 2048, metric_name: "countsketch_partition".into() }
+        Self {
+            rows: 5,
+            cols: 2048,
+            metric_name: "countsketch_partition".into(),
+        }
     }
 }
 
@@ -410,8 +429,9 @@ impl SketchParams {
     /// Extract quantiles if this sketch type supports them.
     pub fn quantiles(&self) -> &[f64] {
         match self {
-            SketchParams::DDSketch { quantiles, .. }
-            | SketchParams::KLL { quantiles, .. } => quantiles,
+            SketchParams::DDSketch { quantiles, .. } | SketchParams::KLL { quantiles, .. } => {
+                quantiles
+            }
             _ => &[],
         }
     }
@@ -472,7 +492,10 @@ pub enum AgentDataSink {
     /// `compression` is the transport-level codec; the canonical
     /// path uses `none` because the backend's tonic gRPC server
     /// rejects gzip-compressed bodies (returns Unimplemented).
-    Otlp { endpoint: String, compression: String },
+    Otlp {
+        endpoint: String,
+        compression: String,
+    },
     /// Pre-existing path: prometheus exporter at `endpoint`. Kept
     /// for back-compat with the legacy raw-scalar deployment.
     PrometheusScrape { endpoint: String },

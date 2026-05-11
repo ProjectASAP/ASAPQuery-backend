@@ -17,7 +17,9 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use query_engine_rust::data_model::enums::{CleanupPolicy, InputFormat, LockStrategy, StreamingEngine};
+use query_engine_rust::data_model::enums::{
+    CleanupPolicy, InputFormat, LockStrategy, StreamingEngine,
+};
 use query_engine_rust::data_model::InferenceConfig;
 use query_engine_rust::drivers::AdapterConfig;
 use query_engine_rust::precompute_engine::config::LateDataPolicy;
@@ -282,7 +284,7 @@ struct Args {
     /// pick the right engine (`SimpleEngine` for warm-tier sketches,
     /// `GorillaQueryEngine` for the cold archive, etc.). Without
     /// this flag the handler falls back to the streaming-config
-    /// single axis (always `SketchWarmTier`) and the EngineRouter is
+    /// single axis (always `SketchStore`) and the EngineRouter is
     /// effectively bypassed — the issue-46 v2 demo's criterion ⑤
     /// failure mode. Mirrors the `precompute_engine` binary's flag
     /// of the same name.
@@ -438,10 +440,10 @@ async fn main() -> Result<()> {
     // are constructed so both can be wired with a single canonical
     // instance — even when precompute is disabled, the engine still
     // needs the index for the Phase 6 archive failover trigger.
-    let series_resolver = Arc::new(
-        query_engine_rust::drivers::ingest::series_resolver::SeriesIdResolver::new(),
-    );
-    let sketch_index = Arc::new(query_engine_rust::stores::sketch_db::sketch_index::SketchIndex::new());
+    let series_resolver =
+        Arc::new(query_engine_rust::drivers::ingest::series_resolver::SeriesIdResolver::new());
+    let sketch_index =
+        Arc::new(query_engine_rust::stores::sketch_db::sketch_index::SketchIndex::new());
 
     // Setup query engine. SimpleEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
@@ -686,7 +688,7 @@ async fn main() -> Result<()> {
     // from `--backend-storage-routing` (or its env-var alias) so the
     // HTTP handler consults a per-metric `StorageBackend` map on
     // every PromQL query instead of bypassing the EngineRouter when
-    // the streaming-config single axis defaults to `SketchWarmTier`.
+    // the streaming-config single axis defaults to `SketchStore`.
     //
     // Phase α (MVP): even when no static YAML is loaded, install an
     // empty hot-reload handle so the controller's first
@@ -721,20 +723,15 @@ async fn main() -> Result<()> {
     };
     server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
-    // Phase-5/6 + Step-2.3: register an archive-tier engine on the
+    // Phase-5/6 + Step-2.3: register the Thanos query engine on the
     // capability router. Two operating modes, selected at startup:
     //
     // * **Path A2 mode** — when `ASAP_THANOS_QUERY_URL` is set, the
     //   backend forwards archive-tier PromQL queries to a
     //   `thanos-query` sidecar via the
-    //   [`ThanosForwardEngine`]. The forwarder is registered under
-    //   both `thanos_archive` (its native id, for explicit
-    //   `X-ASAP-Engine` overrides) and `gorilla_archive` (the legacy
-    //   archive slot that the existing
-    //   `compatible_storage_backends` failover sequence walks), so
-    //   per-metric routing config can target either name without
-    //   surprise. The legacy in-process `GorillaQueryEngine` is
-    //   skipped in this mode.
+    //   [`ThanosQueryEngine`], registered under the single public id
+    //   `thanos_query`. The legacy in-process `GorillaQueryEngine`
+    //   is skipped in this mode.
     // * **Legacy mode** — when `ASAP_THANOS_QUERY_URL` is unset, the
     //   in-process `GorillaQueryEngine` answers archive queries
     //   from per-hour Gorilla chunks landed on S3 / MinIO via the
@@ -743,72 +740,63 @@ async fn main() -> Result<()> {
     //   end-to-end.
     //
     // When neither env-var family is configured the binary registers
-    // a `NoDataArchiveEngine` stub under the `gorilla_archive` alias
+    // a `NoDataArchiveEngine` stub under `thanos_query`
     // so cold queries succeed with an empty result instead of
     // surfacing as `503 NoEngineRegistered`. Operators that want the
     // original fail-loud behaviour can opt back in by setting
     // `ASAP_REQUIRE_ARCHIVE_ENGINE=1`.
     let mut archive_registered = false;
-    match query_engine_rust::engines::gorilla::thanos_engine_from_env() {
+    match query_engine_rust::engines::thanos_query::thanos_engine_from_env() {
         Ok(Some(thanos)) => {
-            use query_engine_rust::engines::gorilla::DATA_SOURCE_THANOS_ARCHIVE_ID;
             use query_engine_rust::routing::QueryEngine;
             info!(
                 upstream = thanos.base_url(),
-                "Path A2: registering ThanosForwardEngine for the archive tier (data_source_id=thanos_archive, alias=gorilla_archive); legacy in-process GorillaQueryEngine skipped",
+                "Path A2: registering ThanosQueryEngine for the archive tier (data_source_id=thanos_query); legacy in-process GorillaQueryEngine skipped",
             );
             let thanos_arc: Arc<dyn QueryEngine> = Arc::new(thanos);
-            server = server
-                .with_query_engine_aliased(
-                    DATA_SOURCE_THANOS_ARCHIVE_ID,
-                    thanos_arc.clone(),
-                )
-                .with_query_engine_aliased(
-                    asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
-                    thanos_arc,
-                );
+            server = server.with_archive_query_engine(thanos_arc);
             archive_registered = true;
         }
-        Ok(None) => {
-            match query_engine_rust::engines::gorilla::GorillaS3Config::from_env() {
-                Ok(s3_cfg) => {
-                    match query_engine_rust::engines::gorilla::GorillaS3Store::with_default_backend(s3_cfg) {
-                        Ok(store) => {
-                            use query_engine_rust::engines::{GorillaEngineConfig, GorillaQueryEngine};
-                            use query_engine_rust::routing::QueryEngine;
-                            let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
-                                Arc::new(store),
-                                GorillaEngineConfig::default(),
-                            ));
-                            info!(
-                                "Registering legacy in-process GorillaQueryEngine on the capability router (data_source_id=gorilla_archive); set ASAP_THANOS_QUERY_URL to switch to Path A2 thanos forwarding",
+        Ok(None) => match query_engine_rust::stores::gorilla_object_store::GorillaS3Config::from_env() {
+            Ok(s3_cfg) => {
+                match query_engine_rust::stores::gorilla_object_store::GorillaS3Store::with_default_backend(
+                    s3_cfg,
+                ) {
+                    Ok(store) => {
+                        use query_engine_rust::stores::{GorillaEngineConfig, GorillaQueryEngine};
+                        use query_engine_rust::routing::QueryEngine;
+                        let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
+                            Arc::new(store),
+                            GorillaEngineConfig::default(),
+                        ));
+                        info!(
+                                "Registering legacy in-process GorillaQueryEngine on the archive slot (canonical data_source_id=thanos_query); set ASAP_THANOS_QUERY_URL to use the intended Thanos archive path",
                             );
-                            server = server.with_query_engine(gorilla as Arc<dyn QueryEngine>);
-                            archive_registered = true;
-                        }
-                        Err(e) => {
-                            warn!(
+                        server = server.with_archive_query_engine(gorilla as Arc<dyn QueryEngine>);
+                        archive_registered = true;
+                    }
+                    Err(e) => {
+                        warn!(
                                 "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
                             );
-                        }
                     }
                 }
-                Err(_) => {
-                    info!(
+            }
+            Err(_) => {
+                info!(
                         "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing, or set ASAP_THANOS_QUERY_URL to enable Path A2 thanos forwarding)",
                     );
-                }
             }
-        }
+        },
         Err(e) => {
             warn!(
-                "ASAP_THANOS_QUERY_URL set but ThanosForwardEngine failed to build ({e}); router will not have an archive engine",
+                "ASAP_THANOS_QUERY_URL set but ThanosQueryEngine failed to build ({e}); router will not have an archive engine",
             );
         }
     }
 
     // No archive engine configured — register a `NoDataArchiveEngine`
-    // stub under the `gorilla_archive` alias so cold queries succeed
+    // stub under `thanos_query` so cold queries succeed
     // with an empty result. `ASAP_REQUIRE_ARCHIVE_ENGINE=1` opts back
     // into the original fail-loud (`503 NoEngineRegistered`) behaviour.
     if !archive_registered {
@@ -823,48 +811,10 @@ async fn main() -> Result<()> {
             use query_engine_rust::engines::NoDataArchiveEngine;
             use query_engine_rust::routing::QueryEngine;
             info!(
-                "Registering NoDataArchiveEngine stub on the archive slot (data_source_id=no_data_archive, alias=gorilla_archive); set ASAP_REQUIRE_ARCHIVE_ENGINE=1 to disable",
+                "Registering NoDataArchiveEngine stub on the archive slot (canonical data_source_id=thanos_query); set ASAP_REQUIRE_ARCHIVE_ENGINE=1 to disable",
             );
             let stub: Arc<dyn QueryEngine> = Arc::new(NoDataArchiveEngine::new());
-            server = server.with_query_engine_aliased(
-                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
-                stub,
-            );
-        }
-    }
-
-    // Phase ε.2: register a `PrometheusForwardEngine` under the
-    // `prometheus_remote` engine id when `ASAP_PROMETHEUS_QUERY_URL`
-    // is set. The controller's Mode 3 (`RawAtEdgePrometheusArchive`)
-    // emits routing-table entries with `engine: prometheus_remote`
-    // for metrics whose raw data is shipped to Prometheus's native
-    // OTLP receiver. When the env var is unset the engine is not
-    // registered; if a routing-table entry references
-    // `prometheus_remote` in that case, the dispatcher returns a
-    // clear `NoEngineRegistered` 503 — fail-loud is the correct
-    // behaviour for a misconfigured deploy.
-    //
-    // Mirrors the `ASAP_THANOS_QUERY_URL` wiring above; the two
-    // engines coexist on the router under different ids and answer
-    // different routing-table entries.
-    match query_engine_rust::engines::prometheus::prometheus_engine_from_env() {
-        Ok(Some(prom)) => {
-            use query_engine_rust::routing::QueryEngine;
-            info!(
-                upstream = prom.base_url(),
-                "Phase ε.2: registering PrometheusForwardEngine on the capability router (data_source_id=prometheus_remote); routing-table entries that reference `prometheus_remote` will dispatch here",
-            );
-            server = server.with_query_engine(Arc::new(prom) as Arc<dyn QueryEngine>);
-        }
-        Ok(None) => {
-            info!(
-                "ASAP_PROMETHEUS_QUERY_URL not set — PrometheusForwardEngine skipped; routing-table entries referencing `prometheus_remote` will surface NoEngineRegistered",
-            );
-        }
-        Err(e) => {
-            warn!(
-                "ASAP_PROMETHEUS_QUERY_URL set but PrometheusForwardEngine failed to build ({e}); router will not have a prometheus_remote engine",
-            );
+            server = server.with_archive_query_engine(stub);
         }
     }
 

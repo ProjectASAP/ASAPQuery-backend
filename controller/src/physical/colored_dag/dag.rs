@@ -22,8 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::sketch_algebra::SketchExpr;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
+use crate::sketch_algebra::SketchExpr;
 
 /// Stable position-based identifier for a node within a `ColoredDag`.
 /// `NodeId(0)` is the root; depth-first walk order otherwise.
@@ -96,7 +96,6 @@ impl Default for ColoredDag {
 }
 
 impl ColoredDag {
-
     /// Root node (the original `SketchExpr` root). `None` only for the
     /// degenerate empty DAG.
     pub fn root(&self) -> Option<&ColoredNode> {
@@ -145,10 +144,10 @@ impl ColoredDag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sketch_algebra::SketchExpr;
+    use crate::intent_algebra::QueryExpr;
     use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
     use crate::sketch_algebra::sketch_expr::EstimateOp;
-    use crate::intent_algebra::QueryExpr;
+    use crate::sketch_algebra::SketchExpr;
 
     fn dummy_logical() -> SketchExpr {
         SketchExpr::Logical(QueryExpr::Ref {

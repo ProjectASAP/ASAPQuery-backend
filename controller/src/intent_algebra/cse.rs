@@ -253,10 +253,7 @@ mod tests {
             child: Box::new(windowed_scan()),
         };
 
-        let out = dedupe_subtrees(vec![
-            (QueryId::new("q1"), q1),
-            (QueryId::new("q2"), q2),
-        ]);
+        let out = dedupe_subtrees(vec![(QueryId::new("q1"), q1), (QueryId::new("q2"), q2)]);
 
         // One binding hoisted, two roots rewritten to `Ref { name: "shared_0" }`.
         assert_eq!(out.bindings.len(), 1);

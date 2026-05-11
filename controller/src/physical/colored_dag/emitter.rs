@@ -31,10 +31,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
+use crate::sketch_algebra::params::{SketchKind, SketchParams};
+use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
 
 /// Errors surfaced by [`Emitter::emit_per_stage`].
 #[derive(Debug, thiserror::Error, PartialEq)]

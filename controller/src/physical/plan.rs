@@ -39,10 +39,10 @@ pub enum PipelineStage {
 impl std::fmt::Display for PipelineStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            PipelineStage::Agent      => "agent",
-            PipelineStage::Backend    => "backend",
+            PipelineStage::Agent => "agent",
+            PipelineStage::Backend => "backend",
             PipelineStage::Precompute => "precompute",
-            PipelineStage::Db         => "db",
+            PipelineStage::Db => "db",
         };
         write!(f, "{s}")
     }
@@ -112,17 +112,17 @@ pub struct NodeAnnotation {
 #[derive(Debug, Clone)]
 pub struct PlanNode {
     /// The logical operator at this node.
-    pub expr:       QueryExpr,
+    pub expr: QueryExpr,
     /// Which pipeline stage executes this operator.
-    pub stage:      PipelineStage,
+    pub stage: PipelineStage,
     /// Sketch vs. exact vs. passthrough.
-    pub mode:       ExecutionMode,
+    pub mode: ExecutionMode,
     /// Estimated resource cost.
-    pub cost:       CostEstimate,
+    pub cost: CostEstimate,
     /// Allocator hints for code-generation.
     pub annotation: NodeAnnotation,
     /// Child plan nodes (mirrors `expr`'s children after annotation).
-    pub children:   Vec<PlanNode>,
+    pub children: Vec<PlanNode>,
 }
 
 impl PlanNode {
@@ -132,9 +132,9 @@ impl PlanNode {
             expr,
             stage,
             mode,
-            cost:       CostEstimate::default(),
+            cost: CostEstimate::default(),
             annotation: NodeAnnotation::default(),
-            children:   vec![],
+            children: vec![],
         }
     }
 
@@ -214,10 +214,10 @@ pub struct PlanSummary {
 /// One row in the [`PlanSummary::node_annotations`] table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSummaryEntry {
-    pub node_kind:  String,
-    pub stage:      PipelineStage,
-    pub mode:       ExecutionMode,
-    pub rationale:  String,
+    pub node_kind: String,
+    pub stage: PipelineStage,
+    pub mode: ExecutionMode,
+    pub rationale: String,
     pub memory_bytes: f64,
     pub bytes_per_sec: f64,
 }
@@ -226,18 +226,19 @@ impl PlanNode {
     /// Build a [`PlanSummary`] from this root node.
     pub fn summarise(&self, raw_bytes_per_sec: f64) -> PlanSummary {
         let flat = self.flatten();
-        let agent_mem: f64 = flat.iter()
+        let agent_mem: f64 = flat
+            .iter()
             .filter(|(_, n)| n.stage == PipelineStage::Agent)
             .map(|(_, n)| n.cost.memory_bytes)
             .sum();
-        let backend_mem: f64 = flat.iter()
+        let backend_mem: f64 = flat
+            .iter()
             .filter(|(_, n)| n.stage == PipelineStage::Backend)
             .map(|(_, n)| n.cost.memory_bytes)
             .sum();
-        let plan_bw: f64 = flat.iter()
-            .filter(|(_, n)| matches!(
-                n.stage, PipelineStage::Agent | PipelineStage::Backend
-            ))
+        let plan_bw: f64 = flat
+            .iter()
+            .filter(|(_, n)| matches!(n.stage, PipelineStage::Agent | PipelineStage::Backend))
             .map(|(_, n)| n.cost.bytes_per_sec)
             .fold(f64::INFINITY, f64::min); // min of outbound paths
         let saved = if raw_bytes_per_sec > plan_bw {
@@ -246,16 +247,21 @@ impl PlanNode {
             0.0
         };
         let has_demotion = flat.iter().any(|(_, n)| n.annotation.budget_demotion);
-        let entries = flat.iter().map(|(_, n)| {
-            NodeSummaryEntry {
-                node_kind:    format!("{:?}", n.expr).split_whitespace().next().unwrap_or("?").to_string(),
-                stage:        n.stage.clone(),
-                mode:         n.mode.clone(),
-                rationale:    n.annotation.rationale.clone(),
+        let entries = flat
+            .iter()
+            .map(|(_, n)| NodeSummaryEntry {
+                node_kind: format!("{:?}", n.expr)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("?")
+                    .to_string(),
+                stage: n.stage.clone(),
+                mode: n.mode.clone(),
+                rationale: n.annotation.rationale.clone(),
                 memory_bytes: n.cost.memory_bytes,
                 bytes_per_sec: n.cost.bytes_per_sec,
-            }
-        }).collect();
+            })
+            .collect();
         PlanSummary {
             bandwidth_saved_bytes_per_sec: saved,
             agent_memory_bytes: agent_mem,
@@ -297,13 +303,18 @@ mod tests {
     #[test]
     fn nodes_at_stage_collects_correctly() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "root".into() }),
-            stage:      PipelineStage::Agent,
-            mode:       ExecutionMode::Sketch,
-            cost:       CostEstimate { memory_bytes: 100.0, ..Default::default() },
+            expr: QueryExpr::Source(SourceSpec {
+                name: "root".into(),
+            }),
+            stage: PipelineStage::Agent,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate {
+                memory_bytes: 100.0,
+                ..Default::default()
+            },
             annotation: NodeAnnotation::default(),
-            children:   vec![
-                source_node("child_agent",   PipelineStage::Agent),
+            children: vec![
+                source_node("child_agent", PipelineStage::Agent),
                 source_node("child_backend", PipelineStage::Backend),
             ],
         };
@@ -318,19 +329,23 @@ mod tests {
     #[test]
     fn sketch_nodes_only_returns_sketch_mode() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "r".into() }),
-            stage:      PipelineStage::Agent,
-            mode:       ExecutionMode::Sketch,
-            cost:       CostEstimate::default(),
+            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            stage: PipelineStage::Agent,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate::default(),
             annotation: NodeAnnotation::default(),
-            children:   vec![
+            children: vec![
                 PlanNode::leaf(
-                    QueryExpr::Source(SourceSpec { name: "exact_child".into() }),
+                    QueryExpr::Source(SourceSpec {
+                        name: "exact_child".into(),
+                    }),
                     PipelineStage::Db,
                     ExecutionMode::Exact,
                 ),
                 PlanNode::leaf(
-                    QueryExpr::Source(SourceSpec { name: "sketch_child".into() }),
+                    QueryExpr::Source(SourceSpec {
+                        name: "sketch_child".into(),
+                    }),
                     PipelineStage::Backend,
                     ExecutionMode::Sketch,
                 ),
@@ -345,21 +360,25 @@ mod tests {
     #[test]
     fn stage_bandwidth_sums_nodes_at_stage() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "r".into() }),
-            stage:      PipelineStage::Agent,
-            mode:       ExecutionMode::Sketch,
-            cost:       CostEstimate { bytes_per_sec: 500.0, ..Default::default() },
+            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            stage: PipelineStage::Agent,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate {
+                bytes_per_sec: 500.0,
+                ..Default::default()
+            },
             annotation: NodeAnnotation::default(),
-            children:   vec![
-                PlanNode {
-                    expr:       QueryExpr::Source(SourceSpec { name: "c".into() }),
-                    stage:      PipelineStage::Agent,
-                    mode:       ExecutionMode::Passthrough,
-                    cost:       CostEstimate { bytes_per_sec: 200.0, ..Default::default() },
-                    annotation: NodeAnnotation::default(),
-                    children:   vec![],
+            children: vec![PlanNode {
+                expr: QueryExpr::Source(SourceSpec { name: "c".into() }),
+                stage: PipelineStage::Agent,
+                mode: ExecutionMode::Passthrough,
+                cost: CostEstimate {
+                    bytes_per_sec: 200.0,
+                    ..Default::default()
                 },
-            ],
+                annotation: NodeAnnotation::default(),
+                children: vec![],
+            }],
         };
         assert!((root.stage_bandwidth(&PipelineStage::Agent) - 700.0).abs() < 1e-6);
     }
@@ -377,12 +396,12 @@ mod tests {
     #[test]
     fn flatten_depth_increments_per_level() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "r".into() }),
-            stage:      PipelineStage::Agent,
-            mode:       ExecutionMode::Passthrough,
-            cost:       CostEstimate::default(),
+            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            stage: PipelineStage::Agent,
+            mode: ExecutionMode::Passthrough,
+            cost: CostEstimate::default(),
             annotation: NodeAnnotation::default(),
-            children:   vec![source_node("c1", PipelineStage::Backend)],
+            children: vec![source_node("c1", PipelineStage::Backend)],
         };
         let flat = root.flatten();
         assert_eq!(flat[0].0, 0);
@@ -394,16 +413,16 @@ mod tests {
     #[test]
     fn summarise_reports_bandwidth_saved() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "r".into() }),
-            stage:      PipelineStage::Agent,
-            mode:       ExecutionMode::Sketch,
-            cost:       CostEstimate {
+            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            stage: PipelineStage::Agent,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate {
                 bytes_per_sec: 1_000.0,
-                memory_bytes:  256.0,
+                memory_bytes: 256.0,
                 ..Default::default()
             },
             annotation: NodeAnnotation::default(),
-            children:   vec![],
+            children: vec![],
         };
         // Raw baseline is 10 000 B/s; plan reduces to 1 000 B/s → saved = 9 000.
         let summary = root.summarise(10_000.0);
@@ -415,12 +434,15 @@ mod tests {
     #[test]
     fn summarise_detects_budget_demotion() {
         let root = PlanNode {
-            expr:       QueryExpr::Source(SourceSpec { name: "r".into() }),
-            stage:      PipelineStage::Backend,
-            mode:       ExecutionMode::Sketch,
-            cost:       CostEstimate::default(),
-            annotation: NodeAnnotation { budget_demotion: true, ..Default::default() },
-            children:   vec![],
+            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            stage: PipelineStage::Backend,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate::default(),
+            annotation: NodeAnnotation {
+                budget_demotion: true,
+                ..Default::default()
+            },
+            children: vec![],
         };
         let summary = root.summarise(0.0);
         assert!(summary.has_budget_demotion);

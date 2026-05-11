@@ -38,14 +38,14 @@ use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value};
 use std::collections::HashMap;
 
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::sketch_algebra::sketch_expr::EstimateOp;
 use crate::physical::colored_dag::emitter::{
     AggregationInput, ArchiveTierMetric, BackendAggregation, BackendReadout, BackendStageConfig,
     EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor, GatewayStageConfig,
     PrometheusArchiveMetric,
 };
 use crate::physical::colored_dag::stage_id::StageId;
+use crate::sketch_algebra::params::{SketchKind, SketchParams};
+use crate::sketch_algebra::sketch_expr::EstimateOp;
 
 // ── YAML structural types ─────────────────────────────────────────────────────
 //
@@ -154,7 +154,7 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
     // ── Phase 3.2.5 Bug (a): Gorilla-S3 archive processor block ──────────────
     // When the plan includes any archive-tier metric (a freshness-probe
     // archive metric, a `RawAtEdgePrometheusArchive` Mode-3 metric, or
-    // any other metric the routing table claims `gorilla_s3_archive`
+    // any other metric the routing table claims `thanos_query`
     // for), the agent's pipeline MUST run the `gorillas3` processor so
     // the metric's samples land in MinIO. Without this, freshness probes
     // (and any other archive-bound metric) never reach the cold tier and
@@ -539,14 +539,14 @@ pub fn emit_backend_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
 ///
 /// ```json
 /// {
-///   "default_engine": "sketch_warm_tier",
+///   "default_engine": "asap_query",
 ///   "metrics": [
 ///     { "name": "http_requests_total",
 ///       "targets": [
-///         { "engine": "thanos_archive",
+///         { "engine": "thanos_query",
 ///           "applies_to_query_shape": ["count", "topk", "rate_post_hoc",
 ///                                      "histogram_quantile", "delta", "absent"] },
-///         { "engine": "sketch_warm_tier" }
+///         { "engine": "asap_query" }
 ///       ]
 ///     }
 ///   ]
@@ -569,7 +569,7 @@ pub fn emit_backend_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
 /// * **CountMinSketch** present → warm-tier serves `point_count` /
 ///   `count` shape (the CMS's `Estimate` readout).
 ///
-/// The `thanos_archive` target is always added with the **archive-eligible
+/// The `thanos_query` target is always added with the **archive-eligible
 /// shape list** — those PromQL shapes that no warm-tier sketch can
 /// answer at all (`histogram_quantile`, `delta`, `deriv`, `absent`,
 /// post-hoc / un-planned ranges). When a sketch-eligible shape is also
@@ -617,27 +617,27 @@ pub fn emit_backend_storage_routing_for_tenant(
     }
     Ok(json!({
         "tenant": tenant,
-        "default_engine": "sketch_warm_tier",
+        "default_engine": "asap_query",
         "metrics": metrics_json,
     }))
 }
 
 /// Phase ε.1 — same as [`emit_backend_storage_routing`] but also
-/// emits `prometheus_remote` engine entries for Mode 3 metrics.
+/// emits `thanos_query` engine entries for Mode 3 metrics.
 ///
 /// Mode-3 metrics have NO `BackendStageConfig` entry (the backend doesn't
 /// own the storage; Prometheus does). They surface here as plain metric
-/// names paired with a single `prometheus_remote` target. The backend's
+/// names paired with a single `thanos_query` target. The backend's
 /// HTTP query handler consults the routing table at request time and
 /// HTTP-forwards Mode-3 queries to
 /// `${ASAP_PROMETHEUS_QUERY_URL:-http://prometheus:9090}/api/v1/query`.
 ///
-/// Phase ε.2 implements the `prometheus_remote` engine on the backend
+/// Phase ε.2 implements the `thanos_query` engine on the backend
 /// (the HTTP forwarder); Phase ε.1 only commits the routing wire shape.
 ///
 /// `mode3_metrics` is the list of metric names the planner routed to
 /// Prometheus archive this cycle. Each yields a single-target row with
-/// `engine: prometheus_remote` and no shape filter (Prom answers
+/// `engine: thanos_query` and no shape filter (Prom answers
 /// everything for these metrics, exact ε = 0).
 pub fn emit_backend_storage_routing_with_prometheus(
     metric_plans: &[(String, &BackendStageConfig)],
@@ -666,19 +666,19 @@ pub fn emit_backend_storage_routing_with_prometheus_for_tenant(
     }
     for metric_name in mode3_metrics {
         // Mode 3 — Prometheus owns the storage. Single target,
-        // engine=prometheus_remote, no shape filter (all PromQL shapes
+        // engine=thanos_query, no shape filter (all PromQL shapes
         // route through the backend's HTTP forwarder).
         metrics_json.push(json!({
             "name": metric_name,
             "targets": [
-                { "engine": "prometheus_remote" }
+                { "engine": "thanos_query" }
             ],
             "asap_mode": "prometheus_archive",
         }));
     }
     Ok(json!({
         "tenant": tenant,
-        "default_engine": "sketch_warm_tier",
+        "default_engine": "asap_query",
         "metrics": metrics_json,
     }))
 }
@@ -783,11 +783,11 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
     // archive serves better.
     let mut targets: Vec<JsonValue> = Vec::new();
     targets.push(json!({
-        "engine": "sketch_warm_tier",
+        "engine": "asap_query",
     }));
     if !archive_shapes.is_empty() {
         targets.push(json!({
-            "engine": "thanos_archive",
+            "engine": "thanos_query",
             "applies_to_query_shape": archive_shapes,
         }));
     }
@@ -1839,7 +1839,7 @@ mod tests {
         let plans: Vec<(String, &BackendStageConfig)> =
             vec![("http_request_duration_seconds".to_string(), &ddsketch)];
         let v = emit_backend_storage_routing(&plans).expect("emit ok");
-        assert_eq!(v["default_engine"], "sketch_warm_tier");
+        assert_eq!(v["default_engine"], "asap_query");
         let metrics = v["metrics"].as_array().expect("metrics array");
         assert_eq!(metrics.len(), 1);
         assert_eq!(metrics[0]["name"], "http_request_duration_seconds");
@@ -1870,7 +1870,7 @@ mod tests {
             emit_backend_storage_routing_for_tenant("tenant-a", &[("latency".into(), &ddsketch)])
                 .expect("emit ok");
         assert_eq!(v["tenant"], "tenant-a");
-        assert_eq!(v["default_engine"], "sketch_warm_tier");
+        assert_eq!(v["default_engine"], "asap_query");
         // Single metric, single warm + archive target shape — the
         // per-tenant emit doesn't change the metric-side shape.
         let metrics = v["metrics"].as_array().expect("metrics array");
@@ -1887,25 +1887,25 @@ mod tests {
             .expect("emit ok");
         assert_eq!(v["tenant"], "tenant-b");
         assert_eq!(v["metrics"][0]["name"], "http_requests_total");
-        assert_eq!(v["metrics"][0]["targets"][0]["engine"], "prometheus_remote");
+        assert_eq!(v["metrics"][0]["targets"][0]["engine"], "thanos_query");
     }
 
     #[test]
-    fn storage_routing_ddsketch_warm_serves_quantile_archive_serves_others() {
+    fn storage_routing_ddasap_query_serves_quantile_archive_serves_others() {
         let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
         let v = emit_backend_storage_routing(&[("latency".into(), &ddsketch)]).expect("emit ok");
         let metric = &v["metrics"][0];
         let targets = metric["targets"].as_array().expect("targets array");
 
         // Default slot — warm tier, no filter.
-        assert_eq!(targets[0]["engine"], "sketch_warm_tier");
+        assert_eq!(targets[0]["engine"], "asap_query");
         assert!(
             targets[0].get("applies_to_query_shape").is_none(),
             "warm slot must be the default (no filter); got {targets:?}"
         );
 
         // Archive slot — must carry the predictable archive shapes.
-        assert_eq!(targets[1]["engine"], "thanos_archive");
+        assert_eq!(targets[1]["engine"], "thanos_query");
         let archive_shapes: Vec<String> = targets[1]["applies_to_query_shape"]
             .as_array()
             .unwrap()
@@ -1997,13 +1997,13 @@ mod tests {
         // serialises keys alphabetically, so `tenant` lands at the
         // end of the document.
         let expected = r#"{
-  "default_engine": "sketch_warm_tier",
+  "default_engine": "asap_query",
   "metrics": [
     {
       "name": "http_requests_total",
       "targets": [
         {
-          "engine": "sketch_warm_tier"
+          "engine": "asap_query"
         },
         {
           "applies_to_query_shape": [
@@ -2014,7 +2014,7 @@ mod tests {
             "rate_post_hoc",
             "count"
           ],
-          "engine": "thanos_archive"
+          "engine": "thanos_query"
         }
       ],
       "warm_tier_native_shapes": [
@@ -2030,7 +2030,7 @@ mod tests {
       "name": "active_users",
       "targets": [
         {
-          "engine": "sketch_warm_tier"
+          "engine": "asap_query"
         },
         {
           "applies_to_query_shape": [
@@ -2041,7 +2041,7 @@ mod tests {
             "rate_post_hoc",
             "topk"
           ],
-          "engine": "thanos_archive"
+          "engine": "thanos_query"
         }
       ],
       "warm_tier_native_shapes": [
@@ -2057,7 +2057,7 @@ mod tests {
       "name": "request_latency_seconds",
       "targets": [
         {
-          "engine": "sketch_warm_tier"
+          "engine": "asap_query"
         },
         {
           "applies_to_query_shape": [
@@ -2069,7 +2069,7 @@ mod tests {
             "topk",
             "count"
           ],
-          "engine": "thanos_archive"
+          "engine": "thanos_query"
         }
       ],
       "warm_tier_native_shapes": [
@@ -2091,7 +2091,7 @@ mod tests {
     #[test]
     fn storage_routing_empty_input_emits_empty_metrics_array() {
         let v = emit_backend_storage_routing(&[]).expect("emit ok");
-        assert_eq!(v["default_engine"], "sketch_warm_tier");
+        assert_eq!(v["default_engine"], "asap_query");
         assert_eq!(v["metrics"].as_array().unwrap().len(), 0);
     }
 
@@ -2112,8 +2112,8 @@ mod tests {
         assert!(metric.get("warm_tier_native_shapes").is_none());
         // Targets: warm-tier default + archive default-shape list.
         let targets = metric["targets"].as_array().unwrap();
-        assert_eq!(targets[0]["engine"], "sketch_warm_tier");
-        assert_eq!(targets[1]["engine"], "thanos_archive");
+        assert_eq!(targets[0]["engine"], "asap_query");
+        assert_eq!(targets[1]["engine"], "thanos_query");
     }
 
     // ── Phase β: emit_backend_config_json snapshot for new pattern coverage ──
@@ -2234,12 +2234,12 @@ mod tests {
     }
 
     /// Mode 3 (Prometheus archive) — the routing emitter adds a
-    /// `prometheus_remote` engine target for the metric. The backend's
+    /// `thanos_query` engine target for the metric. The backend's
     /// HTTP query handler HTTP-forwards the matching PromQL queries to
     /// `${ASAP_PROMETHEUS_QUERY_URL}/api/v1/query`. Phase ε.2 registers
     /// the engine on the backend.
     #[test]
-    fn phase_eps1_mode3_storage_routing_emits_prometheus_remote() {
+    fn phase_eps1_mode3_storage_routing_emits_thanos_query() {
         // No backend-side aggregations for mode 3 — Prometheus owns it.
         let mode3 = vec!["http_requests_total".to_string()];
         let v = emit_backend_storage_routing_with_prometheus(&[], &mode3).expect("emit ok");
@@ -2248,7 +2248,7 @@ mod tests {
         assert_eq!(metrics[0]["name"], "http_requests_total");
         let targets = metrics[0]["targets"].as_array().unwrap();
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0]["engine"], "prometheus_remote");
+        assert_eq!(targets[0]["engine"], "thanos_query");
         // No shape filter — Prometheus serves every PromQL shape.
         assert!(targets[0].get("applies_to_query_shape").is_none());
         // `asap_mode` annotation surfaces so operators can see why a
@@ -2269,13 +2269,13 @@ mod tests {
         assert_eq!(metrics[0]["name"], "latency_seconds");
         // Mode-1 entry — full warm/archive routing.
         let m1_targets = metrics[0]["targets"].as_array().unwrap();
-        assert_eq!(m1_targets[0]["engine"], "sketch_warm_tier");
-        assert_eq!(m1_targets[1]["engine"], "thanos_archive");
-        // Mode-3 entry — single prometheus_remote target.
+        assert_eq!(m1_targets[0]["engine"], "asap_query");
+        assert_eq!(m1_targets[1]["engine"], "thanos_query");
+        // Mode-3 entry — single thanos_query target.
         assert_eq!(metrics[1]["name"], "http_requests_total");
         let m3_targets = metrics[1]["targets"].as_array().unwrap();
         assert_eq!(m3_targets.len(), 1);
-        assert_eq!(m3_targets[0]["engine"], "prometheus_remote");
+        assert_eq!(m3_targets[0]["engine"], "thanos_query");
     }
 
     /// Mode 3 emit_edge_yaml — produces a YAML with `otlphttp/prometheus`
@@ -2600,7 +2600,10 @@ mod tests {
     /// family per the canonical workload-spec table in MVP §46.
     fn five_sketch_edge_cfg() -> EdgeStageConfig {
         let mut metric_to_family: HashMap<String, SketchKind> = HashMap::new();
-        metric_to_family.insert("http_requests_total_latency_ms".into(), SketchKind::DDSketch);
+        metric_to_family.insert(
+            "http_requests_total_latency_ms".into(),
+            SketchKind::DDSketch,
+        );
         metric_to_family.insert("request_size_bytes".into(), SketchKind::Kll);
         metric_to_family.insert("unique_users_per_min".into(), SketchKind::Hll);
         metric_to_family.insert("top_endpoint_qps".into(), SketchKind::CountSketch);

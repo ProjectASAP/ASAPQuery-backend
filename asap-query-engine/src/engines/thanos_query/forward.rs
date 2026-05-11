@@ -1,4 +1,4 @@
-//! `ThanosForwardEngine` — HTTP forwarder to a `thanos-query`
+//! `ThanosQueryEngine` — HTTP forwarder to a `thanos-query`
 //! sidecar for Path A2 of the Step-2 archive deprecation.
 //!
 //! Step-2.1 (PR #311) teaches `gorillas3processor` to emit
@@ -11,24 +11,25 @@
 //! [`ASAP_THANOS_QUERY_URL_ENV`] env var, consulted at backend
 //! startup:
 //!
-//! * **Path A2 mode** (env set) — `ThanosForwardEngine` is
+//! * **Path A2 mode** (env set) — `ThanosQueryEngine` is
 //!   registered in the [`crate::routing::EngineRouter`]. Archive
 //!   queries POST to `${ASAP_THANOS_QUERY_URL}/api/v1/query` and
 //!   the answer is wrapped in ASAP's standard
 //!   [`crate::engines::QueryResult`] shape.
 //! * **Legacy mode** (env unset) — the in-process
-//!   [`super::GorillaQueryEngine`] handles archive queries from
-//!   the per-hour Gorilla chunks the
-//!   [`super::store::GorillaS3Store`] streams from S3 / MinIO.
+//!   [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+//!   handles archive queries from the per-hour Gorilla chunks that
+//!   [`crate::stores::gorilla_object_store::GorillaS3Store`] streams
+//!   from S3 / MinIO.
 //!   Phase δ deletes this leg after Path A2 is verified
 //!   end-to-end.
 //!
 //! The two modes are mutually exclusive: when Path A2 is active,
-//! both the legacy id (`gorilla_archive`) and the alias id
-//! (`thanos_archive`) point at the same `ThanosForwardEngine`
+//! both the legacy id (`thanos_query`) and the alias id
+//! (`thanos_query`) point at the same `ThanosQueryEngine`
 //! instance, so the per-metric `BackendStorageRouting` config can
 //! target either name without surprise. See the binary's
-//! `register_thanos_or_gorilla_archive` helper for the
+//! `register_thanos_or_thanos_query` helper for the
 //! registration site.
 
 use std::time::{Duration, Instant};
@@ -52,10 +53,10 @@ use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 // ---------------------------------------------------------------------------
 
 /// Env var consulted at backend startup. When set, the binary
-/// registers a [`ThanosForwardEngine`] pointing at the URL and the
+/// registers a [`ThanosQueryEngine`] pointing at the URL and the
 /// router dispatches archive-tier queries to it. When unset, the
-/// legacy in-process [`super::GorillaQueryEngine`] handles archive
-/// queries.
+/// legacy in-process [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+/// handles archive queries.
 pub const ASAP_THANOS_QUERY_URL_ENV: &str = "ASAP_THANOS_QUERY_URL";
 
 /// Default upstream URL when `ASAP_THANOS_QUERY_URL` is set to the
@@ -64,16 +65,16 @@ pub const ASAP_THANOS_QUERY_URL_ENV: &str = "ASAP_THANOS_QUERY_URL";
 /// `mvp-thanos-archive.yml` pins `thanos-query:10903`).
 pub const DEFAULT_THANOS_QUERY_URL: &str = "http://thanos-query:10903";
 
-/// `data_source_id` the [`ThanosForwardEngine`] registers under
+/// `data_source_id` the [`ThanosQueryEngine`] registers under
 /// for explicit per-query overrides via the `X-ASAP-Engine` header
 /// or the `?engine=` query param. Pinned so dashboards / e2e
 /// scripts can byte-compare without parsing.
-pub const DATA_SOURCE_THANOS_ARCHIVE_ID: &str = "thanos_archive";
+pub const DATA_SOURCE_THANOS_QUERY_ID: &str = asap_types::ENGINE_ID_THANOS_QUERY;
 
-/// Marker line every `ThanosForwardEngine` answer carries on its
+/// Marker line every `ThanosQueryEngine` answer carries on its
 /// `infos` array. Pinned so dashboards and the upcoming Step-2.4
 /// e2e demo can byte-compare without parsing.
-pub const DATA_SOURCE_THANOS_ARCHIVE_INFO: &str = "data_source: thanos_archive";
+pub const DATA_SOURCE_THANOS_QUERY_INFO: &str = "data_source: thanos_query";
 
 /// `data_source_quirk` line surfaced when the upstream
 /// `thanos-query` sidecar is unreachable (network error / 5xx /
@@ -91,10 +92,10 @@ pub const DEFAULT_THANOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 // Config + engine.
 // ---------------------------------------------------------------------------
 
-/// Tunable runtime knobs for [`ThanosForwardEngine`]. Built from
-/// env via [`ThanosForwardConfig::from_env`].
+/// Tunable runtime knobs for [`ThanosQueryEngine`]. Built from
+/// env via [`ThanosQueryConfig::from_env`].
 #[derive(Debug, Clone)]
-pub struct ThanosForwardConfig {
+pub struct ThanosQueryConfig {
     /// Base URL of the upstream `thanos-query` sidecar — e.g.
     /// `http://thanos-query:10903`. The engine appends
     /// `/api/v1/query` (or `/api/v1/query_range`) when forwarding.
@@ -104,7 +105,7 @@ pub struct ThanosForwardConfig {
     pub request_timeout: Duration,
 }
 
-impl Default for ThanosForwardConfig {
+impl Default for ThanosQueryConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_THANOS_QUERY_URL.to_string(),
@@ -113,7 +114,7 @@ impl Default for ThanosForwardConfig {
     }
 }
 
-impl ThanosForwardConfig {
+impl ThanosQueryConfig {
     /// Build a config from the [`ASAP_THANOS_QUERY_URL_ENV`] env
     /// var, returning `None` when the var is unset / empty / blank
     /// (the binary should then fall through to the legacy
@@ -147,54 +148,40 @@ impl ThanosForwardConfig {
 /// Implements the [`QueryEngine`] trait so the
 /// [`crate::routing::EngineRouter`] can hold it as `Arc<dyn
 /// QueryEngine>`. Reports `data_source_id =
-/// "thanos_archive"` and (for the compatibility-list dispatch path)
-/// `storage_backend = StorageBackend::GorillaS3Archive` — Path A2
+/// "thanos_query"` and (for the compatibility-list dispatch path)
+/// `storage_backend = StorageBackend::GorillaObjectStore` — Path A2
 /// re-uses the archive tier slot in the routing matrix, so any
-/// metric configured for `GorillaS3Archive` keeps routing through
+/// metric configured for `GorillaObjectStore` keeps routing through
 /// the archive tier; only the engine answering changes.
-pub struct ThanosForwardEngine {
-    config: ThanosForwardConfig,
+pub struct ThanosQueryEngine {
+    config: ThanosQueryConfig,
     client: reqwest::Client,
-    /// Pinned id we register under. Defaults to
-    /// [`DATA_SOURCE_THANOS_ARCHIVE_ID`]; `with_data_source_id`
-    /// lets the binary's "alias under the legacy slot" wiring use
-    /// the same engine instance under both `thanos_archive` and
-    /// `gorilla_archive`.
+    /// Pinned id we register under.
     data_source_id: &'static str,
 }
 
-impl ThanosForwardEngine {
+impl ThanosQueryEngine {
     /// Build with an explicit config. Used by tests + the binary's
     /// startup wiring.
-    pub fn new(config: ThanosForwardConfig) -> Result<Self, ThanosForwardError> {
+    pub fn new(config: ThanosQueryConfig) -> Result<Self, ThanosQueryError> {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
-            .map_err(|e| ThanosForwardError::ConfigInvalid(e.to_string()))?;
+            .map_err(|e| ThanosQueryError::ConfigInvalid(e.to_string()))?;
         Ok(Self {
             config,
             client,
-            data_source_id: DATA_SOURCE_THANOS_ARCHIVE_ID,
+            data_source_id: DATA_SOURCE_THANOS_QUERY_ID,
         })
     }
 
     /// Build the production config from
     /// [`ASAP_THANOS_QUERY_URL_ENV`] or return `None` when the env
     /// var is unset / blank. The binary calls this first; if it
-    /// returns `None`, the legacy in-process `GorillaQueryEngine`
-    /// is registered instead.
-    pub fn from_env() -> Option<Result<Self, ThanosForwardError>> {
-        ThanosForwardConfig::from_env().map(Self::new)
-    }
-
-    /// Override the registered `data_source_id`. Used by the
-    /// binary's "alias under the legacy slot" wiring to register
-    /// the same engine instance under `gorilla_archive` so the
-    /// existing `compatible_storage_backends` failover sequence
-    /// finds it transparently.
-    pub fn with_data_source_id(mut self, id: &'static str) -> Self {
-        self.data_source_id = id;
-        self
+    /// returns `None`, the legacy in-process Gorilla object-store
+    /// executor is registered instead.
+    pub fn from_env() -> Option<Result<Self, ThanosQueryError>> {
+        ThanosQueryConfig::from_env().map(Self::new)
     }
 
     /// Read-only access to the configured base URL — useful for
@@ -204,13 +191,13 @@ impl ThanosForwardEngine {
     }
 
     /// The infos a successful forwarded answer carries. The
-    /// `data_source: thanos_archive` line is added by the HTTP
+    /// `data_source: thanos_query` line is added by the HTTP
     /// handler's `annotate_data_source` step (driven from
     /// `capabilities().data_source_id`), so tests pin the strings
     /// here without re-implementing the wire path.
     pub fn success_infos(elapsed_ms: u128) -> Vec<String> {
         vec![
-            DATA_SOURCE_THANOS_ARCHIVE_INFO.to_string(),
+            DATA_SOURCE_THANOS_QUERY_INFO.to_string(),
             AccuracyProfile::exact().summary(),
             format!("query_latency_ms: {elapsed_ms}"),
         ]
@@ -221,7 +208,7 @@ impl ThanosForwardEngine {
     /// fail-loud behaviour.
     pub fn unreachable_infos(reason: &str, elapsed_ms: u128) -> Vec<String> {
         vec![
-            DATA_SOURCE_THANOS_ARCHIVE_INFO.to_string(),
+            DATA_SOURCE_THANOS_QUERY_INFO.to_string(),
             QUIRK_THANOS_UNREACHABLE.to_string(),
             format!("thanos_unreachable_reason: {reason}"),
             format!("query_latency_ms: {elapsed_ms}"),
@@ -231,9 +218,9 @@ impl ThanosForwardEngine {
     /// Forward `query` to `${base_url}/api/v1/query` and parse the
     /// Prometheus-format response back into a [`QueryResult`].
     ///
-    /// Errors are folded into [`ThanosForwardError`] variants —
+    /// Errors are folded into [`ThanosQueryError`] variants —
     /// the [`QueryEngine`] impl decides how to surface each.
-    pub async fn query(&self, query: &str) -> Result<QueryResult, ThanosForwardError> {
+    pub async fn query(&self, query: &str) -> Result<QueryResult, ThanosQueryError> {
         let started = Instant::now();
         let url = self.config.instant_endpoint();
         debug!(
@@ -248,11 +235,11 @@ impl ThanosForwardEngine {
             .form(&[("query", query)])
             .send()
             .await
-            .map_err(|e| ThanosForwardError::Unreachable(e.to_string()))?;
+            .map_err(|e| ThanosQueryError::Unreachable(e.to_string()))?;
 
         let status = resp.status();
         if status.is_server_error() {
-            return Err(ThanosForwardError::Unreachable(format!(
+            return Err(ThanosQueryError::Unreachable(format!(
                 "upstream returned {status}",
             )));
         }
@@ -261,7 +248,7 @@ impl ThanosForwardEngine {
             // not an unreachable upstream, it's a query the
             // sidecar doesn't accept.
             let body = resp.text().await.unwrap_or_default();
-            return Err(ThanosForwardError::BadQuery {
+            return Err(ThanosQueryError::BadQuery {
                 status: status.as_u16(),
                 body,
             });
@@ -270,21 +257,21 @@ impl ThanosForwardEngine {
         let payload: ThanosResponse = resp
             .json()
             .await
-            .map_err(|e| ThanosForwardError::ParseError(e.to_string()))?;
+            .map_err(|e| ThanosQueryError::ParseError(e.to_string()))?;
 
         let elapsed_ms = started.elapsed().as_millis();
         let result = build_result_from_thanos_payload(payload, elapsed_ms)
-            .map_err(ThanosForwardError::ParseError)?;
+            .map_err(ThanosQueryError::ParseError)?;
         Ok(result)
     }
 }
 
 #[async_trait]
-impl QueryEngine for ThanosForwardEngine {
+impl QueryEngine for ThanosQueryEngine {
     async fn execute(&self, query: &str) -> Result<QueryResult, crate::engines::EngineError> {
         match self.query(query).await {
             Ok(result) => Ok(result),
-            Err(ThanosForwardError::Unreachable(reason)) => {
+            Err(ThanosQueryError::Unreachable(reason)) => {
                 // Surface fail-loud as a backend error so the
                 // router's failover sequence can fall through to
                 // the warm-tier sketch on a `DoubleWrite` deploy.
@@ -301,24 +288,20 @@ impl QueryEngine for ThanosForwardEngine {
                     format!("thanos_unreachable: {reason}"),
                 ))
             }
-            Err(ThanosForwardError::BadQuery { status, body }) => {
+            Err(ThanosQueryError::BadQuery { status, body }) => {
                 Err(crate::engines::EngineError::capability_miss(
                     self.data_source_id,
                     format!("thanos rejected query (status {status}): {body}"),
                 ))
             }
-            Err(ThanosForwardError::ParseError(msg)) => {
-                Err(crate::engines::EngineError::backend(
-                    self.data_source_id,
-                    format!("thanos response parse error: {msg}"),
-                ))
-            }
-            Err(ThanosForwardError::ConfigInvalid(msg)) => {
-                Err(crate::engines::EngineError::backend(
-                    self.data_source_id,
-                    format!("thanos client misconfigured: {msg}"),
-                ))
-            }
+            Err(ThanosQueryError::ParseError(msg)) => Err(crate::engines::EngineError::backend(
+                self.data_source_id,
+                format!("thanos response parse error: {msg}"),
+            )),
+            Err(ThanosQueryError::ConfigInvalid(msg)) => Err(crate::engines::EngineError::backend(
+                self.data_source_id,
+                format!("thanos client misconfigured: {msg}"),
+            )),
         }
     }
 
@@ -328,7 +311,7 @@ impl QueryEngine for ThanosForwardEngine {
             // Re-uses the archive tier slot in the routing
             // matrix; Path A2 swaps the engine answering, not the
             // tier classification. See module docstring.
-            storage_backend: asap_types::StorageBackend::GorillaS3Archive,
+            storage_backend: asap_types::StorageBackend::GorillaObjectStore,
             // Forwarder doesn't materialise samples locally;
             // upstream thanos-query owns the memory budget. We
             // surface a generous ceiling so the cost-aware
@@ -374,7 +357,9 @@ fn build_result_from_thanos_payload(
 ) -> Result<QueryResult, String> {
     if payload.status != "success" {
         let detail = payload.error.unwrap_or_else(|| "unknown error".to_string());
-        let kind = payload.error_type.unwrap_or_else(|| "execution".to_string());
+        let kind = payload
+            .error_type
+            .unwrap_or_else(|| "execution".to_string());
         return Err(format!("thanos error ({kind}): {detail}"));
     }
     let data = payload
@@ -410,11 +395,11 @@ fn build_result_from_thanos_payload(
     // `infos: []` array is appended downstream from the
     // PrometheusResponse adapter (`with_accuracy` already mirrors
     // a one-liner there). For dashboards that pin
-    // `data_source: thanos_archive` byte-compares, the HTTP
+    // `data_source: thanos_query` byte-compares, the HTTP
     // handler's `annotate_data_source` step adds the marker line
     // to `infos` after dispatch — but only when the engine reports
-    // the `thanos_archive` id; aliased registrations under
-    // `gorilla_archive` get the gorilla marker instead, which is
+    // the `thanos_query` id; aliased registrations under
+    // `thanos_query` get the gorilla marker instead, which is
     // fine for Path A2 backwards compat.
     let _ = elapsed_ms; // surfaced via tests directly via `success_infos`.
     Ok(result)
@@ -494,7 +479,7 @@ fn parse_matrix(values: &[Value]) -> Result<QueryResult, String> {
 /// the values into `KeyByLabelValues` (the same shape the
 /// in-process engine pins on its results). Unknown / non-object
 /// shapes fall through to an empty label set rather than failing
-/// the parse — the wrapped `data_source: thanos_archive` info is
+/// the parse — the wrapped `data_source: thanos_query` info is
 /// the meaningful annotation.
 fn labels_from_metric(metric: &Value) -> KeyByLabelValues {
     if let Some(obj) = metric.as_object() {
@@ -519,7 +504,7 @@ fn labels_from_metric(metric: &Value) -> KeyByLabelValues {
 /// envelope; the public `query` method returns the richer surface
 /// for tests and direct callers.
 #[derive(Debug, thiserror::Error)]
-pub enum ThanosForwardError {
+pub enum ThanosQueryError {
     /// Upstream returned a network error / timeout / 5xx —
     /// dashboard-level "thanos is down."
     #[error("thanos unreachable: {0}")]
@@ -549,16 +534,16 @@ pub enum ThanosForwardError {
 // ---------------------------------------------------------------------------
 
 /// Convenience combinator the binary uses at startup: try
-/// [`ThanosForwardEngine::from_env`]; if it returns `None`, the
+/// [`ThanosQueryEngine::from_env`]; if it returns `None`, the
 /// caller falls through to the legacy in-process
-/// [`super::GorillaQueryEngine`] path.
+/// [`crate::stores::gorilla_object_store::GorillaQueryEngine`] path.
 ///
 /// Returning `Result<Option<...>, ...>` instead of unwrapping in
 /// `main.rs` keeps the construction failure (bad URL / bad TLS
 /// init) inspectable so the binary can emit a helpful warning
 /// instead of crashing on startup.
-pub fn engine_from_env() -> Result<Option<ThanosForwardEngine>, ThanosForwardError> {
-    match ThanosForwardEngine::from_env() {
+pub fn engine_from_env() -> Result<Option<ThanosQueryEngine>, ThanosQueryError> {
+    match ThanosQueryEngine::from_env() {
         Some(Ok(engine)) => Ok(Some(engine)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
@@ -596,12 +581,13 @@ pub mod test_support {
 
         let app: Router = Router::new()
             .route("/api/v1/query", post(move || async move { canned_body }))
-            .route("/api/v1/query_range", post(move || async move { canned_body }));
+            .route(
+                "/api/v1/query_range",
+                post(move || async move { canned_body }),
+            );
 
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("mock_thanos serve");
+            axum::serve(listener, app).await.expect("mock_thanos serve");
         });
 
         // Best-effort: yield once so the listener is definitely
@@ -700,8 +686,8 @@ mod tests {
     use super::*;
     use crate::engines::query_result::QueryResult;
 
-    fn config_for(url: &str) -> ThanosForwardConfig {
-        ThanosForwardConfig {
+    fn config_for(url: &str) -> ThanosQueryConfig {
+        ThanosQueryConfig {
             base_url: url.trim_end_matches('/').to_string(),
             request_timeout: Duration::from_secs(5),
         }
@@ -710,12 +696,12 @@ mod tests {
     #[tokio::test]
     async fn forwards_promql_and_wraps_response() {
         let (url, _handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
-        let engine = ThanosForwardEngine::new(config_for(&url)).expect("engine");
+        let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
         let result = engine.query("up").await.expect("ok response");
 
-        let infos = ThanosForwardEngine::success_infos(0);
+        let infos = ThanosQueryEngine::success_infos(0);
         assert!(
-            infos.iter().any(|s| s == DATA_SOURCE_THANOS_ARCHIVE_INFO),
+            infos.iter().any(|s| s == DATA_SOURCE_THANOS_QUERY_INFO),
             "success_infos must carry the data_source marker; got {infos:?}",
         );
         assert!(
@@ -739,36 +725,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_report_thanos_archive_id() {
+    async fn capabilities_report_thanos_query_id() {
         // No upstream needed — we only inspect capabilities.
-        let engine =
-            ThanosForwardEngine::new(config_for("http://127.0.0.1:1")).expect("engine");
+        let engine = ThanosQueryEngine::new(config_for("http://127.0.0.1:1")).expect("engine");
         let caps = engine.capabilities();
-        assert_eq!(caps.data_source_id, DATA_SOURCE_THANOS_ARCHIVE_ID);
+        assert_eq!(caps.data_source_id, DATA_SOURCE_THANOS_QUERY_ID);
         assert_eq!(
             caps.storage_backend,
-            asap_types::StorageBackend::GorillaS3Archive,
+            asap_types::StorageBackend::GorillaObjectStore,
             "Path A2 re-uses the archive tier slot in the routing matrix",
         );
     }
 
     #[tokio::test]
-    async fn alias_registration_reports_overridden_id() {
-        let engine = ThanosForwardEngine::new(config_for("http://127.0.0.1:1"))
-            .expect("engine")
-            .with_data_source_id("gorilla_archive");
-        assert_eq!(engine.capabilities().data_source_id, "gorilla_archive");
-    }
-
-    #[tokio::test]
     async fn unreachable_upstream_returns_503_quirk_via_engine_trait() {
         let (url, _handle) = spawn_mock_thanos_503().await;
-        let engine = ThanosForwardEngine::new(config_for(&url)).expect("engine");
+        let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
 
         // The richer surface returns Unreachable.
         let direct = engine.query("up").await;
         match direct {
-            Err(ThanosForwardError::Unreachable(_)) => {}
+            Err(ThanosQueryError::Unreachable(_)) => {}
             other => panic!("expected Unreachable error, got {other:?}"),
         }
 
@@ -779,7 +756,7 @@ mod tests {
         let trait_path = QueryEngine::execute(&engine, "up").await;
         match trait_path {
             Err(crate::engines::EngineError::Backend { engine_id, message }) => {
-                assert_eq!(engine_id, DATA_SOURCE_THANOS_ARCHIVE_ID);
+                assert_eq!(engine_id, DATA_SOURCE_THANOS_QUERY_ID);
                 assert!(
                     message.contains("thanos_unreachable"),
                     "Backend error must carry thanos_unreachable marker; got {message:?}",
@@ -790,43 +767,40 @@ mod tests {
 
         // The unreachable_infos helper exposes the wire shape
         // dashboards / e2e demos pin against.
-        let infos = ThanosForwardEngine::unreachable_infos("upstream returned 503", 0);
+        let infos = ThanosQueryEngine::unreachable_infos("upstream returned 503", 0);
         assert!(infos.iter().any(|s| s == QUIRK_THANOS_UNREACHABLE));
-        assert!(infos.iter().any(|s| s.contains("thanos_unreachable_reason")));
+        assert!(infos
+            .iter()
+            .any(|s| s.contains("thanos_unreachable_reason")));
     }
 
     #[tokio::test]
     async fn config_from_env_returns_none_when_unset() {
         let _g = ENV_LOCK.lock().expect("lock");
         let _scope = test_support::EnvGuard::unset(ASAP_THANOS_QUERY_URL_ENV);
-        assert!(ThanosForwardConfig::from_env().is_none());
+        assert!(ThanosQueryConfig::from_env().is_none());
     }
 
     #[tokio::test]
     async fn config_from_env_returns_none_when_blank() {
         let _g = ENV_LOCK.lock().expect("lock");
         let _scope = test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "   ");
-        assert!(ThanosForwardConfig::from_env().is_none());
+        assert!(ThanosQueryConfig::from_env().is_none());
     }
 
     #[tokio::test]
     async fn config_from_env_strips_trailing_slash() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_THANOS_QUERY_URL_ENV,
-            "http://thanos-query:10903/",
-        );
-        let cfg = ThanosForwardConfig::from_env().expect("set");
+        let _scope =
+            test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "http://thanos-query:10903/");
+        let cfg = ThanosQueryConfig::from_env().expect("set");
         assert_eq!(cfg.base_url, "http://thanos-query:10903");
     }
 
     #[tokio::test]
     async fn engine_from_env_returns_some_when_set() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_THANOS_QUERY_URL_ENV,
-            "http://127.0.0.1:1",
-        );
+        let _scope = test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "http://127.0.0.1:1");
         let engine = engine_from_env().expect("ok");
         assert!(engine.is_some(), "env set → engine constructed");
     }
@@ -836,7 +810,10 @@ mod tests {
         let _g = ENV_LOCK.lock().expect("lock");
         let _scope = test_support::EnvGuard::unset(ASAP_THANOS_QUERY_URL_ENV);
         let engine = engine_from_env().expect("ok");
-        assert!(engine.is_none(), "env unset → caller must use legacy engine");
+        assert!(
+            engine.is_none(),
+            "env unset → caller must use legacy engine"
+        );
     }
 
     #[test]

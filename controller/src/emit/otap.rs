@@ -38,15 +38,14 @@ use serde::Serialize;
 use serde_yaml::{Mapping, Value};
 use std::collections::BTreeMap;
 
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::physical::colored_dag::emitter::{EdgeStageConfig, EdgeSketchProcessor, ExportTarget};
+use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
+use crate::sketch_algebra::params::{SketchKind, SketchParams};
 
 /// Default URL for Prometheus's native OTLP HTTP receiver.
 /// Matches `super::stage_config::emit_edge_yaml`'s placeholder so the
 /// three runtime emitters agree on the wire endpoint.
-pub const DEFAULT_PROMETHEUS_OTLP_URL: &str =
-    "http://prometheus:9090/api/v1/otlp/v1/metrics";
+pub const DEFAULT_PROMETHEUS_OTLP_URL: &str = "http://prometheus:9090/api/v1/otlp/v1/metrics";
 
 /// URN of the OTLP HTTP exporter registered by
 /// `otel-arrow/rust/otap-dataflow/crates/core-nodes/src/exporters/otlp_http_exporter/`.
@@ -156,8 +155,7 @@ pub fn emit_otap_dag_yaml(
         // multi-pipeline `pipelines:` map. Phase ε.1.5 ships the
         // single-pipeline case; the multi-pipeline case is an upstream
         // splitter concern.)
-        let prom_url =
-            prometheus_otlp_url.unwrap_or(DEFAULT_PROMETHEUS_OTLP_URL);
+        let prom_url = prometheus_otlp_url.unwrap_or(DEFAULT_PROMETHEUS_OTLP_URL);
         let exp_cfg = build_otlp_http_exporter_config(prom_url);
         nodes.insert(
             "exporter".to_string(),
@@ -219,10 +217,7 @@ pub fn emit_otap_dag_yaml(
     }
 
     let mut pipelines = BTreeMap::new();
-    pipelines.insert(
-        "main".to_string(),
-        PipelineDef { nodes, connections },
-    );
+    pipelines.insert("main".to_string(), PipelineDef { nodes, connections });
 
     let mut groups = BTreeMap::new();
     groups.insert("default".to_string(), Group { pipelines });
@@ -293,7 +288,10 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
         "aggregation_id".into(),
         Value::String(sp.aggregation_id.clone()),
     );
-    m.insert("sketch_kind".into(), Value::String(sketch_kind_tag(&sp.sketch_kind).into()));
+    m.insert(
+        "sketch_kind".into(),
+        Value::String(sketch_kind_tag(&sp.sketch_kind).into()),
+    );
     match &sp.sketch_params {
         SketchParams::Kll(p) => {
             m.insert("k".into(), Value::Number((p.k as u64).into()));
@@ -336,8 +334,8 @@ fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sketch_algebra::params::DDSketchParams;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
+    use crate::sketch_algebra::params::DDSketchParams;
 
     /// Minimal struct-stub used to validate the emitted DAG parses as the
     /// otap-dataflow schema. We don't pull in the otap-df-config crate
@@ -432,12 +430,17 @@ mod tests {
     /// otlp_grpc exporter to gateway.
     #[test]
     fn otap_dag_mode1_sketch_at_edge_shape() {
-        let yaml =
-            emit_otap_dag_yaml(&ddsketch_edge_cfg_mode1(), "ws://ctrl/v1/opamp", None)
-                .expect("emit_otap_dag_yaml ok");
+        let yaml = emit_otap_dag_yaml(&ddsketch_edge_cfg_mode1(), "ws://ctrl/v1/opamp", None)
+            .expect("emit_otap_dag_yaml ok");
         let dag: OtapDagStub = serde_yaml::from_str(&yaml).expect("DAG parses");
         assert_eq!(dag.version, "otel_dataflow/v1");
-        let pipe = dag.groups.get("default").unwrap().pipelines.get("main").unwrap();
+        let pipe = dag
+            .groups
+            .get("default")
+            .unwrap()
+            .pipelines
+            .get("main")
+            .unwrap();
         // Receiver + sketch + exporter == 3 nodes.
         assert_eq!(pipe.nodes.len(), 3, "expected 3 nodes\n{yaml}");
         assert_eq!(pipe.nodes.get("receiver").unwrap().kind, URN_OTLP_RECEIVER);
@@ -445,7 +448,10 @@ mod tests {
             pipe.nodes.get("sketch_0").unwrap().kind,
             URN_ASAP_SKETCHES_PROCESSOR
         );
-        assert_eq!(pipe.nodes.get("exporter").unwrap().kind, URN_OTLP_GRPC_EXPORTER);
+        assert_eq!(
+            pipe.nodes.get("exporter").unwrap().kind,
+            URN_OTLP_GRPC_EXPORTER
+        );
         // Connections: receiver → sketch_0 → exporter.
         assert_eq!(pipe.connections.len(), 2);
         assert_eq!(pipe.connections[0].from, "receiver");
@@ -453,7 +459,10 @@ mod tests {
         assert_eq!(pipe.connections[1].from, "sketch_0");
         assert_eq!(pipe.connections[1].to, "exporter");
         // Endpoint contains gateway:4317.
-        assert!(yaml.contains("gateway:4317"), "missing gateway endpoint\n{yaml}");
+        assert!(
+            yaml.contains("gateway:4317"),
+            "missing gateway endpoint\n{yaml}"
+        );
     }
 
     /// Mode 2 snapshot — raw at edge: receiver → otlp_grpc exporter.
@@ -463,10 +472,23 @@ mod tests {
         let yaml = emit_otap_dag_yaml(&raw_edge_cfg_mode2(), "ws://ctrl/v1/opamp", None)
             .expect("emit_otap_dag_yaml ok");
         let dag: OtapDagStub = serde_yaml::from_str(&yaml).expect("DAG parses");
-        let pipe = dag.groups.get("default").unwrap().pipelines.get("main").unwrap();
-        assert_eq!(pipe.nodes.len(), 2, "expected receiver + exporter only\n{yaml}");
+        let pipe = dag
+            .groups
+            .get("default")
+            .unwrap()
+            .pipelines
+            .get("main")
+            .unwrap();
+        assert_eq!(
+            pipe.nodes.len(),
+            2,
+            "expected receiver + exporter only\n{yaml}"
+        );
         assert_eq!(pipe.nodes.get("receiver").unwrap().kind, URN_OTLP_RECEIVER);
-        assert_eq!(pipe.nodes.get("exporter").unwrap().kind, URN_OTLP_GRPC_EXPORTER);
+        assert_eq!(
+            pipe.nodes.get("exporter").unwrap().kind,
+            URN_OTLP_GRPC_EXPORTER
+        );
         // Direct connection.
         assert_eq!(pipe.connections.len(), 1);
         assert_eq!(pipe.connections[0].from, "receiver");
@@ -485,9 +507,18 @@ mod tests {
         let yaml = emit_otap_dag_yaml(&prom_edge_cfg_mode3(), "ws://ctrl/v1/opamp", None)
             .expect("emit_otap_dag_yaml ok");
         let dag: OtapDagStub = serde_yaml::from_str(&yaml).expect("DAG parses");
-        let pipe = dag.groups.get("default").unwrap().pipelines.get("main").unwrap();
+        let pipe = dag
+            .groups
+            .get("default")
+            .unwrap()
+            .pipelines
+            .get("main")
+            .unwrap();
         assert_eq!(pipe.nodes.len(), 2);
-        assert_eq!(pipe.nodes.get("exporter").unwrap().kind, URN_OTLP_HTTP_EXPORTER);
+        assert_eq!(
+            pipe.nodes.get("exporter").unwrap().kind,
+            URN_OTLP_HTTP_EXPORTER
+        );
         // Path round-trips verbatim.
         assert!(
             yaml.contains("/api/v1/otlp/v1/metrics"),

@@ -51,11 +51,11 @@
 
 use std::collections::BTreeMap;
 
+use asap_sketchlib::sketches::countminsketch::CountMinSketch;
+use asap_sketchlib::sketches::countsketch::CountSketch;
 use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::HllSketch;
 use asap_sketchlib::sketches::kll::KllSketch;
-use asap_sketchlib::sketches::countminsketch::CountMinSketch;
-use asap_sketchlib::sketches::countsketch::CountSketch;
 
 use crate::engines::warm_tier::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
@@ -379,7 +379,11 @@ impl<'a> SketchReducer<'a> {
                         continue;
                     };
                     any_window = true;
-                    let w_end_u64 = if *window_end >= 0 { *window_end as u64 } else { 0 };
+                    let w_end_u64 = if *window_end >= 0 {
+                        *window_end as u64
+                    } else {
+                        0
+                    };
                     if w_end_u64 < cov_lo {
                         cov_lo = w_end_u64;
                     }
@@ -478,25 +482,25 @@ impl<'a> SketchReducer<'a> {
                 }
 
                 let samples_out: Vec<(i64, f64)> = if is_cumulative {
-                    let (one, _skipped) =
-                        cumulative_evaluate(&samples_vec, delta_kind, &evaluator)
-                            .map_err(|e| WarmTierError::DeserializeFailure {
-                                sid,
-                                encoding: SketchEncoding::ProtoFull,
-                                reason: e,
-                            })?;
+                    let (one, _skipped) = cumulative_evaluate(&samples_vec, delta_kind, &evaluator)
+                        .map_err(|e| WarmTierError::DeserializeFailure {
+                            sid,
+                            encoding: SketchEncoding::ProtoFull,
+                            reason: e,
+                        })?;
                     match one {
                         Some(s) => vec![s],
                         None => Vec::new(),
                     }
                 } else {
                     let (per_win, _skipped) =
-                        per_window_evaluate(&samples_vec, delta_kind, &evaluator)
-                            .map_err(|e| WarmTierError::DeserializeFailure {
+                        per_window_evaluate(&samples_vec, delta_kind, &evaluator).map_err(|e| {
+                            WarmTierError::DeserializeFailure {
                                 sid,
                                 encoding: SketchEncoding::ProtoFull,
                                 reason: e,
-                            })?;
+                            }
+                        })?;
                     per_win
                 };
                 out_series.push((ts.series_label_values, samples_out));
@@ -626,18 +630,17 @@ impl<'a> SketchReducer<'a> {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn decode_ddsketch(
-    sid: u64,
-    state: &SketchSampleState,
-) -> Result<DdSketch, WarmTierError> {
+fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, WarmTierError> {
     match state.encoding {
-        SketchEncoding::ProtoFull => DdSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
+        SketchEncoding::ProtoFull => {
+            DdSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
+                WarmTierError::DeserializeFailure {
+                    sid,
+                    encoding: state.encoding,
+                    reason: e.to_string(),
+                }
+            })
+        }
         SketchEncoding::MsgpackFull => DdSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
             WarmTierError::DeserializeFailure {
                 sid,
@@ -659,18 +662,17 @@ fn decode_ddsketch(
 }
 
 #[allow(dead_code)]
-fn decode_kll(
-    sid: u64,
-    state: &SketchSampleState,
-) -> Result<KllSketch, WarmTierError> {
+fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, WarmTierError> {
     match state.encoding {
-        SketchEncoding::ProtoFull => KllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
+        SketchEncoding::ProtoFull => {
+            KllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
+                WarmTierError::DeserializeFailure {
+                    sid,
+                    encoding: state.encoding,
+                    reason: e.to_string(),
+                }
+            })
+        }
         SketchEncoding::MsgpackFull => KllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
             WarmTierError::DeserializeFailure {
                 sid,
@@ -682,26 +684,24 @@ fn decode_kll(
             Err(WarmTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
-                reason: "KLL delta encodings not implemented in warm-tier reducer"
-                    .to_string(),
+                reason: "KLL delta encodings not implemented in warm-tier reducer".to_string(),
             })
         }
     }
 }
 
 #[allow(dead_code)]
-fn decode_hll(
-    sid: u64,
-    state: &SketchSampleState,
-) -> Result<HllSketch, WarmTierError> {
+fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, WarmTierError> {
     match state.encoding {
-        SketchEncoding::ProtoFull => HllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
+        SketchEncoding::ProtoFull => {
+            HllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
+                WarmTierError::DeserializeFailure {
+                    sid,
+                    encoding: state.encoding,
+                    reason: e.to_string(),
+                }
+            })
+        }
         SketchEncoding::MsgpackFull => HllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
             WarmTierError::DeserializeFailure {
                 sid,
@@ -713,8 +713,7 @@ fn decode_hll(
             Err(WarmTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
-                reason: "HLL delta encodings not implemented in warm-tier reducer"
-                    .to_string(),
+                reason: "HLL delta encodings not implemented in warm-tier reducer".to_string(),
             })
         }
     }
@@ -733,11 +732,13 @@ fn DdSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<DdSketch, String
         Ok(env) => match env.sketch_state {
             Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
             Some(_) => return Err("SketchEnvelope contains non-DDSketch sketch".to_string()),
-            None => DdSketchState::decode(buffer)
-                .map_err(|e| format!("decode DDSketchState: {e}"))?,
+            None => {
+                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
+            }
         },
-        Err(_) => DdSketchState::decode(buffer)
-            .map_err(|e| format!("decode DDSketchState: {e}"))?,
+        Err(_) => {
+            DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
+        }
     };
     if !(state.alpha > 0.0 && state.alpha < 1.0) {
         return Err(format!(
@@ -800,8 +801,9 @@ fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, Stri
             None => HyperLogLogState::decode(buffer)
                 .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
         },
-        Err(_) => HyperLogLogState::decode(buffer)
-            .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+        Err(_) => {
+            HyperLogLogState::decode(buffer).map_err(|e| format!("decode HyperLogLogState: {e}"))?
+        }
     };
     if state.precision == 0 || state.precision > 20 {
         return Err(format!(

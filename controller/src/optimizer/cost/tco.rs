@@ -146,9 +146,8 @@ fn compute_before(w: &TcoWorkload, p: &CloudPricing) -> TcoBefore {
     };
 
     // Ingestion: Grafana charges per 1000 active series at 1 DPM.
-    let ingestion = (w.series_count as f64 / 1000.0)
-        * p.grafana_per_1k_series_1dpm
-        * dpm_multiplier;
+    let ingestion =
+        (w.series_count as f64 / 1000.0) * p.grafana_per_1k_series_1dpm * dpm_multiplier;
 
     // Storage: raw bytes over retention period.
     let samples_per_day = w.samples_per_sec * 86_400.0;
@@ -269,8 +268,14 @@ mod tests {
         let pricing = CloudPricing::default();
         let est = estimate_tco(&workload, &pricing);
 
-        assert!(est.before.total_dollars > 0.0, "before total should be positive");
-        assert!(est.after.total_dollars > 0.0, "after total should be positive");
+        assert!(
+            est.before.total_dollars > 0.0,
+            "before total should be positive"
+        );
+        assert!(
+            est.after.total_dollars > 0.0,
+            "after total should be positive"
+        );
         assert!(
             est.savings_percent > 50.0,
             "expected >50% savings for 100K series, got {:.1}%",
@@ -296,14 +301,18 @@ mod tests {
         let est = estimate_tco(&workload, &pricing);
 
         assert!(est.before.total_dollars > est.after.total_dollars);
-        assert!(est.savings_percent > 50.0,
-            "expected >50% savings at 1M series, got {:.1}%", est.savings_percent);
+        assert!(
+            est.savings_percent > 50.0,
+            "expected >50% savings at 1M series, got {:.1}%",
+            est.savings_percent
+        );
         // At 1M series we need ceil(1M/100K) = 10 instances.
         let expected_compute = pricing.ec2_sketch_instance_per_hour * HOURS_PER_MONTH * 10.0;
         assert!(
             (est.after.compute_dollars - expected_compute).abs() < 0.01,
             "compute should be ~${:.2}, got ${:.2}",
-            expected_compute, est.after.compute_dollars
+            expected_compute,
+            est.after.compute_dollars
         );
     }
 
@@ -326,7 +335,10 @@ mod tests {
             "storage should be 0"
         );
         // After still has a minimum 1-instance compute cost.
-        assert!(est.after.compute_dollars > 0.0, "compute has a 1-instance minimum");
+        assert!(
+            est.after.compute_dollars > 0.0,
+            "compute has a 1-instance minimum"
+        );
         // But sketch/s3 ingestion should be zero.
         assert!(
             est.after.sketch_ingestion_dollars.abs() < f64::EPSILON,

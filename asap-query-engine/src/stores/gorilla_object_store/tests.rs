@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use crate::engines::query_result::QueryResult;
 use crate::stores::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
 
-use super::engine::{plan_query_at, QueryStatistic};
+use super::query_engine::{plan_query_at, QueryStatistic};
 use super::store::{ChunkRef, RawSample, Store, StoreError};
 use super::{
     wrap_result, EngineError, ExactExecutor, ExecutionOutcome, GorillaEngineConfig,
@@ -60,10 +60,7 @@ impl MockStore {
 
     /// mvp/v5: install a postings table for the
     /// `list_postings_for` path.
-    fn with_postings(
-        mut self,
-        postings: BTreeMap<(String, String), Vec<u64>>,
-    ) -> Self {
+    fn with_postings(mut self, postings: BTreeMap<(String, String), Vec<u64>>) -> Self {
         self.postings = Some(postings);
         self
     }
@@ -99,9 +96,7 @@ impl Store for MockStore {
             .chunks
             .iter()
             .filter(|(c, _)| {
-                c.metric == metric
-                    && c.time_range_ms.0 < end_ms
-                    && c.time_range_ms.1 >= start_ms
+                c.metric == metric && c.time_range_ms.0 < end_ms && c.time_range_ms.1 >= start_ms
             })
             .map(|(c, _)| c.clone())
             .collect())
@@ -143,18 +138,14 @@ impl Store for MockStore {
         };
         if matchers.is_empty() {
             // Union of every series id in the table.
-            let mut set: std::collections::BTreeSet<u64> =
-                std::collections::BTreeSet::new();
+            let mut set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             for ids in table.values() {
                 set.extend(ids.iter().copied());
             }
             hits.series_ids = set.into_iter().collect();
             return Ok(hits);
         }
-        let first = table
-            .get(&matchers[0])
-            .cloned()
-            .unwrap_or_default();
+        let first = table.get(&matchers[0]).cloned().unwrap_or_default();
         let mut acc: std::collections::BTreeSet<u64> = first.into_iter().collect();
         for m in &matchers[1..] {
             let next = table.get(m).cloned().unwrap_or_default();
@@ -231,14 +222,7 @@ fn engine_with_config(
 #[tokio::test]
 async fn execute_sum_over_time_streaming() {
     // 60 samples × value 2.0 = 120.0
-    let chunks = vec![linear_chunk(
-        "c1",
-        NOW_MS - 60_000,
-        1_000,
-        60,
-        2.0,
-        0.0,
-    )];
+    let chunks = vec![linear_chunk("c1", NOW_MS - 60_000, 1_000, 60, 2.0, 0.0)];
     let engine = engine_with(chunks);
     let plan = plan_query_at(&format!("sum_over_time({METRIC}[5m])"), NOW_MS).unwrap();
     assert_eq!(plan.statistic, QueryStatistic::SumOverTime);
@@ -415,8 +399,8 @@ async fn execute_last_over_time_unordered_samples_picks_largest_ts() {
     // claims (start, last_ts+1) but the per-sample observe() must
     // still pick the largest ts, not the last-arrived sample.
     let samples = vec![
-        raw(NOW_MS - 5_000, 50.0),  // largest ts is sample[2]
-        raw(NOW_MS - 8_000, 80.0),  // smallest ts but later in vec
+        raw(NOW_MS - 5_000, 50.0),   // largest ts is sample[2]
+        raw(NOW_MS - 8_000, 80.0),   // smallest ts but later in vec
         raw(NOW_MS - 1_000, 1234.5), // largest ts
         raw(NOW_MS - 3_000, 30.0),
     ];
@@ -675,7 +659,7 @@ async fn result_carries_exact_accuracy_envelope() {
 }
 
 #[tokio::test]
-async fn result_includes_data_source_gorilla_archive() {
+async fn result_includes_data_source_thanos_query() {
     // The wrapping fn surfaces the data_source line on
     // ExecutionOutcome::info_lines — pin both the marker constant
     // and the assembled info strings.
@@ -747,7 +731,6 @@ async fn engine_respects_config_timeout() {
     }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────
 // mvp/v5 — postings-aware path tests
 // ─────────────────────────────────────────────────────────────────────
@@ -788,18 +771,31 @@ async fn postings_aware_path_prunes_chunks() {
     // Two chunks: one for zone=a (label_hash=11), one for zone=b
     // (label_hash=22). Postings says zone=a → [11]. The engine
     // must read only the zone=a chunk.
-    let (chunk_a, samples_a) =
-        labeled_chunk("k-a", 11, "a", NOW_MS - 30_000, &[(NOW_MS - 1_000, 5.0), (NOW_MS - 500, 5.0)]);
-    let (chunk_b, samples_b) =
-        labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0), (NOW_MS - 500, 99.0)]);
+    let (chunk_a, samples_a) = labeled_chunk(
+        "k-a",
+        11,
+        "a",
+        NOW_MS - 30_000,
+        &[(NOW_MS - 1_000, 5.0), (NOW_MS - 500, 5.0)],
+    );
+    let (chunk_b, samples_b) = labeled_chunk(
+        "k-b",
+        22,
+        "b",
+        NOW_MS - 30_000,
+        &[(NOW_MS - 1_000, 99.0), (NOW_MS - 500, 99.0)],
+    );
     let mut postings: BTreeMap<(String, String), Vec<u64>> = BTreeMap::new();
     postings.insert(("zone".to_string(), "a".to_string()), vec![11]);
     postings.insert(("zone".to_string(), "b".to_string()), vec![22]);
-    let mock = MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)])
-        .with_postings(postings);
+    let mock =
+        MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]).with_postings(postings);
     let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
-    let plan =
-        plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
+    let plan = plan_query_at(
+        &format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#),
+        NOW_MS,
+    )
+    .unwrap();
     assert_eq!(plan.label_matchers.len(), 1);
     let exec = ExactExecutor::new(engine.store_for_tests(), cfg());
     let outcome = exec.execute_plan(&plan).await.unwrap();
@@ -822,8 +818,11 @@ async fn postings_missing_falls_back_to_scan_all() {
         labeled_chunk("k-b", 22, "b", NOW_MS - 30_000, &[(NOW_MS - 1_000, 99.0)]);
     let mock = MockStore::new(vec![(chunk_a, samples_a), (chunk_b, samples_b)]);
     let engine = GorillaQueryEngine::new(Arc::new(mock), cfg());
-    let plan =
-        plan_query_at(&format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#), NOW_MS).unwrap();
+    let plan = plan_query_at(
+        &format!(r#"sum_over_time({METRIC}{{zone="a"}}[5m])"#),
+        NOW_MS,
+    )
+    .unwrap();
     let exec = ExactExecutor::new(engine.store_for_tests(), cfg());
     let outcome = exec.execute_plan(&plan).await.unwrap();
     // Correctness: only zone=a sample (5.0) folded in. The
@@ -832,9 +831,14 @@ async fn postings_missing_falls_back_to_scan_all() {
     // Both chunks were fetched — postings filter no-oped.
     assert_eq!(outcome.chunks_fetched, 2);
     assert_eq!(outcome.chunks_skipped_via_postings, 0);
-    assert!(outcome.postings_missing, "missing-postings flag must be set");
+    assert!(
+        outcome.postings_missing,
+        "missing-postings flag must be set"
+    );
     let infos = outcome.info_lines();
-    assert!(infos.iter().any(|i| i == "data_source_quirk: postings_missing"));
+    assert!(infos
+        .iter()
+        .any(|i| i == "data_source_quirk: postings_missing"));
 }
 
 #[tokio::test]
@@ -856,4 +860,3 @@ async fn postings_path_no_label_predicate_skips_postings_lookup() {
     assert!(!outcome.postings_missing);
     assert_eq!(outcome.chunks_skipped_via_postings, 0);
 }
-

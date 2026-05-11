@@ -27,10 +27,10 @@
 //!   `NoEngineRegistered` 503 from the HTTP handler — the correct
 //!   fail-loud behaviour for a misconfigured deploy.
 //!
-//! This is a near-mirror of [`crate::engines::gorilla::thanos_forward`]
+//! This is a near-mirror of [`crate::engines::thanos_query::forward`]
 //! (the Step-2.3 archive forwarder), pointed at Prometheus's standard
 //! `/api/v1/query` endpoint instead of a `thanos-query` sidecar. The
-//! two engines coexist: `thanos_archive` answers archive-tier queries
+//! two engines coexist: `thanos_query` answers archive-tier queries
 //! over Prometheus TSDB blocks emitted by `gorillas3processor`;
 //! `prometheus_remote` answers queries for metrics whose raw data is
 //! shipped to Prometheus's native OTLP receiver (no ASAP archive at
@@ -351,7 +351,9 @@ fn build_result_from_prometheus_payload(
 ) -> Result<QueryResult, String> {
     if payload.status != "success" {
         let detail = payload.error.unwrap_or_else(|| "unknown error".to_string());
-        let kind = payload.error_type.unwrap_or_else(|| "execution".to_string());
+        let kind = payload
+            .error_type
+            .unwrap_or_else(|| "execution".to_string());
         return Err(format!("prometheus error ({kind}): {detail}"));
     }
     let data = payload
@@ -559,7 +561,10 @@ pub mod test_support {
 
         let app: Router = Router::new()
             .route("/api/v1/query", post(move || async move { canned_body }))
-            .route("/api/v1/query_range", post(move || async move { canned_body }));
+            .route(
+                "/api/v1/query_range",
+                post(move || async move { canned_body }),
+            );
 
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -680,7 +685,9 @@ mod tests {
 
         let infos = PrometheusForwardEngine::success_infos(0);
         assert!(
-            infos.iter().any(|s| s == DATA_SOURCE_PROMETHEUS_REMOTE_INFO),
+            infos
+                .iter()
+                .any(|s| s == DATA_SOURCE_PROMETHEUS_REMOTE_INFO),
             "success_infos must carry the data_source marker; got {infos:?}",
         );
         assert!(
@@ -749,7 +756,9 @@ mod tests {
         // dashboards / e2e demos pin against.
         let infos = PrometheusForwardEngine::unreachable_infos("upstream returned 503", 0);
         assert!(infos.iter().any(|s| s == QUIRK_PROMETHEUS_UNREACHABLE));
-        assert!(infos.iter().any(|s| s.contains("prometheus_unreachable_reason")));
+        assert!(infos
+            .iter()
+            .any(|s| s.contains("prometheus_unreachable_reason")));
     }
 
     #[tokio::test]
@@ -769,10 +778,8 @@ mod tests {
     #[tokio::test]
     async fn config_from_env_strips_trailing_slash() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_PROMETHEUS_QUERY_URL_ENV,
-            "http://prometheus:9090/",
-        );
+        let _scope =
+            test_support::EnvGuard::set(ASAP_PROMETHEUS_QUERY_URL_ENV, "http://prometheus:9090/");
         let cfg = PrometheusForwardConfig::from_env().expect("set");
         assert_eq!(cfg.base_url, "http://prometheus:9090");
     }
@@ -780,10 +787,8 @@ mod tests {
     #[tokio::test]
     async fn engine_from_env_returns_some_when_set() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_PROMETHEUS_QUERY_URL_ENV,
-            "http://127.0.0.1:1",
-        );
+        let _scope =
+            test_support::EnvGuard::set(ASAP_PROMETHEUS_QUERY_URL_ENV, "http://127.0.0.1:1");
         let engine = engine_from_env().expect("ok");
         assert!(engine.is_some(), "env set → engine constructed");
     }
@@ -810,16 +815,16 @@ mod tests {
         // Env set → engine registered.
         {
             let _g = ENV_LOCK.lock().expect("lock");
-            let _scope = test_support::EnvGuard::set(
-                ASAP_PROMETHEUS_QUERY_URL_ENV,
-                "http://127.0.0.1:1",
-            );
+            let _scope =
+                test_support::EnvGuard::set(ASAP_PROMETHEUS_QUERY_URL_ENV, "http://127.0.0.1:1");
             let mut router = EngineRouter::new();
             if let Ok(Some(engine)) = engine_from_env() {
                 router.register(Arc::new(engine));
             }
             assert!(
-                router.engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID).is_some(),
+                router
+                    .engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID)
+                    .is_some(),
                 "env set must yield prometheus_remote engine in the router",
             );
         }
@@ -833,7 +838,9 @@ mod tests {
                 router.register(Arc::new(engine));
             }
             assert!(
-                router.engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID).is_none(),
+                router
+                    .engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID)
+                    .is_none(),
                 "env unset must leave prometheus_remote unregistered",
             );
         }

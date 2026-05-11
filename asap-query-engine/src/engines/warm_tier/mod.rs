@@ -1,12 +1,12 @@
 //! Warm-tier sketch query evaluator (Phase 5 follow-up to PR #122).
 //!
 //! PR #122 wired the warm-tier classification hook in
-//! [`crate::engines::simple::engine::SimpleEngine`]'s
+//! [`crate::engines::asap_query::engine::SimpleEngine`]'s
 //! `QueryEngine::execute` adapter: parse the PromQL, extract
 //! `(metric_name, label_keys)`, look up candidate sids via
 //! [`crate::stores::sketch_db::sketch_index::SketchIndex::instances_matching`],
 //! and classify each sid. On `Ghost`/`Unknown`, return
-//! `EngineError::CapabilityMiss(SketchWarmTier, …)` so the
+//! `EngineError::CapabilityMiss(SketchStore, …)` so the
 //! `EngineRouter` fails over to the archive engine.
 //!
 //! That hook today still falls through to `handle_query` (legacy

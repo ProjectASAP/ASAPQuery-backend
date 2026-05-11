@@ -48,11 +48,7 @@ fn promql_inference_yaml_loads_all_pattern_families() {
     let cfg = read_inference_config(PROMQL_YAML, QueryLanguage::promql)
         .expect("inference_config.yaml must parse");
 
-    let queries: Vec<&str> = cfg
-        .query_configs
-        .iter()
-        .map(|q| q.query.as_str())
-        .collect();
+    let queries: Vec<&str> = cfg.query_configs.iter().map(|q| q.query.as_str()).collect();
 
     // Sanity: expansion landed (pre-PR baseline was 1 entry).
     assert!(
@@ -313,10 +309,7 @@ fn rate_routes_to_increase_accumulator_warm_tier() {
     );
 
     let result = engine
-        .handle_query_promql(
-            "rate(fake_metric[1m])".to_string(),
-            QUERY_TIME_SEC,
-        )
+        .handle_query_promql("rate(fake_metric[1m])".to_string(), QUERY_TIME_SEC)
         .expect("warm tier should answer rate(...[1m])");
     let (_, qr) = result;
     let elements = match qr {
@@ -345,10 +338,7 @@ fn increase_routes_to_increase_accumulator_warm_tier() {
     );
 
     let result = engine
-        .handle_query_promql(
-            "increase(fake_metric[1m])".to_string(),
-            QUERY_TIME_SEC,
-        )
+        .handle_query_promql("increase(fake_metric[1m])".to_string(), QUERY_TIME_SEC)
         .expect("warm tier should answer increase(...[1m])");
     let (_, qr) = result;
     let elements = match qr {
@@ -374,17 +364,17 @@ fn sum_over_time_wider_range_routes_through_warm_tier() {
     );
 
     let result = engine
-        .handle_query_promql(
-            "sum_over_time(fake_metric[2m])".to_string(),
-            QUERY_TIME_SEC,
-        )
+        .handle_query_promql("sum_over_time(fake_metric[2m])".to_string(), QUERY_TIME_SEC)
         .expect("warm tier should answer sum_over_time(...[2m])");
     let (_, qr) = result;
     let elements = match qr {
         query_engine_rust::engines::QueryResult::Vector(iv) => iv.values,
         other => panic!("expected vector, got {other:?}"),
     };
-    assert!(!elements.is_empty(), "sum_over_time result should not be empty");
+    assert!(
+        !elements.is_empty(),
+        "sum_over_time result should not be empty"
+    );
 }
 
 #[test]
@@ -411,7 +401,10 @@ fn count_over_time_routes_through_warm_tier() {
         query_engine_rust::engines::QueryResult::Vector(iv) => iv.values,
         other => panic!("expected vector, got {other:?}"),
     };
-    assert!(!elements.is_empty(), "count_over_time result should not be empty");
+    assert!(
+        !elements.is_empty(),
+        "count_over_time result should not be empty"
+    );
 }
 
 #[test]
@@ -524,5 +517,8 @@ fn spatial_multi_quantile_routes_through_warm_tier() {
         query_engine_rust::engines::QueryResult::Vector(iv) => iv.values,
         other => panic!("expected vector, got {other:?}"),
     };
-    assert!(!elements.is_empty(), "spatial p50 result should not be empty");
+    assert!(
+        !elements.is_empty(),
+        "spatial p50 result should not be empty"
+    );
 }

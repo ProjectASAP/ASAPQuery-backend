@@ -5,7 +5,7 @@
 //! `gorillas3processor` alongside each per-hour `index.json`:
 //! `<tenant>/<metric>/YYYY/MM/DD/HH/postings-v1.json`. It maps
 //! `(label_name, label_value) → [series_id, ...]` so the
-//! [`super::ExactExecutor`] can prune chunks by `label_hash`
+//! [`super::query_engine::ExactExecutor`] can prune chunks by `label_hash`
 //! without paying the chunk-body GET cost.
 //!
 //! Step-1 of the JSONL deprecation refactor pulled this code out

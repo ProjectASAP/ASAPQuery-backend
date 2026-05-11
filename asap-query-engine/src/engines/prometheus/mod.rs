@@ -12,7 +12,7 @@
 //! 503 from the HTTP handler (the correct fail-loud behaviour for a
 //! misconfigured deploy).
 //!
-//! Sibling of [`crate::engines::gorilla::thanos_forward`] (the
+//! Sibling of [`crate::engines::thanos_query::forward`] (the
 //! Step-2.3 archive forwarder); the two engines coexist in the
 //! router under different ids and answer different routing-table
 //! entries.

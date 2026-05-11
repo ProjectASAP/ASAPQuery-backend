@@ -130,10 +130,8 @@ mod tests {
 
     #[test]
     fn kll_default_caps() {
-        let s = SketchStateSchema::for_kind(
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
-        );
+        let s =
+            SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }));
         assert!(s.caps.mergeable);
         assert!(!s.caps.subtractable);
         assert!(!s.caps.deletable);
@@ -152,28 +150,20 @@ mod tests {
 
     #[test]
     fn merge_compatibility_requires_matching_params() {
-        let a = SketchStateSchema::for_kind(
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
-        );
-        let b = SketchStateSchema::for_kind(
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
-        );
-        let c = SketchStateSchema::for_kind(
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 400 }),
-        );
+        let a =
+            SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }));
+        let b =
+            SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }));
+        let c =
+            SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 400 }));
         assert!(a.is_compatible_for_merge(&b));
         assert!(!a.is_compatible_for_merge(&c)); // different k
     }
 
     #[test]
     fn merge_compatibility_rejects_family_mismatch() {
-        let kll = SketchStateSchema::for_kind(
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
-        );
+        let kll =
+            SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }));
         let cms = SketchStateSchema::for_kind(
             SketchKind::Cms,
             SketchParams::Cms(CmsParams { w: 2048, d: 5 }),

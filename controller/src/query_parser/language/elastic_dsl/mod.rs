@@ -4,8 +4,8 @@
 //! (`controller/docs/design.md` §3 row 1). No L1 parser is shipped in
 //! the DC deployment build.
 
-use super::{Language, ParseError};
 use super::language_ast::LanguageAst;
+use super::{Language, ParseError};
 use crate::types_v2::QueryLanguage;
 
 /// ElasticDSL implementation of the [`Language`] trait. Currently stubbed.

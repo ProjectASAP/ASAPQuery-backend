@@ -1,21 +1,18 @@
-//! Tier-co-located query engines.
+//! Query engines.
 //!
-//! Step-1 of the JSONL deprecation refactor split this module
-//! into two tier sub-directories ([`simple`] for the warm sketch
-//! tier, [`gorilla`] for the archive tier) plus the shared
-//! infrastructure (`logical`/`physical` plan helpers,
-//! `query_result`, `timeline_dispatch`, `window_merger`) used by
-//! both. The capability `EngineRouter` and per-metric
-//! `BackendStorageRouting` config loader moved out into
-//! [`crate::routing`].
+//! The public query-engine surface is intentionally small:
+//! [`asap_query`] answers from ASAP's sketch store, and
+//! [`thanos_query`] forwards exact/archive queries to `thanos-query`.
+//! Gorilla object storage lives under [`crate::stores::gorilla_object_store`]
+//! because it is a storage implementation detail, not a public query-engine
+//! family.
 //!
 //! ## Public surface
 //!
-//! Three engines + the shared error envelope:
+//! Engines + the shared error envelope:
 //!
-//! * [`simple::SimpleEngine`] — warm-tier sketch query engine.
-//! * [`gorilla::GorillaQueryEngine`] — archive-tier exact query
-//!   engine over the [`gorilla::store::GorillaS3Store`].
+//! * [`asap_query::ASAPQueryEngine`] — warm-tier sketch query engine.
+//! * [`thanos_query::ThanosQueryEngine`] — archive-tier query engine.
 //! * [`prometheus::PrometheusForwardEngine`] — HTTP-forwarder to a
 //!   Prometheus `/api/v1/query` endpoint, registered under the
 //!   `prometheus_remote` engine id when
@@ -23,22 +20,24 @@
 //! * [`EngineError`] — the trait-level error envelope every
 //!   `crate::routing::QueryEngine` impl returns.
 
-pub mod gorilla;
+pub mod asap_query;
 pub mod no_data_archive;
 pub mod prometheus;
 pub mod query_result;
-pub mod simple;
+pub mod thanos_query;
 pub mod timeline_dispatch;
 pub mod warm_tier;
 pub mod window_merger;
 
-pub use gorilla::{
-    EngineError as GorillaEngineError, GorillaEngineConfig, GorillaQueryEngine,
-};
+pub use asap_query::{ASAPQueryEngine, SimpleEngine};
 pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
 pub use prometheus::{PrometheusForwardConfig, PrometheusForwardEngine, PrometheusForwardError};
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
-pub use simple::SimpleEngine;
+pub use thanos_query::{
+    thanos_engine_from_env, ThanosQueryConfig, ThanosQueryEngine, ThanosQueryError,
+    ASAP_THANOS_QUERY_URL_ENV, DATA_SOURCE_THANOS_QUERY_ID, DATA_SOURCE_THANOS_QUERY_INFO,
+    DEFAULT_THANOS_QUERY_URL, QUIRK_THANOS_UNREACHABLE,
+};
 pub use timeline_dispatch::{combine_statistic, CombinedResult};
 pub use window_merger::{create_window_merger, NaiveMerger, WindowMerger};
 
@@ -47,7 +46,7 @@ pub use window_merger::{create_window_merger, NaiveMerger, WindowMerger};
 //
 // The trait is engine-agnostic, so its `execute` must return an error type
 // that can wrap *any* concrete engine's failure mode. Today's two engines
-// — `SimpleEngine` (capability-miss → `None`) and `GorillaQueryEngine`
+// — `ASAPQueryEngine` (capability-miss → `None`) and archive/query forwarders
 // (rich `EngineError`) — fold into this common envelope.
 // ---------------------------------------------------------------------------
 

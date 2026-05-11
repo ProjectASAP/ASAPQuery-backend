@@ -794,10 +794,8 @@ mod tests {
     #[test]
     fn is_satisfied_by_topk_handles_must_match() {
         let required = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed_with_heap =
-            Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed_no_heap =
-            Capability::FrequencyTopk(SketchKindHandle::CountMin);
+        let indexed_with_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        let indexed_no_heap = Capability::FrequencyTopk(SketchKindHandle::CountMin);
         assert!(required.is_satisfied_by(&indexed_with_heap));
         assert!(!required.is_satisfied_by(&indexed_no_heap));
     }
@@ -899,7 +897,9 @@ mod tests {
     fn default_table_hll_serves_cardinality_intent() {
         let t = default_capability_table();
         let cap = t.get(&SketchKind::Hll).unwrap();
-        assert!(cap.supported_intents.contains(&SupportedIntent::Cardinality));
+        assert!(cap
+            .supported_intents
+            .contains(&SupportedIntent::Cardinality));
     }
 
     // ── load_capability_overrides ────────────────────────────────────────

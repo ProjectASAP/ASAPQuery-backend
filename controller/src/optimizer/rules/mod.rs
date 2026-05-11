@@ -62,11 +62,9 @@ pub fn typed_sketch_algebra_enabled() -> bool {
 /// the parallel `USE_TYPED_STAGE_SPLIT` gate is enabled — the bound
 /// `SketchExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
-pub fn bind_workload_typed(
-    w: &QueryWorkload,
-) -> Option<crate::sketch_algebra::SketchExpr> {
-    use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source, WindowKind};
+pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::SketchExpr> {
     use crate::intent_algebra::schema::{Column, DataType};
+    use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source, WindowKind};
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
     };
@@ -104,8 +102,8 @@ pub fn bind_workload_typed(
     // Priority: workload-spec metric-name match → AggType-driven
     // default. The metric-name match owns the demo contract rows; the
     // AggType fallback covers everything else.
-    let (statistic, accuracy_pref) = classify_demo_metric(&w.metric_name)
-        .unwrap_or_else(|| match w.aggregations[0] {
+    let (statistic, accuracy_pref) =
+        classify_demo_metric(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
             AggType::Quantile => (StatisticClass::Quantile, AccuracyPreference::RelativeError),
             AggType::Cardinality => (StatisticClass::Cardinality, AccuracyPreference::default()),
             AggType::Frequency => (StatisticClass::Frequency, AccuracyPreference::default()),
@@ -328,7 +326,12 @@ impl RulesPlanner {
         }
 
         let sketch_type = crate::physical::sketch_catalog::sketch_type_for_agg(&w.aggregations);
-        let sketch_params = crate::physical::sketch_catalog::build_sketch_params(&self.sketch_defaults, &sketch_type, w.accuracy_sla, &w.quantiles);
+        let sketch_params = crate::physical::sketch_catalog::build_sketch_params(
+            &self.sketch_defaults,
+            &sketch_type,
+            w.accuracy_sla,
+            &w.quantiles,
+        );
         let (mode, window_duration) = select_window_strategy(w);
 
         let mut aggregate_by = w.group_by_labels.clone();
@@ -383,8 +386,7 @@ impl RulesPlanner {
     /// Returns a raw-passthrough plan for queries that require exact per-sample
     /// computation (RSI, MACD, stochastic oscillator, etc.).
     fn raw_passthrough_plan(&self, w: &QueryWorkload) -> CollectionPlan {
-        let valid_until = Utc::now()
-            + chrono::Duration::seconds(self.valid_for.as_secs() as i64);
+        let valid_until = Utc::now() + chrono::Duration::seconds(self.valid_for.as_secs() as i64);
 
         let mut label_matchers: Vec<String> = w
             .label_filters
@@ -395,18 +397,18 @@ impl RulesPlanner {
 
         CollectionPlan {
             agent_config: AgentCollectorConfig {
-                output_mode:          OutputMode::Raw,
-                sketch_type:          SketchType::DDSketch, // unused for raw mode
-                sketch_params:        SketchParams::default(),
-                aggregate_by:         vec![],
+                output_mode: OutputMode::Raw,
+                sketch_type: SketchType::DDSketch, // unused for raw mode
+                sketch_params: SketchParams::default(),
+                aggregate_by: vec![],
                 label_matchers,
-                window_duration:      None,
-                mode:                 ProcessorMode::Batch,
+                window_duration: None,
+                mode: ProcessorMode::Batch,
                 enable_self_monitoring: true,
-                transmit_sketch:      false,
-                drop_original:        false,
-                delta_transmission:   false,
-                delta_threshold:      0.0,
+                transmit_sketch: false,
+                drop_original: false,
+                delta_transmission: false,
+                delta_threshold: 0.0,
                 enable_series_id: true,
                 series_id_ttl_secs: 0,
 
@@ -415,11 +417,11 @@ impl RulesPlanner {
             gateway_config: GatewayCollectorConfig { passthrough: true },
             backend_config: BackendCollectorConfig {
                 merge_sketch_type: SketchType::DDSketch,
-                group_by:          vec![],
+                group_by: vec![],
             },
-            precompute:               vec![],
+            precompute: vec![],
             valid_until,
-            delta_decision:           DeltaDecision::default(),
+            delta_decision: DeltaDecision::default(),
             transmission_cost_summary: TransmissionCostSummary::default(),
             staged_plan: None,
         }
@@ -428,7 +430,7 @@ impl RulesPlanner {
 
 // ── Sketch selection (delegated to algebra::directory) ───────────────────────
 
-pub use crate::physical::sketch_catalog::{default_sketch_params, build_sketch_params};
+pub use crate::physical::sketch_catalog::{build_sketch_params, default_sketch_params};
 
 // ── Window strategy ───────────────────────────────────────────────────────────
 
@@ -554,7 +556,9 @@ mod tests {
         w.accuracy_sla = 0.005;
         let plan = RulesPlanner::new().plan(&w);
         match &plan.agent_config.sketch_params {
-            SketchParams::DDSketch { relative_accuracy, .. } => assert_eq!(*relative_accuracy, 0.005),
+            SketchParams::DDSketch {
+                relative_accuracy, ..
+            } => assert_eq!(*relative_accuracy, 0.005),
             other => panic!("expected DDSketch, got {:?}", other),
         }
     }
@@ -565,7 +569,9 @@ mod tests {
         w.accuracy_sla = 0.03;
         let plan = RulesPlanner::new().plan(&w);
         match &plan.agent_config.sketch_params {
-            SketchParams::HLL { precision } => assert_eq!(*precision, 10, "coarse SLA should use lower precision"),
+            SketchParams::HLL { precision } => {
+                assert_eq!(*precision, 10, "coarse SLA should use lower precision")
+            }
             other => panic!("expected HLL, got {:?}", other),
         }
     }
@@ -619,9 +625,7 @@ mod tests {
         match expr {
             SketchExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
             SketchExpr::SketchEstimate { child, .. } => extract_family(child),
-            SketchExpr::SketchMerge { children, .. } => {
-                children.iter().find_map(extract_family)
-            }
+            SketchExpr::SketchMerge { children, .. } => children.iter().find_map(extract_family),
             SketchExpr::LetBinding { expr, child, .. } => {
                 extract_family(expr).or_else(|| extract_family(child))
             }
@@ -777,8 +781,8 @@ mod tests {
         // back to the canonical CountSketch default.
         let mut w = workload_for("top_endpoint_qps", AggType::Frequency);
         w.sketch_type_override = Some(SketchType::CountMinSketch);
-        let bound = bind_workload_typed(&w)
-            .expect("CountMin override on a TopK metric should still bind");
+        let bound =
+            bind_workload_typed(&w).expect("CountMin override on a TopK metric should still bind");
         assert_eq!(
             extract_family(&bound),
             Some(SketchKind::Cms),
@@ -823,11 +827,31 @@ mod tests {
         // ("verify each produces the expected `SketchExpr` family").
         let cases: Vec<(&str, AggType, Option<SketchKind>)> = vec![
             ("http_requests_total", AggType::Frequency, None),
-            ("http_latency_ms", AggType::Quantile, Some(SketchKind::DDSketch)),
-            ("request_size_bytes", AggType::Quantile, Some(SketchKind::Kll)),
-            ("unique_users_per_min", AggType::Cardinality, Some(SketchKind::Hll)),
-            ("top_endpoint_qps", AggType::Frequency, Some(SketchKind::CountSketch)),
-            ("endpoint_request_freq", AggType::Frequency, Some(SketchKind::Cms)),
+            (
+                "http_latency_ms",
+                AggType::Quantile,
+                Some(SketchKind::DDSketch),
+            ),
+            (
+                "request_size_bytes",
+                AggType::Quantile,
+                Some(SketchKind::Kll),
+            ),
+            (
+                "unique_users_per_min",
+                AggType::Cardinality,
+                Some(SketchKind::Hll),
+            ),
+            (
+                "top_endpoint_qps",
+                AggType::Frequency,
+                Some(SketchKind::CountSketch),
+            ),
+            (
+                "endpoint_request_freq",
+                AggType::Frequency,
+                Some(SketchKind::Cms),
+            ),
         ];
         for (metric, agg, expected) in cases {
             let w = workload_for(metric, agg);

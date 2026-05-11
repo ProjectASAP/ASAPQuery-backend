@@ -89,17 +89,27 @@ impl AccuracyBound {
             // 1/(2^(rows/2)).
             SketchConfig::CountSketch { rows, cols } => {
                 let e = std::f64::consts::E;
-                let eps = if *cols > 0 { (e / (*cols as f64)).sqrt() } else { 1.0 };
+                let eps = if *cols > 0 {
+                    (e / (*cols as f64)).sqrt()
+                } else {
+                    1.0
+                };
                 let half_rows = (*rows as f64) / 2.0;
                 let delta = 2f64.powf(-half_rows);
-                Self { epsilon: eps, confidence: 1.0 - delta }
+                Self {
+                    epsilon: eps,
+                    confidence: 1.0 - delta,
+                }
             }
             // CMS: ε ≈ e/cols, δ ≈ exp(-rows).
             SketchConfig::CountMin { rows, cols } => {
                 let e = std::f64::consts::E;
                 let eps = if *cols > 0 { e / (*cols as f64) } else { 1.0 };
                 let delta = (-(*rows as f64)).exp();
-                Self { epsilon: eps, confidence: 1.0 - delta }
+                Self {
+                    epsilon: eps,
+                    confidence: 1.0 - delta,
+                }
             }
         }
     }
@@ -294,11 +304,7 @@ impl SketchIndex {
         by_label_id
             .into_iter()
             .map(|(label_id, samples)| {
-                let label_values = guard
-                    .intern
-                    .resolve(label_id)
-                    .cloned()
-                    .unwrap_or_default();
+                let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
                 SketchTimeSeries {
                     sid,
                     series_label_values: label_values,
@@ -349,7 +355,9 @@ mod tests {
     use super::*;
 
     fn meta(sid: u64) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
         SketchInstanceMetadata {
             sid,
             metric_name: "m".into(),
@@ -363,7 +371,10 @@ mod tests {
     }
 
     fn sample(b: u8) -> SketchSampleState {
-        SketchSampleState { bytes: vec![b], encoding: SketchEncoding::ProtoFull }
+        SketchSampleState {
+            bytes: vec![b],
+            encoding: SketchEncoding::ProtoFull,
+        }
     }
 
     #[test]

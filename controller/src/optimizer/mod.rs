@@ -24,10 +24,10 @@
 //! | `planner/rules.rs` | [`rules`] (shared rule library) |
 //! | `planner/baseline_planner.rs` | [`baseline`] |
 
-pub mod engine;
-pub mod cost;
-pub mod rules;
 pub mod baseline;
+pub mod cost;
+pub mod engine;
+pub mod rules;
 pub mod trait_def;
 
 // Re-exports — preserve the surface that `crate::algebra::QueryOptimizer`

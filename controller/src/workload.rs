@@ -43,8 +43,12 @@ pub struct WorkloadEntry {
     pub target_path: Option<String>,
 }
 
-fn default_accuracy_sla() -> f64 { 0.01 }
-fn default_role() -> String { "agent".into() }
+fn default_accuracy_sla() -> f64 {
+    0.01
+}
+fn default_role() -> String {
+    "agent".into()
+}
 
 /// Case-insensitive `SketchType` deserialiser. The wire YAML in
 /// `deploy/configs/mvp-workload.yaml` spells the variants in mixed case
@@ -64,10 +68,12 @@ where
         "hll" => SketchType::HLL,
         "countsketch" => SketchType::CountSketch,
         "countminsketch" | "countmin" | "cms" => SketchType::CountMinSketch,
-        other => return Err(serde::de::Error::custom(format!(
-            "unknown sketch_family_override `{other}`; expected one of \
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "unknown sketch_family_override `{other}`; expected one of \
              DDSketch / KLL / HLL / CountSketch / CountMinSketch"
-        ))),
+            )))
+        }
     };
     Ok(Some(kind))
 }
@@ -117,14 +123,16 @@ impl WorkloadRegistry {
 
     /// Returns workload entries assigned to a given role.
     pub fn for_role(&self, role: &str) -> Vec<&WorkloadEntry> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|e| e.assign_to_role.eq_ignore_ascii_case(role))
             .collect()
     }
 
     /// Returns the first workload entry for a given role, if any.
     pub fn first_for_role(&self, role: &str) -> Option<&WorkloadEntry> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .find(|e| e.assign_to_role.eq_ignore_ascii_case(role))
     }
 }
@@ -227,9 +235,18 @@ mod tests {
         assert_eq!(entries.len(), 6);
         assert_eq!(entries[0].sketch_family_override, Some(SketchType::KLL));
         assert_eq!(entries[1].sketch_family_override, Some(SketchType::HLL));
-        assert_eq!(entries[2].sketch_family_override, Some(SketchType::CountSketch));
-        assert_eq!(entries[3].sketch_family_override, Some(SketchType::CountMinSketch));
-        assert_eq!(entries[4].sketch_family_override, Some(SketchType::DDSketch));
+        assert_eq!(
+            entries[2].sketch_family_override,
+            Some(SketchType::CountSketch)
+        );
+        assert_eq!(
+            entries[3].sketch_family_override,
+            Some(SketchType::CountMinSketch)
+        );
+        assert_eq!(
+            entries[4].sketch_family_override,
+            Some(SketchType::DDSketch)
+        );
         assert_eq!(entries[5].sketch_family_override, None);
     }
 
@@ -246,9 +263,18 @@ mod tests {
   sketch_family_override: cms
 "#;
         let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(entries[0].sketch_family_override, Some(SketchType::DDSketch));
-        assert_eq!(entries[1].sketch_family_override, Some(SketchType::CountMinSketch));
-        assert_eq!(entries[2].sketch_family_override, Some(SketchType::CountMinSketch));
+        assert_eq!(
+            entries[0].sketch_family_override,
+            Some(SketchType::DDSketch)
+        );
+        assert_eq!(
+            entries[1].sketch_family_override,
+            Some(SketchType::CountMinSketch)
+        );
+        assert_eq!(
+            entries[2].sketch_family_override,
+            Some(SketchType::CountMinSketch)
+        );
     }
 
     #[test]
@@ -266,29 +292,36 @@ mod tests {
             return;
         }
         let registry = WorkloadRegistry::load(path.to_str().unwrap());
-        let by_name: std::collections::HashMap<&str, &WorkloadEntry> =
-            registry.entries().iter().map(|e| (e.metric_name.as_str(), e)).collect();
+        let by_name: std::collections::HashMap<&str, &WorkloadEntry> = registry
+            .entries()
+            .iter()
+            .map(|e| (e.metric_name.as_str(), e))
+            .collect();
 
         assert_eq!(
-            by_name.get("request_size_bytes")
+            by_name
+                .get("request_size_bytes")
                 .and_then(|e| e.sketch_family_override.clone()),
             Some(SketchType::KLL),
             "request_size_bytes must carry KLL override",
         );
         assert_eq!(
-            by_name.get("unique_users_per_min")
+            by_name
+                .get("unique_users_per_min")
                 .and_then(|e| e.sketch_family_override.clone()),
             Some(SketchType::HLL),
             "unique_users_per_min must carry HLL override",
         );
         assert_eq!(
-            by_name.get("top_endpoint_qps")
+            by_name
+                .get("top_endpoint_qps")
                 .and_then(|e| e.sketch_family_override.clone()),
             Some(SketchType::CountSketch),
             "top_endpoint_qps must carry CountSketch override",
         );
         assert_eq!(
-            by_name.get("endpoint_request_freq")
+            by_name
+                .get("endpoint_request_freq")
                 .and_then(|e| e.sketch_family_override.clone()),
             Some(SketchType::CountMinSketch),
             "endpoint_request_freq must carry CountMinSketch override",

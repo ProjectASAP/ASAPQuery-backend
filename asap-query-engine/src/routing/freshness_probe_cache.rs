@@ -218,7 +218,13 @@ mod tests {
         let got = cache
             .lookup("http_freshness_probe_warm", 1_005, 10_000)
             .expect("sample should be inside window");
-        assert_eq!(got, ProbeSample { ts_ms: 1_000, value: 1_000.0 });
+        assert_eq!(
+            got,
+            ProbeSample {
+                ts_ms: 1_000,
+                value: 1_000.0
+            }
+        );
     }
 
     #[test]
@@ -285,11 +291,9 @@ mod tests {
             "upper bound must be inclusive (ts_ms == now)",
         );
         // sample.ts == now − range_ms − 1 — outside lower bound.
-        assert!(
-            cache
-                .lookup("http_freshness_probe_warm", 11_001, 10_000)
-                .is_none(),
-        );
+        assert!(cache
+            .lookup("http_freshness_probe_warm", 11_001, 10_000)
+            .is_none(),);
     }
 
     #[test]

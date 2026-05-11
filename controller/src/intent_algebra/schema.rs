@@ -192,10 +192,7 @@ pub enum CseError {
 /// deduper has identified for the candidate binding. Single-consumer
 /// cases short-circuit with `InsufficientConsumers` — a `LetBinding`
 /// with one `Ref` is just a no-op alias and shouldn't be hoisted.
-pub fn cse_reuse_is_legal(
-    producer_schema: &Schema,
-    consumer_count: usize,
-) -> Result<(), CseError> {
+pub fn cse_reuse_is_legal(producer_schema: &Schema, consumer_count: usize) -> Result<(), CseError> {
     if consumer_count < 2 {
         return Err(CseError::InsufficientConsumers(consumer_count));
     }
@@ -243,10 +240,7 @@ mod tests {
     /// drops on the floor").
     #[test]
     fn cse_reuse_illegal_when_unique_keys_empty() {
-        let producer = Schema::new(vec![
-            col("a", DataType::Int64),
-            col("b", DataType::Float64),
-        ]);
+        let producer = Schema::new(vec![col("a", DataType::Int64), col("b", DataType::Float64)]);
         assert_eq!(
             cse_reuse_is_legal(&producer, 2),
             Err(CseError::NoUniqueKeys)
@@ -286,7 +280,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn schema_new_has_no_time_or_unique_key() {
         let s = Schema::new(vec![col("k", DataType::Utf8), col("v", DataType::Float64)]);
@@ -325,7 +318,10 @@ mod tests {
     #[test]
     fn schema_serde_roundtrip() {
         let s = Schema::with_time_index(
-            vec![col("ts", DataType::Timestamp), col("value", DataType::Float64)],
+            vec![
+                col("ts", DataType::Timestamp),
+                col("value", DataType::Float64),
+            ],
             0,
             vec![vec![0]],
         );

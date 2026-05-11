@@ -28,9 +28,7 @@ use promql_utilities::query_logics::parsing::{
     get_metric_and_spatial_filter, get_spatial_aggregation_output_labels, get_statistics_to_compute,
 };
 
-
 // SQL issue: refactor simpleengine to create matchresult similar to SQLquerydata
-
 
 // Type alias for merged outputs (single aggregate per key after merging)
 type MergedOutputsMap = HashMap<Option<KeyByLabelValues>, Box<dyn AggregateCore>>;
@@ -58,7 +56,8 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
     let mut out = String::with_capacity(haystack.len());
     let mut i = 0;
     while i < bytes.len() {
-        if i + needle_bytes.len() <= bytes.len() && &bytes[i..i + needle_bytes.len()] == needle_bytes
+        if i + needle_bytes.len() <= bytes.len()
+            && &bytes[i..i + needle_bytes.len()] == needle_bytes
         {
             let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
             let next_idx = i + needle_bytes.len();
@@ -107,12 +106,7 @@ fn extract_metric_and_label_keys(
     use promql_parser::parser::Expr;
     let ast = promql_parser::parser::parse(query).ok()?;
 
-    fn walk(
-        expr: &Expr,
-    ) -> Option<(
-        String,
-        std::collections::BTreeSet<String>,
-    )> {
+    fn walk(expr: &Expr) -> Option<(String, std::collections::BTreeSet<String>)> {
         match expr {
             Expr::VectorSelector(vs) => {
                 let mut keys = std::collections::BTreeSet::new();
@@ -309,9 +303,14 @@ pub struct SimpleEngine {
     /// When `None` (no archive engine wired), the engine returns the
     /// warm answer as-is; the existing `EngineRouter` failover handles
     /// the rest of the routing matrix.
-    archive_engine:
-        Option<Arc<dyn crate::routing::engine_router::QueryEngine>>,
+    archive_engine: Option<Arc<dyn crate::routing::engine_router::QueryEngine>>,
 }
+
+/// Public production name for the warm-tier sketch query engine.
+///
+/// `SimpleEngine` remains as a compatibility alias in existing tests
+/// and downstream code, but new code should use `ASAPQueryEngine`.
+pub type ASAPQueryEngine = SimpleEngine;
 
 impl SimpleEngine {
     /// Construct a `SimpleEngine` with a static `Arc<StreamingConfig>`.
@@ -741,9 +740,7 @@ impl SimpleEngine {
                 Expr::MatrixSelector(ms) => ms.vs.name.clone(),
                 Expr::Call(call) => call.args.args.iter().find_map(|a| first_metric(a)),
                 Expr::Aggregate(agg) => first_metric(&agg.expr),
-                Expr::Binary(bin) => {
-                    first_metric(&bin.lhs).or_else(|| first_metric(&bin.rhs))
-                }
+                Expr::Binary(bin) => first_metric(&bin.lhs).or_else(|| first_metric(&bin.rhs)),
                 Expr::Subquery(sq) => first_metric(&sq.expr),
                 Expr::Paren(p) => first_metric(&p.expr),
                 Expr::Unary(u) => first_metric(&u.expr),
@@ -2206,9 +2203,7 @@ impl SimpleEngine {
         // downstream stage (pattern match, `QueryConfig` lookup,
         // capability matching, `StoreQueryParams.metric`, schema
         // label lookup) sees the same suffixed name.
-        let query = self
-            .resolve_sketch_metric_alias(&query)
-            .unwrap_or(query);
+        let query = self.resolve_sketch_metric_alias(&query).unwrap_or(query);
 
         // Binary arithmetic dispatch was previously handled here via a
         // DataFusion-based plan combiner. That path was removed alongside
@@ -3555,9 +3550,9 @@ fn stitch_warm_and_archive(
 
     // For each archive series, merge into by_labels.
     for arch_el in archive_matrix {
-        let entry = by_labels.entry(arch_el.labels.labels.clone()).or_insert_with(
-            || RangeVectorElement::new(arch_el.labels.clone()),
-        );
+        let entry = by_labels
+            .entry(arch_el.labels.labels.clone())
+            .or_insert_with(|| RangeVectorElement::new(arch_el.labels.clone()));
         // Build a set of warm timestamps inside coverage (kept).
         let warm_ts: std::collections::HashSet<u64> = entry
             .samples
@@ -3639,7 +3634,7 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
         //
         // 1. `WarmTierAnalysis::unsupported` is `Some(_)` — the
         //    PromQL shape isn't warm-tier-servable. Surface as
-        //    `EngineError::CapabilityMiss(SketchWarmTier, …)` with the
+        //    `EngineError::CapabilityMiss(SketchStore, …)` with the
         //    structured `UnsupportedReason` in the detail string. The
         //    EngineRouter fails over to the archive engine. This
         //    covers all of:
@@ -3669,9 +3664,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
             // Branch 1 — the controller analyzer rejects the shape.
             if let Some(reason) = &analysis.unsupported {
                 return Err(crate::engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                    asap_types::StorageBackend::SketchStore.data_source_id(),
                     format!(
-                        "SketchWarmTier analyzer rejected `{query}`: {reason:?} — \
+                        "SketchStore analyzer rejected `{query}`: {reason:?} — \
                          failing over to archive"
                     ),
                 ));
@@ -3682,9 +3677,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                 // when `candidates.is_empty()` but we keep the
                 // belt-and-braces miss-path for safety.
                 return Err(crate::engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                    asap_types::StorageBackend::SketchStore.data_source_id(),
                     format!(
-                        "SketchWarmTier analyzer produced no warm-tier candidates for \
+                        "SketchStore analyzer produced no warm-tier candidates for \
                          `{query}` — failing over to archive"
                     ),
                 ));
@@ -3717,15 +3712,12 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
             let mut combined_t0: u64 = u64::MAX;
 
             for candidate in &analysis.candidates {
-                let sids = idx.instances_matching(
-                    &candidate.metric_name,
-                    &candidate.group_by_keys,
-                );
+                let sids = idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys);
                 if sids.is_empty() {
                     return Err(crate::engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                        asap_types::StorageBackend::SketchStore.data_source_id(),
                         format!(
-                            "SketchWarmTier has no instance for metric `{}` \
+                            "SketchStore has no instance for metric `{}` \
                              with group_by_keys ⊇ {:?} (analyzer required \
                              {:?}) — failing over to archive",
                             candidate.metric_name,
@@ -3749,9 +3741,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         crate::stores::sketch_db::sketch_index::SidLookup::Ghost
                         | crate::stores::sketch_db::sketch_index::SidLookup::Unknown => {
                             return Err(crate::engines::EngineError::capability_miss(
-                                asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                                asap_types::StorageBackend::SketchStore.data_source_id(),
                                 format!(
-                                    "SketchWarmTier ghost/unknown sid {sid} for metric \
+                                    "SketchStore ghost/unknown sid {sid} for metric \
                                      `{}` — failing over to archive",
                                     candidate.metric_name
                                 ),
@@ -3768,9 +3760,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                 }
                 if hit_sids.is_empty() {
                     return Err(crate::engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                        asap_types::StorageBackend::SketchStore.data_source_id(),
                         format!(
-                            "SketchWarmTier has no sid satisfying capability \
+                            "SketchStore has no sid satisfying capability \
                              {:?} for metric `{}` — failing over to archive",
                             candidate.required_capability, candidate.metric_name
                         ),
@@ -3795,13 +3787,11 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                     now_ms,
                 ) {
                     Ok(r) => r,
-                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(
-                        name,
-                    )) => {
+                    Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(name)) => {
                         return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
-                                "SketchWarmTier reducer does not support function `{name}` \
+                                "SketchStore reducer does not support function `{name}` \
                                  — failing over to archive"
                             ),
                         ));
@@ -3811,9 +3801,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         capability,
                     }) => {
                         return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
-                                "SketchWarmTier reducer cannot answer `{function}` against \
+                                "SketchStore reducer cannot answer `{function}` against \
                                  capability {capability:?} — failing over to archive"
                             ),
                         ));
@@ -3824,21 +3814,19 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         reason,
                     }) => {
                         return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
-                                "SketchWarmTier reducer failed to decode sketch for sid \
+                                "SketchStore reducer failed to decode sketch for sid \
                                  {sid} (encoding={encoding:?}): {reason} — failing over \
                                  to archive"
                             ),
                         ));
                     }
-                    Err(crate::engines::warm_tier::WarmTierError::NoData {
-                        metric_name: m,
-                    }) => {
+                    Err(crate::engines::warm_tier::WarmTierError::NoData { metric_name: m }) => {
                         return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
-                                "SketchWarmTier reducer found no samples for metric \
+                                "SketchStore reducer found no samples for metric \
                                  `{m}` in window — failing over to archive"
                             ),
                         ));
@@ -3848,9 +3836,9 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         sketch_kind,
                     }) => {
                         return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
                             format!(
-                                "SketchWarmTier reducer cannot enumerate top-k for sid \
+                                "SketchStore reducer cannot enumerate top-k for sid \
                                  {sid} (sketch_kind={sketch_kind:?}, no heap) — \
                                  failing over to archive"
                             ),
@@ -3877,10 +3865,7 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         let archive_qr = archive.execute(query).await;
                         if let Ok(archive_qr) = archive_qr {
                             return Ok(stitch_warm_and_archive(
-                                warm_qr,
-                                archive_qr,
-                                cov_lo,
-                                cov_hi,
+                                warm_qr, archive_qr, cov_lo, cov_hi,
                             ));
                         }
                         // On archive error, fall back to warm-only.
@@ -3900,16 +3885,16 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
         match self.handle_query(query.to_string(), now_ms) {
             Some((_labels, result)) => Ok(result),
             None => Err(crate::engines::EngineError::capability_miss(
-                asap_types::StorageBackend::SketchWarmTier.data_source_id(),
-                format!("SimpleEngine has no compatible aggregation for `{query}`"),
+                asap_types::StorageBackend::SketchStore.data_source_id(),
+                format!("ASAPQueryEngine has no compatible aggregation for `{query}`"),
             )),
         }
     }
 
     fn capabilities(&self) -> crate::routing::engine_router::EngineCapabilities {
         crate::routing::engine_router::EngineCapabilities {
-            data_source_id: asap_types::StorageBackend::SketchWarmTier.data_source_id(),
-            storage_backend: asap_types::StorageBackend::SketchWarmTier,
+            data_source_id: asap_types::StorageBackend::SketchStore.data_source_id(),
+            storage_backend: asap_types::StorageBackend::SketchStore,
             // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
             // for buffered ops (KLL with k=200 is well below this).
             supports_streams_above_bytes: 16 * 1024 * 1024,
@@ -4695,7 +4680,7 @@ mod range_query_tests {
 #[cfg(test)]
 mod sketch_query_tests {
     // use crate::data_model::{CleanupPolicy, InferenceConfig, QueryLanguage, StreamingConfig};
-    // use crate::engines::simple::engine::SimpleEngine;
+    // use crate::engines::asap_query::engine::SimpleEngine;
     // use crate::stores::promsketch_store::PromSketchStore;
     // use crate::stores::{Store, TimestampedBucketsMap};
     // use std::collections::HashMap;
@@ -5770,8 +5755,8 @@ mod forced_agg_id_tests {
 mod sketch_alias_resolver_tests {
     use super::*;
     use crate::data_model::{
-        AggregationConfig, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig,
-        PromQLSchema, QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
+        AggregationConfig, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, PromQLSchema,
+        QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
     };
     use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
     use std::sync::Arc;
@@ -5908,8 +5893,7 @@ mod sketch_alias_resolver_tests {
     fn rate_query_is_not_touched() {
         // CountMin processor doesn't rename today; `rate(metric[5m])`
         // must pass through unchanged.
-        let engine =
-            engine_with(&[("endpoint_request_freq", AggregationType::CountMinSketch)]);
+        let engine = engine_with(&[("endpoint_request_freq", AggregationType::CountMinSketch)]);
         let q = "rate(endpoint_request_freq[5m])";
         assert!(engine.resolve_sketch_metric_alias(q).is_none());
     }
@@ -5963,9 +5947,14 @@ mod hll_count_query_tests {
         for &v in observations {
             let h = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let bucket = (h >> (64 - 8)) as usize; // top 8 bits
-            // Remaining 56 bits — count leading zeros + 1 (capped at 64).
+                                                   // Remaining 56 bits — count leading zeros + 1 (capped at 64).
             let rem = h << 8;
-            let lz = if rem == 0 { 64 - 8 } else { rem.leading_zeros() } as u8 + 1;
+            let lz = if rem == 0 {
+                64 - 8
+            } else {
+                rem.leading_zeros()
+            } as u8
+                + 1;
             if (bucket as u64) < m {
                 let r = &mut acc.inner.registers[bucket];
                 if lz > *r {
@@ -6001,10 +5990,7 @@ mod hll_count_query_tests {
             .query_statistic(Statistic::Count, &None, &HashMap::new())
             .expect("empty HLL still answers Count");
         // Linear-counting branch returns 0 when all registers are 0.
-        assert!(
-            v.abs() < 1e-9,
-            "empty HLL cardinality should be 0, got {v}"
-        );
+        assert!(v.abs() < 1e-9, "empty HLL cardinality should be 0, got {v}");
     }
 
     #[test]
@@ -6031,10 +6017,7 @@ mod hll_count_query_tests {
         // the resolved agg is the HLL one. Regression guard for the
         // PR #111 honest-gap closure on HLL-Count capability.
         let acc = hll_with_observations(&(1..=50).collect::<Vec<u64>>());
-        let data = vec![(
-            None,
-            Box::new(acc) as Box<dyn AggregateCore>,
-        )];
+        let data = vec![(None, Box::new(acc) as Box<dyn AggregateCore>)];
         // No `by (...)` modifier on the query → empty grouping. The
         // engine factory's HLL agg is registered with empty grouping
         // labels; this matches the warm-tier production shape.
@@ -6077,10 +6060,7 @@ mod kll_quantile_query_tests {
         // `request_size_bytes_quantile` and verify
         // `quantile_over_time(0.99, ...)` resolves to it.
         let acc = DatasketchesKLLAccumulator::new(200);
-        let data = vec![(
-            None,
-            Box::new(acc) as Box<dyn AggregateCore>,
-        )];
+        let data = vec![(None, Box::new(acc) as Box<dyn AggregateCore>)];
         let engine = create_engine_single_pop(
             "request_size_bytes_quantile",
             AggregationType::DatasketchesKLL,
@@ -6100,7 +6080,10 @@ mod kll_quantile_query_tests {
         );
         assert_eq!(ctx.metadata.statistic_to_compute, Statistic::Quantile);
         assert_eq!(
-            ctx.metadata.query_kwargs.get("quantile").map(String::as_str),
+            ctx.metadata
+                .query_kwargs
+                .get("quantile")
+                .map(String::as_str),
             Some("0.99")
         );
     }
@@ -6121,10 +6104,7 @@ mod cms_rate_capability_tests {
     #[test]
     fn capability_matching_resolves_rate_to_count_min_sketch() {
         let acc = CountMinSketchAccumulator::new(4, 64);
-        let data = vec![(
-            None,
-            Box::new(acc) as Box<dyn AggregateCore>,
-        )];
+        let data = vec![(None, Box::new(acc) as Box<dyn AggregateCore>)];
         let engine = create_engine_single_pop(
             "endpoint_request_freq",
             AggregationType::CountMinSketch,
@@ -6146,7 +6126,10 @@ mod cms_rate_capability_tests {
         // The engine pushes range_ms into kwargs so the CMS
         // accumulator can divide events by seconds at query time.
         assert_eq!(
-            ctx.metadata.query_kwargs.get("range_ms").map(String::as_str),
+            ctx.metadata
+                .query_kwargs
+                .get("range_ms")
+                .map(String::as_str),
             Some("60000")
         );
     }
@@ -6156,7 +6139,7 @@ mod cms_rate_capability_tests {
 /// Pre-Phase-5 the trait adapter unconditionally delegated to
 /// `handle_query`. After Phase 5 wire-in, when a `SketchIndex` is
 /// attached, the adapter classifies first and surfaces
-/// `EngineError::CapabilityMiss(SketchWarmTier, ...)` on Ghost / Unknown
+/// `EngineError::CapabilityMiss(SketchStore, ...)` on Ghost / Unknown
 /// / no-instance outcomes so the EngineRouter (Phase 6) can fall
 /// through to the archive engine.
 #[cfg(test)]
@@ -6194,11 +6177,16 @@ mod warm_tier_classify_tests {
     }
 
     fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
-            group_by_keys: group_by.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            group_by_keys: group_by
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
             capability: Capability::QuantileApprox(SketchKindHandle::DDSketch),
             sketch_kind: SketchKindHandle::DDSketch,
             sketch_config: cfg.clone(),
@@ -6213,14 +6201,15 @@ mod warm_tier_classify_tests {
         // capability-miss rather than burn a `handle_query` round-trip.
         let idx = Arc::new(SketchIndex::new());
         let engine = build_engine_with_index(idx);
-        let err = engine.execute("unknown_metric{zone=\"z0\"}").await.expect_err(
-            "warm-tier with no matching instance must yield CapabilityMiss",
-        );
+        let err = engine
+            .execute("unknown_metric{zone=\"z0\"}")
+            .await
+            .expect_err("warm-tier with no matching instance must yield CapabilityMiss");
         match err {
             EngineError::CapabilityMiss { engine_id, .. } => {
                 assert_eq!(
                     engine_id,
-                    asap_types::StorageBackend::SketchWarmTier.data_source_id()
+                    asap_types::StorageBackend::SketchStore.data_source_id()
                 );
             }
             other => panic!("expected CapabilityMiss, got {other:?}"),
@@ -6247,10 +6236,12 @@ mod warm_tier_classify_tests {
             EngineError::CapabilityMiss { engine_id, detail } => {
                 assert_eq!(
                     engine_id,
-                    asap_types::StorageBackend::SketchWarmTier.data_source_id()
+                    asap_types::StorageBackend::SketchStore.data_source_id()
                 );
                 assert!(
-                    detail.contains("ghost") || detail.contains("Ghost") || detail.contains("unknown"),
+                    detail.contains("ghost")
+                        || detail.contains("Ghost")
+                        || detail.contains("unknown"),
                     "detail mentions ghost/unknown: {detail}"
                 );
             }
@@ -6287,14 +6278,11 @@ mod warm_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    detail.contains("NoCallNodeFound")
-                        || detail.contains("analyzer rejected"),
+                    detail.contains("NoCallNodeFound") || detail.contains("analyzer rejected"),
                     "expected NoCallNodeFound analyzer rejection: {detail}"
                 );
             }
-            other => panic!(
-                "expected analyzer-rejected CapabilityMiss, got {other:?}"
-            ),
+            other => panic!("expected analyzer-rejected CapabilityMiss, got {other:?}"),
         }
     }
 }
@@ -6323,10 +6311,7 @@ mod hybrid_stitch_tests {
     #[test]
     fn stitch_fills_archive_prefix_and_suffix() {
         // Warm covers [100, 200] with timestamps 100, 150, 200.
-        let warm = matrix_with_samples(
-            "host=a",
-            vec![(100, 10.0), (150, 11.0), (200, 12.0)],
-        );
+        let warm = matrix_with_samples("host=a", vec![(100, 10.0), (150, 11.0), (200, 12.0)]);
         // Archive covers [50, 250] with timestamps every 50ms.
         let archive = matrix_with_samples(
             "host=a",

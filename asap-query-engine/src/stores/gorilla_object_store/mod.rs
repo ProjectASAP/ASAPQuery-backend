@@ -1,14 +1,13 @@
-//! `GorillaQueryEngine` — exact PromQL execution over the Gorilla
-//! archive tier.
+//! Gorilla object store and legacy in-process archive executor.
 //!
-//! Sibling of [`crate::engines::simple`] (warm-tier sketches). Both
-//! consume the same PromQL surface; `GorillaQueryEngine` answers
-//! exactly from per-hour Gorilla chunks landed on S3 / MinIO via
-//! [`store::GorillaS3Store`].
+//! This module owns the Gorilla chunk/object-store implementation. The
+//! public archive query engine is [`crate::engines::thanos_query`]; the
+//! in-process [`GorillaQueryEngine`] remains here as a legacy fallback for
+//! development deployments that still read per-hour Gorilla chunks directly.
 //!
 //! ## Module layout (post Step-1 refactor)
 //!
-//! * [`engine`] — query planner + per-statistic exact executor (the
+//! * [`query_engine`] — query planner + per-statistic exact executor (the
 //!   merged form of the previous `query_planner.rs` +
 //!   `exact_executor.rs`).
 //! * [`store`] — `GorillaS3Store` (the only `Store` impl after
@@ -24,14 +23,14 @@
 //!
 //! 1. an [`crate::stores::sketch_db::AccuracyEnvelope`] with
 //!    `kind = Exact`, ε = 0, δ = 0,
-//! 2. a `data_source: gorilla_archive` info line,
+//! 2. a `data_source: thanos_query` info line,
 //! 3. cheap diagnostics (`samples_scanned`, `chunks_fetched`).
 //!
 //! See `docs/design-gorilla-s3-cold-engine.md` §6.
 //!
 //! ## Two execution strategies
 //!
-//! Per-statistic dispatch in [`engine::ExactExecutor`]:
+//! Per-statistic dispatch in [`query_engine::ExactExecutor`]:
 //!
 //! * **Streaming-additive** — `Sum`, `Count`, `Min`, `Max`, `Rate`,
 //!   `Increase` (and `Avg` derived as Sum/Count). One chunk at a
@@ -42,11 +41,10 @@
 //!   [`GorillaEngineConfig::max_buffered_samples`]; over-budget
 //!   queries fail fast with [`EngineError::TooManySamples`].
 
-pub mod engine;
 pub mod postings;
+pub mod query_engine;
 pub mod s3_cost;
 pub mod store;
-pub mod thanos_forward;
 
 #[cfg(test)]
 mod tests;
@@ -62,7 +60,7 @@ use crate::data_model::KeyByLabelValues;
 use crate::engines::query_result::{InstantVectorElement, QueryResult};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
-pub use engine::{
+pub use query_engine::{
     plan_query, plan_query_at, AdditiveOp, ExactExecutor, LabelMatcher, QueryPlan, QueryStatistic,
 };
 pub use postings::PostingsHits;
@@ -73,16 +71,10 @@ pub use store::{
     ChunkRef, GorillaS3Config, GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample,
     S3ObjectStore, Store, StoreError,
 };
-pub use thanos_forward::{
-    engine_from_env as thanos_engine_from_env, ThanosForwardConfig, ThanosForwardEngine,
-    ThanosForwardError, ASAP_THANOS_QUERY_URL_ENV, DATA_SOURCE_THANOS_ARCHIVE_ID,
-    DATA_SOURCE_THANOS_ARCHIVE_INFO, DEFAULT_THANOS_QUERY_URL, QUIRK_THANOS_UNREACHABLE,
-};
-
-/// Marker line that every `GorillaQueryEngine` answer carries on
-/// its `infos` array. Pinned so dashboards / Phase-5 capability
-/// routers can byte-compare without parsing.
-pub const DATA_SOURCE_GORILLA_ARCHIVE: &str = "data_source: gorilla_archive";
+/// Marker line that every archive answer carries on its `infos` array.
+/// The legacy in-process Gorilla executor is an implementation detail;
+/// the public archive engine identity is Thanos.
+pub const DATA_SOURCE_GORILLA_ARCHIVE: &str = "data_source: thanos_query";
 
 /// Tunable runtime knobs for the Gorilla query engine.
 ///
@@ -113,7 +105,7 @@ impl Default for GorillaEngineConfig {
 #[derive(Debug, Error)]
 pub enum EngineError {
     /// PromQL string failed to parse, or used a construct outside
-    /// the engine's supported surface (see [`engine`]).
+    /// the engine's supported surface (see [`query_engine`]).
     #[error("query planning failed: {0}")]
     Plan(String),
     /// Archive-store fetch / decode failed.
@@ -169,10 +161,7 @@ impl GorillaQueryEngine {
     /// Convenience constructor for the production
     /// [`store::GorillaS3Store`] path. Mirrors the design.md type
     /// signature.
-    pub fn with_gorilla_s3(
-        store: Arc<store::GorillaS3Store>,
-        config: GorillaEngineConfig,
-    ) -> Self {
+    pub fn with_gorilla_s3(store: Arc<store::GorillaS3Store>, config: GorillaEngineConfig) -> Self {
         Self::new(store as Arc<dyn store::Store>, config)
     }
 
@@ -192,11 +181,11 @@ impl GorillaQueryEngine {
 
     /// Execute a parsed PromQL query against the archive tier.
     ///
-    /// The query string is parsed via [`engine::plan_query`],
+    /// The query string is parsed via [`query_engine::plan_query`],
     /// the resulting plan dispatches to either the streaming
     /// additive or the buffered execution path, and the answer is
     /// wrapped with the exact-accuracy envelope + the
-    /// `data_source: gorilla_archive` annotation.
+    /// `data_source: thanos_query` annotation.
     pub async fn execute(&self, query: &str) -> Result<QueryResult, EngineError> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -209,23 +198,15 @@ impl GorillaQueryEngine {
     /// pinning the right edge of the request window. Used by
     /// tests + by callers that want to back-date a query against
     /// historical chunks.
-    pub async fn execute_at(
-        &self,
-        query: &str,
-        now_ms: i64,
-    ) -> Result<QueryResult, EngineError> {
+    pub async fn execute_at(&self, query: &str, now_ms: i64) -> Result<QueryResult, EngineError> {
         let timeout = Duration::from_secs(self.config.query_timeout_secs.max(1));
         tokio::time::timeout(timeout, self.execute_inner(query, now_ms))
             .await
             .map_err(|_| EngineError::Timeout(timeout))?
     }
 
-    async fn execute_inner(
-        &self,
-        query: &str,
-        now_ms: i64,
-    ) -> Result<QueryResult, EngineError> {
-        let plan = engine::plan_query_at(query, now_ms).map_err(EngineError::Plan)?;
+    async fn execute_inner(&self, query: &str, now_ms: i64) -> Result<QueryResult, EngineError> {
+        let plan = query_engine::plan_query_at(query, now_ms).map_err(EngineError::Plan)?;
         debug!(
             metric = plan.metric.as_str(),
             stat = ?plan.statistic,
@@ -243,7 +224,7 @@ impl GorillaQueryEngine {
 
 /// Wrap a finished `(scalar value, sample / chunk counts)` into a
 /// `QueryResult` with the exact-accuracy envelope + the
-/// `data_source: gorilla_archive` info line. Pulled out so tests
+/// `data_source: thanos_query` info line. Pulled out so tests
 /// can pin the wrapping shape independently of the executor.
 pub fn wrap_result(plan: &QueryPlan, outcome: ExecutionOutcome) -> QueryResult {
     // Result timestamp is the right edge of the requested range —
@@ -254,7 +235,8 @@ pub fn wrap_result(plan: &QueryPlan, outcome: ExecutionOutcome) -> QueryResult {
     let labels = KeyByLabelValues::new_with_labels(Vec::new());
     let element = InstantVectorElement::new(labels, outcome.value);
     let envelope = AccuracyEnvelope::single(AccuracyProfile::exact());
-    QueryResult::vector(vec![element], result_ts).with_accuracy(envelope)
+    QueryResult::vector(vec![element], result_ts)
+        .with_accuracy(envelope)
         // Window is the requested range, expressed in u64 ms.
         .with_window_used((
             plan.time_range_ms.0.max(0) as u64,
@@ -345,18 +327,15 @@ impl ExecutionOutcome {
 
 #[async_trait::async_trait]
 impl crate::routing::engine_router::QueryEngine for GorillaQueryEngine {
-    async fn execute(
-        &self,
-        query: &str,
-    ) -> Result<QueryResult, crate::engines::EngineError> {
+    async fn execute(&self, query: &str) -> Result<QueryResult, crate::engines::EngineError> {
         match GorillaQueryEngine::execute(self, query).await {
             Ok(result) => Ok(result),
             Err(EngineError::Plan(msg)) => Err(crate::engines::EngineError::capability_miss(
-                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
                 msg,
             )),
             Err(other) => Err(crate::engines::EngineError::backend(
-                asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
+                asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
                 other,
             )),
         }
@@ -364,15 +343,12 @@ impl crate::routing::engine_router::QueryEngine for GorillaQueryEngine {
 
     fn capabilities(&self) -> crate::routing::engine_router::EngineCapabilities {
         crate::routing::engine_router::EngineCapabilities {
-            data_source_id: asap_types::StorageBackend::GorillaS3Archive.data_source_id(),
-            storage_backend: asap_types::StorageBackend::GorillaS3Archive,
+            data_source_id: asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
+            storage_backend: asap_types::StorageBackend::GorillaObjectStore,
             // The buffered-aggregate budget gives a natural ceiling: each
             // sample is ~16 B (i64 ts + f64 value), so the byte budget is
             // ~16 × max_buffered_samples.
-            supports_streams_above_bytes: self
-                .config
-                .max_buffered_samples
-                .saturating_mul(16),
+            supports_streams_above_bytes: self.config.max_buffered_samples.saturating_mul(16),
         }
     }
 }

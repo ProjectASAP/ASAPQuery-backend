@@ -12,6 +12,11 @@ use crate::query_requirements::QueryRequirements;
 use crate::utils::normalize_spatial_filter;
 use promql_utilities::query_logics::enums::AggregationType;
 
+pub const ENGINE_ID_ASAP_QUERY: &str = "asap_query";
+pub const ENGINE_ID_THANOS_QUERY: &str = "thanos_query";
+
+pub const CANONICAL_QUERY_ENGINE_IDS: &[&str] = &[ENGINE_ID_ASAP_QUERY, ENGINE_ID_THANOS_QUERY];
+
 // ---------------------------------------------------------------------------
 // Phase-5: storage-backend capability axis
 //
@@ -25,29 +30,28 @@ use promql_utilities::query_logics::enums::AggregationType;
 
 /// Which physical storage tier a query (or a metric configuration) routes to.
 ///
-/// `SketchWarmTier` is the default — every existing `AggregationConfig` and
+/// `SketchStore` is the default — every existing `AggregationConfig` and
 /// `StreamingConfig` decodes into this variant via `#[serde(default)]`, so
-/// pre-Phase-5 deploys keep dispatching to `SimpleEngine` unchanged.
+/// pre-Phase-5 deploys keep dispatching to `ASAPQueryEngine` unchanged.
 ///
 /// **Step-1 of the JSONL deprecation refactor** removed the
 /// `ColdJsonlFallback` variant. The legacy local-FS JSONL leg
 /// (`LocalFsColdStore`, `parse_jsonl`, the §5.2 raw-store
 /// fallback) was deleted at the same commit; the surviving
-/// failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
-)]
+/// failover surface is warm-tier sketch ↔ Thanos archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
     /// Warm-tier sketch DB (today's `SimpleMapStore` + accumulators).
-    /// Served by `SimpleEngine`. Default for unconfigured metrics.
+    /// Served by `ASAPQueryEngine`. Default for unconfigured metrics.
     #[default]
-    SketchWarmTier,
+    SketchStore,
 
-    /// Gorilla-S3 archive. Served by `GorillaQueryEngine`, reading
-    /// per-hour Gorilla chunks from S3 / MinIO via the
-    /// `GorillaS3Store`.
-    GorillaS3Archive,
+    /// Thanos archive over MinIO/S3. The enum name is kept for
+    /// serde/back-compat with existing configs, but its canonical
+    /// query-engine identity is `thanos_query`. Gorilla is an
+    /// archive chunk format/storage detail, not a public query engine.
+    GorillaObjectStore,
 
     /// Double-write: the metric is written to both warm-tier sketches AND the
     /// Gorilla-S3 archive. Capability matching surfaces both options and the
@@ -61,23 +65,31 @@ pub enum StorageBackend {
     /// Prometheus's `/api/v1/query`) under this slot so the
     /// controller's `RawAtEdgePrometheusArchive` mode can route a
     /// metric's queries to Prometheus directly. Mirrors the
-    /// `GorillaS3Archive` slot's "single backend, no failover"
+    /// `GorillaObjectStore` slot's "single backend, no failover"
     /// semantics — there is no warm-tier sketch to fall back on for a
     /// Prometheus-remote metric.
     PrometheusRemote,
 }
 
 impl StorageBackend {
-    /// String tag pinned for byte-comparable dispatch on the wire (mirrors
+    /// Canonical string tag pinned for byte-comparable dispatch on the wire (mirrors
     /// the `data_source: <tag>` info-line on `QueryResult`). Engines
     /// register themselves under these IDs in the router.
     pub const fn data_source_id(self) -> &'static str {
         match self {
-            StorageBackend::SketchWarmTier => "sketch_warm",
-            StorageBackend::GorillaS3Archive => "gorilla_archive",
+            StorageBackend::SketchStore => ENGINE_ID_ASAP_QUERY,
+            StorageBackend::GorillaObjectStore => ENGINE_ID_THANOS_QUERY,
             StorageBackend::DoubleWrite => "double_write",
             StorageBackend::PrometheusRemote => "prometheus_remote",
         }
+    }
+}
+
+pub fn parse_storage_backend_engine_id(s: &str) -> Option<StorageBackend> {
+    match s {
+        ENGINE_ID_ASAP_QUERY => Some(StorageBackend::SketchStore),
+        ENGINE_ID_THANOS_QUERY => Some(StorageBackend::GorillaObjectStore),
+        _ => None,
     }
 }
 
@@ -86,9 +98,7 @@ impl StorageBackend {
 /// router consults this to decide whether a metric configured for both warm-
 /// tier and Gorilla-S3 should answer from the archive (Exact) or the
 /// approximate warm-tier sketch.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccuracyTarget {
     /// Caller demands an exact answer; warm-tier sketches are not eligible
@@ -244,39 +254,39 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
 ///
 /// Routing rules (mirrors `docs/design-gorilla-s3-cold-engine.md` §8):
 ///
-/// * Metric configured for `GorillaS3Archive`: always
-///   `[GorillaS3Archive]`. Exact-on-archive subsumes approximate-on-warm,
+/// * Metric configured for `GorillaObjectStore`: always
+///   `[GorillaObjectStore]`. Exact-on-archive subsumes approximate-on-warm,
 ///   so even a `Statistic::Quantile` with an `Approximate` target still
 ///   routes to the archive when the metric is Gorilla-only — there is no
 ///   warm-tier sketch to fall back to in that deploy shape.
-/// * Metric configured for `SketchWarmTier` (or unconfigured / default):
-///   `[SketchWarmTier]`. A capability miss in the warm tier surfaces
+/// * Metric configured for `SketchStore` (or unconfigured / default):
+///   `[SketchStore]`. A capability miss in the warm tier surfaces
 ///   as a 404 — the previous JSONL fallback path has been deleted.
 /// * Metric configured for `DoubleWrite`: head depends on accuracy hint,
 ///   tail is the failover sequence (the cost-aware `EngineRouter` picks
 ///   the head, walks the tail on failure):
-///   - `Exact` → `[GorillaS3Archive, SketchWarmTier]`
-///   - `Approximate` → `[SketchWarmTier, GorillaS3Archive]`
+///   - `Exact` → `[GorillaObjectStore, SketchStore]`
+///   - `Approximate` → `[SketchStore, GorillaObjectStore]`
 pub fn compatible_storage_backends(
     _stat: Statistic,
     accuracy: AccuracyTarget,
     metric_storage_config: StorageBackend,
 ) -> Vec<StorageBackend> {
     match metric_storage_config {
-        StorageBackend::GorillaS3Archive => {
-            vec![StorageBackend::GorillaS3Archive]
+        StorageBackend::GorillaObjectStore => {
+            vec![StorageBackend::GorillaObjectStore]
         }
-        StorageBackend::SketchWarmTier => {
-            vec![StorageBackend::SketchWarmTier]
+        StorageBackend::SketchStore => {
+            vec![StorageBackend::SketchStore]
         }
         StorageBackend::DoubleWrite => match accuracy {
             AccuracyTarget::Exact => vec![
-                StorageBackend::GorillaS3Archive,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::GorillaObjectStore,
+                StorageBackend::SketchStore,
             ],
             AccuracyTarget::Approximate => vec![
-                StorageBackend::SketchWarmTier,
-                StorageBackend::GorillaS3Archive,
+                StorageBackend::SketchStore,
+                StorageBackend::GorillaObjectStore,
             ],
         },
         // Phase ε.2: Prometheus-remote metrics route only to the
@@ -1354,22 +1364,22 @@ mod tests {
         let backends = compatible_storage_backends(
             Statistic::Sum,
             AccuracyTarget::Exact,
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
-        assert_eq!(backends, vec![StorageBackend::GorillaS3Archive]);
+        assert_eq!(backends, vec![StorageBackend::GorillaObjectStore]);
     }
 
     #[test]
-    fn sketch_warm_tier_metric_routes_to_simple_engine() {
+    fn asap_query_metric_routes_to_simple_engine() {
         let backends = compatible_storage_backends(
             Statistic::Quantile,
             AccuracyTarget::Approximate,
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         // Step-1 of the JSONL deprecation: warm-tier only routes
         // to itself; the previous `ColdJsonlFallback` failover slot
         // has been deleted.
-        assert_eq!(backends, vec![StorageBackend::SketchWarmTier]);
+        assert_eq!(backends, vec![StorageBackend::SketchStore]);
     }
 
     #[test]
@@ -1383,8 +1393,8 @@ mod tests {
         assert_eq!(
             exact,
             vec![
-                StorageBackend::GorillaS3Archive,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::GorillaObjectStore,
+                StorageBackend::SketchStore,
             ]
         );
         // Approximate: warm-tier head (cheaper for ε/δ-bounded
@@ -1397,8 +1407,8 @@ mod tests {
         assert_eq!(
             approx,
             vec![
-                StorageBackend::SketchWarmTier,
-                StorageBackend::GorillaS3Archive,
+                StorageBackend::SketchStore,
+                StorageBackend::GorillaObjectStore,
             ]
         );
     }
@@ -1412,36 +1422,49 @@ mod tests {
         let backends = compatible_storage_backends(
             Statistic::Quantile,
             AccuracyTarget::Approximate,
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
-        assert_eq!(backends, vec![StorageBackend::GorillaS3Archive]);
+        assert_eq!(backends, vec![StorageBackend::GorillaObjectStore]);
     }
 
     #[test]
     fn storage_backend_default_is_warm_tier() {
         // `#[serde(default)]` on `StreamingConfig.storage_backend` (and on
-        // `StorageBackend::default()`) MUST be `SketchWarmTier` so pre-Phase-5
+        // `StorageBackend::default()`) MUST be `SketchStore` so pre-Phase-5
         // configs decode without bumping deploys onto the archive.
-        assert_eq!(StorageBackend::default(), StorageBackend::SketchWarmTier);
+        assert_eq!(StorageBackend::default(), StorageBackend::SketchStore);
     }
 
     #[test]
     fn storage_backend_data_source_id_is_pinned() {
         // The router registers engines by these strings; dashboards
         // byte-compare them. Pin to catch accidental rename.
-        assert_eq!(StorageBackend::SketchWarmTier.data_source_id(), "sketch_warm");
         assert_eq!(
-            StorageBackend::GorillaS3Archive.data_source_id(),
-            "gorilla_archive",
+            StorageBackend::SketchStore.data_source_id(),
+            ENGINE_ID_ASAP_QUERY
         );
         assert_eq!(
-            StorageBackend::DoubleWrite.data_source_id(),
-            "double_write",
+            StorageBackend::GorillaObjectStore.data_source_id(),
+            ENGINE_ID_THANOS_QUERY,
         );
+        assert_eq!(StorageBackend::DoubleWrite.data_source_id(), "double_write",);
         assert_eq!(
             StorageBackend::PrometheusRemote.data_source_id(),
             "prometheus_remote",
         );
+    }
+
+    #[test]
+    fn storage_backend_engine_id_parser_accepts_only_canonical_query_engines() {
+        assert_eq!(
+            parse_storage_backend_engine_id(ENGINE_ID_ASAP_QUERY),
+            Some(StorageBackend::SketchStore),
+        );
+        assert_eq!(
+            parse_storage_backend_engine_id(ENGINE_ID_THANOS_QUERY),
+            Some(StorageBackend::GorillaObjectStore),
+        );
+        assert_eq!(parse_storage_backend_engine_id("not_an_engine"), None);
     }
 
     /// Source-of-truth agreement check, mirrors
@@ -1466,8 +1489,8 @@ mod tests {
         ];
         let accuracies = [AccuracyTarget::Exact, AccuracyTarget::Approximate];
         let configs = [
-            StorageBackend::SketchWarmTier,
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::SketchStore,
+            StorageBackend::GorillaObjectStore,
             StorageBackend::DoubleWrite,
             StorageBackend::PrometheusRemote,
         ];
@@ -1483,26 +1506,24 @@ mod tests {
                     );
                     let last = *backends.last().unwrap();
                     assert!(
-                        last == StorageBackend::SketchWarmTier
-                            || last == StorageBackend::GorillaS3Archive
+                        last == StorageBackend::SketchStore
+                            || last == StorageBackend::GorillaObjectStore
                             || last == StorageBackend::PrometheusRemote,
                         "backend list for ({stat:?}, {acc:?}, {cfg:?}) must terminate in a \
-                         dispatchable failover (SketchWarmTier, GorillaS3Archive, or \
+                         dispatchable failover (SketchStore, GorillaObjectStore, or \
                          PrometheusRemote); got {last:?}",
                     );
                     // The expected head is determined by `(metric_storage_config, accuracy)`:
                     let expected_head = match (cfg, acc) {
-                        (StorageBackend::GorillaS3Archive, _) => StorageBackend::GorillaS3Archive,
-                        (StorageBackend::SketchWarmTier, _) => StorageBackend::SketchWarmTier,
+                        (StorageBackend::GorillaObjectStore, _) => StorageBackend::GorillaObjectStore,
+                        (StorageBackend::SketchStore, _) => StorageBackend::SketchStore,
                         (StorageBackend::DoubleWrite, AccuracyTarget::Exact) => {
-                            StorageBackend::GorillaS3Archive
+                            StorageBackend::GorillaObjectStore
                         }
                         (StorageBackend::DoubleWrite, AccuracyTarget::Approximate) => {
-                            StorageBackend::SketchWarmTier
+                            StorageBackend::SketchStore
                         }
-                        (StorageBackend::PrometheusRemote, _) => {
-                            StorageBackend::PrometheusRemote
-                        }
+                        (StorageBackend::PrometheusRemote, _) => StorageBackend::PrometheusRemote,
                     };
                     assert_eq!(
                         backends[0], expected_head,

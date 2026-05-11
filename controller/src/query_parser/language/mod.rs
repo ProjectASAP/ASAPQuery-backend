@@ -30,15 +30,15 @@
 //! adding a real backend later is a localised change to the relevant
 //! sub-module.
 
+pub mod elastic_dsl;
 pub mod language_ast;
 pub mod promql;
 pub mod sql;
-pub mod elastic_dsl;
 
+pub use elastic_dsl::ElasticDslLanguage;
 pub use language_ast::LanguageAst;
 pub use promql::PromQLLanguage;
 pub use sql::SqlLanguage;
-pub use elastic_dsl::ElasticDslLanguage;
 
 #[cfg(test)]
 mod tests;
@@ -71,7 +71,10 @@ pub enum ParseError {
 impl ParseError {
     /// Convenience: wrap any `Display` parser error into [`ParseError::Backend`].
     pub fn backend(language: QueryLanguage, e: impl std::fmt::Display) -> Self {
-        ParseError::Backend { language, source_err: e.to_string() }
+        ParseError::Backend {
+            language,
+            source_err: e.to_string(),
+        }
     }
 }
 

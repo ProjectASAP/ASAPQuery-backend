@@ -16,10 +16,8 @@ use tracing::{debug, info, warn};
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
-use crate::engines::SimpleEngine;
-use crate::routing::{
-    EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
-};
+use crate::engines::ASAPQueryEngine;
+use crate::routing::{EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine};
 use crate::stores::Store;
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
@@ -104,7 +102,7 @@ impl std::fmt::Debug for PrecomputeJobRegistry {
 /// (Fix 1) for the design rationale.
 ///
 /// Recognised values match `StorageBackend::data_source_id()` —
-/// `sketch_warm`, `gorilla_archive`, `double_write`. (Step-1 of
+/// `asap_query`, `thanos_query`, `double_write`. (Step-1 of
 /// the JSONL deprecation removed the `cold_jsonl` value.) An
 /// unknown value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
@@ -150,14 +148,14 @@ pub struct HttpServerConfig {
 #[derive(Clone)]
 pub struct HttpServer {
     config: HttpServerConfig,
-    query_engine: Arc<SimpleEngine>,
+    query_engine: Arc<ASAPQueryEngine>,
     /// Phase-5/6 capability router. Built from `query_engine` at
     /// construction time (`SimpleEngine` registered as the warm-tier
     /// `QueryEngine`) and extended via [`Self::with_query_engine`] —
     /// e.g. to plug in a `GorillaQueryEngine` for the cold archive
     /// tier. Instant-query dispatch consults this for metrics whose
     /// `StreamingConfig::storage_backend()` is anything other than
-    /// `SketchWarmTier`; warm-tier queries still take the direct
+    /// `SketchStore`; warm-tier queries still take the direct
     /// `SimpleEngine::handle_query` path so they keep the
     /// `KeyByLabelNames` Prometheus needs to populate the `metric`
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
@@ -173,7 +171,7 @@ pub struct HttpServer {
     /// `EngineRouter` for any per-metric override. When `None` the
     /// handler falls back to the pre-Phase-5 behaviour of consulting
     /// the streaming-config's single `storage_backend()` axis (which
-    /// itself defaults to `SketchWarmTier`). Wired by the binary via
+    /// itself defaults to `SketchStore`). Wired by the binary via
     /// [`Self::with_backend_storage_routing`]; production deploys
     /// bootstrap from `deploy/configs/backend-storage-routing.yaml`
     /// (legacy form) or the controller's first
@@ -224,7 +222,7 @@ pub struct HttpServer {
 #[derive(Clone)]
 struct AppState {
     config: HttpServerConfig,
-    query_engine: Arc<SimpleEngine>,
+    query_engine: Arc<ASAPQueryEngine>,
     /// See [`HttpServer::query_router`].
     query_router: Arc<EngineRouter>,
     store: Arc<dyn Store>,
@@ -253,13 +251,11 @@ struct AppState {
 impl HttpServer {
     pub fn new(
         config: HttpServerConfig,
-        query_engine: Arc<SimpleEngine>,
+        query_engine: Arc<ASAPQueryEngine>,
         store: Arc<dyn Store>,
     ) -> Self {
-        // Bootstrap the capability router with `SimpleEngine` registered
-        // for the warm-tier (`sketch_warm`) `data_source_id`. Callers
-        // wiring up additional engines (e.g. `GorillaQueryEngine` for
-        // the cold archive) extend the router via `with_query_engine`.
+        // Bootstrap the capability router with `ASAPQueryEngine`
+        // registered under its canonical query-engine id.
         let mut router = EngineRouter::new();
         router.register(query_engine.clone() as Arc<dyn QueryEngine>);
         let query_router = Arc::new(router);
@@ -296,23 +292,12 @@ impl HttpServer {
         self
     }
 
-    /// Like [`Self::with_query_engine`] but registers the engine
-    /// under an explicit `data_source_id` instead of the one its
-    /// `capabilities()` reports. Used by Step-2.3's Path A2 wiring:
-    /// the same `ThanosForwardEngine` instance is registered under
-    /// both `thanos_archive` (its native id, for explicit overrides)
-    /// and `gorilla_archive` (the legacy archive slot that the
-    /// existing `compatible_storage_backends` failover sequence
-    /// walks). The legacy in-process `GorillaQueryEngine` is only
-    /// registered when `ASAP_THANOS_QUERY_URL` is unset, so the two
-    /// registrations never collide on the same id.
-    pub fn with_query_engine_aliased(
-        mut self,
-        id: &'static str,
-        engine: Arc<dyn QueryEngine>,
-    ) -> Self {
+    /// Register the archive engine. The only public archive query
+    /// engine id is `thanos_query`; Gorilla is only an
+    /// encoding/storage detail.
+    pub fn with_archive_query_engine(mut self, engine: Arc<dyn QueryEngine>) -> Self {
         let mut router: EngineRouter = (*self.query_router).clone();
-        router.register_aliased(id, engine);
+        router.register(engine);
         self.query_router = Arc::new(router);
         self
     }
@@ -669,8 +654,8 @@ async fn process_query_request(
     // If the caller explicitly named an engine (via `X-ASAP-Engine`
     // header or `?engine=` query param) bypass `BackendStorageRouting`
     // and dispatch directly. The accuracy reducer relies on this to
-    // ask the same PromQL against the warm sketch (`sketch_warm`) and
-    // the Gorilla archive (`gorilla_archive`) so it can compute
+    // ask the same PromQL against the warm sketch (`asap_query`) and
+    // the Gorilla archive (`thanos_query`) so it can compute
     // apples-to-apples relative error per replay row.
     if let Some(override_id) = engine_override.as_deref() {
         return process_via_named_engine(state, parsed_request, start_time, override_id).await;
@@ -694,9 +679,7 @@ async fn process_query_request(
     // dispatch falls through to the normal path — preserving the
     // long-window queries (≥1m) that the cold archive still answers
     // correctly.
-    if let Some(response) =
-        try_answer_freshness_probe(state, parsed_request, start_time).await
-    {
+    if let Some(response) = try_answer_freshness_probe(state, parsed_request, start_time).await {
         return response;
     }
 
@@ -709,18 +692,18 @@ async fn process_query_request(
     //       query is parsed; the metric name is extracted from the
     //       AST and looked up in the table. This is the production
     //       path the issue-46 MVP relies on so cold-archive metrics
-    //       (e.g. `http_requests_total` → `gorilla_archive`) actually
+    //       (e.g. `http_requests_total` → `thanos_query`) actually
     //       route through the `EngineRouter`.
     //   (b) Single-axis `StreamingConfig::storage_backend()` from the
     //       hot-reload config (the pre-Phase-5 fallback). Pre-controller
-    //       deploys ride this path; it always lands on `SketchWarmTier`
+    //       deploys ride this path; it always lands on `SketchStore`
     //       unless the YAML was hand-patched.
-    //   (c) Default — `SketchWarmTier`. Keeps the direct
+    //   (c) Default — `SketchStore`. Keeps the direct
     //       `SimpleEngine::handle_query` path so the response carries
     //       the `KeyByLabelNames` the Prometheus adapter needs to
     //       populate the `metric` map.
     //
-    // For non-`SketchWarmTier` axes the dispatch goes through the
+    // For non-`SketchStore` axes the dispatch goes through the
     // `EngineRouter`. Phase-6 (Gorilla MVP) returns a scalar with
     // empty labels, so dropping `KeyByLabelNames` is acceptable; the
     // response carries `accuracy` + `data_source` via the
@@ -734,7 +717,7 @@ async fn process_query_request(
         state.hot_reload_config.is_some(),
     );
 
-    if matches!(metric_storage, StorageBackend::SketchWarmTier) {
+    if matches!(metric_storage, StorageBackend::SketchStore) {
         process_via_simple_engine(state, parsed_request, start_time, headers).await
     } else {
         process_via_router(state, parsed_request, start_time, metric_storage).await
@@ -749,7 +732,7 @@ async fn process_query_request(
 ///    This is the path issue #46's MVP demo relies on.
 /// 2. Streaming-config single-axis fallback — preserves pre-Phase-5
 ///    behaviour for deploys that haven't loaded a routing table.
-/// 3. Default `SketchWarmTier`.
+/// 3. Default `SketchStore`.
 ///
 /// Parsing failures fall through to (2)/(3) so a malformed PromQL
 /// doesn't surface as a routing 5xx (the engines themselves will
@@ -836,7 +819,7 @@ fn first_metric_name(expr: &promql_parser::parser::Expr) -> Option<String> {
 ///
 /// Response shape mirrors `process_via_router`'s success path: a
 /// Prometheus instant vector with one element (empty labels, scalar
-/// value), a `data_source: sketch_warm` info-line so the wire format
+/// value), a `data_source: asap_query` info-line so the wire format
 /// is consistent with the warm-tier path the routing table comment
 /// describes as the right home for the `_warm` probe.
 async fn try_answer_freshness_probe(
@@ -874,10 +857,8 @@ async fn try_answer_freshness_probe(
         "freshness-probe cache hit; answering last_over_time from RAM"
     );
 
-    let element = InstantVectorElement::new(
-        crate::data_model::KeyByLabelValues::new(),
-        sample.value,
-    );
+    let element =
+        InstantVectorElement::new(crate::data_model::KeyByLabelValues::new(), sample.value);
     // The instant-vector timestamp is unix milliseconds — match the
     // adapter's expectations downstream (the Prometheus adapter
     // divides by 1000 to render the wire `value: [<unix_seconds>, ...]`).
@@ -899,11 +880,10 @@ async fn try_answer_freshness_probe(
             .format_success_response(&execution_result)
             .await
         {
-            Ok(response) => annotate_data_source(
-                response,
-                StorageBackend::SketchWarmTier.data_source_id(),
-            )
-            .await,
+            Ok(response) => {
+                annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
+                    .await
+            }
             Err(status) => status.into_response(),
         },
     )
@@ -950,7 +930,7 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
 /// `KeyByLabelNames` the Prometheus adapter needs to fill in the
 /// `metric` map. Used for warm-tier metrics (the default) so the
 /// response surface is byte-identical to the pre-router path. Adds a
-/// `data_source: sketch_warm` info-line at the JSON layer so Phase-6
+/// `data_source: asap_query` info-line at the JSON layer so Phase-6
 /// callers can byte-compare regardless of the dispatch path.
 async fn process_via_simple_engine(
     state: &AppState,
@@ -997,11 +977,10 @@ async fn process_via_simple_engine(
                 .format_success_response(&execution_result)
                 .await
             {
-                Ok(response) => annotate_data_source(
-                    response,
-                    StorageBackend::SketchWarmTier.data_source_id(),
-                )
-                .await,
+                Ok(response) => {
+                    annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
+                        .await
+                }
                 Err(status) => status.into_response(),
             }
         }
@@ -1027,18 +1006,20 @@ async fn process_via_simple_engine(
             } else {
                 debug!("Query not supported and forwarding disabled, returning error");
                 // Adapter formats the unsupported query error for its protocol.
-                // We still annotate `data_source: sketch_warm` so callers
+                // We still annotate `data_source: asap_query` so callers
                 // see which tier the request was dispatched against —
                 // the routing decision happened, the metric just had no
                 // compatible aggregation. Mirrors the
                 // SimpleEngine-as-router-engine path where a
                 // `EngineError::CapabilityMiss` response is still tagged.
                 match state.adapter.format_unsupported_query_response().await {
-                    Ok(response) => annotate_data_source(
-                        response,
-                        StorageBackend::SketchWarmTier.data_source_id(),
-                    )
-                    .await,
+                    Ok(response) => {
+                        annotate_data_source(
+                            response,
+                            StorageBackend::SketchStore.data_source_id(),
+                        )
+                        .await
+                    }
                     Err(status) => status.into_response(),
                 }
             }
@@ -1164,7 +1145,7 @@ async fn process_via_named_engine(
 }
 
 /// Dispatch through the [`EngineRouter`] — used for any metric whose
-/// pinned `StorageBackend` is something other than `SketchWarmTier`.
+/// pinned `StorageBackend` is something other than `SketchStore`.
 ///
 /// The router's `execute` API is `(&str, Statistic, AccuracyTarget,
 /// StorageBackend) -> QueryResult`. Three of those four axes are
@@ -1180,7 +1161,7 @@ async fn process_via_named_engine(
 /// [`compatible_storage_backends`] consults them only for the
 /// `DoubleWrite` head-selection heuristic (other deploy shapes
 /// degenerate to a fixed list keyed only by `metric_storage`), so
-/// defaulting to `(Sum, Approximate)` is safe for `GorillaS3Archive`-
+/// defaulting to `(Sum, Approximate)` is safe for `GorillaObjectStore`-
 /// only deploys. A follow-up will thread
 /// the real values through once the Phase-6 query-tracker exposes
 /// them per request.
@@ -1209,7 +1190,7 @@ async fn process_via_router(
 
     // Default `(Sum, Approximate)` — see fn doc above. The router's
     // capability table only consults these axes for `DoubleWrite`
-    // metrics; for `GorillaS3Archive`-only deploys the dispatch
+    // metrics; for `GorillaObjectStore`-only deploys the dispatch
     // is a function of `metric_storage` alone.
     let stat = Statistic::Sum;
     let accuracy = AccuracyTarget::Approximate;
@@ -1252,11 +1233,9 @@ async fn process_via_router(
                 .format_success_response(&execution_result)
                 .await
             {
-                Ok(response) => annotate_data_source(
-                    response,
-                    metric_storage.data_source_id(),
-                )
-                .await,
+                Ok(response) => {
+                    annotate_data_source(response, metric_storage.data_source_id()).await
+                }
                 Err(status) => status.into_response(),
             }
         }
@@ -1281,12 +1260,8 @@ async fn process_via_router(
         Err(EngineRouterError::AllFailed { last }) => {
             warn!(error = %last, "EngineRouter: all compatible engines failed");
             let (status, error_type) = match &last {
-                EngineError::CapabilityMiss { .. } => {
-                    (StatusCode::NOT_FOUND, "bad_data")
-                }
-                EngineError::Backend { .. } => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "internal")
-                }
+                EngineError::CapabilityMiss { .. } => (StatusCode::NOT_FOUND, "bad_data"),
+                EngineError::Backend { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
             };
             (
                 status,
@@ -1392,9 +1367,15 @@ async fn handle_instant_query(
         }
     };
 
-    let response =
-        process_query_request(&state, &parsed_request, start_time, HashMap::new(), engine_override, &tenant)
-            .await;
+    let response = process_query_request(
+        &state,
+        &parsed_request,
+        start_time,
+        HashMap::new(),
+        engine_override,
+        &tenant,
+    )
+    .await;
     srv_metrics::record_query_outcome(
         srv_metrics::QUERY_TYPE_INSTANT,
         query_status_label(&response),
@@ -1626,8 +1607,7 @@ async fn handle_metrics() -> impl IntoResponse {
     // mvp/v5: append the S3 cost counters in Prometheus text
     // exposition. Mirrors `/internal/s3_cost.csv` — the CSV is for
     // the demo, this is for live dashboards.
-    let counters =
-        crate::engines::gorilla::global_s3_cost_counters();
+    let counters = crate::stores::gorilla_object_store::global_s3_cost_counters();
     buffer.extend_from_slice(counters.render_prometheus().as_bytes());
     (
         [(
@@ -1644,13 +1624,9 @@ async fn handle_metrics() -> impl IntoResponse {
 /// operations have been issued (the counters default to zero, so
 /// the CSV is still well-formed).
 async fn handle_s3_cost_csv() -> impl IntoResponse {
-    let counters =
-        crate::engines::gorilla::global_s3_cost_counters();
+    let counters = crate::stores::gorilla_object_store::global_s3_cost_counters();
     (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/csv; charset=utf-8",
-        )],
+        [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
         counters.render_csv(),
     )
 }
@@ -2981,10 +2957,8 @@ aggregations:
         metric_storage_backend: StorageBackend,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -3011,8 +2985,8 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let mut server = HttpServer::new(config, query_engine, store)
-            .with_hot_reload_config(hot_reload);
+        let mut server =
+            HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
         for engine in extra_engines {
             server = server.with_query_engine(engine);
         }
@@ -3025,7 +2999,7 @@ aggregations:
     /// Build an `HttpServer` wired with a per-metric
     /// `BackendStorageRouting` table — the **production path** the
     /// issue-46 MVP relies on. The streaming-config single axis stays
-    /// at `SketchWarmTier` (the realistic deploy state); the routing
+    /// at `SketchStore` (the realistic deploy state); the routing
     /// table is what flips per-metric dispatch over to the
     /// `EngineRouter`. This proves the production code path
     /// (`process_query_request → resolve_metric_storage → routing
@@ -3036,10 +3010,8 @@ aggregations:
         routing: crate::data_model::BackendStorageRouting,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -3049,7 +3021,7 @@ aggregations:
             crate::data_model::QueryLanguage::promql,
             crate::data_model::CleanupPolicy::NoCleanup,
         );
-        // Streaming-config stays on the default `SketchWarmTier` axis
+        // Streaming-config stays on the default `SketchStore` axis
         // — exactly what the production deploy looks like (the YAML
         // loader doesn't parse `storage_backend`). All routing
         // decisions must come from the per-metric routing table.
@@ -3086,16 +3058,14 @@ aggregations:
     /// surface — but registers nothing, then asks the router-path
     /// dispatch to route an archive metric. Used by the
     /// `503 NoEngineRegistered` test.
-    async fn setup_test_server_with_empty_router(
-        metric_storage_backend: StorageBackend,
-    ) -> u16 {
+    async fn setup_test_server_with_empty_router(metric_storage_backend: StorageBackend) -> u16 {
         // `HttpServer::new` always registers SimpleEngine for the
         // warm tier. To force `NoEngineRegistered` we point the
         // metric at a backend whose data_source_id doesn't match
         // any registered engine — since `HttpServer::new` only
-        // registers SimpleEngine (sketch_warm), routing a
-        // `GorillaS3Archive`-only metric trips the empty path
-        // (compatible_storage_backends = [GorillaS3Archive], no
+        // registers SimpleEngine (asap_query), routing a
+        // `GorillaObjectStore`-only metric trips the empty path
+        // (compatible_storage_backends = [GorillaObjectStore], no
         // engine registered for that id).
         setup_test_server_with_router(metric_storage_backend, Vec::new()).await
     }
@@ -3107,11 +3077,7 @@ aggregations:
         let infos = body
             .get("infos")
             .and_then(|v| v.as_array())
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected `infos` array in response body, got {body}",
-                )
-            });
+            .unwrap_or_else(|| panic!("expected `infos` array in response body, got {body}",));
         let want = format!("data_source: {expected}");
         assert!(
             infos.iter().any(|v| v.as_str() == Some(&want)),
@@ -3121,12 +3087,12 @@ aggregations:
 
     #[tokio::test]
     async fn http_routes_warm_tier_metric_to_simple_engine() {
-        // Default (no hot-reload) → `SketchWarmTier`. The handler
+        // Default (no hot-reload) → `SketchStore`. The handler
         // takes the direct `SimpleEngine::handle_query` path; the
-        // response's `infos` array carries `data_source: sketch_warm`
+        // response's `infos` array carries `data_source: asap_query`
         // so callers can byte-compare which engine answered.
         let server_port =
-            setup_test_server_with_router(StorageBackend::SketchWarmTier, Vec::new()).await;
+            setup_test_server_with_router(StorageBackend::SketchStore, Vec::new()).await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -3140,19 +3106,19 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "sketch_warm");
+        assert_data_source(&body, "asap_query");
     }
 
     #[tokio::test]
     async fn http_routes_archive_metric_to_gorilla_engine() {
-        // Pin `storage_backend = GorillaS3Archive` and register a
+        // Pin `storage_backend = GorillaObjectStore` and register a
         // `MockQueryEngine` under that id. The handler must dispatch
         // through the router (not SimpleEngine) and the response's
-        // `infos` array must carry `data_source: gorilla_archive`.
+        // `infos` array must carry `data_source: thanos_query`.
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
             vec![gorilla as Arc<dyn QueryEngine>],
         )
         .await;
@@ -3172,7 +3138,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -3183,7 +3149,7 @@ aggregations:
     #[tokio::test]
     async fn http_query_with_no_storage_config_defaults_to_warm_tier() {
         // `StreamingConfig::default()` has `storage_backend =
-        // SketchWarmTier` (per the `#[serde(default)]` on the
+        // SketchStore` (per the `#[serde(default)]` on the
         // field — see `streaming_config.rs`). A server set up
         // without a hot-reload handle still infers warm-tier and
         // takes the SimpleEngine direct path. Back-compat for
@@ -3203,21 +3169,21 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "sketch_warm");
+        assert_data_source(&body, "asap_query");
     }
 
     #[tokio::test]
     async fn http_returns_503_when_no_engines_registered() {
-        // Pin `storage_backend = GorillaS3Archive` but register no
+        // Pin `storage_backend = GorillaObjectStore` but register no
         // archive engine (only `SimpleEngine` is registered under
-        // `sketch_warm`). The router walks
-        // `compatible_storage_backends = [GorillaS3Archive]` and
+        // `asap_query`). The router walks
+        // `compatible_storage_backends = [GorillaObjectStore]` and
         // bails out with `NoEngineRegistered`, which the HTTP layer
         // surfaces as 503. Step-1 of the JSONL deprecation removed
         // the `ColdJsonlFallback` failover slot, so this is the
         // canonical "engine missing" path now.
         let server_port =
-            setup_test_server_with_empty_router(StorageBackend::GorillaS3Archive).await;
+            setup_test_server_with_empty_router(StorageBackend::GorillaObjectStore).await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -3257,14 +3223,14 @@ aggregations:
             }
             fn capabilities(&self) -> EngineCapabilities {
                 EngineCapabilities {
-                    data_source_id: StorageBackend::GorillaS3Archive.data_source_id(),
-                    storage_backend: StorageBackend::GorillaS3Archive,
+                    data_source_id: StorageBackend::GorillaObjectStore.data_source_id(),
+                    storage_backend: StorageBackend::GorillaObjectStore,
                     supports_streams_above_bytes: 1024 * 1024,
                 }
             }
         }
         let server_port = setup_test_server_with_router(
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
             vec![Arc::new(ExactStub) as Arc<dyn QueryEngine>],
         )
         .await;
@@ -3281,7 +3247,7 @@ aggregations:
         // `accuracy: ε=..., δ=..., kind=exact` summary must land on
         // the response — proving the router-path dispatch preserves
         // the engine's wire annotations.
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         let infos = body["infos"].as_array().expect("infos array");
         assert!(
             infos
@@ -3305,13 +3271,13 @@ aggregations:
         // The HTTP handler dispatches with default
         // `(Statistic::Sum, AccuracyTarget::Approximate)`, so for a
         // `DoubleWrite` metric the compatibility list is
-        // `[SketchWarmTier, GorillaS3Archive]` and the warm-tier
+        // `[SketchStore, GorillaObjectStore]` and the warm-tier
         // mock answers first. The archive must NOT be hit (no
         // failover needed when the head succeeds).
         let (warm_ok, warm_calls) =
-            MockQueryEngine::new(StorageBackend::SketchWarmTier, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::SketchStore, MockOutcome::OkEmpty);
         let (archive, archive_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::Backend);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::Backend);
         let server_port = setup_test_server_with_router(
             StorageBackend::DoubleWrite,
             vec![
@@ -3344,10 +3310,10 @@ aggregations:
     //
     // The tests above (e.g. `http_routes_archive_metric_to_gorilla_engine`)
     // mock the routing decision by pinning `streaming_cfg.storage_backend
-    // = GorillaS3Archive` directly. That proves the dispatch BRANCH is
+    // = GorillaObjectStore` directly. That proves the dispatch BRANCH is
     // wired, but not the production code path — in real deploys the
     // streaming-config YAML loader drops `storage_backend` (it always
-    // defaults to `SketchWarmTier`), so the issue-46 v2 demo's queries
+    // defaults to `SketchStore`), so the issue-46 v2 demo's queries
     // never reached the EngineRouter. The tests below exercise the
     // **production path** end-to-end: streaming config stays default,
     // a per-metric `BackendStorageRouting` table is loaded at startup
@@ -3357,28 +3323,26 @@ aggregations:
     #[tokio::test]
     async fn http_production_path_routes_archive_metric_via_routing_table() {
         // Production path: streaming-config single axis stays on
-        // `SketchWarmTier` (the YAML loader's default), but the
+        // `SketchStore` (the YAML loader's default), but the
         // per-metric routing table flips `http_requests_total` to
-        // `gorilla_archive`. The handler must extract the metric name
+        // `thanos_query`. The handler must extract the metric name
         // from the PromQL AST, look it up, and dispatch through the
-        // EngineRouter — landing the `data_source: gorilla_archive`
+        // EngineRouter — landing the `data_source: thanos_query`
         // info-line on the response.
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
             metrics,
         );
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -3395,7 +3359,7 @@ aggregations:
             resp.status(),
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -3411,14 +3375,13 @@ aggregations:
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
             metrics,
         );
-        let server_port =
-            setup_test_server_with_routing_table(routing, Vec::new()).await;
+        let server_port = setup_test_server_with_routing_table(routing, Vec::new()).await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -3435,26 +3398,24 @@ aggregations:
             resp.status(),
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "sketch_warm");
+        assert_data_source(&body, "asap_query");
     }
 
     #[tokio::test]
     async fn http_production_path_default_axis_routes_all_metrics() {
         // Routing table with no per-metric overrides but a non-default
-        // top-level `default: gorilla_s3_archive` — every metric must
+        // top-level `default: thanos_query` — every metric must
         // route through the router. Pins the §8 "all-metrics-archive"
         // deploy mode.
         let routing = crate::data_model::BackendStorageRouting::new_from_single_targets(
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
             std::collections::HashMap::new(),
         );
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -3467,7 +3428,7 @@ aggregations:
             .expect("Failed to send request");
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -3484,29 +3445,25 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_count_lands_on_archive() {
-        use crate::data_model::{
-            BackendStorageRouting, QueryShape, RoutingTarget,
-        };
+        use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
             vec![
-                RoutingTarget::always(StorageBackend::SketchWarmTier),
+                RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaS3Archive,
+                    StorageBackend::GorillaObjectStore,
                     vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
                 ),
             ],
         );
-        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
 
         let client = Client::new();
         let resp = client
@@ -3524,7 +3481,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -3534,47 +3491,40 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_quantile_stays_on_warm_tier() {
-        use crate::data_model::{
-            BackendStorageRouting, QueryShape, RoutingTarget,
-        };
+        use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
             vec![
-                RoutingTarget::always(StorageBackend::SketchWarmTier),
+                RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaS3Archive,
+                    StorageBackend::GorillaObjectStore,
                     vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
                 ),
             ],
         );
-        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
 
         // Register a Gorilla mock so a misroute would surface as a
         // failed assertion rather than a silent fall-through. The
         // mock starts with 0 calls; a quantile must NOT touch it.
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
 
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
             .query(&[
-                (
-                    "query",
-                    "quantile_over_time(0.99, http_requests_total[1m])",
-                ),
+                ("query", "quantile_over_time(0.99, http_requests_total[1m])"),
                 ("time", "1700000000"),
             ])
             .send()
             .await
             .expect("Failed to send request");
-        // Warm tier path returns 2xx with `data_source: sketch_warm`
+        // Warm tier path returns 2xx with `data_source: asap_query`
         // (the SimpleEngine returns None for this unconfigured
         // metric, but the handler still annotates the wire response
         // with the warm-tier source).
@@ -3584,7 +3534,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "sketch_warm");
+        assert_data_source(&body, "asap_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             0,
@@ -3614,7 +3564,7 @@ aggregations:
         use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
 
         // Dual-routing for `metric_warm`: quantiles → warm, count →
         // archive. Without the header the test query routes to warm.
@@ -3623,28 +3573,26 @@ aggregations:
             "metric_warm".to_string(),
             vec![
                 RoutingTarget::for_shapes(
-                    StorageBackend::SketchWarmTier,
+                    StorageBackend::SketchStore,
                     vec![QueryShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaS3Archive,
+                    StorageBackend::GorillaObjectStore,
                     vec![QueryShape::Count],
                 ),
             ],
         );
-        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
 
         let client = Client::new();
         // Ask a quantile query (default routing → warm) but override
         // to archive via the header.
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "gorilla_archive")
+            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
             .query(&[
                 ("query", "quantile_over_time(0.5, metric_warm[1m])"),
                 ("time", "1700000000"),
@@ -3658,7 +3606,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -3674,28 +3622,26 @@ aggregations:
         use crate::data_model::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
 
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "metric_warm".to_string(),
             vec![
                 RoutingTarget::for_shapes(
-                    StorageBackend::SketchWarmTier,
+                    StorageBackend::SketchStore,
                     vec![QueryShape::Quantile],
                 ),
                 RoutingTarget::for_shapes(
-                    StorageBackend::GorillaS3Archive,
+                    StorageBackend::GorillaObjectStore,
                     vec![QueryShape::Count],
                 ),
             ],
         );
-        let routing = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
-        let server_port = setup_test_server_with_routing_table(
-            routing,
-            vec![gorilla as Arc<dyn QueryEngine>],
-        )
-        .await;
+        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
 
         let client = Client::new();
         // No override → quantile shape routes to warm tier.
@@ -3710,7 +3656,7 @@ aggregations:
             .expect("Failed to send request");
         assert!(resp.status().is_success(), "default routing must still 2xx");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "sketch_warm");
+        assert_data_source(&body, "asap_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             0,
@@ -3718,15 +3664,15 @@ aggregations:
         );
     }
 
-    /// Query-param fallback: `?engine=gorilla_archive` overrides the
+    /// Query-param fallback: `?engine=thanos_query` overrides the
     /// routing table when the header is absent.
     #[tokio::test]
     async fn http_engine_override_query_param_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
 
         let server_port = setup_test_server_with_router(
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
             vec![gorilla as Arc<dyn QueryEngine>],
         )
         .await;
@@ -3737,14 +3683,14 @@ aggregations:
             .query(&[
                 ("query", "sum_over_time(foo[5m])"),
                 ("time", "1700000000"),
-                (ENGINE_OVERRIDE_QUERY_PARAM, "gorilla_archive"),
+                (ENGINE_OVERRIDE_QUERY_PARAM, "thanos_query"),
             ])
             .send()
             .await
             .expect("Failed to send request");
         assert!(resp.status().is_success(), "query-param override must 2xx");
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
             1,
@@ -3759,31 +3705,25 @@ aggregations:
     #[tokio::test]
     async fn http_engine_override_unknown_id_returns_400() {
         let server_port =
-            setup_test_server_with_router(StorageBackend::SketchWarmTier, Vec::new()).await;
+            setup_test_server_with_router(StorageBackend::SketchStore, Vec::new()).await;
 
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
             .header(ENGINE_OVERRIDE_HEADER, "does_not_exist")
-            .query(&[
-                ("query", "sum_over_time(foo[5m])"),
-                ("time", "1700000000"),
-            ])
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
             .send()
             .await
             .expect("Failed to send request");
         assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
         let body: serde_json::Value = resp.json().await.unwrap();
-        let err = body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             err.contains("does_not_exist"),
             "error must name the bad id; got {err}",
         );
         assert!(
-            err.contains("sketch_warm"),
+            err.contains("asap_query"),
             "error must list registered engines; got {err}",
         );
     }
@@ -3793,9 +3733,9 @@ aggregations:
     #[tokio::test]
     async fn http_engine_override_post_header_routes_to_named_engine() {
         let (gorilla, gorilla_calls) =
-            MockQueryEngine::new(StorageBackend::GorillaS3Archive, MockOutcome::OkEmpty);
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
         let server_port = setup_test_server_with_router(
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
             vec![gorilla as Arc<dyn QueryEngine>],
         )
         .await;
@@ -3804,7 +3744,7 @@ aggregations:
         let form_body = "query=sum_over_time(foo%5B5m%5D)&time=1700000000";
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .header(ENGINE_OVERRIDE_HEADER, "gorilla_archive")
+            .header(ENGINE_OVERRIDE_HEADER, "thanos_query")
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body)
             .send()
@@ -3816,7 +3756,7 @@ aggregations:
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -3825,14 +3765,13 @@ aggregations:
     /// Standard test wiring for the `/api/v1/storage_routing` endpoint:
     /// install an empty hot-reload routing handle, hold the handle so
     /// the test can introspect the swap result.
-    async fn setup_test_server_for_storage_routing() -> (u16, crate::routing::HotReloadBackendStorageRouting) {
+    async fn setup_test_server_for_storage_routing(
+    ) -> (u16, crate::routing::HotReloadBackendStorageRouting) {
         use crate::data_model::{HotReloadStreamingConfig, StreamingConfig};
         use crate::routing::HotReloadBackendStorageRouting;
 
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -3866,14 +3805,14 @@ aggregations:
 
     fn fixture_routing_json() -> serde_json::Value {
         serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [
                 {
                     "name": "http_requests_total",
                     "targets": [
-                        { "engine": "sketch_warm_tier" },
+                        { "engine": "asap_query" },
                         {
-                            "engine": "thanos_archive",
+                            "engine": "thanos_query",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "absent",
                                 "rate_post_hoc", "count"
@@ -3900,7 +3839,11 @@ aggregations:
             .await
             .expect("send ok");
 
-        assert!(resp.status().is_success(), "swap must 2xx; got {}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "swap must 2xx; got {}",
+            resp.status()
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
         assert_eq!(body["metrics_count"], 1);
@@ -3932,7 +3875,7 @@ aggregations:
 
         // Valid JSON but invalid schema (unknown engine).
         let bad = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [{
                 "name": "x",
                 "targets": [{ "engine": "not_a_real_engine" }]
@@ -3960,10 +3903,9 @@ aggregations:
     async fn storage_routing_get_returns_current_snapshot() {
         let (port, handle) = setup_test_server_for_storage_routing().await;
         // Pre-load the table.
-        let new = crate::data_model::BackendStorageRouting::from_json_payload(
-            &fixture_routing_json(),
-        )
-        .expect("parse");
+        let new =
+            crate::data_model::BackendStorageRouting::from_json_payload(&fixture_routing_json())
+                .expect("parse");
         handle.swap(new);
 
         let client = Client::new();
@@ -3975,7 +3917,7 @@ aggregations:
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        assert_eq!(body["default_engine"], "sketch_warm");
+        assert_eq!(body["default_engine"], "asap_query");
         assert_eq!(body["metrics_count"], 1);
         let snap_hash = body["table_hash"].as_str().unwrap();
         let live_hash = crate::routing::routing_table_hash(handle.snapshot().as_ref());
@@ -4132,74 +4074,58 @@ aggregations:
         // the very next read.
         let snap = handle.snapshot();
         assert_eq!(
-            snap.lookup_with_shape(
-                "http_requests_total",
-                crate::data_model::QueryShape::Count,
-            ),
-            StorageBackend::GorillaS3Archive,
+            snap.lookup_with_shape("http_requests_total", crate::data_model::QueryShape::Count,),
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             snap.lookup_with_shape(
                 "http_requests_total",
                 crate::data_model::QueryShape::Quantile,
             ),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
     }
 
     // ── Step 2.3: Path A2 thanos forwarder integration tests ────────────────
     //
     // Pin the full HTTP path: backend receives PromQL → routes to
-    // `gorilla_archive` (via the alias) → forwards to a mock
+    // `thanos_query` (via the alias) → forwards to a mock
     // `thanos-query` sidecar → returns wrapped Prometheus response.
     //
     // The mock thanos sidecar is a tiny in-process axum server bound
     // to an ephemeral 127.0.0.1 port; the real wire path runs end-to-
     // end (reqwest serialises the form, axum parses it, the mock
     // returns canned JSON, the engine parses it back, the HTTP
-    // handler annotates `data_source: thanos_archive` on the wire
+    // handler annotates `data_source: thanos_query` on the wire
     // response).
 
     #[tokio::test]
     async fn http_archive_metric_forwards_to_thanos_query() {
-        use crate::engines::gorilla::thanos_forward::test_support::{
+        use crate::engines::thanos_query::forward::test_support::{
             spawn_mock_thanos, CANNED_VECTOR_BODY,
         };
-        use crate::engines::gorilla::{
-            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
-        };
+        use crate::engines::thanos_query::{ThanosQueryConfig, ThanosQueryEngine};
 
         let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
-        let cfg = ThanosForwardConfig {
+        let cfg = ThanosQueryConfig {
             base_url: mock_url,
             request_timeout: std::time::Duration::from_secs(5),
         };
-        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
-        // Mirror the binary's Step-2.3 wiring: register under both
-        // ids so the failover sequence finds the engine via
-        // `gorilla_archive` and explicit overrides reach it via
-        // `thanos_archive`.
-        let server_port = setup_test_server_with_router_aliased(
-            StorageBackend::GorillaS3Archive,
-            vec![
-                (DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine.clone()),
-                (
-                    StorageBackend::GorillaS3Archive.data_source_id(),
-                    arc_engine,
-                ),
-            ],
+        // Mirror the binary's Step-2.3 wiring: register once under
+        // the engine's canonical `thanos_query` id.
+        let server_port = setup_test_server_with_named_router(
+            StorageBackend::GorillaObjectStore,
+            vec![arc_engine],
         )
         .await;
 
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
-            .query(&[
-                ("query", "up"),
-                ("time", "1700000000"),
-            ])
+            .query(&[("query", "up"), ("time", "1700000000")])
             .send()
             .await
             .expect("Failed to send request");
@@ -4211,41 +4137,33 @@ aggregations:
         let body: serde_json::Value = resp.json().await.unwrap();
         // The failover-dispatch path annotates `data_source:
         // <metric_storage>.data_source_id()`, which for an
-        // archive-pinned metric is `gorilla_archive`. Path A2
+        // archive-pinned metric is `thanos_query`. Path A2
         // re-uses the archive tier slot in the routing matrix —
         // the wire `data_source` reflects the *tier* (archive),
         // not which engine implementation answered. The explicit
-        // `X-ASAP-Engine: thanos_archive` override path (covered
-        // by `http_engine_override_can_target_thanos_archive_id`)
-        // is the route that pins `data_source: thanos_archive`
+        // `X-ASAP-Engine: thanos_query` override path (covered
+        // by `http_engine_override_can_target_thanos_query_id`)
+        // is the route that pins `data_source: thanos_query`
         // on the wire.
-        assert_data_source(&body, "gorilla_archive");
+        assert_data_source(&body, "thanos_query");
     }
 
     #[tokio::test]
     async fn http_thanos_unreachable_returns_503_with_quirk() {
-        use crate::engines::gorilla::thanos_forward::test_support::spawn_mock_thanos_503;
-        use crate::engines::gorilla::{
-            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
-        };
+        use crate::engines::thanos_query::forward::test_support::spawn_mock_thanos_503;
+        use crate::engines::thanos_query::{ThanosQueryConfig, ThanosQueryEngine};
 
         let (mock_url, _mock_handle) = spawn_mock_thanos_503().await;
-        let cfg = ThanosForwardConfig {
+        let cfg = ThanosQueryConfig {
             base_url: mock_url,
             request_timeout: std::time::Duration::from_secs(2),
         };
-        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
-        let server_port = setup_test_server_with_router_aliased(
-            StorageBackend::GorillaS3Archive,
-            vec![
-                (DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine.clone()),
-                (
-                    StorageBackend::GorillaS3Archive.data_source_id(),
-                    arc_engine,
-                ),
-            ],
+        let server_port = setup_test_server_with_named_router(
+            StorageBackend::GorillaObjectStore,
+            vec![arc_engine],
         )
         .await;
 
@@ -4276,61 +4194,55 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_engine_override_can_target_thanos_archive_id() {
-        // X-ASAP-Engine: thanos_archive must reach the forwarder
+    async fn http_engine_override_can_target_thanos_query_id() {
+        // X-ASAP-Engine: thanos_query must reach the forwarder
         // even when the metric's storage axis would otherwise route
         // to the warm tier. Path A2's accuracy reducer relies on
         // this for apples-to-apples comparison runs.
-        use crate::engines::gorilla::thanos_forward::test_support::{
+        use crate::engines::thanos_query::forward::test_support::{
             spawn_mock_thanos, CANNED_VECTOR_BODY,
         };
-        use crate::engines::gorilla::{
-            ThanosForwardConfig, ThanosForwardEngine, DATA_SOURCE_THANOS_ARCHIVE_ID,
+        use crate::engines::thanos_query::{
+            ThanosQueryConfig, ThanosQueryEngine, DATA_SOURCE_THANOS_QUERY_ID,
         };
 
         let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
-        let cfg = ThanosForwardConfig {
+        let cfg = ThanosQueryConfig {
             base_url: mock_url,
             request_timeout: std::time::Duration::from_secs(5),
         };
-        let engine = ThanosForwardEngine::new(cfg).expect("engine");
+        let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
-        let server_port = setup_test_server_with_router_aliased(
-            StorageBackend::SketchWarmTier, // Default storage axis is warm tier.
-            vec![(DATA_SOURCE_THANOS_ARCHIVE_ID, arc_engine)],
+        let server_port = setup_test_server_with_named_router(
+            StorageBackend::SketchStore, // Default storage axis is warm tier.
+            vec![arc_engine],
         )
         .await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
             .query(&[("query", "up"), ("time", "1700000000")])
-            .header(ENGINE_OVERRIDE_HEADER, DATA_SOURCE_THANOS_ARCHIVE_ID)
+            .header(ENGINE_OVERRIDE_HEADER, DATA_SOURCE_THANOS_QUERY_ID)
             .send()
             .await
             .expect("Failed to send request");
         assert!(
             resp.status().is_success(),
-            "X-ASAP-Engine: thanos_archive must reach the forwarder; got {}",
+            "X-ASAP-Engine: thanos_query must reach the forwarder; got {}",
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_data_source(&body, "thanos_archive");
+        assert_data_source(&body, "thanos_query");
     }
 
-    /// Build an `HttpServer` whose router holds the supplied set of
-    /// `(alias_id, engine)` pairs. Mirrors `setup_test_server_with_router`
-    /// but uses [`HttpServer::with_query_engine_aliased`] so a single
-    /// engine instance can register under multiple ids — the Step-2.3
-    /// pattern Path A2 relies on.
-    async fn setup_test_server_with_router_aliased(
+    /// Build an `HttpServer` whose router holds the supplied engines.
+    async fn setup_test_server_with_named_router(
         metric_storage_backend: StorageBackend,
-        aliased_engines: Vec<(&'static str, Arc<dyn QueryEngine>)>,
+        engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -4355,10 +4267,10 @@ aggregations:
             15000,
             crate::data_model::QueryLanguage::promql,
         ));
-        let mut server = HttpServer::new(config, query_engine, store)
-            .with_hot_reload_config(hot_reload);
-        for (id, engine) in aliased_engines {
-            server = server.with_query_engine_aliased(id, engine);
+        let mut server =
+            HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
+        for engine in engines {
+            server = server.with_query_engine(engine);
         }
         server
             .start_test_server()
@@ -4386,14 +4298,10 @@ aggregations:
     /// hitting `/api/v1/query`. The router holds no cold-archive
     /// engine; the freshness probe short-circuit must answer
     /// without ever consulting the cold tier.
-    async fn setup_test_server_with_probe_cache() -> (
-        u16,
-        Arc<crate::routing::FreshnessProbeCache>,
-    ) {
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+    async fn setup_test_server_with_probe_cache() -> (u16, Arc<crate::routing::FreshnessProbeCache>)
+    {
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -4416,8 +4324,7 @@ aggregations:
             crate::data_model::QueryLanguage::promql,
         ));
         let cache = Arc::new(crate::routing::FreshnessProbeCache::new());
-        let server = HttpServer::new(config, query_engine, store)
-            .with_probe_cache(cache.clone());
+        let server = HttpServer::new(config, query_engine, store).with_probe_cache(cache.clone());
         let port = server
             .start_test_server()
             .await
@@ -4479,7 +4386,7 @@ aggregations:
         // Sample is older than the lookback window — the cache lookup
         // returns None and the handler falls through to the normal
         // routing path. The default routing landed on
-        // `SketchWarmTier`, which the test's empty `SimpleEngine`
+        // `SketchStore`, which the test's empty `SimpleEngine`
         // can't answer, so the response is a structured error or an
         // empty-result success — anything but a crash. The test
         // pins the no-crash contract; the exact error surface is
@@ -4518,10 +4425,9 @@ aggregations:
 
         // Different range — millis are extracted from the matrix
         // selector, not hard-coded.
-        let parsed = super::parse_last_over_time_probe(
-            "last_over_time(http_freshness_probe_archive[5m])",
-        )
-        .expect("5m range must parse");
+        let parsed =
+            super::parse_last_over_time_probe("last_over_time(http_freshness_probe_archive[5m])")
+                .expect("5m range must parse");
         assert_eq!(parsed.1, 5 * 60_000);
     }
 
@@ -4539,10 +4445,7 @@ aggregations:
         );
         // Wrong arg count for last_over_time (which takes one matrix
         // selector).
-        assert_eq!(
-            super::parse_last_over_time_probe("last_over_time()"),
-            None,
-        );
+        assert_eq!(super::parse_last_over_time_probe("last_over_time()"), None,);
         // Aggregation around the call — outermost shape isn't a
         // bare `last_over_time` call.
         assert_eq!(
@@ -4593,11 +4496,7 @@ aggregations:
     /// second call.
     #[tokio::test]
     async fn http_precompute_jobs_register_then_delete_roundtrip() {
-        let port = setup_test_server_with_router(
-            StorageBackend::SketchWarmTier,
-            Vec::new(),
-        )
-        .await;
+        let port = setup_test_server_with_router(StorageBackend::SketchStore, Vec::new()).await;
         let client = Client::new();
 
         let body = serde_json::json!({
@@ -4650,11 +4549,7 @@ aggregations:
     /// `DELETE /api/v1/precompute/jobs/{unknown}` returns 404.
     #[tokio::test]
     async fn http_precompute_jobs_delete_unknown_id_returns_404() {
-        let port = setup_test_server_with_router(
-            StorageBackend::SketchWarmTier,
-            Vec::new(),
-        )
-        .await;
+        let port = setup_test_server_with_router(StorageBackend::SketchStore, Vec::new()).await;
         let client = Client::new();
         let resp = client
             .delete(format!(

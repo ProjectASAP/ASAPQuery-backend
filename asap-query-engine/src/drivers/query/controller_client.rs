@@ -334,5 +334,4 @@ mod tests {
         assert_eq!(payload["statistics"], serde_json::json!(["Sum"]));
         assert_eq!(payload["data_range_ms"], 60_000);
     }
-
 }

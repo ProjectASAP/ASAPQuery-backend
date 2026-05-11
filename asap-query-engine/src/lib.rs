@@ -24,7 +24,7 @@ pub use precompute_operators::{
 
 pub use stores::{SimpleMapStore, Store, StoreResult};
 
-pub use engines::{InstantVector, QueryResult, SimpleEngine};
+pub use engines::{ASAPQueryEngine, InstantVector, QueryResult, SimpleEngine};
 
 pub use drivers::{
     HttpServer, HttpServerConfig, KafkaConsumer, KafkaConsumerConfig, OtlpReceiver,

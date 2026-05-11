@@ -34,16 +34,20 @@ pub fn decode_cms_from_proto(buffer: &[u8]) -> Result<CountMinSketch, String> {
         Ok(env) => match env.sketch_state {
             Some(sketch_envelope::SketchState::CountMin(st)) => st,
             Some(_) => return Err("SketchEnvelope contains non-CountMin sketch".to_string()),
-            None => CountMinState::decode(buffer)
-                .map_err(|e| format!("decode CountMinState: {e}"))?,
+            None => {
+                CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?
+            }
         },
-        Err(_) => CountMinState::decode(buffer)
-            .map_err(|e| format!("decode CountMinState: {e}"))?,
+        Err(_) => {
+            CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?
+        }
     };
     let rows = state.rows as usize;
     let cols = state.cols as usize;
     if rows == 0 || cols == 0 {
-        return Err(format!("CountMinState has zero dims (rows={rows}, cols={cols})"));
+        return Err(format!(
+            "CountMinState has zero dims (rows={rows}, cols={cols})"
+        ));
     }
     let expected_len = rows * cols;
     let counter_type = CounterType::try_from(state.counter_type)
@@ -103,23 +107,28 @@ pub fn decode_cs_from_proto(buffer: &[u8]) -> Result<CountSketch, String> {
     let state = match SketchEnvelope::decode(buffer) {
         Ok(env) => match env.sketch_state {
             Some(sketch_envelope::SketchState::CountSketch(st)) => st,
-            Some(_) => {
-                return Err("SketchEnvelope contains non-CountSketch sketch".to_string())
-            }
+            Some(_) => return Err("SketchEnvelope contains non-CountSketch sketch".to_string()),
             None => CountSketchState::decode(buffer)
                 .map_err(|e| format!("decode CountSketchState: {e}"))?,
         },
-        Err(_) => CountSketchState::decode(buffer)
-            .map_err(|e| format!("decode CountSketchState: {e}"))?,
+        Err(_) => {
+            CountSketchState::decode(buffer).map_err(|e| format!("decode CountSketchState: {e}"))?
+        }
     };
     let rows = state.rows as usize;
     let cols = state.cols as usize;
     if rows == 0 || cols == 0 {
-        return Err(format!("CountSketchState has zero dims (rows={rows}, cols={cols})"));
+        return Err(format!(
+            "CountSketchState has zero dims (rows={rows}, cols={cols})"
+        ));
     }
     let expected_len = rows * cols;
-    let counter_type = CounterType::try_from(state.counter_type)
-        .map_err(|_| format!("CountSketchState unknown counter_type {}", state.counter_type))?;
+    let counter_type = CounterType::try_from(state.counter_type).map_err(|_| {
+        format!(
+            "CountSketchState unknown counter_type {}",
+            state.counter_type
+        )
+    })?;
     let flat: Vec<f64> = match counter_type {
         CounterType::Int32 | CounterType::Int64 => {
             if state.counts_int.len() != expected_len {
@@ -166,9 +175,7 @@ pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
 /// marked the sid as CmsWithHeap (heap embedded in the
 /// `CountMinSketchWithHeapSerialized` outer wrapper). Mirrors
 /// `precompute_operators::count_min_sketch_with_heap_accumulator::deserialize_from_bytes_arroyo`.
-pub fn decode_cms_with_heap_from_msgpack(
-    buffer: &[u8],
-) -> Result<CountMinSketchWithHeap, String> {
+pub fn decode_cms_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountMinSketchWithHeap, String> {
     CountMinSketchWithHeap::deserialize_msgpack(buffer)
         .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))
 }

@@ -303,7 +303,11 @@ impl<P> SealedEpoch<P> {
         // were replaced with zeroed memory; their drop should not run).
         std::mem::forget(m.payloads_col);
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        Self { entries, min_start, max_end }
+        Self {
+            entries,
+            min_start,
+            max_end,
+        }
     }
 
     pub fn min_start(&self) -> Option<u64> {
@@ -417,12 +421,7 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
         // Drop oldest sealed if we exceed `max_epochs`.
         while self.sealed_epochs.len() + 1 > self.max_epochs {
             // BTreeMap::pop_first is stable in 1.66+
-            if let Some((id, _)) = self
-                .sealed_epochs
-                .iter()
-                .next()
-                .map(|(k, _)| (*k, ()))
-            {
+            if let Some((id, _)) = self.sealed_epochs.iter().next().map(|(k, _)| (*k, ())) {
                 self.sealed_epochs.remove(&id);
             } else {
                 break;

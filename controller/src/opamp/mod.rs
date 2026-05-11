@@ -34,16 +34,16 @@ pub mod opamp_proto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteConfig {
     pub config_hash: String,
-    pub yaml:        String,
+    pub yaml: String,
 }
 
 /// Status report sent back from an agent after applying a config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStatus {
-    pub agent_id:    String,
+    pub agent_id: String,
     pub config_hash: String,
-    pub healthy:     bool,
-    pub error:       Option<String>,
+    pub healthy: bool,
+    pub error: Option<String>,
 }
 
 // ── Role ──────────────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ impl AgentRole {
         match value.trim().to_lowercase().as_str() {
             "backend" => AgentRole::Backend,
             "gateway" => AgentRole::Gateway,
-            _         => AgentRole::Agent,
+            _ => AgentRole::Agent,
         }
     }
 }
@@ -81,20 +81,20 @@ impl AgentRole {
 
 type AgentMap = HashMap<String, (mpsc::Sender<RemoteConfig>, AgentRole)>;
 
-pub type OnConnectFn    = Arc<dyn Fn(String, AgentRole) + Send + Sync>;
-pub type OnDisconnectFn = Arc<dyn Fn(String)            + Send + Sync>;
+pub type OnConnectFn = Arc<dyn Fn(String, AgentRole) + Send + Sync>;
+pub type OnDisconnectFn = Arc<dyn Fn(String) + Send + Sync>;
 
 pub struct OpampServer {
-    agents:        Arc<RwLock<AgentMap>>,
-    on_connect:    Option<OnConnectFn>,
+    agents: Arc<RwLock<AgentMap>>,
+    on_connect: Option<OnConnectFn>,
     on_disconnect: Option<OnDisconnectFn>,
 }
 
 impl Default for OpampServer {
     fn default() -> Self {
         Self {
-            agents:        Arc::new(RwLock::new(HashMap::new())),
-            on_connect:    None,
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            on_connect: None,
             on_disconnect: None,
         }
     }
@@ -103,18 +103,23 @@ impl Default for OpampServer {
 impl Clone for OpampServer {
     fn clone(&self) -> Self {
         Self {
-            agents:        Arc::clone(&self.agents),
-            on_connect:    self.on_connect.clone(),
+            agents: Arc::clone(&self.agents),
+            on_connect: self.on_connect.clone(),
             on_disconnect: self.on_disconnect.clone(),
         }
     }
 }
 
 impl OpampServer {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Register a callback invoked when an agent connects.
-    pub fn with_on_connect(mut self, f: impl Fn(String, AgentRole) + Send + Sync + 'static) -> Self {
+    pub fn with_on_connect(
+        mut self,
+        f: impl Fn(String, AgentRole) + Send + Sync + 'static,
+    ) -> Self {
         self.on_connect = Some(Arc::new(f));
         self
     }
@@ -129,7 +134,7 @@ impl OpampServer {
     /// Agents must include `X-Agent-ID: <id>` in the upgrade request.
     /// Optional `X-Agent-Role: agent|backend` (default: `agent`).
     pub async fn ws_handler(
-        ws:      WebSocketUpgrade,
+        ws: WebSocketUpgrade,
         headers: HeaderMap,
         State(srv): State<Arc<OpampServer>>,
     ) -> impl IntoResponse {
@@ -165,17 +170,24 @@ impl OpampServer {
     /// Broadcasts a config to every connected agent regardless of role.
     pub async fn push_all(&self, cfg: RemoteConfig) {
         let ids: Vec<String> = self.agents.read().await.keys().cloned().collect();
-        for id in ids { self.push(&id, cfg.clone()).await; }
+        for id in ids {
+            self.push(&id, cfg.clone()).await;
+        }
     }
 
     /// Broadcasts a config only to agents matching the given role.
     pub async fn push_to_role(&self, role: AgentRole, cfg: RemoteConfig) {
-        let ids: Vec<String> = self.agents.read().await
+        let ids: Vec<String> = self
+            .agents
+            .read()
+            .await
             .iter()
             .filter(|(_, (_, r))| *r == role)
             .map(|(id, _)| id.clone())
             .collect();
-        for id in ids { self.push(&id, cfg.clone()).await; }
+        for id in ids {
+            self.push(&id, cfg.clone()).await;
+        }
     }
 
     /// Returns the IDs of currently connected agents (all roles).
@@ -185,16 +197,26 @@ impl OpampServer {
 
     /// Returns a map of agent_id → role for all connected agents.
     pub async fn connected_agents_with_roles(&self) -> HashMap<String, AgentRole> {
-        self.agents.read().await
+        self.agents
+            .read()
+            .await
             .iter()
             .map(|(id, (_, role))| (id.clone(), role.clone()))
             .collect()
     }
 }
 
-async fn handle_socket(socket: WebSocket, agent_id: String, role: AgentRole, srv: Arc<OpampServer>) {
+async fn handle_socket(
+    socket: WebSocket,
+    agent_id: String,
+    role: AgentRole,
+    srv: Arc<OpampServer>,
+) {
     let (tx, mut rx) = mpsc::channel::<RemoteConfig>(16);
-    srv.agents.write().await.insert(agent_id.clone(), (tx, role.clone()));
+    srv.agents
+        .write()
+        .await
+        .insert(agent_id.clone(), (tx, role.clone()));
     info!(agent = %agent_id, ?role, "agent connected");
 
     if let Some(cb) = &srv.on_connect {
@@ -226,7 +248,9 @@ async fn handle_socket(socket: WebSocket, agent_id: String, role: AgentRole, srv
             let mut buf = Vec::with_capacity(1 + payload.len());
             buf.push(0u8);
             buf.extend_from_slice(&payload);
-            if ws_tx.send(Message::Binary(buf.into())).await.is_err() { break; }
+            if ws_tx.send(Message::Binary(buf.into())).await.is_err() {
+                break;
+            }
             info!(agent = %writer_id, hash = %cfg.config_hash, "config pushed (OpAMP protobuf)");
         }
     });
@@ -273,7 +297,7 @@ async fn handle_socket(socket: WebSocket, agent_id: String, role: AgentRole, srv
                             if let Some(cm) = &ec.config_map {
                                 for (name, file) in &cm.config_map {
                                     let body_preview = String::from_utf8_lossy(
-                                        &file.body[..file.body.len().min(160)]
+                                        &file.body[..file.body.len().min(160)],
                                     );
                                     info!(
                                         agent = %agent_id,
@@ -334,12 +358,16 @@ async fn handle_socket(socket: WebSocket, agent_id: String, role: AgentRole, srv
                             info!(agent = %agent_id, healthy = health.healthy, "agent health");
                         }
                     }
-                    Err(e) => warn!(agent = %agent_id, error = %e, "failed to decode AgentToServer"),
+                    Err(e) => {
+                        warn!(agent = %agent_id, error = %e, "failed to decode AgentToServer")
+                    }
                 }
             }
             // Also accept JSON for backward compatibility.
             Message::Text(text) => match serde_json::from_str::<AgentStatus>(&text) {
-                Ok(s) => info!(agent = %s.agent_id, healthy = s.healthy, "agent status (legacy JSON)"),
+                Ok(s) => {
+                    info!(agent = %s.agent_id, healthy = s.healthy, "agent status (legacy JSON)")
+                }
                 Err(_) => warn!(agent = %agent_id, "unexpected text message"),
             },
             Message::Close(_) => break,
@@ -430,15 +458,21 @@ fn encode_remote_config(cfg: &RemoteConfig) -> opamp_proto::ServerToAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::get};
+    use axum::{routing::get, Router};
     use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn no_agents_push_returns_false() {
         let srv = Arc::new(OpampServer::new());
-        let sent = srv.push("unknown", RemoteConfig {
-            config_hash: "h".into(), yaml: "y".into()
-        }).await;
+        let sent = srv
+            .push(
+                "unknown",
+                RemoteConfig {
+                    config_hash: "h".into(),
+                    yaml: "y".into(),
+                },
+            )
+            .await;
         assert!(!sent);
     }
 
@@ -451,8 +485,8 @@ mod tests {
     #[test]
     fn role_from_header() {
         assert_eq!(AgentRole::from_header("backend"), AgentRole::Backend);
-        assert_eq!(AgentRole::from_header("agent"),   AgentRole::Agent);
-        assert_eq!(AgentRole::from_header(""),        AgentRole::Agent);
+        assert_eq!(AgentRole::from_header("agent"), AgentRole::Agent);
+        assert_eq!(AgentRole::from_header(""), AgentRole::Agent);
         assert_eq!(AgentRole::from_header("BACKEND"), AgentRole::Backend);
     }
 
@@ -552,10 +586,14 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let yaml_payload = "ddsketch:\n  mode: window\n";
-        srv.push_to_role(AgentRole::Agent, RemoteConfig {
-            config_hash: "hash-1".into(),
-            yaml: yaml_payload.to_string(),
-        }).await;
+        srv.push_to_role(
+            AgentRole::Agent,
+            RemoteConfig {
+                config_hash: "hash-1".into(),
+                yaml: yaml_payload.to_string(),
+            },
+        )
+        .await;
 
         let msg = tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -571,10 +609,17 @@ mod tests {
         let sta = decode_server_to_agent_frame(data.as_ref());
         let rc = sta.remote_config.expect("should have remote_config");
         let config = rc.config.expect("should have config");
-        let file = config.config_map.get("").expect("should have empty-key entry");
+        let file = config
+            .config_map
+            .get("")
+            .expect("should have empty-key entry");
         let yaml = String::from_utf8(file.body.clone()).unwrap();
         assert_eq!(yaml, yaml_payload, "delivered yaml must match");
-        assert_eq!(String::from_utf8(rc.config_hash).unwrap(), "hash-1", "delivered hash must match");
+        assert_eq!(
+            String::from_utf8(rc.config_hash).unwrap(),
+            "hash-1",
+            "delivered hash must match"
+        );
     }
 
     /// Phase C integration test: gateway YAML emitted from the typed L5
@@ -588,7 +633,7 @@ mod tests {
     async fn push_to_role_gateway_routes_only_to_gateway_role() {
         use futures_util::StreamExt;
         let (srv, addr) = start_server().await;
-        let mut agent_ws   = connect_ws_client(addr, "agent-1",   "agent").await;
+        let mut agent_ws = connect_ws_client(addr, "agent-1", "agent").await;
         let mut gateway_ws = connect_ws_client(addr, "gateway-1", "gateway").await;
         let mut backend_ws = connect_ws_client(addr, "backend-1", "backend").await;
 
@@ -599,36 +644,33 @@ mod tests {
         // We use a stand-in YAML payload here; the emitter has its own
         // tests in stage_config.rs.
         let yaml = "extensions:\n  opamp: {}\n".to_string();
-        srv.push_to_role(AgentRole::Gateway, RemoteConfig {
-            config_hash: "hash-gw".into(),
-            yaml,
-        }).await;
+        srv.push_to_role(
+            AgentRole::Gateway,
+            RemoteConfig {
+                config_hash: "hash-gw".into(),
+                yaml,
+            },
+        )
+        .await;
 
         // Gateway must receive exactly one frame.
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            gateway_ws.next(),
-        )
-        .await
-        .expect("gateway timed out")
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), gateway_ws.next())
+            .await
+            .expect("gateway timed out")
+            .unwrap()
+            .unwrap();
         let bytes = msg.into_data();
         assert!(!bytes.is_empty(), "gateway must receive a non-empty frame");
 
         // Other roles must receive nothing within a short window.
-        let agent_result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            agent_ws.next(),
-        ).await;
+        let agent_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), agent_ws.next()).await;
         assert!(
             agent_result.is_err(),
             "agent-role client must not receive gateway-role push"
         );
-        let backend_result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            backend_ws.next(),
-        ).await;
+        let backend_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), backend_ws.next()).await;
         assert!(
             backend_result.is_err(),
             "backend-role client must not receive gateway-role push"
@@ -640,36 +682,34 @@ mod tests {
     async fn push_to_agent_role_does_not_reach_backend_role() {
         use futures_util::StreamExt;
         let (srv, addr) = start_server().await;
-        let mut agent_ws   = connect_ws_client(addr, "agent-1",   "agent").await;
+        let mut agent_ws = connect_ws_client(addr, "agent-1", "agent").await;
         let mut backend_ws = connect_ws_client(addr, "backend-1", "backend").await;
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        srv.push_to_role(AgentRole::Agent, RemoteConfig {
-            config_hash: "hash-agent".into(),
-            yaml: "ddsketch:\n  mode: batch\n".to_string(),
-        }).await;
+        srv.push_to_role(
+            AgentRole::Agent,
+            RemoteConfig {
+                config_hash: "hash-agent".into(),
+                yaml: "ddsketch:\n  mode: batch\n".to_string(),
+            },
+        )
+        .await;
 
         // Agent must receive the message.
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            agent_ws.next(),
-        )
-        .await
-        .expect("agent timed out")
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), agent_ws.next())
+            .await
+            .expect("agent timed out")
+            .unwrap()
+            .unwrap();
         let data = msg.into_data();
         let sta = decode_server_to_agent_frame(data.as_ref());
         let rc = sta.remote_config.expect("should have remote_config");
         assert_eq!(String::from_utf8(rc.config_hash).unwrap(), "hash-agent");
 
         // Backend must receive nothing within a short window.
-        let backend_result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            backend_ws.next(),
-        )
-        .await;
+        let backend_result =
+            tokio::time::timeout(std::time::Duration::from_millis(200), backend_ws.next()).await;
         assert!(
             backend_result.is_err(),
             "backend-role client must not receive agent-role push"

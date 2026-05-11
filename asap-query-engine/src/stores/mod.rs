@@ -17,6 +17,7 @@
 //! at the `stores` top level.
 
 pub mod promsketch_store;
+pub mod gorilla_object_store;
 pub mod sketch_db;
 pub mod traits;
 
@@ -27,3 +28,8 @@ pub use sketch_db::sketch_index::{
 };
 pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry, SimpleMapStore};
 pub use traits::*;
+pub use gorilla_object_store::{
+    global_s3_cost_counters, ChunkRef, GorillaEngineConfig, GorillaQueryEngine, GorillaS3Config,
+    GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample, S3CostCounters, S3CostSnapshot,
+    S3CostTrackingObjectStore,
+};
