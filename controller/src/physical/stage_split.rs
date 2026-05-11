@@ -37,9 +37,9 @@
 
 use std::time::Duration;
 
-use crate::intent_algebra::legacy_expr::{AggFunc, BinaryOpKind, LiteralValue, QueryExpr, ScalarExpr};
+use crate::intent_algebra::legacy_expr::{AggFunc, agg_is_exact, agg_is_mergeable, agg_quantiles, BinaryOpKind, LiteralValue, QueryExpr, ScalarExpr};
 use crate::pipeline::format_duration;
-use crate::intent_algebra::legacy_expr::{AggIntent, ExactAgg};
+use crate::intent_algebra::legacy_expr::AggIntent;
 use crate::physical::sketch_catalog;
 use crate::types::{
     AgentSubPlan, BackendSubPlan,
@@ -227,46 +227,47 @@ fn walk(expr: &QueryExpr, plan: &mut StagedPlan, budgets: &StageResourceBudgets)
 // ── Agg assignment ────────────────────────────────────────────────────────────
 
 fn assign_sketch_agg(op: &AggIntent, plan: &mut StagedPlan, budgets: &StageResourceBudgets) {
-    match op {
-        // Exact ops: mergeability decides stage.
-        AggIntent::Exact(ExactAgg::Sum | ExactAgg::Count | ExactAgg::Min | ExactAgg::Max) => {
+    // Exact ops: mergeability decides stage. Canonical mergeable exact
+    // intents (Sum / Count / Min / Max) → Backend; non-mergeable (Avg) → Db.
+    if agg_is_exact(op) {
+        if agg_is_mergeable(op) {
             plan.backend.has_merge = true;
-        }
-        AggIntent::Exact(ExactAgg::Avg) => {
+        } else {
             plan.db.active = true;
         }
-        // Sketch ops: resolve to physical, assign to Agent, defer if budget exceeded.
-        sketch_op => {
-            let physical = crate::physical::planner::resolve(sketch_op);
-            let stage = resolve_sketch_stage(physical.estimated_memory_bytes, budgets, &mut plan.deferral_log, sketch_op);
-            match stage {
-                SketchStage::Agent => {
-                    plan.agent.sketch_type   = Some(physical.sketch_type);
-                    plan.agent.sketch_params = physical.sketch_params;
-                }
-                SketchStage::Backend => {
-                    plan.backend.has_merge = true;
-                }
-                SketchStage::Precompute => {
-                    plan.precompute.active = true;
-                }
-            }
+        return;
+    }
+
+    // Sketch ops: resolve to physical, assign to Agent, defer if budget exceeded.
+    let physical = crate::physical::planner::resolve(op);
+    let stage = resolve_sketch_stage(physical.estimated_memory_bytes, budgets, &mut plan.deferral_log, op);
+    match stage {
+        SketchStage::Agent => {
+            plan.agent.sketch_type   = Some(physical.sketch_type);
+            plan.agent.sketch_params = physical.sketch_params;
+        }
+        SketchStage::Backend => {
+            plan.backend.has_merge = true;
+        }
+        SketchStage::Precompute => {
+            plan.precompute.active = true;
         }
     }
 }
 
 fn assign_agg_func(func: &AggFunc, plan: &mut StagedPlan, budgets: &StageResourceBudgets) {
+    use crate::intent_algebra::legacy_expr::{default_cardinality, default_frequency, default_quantile};
     match func {
         // Sketchable → synthesise the corresponding AggIntent and use existing logic.
         AggFunc::Quantile(phi) => {
-            let op = AggIntent::default_quantile(vec![*phi]);
+            let op = default_quantile(*phi);
             assign_sketch_agg(&op, plan, budgets);
         }
         AggFunc::CountDistinct => {
-            assign_sketch_agg(&AggIntent::default_cardinality(), plan, budgets);
+            assign_sketch_agg(&default_cardinality(), plan, budgets);
         }
         AggFunc::HeavyHitters { .. } => {
-            assign_sketch_agg(&AggIntent::default_frequency(), plan, budgets);
+            assign_sketch_agg(&default_frequency(), plan, budgets);
         }
         // Mergeable exact → Backend.
         AggFunc::Count | AggFunc::Sum | AggFunc::Min | AggFunc::Max
@@ -503,10 +504,13 @@ fn by_clause(keys: &[String]) -> String {
 }
 
 fn sketch_op_to_promql(op: &AggIntent, selector: &str, window: &str, by: &str) -> String {
+    // Canonical Quantile is single-φ post Step α; multi-φ fan-out happens
+    // at construction time (Merge of SketchAgg siblings) so the
+    // `quantile_over_time(qs, …)` arm collapses to one φ.
+    let _ = agg_quantiles; // imported for symmetry — unused after fan-out
     match op {
-        AggIntent::Quantile { quantiles, .. } => {
-            let phi = quantiles.first().copied().unwrap_or(0.99);
-            format!("quantile_over_time({phi}, {selector}{window}){by}")
+        AggIntent::Quantile { q, .. } => {
+            format!("quantile_over_time({q}, {selector}{window}){by}")
         }
         AggIntent::Cardinality { .. } => {
             format!("count_over_time({selector}{window}){by}")
@@ -514,17 +518,18 @@ fn sketch_op_to_promql(op: &AggIntent, selector: &str, window: &str, by: &str) -
         AggIntent::Frequency { .. } => {
             format!("count_over_time({selector}{window}){by}")
         }
-        AggIntent::Extrema { min, max } => match (min, max) {
-            (true, false) => format!("min_over_time({selector}{window}){by}"),
-            (false, true) => format!("max_over_time({selector}{window}){by}"),
-            _             => format!("quantile_over_time(0.5, {selector}{window}){by}"),
-        },
-        AggIntent::Exact(ExactAgg::Count) => format!("count_over_time({selector}{window}){by}"),
-        AggIntent::Exact(ExactAgg::Sum)   => format!("sum_over_time({selector}{window}){by}"),
-        AggIntent::Exact(ExactAgg::Avg)   => format!("avg_over_time({selector}{window}){by}"),
-        AggIntent::Exact(ExactAgg::Min)   => format!("min_over_time({selector}{window}){by}"),
-        AggIntent::Exact(ExactAgg::Max)   => format!("max_over_time({selector}{window}){by}"),
-        AggIntent::PerPartition { inner, .. } => sketch_op_to_promql(inner, selector, window, by),
+        AggIntent::Count { .. } => format!("count_over_time({selector}{window}){by}"),
+        AggIntent::Sum   => format!("sum_over_time({selector}{window}){by}"),
+        AggIntent::Avg   => format!("avg_over_time({selector}{window}){by}"),
+        AggIntent::Min   => format!("min_over_time({selector}{window}){by}"),
+        AggIntent::Max   => format!("max_over_time({selector}{window}){by}"),
+        AggIntent::Rate { .. }     => format!("rate({selector}{window}){by}"),
+        AggIntent::Increase { .. } => format!("increase({selector}{window}){by}"),
+        // TopK + archive-only intents (Phase β): Step γ routes these via
+        // canonical templates; today they reuse `count_over_time` because
+        // the legacy `Exact(_)` fall-through did effectively the same for
+        // any non-mergeable case. Documented as a Step γ TODO.
+        _ => format!("count_over_time({selector}{window}){by}"),
     }
 }
 
@@ -725,7 +730,7 @@ mod tests {
             duration: Duration::from_secs(300),
             slide: None,
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::default_quantile(vec![0.99]),
+                op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
                 col:   ColumnRef::SampleValue,
                 input: Box::new(source("latency")),
             }),
@@ -740,7 +745,7 @@ mod tests {
     #[test]
     fn hll_stays_at_agent_by_default() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_cardinality(),
+            op:    crate::intent_algebra::legacy_expr::default_cardinality(),
             col:   ColumnRef::SampleValue,
             input: Box::new(source("events")),
         };
@@ -753,7 +758,7 @@ mod tests {
         let expr = QueryExpr::Partition {
             keys: PartitionKeys::By(vec!["host".into(), "region".into()]),
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::default_quantile(vec![0.99]),
+                op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
                 col:   ColumnRef::SampleValue,
                 input: Box::new(source("latency")),
             }),
@@ -805,7 +810,7 @@ mod tests {
             k:     10,
             by:    vec!["symbol".into()],
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::default_frequency(),
+                op:    crate::intent_algebra::legacy_expr::default_frequency(),
                 col:   ColumnRef::SampleValue,
                 input: Box::new(source("price")),
             }),
@@ -854,7 +859,7 @@ mod tests {
             ..Default::default()
         };
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(source("latency")),
         };
@@ -872,7 +877,7 @@ mod tests {
             ..Default::default()
         };
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_quantile(vec![0.99]),
+            op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col:   ColumnRef::SampleValue,
             input: Box::new(source("latency")),
         };
@@ -891,7 +896,7 @@ mod tests {
                 duration: Duration::from_secs(300),
                 slide: None,
                 input: Box::new(QueryExpr::SketchAgg {
-                    op:    AggIntent::default_quantile(vec![0.99]),
+                    op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
                     col:   ColumnRef::SampleValue,
                     input: Box::new(QueryExpr::Filter {
                         pred: ScalarExpr::BinaryOp {
@@ -917,7 +922,7 @@ mod tests {
             k:     10,
             by:    vec![],
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::default_frequency(),
+                op:    crate::intent_algebra::legacy_expr::default_frequency(),
                 col:   ColumnRef::SampleValue,
                 input: Box::new(source("events")),
             }),

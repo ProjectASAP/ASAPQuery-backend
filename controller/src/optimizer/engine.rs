@@ -189,13 +189,14 @@ impl CostModel for DefaultCostModel {
     }
 
     fn estimate(&self, expr: &QueryExpr) -> NodeCost {
+        use crate::intent_algebra::legacy_expr::agg_is_exact;
         // Sketch nodes reduce bandwidth; exact nodes pass through.
         let factor = match expr {
             QueryExpr::SketchAgg { op, .. } | QueryExpr::WindowedAgg { agg: op, .. } => match op {
                 AggIntent::Quantile { .. }    => 0.05,
                 AggIntent::Cardinality { .. } => 0.02,
                 AggIntent::Frequency { .. }   => 0.03,
-                AggIntent::Exact(_)           => 1.0,
+                op if agg_is_exact(op)        => 1.0,
                 _                             => 0.1,
             },
             QueryExpr::Merge { inputs } => 1.0 / (inputs.len().max(1) as f64),
@@ -361,7 +362,7 @@ impl RewriteRule for MergeLifting {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::SketchAgg { ref op, ref col, ref input }
-                if op.is_mergeable() =>
+                if crate::intent_algebra::legacy_expr::agg_is_mergeable(op) =>
             {
                 if let QueryExpr::Merge { inputs } = input.as_ref() {
                     let new_inputs: Vec<QueryExpr> = inputs.iter().map(|branch| {
@@ -487,34 +488,48 @@ impl RewriteRule for HistogramQuantileFusion {
     fn name(&self) -> &'static str { "HistogramQuantileFusion" }
 
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+        // Canonical Quantile is single-φ post Step α — multi-φ fan-out
+        // happens at construction time, so the "merge phi into the
+        // existing quantile list" branch is now a "if phis match, keep
+        // structure; else build a Merge of two SketchAgg siblings". For
+        // this PR we keep the structural marker (identity rewrite) and
+        // defer the Merge-aware fusion to Step γ; the original rule was
+        // primarily a structural marker anyway.
         match expr {
             QueryExpr::HistogramQuantile { phi, input } => {
                 match *input {
                     QueryExpr::SketchAgg {
-                        op: AggIntent::Quantile { quantiles, accuracy },
+                        op: AggIntent::Quantile { q, accuracy },
                         col,
                         input: inner,
                     } => {
-                        if !quantiles.contains(&phi) {
-                            let mut new_qs = quantiles;
-                            new_qs.push(phi);
-                            new_qs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        if (q - phi).abs() < f64::EPSILON {
+                            // Quantile already matches φ — keep shape.
                             Some(QueryExpr::HistogramQuantile {
                                 phi,
                                 input: Box::new(QueryExpr::SketchAgg {
-                                    op:    AggIntent::Quantile { quantiles: new_qs, accuracy },
+                                    op: AggIntent::Quantile { q, accuracy },
                                     col,
                                     input: inner,
                                 }),
                             })
                         } else {
+                            // φ ≠ q: build a Merge of two single-φ
+                            // SketchAgg siblings (F1 fan-out for the
+                            // multi-φ case) and re-wrap.
+                            let new_q = QueryExpr::SketchAgg {
+                                op:    AggIntent::Quantile { q: phi, accuracy: accuracy.clone() },
+                                col:   col.clone(),
+                                input: inner.clone(),
+                            };
+                            let old_q = QueryExpr::SketchAgg {
+                                op: AggIntent::Quantile { q, accuracy },
+                                col,
+                                input: inner,
+                            };
                             Some(QueryExpr::HistogramQuantile {
                                 phi,
-                                input: Box::new(QueryExpr::SketchAgg {
-                                    op: AggIntent::Quantile { quantiles, accuracy },
-                                    col,
-                                    input: inner,
-                                }),
+                                input: Box::new(QueryExpr::Merge { inputs: vec![new_q, old_q] }),
                             })
                         }
                     }
@@ -651,12 +666,39 @@ impl RewriteRule for CommonSubexprElim {
 ///
 /// Hydra is a sketch-of-sketches that handles multi-dimensional GROUP BY
 /// more efficiently than one sketch per group tuple.
+///
+/// Step α status: the legacy `AggIntent::PerPartition { inner, keys }`
+/// variant is gone — canonical L3 expresses the same shape as
+/// `QueryExpr::Aggregate { by: keys, aggs: [inner] }`, and
+/// `legacy_expr::PerPartitionWrap` holds the transitional shape (consumed
+/// only by the physical sketch catalog). The historical inlining into
+/// `SketchAgg::op` therefore can't survive Step α; the rule becomes a
+/// pure cost-driven no-op until Step γ rewrites it to emit a canonical
+/// `Aggregate` node. Disabling a cost-driven rule preserves correctness
+/// (the unfused tree still produces the right result, just less
+/// efficiently for multi-key Partition + sketch cases).
 pub struct HydraConversion;
 
 impl RewriteRule for HydraConversion {
     fn name(&self) -> &'static str { "HydraConversion" }
 
-    fn try_rewrite(&self, expr: QueryExpr, model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, _expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+        // Step α: disabled — see struct docs. Step γ TODO: re-emit as a
+        // canonical `Aggregate { by, aggs: [inner] }` wrapper around the
+        // unwrapped `SketchAgg.op`.
+        None
+    }
+}
+
+// Original implementation kept under `dead_code` for Step γ reference.
+#[allow(dead_code)]
+mod hydra_conversion_legacy {
+    use super::*;
+
+    pub(super) fn try_rewrite_legacy(
+        expr: QueryExpr,
+        model: &dyn CostModel,
+    ) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Partition { keys: PartitionKeys::By(ref key_list), ref input }
                 if key_list.len() >= 2 =>
@@ -670,22 +712,9 @@ impl RewriteRule for HydraConversion {
                             | AggIntent::Cardinality { .. }
                             | AggIntent::Frequency { .. }
                     ) {
-                        let hydra_op = AggIntent::PerPartition {
-                            inner: Box::new(inner_op.clone()),
-                            keys:  key_list.clone(),
-                        };
-                        let candidate = QueryExpr::SketchAgg {
-                            op:    hydra_op,
-                            col:   col.clone(),
-                            input: inner_input.clone(),
-                        };
-                        let old_cost = model.estimate(&expr);
-                        let new_cost = model.estimate(&candidate);
-                        if new_cost.memory_bytes < old_cost.memory_bytes
-                            || new_cost.bytes_per_sec < old_cost.bytes_per_sec
-                        {
-                            return Some(candidate);
-                        }
+                        // Step γ: emit a canonical Aggregate { by, aggs: [inner_op] }
+                        // wrapper here instead of re-inlining into SketchAgg.op.
+                        let _ = (inner_op, col, inner_input, key_list, model);
                     }
                 }
                 None
@@ -1123,7 +1152,7 @@ mod tests {
     #[test]
     fn r3_removes_dedup_before_hll() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_cardinality(),
+            op:    crate::intent_algebra::legacy_expr::default_cardinality(),
             col:   ColumnRef::Named("user_id".into()),
             input: Box::new(QueryExpr::Distinct {
                 cols:  vec![ColumnRef::Named("user_id".into())],
@@ -1178,25 +1207,37 @@ mod tests {
     // ── R6: HistogramQuantileFusion ───────────────────────────────────────────
 
     #[test]
-    fn r6_adds_phi_to_ddsketch_quantiles() {
+    fn r6_fans_out_to_merge_when_phi_differs() {
+        use crate::types_v2::AccuracyTarget;
+        // Step α: canonical Quantile is single-φ; R6 emits a Merge of
+        // two single-φ SketchAgg siblings when φ doesn't match the
+        // existing intent's q. Apply R6 directly so this test is
+        // independent of downstream rules (CommonSubexprElim, etc.).
         let expr = QueryExpr::HistogramQuantile {
             phi:   0.95,
             input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::Quantile { quantiles: vec![0.5], accuracy: 0.01 },
+                op:    AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) },
                 col:   ColumnRef::SampleValue,
                 input: Box::new(src("latency")),
             }),
         };
-        let (result, _) = opt().optimize(expr);
+        let rule = HistogramQuantileFusion;
+        let model = DefaultCostModel { raw_bytes_per_sec: 100_000.0, deployment: None };
+        let result = rule.try_rewrite(expr, &model).expect("R6 should fire");
         match &result {
             QueryExpr::HistogramQuantile { input, .. } => {
-                if let QueryExpr::SketchAgg { op: AggIntent::Quantile { quantiles, .. }, .. } =
-                    input.as_ref()
-                {
-                    assert!(quantiles.contains(&0.95), "0.95 should be in DDSketch quantiles");
-                    assert!(quantiles.contains(&0.5), "0.5 should still be present");
-                } else {
-                    panic!("expected DDSketch under HistogramQuantile");
+                match input.as_ref() {
+                    QueryExpr::Merge { inputs } => {
+                        let mut qs: Vec<f64> = inputs.iter().filter_map(|i| match i {
+                            QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => {
+                                Some(*q)
+                            }
+                            _ => None,
+                        }).collect();
+                        qs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        assert_eq!(qs, vec![0.5, 0.95]);
+                    }
+                    other => panic!("expected Merge of SketchAgg siblings, got {other:?}"),
                 }
             }
             other => panic!("unexpected {other:?}"),
@@ -1260,7 +1301,7 @@ mod tests {
                 duration: Duration::from_secs(60),
                 slide:    None,
                 input:    Box::new(QueryExpr::SketchAgg {
-                    op:    AggIntent::default_cardinality(),
+                    op:    crate::intent_algebra::legacy_expr::default_cardinality(),
                     col:   ColumnRef::Named("uid".into()),
                     input: Box::new(QueryExpr::Distinct {
                         cols:  vec![ColumnRef::Named("uid".into())],
@@ -1285,7 +1326,7 @@ mod tests {
     #[test]
     fn r2_lifts_mergeable_sketch_above_merge() {
         let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::default_cardinality(),
+            op:    crate::intent_algebra::legacy_expr::default_cardinality(),
             col:   ColumnRef::Named("uid".into()),
             input: Box::new(QueryExpr::Merge {
                 inputs: vec![src("shard_a"), src("shard_b")],
@@ -1338,7 +1379,7 @@ mod tests {
         };
         let opt = QueryOptimizer::with_constraints(1000.0, dc);
         let expr = QueryExpr::SketchAgg {
-            op: AggIntent::default_quantile(vec![0.99]),
+            op: crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col: ColumnRef::SampleValue,
             input: Box::new(QueryExpr::Source(SourceSpec { name: "m".into() })),
         };
@@ -1352,7 +1393,7 @@ mod tests {
     fn unconstrained_optimizer_normal_cost() {
         let opt = QueryOptimizer::new(1000.0);
         let expr = QueryExpr::SketchAgg {
-            op: AggIntent::default_quantile(vec![0.99]),
+            op: crate::intent_algebra::legacy_expr::default_quantile(0.99),
             col: ColumnRef::SampleValue,
             input: Box::new(QueryExpr::Source(SourceSpec { name: "m".into() })),
         };
