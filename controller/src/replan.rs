@@ -21,14 +21,16 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::backend_client::{push_or_log, BackendClient};
-use crate::config::{
+use crate::emit::{
     build_precompute_jobs, collect_metric_to_family, emit_for_runtime,
     extend_edge_with_demo_plumbing, generate_agent_config, generate_backend_config,
     generate_streaming_config_yaml, AgentRuntime, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
 use crate::opamp::{AgentRole, OpampServer, RemoteConfig};
-use crate::planner::{self, BaselinePlanner};
+use crate::optimizer::baseline::BaselinePlanner;
+use crate::optimizer::{cost as cost_model, rules};
+use crate::physical::stage_split;
 use crate::store::{PlanStore, WorkloadStore};
 use crate::types::QueryWorkload;
 
@@ -169,10 +171,10 @@ impl Replanner {
     /// `QueryWorkload` directly. Used by `replan_metric` which already
     /// has the workload in scope.
     fn try_emit_typed_edge_yaml_for_workload(&self, workload: &QueryWorkload) -> Option<String> {
-        let sketch_expr = planner::rules::bind_workload_typed(workload)?;
-        let configs = planner::stage_split::split_typed_three_stage(&sketch_expr)?;
+        let sketch_expr = rules::bind_workload_typed(workload)?;
+        let configs = stage_split::split_typed_three_stage(&sketch_expr)?;
         let mut edge_cfg = configs.into_iter().find_map(|(_, cfg)| match cfg {
-            crate::stage_split::StageConfig::Edge(edge) => Some(edge),
+            crate::physical::colored_dag::StageConfig::Edge(edge) => Some(edge),
             _ => None,
         })?;
 
@@ -237,7 +239,7 @@ impl Replanner {
 
         let Ok(plan) = self.plan_store.get(&metric) else { return false };
 
-        let yaml = if planner::stage_split::typed_stage_split_enabled() {
+        let yaml = if stage_split::typed_stage_split_enabled() {
             match self.try_emit_typed_edge_yaml(&metric) {
                 Some(y) => {
                     info!(
@@ -303,7 +305,7 @@ impl Replanner {
         // rather than broadcasting to all agent-role collectors. Same gate
         // as `push_config_to_agent` — typed path on, legacy fallback on
         // emit failure or when the gate is off.
-        let agent_yaml: Option<String> = if planner::stage_split::typed_stage_split_enabled() {
+        let agent_yaml: Option<String> = if stage_split::typed_stage_split_enabled() {
             match self.try_emit_typed_edge_yaml_for_workload(&workload) {
                 Some(y) => {
                     info!(
@@ -421,7 +423,8 @@ mod tests {
 
     use chrono::Utc;
 
-    use crate::planner::{CostModelPlanner, BaselinePlanner};
+    use crate::optimizer::baseline::BaselinePlanner;
+    use crate::optimizer::cost::CostModelPlanner;
     use crate::store::{PlanStore, WorkloadStore};
     use crate::types::*;
 

@@ -10,7 +10,7 @@
 //! per-language algebra tree that preserves language-specific
 //! semantics (PromQL instant vs range vector, SQL window frames,
 //! Elastic buckets) before the L3 normalisation pass collapses
-//! everything into the language-orthogonal [`crate::algebra::expr::QueryExpr`].
+//! everything into the language-orthogonal [`crate::intent_algebra::legacy_expr::QueryExpr`].
 //!
 //! # DC deployment scope
 //!
@@ -20,11 +20,11 @@
 //!
 //! # Layer split
 //!
-//! - L1 ([`crate::query_language`]) — `&str` → [`crate::query_language::LanguageAst`].
-//! - L2 ([`Self`]) — [`crate::query_language::LanguageAst`] →
+//! - L1 ([`crate::query_parser::language`]) — `&str` → [`crate::query_parser::language::LanguageAst`].
+//! - L2 ([`Self`]) — [`crate::query_parser::language::LanguageAst`] →
 //!   [`LanguageLogicalPlan`].
 //! - L3 (`crate::intent_algebra`, Phase B) — [`LanguageLogicalPlan`]
-//!   → language-orthogonal [`crate::algebra::expr::QueryExpr`].
+//!   → language-orthogonal [`crate::intent_algebra::legacy_expr::QueryExpr`].
 
 pub mod lower;
 pub mod plan;

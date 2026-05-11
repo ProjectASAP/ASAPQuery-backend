@@ -1,12 +1,12 @@
 //! L1 → L2 lowering — produces a [`LanguageLogicalPlan`] from a
-//! [`crate::query_language::LanguageAst`].
+//! [`crate::query_parser::language::LanguageAst`].
 //!
 //! Today only the PromQL backend has a working L1, so only the PromQL
 //! variant of `LanguageAst` lowers to a real L2 tree. Other variants
 //! return [`LoweringError::UnsupportedLanguage`] cleanly so callers
 //! can surface a uniform error.
 
-use crate::query_language::{language_ast::LanguageAst, promql::PromQLAst};
+use crate::query_parser::language::{language_ast::LanguageAst, promql::PromQLAst};
 use crate::types_v2::QueryLanguage;
 
 use super::plan::{LanguageLogicalPlan, LanguageLogicalPlanSummary};

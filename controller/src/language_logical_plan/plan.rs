@@ -7,7 +7,7 @@
 //! `Sort`, `Limit`. **No sketch names yet**.
 //!
 //! In DC's existing tree the equivalent representation is the
-//! [`crate::algebra::expr::QueryExpr`] tree produced by
+//! [`crate::intent_algebra::legacy_expr::QueryExpr`] tree produced by
 //! `query_parser::parse_query_expr`. To stay consistent with the
 //! design.md L2 contract while not duplicating the algebra:
 //!
@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::algebra::expr::QueryExpr;
+use crate::intent_algebra::legacy_expr::QueryExpr;
 use crate::query_parser::{ParsedQuery, QueryHint};
 use crate::types::AggType;
 use crate::types_v2::QueryLanguage;

@@ -35,7 +35,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, MatrixSelector, VectorSelector};
 
-use crate::algebra::expr::{FilterOp, FilterVal, PartitionKeys, Predicate};
+use crate::intent_algebra::legacy_expr::{FilterOp, FilterVal, PartitionKeys, Predicate};
 
 // ── Walk context ──────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 // | `m[5m:1m]` subquery      | PromQLSubquery { 5m, Some(1m) }      |
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
-use crate::algebra::expr::{
+use crate::intent_algebra::legacy_expr::{
     AggFunc, AggItem,
     BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
     PartitionKeys as QePartitionKeys, QueryExpr,
@@ -479,7 +479,7 @@ fn apply_qe_filters(
     if filters.is_empty() {
         input
     } else {
-        use crate::algebra::expr::{BinaryOpKind, LiteralValue, ScalarExpr};
+        use crate::intent_algebra::legacy_expr::{BinaryOpKind, LiteralValue, ScalarExpr};
         let pred = filters.iter().fold(
             ScalarExpr::Literal(LiteralValue::Bool(true)),
             |acc, p| {

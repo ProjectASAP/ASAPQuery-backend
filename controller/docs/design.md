@@ -43,11 +43,11 @@ DataCollector/controller already documents its query→sketch translation as a 5
 
 | # | Layer | What it does | Today's locations |
 |---|-------|--------------|-------------------|
-| 1 | **Query Language** | Parse raw strings (PromQL, SQL, DataFusion, ElasticDSL, …) into a language-specific AST | DC `controller/src/query_parser/{promql,sql,mod}.rs`; asap-planner-rs pulls `promql-parser` + `sqlparser` directly; asap-fusion consumes a pre-built DataFusion `LogicalPlan` (its L1 happens upstream) |
-| 2 | **Language Logical Plan** | Per-language algebra tree (`Aggregate` / `Window` / `Filter` / `Sort` / `Limit`) preserving language semantics, **no sketch names, no sketch binding** | DC `controller/src/algebra/lower.rs`; asap-fusion inherits DataFusion's `LogicalPlan` as its L2; asap-planner-rs has no L2 today (uses a template-pattern catalogue) — **Phase 4 builds one** |
-| 3 | **Intent algebra** | Language- and deployment-independent IR: `QueryExpr` + `AggIntent`. Describes **intent only** — *what* to compute, with accuracy target. **No sketch type, no sketch parameters, no sketch-bound nodes** (`SketchAgg` / `SketchJoin` / `SketchSubtract` etc. live in the L4 IR `SketchExpr`). **No language-shaped operators** (no `HistogramQuantile`, no `PromQLSubquery` — those are PromQL L2 nodes that lower to data-model-agnostic shapes here). **One canonical form per plan** — no `WindowedAgg` (use `Window` over `Aggregate`). Heavy-hitter intents are first-class (`AggIntent::TopK`) so heavy-hitter sketches bind directly on the intent rather than on a generic `Sort + Limit` shape; generic `Sort + Limit` survives in `QueryExpr` for non-heavy-hitter cases (e.g. `ORDER BY name LIMIT 10`). Every edge carries a typed `Schema`. Data-model-agnostic — `QueryExpr::Scan` wraps a `Source` sum with `TimeSeries` / `Table` / `Join` variants so the same L3 IR covers ASAPQuery's time-series queries and asap-fusion's tabular queries. | DC `controller/src/algebra/{expr,directory}.rs`; asap-fusion's 3-variant `SubPopulationAnalyticsType` maps to a subset; asap-planner-rs's 9-variant `Statistic` maps to a subset — **Phase 4 splits sketch binding out of planner's current fused L3+L4** |
-| 4 | **Sketch algebra + optimizer** | Cost-aware algebraic rewrite rules under deployment constraints. **This is where sketch binding happens** — L4 rules take intent-only L3 (`QueryExpr`) and emit the sketch-bound IR (`SketchExpr`). ~12 rules in DC; a smaller targeted subset in planner; `SketchConfigRule` + `HashModeRule` in fusion. | Core provides the **rule engine driver** + `OptimizerRule` trait + a shared rule library + the sketch-bound IR `core::sketch_algebra::SketchExpr`; deployment models **pick** which rules to enable + supply their own deployment constraints. DC `controller/src/algebra/optimizer.rs` (rules); fusion `src/optimizer/rules/`; planner's `map_statistic_to_precompute_operator` |
-| 5 | **Physical Execution Plan** | Assign ops to pipeline stages (edge / gateway / backend / object store); produce the deployment-specific artifact (OpAMP YAML, `streaming_config.yaml`, rewritten DataFusion `LogicalPlan`). **Sketch binding is already committed by L4**; L5 is about stage allocation + emission. | Core provides the **stage allocator framework** + `PhysicalPlanner` trait + the sketch catalogue; deployment models supply their own **topology** (3-stage / 1-stage / 0-stage) + their own **emitter** for the output format. DC `controller/src/algebra/{physical,allocator,plan}.rs`; asap-planner-rs `output/generator.rs`; asap-fusion `src/executor/` |
+| 1 | **Query Language** | Parse raw strings (PromQL, SQL, DataFusion, ElasticDSL, …) into a language-specific AST | DC `controller/src/query_parser/{promql,sql}.rs` + the per-language façade `controller/src/query_parser/language/{promql,sql,elastic_dsl}/`; asap-planner-rs pulls `promql-parser` + `sqlparser` directly; asap-fusion consumes a pre-built DataFusion `LogicalPlan` (its L1 happens upstream). *Refactor 2026-05 absorbed `controller/src/query_language/` into `query_parser::language/`.* |
+| 2 | **Language Logical Plan** | Per-language algebra tree (`Aggregate` / `Window` / `Filter` / `Sort` / `Limit`) preserving language semantics, **no sketch names, no sketch binding** | DC `controller/src/language_logical_plan/{lower,plan}.rs` + `controller/src/intent_algebra/legacy_lower.rs` (legacy L2→L3 lowering pending unification with `intent_algebra/lower.rs`); asap-fusion inherits DataFusion's `LogicalPlan` as its L2; asap-planner-rs has no L2 today (uses a template-pattern catalogue) — **Phase 4 builds one** |
+| 3 | **Intent algebra** | Language- and deployment-independent IR: `QueryExpr` + `AggIntent`. Describes **intent only** — *what* to compute, with accuracy target. **No sketch type, no sketch parameters, no sketch-bound nodes** (`SketchAgg` / `SketchJoin` / `SketchSubtract` etc. live in the L4 IR `SketchExpr`). **No language-shaped operators** (no `HistogramQuantile`, no `PromQLSubquery` — those are PromQL L2 nodes that lower to data-model-agnostic shapes here). **One canonical form per plan** — no `WindowedAgg` (use `Window` over `Aggregate`). Heavy-hitter intents are first-class (`AggIntent::TopK`) so heavy-hitter sketches bind directly on the intent rather than on a generic `Sort + Limit` shape; generic `Sort + Limit` survives in `QueryExpr` for non-heavy-hitter cases (e.g. `ORDER BY name LIMIT 10`). Every edge carries a typed `Schema`. Data-model-agnostic — `QueryExpr::Scan` wraps a `Source` sum with `TimeSeries` / `Table` / `Join` variants so the same L3 IR covers ASAPQuery's time-series queries and asap-fusion's tabular queries. | DC `controller/src/intent_algebra/{agg_intent,query_expr,schema,lower,cse}.rs` (canonical L3) + `controller/src/intent_algebra/legacy_expr.rs` (legacy heavy-IR pending dedup with the canonical types); asap-fusion's 3-variant `SubPopulationAnalyticsType` maps to a subset; asap-planner-rs's 9-variant `Statistic` maps to a subset — **Phase 4 splits sketch binding out of planner's current fused L3+L4**. *Refactor 2026-05 absorbed `controller/src/algebra/expr.rs` into `intent_algebra/legacy_expr.rs`.* |
+| 4 | **Sketch algebra + optimizer** | Cost-aware algebraic rewrite rules under deployment constraints. **This is where sketch binding happens** — L4 rules take intent-only L3 (`QueryExpr`) and emit the sketch-bound IR (`SketchExpr`). ~12 rules in DC; a smaller targeted subset in planner; `SketchConfigRule` + `HashModeRule` in fusion. | Core provides the **rule engine driver** + `OptimizerRule` trait + a shared rule library + the sketch-bound IR `core::sketch_algebra::SketchExpr`; deployment models **pick** which rules to enable + supply their own deployment constraints. DC `controller/src/sketch_algebra/` (IR + binding rules) + `controller/src/optimizer/{engine,trait_def,baseline,rules/,cost/}.rs` (rule engine + cost models); fusion `src/optimizer/rules/`; planner's `map_statistic_to_precompute_operator`. *Refactor 2026-05 absorbed `controller/src/algebra/optimizer.rs` (→ `optimizer/engine.rs`) and `controller/src/planner/{cost_model,delta_cost_model,online_cost_model,pareto,tco,wire_cost,rules,baseline_planner}.rs` (→ `optimizer/{cost/,rules/,baseline.rs}`).* |
+| 5 | **Physical Execution Plan** | Assign ops to pipeline stages (edge / gateway / backend / object store); produce the deployment-specific artifact (OpAMP YAML, `streaming_config.yaml`, rewritten DataFusion `LogicalPlan`). **Sketch binding is already committed by L4**; L5 is about stage allocation + emission. | Core provides the **stage allocator framework** + `PhysicalPlanner` trait + the sketch catalogue; deployment models supply their own **topology** (3-stage / 1-stage / 0-stage) + their own **emitter** for the output format. DC `controller/src/physical/{allocator,planner,plan,sketch_catalog,stage_split,topology,colored_dag/}.rs` (allocator framework + sketch catalogue + typed three-stage colouring) + `controller/src/emit/{stage_config,otap,telegraf,agent,backend,asapquery_backend,precompute,trait_def}.rs` (per-deployment-model emitters + `PlanEmitter` trait) + `controller/src/pipeline.rs` (L1→…→L5 driver, formerly `analyzer.rs`); asap-planner-rs `output/generator.rs`; asap-fusion `src/executor/`. *Refactor 2026-05 absorbed `controller/src/algebra/{physical,allocator,plan,directory}.rs` and `controller/src/planner/stage_split.rs` and the legacy `controller/src/stage_split/` framework into `physical/`; absorbed `controller/src/config/` into `emit/` + `workload.rs`; renamed `analyzer.rs` to `pipeline.rs`.* |
 
 **The doc's key claim: layers 1–3 are query-language-independent and workload-independent.** That makes them the natural **common core**. Every deployment model reads PromQL (or SQL, or …) the same way, lowers it to the same per-language algebra, and lowers THAT to the same intent-algebra IR (intent only, no sketch binding).
 
@@ -159,6 +159,32 @@ If something must be optional (e.g. OpAMP for deployments that don't run OTel co
 
 ## 5. Target repo layout
 
+> **Refactor 2026-05 — current state vs target.** The per-deployment-model crate
+> split below (`crates/deployment-model-{asaplifecycle,asapquery,asapfusion}/`)
+> is **deferred** until ≥2 deployment models actually ship. Today's
+> implementation is a single `controller/` crate whose internal module
+> structure mirrors design.md §5's modular split:
+>
+> | Target §5 path | Current single-crate path |
+> |---|---|
+> | `crates/core/query_language/` | `controller/src/query_parser/language/` |
+> | `crates/core/logical_plan/` | `controller/src/language_logical_plan/` |
+> | `crates/core/intent_algebra/` | `controller/src/intent_algebra/` (with `legacy_expr` / `legacy_lower` carrying the older `algebra::expr`-flavored IR pending unification) |
+> | `crates/core/sketch_algebra/` | `controller/src/sketch_algebra/` |
+> | `crates/core/optimizer/{engine,trait,rules,cost}/` | `controller/src/optimizer/{engine.rs,trait_def.rs,rules/,cost/,baseline.rs}` |
+> | `crates/core/physical/{planner_trait,stage_allocator,topology,executor,sketch_catalog}/` | `controller/src/physical/{planner,allocator,plan,stage_split,sketch_catalog,topology,colored_dag/}.rs` |
+> | `crates/core/pipeline/` | `controller/src/pipeline.rs` (single-file driver — was `analyzer.rs`) |
+> | `crates/core/workload/` | `controller/src/workload.rs` |
+> | `crates/core/emit/` | `controller/src/emit/` |
+> | `crates/core/registry/` | `controller/src/deployment_model.rs` |
+> | `crates/runtime/{http,opamp,monitor,replan,store,backend_client}/` | `controller/src/{main.rs,opamp/,monitor/,replan.rs,store/,backend_client.rs,metrics_exposer.rs}` |
+> | `crates/deployment-model-asaplifecycle/` | folded into `controller/src/emit/{agent,backend,asapquery_backend,otap,telegraf,stage_config,precompute}.rs` + the three-stage topology in `controller/src/physical/colored_dag/` |
+>
+> The target multi-crate layout below remains the long-term goal but is **not a
+> current migration**. The single-crate is structurally aligned to the §5
+> module boundaries so future extraction is largely `git mv` + `Cargo.toml`
+> edits.
+
 ```
 ASAPController/
 ├── Cargo.toml                 # workspace
@@ -250,6 +276,40 @@ Mashing them into one crate means the union of all their dependencies (sqlparser
 ## 6. Core crate details (layers 1–3 + driver)
 
 Core is not a trait-stubs library. It ships real L1/L2/L3 code lifted from DC's `controller/src/query_parser/` + `controller/src/algebra/` and exposes a small set of traits for L4/L5 plugin points.
+
+> **§6 / `core::*` paths vs current single-crate paths.** §6 below names
+> targets like `core::query_language`, `core::sketch_algebra`,
+> `core::optimizer` from the design.md §5 target layout. Today's
+> single-crate (refactor 2026-05) is structurally aligned to those names
+> via a 1:1 mapping. The lookup table:
+>
+> | `core::*` reference in §6 | Current single-crate path |
+> |---|---|
+> | `core::query_language` | `controller/src/query_parser/language/` |
+> | `core::logical_plan` | `controller/src/language_logical_plan/` |
+> | `core::intent_algebra` | `controller/src/intent_algebra/` (canonical) + `controller/src/intent_algebra/legacy_{expr,lower}.rs` (legacy IR pending unification) |
+> | `core::sketch_algebra` | `controller/src/sketch_algebra/` |
+> | `core::lower` | per-layer: `controller/src/language_logical_plan/lower.rs` + `controller/src/intent_algebra/{lower,legacy_lower}.rs` + `controller/src/sketch_algebra/lower.rs` |
+> | `core::optimizer::engine` | `controller/src/optimizer/engine.rs` |
+> | `core::optimizer::trait` | `controller/src/optimizer/trait_def.rs` (placeholder) |
+> | `core::optimizer::rules` | `controller/src/optimizer/rules/` |
+> | `core::optimizer::cost` | `controller/src/optimizer/cost/` |
+> | `core::physical::planner_trait` | `controller/src/physical/planner.rs` (legacy `physical_plan_to_staged` impl pending trait extraction) |
+> | `core::physical::stage_allocator` | `controller/src/physical/{allocator,stage_split,colored_dag/allocator}.rs` |
+> | `core::physical::topology` | `controller/src/physical/topology.rs` |
+> | `core::physical::executor` | not yet materialised (placeholder absent) |
+> | `core::physical::sketch_catalog` | `controller/src/physical/sketch_catalog.rs` |
+> | `core::pipeline` | `controller/src/pipeline.rs` (single file — was `analyzer.rs`) |
+> | `core::workload` | `controller/src/workload.rs` |
+> | `core::emit` | `controller/src/emit/` |
+> | `core::registry` | `controller/src/deployment_model.rs` |
+> | `core::telemetry` | `controller/src/metrics_exposer.rs` (out-of-core today — drives Prometheus metrics) |
+>
+> Every §6 reference below should be read with this table as the
+> concrete pointer. Where §6 says "lifted from DC's
+> `controller/src/algebra/`", read "structurally aligned to
+> `intent_algebra/legacy_expr.rs` + `physical/` + `optimizer/engine.rs`
+> per the §16 ADR."
 
 ### `core::query_language` — Layer 1
 
@@ -1720,3 +1780,65 @@ The migration is done when:
 4. `asap-fusion`'s microbenchmarks still run under `deployment-model-asapfusion` with identical numbers.
 5. The `DataCollector/controller/`, `ASAPQuery/asap-planner-rs/`, `ASAPQuery-backend/asap-planner-rs/`, and `asap-fusion/` directories are deletable (or already deleted) without breaking any currently-running deployment.
 6. A new hypothetical deployment model can be added with zero changes outside its crate + one line in `bin/asap-controller/main.rs`.
+
+## 16. ADR — Capability consolidation + `algebra/`/`planner/`/`config/` retirement (2026-05)
+
+This section records two migration steps that brought the controller into its current shape.
+
+### 16.1 PR #129 — Four-merged-then-cleaned capability tables
+
+Before PR #129 there were **four** overlapping capability tables in the controller:
+
+| Source | Location | Shape |
+|---|---|---|
+| YAML at `controller/sketch_capabilities.yml` | filesystem | per-sketch perf profile, runtime-loaded |
+| Compiled-in defaults | `algebra/optimizer.rs::sketch_capability` | per-sketch perf profile, hard-coded |
+| `SketchKind` enum | `sketch_algebra/params.rs` | sketch type tag |
+| `Capability` / `SketchKindHandle` | `warm_tier_analysis.rs` (PR #128) | query-side dispatch tag invented per-query |
+
+All four collapsed into one module: `controller/src/sketch_algebra/capability.rs`. The four-way map is now:
+
+- `SketchCapability` + `SupportedIntent` — per-sketch perf profile, read by L4 cost model + L5 physical planner (formerly the YAML + compiled-in copies).
+- `Capability` + `SketchKindHandle` — query-side capability tag, used by `asap-query-engine`'s warm-tier reducer (formerly the per-query invention in PR #128).
+- `capability_for(intent: &AggIntent) -> Option<Capability>` — the **semantic** intent → warm-tier dispatch bridge. The new signature replaces the older `capability_for(query_func: &str)` string-keyed lookup. PromQL → `intent_algebra::lower` → `AggIntent` → (this fn) → `Capability`. The warm-tier analyzer at `controller/src/warm_tier_analysis.rs` is now a thin facade around this single function.
+- `default_capability_table()` / `load_capability_overrides()` — compiled-in defaults + YAML override loader.
+
+The four-table fragmentation reflected partial consolidations that never finished; once `Capability` was the canonical query-side tag (PR #128) the perf-profile + override-loader story had a natural home next to it (PR #129).
+
+### 16.2 Refactor 2026-05 (`refactor/controller-layered-cleanup`) — `algebra/` / `planner/` / `config/` retirement
+
+The pre-refactor layout grew organically as the controller absorbed three legacy code paths (the DC `algebra/` IR, the `planner/` cost models, the `config/` per-deployment emitters). Each had its own naming convention and module structure. This refactor restructures `controller/src/` to mirror design.md §5's target module split without splitting into multiple crates. The retirements:
+
+| Retired path | Replacement |
+|---|---|
+| `controller/src/algebra/expr.rs` | `controller/src/intent_algebra/legacy_expr.rs` |
+| `controller/src/algebra/lower.rs` | `controller/src/intent_algebra/legacy_lower.rs` |
+| `controller/src/algebra/directory.rs` | `controller/src/physical/sketch_catalog.rs` |
+| `controller/src/algebra/physical.rs` | `controller/src/physical/planner.rs` |
+| `controller/src/algebra/allocator.rs` | `controller/src/physical/allocator.rs` |
+| `controller/src/algebra/plan.rs` | `controller/src/physical/plan.rs` |
+| `controller/src/algebra/optimizer.rs` | `controller/src/optimizer/engine.rs` |
+| `controller/src/planner/cost_model.rs` | `controller/src/optimizer/cost/mod.rs` |
+| `controller/src/planner/{delta,online}_cost_model.rs` | `controller/src/optimizer/cost/{delta,online}.rs` |
+| `controller/src/planner/{pareto,tco,wire_cost}.rs` | `controller/src/optimizer/cost/{pareto,tco,wire}.rs` |
+| `controller/src/planner/rules.rs` | `controller/src/optimizer/rules/mod.rs` |
+| `controller/src/planner/baseline_planner.rs` | `controller/src/optimizer/baseline.rs` |
+| `controller/src/planner/stage_split.rs` | `controller/src/physical/stage_split.rs` |
+| `controller/src/analyzer.rs` | `controller/src/pipeline.rs` |
+| `controller/src/stage_split/` | `controller/src/physical/colored_dag/` |
+| `controller/src/query_language/` | `controller/src/query_parser/language/` |
+| `controller/src/config/workloads.rs` | `controller/src/workload.rs` |
+| `controller/src/config/{stage_config*,otap,telegraf,agent,backend,asapquery_backend,precompute}.rs` | `controller/src/emit/{stage_config,otap,telegraf,agent,backend,asapquery_backend,precompute}.rs` |
+| (new) | `controller/src/emit/trait_def.rs` — `PlanEmitter` trait placeholder |
+| (new) | `controller/src/optimizer/trait_def.rs` — `OptimizerRule` trait placeholder |
+| (new) | `controller/src/deployment_model.rs` — `DeploymentModelRegistry` + `DeploymentModelId` placeholder |
+| (new) | `controller/src/physical/topology.rs` — `Topology` descriptor re-export |
+
+`controller/src/lib.rs` keeps thin `pub use` aliases (`pub use pipeline as analyzer;`, `pub use emit as config;`, `pub mod algebra { ... }`, `pub mod planner { ... }`, `pub use physical::colored_dag as stage_split;`) so the historical paths `controller::analyzer::*`, `controller::config::*`, `controller::algebra::*`, `controller::planner::*`, `controller::stage_split::*` keep resolving for external consumers (the `controller` bin's `use controller::algebra;` etc.) without further source churn. Internal source code is migrated to the new paths.
+
+**TODOs left from the refactor:**
+
+- `controller/src/emit/stage_config.rs` (3,020 lines, formerly `config/stage_config.rs`) was moved whole rather than split into `emit/opamp.rs` + `emit/streaming_config.rs` + `emit/inference_config.rs` per design.md §5. The monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, storage-routing JSON emit, and shared internals; a clean split needs ownership reorganisation, not file renames. Tracked for a follow-up.
+- `controller/src/intent_algebra/{legacy_expr,legacy_lower}.rs` carry the older `algebra::expr`-flavored `QueryExpr` / `AggIntent` / `WindowSpec` IR alongside the canonical `intent_algebra::{query_expr,agg_intent,lower}` types. Most of the controller still consumes the legacy types (query_parser, language_logical_plan, physical/, optimizer/, emit/); migrating each call site onto the canonical types is a follow-up.
+- `controller/src/optimizer/trait_def.rs` (`OptimizerRule`), `controller/src/emit/trait_def.rs` (`PlanEmitter`), `controller/src/deployment_model.rs` (`DeploymentModelRegistry`) ship as placeholders — the existing free-function emitters and concrete rule loops still drive behaviour. Migrating them onto the trait surfaces lands when the per-deployment-model crate split lands.
+

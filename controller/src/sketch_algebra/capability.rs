@@ -430,6 +430,33 @@ pub fn load_capability_overrides(path: &str) -> HashMap<SketchKind, SketchCapabi
     default_capability_table()
 }
 
+// ── Sketch-family error bounds ───────────────────────────────────────────────
+//
+// These two helpers were originally defined in `controller/src/algebra/expr.rs`
+// (now `controller/src/intent_algebra/legacy_expr.rs`). The 2026-05
+// layered-cleanup refactor moves them here — they are sketch-family
+// error bounds, so the capability module is their structural home.
+//
+// The legacy module re-exports both via [`hll_accuracy`] /
+// [`countmin_accuracy`] aliases so callers like `AggIntent::default_cardinality`
+// keep compiling.
+
+/// HLL accuracy from register count: `1.04 / sqrt(2^registers)`.
+///
+/// Source: Flajolet et al., "HyperLogLog: the analysis of a
+/// near-optimal cardinality estimation algorithm" (2007).
+pub fn hll_accuracy(registers: u8) -> f64 {
+    1.04 / (2.0f64.powi(registers as i32)).sqrt()
+}
+
+/// Count-Min Sketch accuracy from width: `e / width`.
+///
+/// Source: Cormode & Muthukrishnan, "An improved data stream summary:
+/// the count-min sketch and its applications" (2005).
+pub fn countmin_accuracy(width: u32) -> f64 {
+    std::f64::consts::E / width as f64
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
