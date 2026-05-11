@@ -202,7 +202,7 @@ impl CostModel for DefaultCostModel {
             QueryExpr::Filter { .. }    => 0.5,
             QueryExpr::TopK { k, .. }   => (*k as f64).recip().min(0.1),
             QueryExpr::Partition { .. }  => 0.8, // partition adds overhead
-            QueryExpr::Dedup { .. }      => 0.9,
+            QueryExpr::Distinct { .. }   => 0.9,
             _                           => 1.0,
         };
 
@@ -226,7 +226,7 @@ impl CostModel for DefaultCostModel {
                 | QueryExpr::Source(_) | QueryExpr::Filter { .. }
                 | QueryExpr::Window { .. } => &dc.agent,
                 QueryExpr::Partition { .. } | QueryExpr::Merge { .. }
-                | QueryExpr::Dedup { .. } => &dc.backend_collector,
+                | QueryExpr::Distinct { .. } => &dc.backend_collector,
                 QueryExpr::TopK { .. } | QueryExpr::HistogramQuantile { .. }
                 | QueryExpr::BinaryOp { .. } | QueryExpr::PromQLSubquery { .. } => &dc.backend_db,
                 QueryExpr::Aggregate { .. } => &dc.original_db,
@@ -396,7 +396,7 @@ impl RewriteRule for HLLDedupElim {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::SketchAgg { op: AggIntent::Cardinality { accuracy }, col, input } => {
-                if let QueryExpr::Dedup { input: inner, .. } = *input {
+                if let QueryExpr::Distinct { input: inner, .. } = *input {
                     return Some(QueryExpr::SketchAgg {
                         op:    AggIntent::Cardinality { accuracy },
                         col,
@@ -906,9 +906,9 @@ impl QueryOptimizer {
                 let (new_input, c) = recurse!(input);
                 (QueryExpr::Partition { keys, input: new_input }, c)
             }
-            QueryExpr::Dedup { col, input } => {
+            QueryExpr::Distinct { cols, input } => {
                 let (new_input, c) = recurse!(input);
-                (QueryExpr::Dedup { col, input: new_input }, c)
+                (QueryExpr::Distinct { cols, input: new_input }, c)
             }
             QueryExpr::TopK { k, by, input } => {
                 let (new_input, c) = recurse!(input);
@@ -921,10 +921,6 @@ impl QueryOptimizer {
             QueryExpr::Limit { n, offset, input } => {
                 let (new_input, c) = recurse!(input);
                 (QueryExpr::Limit { n, offset, input: new_input }, c)
-            }
-            QueryExpr::WindowFunc { func, partition_by, order_by, frame, input } => {
-                let (new_input, c) = recurse!(input);
-                (QueryExpr::WindowFunc { func, partition_by, order_by, frame, input: new_input }, c)
             }
             QueryExpr::HistogramQuantile { phi, input } => {
                 let (new_input, c) = recurse!(input);
@@ -946,11 +942,6 @@ impl QueryOptimizer {
                 let (new_right, cr) = recurse!(right);
                 (QueryExpr::Join { kind, pred, left: new_left, right: new_right }, cl || cr)
             }
-            QueryExpr::JoinSketch { join_key, outer, inner } => {
-                let (new_outer, co) = recurse!(outer);
-                let (new_inner, ci) = recurse!(inner);
-                (QueryExpr::JoinSketch { join_key, outer: new_outer, inner: new_inner }, co || ci)
-            }
             QueryExpr::SetOp { kind, all, left, right } => {
                 let (new_left,  cl) = recurse!(left);
                 let (new_right, cr) = recurse!(right);
@@ -960,10 +951,6 @@ impl QueryOptimizer {
                 let (new_lhs, cl) = recurse!(lhs);
                 let (new_rhs, cr) = recurse!(rhs);
                 (QueryExpr::BinaryOp { op, lhs: new_lhs, rhs: new_rhs, vector_match }, cl || cr)
-            }
-            QueryExpr::Subquery { alias, expr } => {
-                let (new_expr, c) = recurse!(expr);
-                (QueryExpr::Subquery { alias, expr: new_expr }, c)
             }
             QueryExpr::LetBinding { name, expr, body } => {
                 let (new_expr, ce) = recurse!(expr);
@@ -1138,16 +1125,16 @@ mod tests {
         let expr = QueryExpr::SketchAgg {
             op:    AggIntent::default_cardinality(),
             col:   ColumnRef::Named("user_id".into()),
-            input: Box::new(QueryExpr::Dedup {
-                col:   "user_id".into(),
+            input: Box::new(QueryExpr::Distinct {
+                cols:  vec![ColumnRef::Named("user_id".into())],
                 input: Box::new(src("events")),
             }),
         };
         let (result, _) = opt().optimize(expr);
         assert!(
             !matches!(&result, QueryExpr::SketchAgg { input, .. }
-                if matches!(input.as_ref(), QueryExpr::Dedup { .. })),
-            "Dedup should be eliminated before HLL"
+                if matches!(input.as_ref(), QueryExpr::Distinct { .. })),
+            "Distinct should be eliminated before HLL"
         );
     }
 
@@ -1264,9 +1251,9 @@ mod tests {
 
     #[test]
     fn optimizer_chain_of_rewrites() {
-        // Filter(Window(Dedup(HLL(Source)))) →
-        //   R1: Window(Filter(Dedup(HLL(Source))))
-        //   R3: Window(Filter(HLL(Source)))   (HLL absorbs Dedup)
+        // Filter(Window(Distinct(HLL(Source)))) →
+        //   R1: Window(Filter(Distinct(HLL(Source))))
+        //   R3: Window(Filter(HLL(Source)))   (HLL absorbs Distinct)
         let expr = QueryExpr::Filter {
             pred:  ScalarExpr::Literal(LiteralValue::Bool(true)),
             input: Box::new(QueryExpr::Window {
@@ -1275,22 +1262,22 @@ mod tests {
                 input:    Box::new(QueryExpr::SketchAgg {
                     op:    AggIntent::default_cardinality(),
                     col:   ColumnRef::Named("uid".into()),
-                    input: Box::new(QueryExpr::Dedup {
-                        col:   "uid".into(),
+                    input: Box::new(QueryExpr::Distinct {
+                        cols:  vec![ColumnRef::Named("uid".into())],
                         input: Box::new(src("events")),
                     }),
                 }),
             }),
         };
         let (result, _iters) = opt().optimize(expr);
-        // The Dedup should be gone.
-        let mut dedup_found = false;
+        // The Distinct should be gone.
+        let mut distinct_found = false;
         result.walk(&mut |n| {
-            if matches!(n, QueryExpr::Dedup { .. }) {
-                dedup_found = true;
+            if matches!(n, QueryExpr::Distinct { .. }) {
+                distinct_found = true;
             }
         });
-        assert!(!dedup_found, "Dedup should have been eliminated");
+        assert!(!distinct_found, "Distinct should have been eliminated");
     }
 
     // ── R2: MergeLifting ─────────────────────────────────────────────────────

@@ -147,8 +147,8 @@ fn walk(expr: &QueryExpr, plan: &mut StagedPlan, budgets: &StageResourceBudgets)
             walk(input, plan, budgets);
         }
 
-        // Dedup — absorbed at Backend (HLL dedup elimination is upstream).
-        QueryExpr::Dedup { input, .. } => {
+        // Distinct — absorbed at Backend (HLL dedup elimination is upstream).
+        QueryExpr::Distinct { input, .. } => {
             plan.backend.has_dedup = true;
             walk(input, plan, budgets);
         }
@@ -197,13 +197,6 @@ fn walk(expr: &QueryExpr, plan: &mut StagedPlan, budgets: &StageResourceBudgets)
             walk(rhs, plan, budgets);
         }
 
-        // JoinSketch — outer and inner both walked; join itself at Backend.
-        QueryExpr::JoinSketch { outer, inner, .. } => {
-            plan.backend.has_merge = true;
-            walk(outer, plan, budgets);
-            walk(inner, plan, budgets);
-        }
-
         // Join — Backend.
         QueryExpr::Join { left, right, .. } => {
             plan.backend.has_merge = true;
@@ -219,9 +212,7 @@ fn walk(expr: &QueryExpr, plan: &mut StagedPlan, budgets: &StageResourceBudgets)
         }
 
         // Transparent / passthrough nodes — recurse into child.
-        QueryExpr::Project { input, .. }
-        | QueryExpr::Subquery { expr: input, .. }
-        | QueryExpr::WindowFunc { input, .. } => walk(input, plan, budgets),
+        QueryExpr::Project { input, .. } => walk(input, plan, budgets),
 
         QueryExpr::LetBinding { expr, body, .. } => {
             walk(expr, plan, budgets);
@@ -486,16 +477,12 @@ fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx) -> String {
         }
 
         // ── Passthrough nodes ─────────────────────────────────────────────────
-        QueryExpr::Dedup { input, .. }
-        | QueryExpr::Project { input, .. }
-        | QueryExpr::WindowFunc { input, .. } => promql_from_qe(input, ctx),
-
-        QueryExpr::Subquery { expr, .. } => promql_from_qe(expr, ctx),
+        QueryExpr::Distinct { input, .. }
+        | QueryExpr::Project { input, .. } => promql_from_qe(input, ctx),
 
         QueryExpr::LetBinding { body, .. } => promql_from_qe(body, ctx),
 
         // ── Join / SetOp — serialise the outer / left branch ─────────────────
-        QueryExpr::JoinSketch { outer, .. } => promql_from_qe(outer, ctx),
         QueryExpr::Join       { left,  .. } => promql_from_qe(left,  ctx),
         QueryExpr::SetOp      { left,  .. } => promql_from_qe(left,  ctx),
     }
