@@ -90,7 +90,6 @@ pub mod workload;
 // follow-up task.
 /// PromQL → warm-tier candidate analyzer. Phase-9 unification of the
 /// per-`Capability` dispatch knowledge that previously lived in
-/// `asap-query-engine/src/engines/warm_tier/promql_extract.rs`. See
+/// `asap-query-engine/src/query-engines/asap_query/warm_tier/promql_extract.rs`. See
 /// the module docs for the full PromQL shape coverage matrix.
 pub mod warm_tier_analysis;
-

@@ -605,7 +605,7 @@ timeline_for_metric("latency", day1-1h, day1+1h)
 Query engine uses this to dispatch per-segment. DB provides it from an
 in-memory BTree; cost is one HashMap lookup + BTree range scan,
 nanoseconds. Implemented at `schema.rs`; used by
-`engines/timeline_dispatch.rs`.
+`query-engines/timeline_dispatch.rs`.
 
 ### 7.3 Per-segment query dispatch
 
@@ -650,7 +650,7 @@ fall-through to the exact DB for the missing segment. Crucially, this
 failure mode is **explicit** — the user knows they are seeing a
 schema-change artifact.
 
-Implemented in `engines/timeline_dispatch.rs`. Coverage-driven branching
+Implemented in `query-engines/timeline_dispatch.rs`. Coverage-driven branching
 (the `match` in the snippet above) is present in skeleton form; the
 `Coverage::BackfillInProgress` → wait-or-fallback policy is still a
 follow-up (see roadmap §16 "Phase 5f").

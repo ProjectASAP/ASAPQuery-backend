@@ -1,5 +1,6 @@
 pub mod data_model;
 pub mod drivers;
+#[path = "query-engines/mod.rs"]
 pub mod engines;
 pub mod precompute_engine;
 pub mod precompute_operators;

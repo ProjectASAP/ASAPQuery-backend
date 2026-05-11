@@ -17,7 +17,7 @@
 //!   engine answers a given `(query, metric_storage)` pair.
 //!
 //! Step-1 of the JSONL deprecation refactor lifted these out of
-//! `data_model/backend_storage_routing.rs` and `engines/router.rs`
+//! `data_model/backend_storage_routing.rs` and `query-engines/router.rs`
 //! into this dedicated `routing/` directory so the HTTP handler's
 //! dispatch surface is a single import (`use crate::routing::*`)
 //! instead of straddling two unrelated module trees.

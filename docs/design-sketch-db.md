@@ -103,7 +103,7 @@ partially wired; "❌ not started" means spec only.
 | 6.3 | Write-side schema barrier `is_writable(agg_id)` | ✅ | called in `ingest_handler.rs` |
 | 6.4 | `AccuracyProfile` on schema | ✅ | `stores/sketch_db/accuracy.rs` |
 | 7.2 | `timeline_for_metric(...)` | ✅ | `schema.rs:594` |
-| 7.3 | Cross-schema query combiner | ✅ | `engines/timeline_dispatch.rs` |
+| 7.3 | Cross-schema query combiner | ✅ | `query-engines/timeline_dispatch.rs` |
 | 8 | Incremental ingest (OTLP / Prometheus / VictoriaMetrics / Kafka drivers) | ✅ | `drivers/ingest/` |
 | 8.4 | Watermark + lateness policy | ✅ | `allowed_lateness_ms` + `LateSampleHandlingPolicy` |
 | 9 | Semantic compaction (LSM levels) | ❌ | comment-level only |

@@ -6,7 +6,7 @@
 //! selected `GORILLA1` chunks via the [`asap_gorilla`] crate
 //! (`ASAPCollector` PR #281).
 //!
-//! Step-1 refactor (`refactor: tier-co-locate engines/{simple,gorilla}/`)
+//! Step-1 refactor (`refactor: tier-co-locate query-engines/{simple,gorilla}/`)
 //! folded the previous `ColdStore` trait + `RawSample`/`ChunkRef`
 //! types into this module. The legacy JSONL leg
 //! (`LocalFsColdStore`, `parse_jsonl`, `ColdJsonlFallback`) was
