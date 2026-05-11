@@ -3585,16 +3585,21 @@ fn warm_tier_result_to_query_result(
 
     let mut elements: Vec<RangeVectorElement> = Vec::with_capacity(result.series.len());
     for (label_values, samples) in result.series {
-        // `KeyByLabelValues` is a `Vec<String>` carrying VALUES only.
-        // We project the BTreeMap's values in key-sorted order
-        // (BTreeMap iteration order matches the `group_by_keys`
-        // BTreeSet iteration order, so the result preserves the
-        // sketch instance's group-by-key projection without
-        // re-emitting the keys).
-        let labels = KeyByLabelValues::new_with_labels(
-            label_values.into_values().collect::<Vec<_>>(),
-        );
-        let mut element = RangeVectorElement::new(labels);
+        // `KeyByLabelValues` is a `Vec<String>` carrying VALUES only;
+        // the serializer pairs them with KEYS from a query-scoped
+        // `KeyByLabelNames`. For most queries the keys ARE the
+        // query's group-by clause, so the default path works. But
+        // warm-tier `topk` synthesizes an `"item"` key (the top-k
+        // entry name) that the original query's group-by doesn't
+        // carry — without an override the serializer drops it and
+        // the response shows `"metric": {}`. Project the BTreeMap's
+        // VALUES in key-sorted order (BTreeMap iteration is
+        // key-sorted), and stash the BTreeMap's KEYS in the
+        // per-element override so the serializer can pair them
+        // correctly.
+        let (keys, values): (Vec<String>, Vec<String>) = label_values.into_iter().unzip();
+        let labels = KeyByLabelValues::new_with_labels(values);
+        let mut element = RangeVectorElement::new(labels).with_label_keys_override(keys);
         for (window_end_ms, value) in samples {
             // `window_end_ms` is i64 from the index; cast to u64
             // for the wire format (window_end is monotonic + post-

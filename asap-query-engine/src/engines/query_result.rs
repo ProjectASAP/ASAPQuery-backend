@@ -181,6 +181,16 @@ pub struct RangeVector {
 pub struct RangeVectorElement {
     pub labels: KeyByLabelValues,
     pub samples: Vec<Sample>,
+    /// Optional per-element label-key override. When `Some`, the
+    /// HTTP serializer uses these keys for the PromQL response's
+    /// `"metric"` object instead of the query-scoped
+    /// `KeyByLabelNames` argument. Used by warm-tier `topk` (whose
+    /// reducer synthesizes an `"item"` key not present in the
+    /// query's group-by clause) and other adapters that materialize
+    /// labels the caller doesn't know about. `None` for everyone
+    /// else — the existing serializer path is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_keys_override: Option<Vec<String>>,
 }
 
 /// A single sample (timestamp, value) pair
@@ -201,7 +211,15 @@ impl RangeVectorElement {
         Self {
             labels,
             samples: Vec::new(),
+            label_keys_override: None,
         }
+    }
+
+    /// Attach a per-element label-key override (see field doc on
+    /// `RangeVectorElement::label_keys_override`).
+    pub fn with_label_keys_override(mut self, keys: Vec<String>) -> Self {
+        self.label_keys_override = Some(keys);
+        self
     }
 
     pub fn add_sample(&mut self, timestamp: u64, value: f64) {
