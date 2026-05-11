@@ -503,6 +503,45 @@ fn subtree_cost_bundled(
             let child_cost = subtree_cost_bundled(child, &extended, &extended_scope)?;
             Ok(bind_cost + child_cost)
         }
+        // A-variants lifted in Batch 2 of the legacy_expr migration — no
+        // canonical-cost consumer exercises them yet. Fall through to a
+        // child-walk-only contribution (0 cost added at this node) until
+        // the per-node cost primitives land alongside their consumers.
+        // TODO(legacy_expr-migration): add proper node_cost_* helpers for
+        // Filter/Project/Partition/Distinct/Merge/Join/SetOp/Sort/Limit/BinaryOp.
+        _ => walk_children_zero_cost_bundled(expr, binding_costs, schema_scope),
+    }
+}
+
+/// Per Batch 2 — walks A-variant children for cost without charging the
+/// node itself. Drops out cleanly when those variants gain proper cost
+/// primitives. Placement here (rather than inline) keeps the main match
+/// arms readable.
+#[allow(dead_code)]
+fn walk_children_zero_cost_bundled(
+    expr: &QueryExpr,
+    binding_costs: &HashMap<String, f64>,
+    schema_scope: &BindingScope,
+) -> Result<f64, QueryExprError> {
+    match expr {
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Partition { child, .. }
+        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. } => subtree_cost_bundled(child, binding_costs, schema_scope),
+        QueryExpr::Merge { children } => children
+            .iter()
+            .map(|c| subtree_cost_bundled(c, binding_costs, schema_scope))
+            .sum(),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+            let l = subtree_cost_bundled(left, binding_costs, schema_scope)?;
+            let r = subtree_cost_bundled(right, binding_costs, schema_scope)?;
+            Ok(l + r)
+        }
+        _ => Ok(0.0),
     }
 }
 
@@ -543,6 +582,38 @@ fn subtree_cost_standalone(
             let child_cost = subtree_cost_standalone(child, &extended, &extended_scope)?;
             Ok(bind_cost + child_cost)
         }
+        // See Batch-2 note on subtree_cost_bundled — same story here.
+        _ => walk_children_zero_cost_standalone(expr, binding_costs, schema_scope),
+    }
+}
+
+#[allow(dead_code)]
+fn walk_children_zero_cost_standalone(
+    expr: &QueryExpr,
+    binding_costs: &HashMap<String, f64>,
+    schema_scope: &BindingScope,
+) -> Result<f64, QueryExprError> {
+    match expr {
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Partition { child, .. }
+        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. } => {
+            subtree_cost_standalone(child, binding_costs, schema_scope)
+        }
+        QueryExpr::Merge { children } => children
+            .iter()
+            .map(|c| subtree_cost_standalone(c, binding_costs, schema_scope))
+            .sum(),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+            let l = subtree_cost_standalone(left, binding_costs, schema_scope)?;
+            let r = subtree_cost_standalone(right, binding_costs, schema_scope)?;
+            Ok(l + r)
+        }
+        _ => Ok(0.0),
     }
 }
 

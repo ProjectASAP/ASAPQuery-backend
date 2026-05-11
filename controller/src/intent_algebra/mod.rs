@@ -96,6 +96,9 @@ pub use agg_intent::AggIntent;
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use lower::{lower_parsed_query, LoweringError};
 pub use query_expr::{
-    BindingScope, HavingPredicate, LabelFilter, QueryExpr, QueryExprError, Source, WindowKind,
+    from_legacy_scalar, BinaryOpKind, BindingScope, ColumnRef, GroupSide, HavingPredicate,
+    JoinKind, LabelFilter, LiteralValue, PartitionKeys, Predicate, ProjectItem, QueryExpr,
+    QueryExprError, SetOpKind, SortKey, Source, VectorGrouping, VectorMatch, VectorMatchKind,
+    WindowKind,
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};

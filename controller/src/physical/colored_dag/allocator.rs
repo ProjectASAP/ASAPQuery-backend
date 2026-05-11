@@ -224,6 +224,22 @@ impl ThreeStageWalker {
                 .get(name.as_str())
                 .copied()
                 .ok_or_else(|| AllocateError::UnresolvedRef(name.as_str().to_string())),
+            // A-variants lifted in Batch 2 of the legacy_expr migration.
+            // No colored-DAG consumer constructs them today; conservatively
+            // route to the Edge stage (matches the per-row Scan/Window
+            // policy) so the build is total. The proper stage-placement
+            // rules for Filter/Project/Partition/Distinct/Merge/Join/SetOp/
+            // Sort/Limit/BinaryOp land alongside their consumers in
+            // follow-up batches.
+            QE::Filter { .. }
+            | QE::Project { .. }
+            | QE::Partition { .. }
+            | QE::Distinct { .. }
+            | QE::Sort { .. }
+            | QE::Limit { .. } => Ok(StageId::Edge),
+            QE::Merge { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
+                Ok(StageId::Backend)
+            }
         }
     }
 }
