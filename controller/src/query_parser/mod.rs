@@ -29,11 +29,17 @@
 
 pub mod promql;
 pub mod sql;
+pub mod language;
+
+// Re-export the L1 language façade at this module's top so call sites
+// that historically used `crate::query_language::*` (folded in by the
+// 2026-05 refactor) keep a one-level import.
+pub use language::{Language, LanguageAst, ParseError, PromQLLanguage, SqlLanguage, ElasticDslLanguage};
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::algebra::expr::{AggIntent, QueryExpr};
+use crate::intent_algebra::legacy_expr::{AggIntent, QueryExpr};
 use crate::types::AggType;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
@@ -100,7 +106,7 @@ pub fn parse_query_expr(query: &str) -> anyhow::Result<QueryExpr> {
         promql::parse_promql_expr(q)?
     };
     // Layer 2 → Layer 3 lowering (shared by both languages).
-    Ok(crate::algebra::lower::lower_to_sketch_algebra(layer2))
+    Ok(crate::intent_algebra::legacy_lower::lower_to_sketch_algebra(layer2))
 }
 
 /// Parse a raw query string (PromQL or SQL) into a [`ParsedQuery`].
@@ -136,7 +142,7 @@ struct QeCollector {
 
 impl QeCollector {
     fn visit(&mut self, expr: &QueryExpr) {
-        use crate::algebra::expr::{FilterOp, FilterVal, LiteralValue, ScalarExpr};
+        use crate::intent_algebra::legacy_expr::{FilterOp, FilterVal, LiteralValue, ScalarExpr};
         match expr {
             QueryExpr::Source(s) => {
                 if self.metric_name.is_none() {
@@ -168,7 +174,7 @@ impl QeCollector {
             }
             QueryExpr::WindowedAgg { agg, window, input, .. } => {
                 if self.time_window.is_none() {
-                    if let crate::algebra::expr::WindowKind::Tumbling { size } = &window.kind {
+                    if let crate::intent_algebra::legacy_expr::WindowKind::Tumbling { size } = &window.kind {
                         self.time_window = Some(*size);
                     }
                 }
@@ -223,8 +229,8 @@ impl QeCollector {
         }
     }
 
-    fn collect_agg_func_with_group(&mut self, func: &crate::algebra::expr::AggFunc, has_group_by: bool) {
-        use crate::algebra::expr::AggFunc;
+    fn collect_agg_func_with_group(&mut self, func: &crate::intent_algebra::legacy_expr::AggFunc, has_group_by: bool) {
+        use crate::intent_algebra::legacy_expr::AggFunc;
         // COUNT(*) without GROUP BY → exact (no sketch benefit), unless inside topk
         // where Count means frequency counting.
         if matches!(func, AggFunc::Count) && !has_group_by && !self.inside_topk {
@@ -234,8 +240,8 @@ impl QeCollector {
         self.collect_agg_func(func);
     }
 
-    fn collect_agg_func(&mut self, func: &crate::algebra::expr::AggFunc) {
-        use crate::algebra::expr::AggFunc;
+    fn collect_agg_func(&mut self, func: &crate::intent_algebra::legacy_expr::AggFunc) {
+        use crate::intent_algebra::legacy_expr::AggFunc;
         match func {
             AggFunc::CountDistinct => {
                 if !self.agg_types.contains(&AggType::Cardinality) {
@@ -353,10 +359,10 @@ impl QeCollector {
 }
 
 fn collect_filters_from_scalar(
-    pred: &crate::algebra::expr::ScalarExpr,
+    pred: &crate::intent_algebra::legacy_expr::ScalarExpr,
     out:  &mut HashMap<String, String>,
 ) {
-    use crate::algebra::expr::{BinaryOpKind, LiteralValue, ScalarExpr};
+    use crate::intent_algebra::legacy_expr::{BinaryOpKind, LiteralValue, ScalarExpr};
     match pred {
         ScalarExpr::BinaryOp { op: BinaryOpKind::Eq, lhs, rhs } => {
             if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v))) =
@@ -456,7 +462,7 @@ mod tests {
 #[cfg(test)]
 mod doc_verify_all {
     use super::*;
-    use crate::algebra::expr::*;
+    use crate::intent_algebra::legacy_expr::*;
 
     #[test]
     fn example4_promql_quantile() {

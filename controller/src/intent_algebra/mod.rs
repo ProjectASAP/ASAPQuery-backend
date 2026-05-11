@@ -79,6 +79,17 @@ pub mod lower;
 pub mod query_expr;
 pub mod schema;
 
+// Refactor 2026-05 (`refactor/controller-layered-cleanup`): the
+// pre-existing legacy L3+ IR formerly at `controller/src/algebra/expr.rs`
+// + `controller/src/algebra/lower.rs` lives here while a separate
+// follow-up unifies it with the canonical `query_expr` / `lower`
+// modules above. These two `legacy_*` modules carry the heavy
+// `QueryExpr` / `AggIntent` types used by the planner, allocator,
+// physical planner, query_parser, and language_logical_plan modules
+// today.
+pub mod legacy_expr;
+pub mod legacy_lower;
+
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
 pub use agg_intent::AggIntent;

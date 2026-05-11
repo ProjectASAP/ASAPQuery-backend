@@ -9,7 +9,6 @@ use controller::metrics_exposer;
 use controller::monitor;
 use controller::opamp;
 use controller::planner;
-use controller::query_language;
 use controller::query_parser;
 use controller::replan;
 use controller::runtime_samples;
@@ -1392,7 +1391,7 @@ mod api_tests {
     async fn rollback_no_previous_returns_400() {
         let (st, app) = test_app();
         // Seed one plan directly.
-        use crate::planner::rules::RulesPlanner;
+        use crate::optimizer::rules::RulesPlanner;
         let wl = crate::types::QueryWorkload {
             metric_name: "m".into(),
             label_filters: std::collections::HashMap::new(),

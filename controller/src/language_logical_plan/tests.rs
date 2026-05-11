@@ -1,8 +1,8 @@
 //! Tests for L2 lowering (`language_logical_plan`).
 
 use super::*;
-use crate::algebra::expr::{AggIntent, QueryExpr};
-use crate::query_language::{Language, LanguageAst, PromQLLanguage};
+use crate::intent_algebra::legacy_expr::{AggIntent, QueryExpr};
+use crate::query_parser::language::{Language, LanguageAst, PromQLLanguage};
 use crate::types::AggType;
 use crate::types_v2::QueryLanguage;
 
@@ -68,10 +68,10 @@ fn lower_unsupported_language_errors_cleanly() {
     // smoke test is: stub backends fail at L1 with `Unimplemented`, and
     // the type system rules out passing them to L2 lowering. We assert
     // that contract here.
-    let err = crate::query_language::SqlLanguage.parse("SELECT 1").unwrap_err();
+    let err = crate::query_parser::language::SqlLanguage.parse("SELECT 1").unwrap_err();
     assert!(matches!(
         err,
-        crate::query_language::ParseError::Unimplemented(_)
+        crate::query_parser::language::ParseError::Unimplemented(_)
     ));
 }
 

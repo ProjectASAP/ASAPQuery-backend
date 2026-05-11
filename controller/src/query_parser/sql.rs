@@ -48,7 +48,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 
-use crate::algebra::expr::{
+use crate::intent_algebra::legacy_expr::{
     AggFunc, AggItem as AlgAggItem, BinaryOpKind, ColumnRef, JoinKind, LiteralValue,
     ProjectItem, QueryExpr, ScalarExpr, SetOpKind, SortKey, SourceSpec,
 };
@@ -644,7 +644,7 @@ fn expr_to_col_name(expr: &Expr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_sql_expr;
-    use crate::algebra::expr::QueryExpr;
+    use crate::intent_algebra::legacy_expr::QueryExpr;
     use crate::types::AggType;
 
     fn parse(sql: &str) -> QueryExpr {
