@@ -92,6 +92,15 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
 /// is tolerable — the candidates are subsequently classified, and on
 /// `Ghost` / `Unknown` outcomes the query falls through to the archive
 /// engine via the EngineRouter's `CapabilityMiss` failover.
+/// Legacy `(metric_name, group_by_keys)` extractor — superseded by
+/// `controller::warm_tier_analysis::analyze_promql_for_warm_tier`,
+/// which returns the full `WarmTierAnalysis` (capability, function
+/// name + args, range). Kept around as `#[allow(dead_code)]` because
+/// downstream code (range-query pipeline, range-step planner) still
+/// uses bare `(metric, keys)` projections for sid candidate filtering;
+/// once those callers also migrate to `WarmTierAnalysis`, this can be
+/// deleted in a follow-up.
+#[allow(dead_code)]
 fn extract_metric_and_label_keys(
     query: &str,
 ) -> Option<(String, std::collections::BTreeSet<String>)> {
@@ -3622,146 +3631,168 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
         &self,
         query: &str,
     ) -> Result<crate::engines::query_result::QueryResult, crate::engines::EngineError> {
-        // Phase 5 wire-in (refactor 2026-05) — classify against the
-        // sketch-warm-tier index BEFORE handing the query to
-        // `handle_query`. The classification is intentionally crude
-        // because the warm-tier sketch reducer is still a stub: as soon
-        // as ANY sid is `Ghost` / `Unknown`, OR no instance even matches
-        // the metric / group-by KEY set, we surface
-        // `EngineError::CapabilityMiss(SketchWarmTier, ...)` so the
-        // EngineRouter (Phase 6) fails over to the archive engine.
+        // Phase 9 controller-unification (2026-05) — the warm-tier
+        // hook is now a thin driver around the controller's
+        // `analyze_promql_for_warm_tier`. The analyzer is the single
+        // owner of "is this PromQL warm-tier-answerable" knowledge.
+        // We drop into one of three branches:
         //
-        // When `instances_matching` returns sids that all classify as
-        // `Hit`, we still fall through to `handle_query`'s legacy code
-        // path — wiring per-Capability sketch reducers on top of
-        // `SketchIndex.query_range` is out of scope for this PR and
-        // tracked as a follow-up. The "hybrid stitch" covering
-        // `[t0..t1']` from warm + `[t1'..t1]` from archive is also
-        // deferred (`QueryResult` would need timestamp coverage
-        // metadata to express it).
+        // 1. `WarmTierAnalysis::unsupported` is `Some(_)` — the
+        //    PromQL shape isn't warm-tier-servable. Surface as
+        //    `EngineError::CapabilityMiss(SketchWarmTier, …)` with the
+        //    structured `UnsupportedReason` in the detail string. The
+        //    EngineRouter fails over to the archive engine. This
+        //    covers all of:
+        //      * `MissReason::UnsupportedFunction(_)` (rate, irate,
+        //        increase, etc.) → cold tier (archive)
+        //      * `MissReason::UnsupportedComposition(_)` (sum-by,
+        //        topk-over-rate, etc.) → cold tier
+        //      * `MissReason::NoCallNodeFound` (bare selector) →
+        //        cold tier (archive answers raw selectors)
+        //      * `MissReason::UnparseablePromql(_)` → cold tier
+        //        (archive's parser may be more permissive, or it'll
+        //        also reject and the user sees the error)
+        //
+        // 2. `WarmTierAnalysis::candidates` is populated, but ANY
+        //    candidate's `instances_matching` returns empty OR a
+        //    sid that classifies as `Ghost`/`Unknown` — surface
+        //    as CapabilityMiss. The EngineRouter falls over.
+        //
+        // 3. All candidates resolve to all-`Hit` sids — dispatch
+        //    each to the per-`Capability` sketch reducer. Today's
+        //    semantic: ANY candidate-level reducer error → fall
+        //    over to archive (no per-candidate hybrid stitch yet —
+        //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
-            if let Some((metric_name, required_keys)) =
-                extract_metric_and_label_keys(query)
-            {
-                let candidates = idx.instances_matching(&metric_name, &required_keys);
-                if candidates.is_empty() {
+            let analysis = controller::warm_tier_analysis::analyze_promql_for_warm_tier(query);
+
+            // Branch 1 — the controller analyzer rejects the shape.
+            if let Some(reason) = &analysis.unsupported {
+                return Err(crate::engines::EngineError::capability_miss(
+                    asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                    format!(
+                        "SketchWarmTier analyzer rejected `{query}`: {reason:?} — \
+                         failing over to archive"
+                    ),
+                ));
+            }
+            if analysis.candidates.is_empty() {
+                // Defensive — `is_warm_tier_answerable` would have
+                // caught this; analyzer guarantees `unsupported.is_some()`
+                // when `candidates.is_empty()` but we keep the
+                // belt-and-braces miss-path for safety.
+                return Err(crate::engines::EngineError::capability_miss(
+                    asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                    format!(
+                        "SketchWarmTier analyzer produced no warm-tier candidates for \
+                         `{query}` — failing over to archive"
+                    ),
+                ));
+            }
+
+            // Branch 2 + 3 — resolve each candidate's sids and
+            // dispatch the reducer. Today this is single-candidate
+            // for every supported PromQL shape; the loop is here
+            // for the per-candidate hybrid-stitch follow-up.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            // Time bounds: the trait's `execute(&str)` adapter
+            // doesn't carry an explicit range today (it's an
+            // instant-query surface). For each candidate, prefer the
+            // candidate's `range_seconds` (extracted from `[5m]` /
+            // `[30s]` selectors); fall back to a 5-minute default
+            // for instant-vector candidates (range_seconds == 0).
+            const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
+
+            let reducer = crate::engines::warm_tier::SketchReducer::new(idx);
+            // Multi-candidate aggregation is deferred (single-result
+            // shapes today). On the first reducer error we surface
+            // CapabilityMiss; on Ok we keep the result for the
+            // hybrid-stitch path below. (When more than one
+            // candidate is supported, a follow-up will fold
+            // per-candidate WarmTierResults.)
+            let mut combined_result: Option<crate::engines::warm_tier::WarmTierResult> = None;
+            let mut combined_t0: u64 = u64::MAX;
+
+            for candidate in &analysis.candidates {
+                let sids = idx.instances_matching(
+                    &candidate.metric_name,
+                    &candidate.group_by_keys,
+                );
+                if sids.is_empty() {
                     return Err(crate::engines::EngineError::capability_miss(
                         asap_types::StorageBackend::SketchWarmTier.data_source_id(),
                         format!(
-                            "SketchWarmTier has no instance for metric `{metric_name}` \
-                             with group_by_keys ⊇ {:?}",
-                            required_keys
+                            "SketchWarmTier has no instance for metric `{}` \
+                             with group_by_keys ⊇ {:?} (analyzer required \
+                             {:?}) — failing over to archive",
+                            candidate.metric_name,
+                            candidate.group_by_keys,
+                            candidate.required_capability,
                         ),
                     ));
                 }
-                let mut all_hit = true;
-                for sid in &candidates {
+
+                // Verify each sid carries the analyzer's required
+                // capability (the controller's
+                // `Capability::is_satisfied_by` honors `Any` semantics).
+                let required: crate::stores::sketch_db::sketch_index::Capability =
+                    candidate.required_capability.clone().into();
+                let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
+                for sid in &sids {
                     match idx.classify(*sid) {
                         crate::stores::sketch_db::sketch_index::SidLookup::Hit => {}
                         crate::stores::sketch_db::sketch_index::SidLookup::Ghost
                         | crate::stores::sketch_db::sketch_index::SidLookup::Unknown => {
-                            all_hit = false;
-                            break;
+                            return Err(crate::engines::EngineError::capability_miss(
+                                asap_types::StorageBackend::SketchWarmTier.data_source_id(),
+                                format!(
+                                    "SketchWarmTier ghost/unknown sid {sid} for metric \
+                                     `{}` — failing over to archive",
+                                    candidate.metric_name
+                                ),
+                            ));
                         }
                     }
+                    let meta = match idx.instance(*sid) {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    if required.is_satisfied_by(&meta.capability) {
+                        hit_sids.push(*sid);
+                    }
                 }
-                if !all_hit {
+                if hit_sids.is_empty() {
                     return Err(crate::engines::EngineError::capability_miss(
                         asap_types::StorageBackend::SketchWarmTier.data_source_id(),
                         format!(
-                            "SketchWarmTier ghost/unknown sid for metric `{metric_name}` \
-                             — failing over to archive"
+                            "SketchWarmTier has no sid satisfying capability \
+                             {:?} for metric `{}` — failing over to archive",
+                            candidate.required_capability, candidate.metric_name
                         ),
                     ));
                 }
 
-                // All sids `Hit` → dispatch to the per-Capability
-                // sketch reducer (`feat/sketch-reducer-warm-tier-evaluator`,
-                // 2026-05). The reducer decodes each window's sketch
-                // state via `asap_sketchlib`, evaluates the
-                // canonical query (`quantile`, `estimate`, …), and
-                // returns per-series timestamped scalars that we
-                // adapt to `QueryResult::Matrix`.
-                //
-                // On any failure mode the reducer surfaces, we
-                // translate to `CapabilityMiss` so the
-                // `EngineRouter` falls over to archive — including
-                // `UnsupportedFunction`/`UnsupportedCapability`
-                // (the user's PromQL doesn't map onto a warm-tier
-                // capability), `DeserializeFailure` (defensive —
-                // the warm-tier state didn't decode; archive can
-                // answer truthfully), and `NoData` (no samples in
-                // window).
-                let call = crate::engines::warm_tier::extract_promql_call(query);
-                let (function_name, function_args) = match &call {
-                    Some(c) if !c.func.is_empty() => (c.func.clone(), c.args.clone()),
-                    _ => {
-                        return Err(crate::engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchWarmTier.data_source_id(),
-                            format!(
-                                "SketchWarmTier reducer cannot extract a PromQL function \
-                                 from `{query}` — failing over to archive"
-                            ),
-                        ));
-                    }
+                let lookback_ms = if candidate.range_seconds > 0 {
+                    candidate.range_seconds.saturating_mul(1000)
+                } else {
+                    DEFAULT_LOOKBACK_MS
                 };
-
-                // Time bounds: the trait's `execute(&str)` adapter
-                // doesn't carry an explicit range today (it's an
-                // instant-query surface). Use `[now - default_range,
-                // now]` matching how `handle_query` used to pick
-                // its window. Phase-5 hybrid stitch (warm + archive
-                // for ranges that exceed warm coverage) is a
-                // follow-up.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                // Default lookback: 5 minutes. Engine code that
-                // wants a precise range (range-query pipeline)
-                // should call into `SketchReducer::evaluate`
-                // directly with its own bounds.
-                let lookback_ms: u64 = 5 * 60 * 1000;
                 let t0_ms = now_ms.saturating_sub(lookback_ms);
+                if t0_ms < combined_t0 {
+                    combined_t0 = t0_ms;
+                }
 
-                let reducer = crate::engines::warm_tier::SketchReducer::new(idx);
-                match reducer.evaluate(
-                    &candidates,
-                    &function_name,
-                    &function_args,
+                let result = match reducer.evaluate(
+                    &hit_sids,
+                    &candidate.function,
+                    &candidate.function_args,
                     t0_ms,
                     now_ms,
                 ) {
-                    Ok(result) => {
-                        // Phase-5 hybrid stitch — if the warm tier
-                        // only covers a sub-range of `[t0, t1]` and an
-                        // archive engine is wired, fetch the missing
-                        // prefix / suffix and merge by
-                        // `(label_values, timestamp)`. Warm-tier
-                        // values win on overlap (warm is approximate
-                        // but more recent; archive is the source of
-                        // truth for older data).
-                        let warm_qr = warm_tier_result_to_query_result(result.clone(), now_ms);
-                        if let (Some((cov_lo, cov_hi)), Some(archive)) =
-                            (result.coverage, self.archive_engine.as_ref())
-                        {
-                            if cov_lo > t0_ms || cov_hi < now_ms {
-                                let archive_qr = archive.execute(query).await;
-                                if let Ok(archive_qr) = archive_qr {
-                                    return Ok(stitch_warm_and_archive(
-                                        warm_qr,
-                                        archive_qr,
-                                        cov_lo,
-                                        cov_hi,
-                                    ));
-                                }
-                                // On archive error, fall back to the
-                                // warm-only answer (router can decide
-                                // on a higher-level retry).
-                            }
-                        }
-                        return Ok(warm_qr);
-                    }
+                    Ok(r) => r,
                     Err(crate::engines::warm_tier::WarmTierError::UnsupportedFunction(
                         name,
                     )) => {
@@ -3814,11 +3845,6 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                         sid,
                         sketch_kind,
                     }) => {
-                        // Top-k against a vanilla CMS / CountSketch
-                        // (no embedded heap) — the reducer can't
-                        // enumerate heavy hitters without the
-                        // external item universe. Fall over to
-                        // archive, which can scan raw samples.
                         return Err(crate::engines::EngineError::capability_miss(
                             asap_types::StorageBackend::SketchWarmTier.data_source_id(),
                             format!(
@@ -3828,7 +3854,37 @@ impl crate::routing::engine_router::QueryEngine for SimpleEngine {
                             ),
                         ));
                     }
+                };
+                combined_result = Some(result);
+            }
+
+            // All candidates resolved successfully — adapt to
+            // QueryResult and run the hybrid-stitch path if archive
+            // is wired and warm coverage is narrower than request.
+            if let Some(result) = combined_result {
+                let warm_qr = warm_tier_result_to_query_result(result.clone(), now_ms);
+                if let (Some((cov_lo, cov_hi)), Some(archive)) =
+                    (result.coverage, self.archive_engine.as_ref())
+                {
+                    let stitch_t0 = if combined_t0 == u64::MAX {
+                        now_ms.saturating_sub(DEFAULT_LOOKBACK_MS)
+                    } else {
+                        combined_t0
+                    };
+                    if cov_lo > stitch_t0 || cov_hi < now_ms {
+                        let archive_qr = archive.execute(query).await;
+                        if let Ok(archive_qr) = archive_qr {
+                            return Ok(stitch_warm_and_archive(
+                                warm_qr,
+                                archive_qr,
+                                cov_lo,
+                                cov_hi,
+                            ));
+                        }
+                        // On archive error, fall back to warm-only.
+                    }
                 }
+                return Ok(warm_qr);
             }
         }
 
@@ -6172,13 +6228,17 @@ mod warm_tier_classify_tests {
     #[tokio::test]
     async fn execute_returns_capability_miss_when_classify_is_ghost() {
         // Register instance metadata but never call append_sample → the
-        // sid classifies as Ghost. Adapter must short-circuit to
-        // CapabilityMiss so the EngineRouter (Phase 6) fails over.
+        // sid classifies as Ghost. The Phase-9 controller-unified
+        // adapter expects a call-shaped query (the analyzer rejects
+        // bare selectors with NoCallNodeFound BEFORE any sid lookup);
+        // use `quantile_over_time(...)` so the analyzer accepts the
+        // shape and the per-candidate sid classification surfaces
+        // the ghost miss.
         let idx = Arc::new(SketchIndex::new());
         idx.register(dd_meta(1, "http_latency_ms", &["zone"]));
         let engine = build_engine_with_index(idx);
         let err = engine
-            .execute("http_latency_ms{zone=\"z0\"}")
+            .execute("quantile_over_time(0.99, http_latency_ms{zone=\"z0\"}[5m])")
             .await
             .expect_err("ghost classification must yield CapabilityMiss");
         match err {
@@ -6197,21 +6257,17 @@ mod warm_tier_classify_tests {
     }
 
     #[tokio::test]
-    async fn execute_proceeds_to_handle_query_when_all_sids_hit() {
-        // Register an instance AND append a sample so the sid Hits.
-        //
-        // Pre-`feat/sketch-reducer-warm-tier-evaluator` (this PR): the
-        // adapter fell through to `handle_query`, producing the legacy
-        // "no compatible aggregation" miss for an empty SimpleMapStore.
-        //
-        // Post-PR: the adapter dispatches to the warm-tier
-        // `SketchReducer`. A bare vector selector (no PromQL call)
-        // surfaces as the warm-tier-specific "cannot extract a PromQL
-        // function" miss (the reducer can only answer call-shaped
-        // queries; raw selectors fall over to archive). The contract
-        // verified here is still "Hit does NOT short-circuit to the
-        // warm-tier ghost/unknown miss"; only the downstream miss
-        // detail changes.
+    async fn execute_rejects_bare_selector_via_analyzer() {
+        // Phase-9 controller-unified behavior: a bare vector selector
+        // (no call node) is rejected by
+        // `controller::warm_tier_analysis::analyze_promql_for_warm_tier`
+        // with `UnsupportedReason::NoCallNodeFound` BEFORE the sid
+        // index is even consulted. The archive engine answers raw
+        // selectors directly, so this is the right place for the
+        // routing decision. Replaces the legacy
+        // `execute_proceeds_to_handle_query_when_all_sids_hit` test —
+        // the new behavior is "bare selectors short-circuit on shape
+        // rejection, regardless of index state".
         let idx = Arc::new(SketchIndex::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
@@ -6229,17 +6285,13 @@ mod warm_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    !detail.contains("ghost") && !detail.contains("Ghost"),
-                    "Hit path must NOT short-circuit to the ghost-miss path: {detail}"
-                );
-                assert!(
-                    detail.contains("cannot extract a PromQL function")
-                        || detail.contains("no compatible aggregation"),
-                    "Hit path produced expected post-Hit miss: {detail}"
+                    detail.contains("NoCallNodeFound")
+                        || detail.contains("analyzer rejected"),
+                    "expected NoCallNodeFound analyzer rejection: {detail}"
                 );
             }
             other => panic!(
-                "expected post-Hit CapabilityMiss, got {other:?}"
+                "expected analyzer-rejected CapabilityMiss, got {other:?}"
             ),
         }
     }

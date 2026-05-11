@@ -46,3 +46,8 @@ pub mod stage_split;
 pub mod store;
 pub mod types;
 pub mod types_v2;
+/// PromQL → warm-tier candidate analyzer. Phase-9 unification of the
+/// per-`Capability` dispatch knowledge that previously lived in
+/// `asap-query-engine/src/engines/warm_tier/promql_extract.rs`. See
+/// the module docs for the full PromQL shape coverage matrix.
+pub mod warm_tier_analysis;

@@ -65,6 +65,91 @@ pub enum SketchKindHandle {
     CmsWithHeap,
 }
 
+// ── Controller ↔ backend Capability adapters ─────────────────────────────────
+//
+// `controller::warm_tier_analysis::Capability` is the canonical
+// PromQL-shape-recognition output (the controller is the single owner
+// of "is this PromQL warm-tier-answerable" knowledge — see
+// `controller/src/warm_tier_analysis.rs`). The backend's `Capability`
+// here is the source-of-truth for INDEXED sketch instances (driven by
+// the OTLP receive path). The two enums are kept structurally
+// identical and the backend adapts at the boundary so the controller
+// crate stays free of any backend dep.
+//
+// `SketchKindHandle::Any` from the controller side maps to ALL
+// concrete handles when used in capability matching — the backend's
+// `is_compatible_with` helper consumes that semantics so callers don't
+// need to enumerate the cross product.
+
+impl From<controller::warm_tier_analysis::SketchKindHandle> for SketchKindHandle {
+    fn from(h: controller::warm_tier_analysis::SketchKindHandle) -> Self {
+        use controller::warm_tier_analysis::SketchKindHandle as C;
+        match h {
+            C::DDSketch => SketchKindHandle::DDSketch,
+            C::Kll => SketchKindHandle::Kll,
+            C::Hll => SketchKindHandle::Hll,
+            C::CountSketch => SketchKindHandle::CountSketch,
+            C::CountMin => SketchKindHandle::CountMin,
+            C::CmsWithHeap => SketchKindHandle::CmsWithHeap,
+            // `Any` has no single concrete handle. Callers that need
+            // to match against a specific instance should use
+            // `Capability::is_satisfied_by` instead of `From` for the
+            // handle directly. Defensive default: return DDSketch (the
+            // QuantileApprox catalog default) so a stray `Any` doesn't
+            // panic, though the canonical flow goes through
+            // `Capability::is_satisfied_by`.
+            C::Any => SketchKindHandle::DDSketch,
+        }
+    }
+}
+
+impl Capability {
+    /// True when the indexed sketch instance's capability satisfies
+    /// the controller-side required capability. The controller emits
+    /// `SketchKindHandle::Any` to mean "any implementation in the
+    /// family is acceptable" (e.g. QuantileApprox(Any) is satisfied
+    /// by both DDSketch and KLL); concrete handles must match
+    /// exactly.
+    pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
+        use controller::warm_tier_analysis::SketchKindHandle as Any;
+        let _ = Any::Any; // silence unused-import warning when compiled standalone
+        match (self, indexed) {
+            (Capability::QuantileApprox(_), Capability::QuantileApprox(_)) => true,
+            (Capability::CardinalityApprox, Capability::CardinalityApprox) => true,
+            // FrequencyTopk(CmsWithHeap) is the only sub-variant the
+            // warm tier can answer top-k against (CountMin /
+            // CountSketch carry no heap). Match exactly on the inner
+            // handle so the reducer's MissingHeap path stays
+            // accessible.
+            (Capability::FrequencyTopk(req), Capability::FrequencyTopk(have))
+                if req == have =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Adapt a controller-side analyzed Capability into the backend
+/// `Capability` enum. Used by the engine warm-tier hook to compare
+/// the analyzer's required-capability against the index's recorded
+/// per-instance capability. `SketchKindHandle::Any` from the
+/// controller side is preserved as the catalog default for the
+/// outer family (DDSketch for QuantileApprox); call sites that need
+/// the "matches any concrete impl" semantic should call
+/// [`Capability::is_satisfied_by`] instead.
+impl From<controller::warm_tier_analysis::Capability> for Capability {
+    fn from(c: controller::warm_tier_analysis::Capability) -> Self {
+        use controller::warm_tier_analysis::Capability as C;
+        match c {
+            C::QuantileApprox(h) => Capability::QuantileApprox(h.into()),
+            C::CardinalityApprox => Capability::CardinalityApprox,
+            C::FrequencyTopk(h) => Capability::FrequencyTopk(h.into()),
+        }
+    }
+}
+
 /// Sketch-instance configuration carried per-Metric on the OTLP wire
 /// (Phase 2 lifted these from per-DP up to the parent sketch container).
 /// Backend reads the relevant variant at ingest time and stores it in
