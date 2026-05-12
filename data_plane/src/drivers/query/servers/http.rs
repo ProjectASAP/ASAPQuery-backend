@@ -5,8 +5,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
-    Router,
-};
+    Router};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -47,8 +46,7 @@ pub struct PrecomputeJobSpec {
     pub granularity: String,
     pub source: String,
     pub sketch_type: String,
-    pub store_path: String,
-}
+    pub store_path: String}
 
 /// In-memory map of `job_id → spec`, populated by the
 /// `POST /api/v1/precompute/jobs` handler and drained by the matching
@@ -57,8 +55,7 @@ pub struct PrecomputeJobSpec {
 /// uncontended in practice (job count is small).
 #[derive(Clone, Default)]
 pub struct PrecomputeJobRegistry {
-    inner: Arc<RwLock<HashMap<String, PrecomputeJobSpec>>>,
-}
+    inner: Arc<RwLock<HashMap<String, PrecomputeJobSpec>>>}
 
 impl PrecomputeJobRegistry {
     pub fn new() -> Self {
@@ -142,8 +139,7 @@ fn extract_tenant(headers: &axum::http::HeaderMap) -> String {
 pub struct HttpServerConfig {
     pub port: u16,
     pub handle_http_requests: bool,
-    pub adapter_config: AdapterConfig,
-}
+    pub adapter_config: AdapterConfig}
 
 #[derive(Clone)]
 pub struct HttpServer {
@@ -216,8 +212,7 @@ pub struct HttpServer {
     /// `Default` registry is fine for binaries that never wire the
     /// controller). Future PRs will plumb this into the precompute
     /// engine; today the handler just acks the call.
-    precompute_jobs: PrecomputeJobRegistry,
-}
+    precompute_jobs: PrecomputeJobRegistry}
 
 #[derive(Clone)]
 struct AppState {
@@ -245,8 +240,7 @@ struct AppState {
     /// See [`HttpServer::probe_cache`].
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     /// See [`HttpServer::precompute_jobs`].
-    precompute_jobs: PrecomputeJobRegistry,
-}
+    precompute_jobs: PrecomputeJobRegistry}
 
 impl HttpServer {
     pub fn new(
@@ -270,8 +264,7 @@ impl HttpServer {
             backfill: None,
             data_retention_ms: None,
             probe_cache: None,
-            precompute_jobs: PrecomputeJobRegistry::new(),
-        }
+            precompute_jobs: PrecomputeJobRegistry::new()}
     }
 
     /// Plug an additional [`QueryEngine`] into the capability router.
@@ -443,8 +436,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
-            precompute_jobs: self.precompute_jobs.clone(),
-        };
+            precompute_jobs: self.precompute_jobs.clone()};
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
 
@@ -535,8 +527,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
-            precompute_jobs: self.precompute_jobs.clone(),
-        };
+            precompute_jobs: self.precompute_jobs.clone()};
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
 
@@ -625,8 +616,7 @@ async fn process_query_request(
                 .await
             {
                 Ok(response) => response.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         } else {
             debug!("Returning error - both handling and forwarding disabled");
             use crate::drivers::query::adapters::AdapterError;
@@ -638,8 +628,7 @@ async fn process_query_request(
                 .await
             {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         }
     }
 
@@ -802,8 +791,7 @@ fn first_metric_name(expr: &promql_parser::parser::Expr) -> Option<String> {
         Expr::Subquery(sq) => first_metric_name(&sq.expr),
         Expr::Paren(p) => first_metric_name(&p.expr),
         Expr::Unary(u) => first_metric_name(&u.expr),
-        _ => None,
-    }
+        _ => None}
 }
 
 /// Issue #46 ⑥ short-circuit — answer
@@ -865,8 +853,7 @@ async fn try_answer_freshness_probe(
     let query_result = QueryResult::vector(vec![element], now_ms as u64);
     let execution_result = QueryExecutionResult {
         query_output_labels: KeyByLabelNames::default(),
-        query_result,
-    };
+        query_result};
 
     let total_duration = start_time.elapsed();
     debug!(
@@ -884,8 +871,7 @@ async fn try_answer_freshness_probe(
                 annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
                     .await
             }
-            Err(status) => status.into_response(),
-        },
+            Err(status) => status.into_response()},
     )
 }
 
@@ -902,14 +888,12 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
         match expr {
             Expr::Paren(p) => unwrap(&p.expr),
             Expr::Unary(u) => unwrap(&u.expr),
-            other => other,
-        }
+            other => other}
     }
     let inner = unwrap(&expr);
     let call = match inner {
         Expr::Call(c) => c,
-        _ => return None,
-    };
+        _ => return None};
     if !call.func.name.eq_ignore_ascii_case("last_over_time") {
         return None;
     }
@@ -919,8 +903,7 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
     let arg = unwrap(&call.args.args[0]);
     let ms = match arg {
         Expr::MatrixSelector(ms) => ms,
-        _ => return None,
-    };
+        _ => return None};
     let metric = ms.vs.name.clone()?;
     let range_ms = ms.range.as_millis() as i64;
     Some((metric, range_ms))
@@ -962,8 +945,7 @@ async fn process_via_simple_engine(
             use crate::drivers::query::adapters::QueryExecutionResult;
             let execution_result = QueryExecutionResult {
                 query_output_labels,
-                query_result,
-            };
+                query_result};
 
             let total_duration = start_time.elapsed();
             debug!(
@@ -981,8 +963,7 @@ async fn process_via_simple_engine(
                     annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
                         .await
                 }
-                Err(status) => status.into_response(),
-            }
+                Err(status) => status.into_response()}
         }
         None => {
             let total_duration = start_time.elapsed();
@@ -1001,8 +982,7 @@ async fn process_via_simple_engine(
                     .await
                 {
                     Ok(response) => response.into_response(),
-                    Err(status) => status.into_response(),
-                }
+                    Err(status) => status.into_response()}
             } else {
                 debug!("Query not supported and forwarding disabled, returning error");
                 // Adapter formats the unsupported query error for its protocol.
@@ -1020,8 +1000,7 @@ async fn process_via_simple_engine(
                         )
                         .await
                     }
-                    Err(status) => status.into_response(),
-                }
+                    Err(status) => status.into_response()}
             }
         }
     }
@@ -1069,8 +1048,7 @@ async fn process_via_named_engine(
                 "error": format!(
                     "no engine registered under data_source_id={data_source_id:?}; \
                      registered={registered:?}"
-                ),
-            })),
+                )})),
         )
             .into_response();
     };
@@ -1094,8 +1072,7 @@ async fn process_via_named_engine(
             let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
             let execution_result = QueryExecutionResult {
                 query_output_labels,
-                query_result,
-            };
+                query_result};
             // Resolve the `data_source` annotation from the engine's
             // own capabilities so the wire response stays in sync
             // even if the request used a typo'd casing of the id.
@@ -1106,8 +1083,7 @@ async fn process_via_named_engine(
                 .await
             {
                 Ok(response) => annotate_data_source(response, canonical_id).await,
-                Err(status) => status.into_response(),
-            }
+                Err(status) => status.into_response()}
         }
         Err(EngineError::CapabilityMiss { .. }) => {
             warn!(
@@ -1121,8 +1097,7 @@ async fn process_via_named_engine(
                     "errorType": "bad_data",
                     "error": format!(
                         "engine {data_source_id:?} could not serve this query (capability miss)"
-                    ),
-                })),
+                    )})),
             )
                 .into_response()
         }
@@ -1136,8 +1111,7 @@ async fn process_via_named_engine(
                 Json(serde_json::json!({
                     "status": "error",
                     "errorType": "internal",
-                    "error": format!("engine {data_source_id:?} backend failed"),
-                })),
+                    "error": format!("engine {data_source_id:?} backend failed")})),
             )
                 .into_response()
         }
@@ -1218,8 +1192,7 @@ async fn process_via_router(
             let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
             let execution_result = QueryExecutionResult {
                 query_output_labels,
-                query_result,
-            };
+                query_result};
 
             let total_duration = start_time.elapsed();
             debug!(
@@ -1236,8 +1209,7 @@ async fn process_via_router(
                 Ok(response) => {
                     annotate_data_source(response, metric_storage.data_source_id()).await
                 }
-                Err(status) => status.into_response(),
-            }
+                Err(status) => status.into_response()}
         }
         Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
             warn!(
@@ -1252,8 +1224,7 @@ async fn process_via_router(
                     "errorType": "internal",
                     "error": format!(
                         "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
-                    ),
-                })),
+                    )})),
             )
                 .into_response()
         }
@@ -1261,15 +1232,13 @@ async fn process_via_router(
             warn!(error = %last, "EngineRouter: all compatible engines failed");
             let (status, error_type) = match &last {
                 EngineError::CapabilityMiss { .. } => (StatusCode::NOT_FOUND, "bad_data"),
-                EngineError::Backend { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-            };
+                EngineError::Backend { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "internal")};
             (
                 status,
                 Json(serde_json::json!({
                     "status": "error",
                     "errorType": error_type,
-                    "error": last.to_string(),
-                })),
+                    "error": last.to_string()})),
             )
                 .into_response()
         }
@@ -1362,8 +1331,7 @@ async fn handle_instant_query(
             );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         }
     };
 
@@ -1465,8 +1433,7 @@ async fn handle_instant_query_post(
                 );
                 return match state.adapter.format_error_response(&parse_error).await {
                     Ok(json) => json.into_response(),
-                    Err(status) => status.into_response(),
-                };
+                    Err(status) => status.into_response()};
             }
         }
     } else {
@@ -1492,8 +1459,7 @@ async fn handle_instant_query_post(
                     .await
                 {
                     Ok(json) => json.into_response(),
-                    Err(status) => status.into_response(),
-                };
+                    Err(status) => status.into_response()};
             }
         };
 
@@ -1530,8 +1496,7 @@ async fn handle_instant_query_post(
                 );
                 return match state.adapter.format_error_response(&parse_error).await {
                     Ok(json) => json.into_response(),
-                    Err(status) => status.into_response(),
-                };
+                    Err(status) => status.into_response()};
             }
         }
     };
@@ -1654,8 +1619,7 @@ async fn process_range_query_request(
             .await
         {
             Ok(json) => json.into_response(),
-            Err(status) => status.into_response(),
-        };
+            Err(status) => status.into_response()};
     }
 
     // (Phase γ: legacy in-backend query tracker removed — see
@@ -1694,15 +1658,13 @@ async fn process_range_query_request(
                 .await
             {
                 Ok(response) => response.into_response(),
-                Err(status) => status.into_response(),
-            }
+                Err(status) => status.into_response()}
         }
         None => {
             debug!("Range query returned None - query not supported");
             match state.adapter.format_unsupported_query_response().await {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            }
+                Err(status) => status.into_response()}
         }
     }
 }
@@ -1732,8 +1694,7 @@ async fn handle_range_query(
             );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         }
     };
 
@@ -1766,8 +1727,7 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
                 .await
             {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         }
     };
 
@@ -1793,8 +1753,7 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
             );
             return match state.adapter.format_error_response(&parse_error).await {
                 Ok(json) => json.into_response(),
-                Err(status) => status.into_response(),
-            };
+                Err(status) => status.into_response()};
         }
     };
 
@@ -1806,7 +1765,7 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
+    use crate::stores::types::{HotReloadStreamingConfig, StreamingConfig};
     use crate::query_engines::ASAPQueryEngine;
     use crate::stores::sketch_db::store::SketchStore;
     use reqwest::Client;
@@ -1827,13 +1786,8 @@ mod tests {
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
+            adapter_config};
 
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
@@ -1841,11 +1795,8 @@ mod tests {
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            // None,
-            inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
 
         let mut server = HttpServer::new(config, query_engine, store);
@@ -2085,12 +2036,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
@@ -2098,10 +2044,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
@@ -2568,12 +2512,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
@@ -2581,10 +2520,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let schemas = {
             use asap_types::aggregation_config::AggregationConfig;
@@ -2638,8 +2575,7 @@ aggregations:
             "start_ms": 100,
             "end_ms": 500,
             "source": { "Prometheus": { "url": "http://prom.local" } },
-            "windows_total": 4,
-        });
+            "windows_total": 4});
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
             .json(&req)
@@ -2736,8 +2672,7 @@ aggregations:
             "start_ms": 500,
             "end_ms": 100,
             "source": { "Prometheus": { "url": "http://prom.local" } },
-            "windows_total": 1,
-        });
+            "windows_total": 1});
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
             .json(&req)
@@ -2795,8 +2730,7 @@ aggregations:
             "start_ms": 0,
             "end_ms": 10,
             "source": { "Prometheus": { "url": "x" } },
-            "windows_total": 1,
-        });
+            "windows_total": 1});
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
             .json(&req)
@@ -2834,8 +2768,7 @@ aggregations:
             "start_ms": 100,
             "end_ms": 500,
             "source": { "Prometheus": { "url": "http://prom.local" } },
-            "windows_total": 1,
-        });
+            "windows_total": 1});
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
             .json(&req)
@@ -2868,8 +2801,7 @@ aggregations:
             "start_ms": 0,
             "end_ms": future_ms,
             "source": { "Prometheus": { "url": "http://prom.local" } },
-            "windows_total": 1,
-        });
+            "windows_total": 1});
         let resp = client
             .post(format!("http://127.0.0.1:{server_port}/api/v1/db/backfill"))
             .json(&req)
@@ -2900,8 +2832,7 @@ aggregations:
     struct MockQueryEngine {
         caps: EngineCapabilities,
         calls: Arc<AtomicUsize>,
-        outcome: MockOutcome,
-    }
+        outcome: MockOutcome}
 
     #[derive(Clone)]
     enum MockOutcome {
@@ -2910,8 +2841,7 @@ aggregations:
         OkEmpty,
         /// Force the engine to fail with `EngineError::Backend` so
         /// the router falls through to the next compatible backend.
-        Backend,
-    }
+        Backend}
 
     impl MockQueryEngine {
         fn new(backend: StorageBackend, outcome: MockOutcome) -> (Arc<Self>, Arc<AtomicUsize>) {
@@ -2920,11 +2850,9 @@ aggregations:
                 caps: EngineCapabilities {
                     data_source_id: backend.data_source_id(),
                     storage_backend: backend,
-                    supports_streams_above_bytes: 1024 * 1024,
-                },
+                    supports_streams_above_bytes: 1024 * 1024},
                 calls: calls.clone(),
-                outcome,
-            });
+                outcome});
             (engine, calls)
         }
     }
@@ -2938,8 +2866,7 @@ aggregations:
                 MockOutcome::Backend => Err(EngineError::backend(
                     self.caps.data_source_id,
                     "simulated backend failure",
-                )),
-            }
+                ))}
         }
         fn capabilities(&self) -> EngineCapabilities {
             self.caps
@@ -2961,12 +2888,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         // Pin `storage_backend` on the streaming config so the http
         // dispatcher reads it back through the hot-reload handle.
         let streaming_cfg =
@@ -2979,10 +2901,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_arc,
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server =
             HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
@@ -3014,12 +2934,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         // Streaming-config stays on the default `SketchStore` axis
         // — exactly what the production deploy looks like (the YAML
         // loader doesn't parse `storage_backend`). All routing
@@ -3033,10 +2948,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_arc,
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
@@ -3224,8 +3137,7 @@ aggregations:
                 EngineCapabilities {
                     data_source_id: StorageBackend::GorillaObjectStore.data_source_id(),
                     storage_backend: StorageBackend::GorillaObjectStore,
-                    supports_streams_above_bytes: 1024 * 1024,
-                }
+                    supports_streams_above_bytes: 1024 * 1024}
             }
         }
         let server_port = setup_test_server_with_router(
@@ -3774,12 +3686,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
@@ -3789,10 +3696,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_arc,
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
         let server = HttpServer::new(config, query_engine, store)
@@ -4101,15 +4006,13 @@ aggregations:
     #[tokio::test]
     async fn http_archive_metric_forwards_to_thanos_query() {
         use crate::query_engines::thanos_query_engine::forward::test_support::{
-            spawn_mock_thanos, CANNED_VECTOR_BODY,
-        };
+            spawn_mock_thanos, CANNED_VECTOR_BODY};
         use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
 
         let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
         let cfg = ThanosQueryConfig {
             base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(5),
-        };
+            request_timeout: std::time::Duration::from_secs(5)};
         let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
@@ -4155,8 +4058,7 @@ aggregations:
         let (mock_url, _mock_handle) = spawn_mock_thanos_503().await;
         let cfg = ThanosQueryConfig {
             base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(2),
-        };
+            request_timeout: std::time::Duration::from_secs(2)};
         let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
@@ -4199,17 +4101,14 @@ aggregations:
         // to the warm tier. Path A2's accuracy reducer relies on
         // this for apples-to-apples comparison runs.
         use crate::query_engines::thanos_query_engine::forward::test_support::{
-            spawn_mock_thanos, CANNED_VECTOR_BODY,
-        };
+            spawn_mock_thanos, CANNED_VECTOR_BODY};
         use crate::query_engines::thanos_query_engine::{
-            ThanosQueryConfig, ThanosQueryEngine, DATA_SOURCE_THANOS_QUERY_ID,
-        };
+            ThanosQueryConfig, ThanosQueryEngine, DATA_SOURCE_THANOS_QUERY_ID};
 
         let (mock_url, _mock_handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
         let cfg = ThanosQueryConfig {
             base_url: mock_url,
-            request_timeout: std::time::Duration::from_secs(5),
-        };
+            request_timeout: std::time::Duration::from_secs(5)};
         let engine = ThanosQueryEngine::new(cfg).expect("engine");
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
@@ -4245,12 +4144,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         let streaming_cfg =
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
@@ -4261,10 +4155,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_arc,
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server =
             HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
@@ -4304,12 +4196,7 @@ aggregations:
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
-            adapter_config,
-        };
-        let inference_config = InferenceConfig::new(
-            crate::stores::types::QueryLanguage::promql,
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        );
+            adapter_config};
         let streaming_arc = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
@@ -4317,10 +4204,8 @@ aggregations:
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
-            inference_config,
             streaming_arc,
             15000,
-            crate::stores::types::QueryLanguage::promql,
         ));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
         let server = HttpServer::new(config, query_engine, store).with_probe_cache(cache.clone());
@@ -4503,8 +4388,7 @@ aggregations:
             "granularity": "60s",
             "source": "backend:4317",
             "sketch_type": "ddsketch",
-            "store_path": "precomputed/http_requests_total/p99/5m",
-        });
+            "store_path": "precomputed/http_requests_total/p99/5m"});
         let resp = client
             .post(format!("http://127.0.0.1:{port}/api/v1/precompute/jobs"))
             .json(&body)
@@ -4577,8 +4461,7 @@ struct PrecomputeJobRequest {
     start: f64,
     /// End timestamp (unix seconds). 0 = use latest available.
     #[serde(default)]
-    end: f64,
-}
+    end: f64}
 
 /// Execute a precompute job from the DataCollector controller.
 ///
@@ -4620,8 +4503,7 @@ async fn handle_precompute_job(
                 "data": {
                     "result_type": "precompute",
                     "key_by": format!("{:?}", key_by),
-                    "result": format!("{:?}", result),
-                }
+                    "result": format!("{:?}", result)}
             });
             (StatusCode::OK, axum::Json(body)).into_response()
         }
@@ -4653,8 +4535,7 @@ async fn handle_post_precompute_job_register(
     let body = serde_json::json!({
         "job_id": job_id,
         "status": "created",
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    });
+        "created_at": chrono::Utc::now().to_rfc3339()});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4669,8 +4550,7 @@ async fn handle_delete_precompute_job(
     } else {
         let body = serde_json::json!({
             "status": "error",
-            "error": format!("precompute job '{job_id}' not found"),
-        });
+            "error": format!("precompute job '{job_id}' not found")});
         (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
     }
 }
@@ -4690,15 +4570,13 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
             let body = serde_json::json!({
                 "status": "success",
                 "aggregation_count": timestamps.len(),
-                "earliest_timestamps": timestamps,
-            });
+                "earliest_timestamps": timestamps});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("{}", e),
-            });
+                "error": format!("{}", e)});
             (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
         }
     }
@@ -4726,8 +4604,7 @@ async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::res
     let Some(handle) = state.hot_reload_config else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config",
-        });
+            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     let snap = handle.snapshot();
@@ -4735,8 +4612,7 @@ async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::res
         "status": "success",
         "aggregation_count": snap.aggregation_configs.len(),
         "aggregation_ids": snap.aggregation_configs.keys().copied().collect::<Vec<_>>(),
-        "streaming_config": &*snap,
-    });
+        "streaming_config": &*snap});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4751,8 +4627,7 @@ async fn handle_post_streaming_config(
     let Some(handle) = state.hot_reload_config else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config",
-        });
+            "error": "hot-reload handle not attached; backend was built without HttpServer::with_hot_reload_config"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
@@ -4761,8 +4636,7 @@ async fn handle_post_streaming_config(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("request body is not valid UTF-8: {e}"),
-            });
+                "error": format!("request body is not valid UTF-8: {e}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -4771,19 +4645,17 @@ async fn handle_post_streaming_config(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("YAML parse error: {e}"),
-            });
+                "error": format!("YAML parse error: {e}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
     let new_config =
-        match asap_types::streaming_config::StreamingConfig::from_yaml_data(&yaml_value, None) {
+        match asap_types::streaming_config::StreamingConfig::from_yaml_data(&yaml_value) {
             Ok(c) => c,
             Err(e) => {
                 let body = serde_json::json!({
                     "status": "error",
-                    "error": format!("StreamingConfig build error: {e}"),
-                });
+                    "error": format!("StreamingConfig build error: {e}")});
                 return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
             }
         };
@@ -4828,8 +4700,7 @@ async fn handle_post_streaming_config(
         "agg_ids_removed": removed,
         "new_aggregation_count": new_ids.len(),
         "schemas_created": schema_added,
-        "schemas_retired": schema_retired,
-    });
+        "schemas_retired": schema_retired});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4853,8 +4724,7 @@ async fn handle_get_storage_routing(
     let Some(handle) = state.backend_storage_routing.as_ref() else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing",
-        });
+            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     // Per-tenant scope: the GET reports the tenant inferred from the
@@ -4870,8 +4740,7 @@ async fn handle_get_storage_routing(
         "default_engine": snap.default_backend().data_source_id(),
         "metrics_count": snap.len(),
         "table_hash": crate::query_engines::routing::routing_table_hash(snap.as_ref()),
-        "tenants": handle.tenant_ids(),
-    });
+        "tenants": handle.tenant_ids()});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4904,8 +4773,7 @@ async fn handle_post_storage_routing(
     let Some(handle) = state.backend_storage_routing.as_ref() else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing",
-        });
+            "error": "routing handle not attached; backend was built without HttpServer::with_backend_storage_routing"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
@@ -4914,8 +4782,7 @@ async fn handle_post_storage_routing(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("request body is not valid UTF-8: {e}"),
-            });
+                "error": format!("request body is not valid UTF-8: {e}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -4924,8 +4791,7 @@ async fn handle_post_storage_routing(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("JSON parse error: {e}"),
-            });
+                "error": format!("JSON parse error: {e}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -4934,8 +4800,7 @@ async fn handle_post_storage_routing(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("BackendStorageRouting build error: {e:#}"),
-            });
+                "error": format!("BackendStorageRouting build error: {e:#}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -4967,8 +4832,7 @@ async fn handle_post_storage_routing(
         "status": "success",
         "tenant": tenant,
         "metrics_count": entries,
-        "table_hash": hash,
-    });
+        "table_hash": hash});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4987,8 +4851,7 @@ async fn handle_get_schemas(
     let Some(schemas) = state.schemas else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "schema registry not attached; backend was built without HttpServer::with_schemas",
-        });
+            "error": "schema registry not attached; backend was built without HttpServer::with_schemas"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
@@ -5003,8 +4866,7 @@ async fn handle_get_schemas(
                 "status": "error",
                 "error": format!(
                     "unknown status filter '{other}'; expected one of active|retired|expired|all",
-                ),
-            });
+                )});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -5020,8 +4882,7 @@ async fn handle_get_schemas(
     let body = serde_json::json!({
         "status": "success",
         "count": entries.len(),
-        "schemas": entries,
-    });
+        "schemas": entries});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -5030,8 +4891,7 @@ fn status_str(s: crate::stores::sketch_db::AggStatus) -> &'static str {
     match s {
         AggStatus::Active => "active",
         AggStatus::Retired => "retired",
-        AggStatus::Expired => "expired",
-    }
+        AggStatus::Expired => "expired"}
 }
 
 fn schema_to_json(s: &crate::stores::sketch_db::AggSchema) -> serde_json::Value {
@@ -5043,8 +4903,7 @@ fn schema_to_json(s: &crate::stores::sketch_db::AggSchema) -> serde_json::Value 
         "retired_at_ms": s.retired_at_ms,
         "expires_at_ms": s.expires_at_ms,
         "aggregation_type": format!("{:?}", s.config.aggregation_type),
-        "accuracy_profile": s.accuracy_profile(),
-    })
+        "accuracy_profile": s.accuracy_profile()})
 }
 
 /// `POST /api/v1/db/schemas/:agg_id/retire` — manually transition an
@@ -5060,23 +4919,20 @@ async fn handle_post_schema_retire(
     let Some(schemas) = state.schemas else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "schema registry not attached",
-        });
+            "error": "schema registry not attached"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     match schemas.force_retire(agg_id) {
         Some(schema) => {
             let body = serde_json::json!({
                 "status": "success",
-                "schema": schema_to_json(&schema),
-            });
+                "schema": schema_to_json(&schema)});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("agg_id {agg_id} not found"),
-            });
+                "error": format!("agg_id {agg_id} not found")});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
     }
@@ -5094,23 +4950,20 @@ async fn handle_post_schema_expire(
     let Some(schemas) = state.schemas else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "schema registry not attached",
-        });
+            "error": "schema registry not attached"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
     match schemas.force_expire(agg_id) {
         Some(schema) => {
             let body = serde_json::json!({
                 "status": "success",
-                "schema": schema_to_json(&schema),
-            });
+                "schema": schema_to_json(&schema)});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("agg_id {agg_id} not found"),
-            });
+                "error": format!("agg_id {agg_id} not found")});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
     }
@@ -5120,8 +4973,7 @@ fn coverage_str(c: crate::stores::sketch_db::TimelineCoverage) -> &'static str {
     use crate::stores::sketch_db::TimelineCoverage;
     match c {
         TimelineCoverage::Sketch => "sketch",
-        TimelineCoverage::Purged => "purged",
-    }
+        TimelineCoverage::Purged => "purged"}
 }
 
 /// §7 / §15.3 of the sketch DB design: expose the schema timeline
@@ -5144,16 +4996,14 @@ async fn handle_get_timeline(
     let Some(schemas) = state.schemas else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "schema registry not attached; backend was built without HttpServer::with_schemas",
-        });
+            "error": "schema registry not attached; backend was built without HttpServer::with_schemas"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
     let Some(metric) = params.get("metric") else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "missing required query parameter 'metric'",
-        });
+            "error": "missing required query parameter 'metric'"});
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     };
 
@@ -5162,15 +5012,13 @@ async fn handle_get_timeline(
             Some(s) => s.parse::<u64>().map_err(|e| {
                 let body = serde_json::json!({
                     "status": "error",
-                    "error": format!("query parameter '{key}' is not a valid u64: {e}"),
-                });
+                    "error": format!("query parameter '{key}' is not a valid u64: {e}")});
                 Box::new((StatusCode::BAD_REQUEST, axum::Json(body)).into_response())
             }),
             None => {
                 let body = serde_json::json!({
                     "status": "error",
-                    "error": format!("missing required query parameter '{key}'"),
-                });
+                    "error": format!("missing required query parameter '{key}'")});
                 Err(Box::new(
                     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response(),
                 ))
@@ -5179,12 +5027,10 @@ async fn handle_get_timeline(
     };
     let start_ms = match parse_u64("start_ms") {
         Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+        Err(resp) => return *resp};
     let end_ms = match parse_u64("end_ms") {
         Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+        Err(resp) => return *resp};
 
     let segments = schemas.timeline_for_metric(metric, start_ms, end_ms);
     let entries: Vec<serde_json::Value> = segments
@@ -5195,8 +5041,7 @@ async fn handle_get_timeline(
                 "start_ms": s.start_ms,
                 "end_ms": s.end_ms,
                 "status": status_str(s.status),
-                "coverage": coverage_str(s.coverage),
-            })
+                "coverage": coverage_str(s.coverage)})
         })
         .collect();
 
@@ -5206,8 +5051,7 @@ async fn handle_get_timeline(
         "start_ms": start_ms,
         "end_ms": end_ms,
         "count": entries.len(),
-        "segments": entries,
-    });
+        "segments": entries});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -5220,8 +5064,7 @@ struct CreateBackfillJobRequest {
     start_ms: u64,
     end_ms: u64,
     source: crate::stores::sketch_db::BackfillSource,
-    windows_total: u64,
-}
+    windows_total: u64}
 
 fn backfill_status_str(s: &crate::stores::sketch_db::BackfillStatus) -> &'static str {
     use crate::stores::sketch_db::BackfillStatus;
@@ -5230,8 +5073,7 @@ fn backfill_status_str(s: &crate::stores::sketch_db::BackfillStatus) -> &'static
         BackfillStatus::Running => "running",
         BackfillStatus::Complete => "complete",
         BackfillStatus::Failed => "failed",
-        BackfillStatus::Cancelled => "cancelled",
-    }
+        BackfillStatus::Cancelled => "cancelled"}
 }
 
 fn backfill_job_to_json(job: &crate::stores::sketch_db::BackfillJob) -> serde_json::Value {
@@ -5248,16 +5090,14 @@ fn backfill_job_to_json(job: &crate::stores::sketch_db::BackfillJob) -> serde_js
         "created_at_ms": job.created_at_ms,
         "started_at_ms": job.started_at_ms,
         "completed_at_ms": job.completed_at_ms,
-        "error_message": job.error_message,
-    })
+        "error_message": job.error_message})
 }
 
 fn service_unavailable_no_backfill() -> axum::response::Response {
     use axum::response::IntoResponse;
     let body = serde_json::json!({
         "status": "error",
-        "error": "backfill registry not attached; backend was built without HttpServer::with_backfill_registry",
-    });
+        "error": "backfill registry not attached; backend was built without HttpServer::with_backfill_registry"});
     (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response()
 }
 
@@ -5286,8 +5126,7 @@ async fn handle_post_backfill_job(
     let Some(schemas) = state.schemas else {
         let body = serde_json::json!({
             "status": "error",
-            "error": "schema registry not attached; backfill retention check requires HttpServer::with_schemas",
-        });
+            "error": "schema registry not attached; backfill retention check requires HttpServer::with_schemas"});
         return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
     };
 
@@ -5296,8 +5135,7 @@ async fn handle_post_backfill_job(
         Err(e) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("invalid request body: {e}"),
-            });
+                "error": format!("invalid request body: {e}")});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -5307,8 +5145,7 @@ async fn handle_post_backfill_job(
             "error": format!(
                 "start_ms {} must be < end_ms {}",
                 req.start_ms, req.end_ms
-            ),
-        });
+            )});
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
 
@@ -5323,22 +5160,19 @@ async fn handle_post_backfill_job(
         Ok(job_id) => {
             let body = serde_json::json!({
                 "status": "success",
-                "job_id": job_id,
-            });
+                "job_id": job_id});
             (StatusCode::CREATED, axum::Json(body)).into_response()
         }
         Err(e @ CreateError::UnknownAgg { .. }) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": e.to_string(),
-            });
+                "error": e.to_string()});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
         Err(e @ (CreateError::Overlap { .. } | CreateError::OutOfRetention { .. })) => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": e.to_string(),
-            });
+                "error": e.to_string()});
             (StatusCode::CONFLICT, axum::Json(body)).into_response()
         }
     }
@@ -5370,8 +5204,7 @@ async fn handle_get_backfill_jobs(
                 "status": "error",
                 "error": format!(
                     "unknown status filter '{other}'; expected one of queued|running|complete|failed|cancelled|all",
-                ),
-            });
+                )});
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
@@ -5381,8 +5214,7 @@ async fn handle_get_backfill_jobs(
     let body = serde_json::json!({
         "status": "success",
         "count": entries.len(),
-        "jobs": entries,
-    });
+        "jobs": entries});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -5401,15 +5233,13 @@ async fn handle_get_backfill_job(
         Some(job) => {
             let body = serde_json::json!({
                 "status": "success",
-                "job": backfill_job_to_json(&job),
-            });
+                "job": backfill_job_to_json(&job)});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("job_id {job_id} not found"),
-            });
+                "error": format!("job_id {job_id} not found")});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
     }
@@ -5430,8 +5260,7 @@ async fn handle_delete_backfill_job(
     let Some(job) = registry.get(job_id) else {
         let body = serde_json::json!({
             "status": "error",
-            "error": format!("job_id {job_id} not found"),
-        });
+            "error": format!("job_id {job_id} not found")});
         return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
     };
     if job.status.is_terminal() {
@@ -5440,14 +5269,12 @@ async fn handle_delete_backfill_job(
             "error": format!(
                 "job {job_id} already {}, cannot cancel",
                 backfill_status_str(&job.status)
-            ),
-        });
+            )});
         return (StatusCode::CONFLICT, axum::Json(body)).into_response();
     }
     registry.cancel(job_id);
     let body = serde_json::json!({
         "status": "success",
-        "job_id": job_id,
-    });
+        "job_id": job_id});
     (StatusCode::OK, axum::Json(body)).into_response()
 }

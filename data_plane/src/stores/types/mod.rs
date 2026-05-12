@@ -22,13 +22,8 @@ pub use traits::*;
 
 // Cross-module re-exports of asap_types data types so callers can
 // write `crate::stores::types::StreamingConfig` instead of reaching
-// across crates. (Previously these had per-type shim files like
-// `aggregation_config.rs` containing only `pub use asap_types::...`.)
+// across crates.
 pub use asap_types::aggregation_config::*;
-pub use asap_types::aggregation_reference::*;
-pub use asap_types::inference_config::*;
-pub use asap_types::promql_schema::*;
-pub use asap_types::query_config::*;
 pub use asap_types::streaming_config::*;
 
 // Re-export the query-side routing surface so existing call sites

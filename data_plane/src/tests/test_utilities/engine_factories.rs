@@ -6,10 +6,9 @@
 //! the correct aggregation_type string.
 
 use crate::stores::types::{
-    AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
-    KeyByLabelValues, PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig,
-    StreamingConfig, WindowType,
-};
+    AggregationConfig, AggregationType, CleanupPolicy,
+    KeyByLabelValues, PrecomputedOutput, QueryLanguage,
+    StreamingConfig, WindowType};
 use crate::query_engines::query_result::InstantVectorElement;
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::stores::sketch_db::store::SketchStore;
@@ -88,14 +87,12 @@ pub fn create_engine_single_pop_with_aggregated(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(1u64, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -111,25 +108,13 @@ pub fn create_engine_single_pop_with_aggregated(
     }
 
     // Create inference config — schema includes grouping + rollup labels
-    let promql_schema =
-        PromQLSchema::new().add_metric(metric.to_string(), KeyByLabelNames::new(all_schema_labels));
 
-    let query_config = QueryConfig::new(promql_query.to_string())
-        .add_aggregation(AggregationReference::new(1, None));
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        // None,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }
 
@@ -185,8 +170,7 @@ pub fn create_engine_dual_input(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(1u64, value_agg_config);
 
     // Keys aggregation (id=2)
@@ -207,14 +191,12 @@ pub fn create_engine_dual_input(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(2u64, keys_agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -237,26 +219,13 @@ pub fn create_engine_dual_input(
     }
 
     // Create inference config
-    let promql_schema =
-        PromQLSchema::new().add_metric(metric.to_string(), KeyByLabelNames::new(all_labels));
 
-    let query_config = QueryConfig::new(promql_query.to_string())
-        .add_aggregation(AggregationReference::new(1, None))
-        .add_aggregation(AggregationReference::new(2, None));
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        // None,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }
 
@@ -300,8 +269,7 @@ pub fn create_engine_two_metrics(
         metric: metric_a.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(1u64, agg_config_a);
 
     let agg_config_b = AggregationConfig {
@@ -321,14 +289,12 @@ pub fn create_engine_two_metrics(
         metric: metric_b.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(2u64, agg_config_b);
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -347,29 +313,9 @@ pub fn create_engine_two_metrics(
         store.insert_precomputed_output(output, acc).unwrap();
     }
 
-    // Schema includes both metrics
-    let promql_schema = PromQLSchema::new()
-        .add_metric(metric_a.to_string(), KeyByLabelNames::new(labels_a))
-        .add_metric(metric_b.to_string(), KeyByLabelNames::new(labels_b));
+    let _ = (query_a, query_b);
 
-    let query_config_a =
-        QueryConfig::new(query_a.to_string()).add_aggregation(AggregationReference::new(1, None));
-    let query_config_b =
-        QueryConfig::new(query_b.to_string()).add_aggregation(AggregationReference::new(2, None));
-
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config_a, query_config_b],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
-
-    ASAPQueryEngine::new(
-        store,
-        inference_config,
-        streaming_config,
-        1,
-        QueryLanguage::promql,
-    )
+    ASAPQueryEngine::new(store, streaming_config, 1)
 }
 
 /// Creates a ASAPQueryEngine with three independent metrics, each with their own
@@ -424,15 +370,13 @@ pub fn create_engine_three_metrics(
                 metric: metric.to_string(),
                 num_aggregates_to_retain: None,
                 table_name: None,
-                value_column: None,
-            },
+                value_column: None},
         );
     }
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -448,31 +392,9 @@ pub fn create_engine_three_metrics(
         }
     }
 
-    let promql_schema = PromQLSchema::new()
-        .add_metric(metric_a.to_string(), KeyByLabelNames::new(labels_a))
-        .add_metric(metric_b.to_string(), KeyByLabelNames::new(labels_b))
-        .add_metric(metric_c.to_string(), KeyByLabelNames::new(labels_c));
+    let _ = (labels_a, labels_b, labels_c, query_a, query_b, query_c);
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![
-            QueryConfig::new(query_a.to_string())
-                .add_aggregation(AggregationReference::new(1, None)),
-            QueryConfig::new(query_b.to_string())
-                .add_aggregation(AggregationReference::new(2, None)),
-            QueryConfig::new(query_c.to_string())
-                .add_aggregation(AggregationReference::new(3, None)),
-        ],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
-
-    ASAPQueryEngine::new(
-        store,
-        inference_config,
-        streaming_config,
-        1,
-        QueryLanguage::promql,
-    )
+    ASAPQueryEngine::new(store, streaming_config, 1)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps for testing merge.
@@ -505,14 +427,12 @@ pub fn create_engine_multi_timestamp(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(1u64, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -525,27 +445,13 @@ pub fn create_engine_multi_timestamp(
         store.insert_precomputed_output(output, acc).unwrap();
     }
 
-    let promql_schema = PromQLSchema::new().add_metric(
-        metric.to_string(),
-        KeyByLabelNames::new(grouping_label_strings),
-    );
 
-    let query_config = QueryConfig::new(promql_query.to_string())
-        .add_aggregation(AggregationReference::new(1, None));
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        // None,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }
 
@@ -585,14 +491,12 @@ pub fn create_engine_multi_timestamp_with_window(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    };
+        value_column: None};
     aggregation_configs.insert(1u64, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
 
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -605,26 +509,12 @@ pub fn create_engine_multi_timestamp_with_window(
         store.insert_precomputed_output(output, acc).unwrap();
     }
 
-    let promql_schema = PromQLSchema::new().add_metric(
-        metric.to_string(),
-        KeyByLabelNames::new(grouping_label_strings),
-    );
 
-    let query_config = QueryConfig::new(promql_query.to_string())
-        .add_aggregation(AggregationReference::new(1, None));
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        // None,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }

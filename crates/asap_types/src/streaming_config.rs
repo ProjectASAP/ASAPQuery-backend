@@ -10,7 +10,6 @@ use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
 use crate::capability_matching::find_compatible_aggregation as common_find_compatible;
 use crate::capability_matching::StorageBackend;
 use crate::enums::QueryLanguage;
-use crate::inference_config::{InferenceConfig, SchemaConfig};
 use crate::query_requirements::QueryRequirements;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,33 +69,15 @@ impl StreamingConfig {
         let reader = BufReader::new(file);
         let data: Value = serde_yaml::from_reader(reader)?;
 
-        Self::from_yaml_data(&data, None)
+        Self::from_yaml_data(&data)
     }
 
-    pub fn from_yaml_data(
-        data: &Value,
-        inference_config: Option<&InferenceConfig>,
-    ) -> Result<Self> {
-        let mut retention_map: HashMap<u64, u64> = HashMap::new();
-
-        if let Some(inference_config) = inference_config {
-            for query_config in &inference_config.query_configs {
-                for aggregation in &query_config.aggregations {
-                    let aggregation_id = aggregation.aggregation_id;
-                    if let Some(num_aggregates) = aggregation.num_aggregates_to_retain {
-                        retention_map.insert(aggregation_id, num_aggregates);
-                    }
-                }
-            }
-        }
-
-        // Derive query_language from inference_config schema
-        let query_language = inference_config
-            .map(|ic| match &ic.schema {
-                SchemaConfig::PromQL(_) => QueryLanguage::promql,
-            })
-            .unwrap_or(QueryLanguage::promql); // Default to promql if no inference_config
-
+    /// Build from the streaming-config YAML alone. Per-aggregation
+    /// `numAggregatesToRetain` is read directly from each
+    /// aggregation's YAML entry; the old InferenceConfig indirection
+    /// (operator-authored query→agg_ids YAML feeding a retention_map)
+    /// is gone — the controller drives capability matching dynamically.
+    pub fn from_yaml_data(data: &Value) -> Result<Self> {
         let mut aggregation_configs: HashMap<u64, AggregationConfig> = HashMap::new();
 
         if let Some(aggregations) = data.get("aggregations").and_then(|v| v.as_sequence()) {
@@ -108,11 +89,16 @@ impl StreamingConfig {
                             aggregation_id
                         )
                     })?;
-                    let num_aggregates_to_retain = retention_map.get(&aggregation_id_u64);
+                    // Read per-agg retention directly from the YAML
+                    // entry (previously was looked up via
+                    // inference_config's query→agg map).
+                    let num_aggregates_to_retain = aggregation_data
+                        .get("numAggregatesToRetain")
+                        .and_then(|v| v.as_u64());
                     let config = AggregationConfig::from_yaml_data(
                         aggregation_data,
-                        num_aggregates_to_retain.copied(),
-                        query_language,
+                        num_aggregates_to_retain,
+                        QueryLanguage::promql,
                     )?;
                     aggregation_configs.insert(aggregation_id_u64, config);
                 }

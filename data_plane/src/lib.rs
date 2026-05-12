@@ -9,10 +9,10 @@ pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
 pub use stores::types::{
-    AccumulatorFactory, AggregateCore, AggregationConfig, InferenceConfig, KeyByLabelValues,
-    Measurement, MergeableAccumulator, MultipleSubpopulationAggregate,
-    MultipleSubpopulationAggregateFactory, PrecomputedOutput, PromQLSchema, QueryConfig,
-    SerializableToSink, SingleSubpopulationAggregate, SingleSubpopulationAggregateFactory,
+    AccumulatorFactory, AggregateCore, AggregationConfig, KeyByLabelValues, Measurement,
+    MergeableAccumulator, MultipleSubpopulationAggregate, MultipleSubpopulationAggregateFactory,
+    PrecomputedOutput, SerializableToSink, SingleSubpopulationAggregate,
+    SingleSubpopulationAggregateFactory,
 };
 
 pub use precompute_engine::operators::{
@@ -29,6 +29,6 @@ pub use precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
 pub use precompute_engine::output_sink::StoreOutputSink;
 pub use precompute_engine::PrecomputeEngine;
 
-pub use utils::{read_inference_config, read_streaming_config};
+pub use utils::read_streaming_config;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;

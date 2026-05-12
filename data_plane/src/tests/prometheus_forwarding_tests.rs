@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::stores::types::{CleanupPolicy, InferenceConfig, QueryLanguage, StreamingConfig};
+use crate::stores::types::{CleanupPolicy, QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
@@ -70,10 +70,8 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         adapter_config: AdapterConfig::prometheus_promql(
             format!("http://127.0.0.1:{prometheus_port}"),
             true,
-        ),
-    };
+        )};
 
-    let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -81,11 +79,8 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
     ));
     let query_engine = Arc::new(ASAPQueryEngine::new(
         store.clone(),
-        // None,
-        inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);
@@ -163,10 +158,8 @@ async fn test_forwarding_disabled() {
         adapter_config: AdapterConfig::prometheus_promql(
             "http://127.0.0.1:19093".to_string(),
             false, // Forwarding disabled
-        ),
-    };
+        )};
 
-    let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -175,11 +168,8 @@ async fn test_forwarding_disabled() {
 
     let query_engine = Arc::new(ASAPQueryEngine::new(
         store.clone(),
-        // None,
-        inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);
@@ -219,10 +209,8 @@ async fn test_prometheus_server_unreachable() {
         adapter_config: AdapterConfig::prometheus_promql(
             "http://127.0.0.1:99999".to_string(), // Unreachable port
             true,
-        ),
-    };
+        )};
 
-    let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
@@ -231,11 +219,8 @@ async fn test_prometheus_server_unreachable() {
 
     let query_engine = Arc::new(ASAPQueryEngine::new(
         store.clone(),
-        // None,
-        inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);

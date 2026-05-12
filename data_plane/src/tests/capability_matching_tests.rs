@@ -5,10 +5,9 @@
 //! the existing query_config path still takes priority when an entry is present.
 
 use crate::stores::types::{
-    AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
-    PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig, StreamingConfig,
-    WindowType,
-};
+    AggregationConfig, AggregationType, CleanupPolicy,
+    PrecomputedOutput, QueryLanguage, StreamingConfig,
+    WindowType};
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
@@ -50,8 +49,7 @@ fn make_agg_config(
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
         table_name: None,
-        value_column: None,
-    }
+        value_column: None}
 }
 
 /// Build a `ASAPQueryEngine` with an explicit list of `AggregationConfig`s and no query_configs.
@@ -67,8 +65,7 @@ fn engine_no_query_configs(
     }
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
@@ -93,27 +90,18 @@ fn engine_no_query_configs(
                 Box::new(cms)
             }
             "DeltaSetAggregator" => Box::new(DeltaSetAggregatorAccumulator::new()),
-            _ => Box::new(SumAccumulator::with_sum(42.0)),
-        };
+            _ => Box::new(SumAccumulator::with_sum(42.0))};
         store.insert_precomputed_output(output, acc).unwrap();
     }
 
     let schema_label_names =
         KeyByLabelNames::new(schema_labels.iter().map(|s| s.to_string()).collect());
-    let promql_schema = PromQLSchema::new().add_metric(metric.to_string(), schema_label_names);
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![], // intentionally empty — forces capability matching
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }
 
@@ -129,8 +117,7 @@ fn engine_with_query_config(
     agg_map.insert(agg_id, agg_config.clone());
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
-        storage_backend: Default::default(),
-    });
+        storage_backend: Default::default()});
     let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
@@ -145,23 +132,13 @@ fn engine_with_query_config(
 
     let schema_label_names =
         KeyByLabelNames::new(schema_labels.iter().map(|s| s.to_string()).collect());
-    let promql_schema = PromQLSchema::new().add_metric(metric.to_string(), schema_label_names);
 
-    let query_config = QueryConfig::new(promql_query.to_string())
-        .add_aggregation(AggregationReference::new(agg_id, None));
 
-    let inference_config = InferenceConfig {
-        schema: SchemaConfig::PromQL(promql_schema),
-        query_configs: vec![query_config],
-        cleanup_policy: CleanupPolicy::NoCleanup,
-    };
 
     ASAPQueryEngine::new(
         store,
-        inference_config,
         streaming_config,
         1,
-        QueryLanguage::promql,
     )
 }
 
