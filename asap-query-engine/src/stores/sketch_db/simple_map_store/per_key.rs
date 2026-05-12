@@ -675,7 +675,7 @@ impl SimpleMapStorePerKey {
         // SketchIndex, this returns Ok(()) so that callers see "no disk
         // parts" rather than panicking; the live in-memory path still
         // serves recent windows.
-        panic!("datafusion-dependent path removed; ingest/persistence still under refactor")
+        Ok(())
     }
 }
 
@@ -1002,7 +1002,18 @@ impl EpochSource for PerKeyInner {
         // removed `engines::physical` module. SimpleMapStore is
         // deprecated; persistence is being refactored on top of the
         // SketchIndex.
-        panic!("datafusion-dependent path removed; ingest/persistence still under refactor")
+        //
+        // Until the refactor lands, return `Ok(None)` (the same shape
+        // the flusher uses for "already-evicted" epochs) instead of
+        // panicking. Panicking on a stub kills the background flusher
+        // thread, which leaves any insert blocked in
+        // `wait_for_memory_under` waiting up to 30s for memory that
+        // can never drain — turning a unit-test hot-path into a
+        // multi-minute deadlock. `Ok(None)` causes the flusher to
+        // skip the epoch on each tick; sealed memory stays in-process
+        // until the proper SketchIndex-backed snapshot path is wired
+        // up, but inserts make forward progress.
+        Ok(None)
     }
 
     fn evict_sealed_epoch(&self, agg_id: u64, epoch_id: u64) {
