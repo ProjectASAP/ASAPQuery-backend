@@ -205,9 +205,55 @@ impl SketchAllocator {
             }
 
             // ── WindowedAgg — treat as SketchAgg (window is informational) ──
-            QueryExpr::WindowedAgg { agg, window: _, col, input } => {
+            //
+            // Step γ3 demonstration: bridge the legacy WindowedAgg to
+            // canonical-shape data (Window over Aggregate) and enrich
+            // the child PlanNode's annotation rationale with the
+            // canonical window kind + intent kind. The legacy emit
+            // shape is unchanged — `alloc_sketch_agg` still receives
+            // the legacy `agg` / `col` and emits a `QueryExpr::SketchAgg`
+            // (approach (c) per the migration spec). The bridge fails
+            // gracefully on Wildcard cols / Unbounded / Landmark
+            // windows; we keep the un-enriched fallback rationale in
+            // that case.
+            QueryExpr::WindowedAgg { agg, window, col, input } => {
+                let bridge_annotation: Option<String> =
+                    crate::intent_algebra::bridge_windowed_agg_to_canonical(
+                        &agg, &window, &col, parent_schema,
+                    )
+                    .ok()
+                    .map(|b| {
+                        let kind_str = match b.window_kind {
+                            crate::intent_algebra::WindowKind::Tumbling => "tumbling",
+                            crate::intent_algebra::WindowKind::Sliding => "sliding",
+                            crate::intent_algebra::WindowKind::Session => "session",
+                        };
+                        let intent_str = b
+                            .inner
+                            .aggs
+                            .first()
+                            .map(canonical_intent_kind_str)
+                            .unwrap_or("<none>");
+                        format!(
+                            "canonical view: Window(kind={kind_str}, \
+                             size={:?}, slide={:?}) over Aggregate(by_len={}, \
+                             intent={intent_str})",
+                            b.window_size,
+                            b.window_slide,
+                            b.inner.by.len(),
+                        )
+                    });
                 let child = self.alloc_node(*input, budget, parent_schema);
-                self.alloc_sketch_agg(agg, col, child, budget, parent_schema)
+                let mut node = self.alloc_sketch_agg(agg, col, child, budget, parent_schema);
+                if let Some(extra) = bridge_annotation {
+                    if node.annotation.rationale.is_empty() {
+                        node.annotation.rationale = extra;
+                    } else {
+                        node.annotation.rationale =
+                            format!("{}; {extra}", node.annotation.rationale);
+                    }
+                }
+                node
             }
 
             // ── TopK — Precompute engine ──────────────────────────────────

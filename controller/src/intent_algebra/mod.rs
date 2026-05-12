@@ -135,3 +135,15 @@ pub use aggregate_bridge::{
 // or later).
 pub mod topk_bridge;
 pub use topk_bridge::{bridge_topk, BridgeError as TopKBridgeError, BridgedTopK};
+
+// Step γ3 bridge: one-way `legacy_expr::QueryExpr::WindowedAgg` →
+// canonical `Window { child: Aggregate { .. } }` helper. Sidesteps the
+// 20+ consumers that depend on the fused `WindowedAgg`'s window-sketch
+// lifecycle invariant — they continue matching the legacy variant; only
+// consumers that want the canonical stacked view call this bridge. The
+// legacy variant remains in `legacy_expr.rs` until Step γ7 retires it.
+pub mod windowed_agg_bridge;
+pub use windowed_agg_bridge::{
+    bridge_windowed_agg_to_canonical, output_schema_for_windowed_agg,
+    BridgeError as WindowedAggBridgeError, BridgedWindowedAgg,
+};
