@@ -17,31 +17,20 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use data_plane::stores::types::enums::{
-    CleanupPolicy, InputFormat, LockStrategy, StreamingEngine,
-};
+use data_plane::stores::types::enums::{CleanupPolicy, LockStrategy};
 use data_plane::stores::types::InferenceConfig;
 use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::utils::file_io::{read_inference_config, read_streaming_config};
 use data_plane::{
-    HttpServer, HttpServerConfig, KafkaConsumer, KafkaConsumerConfig, OtlpReceiver,
-    OtlpReceiverConfig, PrecomputeEngine, PrecomputeEngineConfig, Result, ASAPQueryEngine,
-    SketchStore, StoreOutputSink,
+    HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
+    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStore, StoreOutputSink,
 };
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Kafka topic to consume from (required when streaming-engine=arroyo)
-    #[arg(long)]
-    kafka_topic: Option<String>,
-
-    /// Input format for Kafka messages (required when streaming-engine=arroyo)
-    #[arg(long, value_enum)]
-    input_format: Option<InputFormat>,
-
     /// Path to the inference config YAML — maps query patterns to
     /// aggregation IDs so the query engine can pick the right
     /// stored sketch for an incoming PromQL. Both spellings are
@@ -56,12 +45,6 @@ struct Args {
     /// File path for streaming_config
     #[arg(long)]
     streaming_config: String,
-
-    /// Streaming engine to use. Default `precompute` matches the
-    /// formerly-deployed `precompute_engine` binary's behavior;
-    /// override to `arroyo` (Kafka consumer) only when needed.
-    #[arg(long, value_enum, default_value = "precompute")]
-    streaming_engine: StreamingEngine,
 
     /// Prometheus scrape interval (seconds). Default 30 matches
     /// the e2e harness's 30s window. ASAPQueryEngine uses this as the
@@ -108,10 +91,6 @@ struct Args {
     #[arg(long)]
     forward_unsupported_queries: bool,
 
-    /// Kafka broker address
-    #[arg(long, default_value = "localhost:9092")]
-    kafka_broker: String,
-
     /// Database path (currently unused, kept for compatibility)
     #[arg(long, default_value = "sketchdb.db")]
     db_path: String,
@@ -131,10 +110,6 @@ struct Args {
     /// Enable profiling (currently unused, kept for compatibility)
     #[arg(long)]
     do_profiling: bool,
-
-    /// Decompress JSON messages
-    #[arg(long)]
-    decompress_json: bool,
 
     /// Enable dumping received precomputes to files for debugging
     #[arg(long)]
@@ -490,59 +465,7 @@ async fn main() -> Result<()> {
         engine
     };
 
-    // Setup Kafka consumer (only when not using precompute engine as the streaming backend)
-    let kafka_handle = if args.streaming_engine == StreamingEngine::Precompute {
-        info!("Using precompute engine as streaming backend — skipping Kafka consumer");
-        None
-    } else {
-        let kafka_topic = args.kafka_topic.clone().unwrap_or_else(|| {
-            error!("--kafka-topic is required when --streaming-engine is not precompute");
-            std::process::exit(1);
-        });
-        let input_format = args.input_format.unwrap_or_else(|| {
-            error!("--input-format is required when --streaming-engine is not precompute");
-            std::process::exit(1);
-        });
-        let kafka_config = KafkaConsumerConfig {
-            broker: args.kafka_broker.clone(),
-            topic: kafka_topic.clone(),
-            group_id: "query-engine-rust".to_string(),
-            auto_offset_reset: "beginning".to_string(),
-            input_format,
-            decompress_json: args.decompress_json,
-            batch_size: 1000,
-            poll_timeout_ms: 1000,
-            streaming_engine: args.streaming_engine.clone(),
-            dump_precomputes: args.dump_precomputes,
-            dump_output_dir: if args.dump_precomputes {
-                Some(args.output_dir.clone())
-            } else {
-                None
-            },
-        };
-
-        let store_for_kafka = store.clone();
-        let kafka_consumer_result =
-            KafkaConsumer::new(kafka_config, store_for_kafka, streaming_config.clone());
-        match kafka_consumer_result {
-            Ok(mut consumer) => {
-                info!("Starting Kafka consumer for topic: {}", kafka_topic);
-                Some(tokio::spawn(async move {
-                    if let Err(e) = consumer.run().await {
-                        error!("Kafka consumer error: {}", e);
-                    }
-                }))
-            }
-            Err(e) => {
-                error!("Failed to create Kafka consumer: {}", e);
-                info!("Continuing without Kafka consumer");
-                None
-            }
-        }
-    };
-
-    // Setup precompute engine. Automatically enabled when the configured
-    // streaming engine is Precompute. Backend ingest is OTLP-only — the
+    // Setup precompute engine. Backend ingest is OTLP-only — the
     // precompute engine no longer hosts an HTTP listener of its own; the
     // OTLP receiver below pushes envelopes / raw points into the worker
     // pool via the `IngestState` handle returned by `engine.ingest_state()`.
@@ -550,8 +473,7 @@ async fn main() -> Result<()> {
     // NOTE: precompute is constructed BEFORE the OTLP receiver so the receiver
     // can obtain an `Arc<IngestState>` handle and push OTLP metrics / sketches
     // into the same worker pool (and not just write directly to the store).
-    let enable_precompute = args.streaming_engine == StreamingEngine::Precompute;
-    let (precompute_handle, precompute_ingest_state) = if enable_precompute {
+    let (precompute_handle, precompute_ingest_state) = {
         let precompute_config = PrecomputeEngineConfig {
             num_workers: args.precompute_num_workers,
             allowed_lateness_ms: args.precompute_allowed_lateness_ms,
@@ -588,13 +510,6 @@ async fn main() -> Result<()> {
             }
         });
         (Some(handle), Some(ingest_state))
-    } else {
-        // Even without precompute, log store diagnostics
-        let diag_store = store.clone();
-        tokio::spawn(async move {
-            spawn_memory_diagnostics(diag_store, None).await;
-        });
-        (None, None)
     };
 
     // Hand the precompute engine's `SchemaRegistry` to the query
@@ -945,12 +860,6 @@ async fn main() -> Result<()> {
     if let Some(handle) = schema_eviction_handle {
         info!("Shutting down schema eviction service...");
         handle.shutdown().await;
-    }
-
-    if let Some(handle) = kafka_handle {
-        info!("Shutting down Kafka consumer...");
-        handle.abort();
-        let _ = handle.await;
     }
 
     if let Some(handle) = otel_handle {

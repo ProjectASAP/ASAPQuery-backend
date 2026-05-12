@@ -1,15 +1,3 @@
-#[derive(clap::ValueEnum, Clone, Debug)]
-pub enum InputFormat {
-    Json,
-    Byte,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
-pub enum StreamingEngine {
-    Arroyo,
-    Precompute,
-}
-
 pub use asap_types::enums::{CleanupPolicy, QueryLanguage, WindowType};
 pub use promql_utilities::query_logics::enums::AggregationType;
 
