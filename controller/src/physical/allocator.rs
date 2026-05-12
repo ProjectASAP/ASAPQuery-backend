@@ -32,6 +32,7 @@ use super::plan::{
     CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode,
 };
 use crate::intent_algebra::legacy_expr::{agg_is_exact, AggIntent};
+use crate::intent_algebra::{infer_schema_for_root, Schema};
 use crate::types::{SketchType, StageResourceBudgets};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
@@ -94,14 +95,27 @@ impl SketchAllocator {
     }
 
     /// Allocate stages for the entire expression tree.
+    ///
+    /// Step β: derives the root-level [`Schema`] from the outermost
+    /// `Source` leaf (via [`infer_schema_for_root`]) and threads it
+    /// through every recursive [`Self::alloc_node`] call. The allocator's
+    /// stage-assignment logic is purely structural today, but the schema
+    /// parameter is in place for Step γ when sketch-placement heuristics
+    /// start consulting column types.
     pub fn allocate(&self, expr: QueryExpr) -> PlanNode {
+        let schema = infer_schema_for_root(&expr);
         let mut budget = BudgetState::from_budgets(&self.budgets);
-        self.alloc_node(expr, &mut budget)
+        self.alloc_node(expr, &mut budget, &schema)
     }
 
     // ── Recursive allocation ──────────────────────────────────────────────────
 
-    fn alloc_node(&self, expr: QueryExpr, budget: &mut BudgetState) -> PlanNode {
+    fn alloc_node(
+        &self,
+        expr: QueryExpr,
+        budget: &mut BudgetState,
+        parent_schema: &Schema,
+    ) -> PlanNode {
         match expr {
             // ── Leaves ───────────────────────────────────────────────────────
             QueryExpr::Source(_) | QueryExpr::Ref(_) => PlanNode::leaf(
@@ -112,7 +126,7 @@ impl SketchAllocator {
 
             // ── Structural / filter nodes — always Agent ──────────────────
             QueryExpr::Filter { pred, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 let stage = PipelineStage::Agent;
                 PlanNode {
                     expr: QueryExpr::Filter { pred, input: Box::new(child.expr.clone()) },
@@ -131,7 +145,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Window { duration, slide, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Window {
                         duration, slide,
@@ -149,7 +163,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Partition { keys, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Partition {
                         keys,
@@ -167,7 +181,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Distinct { cols, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Distinct {
                         cols,
@@ -186,19 +200,19 @@ impl SketchAllocator {
 
             // ── Sketch aggregation — core allocation logic ────────────────
             QueryExpr::SketchAgg { op, col, input } => {
-                let child = self.alloc_node(*input, budget);
-                self.alloc_sketch_agg(op, col, child, budget)
+                let child = self.alloc_node(*input, budget, parent_schema);
+                self.alloc_sketch_agg(op, col, child, budget, parent_schema)
             }
 
             // ── WindowedAgg — treat as SketchAgg (window is informational) ──
             QueryExpr::WindowedAgg { agg, window: _, col, input } => {
-                let child = self.alloc_node(*input, budget);
-                self.alloc_sketch_agg(agg, col, child, budget)
+                let child = self.alloc_node(*input, budget, parent_schema);
+                self.alloc_sketch_agg(agg, col, child, budget, parent_schema)
             }
 
             // ── TopK — Precompute engine ──────────────────────────────────
             QueryExpr::TopK { k, by, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::TopK {
                         k, by,
@@ -224,7 +238,7 @@ impl SketchAllocator {
             QueryExpr::Merge { inputs } => {
                 let children: Vec<PlanNode> = inputs
                     .into_iter()
-                    .map(|inp| self.alloc_node(inp, budget))
+                    .map(|inp| self.alloc_node(inp, budget, parent_schema))
                     .collect();
                 let mem: f64 = children.iter().map(|c| c.cost.memory_bytes).sum();
                 PlanNode {
@@ -248,7 +262,7 @@ impl SketchAllocator {
 
             // ── Exact / relational — Db ───────────────────────────────────
             QueryExpr::Aggregate { keys, aggs, having, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Aggregate {
                         keys, aggs, having,
@@ -269,7 +283,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Project { cols, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Project {
                         cols,
@@ -287,7 +301,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Sort { keys, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Sort {
                         keys,
@@ -305,7 +319,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::Limit { n, offset, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Limit {
                         n, offset,
@@ -323,8 +337,8 @@ impl SketchAllocator {
             }
 
             QueryExpr::Join { kind, pred, left, right } => {
-                let left_node  = self.alloc_node(*left, budget);
-                let right_node = self.alloc_node(*right, budget);
+                let left_node  = self.alloc_node(*left, budget, parent_schema);
+                let right_node = self.alloc_node(*right, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Join {
                         kind, pred,
@@ -346,8 +360,8 @@ impl SketchAllocator {
             }
 
             QueryExpr::SetOp { kind, all, left, right } => {
-                let left_node  = self.alloc_node(*left, budget);
-                let right_node = self.alloc_node(*right, budget);
+                let left_node  = self.alloc_node(*left, budget, parent_schema);
+                let right_node = self.alloc_node(*right, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::SetOp {
                         kind, all,
@@ -367,7 +381,7 @@ impl SketchAllocator {
 
             // ── PromQL-specific ───────────────────────────────────────────
             QueryExpr::HistogramQuantile { phi, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 // If the child is a sketch, elevate to Precompute;
                 // otherwise fall through to Db.
                 let stage = if child.mode == ExecutionMode::Sketch {
@@ -397,7 +411,7 @@ impl SketchAllocator {
             }
 
             QueryExpr::PromQLSubquery { range, resolution, input } => {
-                let child = self.alloc_node(*input, budget);
+                let child = self.alloc_node(*input, budget, parent_schema);
                 let stage = if child.mode == ExecutionMode::Sketch {
                     PipelineStage::Precompute
                 } else {
@@ -421,8 +435,8 @@ impl SketchAllocator {
             }
 
             QueryExpr::BinaryOp { op, lhs, rhs, vector_match } => {
-                let left_node  = self.alloc_node(*lhs, budget);
-                let right_node = self.alloc_node(*rhs, budget);
+                let left_node  = self.alloc_node(*lhs, budget, parent_schema);
+                let right_node = self.alloc_node(*rhs, budget, parent_schema);
                 let has_sketch = left_node.mode == ExecutionMode::Sketch
                     || right_node.mode == ExecutionMode::Sketch;
                 let stage = if has_sketch {
@@ -450,8 +464,8 @@ impl SketchAllocator {
 
             // ── Scoping constructs — propagate body's stage ───────────────
             QueryExpr::LetBinding { name, expr, body } => {
-                let expr_node = self.alloc_node(*expr, budget);
-                let body_node = self.alloc_node(*body, budget);
+                let expr_node = self.alloc_node(*expr, budget, parent_schema);
+                let body_node = self.alloc_node(*body, budget, parent_schema);
                 let stage = body_node.stage.clone();
                 let mode  = body_node.mode.clone();
                 PlanNode {
@@ -481,6 +495,10 @@ impl SketchAllocator {
         col:    crate::intent_algebra::legacy_expr::ColumnRef,
         child:  PlanNode,
         budget: &mut BudgetState,
+        // Step β: schema in scope at this SketchAgg node. Unused today —
+        // Step γ wires sketch-placement rules that consult column types
+        // (e.g. KLL vs DDSketch for `value: Float64`).
+        _parent_schema: &Schema,
     ) -> PlanNode {
         // Exact non-mergeable (Avg) → always Db.
         if matches!(&op, AggIntent::Avg) {

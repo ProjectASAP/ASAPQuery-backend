@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use crate::physical::sketch_catalog;
 use crate::intent_algebra::legacy_expr::{AggIntent, WindowKind, WindowSpec};
+use crate::intent_algebra::{infer_schema_for_root, Schema};
 use crate::types::{SketchParams, SketchType};
 
 // ── PhysicalAggOp (resolved sketch intent) ──────────────────────────────────
@@ -230,11 +231,23 @@ pub struct PhysicalPlannerConfig {
 /// Walks the logical tree bottom-up, assigning each node to a pipeline stage
 /// (`Placement`), resolving sketch intents to concrete implementations, and
 /// inserting `Exchange` nodes at stage boundaries.
+///
+/// Step β: derives the root-level [`Schema`] from the outermost `Source`
+/// leaf and threads it through every recursive [`plan_node`] call. The
+/// physical planner is structurally schema-agnostic today (resolution
+/// happens against legacy `ColumnRef::Named(_)` strings); the parameter
+/// is plumbing for Step γ when sketch-binding decisions start consulting
+/// column types.
 pub fn plan(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
-    plan_node(expr, config)
+    let schema = infer_schema_for_root(expr);
+    plan_node(expr, config, &schema)
 }
 
-fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
+fn plan_node(
+    expr: &QueryExpr,
+    config: &PhysicalPlannerConfig,
+    parent_schema: &Schema,
+) -> PhysicalNode {
     match expr {
         // ── Leaf: scan at Agent ─────────────────────────────────────
         QueryExpr::Source(s) => PhysicalNode {
@@ -249,7 +262,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── Filter: same placement as child ─────────────────────────
         QueryExpr::Filter { pred, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             PhysicalNode {
                 placement: child.placement.clone(),
                 op: PhysicalOp::Filter { pred: format!("{pred:?}") },
@@ -260,7 +273,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── SketchAgg: resolve intent → physical, place at Agent or defer ──
         QueryExpr::SketchAgg { op, col, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let resolved = resolve(op);
             let placement = decide_sketch_placement(&resolved, config);
 
@@ -287,7 +300,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── WindowedAgg: resolve + place with window ────────────────
         QueryExpr::WindowedAgg { agg, window, col, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let resolved = resolve(agg);
             let placement = decide_sketch_placement(&resolved, config);
             let phys_window = resolve_window(window, &placement);
@@ -314,7 +327,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── Partition / Merge: Backend stage ────────────────────────
         QueryExpr::Partition { keys, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::HashAggregate { keys: keys.keys().to_vec() },
                 placement: Placement::BackendCollector,
@@ -327,7 +340,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         QueryExpr::Merge { inputs } => {
             let children: Vec<PhysicalNode> = inputs.iter()
-                .map(|i| plan_node(i, config))
+                .map(|i| plan_node(i, config, parent_schema))
                 .collect();
             let sketch_type = children.first()
                 .and_then(|c| match &c.op {
@@ -344,7 +357,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         }
 
         QueryExpr::Distinct { cols, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let pred = format!("distinct({})", display_distinct_cols(cols));
             let mut node = PhysicalNode {
                 op: PhysicalOp::Filter { pred },
@@ -358,7 +371,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── TopK / HistogramQuantile / BinaryOp: QueryEngine stage ──
         QueryExpr::TopK { k, input, .. } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::TopK { k: *k },
                 placement: Placement::QueryEngine,
@@ -370,7 +383,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         }
 
         QueryExpr::HistogramQuantile { phi, input } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::SketchEval {
                     sketch_type: SketchType::DDSketch,
@@ -385,8 +398,8 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         }
 
         QueryExpr::BinaryOp { op, lhs, rhs, .. } => {
-            let left = plan_node(lhs, config);
-            let right = plan_node(rhs, config);
+            let left = plan_node(lhs, config, parent_schema);
+            let right = plan_node(rhs, config, parent_schema);
             PhysicalNode {
                 op: PhysicalOp::Passthrough,
                 placement: Placement::QueryEngine,
@@ -396,7 +409,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         }
 
         QueryExpr::PromQLSubquery { input, .. } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::Passthrough,
                 placement: Placement::QueryEngine,
@@ -409,7 +422,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── Aggregate (non-sketch, exact): Database stage ───────────
         QueryExpr::Aggregate { keys, input, .. } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::DbQuery { sql: format!("GROUP BY {:?}", keys) },
                 placement: Placement::Database,
@@ -425,7 +438,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         | QueryExpr::Limit { input, .. }
         | QueryExpr::Project { input, .. }
         | QueryExpr::Window { input, .. } => {
-            let child = plan_node(input, config);
+            let child = plan_node(input, config, parent_schema);
             PhysicalNode {
                 op: PhysicalOp::Passthrough,
                 placement: child.placement.clone(),
@@ -437,8 +450,8 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         // ── Join: both children, QueryEngine placement ──────────────
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. } => {
-            let l = plan_node(left, config);
-            let r = plan_node(right, config);
+            let l = plan_node(left, config, parent_schema);
+            let r = plan_node(right, config, parent_schema);
             PhysicalNode {
                 op: PhysicalOp::Passthrough,
                 placement: Placement::QueryEngine,
@@ -448,7 +461,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         }
 
         // ── LetBinding ──────────────────────────────────────────────
-        QueryExpr::LetBinding { body, .. } => plan_node(body, config),
+        QueryExpr::LetBinding { body, .. } => plan_node(body, config, parent_schema),
         QueryExpr::Ref(_) => PhysicalNode {
             op: PhysicalOp::Passthrough,
             placement: Placement::QueryEngine,

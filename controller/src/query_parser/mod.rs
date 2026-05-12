@@ -120,9 +120,19 @@ pub fn parse_query(query: &str) -> anyhow::Result<ParsedQuery> {
 }
 
 /// Extract a flat [`ParsedQuery`] by walking a [`QueryExpr`] tree.
+///
+/// Step β: the root-level [`crate::intent_algebra::Schema`] is derived
+/// from the outermost `Source` leaf (via
+/// [`crate::intent_algebra::infer_schema_for_root`]) and threaded through
+/// the [`QeCollector::visit`] walk. The collector is schema-agnostic
+/// today (it reads metric / aggregate / label names from the legacy
+/// `ColumnRef::Named(_)` shape directly); Step γ migrates the column-name
+/// reads onto positional `ColumnId` lookups via
+/// [`crate::intent_algebra::resolve_column_ref`].
 fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
+    let schema = crate::intent_algebra::infer_schema_for_root(qe);
     let mut c = QeCollector::default();
-    c.visit(qe);
+    c.visit(qe, &schema);
     c.build()
 }
 
@@ -141,7 +151,11 @@ struct QeCollector {
 }
 
 impl QeCollector {
-    fn visit(&mut self, expr: &QueryExpr) {
+    /// Step β: `parent_schema` is the [`crate::intent_algebra::Schema`] in
+    /// scope at this node. Collectors that need to convert a
+    /// `ColumnRef::Named` to a `ColumnId` (Step γ migration) call
+    /// [`crate::intent_algebra::resolve_column_ref`] with it.
+    fn visit(&mut self, expr: &QueryExpr, parent_schema: &crate::intent_algebra::Schema) {
         use crate::intent_algebra::legacy_expr::{FilterOp, FilterVal, LiteralValue, ScalarExpr};
         match expr {
             QueryExpr::Source(s) => {
@@ -152,13 +166,13 @@ impl QeCollector {
             QueryExpr::Filter { pred, input } => {
                 // Extract equality label filters from the predicate tree.
                 collect_filters_from_scalar(pred, &mut self.label_filters);
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::Window { duration, input, .. } => {
                 if self.time_window.is_none() {
                     self.time_window = Some(*duration);
                 }
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::Partition { keys, input } => {
                 for k in keys.keys() {
@@ -166,11 +180,11 @@ impl QeCollector {
                         self.group_by_labels.push(k.clone());
                     }
                 }
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::SketchAgg { op, input, .. } => {
                 self.collect_op(op);
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::WindowedAgg { agg, window, input, .. } => {
                 if self.time_window.is_none() {
@@ -179,18 +193,18 @@ impl QeCollector {
                     }
                 }
                 self.collect_op(agg);
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::TopK { k, input, .. } => {
                 self.topk = Some(*k);
                 let prev = self.inside_topk;
                 self.inside_topk = true;
-                self.visit(input);
+                self.visit(input, parent_schema);
                 self.inside_topk = prev;
             }
-            QueryExpr::Distinct { input, .. } => self.visit(input),
+            QueryExpr::Distinct { input, .. } => self.visit(input, parent_schema),
             QueryExpr::Merge { inputs } => {
-                for i in inputs { self.visit(i); }
+                for i in inputs { self.visit(i, parent_schema); }
             }
             QueryExpr::Aggregate { keys, aggs, input, .. } => {
                 for k in keys {
@@ -202,22 +216,22 @@ impl QeCollector {
                 for agg in aggs {
                     self.collect_agg_func_with_group(&agg.func, has_group_by);
                 }
-                self.visit(input);
+                self.visit(input, parent_schema);
             }
             QueryExpr::Project { input, .. }
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
             | QueryExpr::HistogramQuantile { input, .. }
-            | QueryExpr::PromQLSubquery { input, .. } => self.visit(input),
+            | QueryExpr::PromQLSubquery { input, .. } => self.visit(input, parent_schema),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
-                self.visit(left);
-                self.visit(right);
+                self.visit(left, parent_schema);
+                self.visit(right, parent_schema);
             }
             QueryExpr::LetBinding { expr, body, .. } => {
-                self.visit(expr);
-                self.visit(body);
+                self.visit(expr, parent_schema);
+                self.visit(body, parent_schema);
             }
             QueryExpr::Ref(_) => {}
         }

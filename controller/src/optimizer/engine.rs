@@ -32,6 +32,7 @@ use std::collections::HashMap;
 
 use crate::intent_algebra::legacy_expr::{QueryExpr, ScalarExpr, SetOpKind, SortKey};
 use crate::intent_algebra::legacy_expr::{AggIntent, PartitionKeys, SourceSpec};
+use crate::intent_algebra::{infer_schema_for_root, Schema};
 use crate::sketch_algebra::capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
 };
@@ -278,6 +279,18 @@ impl CostModel for DefaultCostModel {
 // ── Rewrite rule trait ────────────────────────────────────────────────────────
 
 /// A single algebraic rewrite rule.
+///
+/// # Schema parameter (Step β of the legacy_expr migration)
+///
+/// `parent_schema` is the [`Schema`] in scope at this node — the output
+/// schema of `expr`'s parent in the tree (or the root-level schema when
+/// `expr` is the root). Step β threads this through every walker so Step
+/// γ rules can call
+/// [`crate::intent_algebra::resolve_column_ref`] to convert
+/// `ColumnRef::Named("host")` → `ColumnId(2)` without changing the
+/// legacy `QueryExpr` shape. The default rules in this file are
+/// structural rewrites that don't read the schema today — the parameter
+/// is plumbing for Step γ.
 pub trait RewriteRule: Send + Sync {
     /// Human-readable name for logging.
     fn name(&self) -> &'static str;
@@ -285,7 +298,16 @@ pub trait RewriteRule: Send + Sync {
     /// Try to rewrite `expr`.  Returns `Some(new_expr)` if the rule fired,
     /// `None` otherwise.  The rule is applied top-down: the optimizer will
     /// also recurse into the children of `new_expr`.
-    fn try_rewrite(&self, expr: QueryExpr, model: &dyn CostModel) -> Option<QueryExpr>;
+    ///
+    /// `parent_schema` is the schema in scope at `expr` — see the trait
+    /// docs. Rules that need positional column resolution should consult
+    /// it; rules that are purely structural can ignore it.
+    fn try_rewrite(
+        &self,
+        expr: QueryExpr,
+        model: &dyn CostModel,
+        parent_schema: &Schema,
+    ) -> Option<QueryExpr>;
 }
 
 // ── R1: PredicatePushDown ─────────────────────────────────────────────────────
@@ -302,7 +324,7 @@ pub struct PredicatePushDown;
 impl RewriteRule for PredicatePushDown {
     fn name(&self) -> &'static str { "PredicatePushDown" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Filter { pred, input } => {
                 match *input {
@@ -359,7 +381,7 @@ pub struct MergeLifting;
 impl RewriteRule for MergeLifting {
     fn name(&self) -> &'static str { "MergeLifting" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::SketchAgg { ref op, ref col, ref input }
                 if crate::intent_algebra::legacy_expr::agg_is_mergeable(op) =>
@@ -394,7 +416,7 @@ pub struct HLLDedupElim;
 impl RewriteRule for HLLDedupElim {
     fn name(&self) -> &'static str { "HLLDedupElim" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::SketchAgg { op: AggIntent::Cardinality { accuracy }, col, input } => {
                 if let QueryExpr::Distinct { input: inner, .. } = *input {
@@ -424,7 +446,7 @@ pub struct FilterWindowSwap;
 impl RewriteRule for FilterWindowSwap {
     fn name(&self) -> &'static str { "FilterWindowSwap" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         // Handled by PredicatePushDown — mark as no-op here to avoid double-fire.
         match expr {
             QueryExpr::Filter { pred, input } => {
@@ -453,7 +475,7 @@ pub struct TopKFusion;
 impl RewriteRule for TopKFusion {
     fn name(&self) -> &'static str { "TopKFusion" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Limit { n, offset: 0, input } => {
                 if let QueryExpr::Sort { keys, input: inner } = *input {
@@ -487,7 +509,7 @@ pub struct HistogramQuantileFusion;
 impl RewriteRule for HistogramQuantileFusion {
     fn name(&self) -> &'static str { "HistogramQuantileFusion" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         // Canonical Quantile is single-φ post Step α — multi-φ fan-out
         // happens at construction time, so the "merge phi into the
         // existing quantile list" branch is now a "if phis match, keep
@@ -555,7 +577,7 @@ pub struct SubqueryDecorrelation;
 impl RewriteRule for SubqueryDecorrelation {
     fn name(&self) -> &'static str { "SubqueryDecorrelation" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Filter { pred, input } => {
                 if let Some((name, sq_expr, new_pred)) = extract_scalar_subquery(pred) {
@@ -621,7 +643,7 @@ pub struct CommonSubexprElim;
 impl RewriteRule for CommonSubexprElim {
     fn name(&self) -> &'static str { "CommonSubexprElim" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Merge { ref inputs } => {
                 // Count occurrences of each source name.
@@ -682,7 +704,7 @@ pub struct HydraConversion;
 impl RewriteRule for HydraConversion {
     fn name(&self) -> &'static str { "HydraConversion" }
 
-    fn try_rewrite(&self, _expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, _expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         // Step α: disabled — see struct docs. Step γ TODO: re-emit as a
         // canonical `Aggregate { by, aggs: [inner] }` wrapper around the
         // unwrapped `SketchAgg.op`.
@@ -734,7 +756,7 @@ pub struct WindowMerge;
 impl RewriteRule for WindowMerge {
     fn name(&self) -> &'static str { "WindowMerge" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Window { duration, slide, input } => {
                 if let QueryExpr::Window { duration: inner_d, slide: inner_s, input: inner_e } =
@@ -766,7 +788,7 @@ pub struct PartitionElim;
 impl RewriteRule for PartitionElim {
     fn name(&self) -> &'static str { "PartitionElim" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Partition { keys, input } if keys.is_empty() => Some(*input),
             _ => None,
@@ -782,7 +804,7 @@ pub struct SetOpFusion;
 impl RewriteRule for SetOpFusion {
     fn name(&self) -> &'static str { "SetOpFusion" }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
         match expr {
             QueryExpr::SetOp {
                 kind: SetOpKind::Union,
@@ -861,10 +883,16 @@ impl QueryOptimizer {
     /// Optimize `expr` until fixed point or `max_iters` iterations.
     ///
     /// Returns the rewritten tree and the number of iterations actually run.
+    ///
+    /// Step β: derives the root-level [`Schema`] from `expr`'s outermost
+    /// `Source` leaf (via [`infer_schema_for_root`]) and threads it
+    /// through the recursive walk so every [`RewriteRule::try_rewrite`]
+    /// call sees the schema in scope at its node.
     pub fn optimize(&self, expr: QueryExpr) -> (QueryExpr, usize) {
+        let schema = infer_schema_for_root(&expr);
         let mut current = expr;
         for iter in 0..self.max_iters {
-            let (next, changed) = self.apply_all(current);
+            let (next, changed) = self.apply_all(current, &schema);
             current = next;
             if !changed {
                 return (current, iter + 1);
@@ -875,18 +903,32 @@ impl QueryOptimizer {
 
     /// Apply all rules once to every node in the tree (single pass).
     /// Returns `(new_tree, did_anything_change)`.
-    fn apply_all(&self, expr: QueryExpr) -> (QueryExpr, bool) {
+    ///
+    /// `parent_schema` is the schema in scope at `expr` per Step β —
+    /// threaded through to [`RewriteRule::try_rewrite`] and the child
+    /// recursion. Legacy variants don't transform schema today; Step γ
+    /// will refine the per-variant schema propagation (e.g. `Aggregate`
+    /// strips the time axis, `Project` reshapes columns).
+    fn apply_all(&self, expr: QueryExpr, parent_schema: &Schema) -> (QueryExpr, bool) {
         // First recurse into children, then try rules at this node.
-        let (expr_with_new_children, child_changed) = self.recurse_children(expr);
-        let (final_expr, this_changed) = self.apply_rules_at(expr_with_new_children);
+        let (expr_with_new_children, child_changed) =
+            self.recurse_children(expr, parent_schema);
+        let (final_expr, this_changed) =
+            self.apply_rules_at(expr_with_new_children, parent_schema);
         (final_expr, child_changed || this_changed)
     }
 
     /// Apply all rules at the current node (no recursion).
-    fn apply_rules_at(&self, mut expr: QueryExpr) -> (QueryExpr, bool) {
+    fn apply_rules_at(
+        &self,
+        mut expr: QueryExpr,
+        parent_schema: &Schema,
+    ) -> (QueryExpr, bool) {
         let mut changed = false;
         for rule in &self.rules {
-            if let Some(new_expr) = rule.try_rewrite(expr.clone(), self.cost_model.as_ref()) {
+            if let Some(new_expr) =
+                rule.try_rewrite(expr.clone(), self.cost_model.as_ref(), parent_schema)
+            {
                 expr = new_expr;
                 changed = true;
                 // After firing, restart from the first rule (fixed-point per node).
@@ -897,10 +939,20 @@ impl QueryOptimizer {
     }
 
     /// Recurse into children, rebuilding the node with rewritten children.
-    fn recurse_children(&self, expr: QueryExpr) -> (QueryExpr, bool) {
+    ///
+    /// The child walk inherits the same `parent_schema` — Step β only
+    /// threads the schema-in-scope without per-variant transformations.
+    /// Step γ will replace this with proper canonical
+    /// [`QueryExpr::output_schema_in`]-style propagation as each variant
+    /// migrates.
+    fn recurse_children(
+        &self,
+        expr: QueryExpr,
+        parent_schema: &Schema,
+    ) -> (QueryExpr, bool) {
         macro_rules! recurse {
             ($child:expr) => {{
-                let (e, c) = self.apply_all(*$child);
+                let (e, c) = self.apply_all(*$child, parent_schema);
                 (Box::new(e), c)
             }};
         }
@@ -962,7 +1014,7 @@ impl QueryOptimizer {
             QueryExpr::Merge { inputs } => {
                 let (new_inputs, changed): (Vec<_>, Vec<_>) = inputs
                     .into_iter()
-                    .map(|inp| self.apply_all(inp))
+                    .map(|inp| self.apply_all(inp, parent_schema))
                     .unzip();
                 (QueryExpr::Merge { inputs: new_inputs }, changed.into_iter().any(|c| c))
             }
@@ -1223,7 +1275,8 @@ mod tests {
         };
         let rule = HistogramQuantileFusion;
         let model = DefaultCostModel { raw_bytes_per_sec: 100_000.0, deployment: None };
-        let result = rule.try_rewrite(expr, &model).expect("R6 should fire");
+        let schema = infer_schema_for_root(&expr);
+        let result = rule.try_rewrite(expr, &model, &schema).expect("R6 should fire");
         match &result {
             QueryExpr::HistogramQuantile { input, .. } => {
                 match input.as_ref() {

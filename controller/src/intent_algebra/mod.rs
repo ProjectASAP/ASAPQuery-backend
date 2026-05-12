@@ -87,6 +87,7 @@ pub mod schema;
 // `QueryExpr` / `AggIntent` types used by the planner, allocator,
 // physical planner, query_parser, and language_logical_plan modules
 // today.
+pub mod column_resolution;
 pub mod legacy_expr;
 pub mod legacy_lower;
 
@@ -102,3 +103,15 @@ pub use query_expr::{
     WindowKind,
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
+
+// Step β plumbing: schema-driven column resolution helpers used by the
+// legacy planning stack (`optimizer/engine.rs`, `physical/{allocator,
+// planner, stage_split}.rs`, `query_parser/*`, `intent_algebra::
+// legacy_lower`) to carry an inherited `Schema` alongside every legacy
+// `QueryExpr` traversal. Consumers call `resolve_column_ref` at the point
+// where they need a positional `ColumnId` — Step γ migrates variants
+// one at a time onto the canonical positional form.
+pub use column_resolution::{
+    infer_schema_for_root, infer_source_schema, resolve_column_ref, resolve_column_refs,
+    ResolveError,
+};

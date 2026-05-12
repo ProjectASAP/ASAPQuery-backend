@@ -14,6 +14,7 @@
 //! unchanged — the physical planner handles them.
 
 use crate::intent_algebra::legacy_expr::*;
+use crate::intent_algebra::{infer_schema_for_root, Schema};
 
 /// Lower a Layer 2 `QueryExpr` (relational operators only) to Layer 3
 /// (sketch algebra with `AggIntent`).
@@ -21,24 +22,43 @@ use crate::intent_algebra::legacy_expr::*;
 /// This pass walks the tree and converts `Aggregate { AggFunc }` nodes
 /// to `SketchAgg { AggIntent }` where the aggregation can benefit from
 /// sketch-based execution.
+///
+/// Step β: derives the root-level [`Schema`] from the outermost `Source`
+/// leaf (via [`infer_schema_for_root`]) and threads it through the
+/// recursive descent. The lowering pass is structurally schema-agnostic
+/// today (it preserves `ColumnRef::Named(_)` verbatim); Step γ will
+/// migrate the per-variant column-list rewrites onto positional
+/// `ColumnId` once the canonical aggregator surface lands consumer-side.
 pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
+    let schema = infer_schema_for_root(&expr);
+    lower_to_sketch_algebra_with_schema(expr, &schema)
+}
+
+/// Variant of [`lower_to_sketch_algebra`] that takes an explicit
+/// inherited [`Schema`]. The public entry point derives it from the
+/// outermost source; callers that already hold a Schema (the optimiser
+/// pipeline, for instance) can pass it directly.
+pub fn lower_to_sketch_algebra_with_schema(
+    expr: QueryExpr,
+    parent_schema: &Schema,
+) -> QueryExpr {
     match expr {
         QueryExpr::Aggregate { keys, aggs, having, input } => {
-            let input = lower_to_sketch_algebra(*input);
+            let input = lower_to_sketch_algebra_with_schema(*input, parent_schema);
             lower_aggregate(keys, aggs, having, Box::new(input))
         }
 
         // ── Single-input nodes: recurse ──────────────────────────────────
         QueryExpr::Filter { pred, input } => QueryExpr::Filter {
             pred,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Project { cols, input } => QueryExpr::Project {
             cols,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Window { duration, slide, input } => {
-            let lowered_input = lower_to_sketch_algebra(*input);
+            let lowered_input = lower_to_sketch_algebra_with_schema(*input, parent_schema);
             // Fuse Window + SketchAgg → WindowedAgg (the window defines sketch lifecycle).
             if let QueryExpr::SketchAgg { op, col, input: sketch_input } = lowered_input {
                 let window = WindowSpec {
@@ -56,74 +76,77 @@ pub fn lower_to_sketch_algebra(expr: QueryExpr) -> QueryExpr {
         QueryExpr::SketchAgg { op, col, input } => QueryExpr::SketchAgg {
             op,
             col,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::WindowedAgg { agg, window, col, input } => QueryExpr::WindowedAgg {
             agg,
             window,
             col,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Partition { keys, input } => QueryExpr::Partition {
             keys,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Distinct { cols, input } => QueryExpr::Distinct {
             cols,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::TopK { k, by, input } => QueryExpr::TopK {
             k,
             by,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Sort { keys, input } => QueryExpr::Sort {
             keys,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::Limit { n, offset, input } => QueryExpr::Limit {
             n,
             offset,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::HistogramQuantile { phi, input } => QueryExpr::HistogramQuantile {
             phi,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
         QueryExpr::PromQLSubquery { range, resolution, input } => QueryExpr::PromQLSubquery {
             range,
             resolution,
-            input: Box::new(lower_to_sketch_algebra(*input)),
+            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
 
-        // ── Two-input nodes: recurse into both ───���──────────────────────
+        // ── Two-input nodes: recurse into both ──────────────────────────
         QueryExpr::BinaryOp { op, lhs, rhs, vector_match } => QueryExpr::BinaryOp {
             op,
-            lhs: Box::new(lower_to_sketch_algebra(*lhs)),
-            rhs: Box::new(lower_to_sketch_algebra(*rhs)),
+            lhs: Box::new(lower_to_sketch_algebra_with_schema(*lhs, parent_schema)),
+            rhs: Box::new(lower_to_sketch_algebra_with_schema(*rhs, parent_schema)),
             vector_match,
         },
         QueryExpr::Join { kind, pred, left, right } => QueryExpr::Join {
             kind,
             pred,
-            left:  Box::new(lower_to_sketch_algebra(*left)),
-            right: Box::new(lower_to_sketch_algebra(*right)),
+            left:  Box::new(lower_to_sketch_algebra_with_schema(*left, parent_schema)),
+            right: Box::new(lower_to_sketch_algebra_with_schema(*right, parent_schema)),
         },
         QueryExpr::SetOp { kind, all, left, right } => QueryExpr::SetOp {
             kind,
             all,
-            left:  Box::new(lower_to_sketch_algebra(*left)),
-            right: Box::new(lower_to_sketch_algebra(*right)),
+            left:  Box::new(lower_to_sketch_algebra_with_schema(*left, parent_schema)),
+            right: Box::new(lower_to_sketch_algebra_with_schema(*right, parent_schema)),
         },
 
         // ── Multi-input / container nodes ─────��──────────────────────────
         QueryExpr::Merge { inputs } => QueryExpr::Merge {
-            inputs: inputs.into_iter().map(lower_to_sketch_algebra).collect(),
+            inputs: inputs
+                .into_iter()
+                .map(|i| lower_to_sketch_algebra_with_schema(i, parent_schema))
+                .collect(),
         },
         QueryExpr::LetBinding { name, expr, body } => QueryExpr::LetBinding {
             name,
-            expr: Box::new(lower_to_sketch_algebra(*expr)),
-            body: Box::new(lower_to_sketch_algebra(*body)),
+            expr: Box::new(lower_to_sketch_algebra_with_schema(*expr, parent_schema)),
+            body: Box::new(lower_to_sketch_algebra_with_schema(*body, parent_schema)),
         },
 
         // ── Leaf nodes: pass through ────────���────────────────────────────
