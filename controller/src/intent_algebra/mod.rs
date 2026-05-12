@@ -126,3 +126,12 @@ pub mod aggregate_bridge;
 pub use aggregate_bridge::{
     bridge_aggregate_to_canonical, BridgeError, BridgedAggregate,
 };
+
+// Step γ4 bridge: one-way `legacy_expr::QueryExpr::TopK` → one of two
+// canonical shapes (heavy-hitter `AggIntent::TopK` vs generic
+// `Sort + Limit`) per design.md §6 "What was removed" row 1. Consumers
+// call this on an inherited Schema; the legacy variant remains in
+// `legacy_expr.rs` until every consumer entry point migrates (Step γ7
+// or later).
+pub mod topk_bridge;
+pub use topk_bridge::{bridge_topk, BridgeError as TopKBridgeError, BridgedTopK};

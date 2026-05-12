@@ -212,6 +212,37 @@ impl SketchAllocator {
 
             // ── TopK — Precompute engine ──────────────────────────────────
             QueryExpr::TopK { k, by, input } => {
+                // Step γ4 demonstration: bridge the legacy TopK to its
+                // canonical-shape data (one of `HeavyHitter` vs
+                // `SortLimit`) and enrich the annotation rationale with
+                // the canonical intent kind. The legacy emit shape is
+                // unchanged — `expr` still carries the legacy variant
+                // (approach (c) per the migration spec). The bridge fails
+                // gracefully when `by` columns don't resolve; the legacy
+                // annotation text is used as the fallback in that case.
+                let by_refs: Vec<crate::intent_algebra::query_expr::ColumnRef> = by
+                    .iter()
+                    .map(|name| {
+                        crate::intent_algebra::query_expr::ColumnRef::Named(name.clone())
+                    })
+                    .collect();
+                let bridge_annotation: String =
+                    match crate::intent_algebra::bridge_topk(k as usize, &by_refs, parent_schema) {
+                        Ok(crate::intent_algebra::BridgedTopK::HeavyHitter { k: kb, by: by_ids, .. }) => format!(
+                            "TopK assigned to Precompute engine (CountSketch); \
+                             canonical intent: HeavyHitter {{ k: {}, by_cols: {} }}",
+                            kb,
+                            by_ids.len(),
+                        ),
+                        Ok(crate::intent_algebra::BridgedTopK::SortLimit { k: kb, by: by_ids }) => format!(
+                            "TopK assigned to Precompute engine (CountSketch); \
+                             canonical intent: SortLimit {{ k: {}, by_cols: {} }}",
+                            kb,
+                            by_ids.len(),
+                        ),
+                        Err(_e) => "TopK assigned to Precompute engine (CountSketch)".into(),
+                    };
+
                 let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::TopK {
@@ -227,7 +258,7 @@ impl SketchAllocator {
                     },
                     annotation: NodeAnnotation {
                         sketch_type: Some(SketchType::CountSketch),
-                        rationale:   "TopK assigned to Precompute engine (CountSketch)".into(),
+                        rationale:   bridge_annotation,
                         ..Default::default()
                     },
                     children: vec![child],
