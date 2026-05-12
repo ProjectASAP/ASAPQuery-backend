@@ -1,0 +1,121 @@
+[package]
+name = "data_plane"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Internal crates (workspace)
+promql_utilities.workspace = true
+asap_types.workspace = true
+# Phase 9: controller is now an in-process library inside the backend
+# binary. Wiring up the in-process OpAMP server + capability-map
+# exposure is a follow-up after Phase 4 (centralized series_id
+# resolver). For now this dep just makes the controller crate
+# compile in the workspace and importable from main.rs.
+controller = { path = "../controller" }
+
+# Shared external (workspace)
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+chrono.workspace = true
+promql-parser.workspace = true
+tokio.workspace = true
+arc-swap.workspace = true
+
+# Crate-specific (keep version pinned here)
+form_urlencoded = "1.2"
+rmp-serde = "1.1"
+axum = "0.7"
+rdkafka = "0.34"
+rusqlite = { version = "0.31", features = ["bundled"] }
+bincode = "1.3"
+dashmap = "5.5"
+uuid = { version = "1.0", features = ["v4"] }
+structopt = "0.3"
+urlencoding = "2.1"
+flate2 = "1.0"
+async-trait = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+base64 = "0.21"
+hex = "0.4"
+arrow = "53.4.1"
+futures = "0.3"
+prost = "0.13"
+# Vendored modified opentelemetry-proto with first-class sketch metric
+# variants from DataCollector (DDSketch / KLLSketch / CountSketch /
+# CountMinSketch / HLLSketch). See docs/pipeline-query-catalog.md §5.4 in the
+# DataCollector repo for the rationale.
+asap_otel_proto.workspace = true
+tonic = "0.12"
+tokio-stream = "0.1"
+regex = "1"
+prometheus = "0.13"
+lazy_static = "1.4"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tracing-appender = "0.2"
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
+# Phase 3 step 3: backend ingest path consumes asap-precompute-rs for the
+# SHARED envelope-parsing / delta-apply / sketch-reconstruction / merge
+# logic. Query-side engine (PromQL aggregation, storage, query planner)
+# is unaffected. See README §"Ingest path consumes asap-precompute-rs"
+# and `docs/adr/ADR-phase3-asap-precompute-rs.md`.
+# `asap-precompute-rs` lives in the `ASAPCollector` repo as a sibling
+# crate alongside non-Rust submodules (telegraf / opentelemetry-go /
+# opentelemetry-collector / etc.) that cargo can't recursively fetch
+# during a `git` source resolution because the parent repo's submodule
+# pins reference commits not reachable via `git fetch <commit>`. The
+# `asap-precompute-rs` Cargo.toml itself path-deps `asap_sketchlib`
+# (`../../asap_sketchlib`) — that path is meaningful only inside the
+# checkout, not from cargo's git cache.
+#
+# We therefore consume `asap-precompute-rs` via a sibling path dep,
+# matching how `asap-precompute-rs` itself path-deps `asap_sketchlib`.
+# Downstream CI / reproducible builds: clone `ASAPCollector` next to
+# `ASAPQuery-backend` (sibling directories under `~/repos/`) before
+# `cargo build`. The path is relative so any matching layout works.
+asap-precompute-rs = { path = "../../ASAPCollector/asap-precompute-rs" }
+# Persistence layer (SimpleMapStore parts / manifest / Tier-2 cache)
+moka = { version = "0.12", features = ["sync"] }
+memmap2 = "0.9"
+crc32fast = "1.4"
+# Phase 3 — Gorilla-S3 cold engine. `asap-gorilla` (path-dep, mirrors
+# the `asap-precompute-rs` sibling-checkout pattern) provides the
+# `GORILLA1` block decoder + per-hour `index.json` catalog. `rust-s3`
+# (`s3` package on crates.io) is a single-crate S3-compatible client
+# with first-class MinIO support; we hold it behind
+# `default-features = false` + `tokio-rustls-tls` so it shares the
+# rustls backend already pulled in by `reqwest`. `lru` powers the
+# Phase 3 `ChunkCache` keyed on chunk object key.
+asap-gorilla = { path = "../../ASAPCollector/asap-gorilla-rust" }
+# mvp/v5 NOTE FOR REVIEWERS: this PR depends on the matching
+# `mvp/v5-postings-compactor` PR in ASAPCollector — specifically the
+# `asap_gorilla::Postings` type and the `IndexEntry::byte_offset /
+# byte_length / object_key` fields. CI machines that build from a
+# `/home/.../ASAPCollector` checkout pinned to `origin/main` will
+# fail compilation with `no Postings in the root` until the
+# collector PR lands. Local dev: `git fetch && git checkout
+# mvp/v5-postings-compactor` in the sibling ASAPCollector repo.
+s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls"] }
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3.20.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "simple_store_bench"
+harness = false
+
+[features]
+#default = ["lock_profiling", "extra_debugging"]
+default = []
+# Enable lock profiling instrumentation
+lock_profiling = []
+# Enable extra debugging output
+extra_debugging = []

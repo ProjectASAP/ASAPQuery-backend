@@ -20,7 +20,7 @@ pub struct StreamingConfig {
     /// per-metric runtime config. The controller pushes this when planning
     /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
     /// configs decode with `#[serde(default)]` to `SketchStore` so
-    /// existing deploys keep dispatching to `SimpleEngine`.
+    /// existing deploys keep dispatching to `ASAPQueryEngine`.
     #[serde(default)]
     pub storage_backend: StorageBackend,
 }
@@ -162,7 +162,7 @@ mod tests {
 
     /// Pre-Phase-5 deploys serialize `StreamingConfig` without the
     /// `storage_backend` field; deserialize must default to `SketchStore`
-    /// so the router keeps dispatching to `SimpleEngine` unchanged.
+    /// so the router keeps dispatching to `ASAPQueryEngine` unchanged.
     #[test]
     fn deserialize_legacy_yaml_defaults_to_warm_tier() {
         let yaml = "{\"aggregation_configs\":{}}";

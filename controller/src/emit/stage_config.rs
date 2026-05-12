@@ -588,7 +588,7 @@ pub fn emit_backend_storage_routing(
 }
 
 /// Tenant id used when the deploy is single-tenant. Mirrors the
-/// backend's `crate::routing::DEFAULT_TENANT` (defined in
+/// backend's `crate::query_engines::routing::DEFAULT_TENANT` (defined in
 /// `ASAPQuery-backend/asap-query-engine/src/routing/backend_storage_routing.rs`)
 /// — kept as a literal here so the controller doesn't take a build-time
 /// dependency on the backend crate just for one constant.
@@ -2121,7 +2121,7 @@ mod tests {
     // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
     // bind to `SketchExpr::Logical` rather than producing a `BackendAggregation`,
     // so they correctly stay OUT of the warm-tier StreamingConfig the
-    // backend's SimpleEngine receives. Phase α wires the archive routing
+    // backend's ASAPQueryEngine receives. Phase α wires the archive routing
     // entry separately. This snapshot pins that contract.
 
     /// Snapshot: an empty `BackendStageConfig` produces the canonical

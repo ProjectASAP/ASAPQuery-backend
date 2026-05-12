@@ -7,7 +7,7 @@
 //!
 //! | Mode                              | Edge action                | Wire                         | Backend role                 | Accuracy        |
 //! |-----------------------------------|----------------------------|------------------------------|------------------------------|-----------------|
-//! | [`BindMode::SketchAtEdge`]        | sketch processor at edge   | edge → backend OTLP          | SimpleEngine over sketch     | bounded ε > 0   |
+//! | [`BindMode::SketchAtEdge`]        | sketch processor at edge   | edge → backend OTLP          | ASAPQueryEngine over sketch     | bounded ε > 0   |
 //! | [`BindMode::RawAtEdgeSketchAtBackend`] | no sketch processor   | edge → backend OTLP (raw)    | builds sketches at ingest    | bounded ε > 0   |
 //! | [`BindMode::RawAtEdgePrometheusArchive`] | no sketch processor | edge → Prometheus OTLP HTTP | backend HTTP-forwards queries | exact (ε = 0)   |
 //!
