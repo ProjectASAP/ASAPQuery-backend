@@ -40,6 +40,7 @@
 
 use thiserror::Error;
 
+use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::legacy_expr::{ColumnRef, QueryExpr, SourceSpec};
 use crate::intent_algebra::schema::{Column, ColumnId, DataType, Schema};
 
@@ -167,6 +168,130 @@ pub fn resolve_column_refs(
     cols.iter().map(|c| resolve_column_ref(c, schema)).collect()
 }
 
+/// Slice-flavoured variant of [`resolve_column_ref`] over a list of
+/// `Vec<String>` GROUP BY keys (the shape carried by
+/// `legacy_expr::QueryExpr::Aggregate.keys`). Mirrors
+/// [`resolve_column_refs`] but skips the `ColumnRef::Named` wrapping —
+/// the legacy `Aggregate.keys` field is already a `Vec<String>`.
+///
+/// Step γ1: used by the legacy→canonical `Aggregate` bridge
+/// ([`crate::intent_algebra::aggregate_bridge::bridge_aggregate_to_canonical`])
+/// to translate the legacy `keys: Vec<String>` into the canonical
+/// `by: Vec<ColumnId>` form.
+pub fn resolve_named_keys(
+    keys: &[String],
+    schema: &Schema,
+) -> Result<Vec<ColumnId>, ResolveError> {
+    keys.iter()
+        .map(|name| {
+            schema
+                .column_id(name)
+                .ok_or_else(|| ResolveError::NotFound {
+                    name: name.clone(),
+                    available: schema.columns.iter().map(|c| c.name.clone()).collect(),
+                })
+        })
+        .collect()
+}
+
+// ── Aggregate schema transformation (Step γ1) ────────────────────────────────
+
+/// Output schema produced by `QueryExpr::Aggregate { by, aggs, child, .. }`
+/// when its `child` carries `input` as its output schema.
+///
+/// Mirrors the canonical
+/// [`crate::intent_algebra::query_expr::QueryExpr::output_schema_in`]
+/// implementation for the `Aggregate` arm — extracted here so consumers
+/// descending into a still-legacy `Aggregate.input` can derive the right
+/// schema for the child without first having to translate the whole
+/// subtree to canonical.
+///
+/// Schema-flow rules (per `design.md` §6 schema-flow table, mirrored
+/// in `query_expr.rs::output_schema_in`):
+///
+/// * Output columns = `by` columns (preserved positionally) followed by
+///   one new column per `aggs` entry, named + typed via
+///   [`AggIntent::output_column`].
+/// * Time axis is stripped — `Aggregate` produces one row per group, not
+///   one row per timestamp.
+/// * `unique_keys` = `[by]` when `by` is non-empty (the group-by tuple is
+///   unique by construction); empty when `by` is empty (single global row).
+///
+/// `by` ids are silently clamped to in-range — out-of-range ids are
+/// dropped from the output. The canonical
+/// [`crate::intent_algebra::query_expr::QueryExpr::output_schema_in`]
+/// surfaces them as
+/// [`crate::intent_algebra::query_expr::QueryExprError::InvalidGroupByColumn`];
+/// the legacy bridge here can't error-type its callers without breaking
+/// the Step β plumbing signature, so we drop instead. (Callers that need
+/// the strict check should resolve `by` ids upstream via
+/// [`resolve_named_keys`] which DOES surface `NotFound`.)
+///
+/// # Example
+///
+/// ```ignore
+/// use controller::intent_algebra::{
+///     column_resolution::{infer_source_schema, output_schema_for_aggregate},
+///     agg_intent::AggIntent,
+///     schema::{Column, DataType, Schema},
+/// };
+/// // Input: a PromQL scan schema (ts, value).
+/// let input = infer_source_schema("http_requests_total");
+/// // Aggregate by [] (global) with [Count, Sum].
+/// let by: Vec<usize> = vec![];
+/// let aggs = vec![
+///     AggIntent::Count { accuracy: types_v2::AccuracyTarget::Exact },
+///     AggIntent::Sum,
+/// ];
+/// let output = output_schema_for_aggregate(&input, &by, &aggs);
+/// assert_eq!(output.columns.len(), 2);          // count + sum
+/// assert!(output.time_index.is_none());         // time axis stripped
+/// assert!(output.unique_keys.is_empty());       // global agg → no UK
+/// ```
+pub fn output_schema_for_aggregate(
+    input: &Schema,
+    by: &[ColumnId],
+    aggs: &[AggIntent],
+) -> Schema {
+    let mut out_cols: Vec<Column> = Vec::with_capacity(by.len() + aggs.len());
+    // GROUP BY columns flow through positionally.
+    for &id in by {
+        if let Some(c) = input.columns.get(id) {
+            out_cols.push(c.clone());
+        }
+        // out-of-range: silently drop — see doc-comment above.
+    }
+    // One new column per intent. PromQL convention: intent applied to the
+    // synthetic `value` column when present; otherwise to the first
+    // non-grouped column. Mirrors canonical query_expr.rs::output_schema_in.
+    let value_col_idx = input
+        .column_id("value")
+        .or_else(|| (0..input.columns.len()).find(|i| !by.contains(i)));
+    let probe = value_col_idx
+        .and_then(|i| input.columns.get(i))
+        .cloned()
+        .unwrap_or(Column {
+            name: "value".into(),
+            dtype: DataType::Float64,
+            nullable: false,
+        });
+    for intent in aggs {
+        out_cols.push(intent.output_column(&probe));
+    }
+    // Output unique_keys = [by] when by is non-empty; empty (global) → no UK.
+    let unique_keys = if by.is_empty() {
+        Vec::new()
+    } else {
+        vec![(0..by.len()).collect()]
+    };
+    // Aggregate strips the time axis — output is one row per group.
+    Schema {
+        columns: out_cols,
+        time_index: None,
+        unique_keys,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -247,6 +372,92 @@ mod tests {
         let expr = QueryExpr::Ref("dangling".into());
         let s = infer_schema_for_root(&expr);
         assert_eq!(s.columns.len(), 0);
+    }
+
+    // ── output_schema_for_aggregate (Step γ1) ──────────────────────────────
+
+    #[test]
+    fn output_schema_for_aggregate_global_count() {
+        use crate::types_v2::AccuracyTarget;
+        let input = infer_source_schema("m");
+        let by: Vec<ColumnId> = vec![];
+        let aggs = vec![AggIntent::Count {
+            accuracy: AccuracyTarget::Exact,
+        }];
+        let out = output_schema_for_aggregate(&input, &by, &aggs);
+        assert_eq!(out.columns.len(), 1);
+        assert_eq!(out.columns[0].name, "count");
+        assert!(out.time_index.is_none());
+        assert!(out.unique_keys.is_empty());
+    }
+
+    #[test]
+    fn output_schema_for_aggregate_strips_time_axis() {
+        use crate::types_v2::AccuracyTarget;
+        let input = infer_source_schema("m");
+        assert!(input.time_index.is_some());
+        let aggs = vec![AggIntent::Count {
+            accuracy: AccuracyTarget::Exact,
+        }];
+        let out = output_schema_for_aggregate(&input, &[], &aggs);
+        assert!(out.time_index.is_none());
+    }
+
+    #[test]
+    fn output_schema_for_aggregate_preserves_by_columns_and_unique_keys() {
+        // Build an input schema with two extra label columns.
+        let mut input = infer_source_schema("m");
+        input.columns.push(Column {
+            name: "host".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        });
+        input.columns.push(Column {
+            name: "region".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        });
+        // Group by host, region (positions 2 and 3).
+        let by = vec![2usize, 3usize];
+        let aggs = vec![AggIntent::Sum];
+        let out = output_schema_for_aggregate(&input, &by, &aggs);
+        // Output columns: host, region, sum.
+        assert_eq!(out.columns.len(), 3);
+        assert_eq!(out.columns[0].name, "host");
+        assert_eq!(out.columns[1].name, "region");
+        assert_eq!(out.columns[2].name, "sum");
+        // unique_keys = [[0, 1]] (the by tuple is unique by construction).
+        assert_eq!(out.unique_keys, vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn output_schema_for_aggregate_drops_out_of_range_by_ids() {
+        let input = infer_source_schema("m");
+        // schema only has columns 0..=1; ask for by=[5] which is out of range.
+        let aggs = vec![AggIntent::Sum];
+        let out = output_schema_for_aggregate(&input, &[5usize], &aggs);
+        // The out-of-range by id is silently dropped; output has only the agg.
+        assert_eq!(out.columns.len(), 1);
+        assert_eq!(out.columns[0].name, "sum");
+    }
+
+    #[test]
+    fn resolve_named_keys_resolves_present_columns() {
+        let mut s = infer_source_schema("m");
+        s.columns.push(Column {
+            name: "host".into(),
+            dtype: DataType::Utf8,
+            nullable: false,
+        });
+        let ids = resolve_named_keys(&["host".to_string()], &s).unwrap();
+        assert_eq!(ids, vec![2usize]);
+    }
+
+    #[test]
+    fn resolve_named_keys_surfaces_not_found() {
+        let s = infer_source_schema("m");
+        let err = resolve_named_keys(&["missing".to_string()], &s).unwrap_err();
+        assert!(matches!(err, ResolveError::NotFound { .. }));
     }
 }
 
