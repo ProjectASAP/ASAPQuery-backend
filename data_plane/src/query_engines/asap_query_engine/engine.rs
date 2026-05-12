@@ -5947,7 +5947,10 @@ mod warm_tier_classify_tests {
             sketch_kind: SketchKindHandle::DDSketch,
             sketch_config: cfg.clone(),
             accuracy: AccuracyBound::from_config(&cfg),
-            first_seen_unix_ms: 0}
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+        }
     }
 
     #[tokio::test]

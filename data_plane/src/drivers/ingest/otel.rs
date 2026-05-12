@@ -934,6 +934,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 sketch_config: cfg.clone(),
                                 accuracy: AccuracyBound::from_config(&cfg),
                                 first_seen_unix_ms: ts_ms,
+                                retired_at_ms: None,
+                                expires_at_ms: None,
                             });
                         }
 
