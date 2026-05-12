@@ -262,6 +262,32 @@ impl SketchAllocator {
 
             // ── Exact / relational — Db ───────────────────────────────────
             QueryExpr::Aggregate { keys, aggs, having, input } => {
+                // Step γ1 demonstration: bridge the legacy Aggregate to
+                // canonical-shape data and enrich the annotation rationale
+                // with the canonical intent kind(s). The legacy emit shape
+                // is unchanged — `expr` still carries the legacy variant
+                // (approach (c) per the migration spec). The bridge fails
+                // gracefully when keys don't resolve or HAVING uses an
+                // E-deferred ScalarExpr variant; the legacy annotation
+                // text is used as the fallback in that case.
+                let bridge_annotation: String = match
+                    crate::intent_algebra::bridge_aggregate_to_canonical(
+                        &keys, &aggs, &having, parent_schema,
+                    )
+                {
+                    Ok(b) => {
+                        let kinds: Vec<&'static str> = b.aggs.iter()
+                            .map(canonical_intent_kind_str)
+                            .collect();
+                        format!(
+                            "General Aggregate at Db (exact); canonical \
+                             intents: {:?}, group_by_cols: {}",
+                            kinds, b.by.len()
+                        )
+                    }
+                    Err(_e) => "General Aggregate at Db (exact)".into(),
+                };
+
                 let child = self.alloc_node(*input, budget, parent_schema);
                 PlanNode {
                     expr: QueryExpr::Aggregate {
@@ -275,7 +301,7 @@ impl SketchAllocator {
                         ..Default::default()
                     },
                     annotation: NodeAnnotation {
-                        rationale: "General Aggregate at Db (exact)".into(),
+                        rationale: bridge_annotation,
                         ..Default::default()
                     },
                     children: vec![child],
@@ -634,6 +660,36 @@ impl SketchAllocator {
 /// Estimate the memory footprint of a sketch in bytes.
 fn estimated_sketch_memory(op: &AggIntent) -> f64 {
     super::sketch_catalog::estimated_sketch_memory_bytes(op) as f64
+}
+
+/// Map a canonical [`AggIntent`] to a short stable kind string for
+/// annotation rationale text. Step γ1: used by the legacy
+/// `QueryExpr::Aggregate` arm to enrich the rationale with the canonical
+/// intent kinds reachable via `bridge_aggregate_to_canonical`.
+fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
+    match intent {
+        AggIntent::Count { .. } => "count",
+        AggIntent::Sum => "sum",
+        AggIntent::Min => "min",
+        AggIntent::Max => "max",
+        AggIntent::Avg => "avg",
+        AggIntent::Quantile { .. } => "quantile",
+        AggIntent::TopK { .. } => "topk",
+        AggIntent::Cardinality { .. } => "cardinality",
+        AggIntent::Frequency { .. } => "frequency",
+        AggIntent::Rate { .. } => "rate",
+        AggIntent::Increase { .. } => "increase",
+        AggIntent::Absent => "absent",
+        AggIntent::Present => "present",
+        AggIntent::Delta { .. } => "delta",
+        AggIntent::Deriv { .. } => "deriv",
+        AggIntent::PredictLinear { .. } => "predict_linear",
+        AggIntent::HoltWinters { .. } => "holt_winters",
+        AggIntent::Idelta { .. } => "idelta",
+        AggIntent::Irate { .. } => "irate",
+        AggIntent::Resets { .. } => "resets",
+        AggIntent::Changes { .. } => "changes",
+    }
 }
 
 // sketch_type_for_op delegated to algebra::directory::sketch_type_and_params.

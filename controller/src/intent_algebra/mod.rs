@@ -112,6 +112,17 @@ pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schem
 // where they need a positional `ColumnId` — Step γ migrates variants
 // one at a time onto the canonical positional form.
 pub use column_resolution::{
-    infer_schema_for_root, infer_source_schema, resolve_column_ref, resolve_column_refs,
-    ResolveError,
+    infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
+    resolve_column_refs, resolve_named_keys, ResolveError,
+};
+
+// Step γ1 bridge: one-way `legacy_expr::QueryExpr::Aggregate` →
+// canonical `query_expr::QueryExpr::Aggregate` helper. Consumers that
+// need canonical-shape pattern-matching (`by: Vec<ColumnId>`, `aggs:
+// Vec<AggIntent>`) call this on an inherited Schema; the legacy variant
+// remains in `legacy_expr.rs` until every consumer entry point migrates
+// (Step γ7 or later).
+pub mod aggregate_bridge;
+pub use aggregate_bridge::{
+    bridge_aggregate_to_canonical, BridgeError, BridgedAggregate,
 };

@@ -238,7 +238,15 @@ fn lower_aggregate(
 /// (`Custom`), one intent for single-statistic functions, and N intents
 /// for the StdDev / Variance fan-out (Step α F1 strategy: callers wrap
 /// the resulting list in a `QueryExpr::Merge` of sibling SketchAggs).
-fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
+///
+/// Step γ1 exposed this helper publicly so the legacy→canonical
+/// `Aggregate` bridge (`aggregate_bridge::legacy_aggregate_to_canonical`)
+/// can reuse the same `AggFunc` → `AggIntent` translation. The fan-out
+/// semantics (StdDev / Variance → two siblings) are wrapped one layer
+/// up (sketch lowering) before the bridge is called, so each `AggItem`
+/// at the bridge level produces a single intent vector that's mostly
+/// length 1.
+pub(crate) fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
     use crate::intent_algebra::legacy_expr::{
         default_cardinality, default_frequency, default_quantile,
     };
