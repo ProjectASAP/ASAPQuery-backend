@@ -57,11 +57,11 @@ use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::HllSketch;
 use asap_sketchlib::sketches::kll::KllSketch;
 
-use crate::query_engines::warm_tier::decoders::{
+use crate::query_engines::asap_query_engine::warm_tier::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
     decode_cs_from_msgpack, decode_cs_from_proto,
 };
-use crate::query_engines::warm_tier::delta_apply::{
+use crate::query_engines::asap_query_engine::warm_tier::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
 use crate::stores::sketch_db::index::{

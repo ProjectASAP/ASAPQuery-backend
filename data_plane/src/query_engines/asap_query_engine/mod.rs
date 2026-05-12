@@ -10,6 +10,7 @@
 //! the JSONL leg has been deleted).
 
 pub mod engine;
+pub mod warm_tier;
 
 #[cfg(test)]
 pub mod tests;

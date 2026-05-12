@@ -1,7 +1,7 @@
 //! Per-sketch-kind decoder helpers — out-of-line wrappers around
 //! `asap_sketchlib` deserialize / proto-decode paths.
 //!
-//! Lifted from the inline closures in [`crate::query_engines::warm_tier::sketch_reducer`]
+//! Lifted from the inline closures in [`crate::query_engines::asap_query_engine::warm_tier::sketch_reducer`]
 //! once the reducer started decoding CMS / CountSketch / CMS-with-heap
 //! payloads in addition to DDSketch / KLL / HLL. The CMS / CountSketch
 //! / CMS-with-heap decoders mirror

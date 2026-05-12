@@ -606,7 +606,7 @@ impl SketchStorePerKey {
             let metric_id: MetricID = data.intern.intern(output.key);
 
             data.current_epoch
-                .insert(metric_id, timestamp_range, Arc::from(precompute));
+                .insert(timestamp_range, metric_id, Arc::from(precompute));
 
             // When persistence is on, always run rotation so sealed
             // epochs accumulate. Otherwise preserve the old
@@ -787,8 +787,12 @@ impl Store for SketchStorePerKey {
 
             if let Some((min_start, max_end)) = data.current_epoch.time_bounds() {
                 if !(min_start > end || max_end < start) {
-                    data.current_epoch
-                        .range_query_into(start, end, &mut mid, &mut matched_windows);
+                    data.current_epoch.range_query_into_grouped(
+                        start,
+                        end,
+                        &mut mid,
+                        &mut matched_windows,
+                    );
                 }
             }
 
@@ -799,11 +803,11 @@ impl Store for SketchStorePerKey {
                 if min_start > end || max_end < start {
                     continue;
                 }
-                epoch.range_query_into(start, end, &mut mid, &mut matched_windows);
+                epoch.range_query_into_grouped(start, end, &mut mid, &mut matched_windows);
             }
 
             for (metric_id, buckets) in mid {
-                let label = data.intern.resolve(metric_id).clone();
+                let label = data.intern.resolve(metric_id).cloned().unwrap_or(None);
                 results.entry(label).or_default().extend(buckets);
             }
 
@@ -876,12 +880,14 @@ impl Store for SketchStorePerKey {
 
         let timestamp_range = (exact_start, exact_end);
 
-        let entries_opt: Option<Vec<(MetricID, Arc<dyn AggregateCore>)>> =
-            data.current_epoch.exact_query(timestamp_range).or_else(|| {
+        let entries_opt: Option<Vec<(MetricID, Arc<dyn AggregateCore>)>> = data
+            .current_epoch
+            .exact_query_owned(timestamp_range)
+            .or_else(|| {
                 data.sealed_epochs
                     .values()
                     .rev()
-                    .find_map(|epoch| epoch.exact_query(timestamp_range))
+                    .find_map(|epoch| epoch.exact_query_owned(timestamp_range))
             });
 
         let mut results: TimestampedBucketsMap = HashMap::new();
@@ -889,7 +895,7 @@ impl Store for SketchStorePerKey {
 
         if let Some(entries) = entries_opt {
             for (metric_id, agg) in entries {
-                let label = data.intern.resolve(metric_id).clone();
+                let label = data.intern.resolve(metric_id).cloned().unwrap_or(None);
                 results
                     .entry(label)
                     .or_default()

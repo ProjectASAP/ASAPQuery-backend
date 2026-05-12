@@ -261,6 +261,93 @@ impl<P> MutableEpoch<P> {
     pub fn distinct_windows(&self) -> usize {
         self.windows_set.len()
     }
+
+    /// `(min_start, max_end)` across all windows, or `None` if empty.
+    /// Convenience for the epoch-skip check
+    /// `min_start > end || max_end < start`.
+    pub fn time_bounds(&self) -> Option<(u64, u64)> {
+        match (self.min_start, self.max_end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }
+    }
+
+    /// Consume self and produce a `SealedEpoch<P>` — convenience for
+    /// epoch rotation. Equivalent to `SealedEpoch::from_mutable(self)`.
+    pub fn seal(self) -> SealedEpoch<P> {
+        SealedEpoch::from_mutable(self)
+    }
+
+    /// Remove all entries whose window is in `windows`.
+    /// Mirrors the legacy `SketchStore` ReadBased / CircularBuffer
+    /// cleanup contract. O(N) — rebuilds columns in one pass.
+    pub fn remove_windows(&mut self, windows: &[TimestampRange]) {
+        use std::collections::HashSet as StdHashSet;
+        let drop_set: StdHashSet<TimestampRange> = windows.iter().copied().collect();
+        let old_windows = std::mem::take(&mut self.windows_col);
+        let old_ids = std::mem::take(&mut self.label_ids_col);
+        let old_payloads = std::mem::take(&mut self.payloads_col);
+        for ((w, id), p) in old_windows.into_iter().zip(old_ids).zip(old_payloads) {
+            if !drop_set.contains(&w) {
+                self.windows_col.push(w);
+                self.label_ids_col.push(id);
+                self.payloads_col.push(p);
+            }
+        }
+        for w in windows {
+            self.windows_set.remove(w);
+        }
+        self.window_to_ids = None;
+        self.last_window = None;
+        self.min_start = self.windows_col.iter().map(|w| w.0).min();
+        self.max_end = self.windows_col.iter().map(|w| w.1).max();
+    }
+}
+
+impl<P: Clone> MutableEpoch<P> {
+    /// Range query into a caller-provided `HashMap<LabelValuesId, Vec<(TimestampRange, P)>>`,
+    /// matching the legacy `SketchStore`'s `MetricBucketMap` shape.
+    /// Also pushes each matched window into `matched_windows` for the
+    /// downstream `read_counts` accounting.
+    ///
+    /// Uses the same overlap-filter semantics as the flat
+    /// `range_query_into`: include any window whose `[w.0, w.1)`
+    /// intersects `[start, end)`. Tumbling panes that straddle the
+    /// query boundaries match; same fix that the legacy implementation
+    /// carried (see legacy module comment about
+    /// `quantile_over_time(...[1m])` against 30s panes).
+    pub fn range_query_into_grouped(
+        &self,
+        start: u64,
+        end: u64,
+        out: &mut HashMap<LabelValuesId, Vec<(TimestampRange, P)>>,
+        matched_windows: &mut Vec<TimestampRange>,
+    ) {
+        for (i, &w) in self.windows_col.iter().enumerate() {
+            if w.1 <= start || w.0 >= end {
+                continue;
+            }
+            out.entry(self.label_ids_col[i])
+                .or_default()
+                .push((w, self.payloads_col[i].clone()));
+            matched_windows.push(w);
+        }
+    }
+
+    /// Exact-window query returning OWNED payload clones — for callers
+    /// that need to hand the payload out across a lock boundary.
+    /// `None` when the window has no entries.
+    pub fn exact_query_owned(
+        &mut self,
+        target: TimestampRange,
+    ) -> Option<Vec<(LabelValuesId, P)>> {
+        let r = self.exact_query(target);
+        if r.is_empty() {
+            None
+        } else {
+            Some(r.into_iter().map(|(id, p)| (id, p.clone())).collect())
+        }
+    }
 }
 
 impl<P> Default for MutableEpoch<P> {
@@ -275,7 +362,7 @@ impl<P> Default for MutableEpoch<P> {
 pub struct SealedEpoch<P> {
     /// Sorted by `(TimestampRange, LabelValuesId)`. Binary search on
     /// `start_unix_ms` to seek; linear scan within the matched range.
-    entries: Vec<(TimestampRange, LabelValuesId, P)>,
+    pub entries: Vec<(TimestampRange, LabelValuesId, P)>,
     min_start: Option<u64>,
     max_end: Option<u64>,
 }
@@ -283,25 +370,22 @@ pub struct SealedEpoch<P> {
 impl<P> SealedEpoch<P> {
     /// Consume a `MutableEpoch` and produce its sorted immutable form.
     /// O(M log M) — paid once at rotation, off the insert hot path.
-    pub fn from_mutable(mut m: MutableEpoch<P>) -> Self {
+    ///
+    /// Safe payload move: zip-consumes the three parallel columns
+    /// into owned tuples. Previously used `MaybeUninit::zeroed()` +
+    /// `mem::forget` which is UB for any `P` with non-trivial Drop
+    /// (e.g. `Arc<_>`); the new form has the same algorithmic cost
+    /// and works for arbitrary `P`.
+    pub fn from_mutable(m: MutableEpoch<P>) -> Self {
         let min_start = m.min_start;
         let max_end = m.max_end;
-        let len = m.windows_col.len();
-        let mut entries: Vec<(TimestampRange, LabelValuesId, P)> = Vec::with_capacity(len);
-        // Drain via swap_remove from the back to move payloads without
-        // cloning. Equivalent to consuming the parallel arrays in order.
-        for i in 0..len {
-            entries.push((
-                m.windows_col[i],
-                m.label_ids_col[i],
-                std::mem::replace(&mut m.payloads_col[i], unsafe {
-                    std::mem::MaybeUninit::zeroed().assume_init()
-                }),
-            ));
-        }
-        // Forget the columns to avoid double-drop (the moved-out payloads
-        // were replaced with zeroed memory; their drop should not run).
-        std::mem::forget(m.payloads_col);
+        let mut entries: Vec<(TimestampRange, LabelValuesId, P)> = m
+            .windows_col
+            .into_iter()
+            .zip(m.label_ids_col)
+            .zip(m.payloads_col)
+            .map(|((w, lid), p)| (w, lid, p))
+            .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         Self {
             entries,
@@ -363,6 +447,88 @@ impl<P> SealedEpoch<P> {
             out.push((entry.1, &entry.2));
         }
         out
+    }
+
+    /// `(min_start, max_end)` or `None` if empty.
+    pub fn time_bounds(&self) -> Option<(u64, u64)> {
+        match (self.min_start, self.max_end) {
+            (Some(s), Some(e)) => Some((s, e)),
+            _ => None,
+        }
+    }
+
+    /// Count of distinct time windows in this sealed epoch — O(N)
+    /// scan (entries are sorted, so consecutive dupes are adjacent).
+    pub fn distinct_window_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut last: Option<TimestampRange> = None;
+        for (w, _, _) in &self.entries {
+            if last != Some(*w) {
+                count += 1;
+                last = Some(*w);
+            }
+        }
+        count
+    }
+
+    /// Sorted-deduplicated windows. Used by the legacy SketchStore to
+    /// purge `read_counts` when an epoch is dropped.
+    pub fn unique_windows(&self) -> Vec<TimestampRange> {
+        let mut windows: Vec<TimestampRange> =
+            self.entries.iter().map(|(w, _, _)| *w).collect();
+        windows.dedup();
+        windows
+    }
+
+    /// Remove all entries whose window is in `windows`. O(N) scan;
+    /// preserves sortedness since `retain` keeps relative order.
+    pub fn remove_windows(&mut self, windows: &[TimestampRange]) {
+        use std::collections::HashSet as StdHashSet;
+        let drop_set: StdHashSet<TimestampRange> = windows.iter().copied().collect();
+        self.entries.retain(|(w, _, _)| !drop_set.contains(w));
+        self.min_start = self.entries.iter().map(|(w, _, _)| w.0).min();
+        self.max_end = self.entries.iter().map(|(w, _, _)| w.1).max();
+    }
+}
+
+impl<P: Clone> SealedEpoch<P> {
+    /// Range query into a caller-provided
+    /// `HashMap<LabelValuesId, Vec<(TimestampRange, P)>>` — the
+    /// legacy `MetricBucketMap` shape used by `SketchStore`.
+    /// Binary-search start + linear scan. Same overlap semantics
+    /// as the mutable variant.
+    pub fn range_query_into_grouped(
+        &self,
+        start: u64,
+        end: u64,
+        out: &mut HashMap<LabelValuesId, Vec<(TimestampRange, P)>>,
+        matched_windows: &mut Vec<TimestampRange>,
+    ) {
+        // Entries are sorted by `(w.0, label_id)`. Bound the upper
+        // end with `w.0 < end`; entries past that point can't overlap.
+        let end_pos = self.entries.partition_point(|(w, _, _)| w.0 < end);
+        for (w, id, p) in &self.entries[..end_pos] {
+            if w.1 <= start {
+                continue;
+            }
+            out.entry(*id).or_default().push((*w, p.clone()));
+            matched_windows.push(*w);
+        }
+    }
+
+    /// Exact-window query returning OWNED clones — used by callers
+    /// that need to release the lock before reading the payloads.
+    /// `None` when no entry matches.
+    pub fn exact_query_owned(
+        &self,
+        target: TimestampRange,
+    ) -> Option<Vec<(LabelValuesId, P)>> {
+        let r = self.exact_query(target);
+        if r.is_empty() {
+            None
+        } else {
+            Some(r.into_iter().map(|(id, p)| (id, p.clone())).collect())
+        }
     }
 }
 

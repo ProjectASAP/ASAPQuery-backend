@@ -24,7 +24,6 @@ pub mod query_result;
 pub mod routing;
 pub mod thanos_query_engine;
 pub mod timeline_dispatch;
-pub mod warm_tier;
 pub mod window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;

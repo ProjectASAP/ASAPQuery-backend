@@ -339,7 +339,7 @@ impl Store for SketchStoreGlobal {
                 // Insert into current (mutable) epoch.
                 per_key
                     .current_epoch
-                    .insert(metric_id, timestamp_range, Arc::from(precompute));
+                    .insert(timestamp_range, metric_id, Arc::from(precompute));
 
                 // Apply retention policy if configured (but exclude DeltaSetAggregator).
                 // per_key is last used above; NLL ends its borrow so data.read_counts can
@@ -484,7 +484,7 @@ impl Store for SketchStoreGlobal {
             // Query current (mutable) epoch.
             if let Some((min_start, max_end)) = per_key.current_epoch.time_bounds() {
                 if !(min_start > end || max_end < start) {
-                    per_key.current_epoch.range_query_into(
+                    per_key.current_epoch.range_query_into_grouped(
                         start,
                         end,
                         &mut mid,
@@ -501,7 +501,12 @@ impl Store for SketchStoreGlobal {
                 if min_start > end || max_end < start {
                     continue;
                 }
-                epoch.range_query_into(start, end, &mut mid, &mut matched_windows);
+                epoch.range_query_into_grouped(
+                    start,
+                    end,
+                    &mut mid,
+                    &mut matched_windows,
+                );
             }
 
             mid
@@ -513,7 +518,11 @@ impl Store for SketchStoreGlobal {
             let mut r = HashMap::with_capacity(mid.len());
             for (metric_id, buckets) in mid.drain() {
                 total_entries += buckets.len();
-                let label = per_key.intern.resolve(metric_id).clone();
+                let label = per_key
+                    .intern
+                    .resolve(metric_id)
+                    .cloned()
+                    .unwrap_or(None);
                 r.insert(label, buckets);
             }
             r
@@ -614,13 +623,13 @@ impl Store for SketchStoreGlobal {
             // sealed_epochs scan below.
             per_key
                 .current_epoch
-                .exact_query(timestamp_range)
+                .exact_query_owned(timestamp_range)
                 .or_else(|| {
                     per_key
                         .sealed_epochs
                         .values()
                         .rev()
-                        .find_map(|epoch| epoch.exact_query(timestamp_range))
+                        .find_map(|epoch| epoch.exact_query_owned(timestamp_range))
                 })
         }; // &mut borrow of data.stores ends here
 
@@ -631,7 +640,11 @@ impl Store for SketchStoreGlobal {
         if let Some(entries) = entries_opt {
             let per_key = data.stores.get(&store_key).unwrap();
             for (metric_id, agg) in entries {
-                let label = per_key.intern.resolve(metric_id).clone();
+                let label = per_key
+                    .intern
+                    .resolve(metric_id)
+                    .cloned()
+                    .unwrap_or(None);
                 results
                     .entry(label)
                     .or_default()

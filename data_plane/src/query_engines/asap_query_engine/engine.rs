@@ -3501,7 +3501,7 @@ impl ASAPQueryEngine {
 // to the next compatible backend.
 // ---------------------------------------------------------------------------
 
-/// Adapt a [`crate::query_engines::warm_tier::WarmTierResult`] to the engine's
+/// Adapt a [`crate::query_engines::asap_query_engine::warm_tier::WarmTierResult`] to the engine's
 /// existing `QueryResult` shape. The reducer hands back per-series
 /// time-stamped scalars; we materialize them as a
 /// `QueryResult::Matrix` whose [`crate::query_engines::query_result::RangeVectorElement`]s
@@ -3575,7 +3575,7 @@ fn stitch_warm_and_archive(
 }
 
 fn warm_tier_result_to_query_result(
-    result: crate::query_engines::warm_tier::WarmTierResult,
+    result: crate::query_engines::asap_query_engine::warm_tier::WarmTierResult,
     _now_ms: u64,
 ) -> crate::query_engines::query_result::QueryResult {
     use crate::stores::types::KeyByLabelValues;
@@ -3695,14 +3695,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // for instant-vector candidates (range_seconds == 0).
             const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
 
-            let reducer = crate::query_engines::warm_tier::SketchReducer::new(idx);
+            let reducer = crate::query_engines::asap_query_engine::warm_tier::SketchReducer::new(idx);
             // Multi-candidate aggregation is deferred (single-result
             // shapes today). On the first reducer error we surface
             // CapabilityMiss; on Ok we keep the result for the
             // hybrid-stitch path below. (When more than one
             // candidate is supported, a follow-up will fold
             // per-candidate WarmTierResults.)
-            let mut combined_result: Option<crate::query_engines::warm_tier::WarmTierResult> =
+            let mut combined_result: Option<crate::query_engines::asap_query_engine::warm_tier::WarmTierResult> =
                 None;
             let mut combined_t0: u64 = u64::MAX;
 
@@ -3783,7 +3783,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 ) {
                     Ok(r) => r,
                     Err(
-                        crate::query_engines::warm_tier::WarmTierError::UnsupportedFunction(
+                        crate::query_engines::asap_query_engine::warm_tier::WarmTierError::UnsupportedFunction(
                             name,
                         ),
                     ) => {
@@ -3795,7 +3795,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::query_engines::warm_tier::WarmTierError::UnsupportedCapability {
+                    Err(crate::query_engines::asap_query_engine::warm_tier::WarmTierError::UnsupportedCapability {
                         function,
                         capability,
                     }) => {
@@ -3807,7 +3807,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::query_engines::warm_tier::WarmTierError::DeserializeFailure {
+                    Err(crate::query_engines::asap_query_engine::warm_tier::WarmTierError::DeserializeFailure {
                         sid,
                         encoding,
                         reason,
@@ -3821,7 +3821,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::query_engines::warm_tier::WarmTierError::NoData {
+                    Err(crate::query_engines::asap_query_engine::warm_tier::WarmTierError::NoData {
                         metric_name: m,
                     }) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
@@ -3832,7 +3832,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::query_engines::warm_tier::WarmTierError::MissingHeap {
+                    Err(crate::query_engines::asap_query_engine::warm_tier::WarmTierError::MissingHeap {
                         sid,
                         sketch_kind,
                     }) => {
