@@ -89,6 +89,8 @@ pub fn parse_storage_backend_engine_id(s: &str) -> Option<StorageBackend> {
     match s {
         ENGINE_ID_ASAP_QUERY => Some(StorageBackend::SketchStore),
         ENGINE_ID_THANOS_QUERY => Some(StorageBackend::GorillaObjectStore),
+        "double_write" => Some(StorageBackend::DoubleWrite),
+        "prometheus_remote" => Some(StorageBackend::PrometheusRemote),
         _ => None,
     }
 }

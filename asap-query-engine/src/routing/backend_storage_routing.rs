@@ -46,27 +46,27 @@
 //!
 //! ```yaml
 //! # v6.1 form (single-target):
-//! default: asap_query
+//! default: sketch_store
 //! metrics:
-//!   audit_events: thanos_query
+//!   audit_events: gorilla_object_store
 //! ```
 //!
 //! ```yaml
 //! # v7 form (multi-target with query-shape selection):
-//! default: asap_query
+//! default: sketch_store
 //! routes:
 //!   - metric: http_requests_total
 //!     targets:
-//!       - backend: asap_query
+//!       - backend: sketch_store
 //!         # default — predictable / planned queries land here
-//!       - backend: thanos_query
+//!       - backend: gorilla_object_store
 //!         applies_to_query_shape: [count, topk, rate_post_hoc]
 //!   - metric: http_freshness_probe_warm
 //!     targets:
-//!       - backend: asap_query
+//!       - backend: sketch_store
 //!   - metric: http_freshness_probe_archive
 //!     targets:
-//!       - backend: thanos_query
+//!       - backend: gorilla_object_store
 //! ```
 //!
 //! The two shapes can be mixed in the same YAML — metrics under
@@ -75,9 +75,9 @@
 //! in BOTH wins from `routes:` (multi-target overrides single-target).
 //!
 //! Valid `StorageBackend` values mirror the snake-cased serde tags on
-//! `asap_types::StorageBackend`: `asap_query`,
-//! `thanos_query`, `double_write`. (Step-1 of the JSONL
-//! deprecation refactor removed the `cold_jsonl_fallback` tag.)
+//! `asap_types::StorageBackend`: `sketch_store`,
+//! `gorilla_object_store`, `double_write`, `prometheus_remote`. (Step-1
+//! of the JSONL deprecation refactor removed the `cold_jsonl_fallback` tag.)
 //!
 //! Loaded once at backend startup (CLI flag `--backend-storage-routing`
 //! on `precompute_engine`) and stored in `AppState`. Lookup is
@@ -1104,10 +1104,10 @@ mod tests {
     fn yaml_with_per_metric_override_routes_correctly_v6_1_form() {
         // v6.1 form: `metrics:` map. Each value is a single backend.
         let yaml = r#"
-default: asap_query
+default: sketch_store
 metrics:
-  http_requests_total: thanos_query
-  audit_events: thanos_query
+  http_requests_total: gorilla_object_store
+  audit_events: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(
@@ -1121,7 +1121,7 @@ metrics:
 
     #[test]
     fn yaml_default_only_routes_all_metrics_to_default() {
-        let yaml = "default: thanos_query\n";
+        let yaml = "default: gorilla_object_store\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.lookup("anything"), StorageBackend::GorillaObjectStore);
         assert!(r.is_empty());
@@ -1130,7 +1130,7 @@ metrics:
 
     #[test]
     fn yaml_omitted_default_falls_back_to_asap_query() {
-        let yaml = "metrics:\n  foo: thanos_query\n";
+        let yaml = "metrics:\n  foo: gorilla_object_store\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.lookup("foo"), StorageBackend::GorillaObjectStore);
         assert_eq!(r.lookup("bar"), StorageBackend::SketchStore);
@@ -1157,19 +1157,19 @@ metrics:
         // targets — the default warm-tier slot and a cold-archive
         // slot scoped to count/topk/rate_post_hoc.
         let yaml = r#"
-default: asap_query
+default: sketch_store
 routes:
   - metric: http_requests_total
     targets:
-      - backend: asap_query
-      - backend: thanos_query
+      - backend: sketch_store
+      - backend: gorilla_object_store
         applies_to_query_shape: [count, topk, rate_post_hoc]
   - metric: http_freshness_probe_warm
     targets:
-      - backend: asap_query
+      - backend: sketch_store
   - metric: http_freshness_probe_archive
     targets:
-      - backend: thanos_query
+      - backend: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
 
@@ -1218,7 +1218,7 @@ routes:
         // to the same backend (no dual-routing).
         let yaml = r#"
 metrics:
-  audit_events: thanos_query
+  audit_events: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         for shape in [
@@ -1241,14 +1241,14 @@ metrics:
         // Both `metrics:` and `routes:` populated; a metric in BOTH
         // wins from `routes:` (multi-target overrides single-target).
         let yaml = r#"
-default: asap_query
+default: sketch_store
 metrics:
-  http_requests_total: thanos_query
+  http_requests_total: gorilla_object_store
 routes:
   - metric: http_requests_total
     targets:
-      - backend: asap_query
-      - backend: thanos_query
+      - backend: sketch_store
+      - backend: gorilla_object_store
         applies_to_query_shape: [count]
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
@@ -1695,9 +1695,9 @@ routes:
         // Existing YAMLs in the wild don't have `tenant:` — they
         // must keep parsing and resolve to [`DEFAULT_TENANT`].
         let yaml = r#"
-default: asap_query
+default: sketch_store
 metrics:
-  http_requests_total: thanos_query
+  http_requests_total: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), DEFAULT_TENANT);
@@ -1707,9 +1707,9 @@ metrics:
     fn yaml_tenant_field_is_picked_up_when_present() {
         let yaml = r#"
 tenant: tenant-b
-default: asap_query
+default: sketch_store
 metrics:
-  http_requests_total: thanos_query
+  http_requests_total: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), "tenant-b");

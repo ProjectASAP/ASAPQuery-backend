@@ -453,7 +453,7 @@ mod tests {
         // Iter exposes every registered id.
         let mut ids: Vec<&str> = router.registered_ids().collect();
         ids.sort();
-        assert_eq!(ids, vec!["thanos_query", "asap_query"]);
+        assert_eq!(ids, vec!["asap_query", "thanos_query"]);
     }
 
     #[tokio::test]
