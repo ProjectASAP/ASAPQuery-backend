@@ -30,7 +30,6 @@ arc-swap.workspace = true
 
 # Crate-specific (keep version pinned here)
 form_urlencoded = "1.2"
-rmp-serde = "1.1"
 axum = "0.7"
 rusqlite = { version = "0.31", features = ["bundled"] }
 bincode = "1.3"

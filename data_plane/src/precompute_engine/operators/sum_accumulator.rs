@@ -42,19 +42,7 @@ impl SumAccumulator {
         Ok(Self::with_sum(sum))
     }
 
-    pub fn deserialize_from_bytes_arroyo(
-        buffer: &[u8],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Arroyo uses MessagePack format
-        let sum: f64 = rmp_serde::from_slice(buffer)
-            .map_err(|e| format!("Failed to deserialize from MessagePack: {e}"))?;
-        Ok(Self::with_sum(sum))
-    }
 
-    /// Serialize to Arroyo-compatible format (MessagePack f64)
-    pub fn serialize_to_bytes_arroyo(&self) -> Vec<u8> {
-        rmp_serde::to_vec(&self.sum).expect("Failed to serialize sum to MessagePack")
-    }
 }
 
 impl Default for SumAccumulator {

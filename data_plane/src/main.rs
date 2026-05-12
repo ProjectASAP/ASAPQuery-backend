@@ -111,10 +111,6 @@ struct Args {
     #[arg(long)]
     do_profiling: bool,
 
-    /// Enable dumping received precomputes to files for debugging
-    #[arg(long)]
-    dump_precomputes: bool,
-
     /// Differentiate between query languages of input query.
     /// Default `promql` matches every production deploy.
     #[arg(long, value_enum, default_value = "promql")]

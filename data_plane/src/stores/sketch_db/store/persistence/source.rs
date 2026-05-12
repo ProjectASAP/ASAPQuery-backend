@@ -28,8 +28,11 @@ pub struct SealedEpochRef {
 ///
 /// The `entries` are ready to write to disk: labels are already resolved
 /// to `Option<KeyByLabelValues>` (no intern-table lookup needed) and the
-/// sketch bytes are already in the Arroyo/MessagePack format used by
-/// `crate::query_engines::physical::accumulator_serde::deserialize_accumulator`.
+/// sketch bytes are opaque to the persistence layer — the writer carries
+/// whatever format the SketchStore put in. (The legacy Arroyo/MessagePack
+/// path that consumed these bytes lives in deleted modules; the
+/// production read-back path will land with the SketchIndex-backed
+/// refactor — `snapshot_sealed_epoch` returns `Ok(None)` until then.)
 #[derive(Debug, Clone)]
 pub struct EpochSnapshot {
     pub agg_id: u64,
@@ -60,10 +63,11 @@ pub struct EpochSnapshotEntry {
     pub end_ts: u64,
     /// Optional label set, already resolved from the per-agg intern table.
     pub label: Option<KeyByLabelValues>,
-    /// `AggregateCore::type_name()` of the underlying sketch, used on
-    /// read-back to pick the right `deserialize_from_bytes_arroyo` impl.
+    /// `AggregateCore::type_name()` of the underlying sketch — recorded
+    /// so a future read-back path can dispatch to the right
+    /// deserializer once the SketchIndex-backed snapshot lands.
     pub sketch_type_name: String,
-    /// Serialized sketch payload (Arroyo / MessagePack format).
+    /// Serialized sketch payload (opaque to the persistence layer).
     pub sketch_bytes: Vec<u8>,
 }
 

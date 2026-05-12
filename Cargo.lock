@@ -1073,7 +1073,6 @@ dependencies = [
  "prost",
  "regex",
  "reqwest 0.11.27",
- "rmp-serde",
  "rusqlite",
  "rust-s3",
  "serde",

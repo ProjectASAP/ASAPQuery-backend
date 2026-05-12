@@ -173,8 +173,8 @@ pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
 /// Decode a `CountMinSketchWithHeap` from msgpack bytes — the OTLP
 /// `CountMinSketch` wire bytes when the gateway/precompute layer
 /// marked the sid as CmsWithHeap (heap embedded in the
-/// `CountMinSketchWithHeapSerialized` outer wrapper). Mirrors
-/// `precompute_operators::count_min_sketch_with_heap_accumulator::deserialize_from_bytes_arroyo`.
+/// `CountMinSketchWithHeapSerialized` outer wrapper). Delegates to
+/// `asap_sketchlib::sketches::CountMinSketchWithHeap::deserialize_msgpack`.
 pub fn decode_cms_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountMinSketchWithHeap, String> {
     CountMinSketchWithHeap::deserialize_msgpack(buffer)
         .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))

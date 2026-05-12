@@ -116,69 +116,6 @@ impl MultipleIncreaseAccumulator {
 
         Ok(accumulator)
     }
-
-    pub fn deserialize_from_bytes_arroyo(
-        buffer: &[u8],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let precompute: HashMap<String, MeasurementData> =
-            rmp_serde::from_slice(buffer).map_err(|e| {
-                format!("Failed to deserialize MultipleIncreaseAccumulator from MessagePack: {e}")
-            })?;
-
-        let mut accumulator = Self::new();
-        for (key_str, values) in precompute {
-            // Parse semicolon-separated key values
-            let key_values: Vec<String> = key_str.split(';').map(|s| s.to_string()).collect();
-            // let mut labels = std::collections::BTreeMap::new();
-            // for (i, value) in key_values.into_iter().enumerate() {
-            //     labels.insert(format!("label_{i}"), value);
-            // }
-            let key_obj = KeyByLabelValues::new_with_labels(key_values);
-
-            let starting_measurement = Measurement::new(values.starting_measurement);
-            let starting_timestamp = values.starting_timestamp;
-            let last_seen_measurement = Measurement::new(values.last_seen_measurement);
-            let last_seen_timestamp = values.last_seen_timestamp;
-
-            let increase_accumulator = IncreaseAccumulator::new(
-                starting_measurement,
-                starting_timestamp,
-                last_seen_measurement,
-                last_seen_timestamp,
-            );
-
-            accumulator.increases.insert(key_obj, increase_accumulator);
-        }
-
-        Ok(accumulator)
-    }
-
-    /// Serialize to Arroyo-compatible format (MessagePack HashMap<String, MeasurementData>)
-    /// Matches the Arroyo multipleincrease_ UDF format
-    pub fn serialize_to_bytes_arroyo(&self) -> Vec<u8> {
-        use serde::Serialize;
-        let mut per_key_storage: HashMap<String, MeasurementData> = HashMap::new();
-
-        for (key, increase_acc) in &self.increases {
-            // Keys are semicolon-separated label values
-            let key_str = key.labels.join(";");
-            per_key_storage.insert(
-                key_str,
-                MeasurementData {
-                    starting_measurement: increase_acc.starting_measurement.value,
-                    starting_timestamp: increase_acc.starting_timestamp,
-                    last_seen_measurement: increase_acc.last_seen_measurement.value,
-                    last_seen_timestamp: increase_acc.last_seen_timestamp,
-                },
-            );
-        }
-
-        let mut buf = Vec::new();
-        per_key_storage
-            .serialize(&mut rmp_serde::Serializer::new(&mut buf))
-            .expect("Failed to serialize MultipleIncreaseAccumulator to MessagePack");
-        buf
-    }
 }
 
 impl Default for MultipleIncreaseAccumulator {

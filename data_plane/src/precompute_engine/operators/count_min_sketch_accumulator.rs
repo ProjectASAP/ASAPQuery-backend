@@ -60,14 +60,6 @@ impl CountMinSketchAccumulator {
         })
     }
 
-    pub fn deserialize_from_bytes_arroyo(
-        buffer: &[u8],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            inner: CountMinSketch::deserialize_msgpack(buffer)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
-        })
-    }
 
     /// Decode from the modified OTLP wire format's
     /// `CountMinSketchDataPoint.sketch` bytes when
@@ -554,27 +546,6 @@ mod tests {
         let cms2 = CountMinSketchAccumulator::new(3, 3);
         let result = CountMinSketchAccumulator::merge_accumulators(vec![cms1, cms2]);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_count_min_sketch_serialization() {
-        let cms = CountMinSketchAccumulator {
-            inner: CountMinSketch::from_legacy_matrix(
-                vec![vec![0.0, 42.0, 0.0], vec![0.0, 0.0, 100.0]],
-                2,
-                3,
-            ),
-        };
-
-        let bytes = cms.serialize_to_bytes();
-        let deserialized =
-            CountMinSketchAccumulator::deserialize_from_bytes_arroyo(&bytes).unwrap();
-
-        assert_eq!(deserialized.inner.rows(), 2);
-        assert_eq!(deserialized.inner.cols(), 3);
-        let deser_sketch = deserialized.inner.sketch();
-        assert_eq!(deser_sketch[0][1], 42.0);
-        assert_eq!(deser_sketch[1][2], 100.0);
     }
 
     #[test]
