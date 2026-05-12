@@ -221,7 +221,6 @@ impl QeCollector {
             QueryExpr::Project { input, .. }
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
-            | QueryExpr::HistogramQuantile { input, .. }
             | QueryExpr::PromQLSubquery { input, .. } => self.visit(input, parent_schema),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }

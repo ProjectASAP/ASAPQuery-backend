@@ -23,8 +23,10 @@
 //! | TopK | Precompute | always |
 //! | Merge | Backend | always |
 //! | Aggregate, Project, Sort, Limit | Db | always |
-//! | HistogramQuantile | Db | always |
 //! | PromQLSubquery, BinaryOp | Precompute | has sketch children |
+//!
+//! `histogram_quantile(φ, …)` is substituted at the parser level into a plain
+//! `Aggregate{Quantile(φ)}` (Step γ5) — no dedicated allocator arm.
 //! | LetBinding | same as body | propagated |
 
 use crate::intent_algebra::legacy_expr::QueryExpr;
@@ -483,35 +485,9 @@ impl SketchAllocator {
             }
 
             // ── PromQL-specific ───────────────────────────────────────────
-            QueryExpr::HistogramQuantile { phi, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
-                // If the child is a sketch, elevate to Precompute;
-                // otherwise fall through to Db.
-                let stage = if child.mode == ExecutionMode::Sketch {
-                    PipelineStage::Precompute
-                } else {
-                    PipelineStage::Db
-                };
-                let rationale = format!("histogram_quantile(φ={phi}) at {stage}");
-                PlanNode {
-                    expr: QueryExpr::HistogramQuantile {
-                        phi,
-                        input: Box::new(child.expr.clone()),
-                    },
-                    stage,
-                    mode:  ExecutionMode::Sketch,
-                    cost:  CostEstimate {
-                        bytes_per_sec:  self.raw_bytes_per_sec * 0.02,
-                        ..Default::default()
-                    },
-                    annotation: NodeAnnotation {
-                        sketch_type: Some(SketchType::DDSketch),
-                        rationale,
-                        ..Default::default()
-                    },
-                    children: vec![child],
-                }
-            }
+            // (histogram_quantile is substituted at the parser level into a
+            // plain Aggregate{Quantile(φ)}; see Step γ5. The Aggregate arm
+            // above handles the resulting Quantile intent.)
 
             QueryExpr::PromQLSubquery { range, resolution, input } => {
                 let child = self.alloc_node(*input, budget, parent_schema);
@@ -1009,21 +985,9 @@ mod tests {
         assert_eq!(node.stage, PipelineStage::Db);
     }
 
-    // ── HistogramQuantile + DDSketch → Precompute ─────────────────────────────
-
-    #[test]
-    fn histogram_quantile_over_sketch_at_precompute() {
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.95,
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    default_quantile(0.95),
-                col:   ColumnRef::SampleValue,
-                input: Box::new(src("hist")),
-            }),
-        };
-        let node = alloc(unlimited(), expr);
-        assert_eq!(node.stage, PipelineStage::Precompute);
-    }
+    // (`histogram_quantile` is substituted at the parser level into a plain
+    // `Aggregate{Quantile(φ)}` — see Step γ5. The Aggregate → SketchAgg path
+    // is covered by other tests.)
 
     // ── LetBinding inherits body stage ────────────────────────────────────────
 

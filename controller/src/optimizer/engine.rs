@@ -14,7 +14,7 @@
 //! | R3 | `HLLDedupElim`          | Eliminate `Dedup` before HLL (HLL is inherently distinct) |
 //! | R4 | `FilterWindowSwap`      | Swap `Filter` below `Window` to reduce window input size |
 //! | R5 | `TopKFusion`            | Absorb `Limit` / `TopK` into a `CountSketch` agg |
-//! | R6 | `HistogramQuantileFusion` | Recognise `HistogramQuantile(φ, Agg(DDSketch))` and mark |
+//! | R6 | _(retired)_             | `HistogramQuantileFusion` retired in Step γ5 — `histogram_quantile` is now a parser-level substitution |
 //! | R7 | `SubqueryDecorrelation` | Hoist correlated `ScalarSubquery` to a `LetBinding` |
 //! | R8 | `CommonSubexprElim`     | Extract identical sub-trees into `LetBinding`s |
 //! | R9 | `HydraConversion`       | Convert multi-key `Partition + Agg` into `Hydra` sketch |
@@ -229,7 +229,7 @@ impl CostModel for DefaultCostModel {
                 | QueryExpr::Window { .. } => &dc.agent,
                 QueryExpr::Partition { .. } | QueryExpr::Merge { .. }
                 | QueryExpr::Distinct { .. } => &dc.backend_collector,
-                QueryExpr::TopK { .. } | QueryExpr::HistogramQuantile { .. }
+                QueryExpr::TopK { .. }
                 | QueryExpr::BinaryOp { .. } | QueryExpr::PromQLSubquery { .. } => &dc.backend_db,
                 QueryExpr::Aggregate { .. } => &dc.original_db,
                 _ => &dc.agent,
@@ -492,76 +492,15 @@ impl RewriteRule for TopKFusion {
     }
 }
 
-// ── R6: HistogramQuantileFusion ───────────────────────────────────────────────
-
-/// Recognise `HistogramQuantile(φ, SketchAgg(DDSketch([φ]), …))` and
-/// simplify to a single annotated node that the allocator handles as one
-/// DDSketch query.
-///
-/// `HistogramQuantile(φ, SketchAgg(DDSketch(qs), col, e))`
-///    where `qs` contains `φ`
-/// → `HistogramQuantile(φ, SketchAgg(DDSketch(qs), col, e))`   [marked fused]
-///
-/// In practice we just ensure the quantile is in the DDSketch's quantile
-/// list so the allocator emits a single sketch with the right φ.
-pub struct HistogramQuantileFusion;
-
-impl RewriteRule for HistogramQuantileFusion {
-    fn name(&self) -> &'static str { "HistogramQuantileFusion" }
-
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel, _parent_schema: &Schema) -> Option<QueryExpr> {
-        // Canonical Quantile is single-φ post Step α — multi-φ fan-out
-        // happens at construction time, so the "merge phi into the
-        // existing quantile list" branch is now a "if phis match, keep
-        // structure; else build a Merge of two SketchAgg siblings". For
-        // this PR we keep the structural marker (identity rewrite) and
-        // defer the Merge-aware fusion to Step γ; the original rule was
-        // primarily a structural marker anyway.
-        match expr {
-            QueryExpr::HistogramQuantile { phi, input } => {
-                match *input {
-                    QueryExpr::SketchAgg {
-                        op: AggIntent::Quantile { q, accuracy },
-                        col,
-                        input: inner,
-                    } => {
-                        if (q - phi).abs() < f64::EPSILON {
-                            // Quantile already matches φ — keep shape.
-                            Some(QueryExpr::HistogramQuantile {
-                                phi,
-                                input: Box::new(QueryExpr::SketchAgg {
-                                    op: AggIntent::Quantile { q, accuracy },
-                                    col,
-                                    input: inner,
-                                }),
-                            })
-                        } else {
-                            // φ ≠ q: build a Merge of two single-φ
-                            // SketchAgg siblings (F1 fan-out for the
-                            // multi-φ case) and re-wrap.
-                            let new_q = QueryExpr::SketchAgg {
-                                op:    AggIntent::Quantile { q: phi, accuracy: accuracy.clone() },
-                                col:   col.clone(),
-                                input: inner.clone(),
-                            };
-                            let old_q = QueryExpr::SketchAgg {
-                                op: AggIntent::Quantile { q, accuracy },
-                                col,
-                                input: inner,
-                            };
-                            Some(QueryExpr::HistogramQuantile {
-                                phi,
-                                input: Box::new(QueryExpr::Merge { inputs: vec![new_q, old_q] }),
-                            })
-                        }
-                    }
-                    other => Some(QueryExpr::HistogramQuantile { phi, input: Box::new(other) }),
-                }
-            }
-            _ => None,
-        }
-    }
-}
+// ── R6 (retired): HistogramQuantileFusion ─────────────────────────────────────
+//
+// Per Step γ5 of the legacy_expr migration, `histogram_quantile(φ, …)` is
+// substituted at the PromQL parser level into a plain
+// `Aggregate{Quantile(φ)}`. The fusion rule that used to merge a
+// `HistogramQuantile` wrapper with an inner DDSketch is no longer needed —
+// the parser emits a single `Aggregate{Quantile(φ)}` directly, and the
+// L1→L3 lowerer turns it into a single `SketchAgg{Quantile(φ, ...)}` with
+// no wrapper to fuse.
 
 // ── R7: SubqueryDecorrelation ─────────────────────────────────────────────────
 
@@ -1003,10 +942,6 @@ impl QueryOptimizer {
                 let (new_input, c) = recurse!(input);
                 (QueryExpr::Limit { n, offset, input: new_input }, c)
             }
-            QueryExpr::HistogramQuantile { phi, input } => {
-                let (new_input, c) = recurse!(input);
-                (QueryExpr::HistogramQuantile { phi, input: new_input }, c)
-            }
             QueryExpr::PromQLSubquery { range, resolution, input } => {
                 let (new_input, c) = recurse!(input);
                 (QueryExpr::PromQLSubquery { range, resolution, input: new_input }, c)
@@ -1051,7 +986,9 @@ fn default_rules() -> Vec<Box<dyn RewriteRule>> {
         Box::new(WindowMerge),
         Box::new(PartitionElim),
         Box::new(TopKFusion),
-        Box::new(HistogramQuantileFusion),
+        // R6 (HistogramQuantileFusion) retired in Step γ5 — see the
+        // module-level note above; histogram_quantile is now a parser-
+        // level substitution into plain `Aggregate{Quantile(φ)}`.
         Box::new(MergeLifting),
         Box::new(SetOpFusion),
         Box::new(HydraConversion),
@@ -1075,7 +1012,7 @@ pub fn default_rules_as_optimizer_rules()
         Box::new(WindowMerge),
         Box::new(PartitionElim),
         Box::new(TopKFusion),
-        Box::new(HistogramQuantileFusion),
+        // R6 (HistogramQuantileFusion) retired in Step γ5.
         Box::new(MergeLifting),
         Box::new(SetOpFusion),
         Box::new(HydraConversion),
@@ -1118,10 +1055,6 @@ impl OptimizerRule for PartitionElim {
     fn category(&self) -> RuleCategory { RuleCategory::Elim }
 }
 impl OptimizerRule for TopKFusion {
-    fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
-    fn category(&self) -> RuleCategory { RuleCategory::Fusion }
-}
-impl OptimizerRule for HistogramQuantileFusion {
     fn name(&self) -> &'static str { <Self as RewriteRule>::name(self) }
     fn category(&self) -> RuleCategory { RuleCategory::Fusion }
 }
@@ -1256,46 +1189,11 @@ mod tests {
         );
     }
 
-    // ── R6: HistogramQuantileFusion ───────────────────────────────────────────
-
-    #[test]
-    fn r6_fans_out_to_merge_when_phi_differs() {
-        use crate::types_v2::AccuracyTarget;
-        // Step α: canonical Quantile is single-φ; R6 emits a Merge of
-        // two single-φ SketchAgg siblings when φ doesn't match the
-        // existing intent's q. Apply R6 directly so this test is
-        // independent of downstream rules (CommonSubexprElim, etc.).
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.95,
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) },
-                col:   ColumnRef::SampleValue,
-                input: Box::new(src("latency")),
-            }),
-        };
-        let rule = HistogramQuantileFusion;
-        let model = DefaultCostModel { raw_bytes_per_sec: 100_000.0, deployment: None };
-        let schema = infer_schema_for_root(&expr);
-        let result = rule.try_rewrite(expr, &model, &schema).expect("R6 should fire");
-        match &result {
-            QueryExpr::HistogramQuantile { input, .. } => {
-                match input.as_ref() {
-                    QueryExpr::Merge { inputs } => {
-                        let mut qs: Vec<f64> = inputs.iter().filter_map(|i| match i {
-                            QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => {
-                                Some(*q)
-                            }
-                            _ => None,
-                        }).collect();
-                        qs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        assert_eq!(qs, vec![0.5, 0.95]);
-                    }
-                    other => panic!("expected Merge of SketchAgg siblings, got {other:?}"),
-                }
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
+    // ── R6 (retired) ──────────────────────────────────────────────────────────
+    // HistogramQuantileFusion was removed in Step γ5 — `histogram_quantile`
+    // is now substituted at the parser level into a plain
+    // `Aggregate{Quantile(φ)}`, so the wrapper-fusion rule has no input
+    // shape to match. See the module-level note for details.
 
     // ── R10: WindowMerge ──────────────────────────────────────────────────────
 

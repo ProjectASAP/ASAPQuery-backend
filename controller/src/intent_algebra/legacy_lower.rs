@@ -106,10 +106,6 @@ pub fn lower_to_sketch_algebra_with_schema(
             offset,
             input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
         },
-        QueryExpr::HistogramQuantile { phi, input } => QueryExpr::HistogramQuantile {
-            phi,
-            input: Box::new(lower_to_sketch_algebra_with_schema(*input, parent_schema)),
-        },
         QueryExpr::PromQLSubquery { range, resolution, input } => QueryExpr::PromQLSubquery {
             range,
             resolution,
@@ -541,22 +537,6 @@ mod tests {
                 assert!(matches!(input.as_ref(), QueryExpr::Partition { .. }));
             }
             other => panic!("expected TopK, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn histogram_quantile_passthrough() {
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.95,
-            input: Box::new(make_agg(AggFunc::Quantile(0.95), src("m"))),
-        };
-        let lowered = lower_to_sketch_algebra(expr);
-        match &lowered {
-            QueryExpr::HistogramQuantile { phi, input } => {
-                assert!((phi - 0.95).abs() < 1e-9);
-                assert!(matches!(input.as_ref(), QueryExpr::SketchAgg { .. }));
-            }
-            other => panic!("expected HistogramQuantile, got {other:?}"),
         }
     }
 

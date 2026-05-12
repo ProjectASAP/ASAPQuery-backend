@@ -480,9 +480,9 @@ fn phase_b_pattern_temporal_and_spatial_combined() {
 /// for the archive tier.
 ///
 /// `histogram_quantile(...)` was previously an L3 intent here but is no
-/// longer — it's a PromQL/MetricsQL language-level operator (carried by
-/// `legacy_expr::QueryExpr::HistogramQuantile`), NOT a semantic intent.
-/// The L1→L3 lowerer's documented contract is
+/// longer — it's a PromQL/MetricsQL language-level operator that the
+/// parser substitutes (Step γ5) into a plain `Aggregate { Quantile(φ) }`,
+/// NOT a semantic intent. The L1→L3 lowerer's documented contract is
 /// `histogram_quantile(q, bucket_metric) → AggIntent::Quantile { q, .. }`;
 /// bucket-aware reduction is a physical-planner concern.
 #[test]
@@ -717,10 +717,10 @@ fn phase_b_e2e_topk_well_formed() {
 ///
 /// Replaces the prior `phase_b_e2e_histogram_quantile_e2e_through_parser`
 /// — `histogram_quantile(...)` is now a PromQL/MetricsQL language-level
-/// operator carried by `legacy_expr::QueryExpr::HistogramQuantile`, NOT
-/// an L3 intent. The L1→L3 contract maps it semantically to `Quantile{q}`;
-/// the archive-only routing this test exercises uses `Absent` as a
-/// stable proxy (every archive-only variant follows the same code path).
+/// operator that the parser substitutes (Step γ5) into a plain
+/// `Aggregate { Quantile(φ) }`, NOT an L3 intent of its own. The
+/// archive-only routing this test exercises uses `Absent` as a stable
+/// proxy (every archive-only variant follows the same code path).
 #[test]
 fn phase_b_e2e_archive_only_e2e_binding() {
     let intent = AggIntent::Absent;

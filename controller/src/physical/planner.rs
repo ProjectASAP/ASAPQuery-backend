@@ -369,26 +369,13 @@ fn plan_node(
             node
         }
 
-        // ── TopK / HistogramQuantile / BinaryOp: QueryEngine stage ──
+        // ── TopK / BinaryOp: QueryEngine stage ──
+        // (histogram_quantile is substituted at the parser level into a plain
+        // Aggregate{Quantile(φ)} — no dedicated arm needed; see step γ5.)
         QueryExpr::TopK { k, input, .. } => {
             let child = plan_node(input, config, parent_schema);
             let mut node = PhysicalNode {
                 op: PhysicalOp::TopK { k: *k },
-                placement: Placement::QueryEngine,
-                cost: PhysicalCost::default(),
-                children: vec![child],
-            };
-            insert_exchange_if_needed(&mut node);
-            node
-        }
-
-        QueryExpr::HistogramQuantile { phi, input } => {
-            let child = plan_node(input, config, parent_schema);
-            let mut node = PhysicalNode {
-                op: PhysicalOp::SketchEval {
-                    sketch_type: SketchType::DDSketch,
-                    func: EvalFunc::Quantile(vec![*phi]),
-                },
                 placement: Placement::QueryEngine,
                 cost: PhysicalCost::default(),
                 children: vec![child],

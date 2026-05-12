@@ -125,12 +125,10 @@ mod tests {
     #[test]
     fn binds_absent_archive_only() {
         // `histogram_quantile(...)` is no longer an L3 intent — it's a
-        // PromQL operator that the controller's PromQL parser lowers via
-        // `legacy_expr::QueryExpr::HistogramQuantile`. The L3 mapping
-        // `histogram_quantile(q, bucket_metric) → Quantile{q,...}` is a
-        // semantic-only documented contract; the canonical archive-only
-        // anchor for this test is `Absent` (which has no warm-tier sketch
-        // family).
+        // PromQL operator that the controller's PromQL parser substitutes
+        // (Step γ5) into a plain `Aggregate { Quantile(φ) }`. The
+        // canonical archive-only anchor for this test is `Absent`
+        // (which has no warm-tier sketch family).
         let expr = agg_with(AggIntent::Absent);
         let out = BindArchiveOnly
             .apply(&expr, &AccuracyTarget::Epsilon(0.01))

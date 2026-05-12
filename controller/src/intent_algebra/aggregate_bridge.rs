@@ -16,7 +16,7 @@
 //!
 //! Many `Aggregate.input` subtrees still hold legacy types (other not-
 //! yet-migrated variants — `SketchAgg`, `WindowedAgg`, `TopK`,
-//! `HistogramQuantile`, `PromQLSubquery`). The canonical
+//! `PromQLSubquery`). The canonical
 //! `QueryExpr::Aggregate.child: Box<QueryExpr>` field expects a CANONICAL
 //! `QueryExpr` — so until Steps γ2-γ7 migrate those variants, we cannot
 //! build a fully-canonical `Aggregate` rooted at a legacy parser's emit

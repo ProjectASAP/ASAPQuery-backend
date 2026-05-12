@@ -196,8 +196,10 @@ mod tests {
         let id = DeploymentModelId::asaplifecycle();
         assert!(reg.contains(&id));
         let m = reg.lookup(&id).expect("asaplifecycle must be registered");
-        // The default rule set carries the 12 engine rules.
-        assert_eq!(m.rules.len(), 12, "asaplifecycle should ship the 12 engine rules");
+        // The default rule set carries the 11 engine rules. (R6
+        // HistogramQuantileFusion was retired in Step γ5 — see
+        // `optimizer::engine` module note.)
+        assert_eq!(m.rules.len(), 11, "asaplifecycle should ship the 11 engine rules");
         // Emitter set carries the three demo emitters.
         assert!(m.emitters.has("opamp_edge_yaml"));
         assert!(m.emitters.has("streaming_config_json"));

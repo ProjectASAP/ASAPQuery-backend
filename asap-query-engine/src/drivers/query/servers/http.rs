@@ -4691,7 +4691,8 @@ struct PrecomputeJobRequest {
 /// POST /api/v1/precompute
 ///
 /// The controller creates PrecomputeJobs when a query's upper sub-tree
-/// (e.g., TopK, HistogramQuantile) requires evaluation on merged sketches.
+/// (e.g., TopK or a histogram-quantile-shaped Aggregate{Quantile(φ)})
+/// requires evaluation on merged sketches.
 /// This endpoint receives that job and runs it against the SimpleMapStore.
 async fn handle_precompute_job(
     State(state): State<AppState>,

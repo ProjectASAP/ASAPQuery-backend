@@ -104,10 +104,10 @@ pub enum AggIntent {
     // captures the intent so the routing decision is layered above intent.
     //
     // Note: `histogram_quantile(φ, …)` is NOT an L3 intent — it's a PromQL
-    // /MetricsQL language-level operator (a query-expression node carried
-    // by `legacy_expr::QueryExpr::HistogramQuantile`). The L1→L3 lowerer
-    // maps `histogram_quantile(q, bucket_metric)` semantically to
-    // `AggIntent::Quantile { q, accuracy }`; bucket-aware handling is a
+    // /MetricsQL language-level operator. Per Step γ5 of the legacy_expr
+    // migration, the PromQL parser substitutes it directly into a plain
+    // `Aggregate { Quantile(φ) }` (which lowers to
+    // `AggIntent::Quantile { q, accuracy }`); bucket-aware handling is a
     // physical-planner concern, not an L3 intent.
     //
     /// `absent(vector_selector)` — 1 iff the selector matched no series in
@@ -176,9 +176,10 @@ impl AggIntent {
     ///
     /// Note: `histogram_quantile(...)` was previously listed as
     /// archive-only here but is no longer an `AggIntent` variant —
-    /// it's a PromQL/MetricsQL language-level operator (carried by
-    /// `legacy_expr::QueryExpr::HistogramQuantile`). The L1→L3
-    /// lowerer maps it semantically to `AggIntent::Quantile { q, .. }`.
+    /// it's a PromQL/MetricsQL language-level operator. Per Step γ5,
+    /// the PromQL parser substitutes it into a plain
+    /// `Aggregate { Quantile(φ) }`, which lowers to
+    /// `AggIntent::Quantile { q, .. }`.
     pub fn archive_only(&self) -> bool {
         matches!(
             self,

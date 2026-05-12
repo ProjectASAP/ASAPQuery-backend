@@ -7,7 +7,7 @@
 //! |---|---|
 //! | Agent OTel Collector | `Source`, `Filter`, `Window`, `SketchAgg` (sketch ops) |
 //! | Backend OTel Collector | `Partition`, `Merge`, `Dedup`, `Aggregate { Exact(Sum\|Count\|Min\|Max) }` |
-//! | ASAPQuery Precompute Engine | `TopK`, `HistogramQuantile`, `PromQLSubquery`, deferred sketch ops |
+//! | ASAPQuery Precompute Engine | `TopK`, `PromQLSubquery`, deferred sketch ops |
 //! | DB-side query | `Aggregate { Avg }` (non-mergeable) |
 //!
 //! # ExactAgg / AggFunc deferral
@@ -33,7 +33,9 @@
 //! [`expr_to_promql`] converts a [`QueryExpr`] tree to a valid PromQL expression
 //! consumed by the ASAPQuery Precompute Engine's query engine.  Unlike the old
 //! flat-template approach, this uses a proper recursive descent so it handles
-//! `histogram_quantile`, `PromQLSubquery`, and vector `BinaryOp` nodes natively.
+//! `PromQLSubquery` and vector `BinaryOp` nodes natively. (`histogram_quantile`
+//! is substituted at the parser level into a plain `Aggregate{Quantile(φ)}`;
+//! see Step γ5.)
 
 use std::time::Duration;
 
@@ -62,7 +64,7 @@ pub fn split_expr_by_stage(expr: &QueryExpr, budgets: &StageResourceBudgets) -> 
     walk(expr, &mut plan, budgets, &schema);
 
     // Build the precompute query_expr from the full tree when the precompute
-    // stage is active (TopK, HistogramQuantile, PromQLSubquery, or deferred ops).
+    // stage is active (TopK, PromQLSubquery, or deferred ops).
     if plan.precompute.active && plan.precompute.query_expr.is_empty() {
         plan.precompute.query_expr = expr_to_promql(expr);
     }
@@ -81,9 +83,10 @@ pub fn split_expr_by_stage(expr: &QueryExpr, budgets: &StageResourceBudgets) -> 
 /// Sketch data is already ingested from the Backend OTel Collector; the PromQL
 /// describes the aggregation to apply over it.
 ///
-/// Uses recursive descent, so it handles `histogram_quantile`,
-/// `PromQLSubquery`, and vector `BinaryOp` nodes that the old flat-template
-/// could not represent.
+/// Uses recursive descent, so it handles `PromQLSubquery` and vector
+/// `BinaryOp` nodes that the old flat-template could not represent.
+/// (`histogram_quantile` is substituted at the parser level into a plain
+/// `Aggregate{Quantile(φ)}`; see Step γ5.)
 ///
 /// Step β: the root-level [`Schema`] is derived from the outermost
 /// `Source` leaf and threaded through the recursive descent. The
@@ -216,11 +219,8 @@ fn walk(
             walk(input, plan, budgets, parent_schema);
         }
 
-        // HistogramQuantile — precompute engine applies it over ingested histograms.
-        QueryExpr::HistogramQuantile { input, .. } => {
-            plan.precompute.active = true;
-            walk(input, plan, budgets, parent_schema);
-        }
+        // (histogram_quantile is substituted at the parser level into a plain
+        // Aggregate{Quantile(φ)}; see step γ5. No dedicated stage-split arm.)
 
         // PromQLSubquery — precompute engine evaluates the sub-query.
         QueryExpr::PromQLSubquery { input, .. } => {
@@ -461,12 +461,9 @@ fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx, parent_schema: &Schema)
         }
         QueryExpr::Sort { input, .. } => promql_from_qe(input, ctx, parent_schema),
 
-        // ── histogram_quantile(φ, rate(selector[w])) ─────────────────────────
-        QueryExpr::HistogramQuantile { phi, input } => {
-            let selector = promql_from_qe(input, ctx, parent_schema);
-            let window   = window_str(ctx.window);
-            format!("histogram_quantile({phi}, rate({selector}{window}))")
-        }
+        // (histogram_quantile lowered to plain Aggregate{Quantile(φ)} at the
+        // parser level; the resulting Aggregate node round-trips to PromQL
+        // via the `quantile_over_time(φ, …)` shape above.)
 
         // ── PromQL subquery expr[range:step] ─────────────────────────────────
         QueryExpr::PromQLSubquery { range, resolution, input } => {
@@ -859,22 +856,6 @@ mod tests {
     }
 
     #[test]
-    fn histogram_quantile_activates_precompute() {
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.99,
-            input: Box::new(QueryExpr::Window {
-                duration: Duration::from_secs(300),
-                slide: None,
-                input: Box::new(source("http_request_duration_seconds_bucket")),
-            }),
-        };
-        let plan = split_expr_by_stage(&expr, &no_budget());
-        assert!(plan.precompute.active);
-        assert!(!plan.precompute.query_expr.is_empty());
-        assert!(plan.precompute.query_expr.contains("histogram_quantile(0.99"));
-    }
-
-    #[test]
     fn binary_op_activates_precompute() {
         let lhs = source("metric_a");
         let rhs = source("metric_b");
@@ -967,22 +948,6 @@ mod tests {
         };
         let ql = expr_to_promql(&expr);
         assert!(ql.starts_with("topk(10,"), "expected topk prefix: {ql}");
-    }
-
-    #[test]
-    fn promql_histogram_quantile() {
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.95,
-            input: Box::new(QueryExpr::Window {
-                duration: Duration::from_secs(300),
-                slide: None,
-                input: Box::new(source("http_request_duration_seconds_bucket")),
-            }),
-        };
-        let ql = expr_to_promql(&expr);
-        assert!(ql.contains("histogram_quantile(0.95"), "got: {ql}");
-        assert!(ql.contains("rate("),                   "got: {ql}");
-        assert!(ql.contains("[5m]"),                    "got: {ql}");
     }
 
     #[test]
