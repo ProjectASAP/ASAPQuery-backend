@@ -20,7 +20,7 @@ pub struct StreamingConfig {
     /// per-metric runtime config. The controller pushes this when planning
     /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
     /// configs decode with `#[serde(default)]` to `SketchStore` so
-    /// existing deploys keep dispatching to `SimpleEngine`.
+    /// existing deploys keep dispatching to `ASAPQueryEngine`.
     #[serde(default)]
     pub storage_backend: StorageBackend,
 }
@@ -78,19 +78,13 @@ impl StreamingConfig {
         inference_config: Option<&InferenceConfig>,
     ) -> Result<Self> {
         let mut retention_map: HashMap<u64, u64> = HashMap::new();
-        let mut read_count_threshold_map: HashMap<u64, u64> = HashMap::new();
 
         if let Some(inference_config) = inference_config {
             for query_config in &inference_config.query_configs {
                 for aggregation in &query_config.aggregations {
                     let aggregation_id = aggregation.aggregation_id;
                     if let Some(num_aggregates) = aggregation.num_aggregates_to_retain {
-                        // OLD: Keep last value only (for backwards compatibility)
                         retention_map.insert(aggregation_id, num_aggregates);
-
-                        // NEW: Sum up num_aggregates_to_retain across all queries
-                        *read_count_threshold_map.entry(aggregation_id).or_insert(0) +=
-                            num_aggregates;
                     }
                 }
             }
@@ -115,11 +109,9 @@ impl StreamingConfig {
                         )
                     })?;
                     let num_aggregates_to_retain = retention_map.get(&aggregation_id_u64);
-                    let read_count_threshold = read_count_threshold_map.get(&aggregation_id_u64);
                     let config = AggregationConfig::from_yaml_data(
                         aggregation_data,
                         num_aggregates_to_retain.copied(),
-                        read_count_threshold.copied(),
                         query_language,
                     )?;
                     aggregation_configs.insert(aggregation_id_u64, config);
@@ -162,7 +154,7 @@ mod tests {
 
     /// Pre-Phase-5 deploys serialize `StreamingConfig` without the
     /// `storage_backend` field; deserialize must default to `SketchStore`
-    /// so the router keeps dispatching to `SimpleEngine` unchanged.
+    /// so the router keeps dispatching to `ASAPQueryEngine` unchanged.
     #[test]
     fn deserialize_legacy_yaml_defaults_to_warm_tier() {
         let yaml = "{\"aggregation_configs\":{}}";

@@ -28,7 +28,6 @@ pub struct AggregationConfig {
     pub spatial_filter_normalized: String,
     pub metric: String, // PromQL mode: metric name; SQL mode: derived from table_name.value_column
     pub num_aggregates_to_retain: Option<u64>,
-    pub read_count_threshold: Option<u64>,
 
     // SQL-specific fields (optional, used when query_language=sql)
     pub table_name: Option<String>,   // SQL mode: table name
@@ -65,7 +64,6 @@ impl AggregationConfig {
         spatial_filter: String,
         metric: String,
         num_aggregates_to_retain: Option<u64>,
-        read_count_threshold: Option<u64>,
         // SQL-specific fields
         table_name: Option<String>,
         value_column: Option<String>,
@@ -89,7 +87,6 @@ impl AggregationConfig {
             spatial_filter_normalized,
             metric,
             num_aggregates_to_retain,
-            read_count_threshold,
             table_name,
             value_column,
         }
@@ -163,7 +160,6 @@ impl AggregationConfig {
         let metric = data["metric"].as_str().ok_or("Missing metric")?.to_string();
 
         let num_aggregates_to_retain = data.get("numAggregatesToRetain").and_then(|v| v.as_u64());
-        let read_count_threshold = data.get("readCountThreshold").and_then(|v| v.as_u64());
 
         // SQL-specific fields (optional)
         let table_name = data
@@ -190,7 +186,6 @@ impl AggregationConfig {
             spatial_filter,
             metric,
             num_aggregates_to_retain,
-            read_count_threshold,
             table_name,
             value_column,
         ))
@@ -207,7 +202,6 @@ impl AggregationConfig {
     pub fn from_yaml_data(
         aggregation_data: &serde_yaml::Value,
         num_aggregates_to_retain: Option<u64>,
-        read_count_threshold: Option<u64>,
         query_language: QueryLanguage,
     ) -> Result<Self, anyhow::Error> {
         let aggregation_id = aggregation_data["aggregationId"]
@@ -313,7 +307,6 @@ impl AggregationConfig {
             spatial_filter,
             metric,
             num_aggregates_to_retain,
-            read_count_threshold,
             table_name,
             value_column,
         ))
@@ -338,11 +331,6 @@ impl SerializableToSink for AggregationConfig {
         // Only include numAggregatesToRetain if it's Some
         if let Some(num_aggregates) = self.num_aggregates_to_retain {
             json["numAggregatesToRetain"] = serde_json::json!(num_aggregates);
-        }
-
-        // Only include readCountThreshold if it's Some
-        if let Some(threshold) = self.read_count_threshold {
-            json["readCountThreshold"] = serde_json::json!(threshold);
         }
 
         // SQL-specific fields (only include if present)
