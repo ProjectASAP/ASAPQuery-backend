@@ -598,11 +598,37 @@ impl SketchAllocator {
         col:    crate::intent_algebra::legacy_expr::ColumnRef,
         child:  PlanNode,
         budget: &mut BudgetState,
-        // Step β: schema in scope at this SketchAgg node. Unused today —
-        // Step γ wires sketch-placement rules that consult column types
-        // (e.g. KLL vs DDSketch for `value: Float64`).
-        _parent_schema: &Schema,
+        // Step β: schema in scope at this SketchAgg node. Step γ2 wires
+        // this schema through the SketchAgg bridge so the annotation
+        // rationale can carry canonical-shape info; future Step γ wiring
+        // (sketch-placement rules that consult column types, e.g. KLL vs
+        // DDSketch for `value: Float64`) will read it directly.
+        parent_schema: &Schema,
     ) -> PlanNode {
+        // Step γ2 demonstration: bridge the legacy SketchAgg to canonical-
+        // shape data and capture a suffix describing the canonical intent
+        // kind + group-by column count. The legacy emit shape is unchanged
+        // — `expr` still carries the legacy SketchAgg variant (approach (c)
+        // per the migration spec). The bridge fails gracefully when `col`
+        // is a Named/SampleValue that doesn't resolve against the inherited
+        // schema; the legacy annotation text stands alone in that case.
+        let canonical_suffix: String = match
+            crate::intent_algebra::bridge_sketch_agg_to_canonical(
+                &op, &col, parent_schema,
+            )
+        {
+            Ok(b) => {
+                let kinds: Vec<&'static str> = b.aggs.iter()
+                    .map(canonical_intent_kind_str)
+                    .collect();
+                format!(
+                    " [canonical: intents={:?}, group_by_cols={}]",
+                    kinds, b.by.len()
+                )
+            }
+            Err(_e) => String::new(),
+        };
+
         // Exact non-mergeable (Avg) → always Db.
         if matches!(&op, AggIntent::Avg) {
             return PlanNode {
@@ -618,7 +644,9 @@ impl SketchAllocator {
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    rationale: "Avg is not mergeable — must run at Db".into(),
+                    rationale: format!(
+                        "Avg is not mergeable — must run at Db{canonical_suffix}"
+                    ),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -640,7 +668,9 @@ impl SketchAllocator {
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    rationale: "Exact(Sum/Count/Min/Max) merged at Backend".into(),
+                    rationale: format!(
+                        "Exact(Sum/Count/Min/Max) merged at Backend{canonical_suffix}"
+                    ),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -671,7 +701,9 @@ impl SketchAllocator {
                 annotation: NodeAnnotation {
                     sketch_type: Some(sketch_type),
                     sketch_params: Some(params),
-                    rationale: "Sketch at Agent (within budget)".into(),
+                    rationale: format!(
+                        "Sketch at Agent (within budget){canonical_suffix}"
+                    ),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -697,7 +729,9 @@ impl SketchAllocator {
                 annotation: NodeAnnotation {
                     sketch_type:     Some(sketch_type),
                     sketch_params:   Some(params),
-                    rationale:       "Sketch demoted to Backend (Agent budget exceeded)".into(),
+                    rationale:       format!(
+                        "Sketch demoted to Backend (Agent budget exceeded){canonical_suffix}"
+                    ),
                     budget_demotion: true,
                     ..Default::default()
                 },
@@ -723,7 +757,9 @@ impl SketchAllocator {
             annotation: NodeAnnotation {
                 sketch_type:     Some(sketch_type),
                 sketch_params:   Some(params),
-                rationale:       "Sketch demoted to Precompute (Agent+Backend budgets exceeded)".into(),
+                rationale:       format!(
+                    "Sketch demoted to Precompute (Agent+Backend budgets exceeded){canonical_suffix}"
+                ),
                 budget_demotion: true,
                 ..Default::default()
             },
