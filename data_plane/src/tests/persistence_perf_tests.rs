@@ -66,7 +66,6 @@ fn streaming_config(agg_id: u64, retention: Option<u64>) -> Arc<StreamingConfig>
         retention,
         None,
         None,
-        None,
     );
     let mut map = HashMap::new();
     map.insert(agg_id, cfg);

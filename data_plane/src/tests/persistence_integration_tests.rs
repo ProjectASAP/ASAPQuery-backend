@@ -37,7 +37,6 @@ fn make_streaming_config(agg_id: u64) -> Arc<StreamingConfig> {
         Some(2),
         None,
         None,
-        None,
     );
     let mut map = std::collections::HashMap::new();
     map.insert(agg_id, cfg);

@@ -85,7 +85,6 @@ fn make_count_min_agg_config(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -353,7 +352,6 @@ fn make_count_sketch_agg_config(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -566,7 +564,6 @@ fn make_kll_agg_config(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -744,7 +741,6 @@ fn make_dd_sketch_agg_config(
         WindowType::Tumbling,
         metric.to_string(),
         metric.to_string(),
-        None,
         None,
         None,
         None,
@@ -928,7 +924,6 @@ fn make_hll_agg_config(
         WindowType::Tumbling,
         metric.to_string(),
         metric.to_string(),
-        None,
         None,
         None,
         None,

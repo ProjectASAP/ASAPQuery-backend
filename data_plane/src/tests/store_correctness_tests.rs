@@ -8,7 +8,7 @@
 //! - Partial-range filtering
 //! - Aggregation-ID isolation
 //! - Earliest-timestamp tracking
-//! - Cleanup policies (circular-buffer and read-based)
+//! - Cleanup policies (circular-buffer + no-cleanup)
 //! - Concurrent insert and read safety
 //! - **Clone fidelity** for every supported accumulator type
 //! - **Keyed (label-grouped) entries**
@@ -49,7 +49,6 @@ fn make_agg_config(
     agg_id: u64,
     aggregation_type: AggregationType,
     num_aggregates_to_retain: Option<u64>,
-    read_count_threshold: Option<u64>,
 ) -> AggregationConfig {
     AggregationConfig::new(
         agg_id,
@@ -66,20 +65,17 @@ fn make_agg_config(
         "".to_string(),       // spatial_filter
         "cpu_usage".to_string(),
         num_aggregates_to_retain,
-        read_count_threshold,
         None, // table_name
         None, // value_column
     )
 }
 
 fn make_streaming_config(
-    ids: &[(u64, AggregationType, Option<u64>, Option<u64>)],
+    ids: &[(u64, AggregationType, Option<u64>)],
 ) -> Arc<StreamingConfig> {
     let configs = ids
         .iter()
-        .map(|&(id, agg_type, retain, threshold)| {
-            (id, make_agg_config(id, agg_type, retain, threshold))
-        })
+        .map(|&(id, agg_type, retain)| (id, make_agg_config(id, agg_type, retain)))
         .collect();
     Arc::new(StreamingConfig::new(configs))
 }
@@ -87,7 +83,7 @@ fn make_streaming_config(
 fn make_store(
     strategy: LockStrategy,
     policy: CleanupPolicy,
-    ids: &[(u64, AggregationType, Option<u64>, Option<u64>)],
+    ids: &[(u64, AggregationType, Option<u64>)],
 ) -> SketchStore {
     let config = make_streaming_config(ids);
     SketchStore::new_with_strategy(config, policy, strategy)
@@ -98,7 +94,7 @@ fn make_store_simple(strategy: LockStrategy) -> SketchStore {
     make_store(
         strategy,
         CleanupPolicy::NoCleanup,
-        &[(1, AggregationType::Sum, None, None)],
+        &[(1, AggregationType::Sum, None)],
     )
 }
 
@@ -196,8 +192,6 @@ pub fn run_contract_suite(strategy: LockStrategy) {
     // Cleanup policies
     test_cleanup_circular_buffer_evicts_oldest_window(strategy);
     test_cleanup_circular_buffer_retains_newest_windows(strategy);
-    test_cleanup_read_based_evicts_after_threshold_reads(strategy);
-    test_cleanup_read_based_unread_window_is_retained(strategy);
     test_delta_set_aggregator_bypasses_cleanup(strategy);
 
     // Keyed (label-grouped) entries
@@ -417,8 +411,8 @@ fn test_multiple_agg_ids_are_isolated(strategy: LockStrategy) {
         strategy,
         CleanupPolicy::NoCleanup,
         &[
-            (1, AggregationType::Sum, None, None),
-            (2, AggregationType::Sum, None, None),
+            (1, AggregationType::Sum, None),
+            (2, AggregationType::Sum, None),
         ],
     );
     let (o1, a1) = sum_entry(1, 1_000, 2_000, 10.0);
@@ -481,8 +475,8 @@ fn test_earliest_timestamp_tracked_per_agg_id(strategy: LockStrategy) {
         strategy,
         CleanupPolicy::NoCleanup,
         &[
-            (1, AggregationType::Sum, None, None),
-            (2, AggregationType::Sum, None, None),
+            (1, AggregationType::Sum, None),
+            (2, AggregationType::Sum, None),
         ],
     );
     let (o1, a1) = sum_entry(1, 1_000, 2_000, 1.0);
@@ -513,7 +507,7 @@ fn test_cleanup_circular_buffer_evicts_oldest_window(strategy: LockStrategy) {
     let store = make_store(
         strategy,
         CleanupPolicy::CircularBuffer,
-        &[(1, AggregationType::Sum, Some(2), None)],
+        &[(1, AggregationType::Sum, Some(2))],
     );
     for i in 0u64..9 {
         let (out, acc) = sum_entry(1, i * 60_000, (i + 1) * 60_000, i as f64);
@@ -533,7 +527,7 @@ fn test_cleanup_circular_buffer_retains_newest_windows(strategy: LockStrategy) {
     let store = make_store(
         strategy,
         CleanupPolicy::CircularBuffer,
-        &[(1, AggregationType::Sum, Some(2), None)],
+        &[(1, AggregationType::Sum, Some(2))],
     );
     for i in 0u64..9 {
         let (out, acc) = sum_entry(1, i * 60_000, (i + 1) * 60_000, i as f64);
@@ -552,77 +546,6 @@ fn test_cleanup_circular_buffer_retains_newest_windows(strategy: LockStrategy) {
 
 // ── cleanup: read-based ───────────────────────────────────────────────────────
 
-fn test_cleanup_read_based_evicts_after_threshold_reads(strategy: LockStrategy) {
-    // read_count_threshold = 2: evicted once read count reaches 2.
-    // Cleanup runs on every insert.
-    let store = make_store(
-        strategy,
-        CleanupPolicy::ReadBased,
-        &[(1, AggregationType::Sum, None, Some(2))],
-    );
-    let (out, acc) = sum_entry(1, 1_000, 2_000, 1.0);
-    store.insert_precomputed_output(out, acc).unwrap();
-
-    // Read 1 — count becomes 1, window kept on next insert.
-    store
-        .query_precomputed_output("cpu_usage", 1, 0, u64::MAX)
-        .unwrap();
-    let (o2, a2) = sum_entry(1, 3_000, 4_000, 2.0);
-    store.insert_precomputed_output(o2, a2).unwrap();
-
-    let still_there = store
-        .query_precomputed_output_exact("cpu_usage", 1, 1_000, 2_000)
-        .unwrap();
-    assert_eq!(
-        total_bucket_count(&still_there),
-        1,
-        "[{}] window must survive until read count reaches threshold",
-        label(strategy)
-    );
-
-    // Read 2 — count becomes 2, evicted on the next insert.
-    store
-        .query_precomputed_output("cpu_usage", 1, 0, 2_000)
-        .unwrap();
-    let (o3, a3) = sum_entry(1, 5_000, 6_000, 3.0);
-    store.insert_precomputed_output(o3, a3).unwrap();
-
-    let evicted = store
-        .query_precomputed_output_exact("cpu_usage", 1, 1_000, 2_000)
-        .unwrap();
-    assert!(
-        evicted.is_empty(),
-        "[{}] window must be evicted once read count reaches threshold",
-        label(strategy)
-    );
-}
-
-fn test_cleanup_read_based_unread_window_is_retained(strategy: LockStrategy) {
-    let store = make_store(
-        strategy,
-        CleanupPolicy::ReadBased,
-        &[(1, AggregationType::Sum, None, Some(1))],
-    );
-    let (out, acc) = sum_entry(1, 1_000, 2_000, 1.0);
-    store.insert_precomputed_output(out, acc).unwrap();
-
-    // Insert more windows without reading window 0 — cleanup runs each time.
-    for i in 1u64..5 {
-        let (o, a) = sum_entry(1, i * 10_000, (i + 1) * 10_000, i as f64);
-        store.insert_precomputed_output(o, a).unwrap();
-    }
-
-    let result = store
-        .query_precomputed_output_exact("cpu_usage", 1, 1_000, 2_000)
-        .unwrap();
-    assert_eq!(
-        total_bucket_count(&result),
-        1,
-        "[{}] unread window must not be evicted by read-based cleanup",
-        label(strategy)
-    );
-}
-
 // ── cleanup: DeltaSetAggregator exclusion ─────────────────────────────────────
 
 fn test_delta_set_aggregator_bypasses_cleanup(strategy: LockStrategy) {
@@ -631,7 +554,7 @@ fn test_delta_set_aggregator_bypasses_cleanup(strategy: LockStrategy) {
     let store = make_store(
         strategy,
         CleanupPolicy::CircularBuffer,
-        &[(1, AggregationType::DeltaSetAggregator, Some(2), None)],
+        &[(1, AggregationType::DeltaSetAggregator, Some(2))],
     );
     let n = 10u64;
     for i in 0..n {

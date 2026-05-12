@@ -72,10 +72,6 @@ struct StoreKeyData {
 
     /// Max total epochs (1 current + sealed) to retain before dropping the oldest.
     max_epochs: usize,
-
-    /// Track how many times each timestamp range has been read.
-    /// Behind Mutex so range queries can use a read lock on the outer RwLock.
-    read_counts: Mutex<HashMap<TimestampRange, u64>>,
 }
 
 impl StoreKeyData {
@@ -87,7 +83,6 @@ impl StoreKeyData {
             current_epoch_id: 0,
             epoch_capacity: None,
             max_epochs: 4,
-            read_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -151,12 +146,6 @@ impl StoreKeyData {
             let to_remove = oldest_windows[..n_evict].to_vec();
             over -= n_evict;
 
-            {
-                let read_counts = self.read_counts.get_mut().unwrap();
-                for w in &to_remove {
-                    read_counts.remove(w);
-                }
-            }
             if n_evict == oldest_windows.len() {
                 self.sealed_epochs.remove(&oldest_id);
             } else {
@@ -166,38 +155,6 @@ impl StoreKeyData {
                     .remove_windows(&to_remove);
             }
         }
-    }
-
-    /// Apply ReadBased cleanup across current and sealed epochs.
-    fn cleanup_read_based(&mut self, metric: &str, aggregation_id: u64, threshold: u64) {
-        let read_counts = self.read_counts.get_mut().unwrap();
-
-        let windows_to_remove: Vec<TimestampRange> = read_counts
-            .iter()
-            .filter(|(_, &count)| count >= threshold)
-            .map(|(range, _)| *range)
-            .collect();
-
-        if windows_to_remove.is_empty() {
-            return;
-        }
-
-        for window in &windows_to_remove {
-            debug!(
-                "Removed aggregate for {} aggregation_id {} window {}-{} (read_count >= threshold: {})",
-                metric, aggregation_id, window.0, window.1, threshold
-            );
-            read_counts.remove(window);
-        }
-
-        // Remove from current epoch.
-        self.current_epoch.remove_windows(&windows_to_remove);
-
-        // Remove from sealed epochs; drop any that become empty.
-        self.sealed_epochs.retain(|_, epoch| {
-            epoch.remove_windows(&windows_to_remove);
-            !epoch.is_empty()
-        });
     }
 }
 
@@ -289,7 +246,7 @@ impl SketchStorePerKey {
     /// memory / time pressure.
     ///
     /// Cleanup policy still applies, but when persistence is on, the
-    /// destructive eviction step of `CircularBuffer` / `ReadBased` is
+    /// destructive eviction step of `CircularBuffer` is
     /// bypassed in favor of the flusher. `NoCleanup` + persistence is
     /// the typical production configuration: the flusher bounds RAM,
     /// nothing is ever dropped from memory without first being on
@@ -380,7 +337,6 @@ impl SketchStorePerKey {
                     .values()
                     .map(|e| e.distinct_window_count())
                     .sum::<usize>();
-            let read_counts_len = data.read_counts.lock().map(|rc| rc.len()).unwrap_or(0);
             total_time_map_entries += time_map_len;
 
             let num_aggregate_objects = data.current_epoch.len()
@@ -393,7 +349,6 @@ impl SketchStorePerKey {
             per_aggregation.push(AggregationDiagnostic {
                 aggregation_id: agg_id,
                 time_map_len,
-                read_counts_len,
                 num_aggregate_objects,
                 sketch_bytes: 0, // per-agg sketch byte sizing is a follow-up
             });
@@ -413,30 +368,19 @@ impl SketchStorePerKey {
         metric: &str,
         aggregation_id: u64,
         num_aggregates_to_retain: Option<u64>,
-        read_count_threshold: Option<u64>,
     ) {
         // When persistence is enabled, eviction is the flusher's job.
         // Skip destructive cleanup entirely — parts on disk are the
         // source of truth for cold data.
         if self.inner.persistence_enabled {
-            let _ = (
-                num_aggregates_to_retain,
-                metric,
-                aggregation_id,
-                read_count_threshold,
-            );
+            let _ = (num_aggregates_to_retain, metric, aggregation_id, data);
             return;
         }
 
         match self.inner.cleanup_policy {
             CleanupPolicy::CircularBuffer => {
                 // Handled by maybe_rotate_epoch() during insert.
-                let _ = (num_aggregates_to_retain, metric, aggregation_id);
-            }
-            CleanupPolicy::ReadBased => {
-                if let Some(threshold) = read_count_threshold {
-                    data.cleanup_read_based(metric, aggregation_id, threshold);
-                }
+                let _ = (num_aggregates_to_retain, metric, aggregation_id, data);
             }
             CleanupPolicy::NoCleanup => {}
         }
@@ -639,7 +583,6 @@ impl SketchStorePerKey {
                 metric,
                 aggregation_id,
                 aggregation_config.num_aggregates_to_retain,
-                aggregation_config.read_count_threshold,
             );
         }
 
@@ -811,12 +754,9 @@ impl Store for SketchStorePerKey {
                 results.entry(label).or_default().extend(buckets);
             }
 
-            {
-                let mut read_counts = data.read_counts.lock().unwrap();
-                for window in &matched_windows {
-                    *read_counts.entry(*window).or_insert(0) += 1;
-                }
-            }
+            // read-count tracking removed; matched_windows kept available for
+            // telemetry if needed in the future.
+            let _ = matched_windows;
         } else if self.persistence.is_none() {
             // Nothing in memory and no disk layer → empty result,
             // matching the old behavior.
@@ -903,10 +843,8 @@ impl Store for SketchStorePerKey {
             }
         }
 
-        if found_match {
-            let mut read_counts = data.read_counts.lock().unwrap();
-            *read_counts.entry(timestamp_range).or_insert(0) += 1;
-        }
+        // read-count tracking removed.
+        let _ = found_match;
 
         let query_duration = query_start_time.elapsed();
         debug!(
@@ -1036,12 +974,6 @@ impl EpochSource for PerKeyInner {
         if let Some(epoch) = data.sealed_epochs.remove(&epoch_id) {
             let freed = epoch_approx_bytes(&epoch);
             self.mem_bytes_sealed.fetch_sub(freed, Ordering::Relaxed);
-            // Also purge the epoch's windows from read_counts so they
-            // don't leak.
-            let mut read_counts = data.read_counts.lock().unwrap();
-            for w in epoch.unique_windows() {
-                read_counts.remove(&w);
-            }
         }
     }
 

@@ -91,7 +91,7 @@ impl InferenceConfig {
         let cleanup_policy_data = data.get("cleanup_policy").ok_or_else(|| {
             anyhow::anyhow!(
                 "Missing cleanup_policy section in inference_config.yaml. \
-                 Must specify cleanup_policy.name as one of: circular_buffer, read_based, no_cleanup"
+                 Must specify cleanup_policy.name as one of: circular_buffer, no_cleanup"
             )
         })?;
 
@@ -101,13 +101,13 @@ impl InferenceConfig {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Missing cleanup_policy.name in inference_config.yaml. \
-                     Must be one of: circular_buffer, read_based, no_cleanup"
+                     Must be one of: circular_buffer, no_cleanup"
                 )
             })?;
 
         name.parse::<CleanupPolicy>().map_err(|_| {
             anyhow::anyhow!(
-                "Invalid cleanup policy: '{}'. Valid options: circular_buffer, read_based, no_cleanup",
+                "Invalid cleanup policy: '{}'. Valid options: circular_buffer, no_cleanup",
                 name
             )
         })
@@ -145,15 +145,6 @@ impl InferenceConfig {
                                     .get("num_aggregates_to_retain")
                                     .and_then(|v| v.as_u64());
                                 AggregationReference::new(aggregation_id, num_aggregates_to_retain)
-                            }
-                            CleanupPolicy::ReadBased => {
-                                let read_count_threshold = agg_data
-                                    .get("read_count_threshold")
-                                    .and_then(|v| v.as_u64());
-                                AggregationReference::with_read_count_threshold(
-                                    aggregation_id,
-                                    read_count_threshold,
-                                )
                             }
                             CleanupPolicy::NoCleanup => {
                                 AggregationReference::new(aggregation_id, None)

@@ -73,7 +73,6 @@ fn make_agg_config(id: u64) -> AggregationConfig {
         None,
         None,
         None,
-        None,
     )
 }
 

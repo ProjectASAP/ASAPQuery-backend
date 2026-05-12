@@ -5,7 +5,7 @@ metrics:
   - label_0
   - label_1
 cleanup_policy:
-  name: read_based
+  name: circular_buffer
 # Each (query, aggregation_id) pair binds a PromQL pattern to a precompute
 # plan. The exact-string match in `find_query_config` requires the request
 # query to canonicalize to one of the listed strings — wider-range / wider-
@@ -17,96 +17,74 @@ queries:
 # ── Spatial quantile (existing canonical pattern + multi-quantile) ─────
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile by (label_0) (0.5, fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile by (label_0) (0.9, fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile by (label_0) (0.95, fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile by (label_0) (0.99, fake_metric)
 # ── quantile_over_time: multi-quantile × wider ranges ──────────────────
 # Routes to `Statistic::Quantile`; supported by DDSketch / KLL accumulators.
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.5, fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.9, fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.95, fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.99, fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.5, fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.9, fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.95, fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.99, fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.5, fake_metric[5m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.9, fake_metric[5m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.95, fake_metric[5m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: quantile_over_time(0.99, fake_metric[5m])
 # ── sum_over_time / count_over_time: wider ranges ──────────────────────
 # Routes to `Statistic::Sum` / `Statistic::Count`; supported by DDSketch /
 # CountSketch / CountMinSketch accumulators (no-key total-volume fallback).
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: sum_over_time(fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: sum_over_time(fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: sum_over_time(fake_metric[5m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: count_over_time(fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: count_over_time(fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: count_over_time(fake_metric[5m])
 # ── rate / increase: delta-capable sketches ────────────────────────────
 # Routes to `Statistic::Rate` / `Statistic::Increase`; supported by
@@ -115,23 +93,18 @@ queries:
 # streaming aggregation when serving rate/increase queries.
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: rate(fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: rate(fake_metric[2m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: rate(fake_metric[5m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: increase(fake_metric[1m])
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: increase(fake_metric[5m])
 # ── Cardinality / generic spatial aggregations ─────────────────────────
 # `count` over an HLL-backed aggregation routes to `Statistic::Count`,
@@ -139,15 +112,12 @@ queries:
 # `sum` / `avg` route to `Statistic::Sum` / `(Sum, Count)`.
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: count(fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: sum(fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: avg(fake_metric)
 # ── Top-K (CountSketch heavy-hitter readout) ───────────────────────────
 # `topk(N, …)` routes to `Statistic::Topk`; CountSketch's `query_statistic`
@@ -156,13 +126,10 @@ queries:
 # upstream).
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: topk(5, fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: topk(10, fake_metric)
 - aggregations:
   - aggregation_id: 1
-    read_count_threshold: 1
   query: topk(50, fake_metric)

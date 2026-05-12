@@ -574,7 +574,6 @@ mod tests {
             spatial_filter_normalized,
             metric: metric.to_string(),
             num_aggregates_to_retain: None,
-            read_count_threshold: None,
             table_name: None,
             value_column: None,
         }

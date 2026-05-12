@@ -1137,7 +1137,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -2109,7 +2108,6 @@ aggregations:
             "http_requests_total".to_string(),
             "http_requests_total".to_string(),
             Some(60),
-            Some(0),
             None,
             None,
         );

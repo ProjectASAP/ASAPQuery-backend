@@ -53,7 +53,6 @@ fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> Aggregation
         None,
         None,
         None,
-        None,
     )
 }
 

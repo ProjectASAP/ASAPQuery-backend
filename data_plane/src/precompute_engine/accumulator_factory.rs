@@ -844,7 +844,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
         };
 
@@ -925,7 +924,6 @@ mod tests {
             WindowType::Tumbling,
             "m".to_string(),
             "m".to_string(),
-            None,
             None,
             None,
             None,

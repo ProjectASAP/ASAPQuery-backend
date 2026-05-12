@@ -990,10 +990,9 @@ async fn spawn_memory_diagnostics(
         );
         for agg in &store_diag.per_aggregation {
             info!(
-                "[MEMORY_DIAG]   agg_id={}: time_map_len={}, read_counts_len={}, aggregate_objects={}, sketch_bytes={:.2} KB",
+                "[MEMORY_DIAG]   agg_id={}: time_map_len={}, aggregate_objects={}, sketch_bytes={:.2} KB",
                 agg.aggregation_id,
                 agg.time_map_len,
-                agg.read_counts_len,
                 agg.num_aggregate_objects,
                 agg.sketch_bytes as f64 / 1024.0,
             );

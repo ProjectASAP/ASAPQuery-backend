@@ -87,7 +87,6 @@ pub fn create_engine_single_pop_with_aggregated(
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -185,7 +184,6 @@ pub fn create_engine_dual_input(
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -208,7 +206,6 @@ pub fn create_engine_dual_input(
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -302,7 +299,6 @@ pub fn create_engine_two_metrics(
         spatial_filter_normalized: String::new(),
         metric: metric_a.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -324,7 +320,6 @@ pub fn create_engine_two_metrics(
         spatial_filter_normalized: String::new(),
         metric: metric_b.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -428,7 +423,6 @@ pub fn create_engine_three_metrics(
                 spatial_filter_normalized: String::new(),
                 metric: metric.to_string(),
                 num_aggregates_to_retain: None,
-                read_count_threshold: None,
                 table_name: None,
                 value_column: None,
             },
@@ -510,7 +504,6 @@ pub fn create_engine_multi_timestamp(
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };
@@ -591,7 +584,6 @@ pub fn create_engine_multi_timestamp_with_window(
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
         num_aggregates_to_retain: None,
-        read_count_threshold: None,
         table_name: None,
         value_column: None,
     };

@@ -64,7 +64,6 @@ mod schema {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -473,7 +472,6 @@ mod v2_forward_compat {
                 WindowType::Tumbling,
                 String::new(),
                 metric.to_string(),
-                None,
                 None,
                 None,
                 None,

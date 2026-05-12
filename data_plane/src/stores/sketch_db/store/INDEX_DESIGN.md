@@ -110,11 +110,8 @@ StoreKeyData {
     current_epoch_id: EpochID
     epoch_capacity:   Option<usize>         // None = unlimited
     max_epochs:       usize                 // default 4
-    read_counts:      Mutex<HashMap<TimestampRange, u64>>
 }
 ```
-
-`read_counts` is behind an inner `Mutex` so queries can hold the outer `RwLock::read` and still update counts.
 
 ### Global Store (`global.rs`)
 
@@ -124,9 +121,8 @@ Same per-key epoch structure, but all aggregation_ids share a single `Mutex<Stor
 Mutex<StoreData>
 
 StoreData {
-    stores:      HashMap<aggregation_id, PerKeyState>
-    read_counts: HashMap<aggregation_id, HashMap<TimestampRange, u64>>
-    metrics:     HashSet<String>
+    stores:  HashMap<aggregation_id, PerKeyState>
+    metrics: HashSet<String>
 }
 
 PerKeyState {
@@ -138,8 +134,6 @@ PerKeyState {
     max_epochs:       usize
 }
 ```
-
-No inner `Mutex` for `read_counts` — the outer `Mutex` already serializes all access.
 
 ---
 
@@ -170,7 +164,6 @@ No inner `Mutex` for `read_counts` — the outer `Mutex` already serializes all 
 | **Exact query** (first after write) | O(M) | Build `window_to_ids` from `windows_col` |
 | **Exact query** (cached) | O(m) | HashMap lookup + `Arc::clone` per offset |
 | **Exact query** (sealed epoch) | O(log N + m) | Binary search to window + linear scan |
-| **ReadBased cleanup** | O(N + k · m) | Scan `read_counts` + targeted removal via `remove_windows` |
 | **get_earliest_timestamp** | O(A) | DashMap iteration with AtomicU64 loads |
 
 ### Space
@@ -181,7 +174,6 @@ No inner `Mutex` for `read_counts` — the outer `Mutex` already serializes all 
 | `MutableEpoch` columns | O(M) |
 | `SealedEpoch` entries | O(M) per sealed epoch |
 | `window_to_ids` (when built) | O(M) |
-| `read_counts` | O(N) total |
 | **Total** | **O(A · E · M)** where E ≤ `max_epochs` |
 
 ---
@@ -196,7 +188,6 @@ No inner `Mutex` for `read_counts` — the outer `Mutex` already serializes all 
    - Skip if `min_start > end || max_end < start` — O(1) bounds check
    - `sealed_epoch.range_query_into(start, end)` — O(log N + k) binary search + scan
 4. Resolve MetricIDs → labels via `InternTable` in one pass
-5. Briefly acquire inner `Mutex` to update `read_counts`
 
 ### Exact Query `(exact_start, exact_end)`
 
@@ -217,15 +208,7 @@ Epoch-based eviction — O(1) amortized per insert:
 1. On first insert: set `epoch_capacity` from `num_aggregates_to_retain`
 2. After each insert: call `maybe_rotate_epoch()`
    - If `current_epoch.window_count() >= epoch_capacity`: seal current epoch, open new one with `with_capacity(hint)` (Opt 6)
-   - If `1 + sealed_epochs.len() > max_epochs`: pop oldest sealed epoch in O(1), purge its windows from `read_counts`
-
-### ReadBased
-
-Read-count triggered eviction:
-
-1. Scan `read_counts` for windows with `count >= threshold`
-2. For each such window, call `MutableEpoch::remove_windows` or `SealedEpoch::remove_windows`
-3. Drop any epochs that become empty
+   - If `1 + sealed_epochs.len() > max_epochs`: pop oldest sealed epoch in O(1)
 
 ### NoCleanup
 
@@ -238,8 +221,8 @@ No eviction — data accumulates indefinitely.
 | Operation | Lock |
 |-----------|------|
 | **Insert** | `RwLock::write` for the batch duration |
-| **Range query** | `RwLock::read` → brief `Mutex::lock` on `read_counts` |
+| **Range query** | `RwLock::read` for the scan |
 | **Exact query** | `RwLock::write` (lazy index build) → drop → `RwLock::read` for label resolution |
-| **Cleanup** | Under existing write lock; `Mutex::get_mut()` bypasses inner lock |
+| **Cleanup** | Under existing write lock |
 
 Multiple readers per `aggregation_id` run concurrently. Writers only block readers of the same `aggregation_id`.

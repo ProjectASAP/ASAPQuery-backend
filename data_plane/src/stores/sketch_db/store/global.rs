@@ -58,7 +58,7 @@ impl PerKeyState {
 
     /// Seal the current epoch when full, then evict the minimum number of oldest windows
     /// to keep total distinct windows ≤ `epoch_capacity * max_epochs`.
-    /// Returns the evicted windows so the caller can clean up `read_counts`.
+    /// Returns the evicted windows.
     fn maybe_rotate_epoch(&mut self) -> Vec<TimestampRange> {
         let capacity = match self.epoch_capacity {
             Some(c) if c > 0 => c,
@@ -124,10 +124,6 @@ struct StoreData {
 
     /// Track earliest timestamp per aggregation ID
     earliest_timestamp_per_aggregation_id: HashMap<u64, u64>,
-
-    /// Track how many times each aggregate window has been read (per store key)
-    /// No inner Mutex needed — outer Mutex serializes everything.
-    read_counts: HashMap<StoreKey, HashMap<TimestampRange, u64>>,
 }
 
 /// In-memory storage implementation using single mutex (like Python version)
@@ -150,7 +146,6 @@ impl SketchStoreGlobal {
                 metrics: HashSet::new(),
                 items_inserted: HashMap::new(),
                 earliest_timestamp_per_aggregation_id: HashMap::new(),
-                read_counts: HashMap::new(),
             }),
             streaming_config,
             cleanup_policy,
@@ -173,11 +168,6 @@ impl SketchStoreGlobal {
                     .values()
                     .map(|e| e.distinct_window_count())
                     .sum::<usize>();
-            let read_counts_len = data
-                .read_counts
-                .get(&agg_id)
-                .map(|rc| rc.len())
-                .unwrap_or(0);
             total_time_map_entries += time_map_len;
 
             let num_aggregate_objects = per_key.current_epoch.len()
@@ -190,7 +180,6 @@ impl SketchStoreGlobal {
             per_aggregation.push(AggregationDiagnostic {
                 aggregation_id: agg_id,
                 time_map_len,
-                read_counts_len,
                 num_aggregate_objects,
                 sketch_bytes: 0, // skip serialization for diagnostics
             });
@@ -220,7 +209,6 @@ struct BatchConfig {
     metric: String,
     is_delta: bool,
     num_aggregates_to_retain: Option<u64>,
-    read_count_threshold: Option<u64>,
 }
 
 #[async_trait::async_trait]
@@ -270,7 +258,6 @@ impl Store for SketchStoreGlobal {
                         is_delta: aggregation_config.aggregation_type
                             == AggregationType::DeltaSetAggregator,
                         num_aggregates_to_retain: aggregation_config.num_aggregates_to_retain,
-                        read_count_threshold: aggregation_config.read_count_threshold,
                     },
                     u64::MAX,
                     Vec::new(),
@@ -327,9 +314,6 @@ impl Store for SketchStoreGlobal {
             } // per_key borrow ends here
 
             for (output, precompute) in items {
-                // Get per_key fresh each iteration so the borrow of data.stores ends before
-                // the cleanup branches borrow data.read_counts (different field — NLL splits
-                // them, but only if the per_key borrow scope is confined to each iteration).
                 let per_key = data.stores.get_mut(&store_key).unwrap();
 
                 // Intern the label key (Optimization 1)
@@ -342,8 +326,6 @@ impl Store for SketchStoreGlobal {
                     .insert(timestamp_range, metric_id, Arc::from(precompute));
 
                 // Apply retention policy if configured (but exclude DeltaSetAggregator).
-                // per_key is last used above; NLL ends its borrow so data.read_counts can
-                // be accessed in the cleanup branches below.
                 if !cfg.is_delta {
                     match self.cleanup_policy {
                         CleanupPolicy::CircularBuffer => {
@@ -352,45 +334,11 @@ impl Store for SketchStoreGlobal {
                                 .get_mut(&store_key)
                                 .unwrap()
                                 .maybe_rotate_epoch();
-                            if !dropped_windows.is_empty() {
-                                if let Some(rc_map) = data.read_counts.get_mut(&store_key) {
-                                    for window in &dropped_windows {
-                                        rc_map.remove(window);
-                                    }
-                                }
-                                for window in &dropped_windows {
-                                    debug!(
-                                        "Removed old aggregate for {} aggregation_id {} window {}-{} (epoch rotation)",
-                                        cfg.metric, store_key, window.0, window.1
-                                    );
-                                }
-                            }
-                        }
-                        CleanupPolicy::ReadBased => {
-                            if let Some(threshold) = cfg.read_count_threshold {
-                                let rc_map = data.read_counts.entry(store_key).or_default();
-                                let windows_to_remove: Vec<TimestampRange> = rc_map
-                                    .iter()
-                                    .filter(|(_, &count)| count >= threshold)
-                                    .map(|(range, _)| *range)
-                                    .collect();
-
-                                if !windows_to_remove.is_empty() {
-                                    for window in &windows_to_remove {
-                                        debug!(
-                                            "Removed aggregate for {} aggregation_id {} window {}-{} (read_count >= threshold: {})",
-                                            cfg.metric, store_key, window.0, window.1, threshold
-                                        );
-                                        rc_map.remove(window);
-                                    }
-
-                                    let per_key = data.stores.get_mut(&store_key).unwrap();
-                                    per_key.current_epoch.remove_windows(&windows_to_remove);
-                                    per_key.sealed_epochs.retain(|_, epoch| {
-                                        epoch.remove_windows(&windows_to_remove);
-                                        !epoch.is_empty()
-                                    });
-                                }
+                            for window in &dropped_windows {
+                                debug!(
+                                    "Removed old aggregate for {} aggregation_id {} window {}-{} (epoch rotation)",
+                                    cfg.metric, store_key, window.0, window.1
+                                );
                             }
                         }
                         CleanupPolicy::NoCleanup => {}
@@ -512,7 +460,7 @@ impl Store for SketchStoreGlobal {
             mid
         };
 
-        // Resolve MetricIDs → labels in a single pass (scope ends before read_counts borrow)
+        // Resolve MetricIDs → labels in a single pass.
         let results: TimestampedBucketsMap = {
             let per_key = data.stores.get(&store_key).unwrap();
             let mut r = HashMap::with_capacity(mid.len());
@@ -528,11 +476,9 @@ impl Store for SketchStoreGlobal {
             r
         };
 
-        // Update read counts (outer Mutex already held — no inner Mutex needed)
-        let rc_map = data.read_counts.entry(store_key).or_default();
-        for window in &matched_windows {
-            *rc_map.entry(*window).or_insert(0) += 1;
-        }
+        // matched_windows kept for potential telemetry — read-count-based
+        // eviction was removed; tracking is no-op now.
+        let _ = matched_windows;
 
         let range_scan_duration = range_scan_start_time.elapsed();
         debug!(
@@ -668,11 +614,8 @@ impl Store for SketchStoreGlobal {
             );
         }
 
-        // Update read count (outer Mutex held — no inner Mutex needed)
-        if found_match {
-            let rc_map = data.read_counts.entry(store_key).or_default();
-            *rc_map.entry(timestamp_range).or_insert(0) += 1;
-        }
+        // read-count tracking removed.
+        let _ = found_match;
 
         #[cfg(feature = "lock_profiling")]
         {
@@ -726,7 +669,6 @@ impl Store for SketchStoreGlobal {
             })
             .unwrap_or(0);
         data.stores.remove(&agg_id);
-        data.read_counts.remove(&agg_id);
         data.earliest_timestamp_per_aggregation_id.remove(&agg_id);
         // `metrics` and `items_inserted` are keyed by metric name,
         // not agg_id, so we don't touch them — other agg_ids for the

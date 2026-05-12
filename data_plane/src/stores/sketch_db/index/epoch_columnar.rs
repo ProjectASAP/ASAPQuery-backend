@@ -279,7 +279,7 @@ impl<P> MutableEpoch<P> {
     }
 
     /// Remove all entries whose window is in `windows`.
-    /// Mirrors the legacy `SketchStore` ReadBased / CircularBuffer
+    /// Mirrors the legacy `SketchStore` CircularBuffer
     /// cleanup contract. O(N) — rebuilds columns in one pass.
     pub fn remove_windows(&mut self, windows: &[TimestampRange]) {
         use std::collections::HashSet as StdHashSet;
@@ -308,7 +308,7 @@ impl<P: Clone> MutableEpoch<P> {
     /// Range query into a caller-provided `HashMap<LabelValuesId, Vec<(TimestampRange, P)>>`,
     /// matching the legacy `SketchStore`'s `MetricBucketMap` shape.
     /// Also pushes each matched window into `matched_windows` for the
-    /// downstream `read_counts` accounting.
+    /// downstream accounting (e.g. metrics).
     ///
     /// Uses the same overlap-filter semantics as the flat
     /// `range_query_into`: include any window whose `[w.0, w.1)`
@@ -472,7 +472,7 @@ impl<P> SealedEpoch<P> {
     }
 
     /// Sorted-deduplicated windows. Used by the legacy SketchStore to
-    /// purge `read_counts` when an epoch is dropped.
+    /// surface the windows that were dropped on epoch eviction.
     pub fn unique_windows(&self) -> Vec<TimestampRange> {
         let mut windows: Vec<TimestampRange> =
             self.entries.iter().map(|(w, _, _)| *w).collect();

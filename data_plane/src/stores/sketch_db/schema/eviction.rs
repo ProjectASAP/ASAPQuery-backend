@@ -292,7 +292,6 @@ mod tests {
             spatial_filter_normalized: String::new(),
             metric: format!("metric_{id}"),
             num_aggregates_to_retain: None,
-            read_count_threshold: None,
             table_name: None,
             value_column: None,
         }

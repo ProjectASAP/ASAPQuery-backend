@@ -18,8 +18,6 @@ pub enum QueryLanguage {
 pub enum CleanupPolicy {
     /// Keep only the N most recent aggregates (circular buffer behavior)
     CircularBuffer,
-    /// Remove aggregates after they've been read N times
-    ReadBased,
     /// Never clean up aggregates
     NoCleanup,
 }
@@ -28,7 +26,6 @@ impl fmt::Display for CleanupPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CleanupPolicy::CircularBuffer => write!(f, "circular_buffer"),
-            CleanupPolicy::ReadBased => write!(f, "read_based"),
             CleanupPolicy::NoCleanup => write!(f, "no_cleanup"),
         }
     }
@@ -40,7 +37,6 @@ impl FromStr for CleanupPolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "circular_buffer" => Ok(CleanupPolicy::CircularBuffer),
-            "read_based" => Ok(CleanupPolicy::ReadBased),
             "no_cleanup" => Ok(CleanupPolicy::NoCleanup),
             _ => Err(format!("Unknown cleanup policy: '{s}'")),
         }

@@ -2610,7 +2610,6 @@ aggregations:
                     None,
                     None,
                     None,
-                    None,
                 );
                 map.insert(*agg_id, cfg);
             }

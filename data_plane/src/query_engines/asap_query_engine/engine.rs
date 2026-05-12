@@ -4950,7 +4950,6 @@ mod hot_reload_phase2_tests {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -5114,7 +5113,6 @@ mod e2e_feedback_loop_tests {
             WindowType::Tumbling,
             String::new(),
             metric.to_string(),
-            None,
             None,
             None,
             None,
@@ -5777,7 +5775,6 @@ mod sketch_alias_resolver_tests {
             WindowType::Tumbling,
             String::new(),
             metric.to_string(),
-            None,
             None,
             None,
             None,

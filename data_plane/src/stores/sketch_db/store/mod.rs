@@ -16,7 +16,6 @@ use std::sync::Arc;
 pub struct AggregationDiagnostic {
     pub aggregation_id: u64,
     pub time_map_len: usize,
-    pub read_counts_len: usize,
     pub num_aggregate_objects: usize,
     pub sketch_bytes: usize,
 }
@@ -195,7 +194,6 @@ mod drop_agg_id_tests {
             spatial_filter_normalized: String::new(),
             metric: format!("metric_{id}"),
             num_aggregates_to_retain: None,
-            read_count_threshold: None,
             table_name: None,
             value_column: None,
         };
