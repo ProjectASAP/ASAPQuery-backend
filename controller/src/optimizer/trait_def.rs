@@ -69,7 +69,7 @@ pub trait OptimizerRule: Send + Sync {
 mod tests {
     use super::*;
     use crate::optimizer::engine::{
-        CommonSubexprElim, FilterWindowSwap, HLLDedupElim, HistogramQuantileFusion,
+        CommonSubexprElim, FilterWindowSwap, HLLDedupElim,
         HydraConversion, MergeLifting, PartitionElim, PredicatePushDown, SetOpFusion,
         SubqueryDecorrelation, TopKFusion, WindowMerge,
     };
@@ -89,7 +89,7 @@ mod tests {
             Box::new(WindowMerge),
             Box::new(PartitionElim),
             Box::new(TopKFusion),
-            Box::new(HistogramQuantileFusion),
+            // R6 (HistogramQuantileFusion) retired in Step γ5.
             Box::new(MergeLifting),
             Box::new(SetOpFusion),
             Box::new(HydraConversion),

@@ -492,12 +492,11 @@ pub enum QueryExpr {
 
     // ── PromQL-specific operators ─────────────────────────────────────────
 
-    /// `histogram_quantile(φ, <buckets>)` — converts an HLL / histogram
-    /// sketch into a quantile estimate.
-    HistogramQuantile {
-        phi:   f64,
-        input: Box<QueryExpr>,
-    },
+    // Note: `histogram_quantile(φ, <buckets>)` is no longer a `QueryExpr`
+    // variant. Per Step γ5 of the legacy_expr migration, the PromQL parser
+    // substitutes the call with a plain `Aggregate { Quantile(φ) }` so
+    // downstream code (lowerer, optimizer, physical planner) sees a single
+    // canonical Quantile intent.
 
     /// PromQL sub-query syntax: `<expr>[range:resolution]`.
     PromQLSubquery {
@@ -784,7 +783,6 @@ impl QueryExpr {
             | QueryExpr::TopK { input, .. }
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
-            | QueryExpr::HistogramQuantile { input, .. }
             | QueryExpr::PromQLSubquery { input, .. } => input.walk(f),
 
             QueryExpr::Aggregate { input, .. } => input.walk(f),
@@ -832,7 +830,6 @@ impl QueryExpr {
             | QueryExpr::Sort { input, .. }
             | QueryExpr::Limit { input, .. }
             | QueryExpr::Aggregate { input, .. }
-            | QueryExpr::HistogramQuantile { input, .. }
             | QueryExpr::PromQLSubquery { input, .. } => input.source_name(),
             QueryExpr::Merge { inputs } => inputs.first()?.source_name(),
             QueryExpr::Join { left, .. }
@@ -1090,20 +1087,6 @@ mod tests {
         };
         match expr {
             QueryExpr::LetBinding { name, .. } => assert_eq!(name, "base"),
-            _ => panic!(),
-        }
-    }
-
-    #[test]
-    fn histogram_quantile_node() {
-        let expr = QueryExpr::HistogramQuantile {
-            phi:   0.95,
-            input: Box::new(QueryExpr::Source(SourceSpec { name: "hist".into() })),
-        };
-        match expr {
-            QueryExpr::HistogramQuantile { phi, .. } => {
-                assert!((phi - 0.95).abs() < 1e-9);
-            }
             _ => panic!(),
         }
     }

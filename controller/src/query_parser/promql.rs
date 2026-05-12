@@ -15,7 +15,7 @@
 //! | Expression | AggFunc |
 //! |---|---|
 //! | `quantile_over_time(φ, m[w])` | Quantile(φ) |
-//! | `histogram_quantile(φ, rate(m[w]))` | (HistogramQuantile node — not an Aggregate) |
+//! | `histogram_quantile(φ, rate(m[w]))` | Quantile(φ)  (parser-level substitution; see step γ5) |
 //! | `avg_over_time(m[w])` | Avg |
 //! | `min_over_time(m[w])` | Min |
 //! | `max_over_time(m[w])` | Max |
@@ -149,7 +149,7 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 //
 // | PromQL pattern           | QueryExpr node                        |
 // |--------------------------|---------------------------------------|
-// | `histogram_quantile(φ…)` | HistogramQuantile { phi }             |
+// | `histogram_quantile(φ…)` | Aggregate { Quantile(φ) } (step γ5)   |
 // | `m[5m:1m]` subquery      | PromQLSubquery { 5m, Some(1m) }      |
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
@@ -163,8 +163,9 @@ use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality
 
 /// Parse a PromQL expression string directly into an optimised [`QueryExpr`].
 ///
-/// This preserves
-/// `HistogramQuantile`, `PromQLSubquery`, and `BinaryOp` nodes natively.
+/// This preserves `PromQLSubquery` and `BinaryOp` nodes natively;
+/// `histogram_quantile(φ, …)` is substituted into a plain
+/// `Aggregate { Quantile(φ) }` per Step γ5 of the legacy_expr migration.
 pub fn parse_promql_expr(query: &str) -> anyhow::Result<QueryExpr> {
     let expr = parser::parse(query)
         .map_err(|e| anyhow!("PromQL parse error: {e}"))?;
@@ -308,15 +309,29 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
 fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     let name = call.func.name;
     match name {
-        // histogram_quantile → native HistogramQuantile node (PromQL-specific).
+        // histogram_quantile(φ, bucket_metric) → plain Aggregate { Quantile(φ) }.
+        //
+        // Per Step γ5 of the legacy_expr migration: at the PromQL parser level
+        // we substitute `histogram_quantile(φ, bucket_metric)` with the same
+        // shape that `quantile_over_time(φ, m[w])` produces — an `Aggregate`
+        // carrying a single `AggFunc::Quantile(φ)`. Downstream code (the
+        // L1→L3 lowerer, the optimizer, the physical planner) then sees a
+        // plain Quantile and routes via the existing `AggIntent::Quantile`
+        // path. Bucket-aware physical reduction is a physical-planner
+        // concern, not an IR variant. The legacy `QueryExpr::HistogramQuantile`
+        // variant has been retired.
+        //
+        // The inner `rate(...)` is the buckets argument; we use a fresh
+        // `WalkCtx::default()` because an outer `topk` context would otherwise
+        // rewrite the Quantile(φ) into a Count-frequency aggregate, which
+        // would be semantically wrong for the histogram-quantile reduction.
         "histogram_quantile" => {
             let phi       = extract_call_num_arg(call, 0)?;
             let rate_expr = call.args.args[1].as_ref();
             let (source, filters, window) = extract_inner_matrix(rate_expr)?;
-            let inner = build_qe_aggregate(source, filters, window,
+            Ok(build_qe_aggregate(source, filters, window,
                 AggFunc::Quantile(phi),
-                WalkCtx::default());
-            Ok(QueryExpr::HistogramQuantile { phi, input: Box::new(inner) })
+                WalkCtx::default()))
         }
         // All other function calls: map to AggFunc (Layer 2).
         "quantile_over_time" => {
@@ -574,6 +589,49 @@ mod tests {
         let pq = pq("histogram_quantile(0.95, rate(http_duration_seconds_bucket[5m]))");
         assert_eq!(pq.aggregations, vec![AggType::Quantile]);
         assert_eq!(pq.quantiles, vec![0.95]);
+    }
+
+    /// Step γ5 contract: at the PromQL parser level, `histogram_quantile(φ, …)`
+    /// is substituted into a plain `QueryExpr::Aggregate { aggs: [AggItem {
+    /// func: AggFunc::Quantile(φ), … }], … }` so downstream code sees a
+    /// single canonical Quantile intent (no `QueryExpr::HistogramQuantile`
+    /// wrapper). `ParsedQuery.quantiles` records the φ via the existing
+    /// multi-quantile machinery.
+    #[test]
+    fn histogram_quantile_lowers_to_plain_aggregate_quantile() {
+        use crate::intent_algebra::legacy_expr::{AggFunc, ColumnRef, QueryExpr};
+
+        let qe = super::parse_promql_expr(
+            r#"histogram_quantile(0.99, rate(http_requests_bucket{le="0.5"}[5m]))"#,
+        )
+        .expect("parse should succeed");
+
+        // The top of the tree must be a plain Aggregate with a single
+        // Quantile(0.99) AggItem — NOT a HistogramQuantile wrapper.
+        match &qe {
+            QueryExpr::Aggregate { aggs, .. } => {
+                assert_eq!(aggs.len(), 1, "expected single AggItem, got {aggs:?}");
+                let item = &aggs[0];
+                match item.func {
+                    AggFunc::Quantile(phi) => {
+                        assert!((phi - 0.99).abs() < 1e-9, "expected φ=0.99, got {phi}");
+                    }
+                    ref other => panic!("expected AggFunc::Quantile(0.99), got {other:?}"),
+                }
+                assert!(matches!(item.col, ColumnRef::SampleValue));
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+
+        // The flat ParsedQuery view exposes the φ via the existing
+        // multi-quantile machinery.
+        let pq = pq(r#"histogram_quantile(0.99, rate(http_requests_bucket{le="0.5"}[5m]))"#);
+        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
+        assert_eq!(pq.quantiles, vec![0.99]);
+        assert_eq!(
+            pq.label_filters.get("le").map(String::as_str),
+            Some("0.5"),
+        );
     }
 
     // ── avg_over_time ─────────────────────────────────────────────────────────

@@ -19,8 +19,9 @@
 //!
 //! The `intent_algebra` (L3) layer (Phase B, separate worktree) is
 //! responsible for normalising this language-specific tree into the
-//! language-orthogonal `QueryExpr` shape (e.g. dropping
-//! `HistogramQuantile`, `PromQLSubquery`).
+//! language-orthogonal `QueryExpr` shape (e.g. dropping `PromQLSubquery`).
+//! `histogram_quantile(...)` is no longer a legacy variant — Step γ5
+//! substitutes it at the parser level into a plain `Aggregate{Quantile(φ)}`.
 
 use std::collections::HashMap;
 use std::time::Duration;
