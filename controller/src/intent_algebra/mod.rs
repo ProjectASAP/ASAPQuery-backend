@@ -147,3 +147,14 @@ pub use windowed_agg_bridge::{
     bridge_windowed_agg_to_canonical, output_schema_for_windowed_agg,
     BridgeError as WindowedAggBridgeError, BridgedWindowedAgg,
 };
+
+// Step γ2 bridge: one-way `legacy_expr::QueryExpr::SketchAgg` →
+// canonical-shape `BridgedAggregate` helper. Companion to the γ1
+// Aggregate bridge — SketchAgg's single-intent / single-column shape
+// maps onto the same `BridgedAggregate` carrier (with `having: None`)
+// so consumers can match on `by` / `aggs` regardless of which legacy
+// variant the data came from.
+pub mod sketch_agg_bridge;
+pub use sketch_agg_bridge::{
+    bridge_sketch_agg_to_canonical, output_schema_for_sketch_agg,
+};
