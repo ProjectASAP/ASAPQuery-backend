@@ -76,7 +76,9 @@ fn ddsketch_envelope_structural_assertions() {
     w.update(2.0);
     w.update(3.0);
     let bytes = w.snapshot().expect("snapshot");
-    let state = unwrap_envelope_state(&bytes).expect("unwrap").expect("state");
+    let state = unwrap_envelope_state(&bytes)
+        .expect("unwrap")
+        .expect("state");
     match state {
         SketchState::Ddsketch(s) => {
             assert_eq!(s.count, 3, "structural count");
@@ -106,8 +108,7 @@ fn ddsketch_envelope_ends_up_in_backend_accumulator() {
     }
     let bytes = w.snapshot().expect("snapshot");
 
-    let reconstructed =
-        reconstruct_via_runtime(SketchType::DDSketch, &bytes).expect("reconstruct");
+    let reconstructed = reconstruct_via_runtime(SketchType::DDSketch, &bytes).expect("reconstruct");
     let dd = match reconstructed {
         ReconstructedSketch::DdSketch(d) => d,
         _ => panic!(),
@@ -205,7 +206,9 @@ fn kll_envelope_structural_assertions() {
         w.update(i as f64);
     }
     let bytes = w.snapshot().expect("snapshot");
-    let state = unwrap_envelope_state(&bytes).expect("unwrap").expect("state");
+    let state = unwrap_envelope_state(&bytes)
+        .expect("unwrap")
+        .expect("state");
     match state {
         SketchState::Kll(s) => {
             assert_eq!(s.k, 200, "structural k");

@@ -37,17 +37,16 @@
 
 use anyhow::{Context, Result};
 
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::physical::colored_dag::emitter::{EdgeStageConfig, EdgeSketchProcessor, ExportTarget};
+use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
+use crate::sketch_algebra::params::{SketchKind, SketchParams};
 
 /// Default Prometheus remote-write URL for Mode 3 — Telegraf doesn't
 /// support OTLP-HTTP egress, so we land in the same Prometheus archive
 /// via remote-write instead. The URL maps to the same Prometheus instance
 /// the OTel-collector emitter targets via OTLP HTTP — Prometheus accepts
 /// both ingest paths and stores into the same TSDB.
-pub const DEFAULT_PROMETHEUS_REMOTE_WRITE_URL: &str =
-    "http://prometheus:9090/api/v1/write";
+pub const DEFAULT_PROMETHEUS_REMOTE_WRITE_URL: &str = "http://prometheus:9090/api/v1/write";
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -80,8 +79,7 @@ pub fn emit_telegraf_toml(
     if has_prometheus_archive {
         // Mode 3 — Prometheus archive: passthrough, then remote-write
         // to Prometheus. We do NOT include `[[processors.allsketches]]`.
-        let url =
-            prometheus_remote_write_url.unwrap_or(DEFAULT_PROMETHEUS_REMOTE_WRITE_URL);
+        let url = prometheus_remote_write_url.unwrap_or(DEFAULT_PROMETHEUS_REMOTE_WRITE_URL);
         emit_outputs_http_remote_write(&mut out, url);
     } else if has_sketch {
         // Mode 1 — sketch at edge. One `[[processors.allsketches]]` per
@@ -148,15 +146,16 @@ fn emit_processors_allsketches(
     window_secs: Option<u64>,
 ) {
     out.push_str("[[processors.allsketches]]\n");
-    let mode = if window_secs.is_some() { "window" } else { "batch" };
+    let mode = if window_secs.is_some() {
+        "window"
+    } else {
+        "batch"
+    };
     out.push_str(&format!("  mode = \"{mode}\"\n"));
     if let Some(w) = window_secs {
         out.push_str(&format!("  window_duration = \"{w}s\"\n"));
     }
-    out.push_str(&format!(
-        "  aggregation_id = \"{}\"\n",
-        sp.aggregation_id
-    ));
+    out.push_str(&format!("  aggregation_id = \"{}\"\n", sp.aggregation_id));
     out.push_str(&format!(
         "  sketch_kind = \"{}\"\n",
         sketch_kind_tag(&sp.sketch_kind)
@@ -250,10 +249,7 @@ mod toml_minimal {
                 // unquoted scalar (number / fraction).
                 if val.starts_with('"') {
                     if !val.ends_with('"') || val.len() < 2 {
-                        return Err(anyhow!(
-                            "line {}: unbalanced \" in: {raw}",
-                            lineno + 1
-                        ));
+                        return Err(anyhow!("line {}: unbalanced \" in: {raw}", lineno + 1));
                     }
                 }
             }
@@ -295,8 +291,8 @@ mod toml_minimal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sketch_algebra::params::{DDSketchParams, KllParams};
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
+    use crate::sketch_algebra::params::{DDSketchParams, KllParams};
 
     fn ddsketch_edge_cfg_mode1() -> EdgeStageConfig {
         EdgeStageConfig {
@@ -354,9 +350,12 @@ mod tests {
     /// `[[outputs.opentelemetry]]`.
     #[test]
     fn telegraf_toml_mode1_sketch_at_edge_shape() {
-        let toml = emit_telegraf_toml(&ddsketch_edge_cfg_mode1(), None)
-            .expect("emit_telegraf_toml ok");
-        assert!(toml.contains("[[inputs.opentelemetry]]"), "missing input\n{toml}");
+        let toml =
+            emit_telegraf_toml(&ddsketch_edge_cfg_mode1(), None).expect("emit_telegraf_toml ok");
+        assert!(
+            toml.contains("[[inputs.opentelemetry]]"),
+            "missing input\n{toml}"
+        );
         assert!(
             toml.contains("[[processors.allsketches]]"),
             "missing sketch processor\n{toml}"
@@ -370,17 +369,25 @@ mod tests {
             "missing gateway endpoint\n{toml}"
         );
         // Sketch params preserved.
-        assert!(toml.contains("relative_accuracy = 0.01"), "missing alpha\n{toml}");
-        assert!(toml.contains("sketch_kind = \"ddsketch\""), "wrong kind\n{toml}");
+        assert!(
+            toml.contains("relative_accuracy = 0.01"),
+            "missing alpha\n{toml}"
+        );
+        assert!(
+            toml.contains("sketch_kind = \"ddsketch\""),
+            "wrong kind\n{toml}"
+        );
     }
 
     /// Mode 2 snapshot — raw at edge. No `[[processors.allsketches]]`.
     /// `[[outputs.opentelemetry]]` ships raw OTLP to the gateway.
     #[test]
     fn telegraf_toml_mode2_raw_at_edge_shape() {
-        let toml = emit_telegraf_toml(&raw_edge_cfg_mode2(), None)
-            .expect("emit_telegraf_toml ok");
-        assert!(toml.contains("[[inputs.opentelemetry]]"), "missing input\n{toml}");
+        let toml = emit_telegraf_toml(&raw_edge_cfg_mode2(), None).expect("emit_telegraf_toml ok");
+        assert!(
+            toml.contains("[[inputs.opentelemetry]]"),
+            "missing input\n{toml}"
+        );
         assert!(
             !toml.contains("[[processors.allsketches]]"),
             "Mode 2 must not include sketch processor\n{toml}"
@@ -401,9 +408,11 @@ mod tests {
     /// Prometheus TSDB the OTel-collector path lands in via OTLP HTTP).
     #[test]
     fn telegraf_toml_mode3_prometheus_archive_shape() {
-        let toml = emit_telegraf_toml(&prom_edge_cfg_mode3(), None)
-            .expect("emit_telegraf_toml ok");
-        assert!(toml.contains("[[inputs.opentelemetry]]"), "missing input\n{toml}");
+        let toml = emit_telegraf_toml(&prom_edge_cfg_mode3(), None).expect("emit_telegraf_toml ok");
+        assert!(
+            toml.contains("[[inputs.opentelemetry]]"),
+            "missing input\n{toml}"
+        );
         assert!(
             !toml.contains("[[processors.allsketches]]"),
             "Mode 3 must not include sketch processor\n{toml}"
@@ -457,7 +466,10 @@ mod tests {
             // Parsing happens inside emit_telegraf_toml; if we got Ok,
             // parsing succeeded. Spot-check a handful of expected
             // tokens defensively.
-            assert!(toml.contains("inputs.opentelemetry"), "{name}: missing input header");
+            assert!(
+                toml.contains("inputs.opentelemetry"),
+                "{name}: missing input header"
+            );
         }
     }
 

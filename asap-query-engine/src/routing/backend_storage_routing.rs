@@ -9,10 +9,10 @@
 //! the entire streaming config. In production deploys (the
 //! `precompute_engine` binary loading `backend-streaming.yaml`) the
 //! field decodes via `Self::new(...)` which always defaults to
-//! `SketchWarmTier`, so the handler always took the
+//! `SketchStore`, so the handler always took the
 //! `SimpleEngine`-direct-dispatch branch and the `EngineRouter` was
 //! effectively bypassed for every query — the `data_source:
-//! gorilla_archive` info-line never landed on cold-archive responses
+//! thanos_query` info-line never landed on cold-archive responses
 //! even when the chunks were on disk in MinIO.
 //!
 //! The fix lives **outside** the streaming pipeline: the streaming
@@ -30,7 +30,7 @@
 //! accuracy) and criterion ⑤ (cold-fallback). Every quantile/sum-by
 //! query on `http_requests_total` had to go to either the warm tier
 //! (so the accuracy reducer could compute relative error) or the
-//! archive (so the `data_source: gorilla_archive` info-line landed on
+//! archive (so the `data_source: thanos_query` info-line landed on
 //! the cold-fallback probe). v7 closes this by letting one metric have
 //! multiple targets, each with an optional query-shape filter; the
 //! HTTP handler inspects the parsed PromQL and picks the matching
@@ -46,27 +46,27 @@
 //!
 //! ```yaml
 //! # v6.1 form (single-target):
-//! default: sketch_warm_tier
+//! default: sketch_store
 //! metrics:
-//!   audit_events: gorilla_s3_archive
+//!   audit_events: gorilla_object_store
 //! ```
 //!
 //! ```yaml
 //! # v7 form (multi-target with query-shape selection):
-//! default: sketch_warm_tier
+//! default: sketch_store
 //! routes:
 //!   - metric: http_requests_total
 //!     targets:
-//!       - backend: sketch_warm_tier
+//!       - backend: sketch_store
 //!         # default — predictable / planned queries land here
-//!       - backend: gorilla_s3_archive
+//!       - backend: gorilla_object_store
 //!         applies_to_query_shape: [count, topk, rate_post_hoc]
 //!   - metric: http_freshness_probe_warm
 //!     targets:
-//!       - backend: sketch_warm_tier
+//!       - backend: sketch_store
 //!   - metric: http_freshness_probe_archive
 //!     targets:
-//!       - backend: gorilla_s3_archive
+//!       - backend: gorilla_object_store
 //! ```
 //!
 //! The two shapes can be mixed in the same YAML — metrics under
@@ -75,14 +75,14 @@
 //! in BOTH wins from `routes:` (multi-target overrides single-target).
 //!
 //! Valid `StorageBackend` values mirror the snake-cased serde tags on
-//! `asap_types::StorageBackend`: `sketch_warm_tier`,
-//! `gorilla_s3_archive`, `double_write`. (Step-1 of the JSONL
-//! deprecation refactor removed the `cold_jsonl_fallback` tag.)
+//! `asap_types::StorageBackend`: `sketch_store`,
+//! `gorilla_object_store`, `double_write`, `prometheus_remote`. (Step-1
+//! of the JSONL deprecation refactor removed the `cold_jsonl_fallback` tag.)
 //!
 //! Loaded once at backend startup (CLI flag `--backend-storage-routing`
 //! on `precompute_engine`) and stored in `AppState`. Lookup is
 //! O(metric-name-hash); a query that doesn't match any entry falls back
-//! to `default` (which itself falls back to `SketchWarmTier`).
+//! to `default` (which itself falls back to `SketchStore`).
 //!
 //! ## Out of scope
 //!
@@ -97,7 +97,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use asap_types::StorageBackend;
+use asap_types::{parse_storage_backend_engine_id, StorageBackend, CANONICAL_QUERY_ENGINE_IDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tracing::{debug, info};
@@ -313,7 +313,7 @@ struct BackendStorageRoutingYaml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tenant: Option<String>,
     /// Fallback storage backend for any metric not explicitly listed.
-    /// Optional; defaults to `SketchWarmTier`.
+    /// Optional; defaults to `SketchStore`.
     #[serde(default)]
     default: StorageBackend,
     /// v6.1 form — per-metric overrides keyed by the bare metric name
@@ -375,7 +375,7 @@ pub const DEFAULT_TENANT: &str = "default";
 
 /// In-memory routing table consulted by the HTTP handler at request
 /// time. Build via [`Self::from_yaml_file`] / [`Self::from_yaml_str`]
-/// or [`Self::empty`] (everything routes to `SketchWarmTier`).
+/// or [`Self::empty`] (everything routes to `SketchStore`).
 ///
 /// ## Tenant scope (per-tenant routing, follow-up to PR #333)
 ///
@@ -408,7 +408,7 @@ pub struct BackendStorageRouting {
 
 impl BackendStorageRouting {
     /// Build an empty router — every metric resolves to
-    /// `SketchWarmTier`. Equivalent to "no routing config at all" and
+    /// `SketchStore`. Equivalent to "no routing config at all" and
     /// preserves pre-Phase-5 dispatch (`SimpleEngine` direct path).
     /// Scoped to the [`DEFAULT_TENANT`] tenant.
     pub fn empty() -> Self {
@@ -536,12 +536,12 @@ impl BackendStorageRouting {
     ///
     /// ```json
     /// {
-    ///   "default_engine": "sketch_warm_tier",
+    ///   "default_engine": "asap_query",
     ///   "metrics": [
     ///     { "name": "http_requests_total",
     ///       "targets": [
-    ///         { "engine": "sketch_warm_tier" },
-    ///         { "engine": "thanos_archive",
+    ///         { "engine": "asap_query" },
+    ///         { "engine": "thanos_query",
     ///           "applies_to_query_shape": ["count", "topk", "rate_post_hoc",
     ///                                      "histogram_quantile", "delta", "absent"] }
     ///       ]
@@ -552,11 +552,9 @@ impl BackendStorageRouting {
     ///
     /// Engine-name compatibility (controller → backend `StorageBackend`):
     ///
-    /// * `sketch_warm_tier` → `SketchWarmTier`
-    /// * `thanos_archive` → `GorillaS3Archive` (Phase α uses the existing
-    ///   archive engine; future phases may register a real Thanos engine).
-    /// * `gorilla_s3_archive` → `GorillaS3Archive` (back-compat alias).
-    /// * `double_write` → `DoubleWrite`.
+    /// * `asap_query` → `SketchStore`
+    /// * `thanos_query` → `GorillaObjectStore` storage, served by
+    ///   `ThanosQueryEngine`.
     ///
     /// Unknown query-shape strings are mapped to [`QueryShape::Other`]
     /// rather than failing the parse — the controller's vocabulary may
@@ -575,7 +573,7 @@ impl BackendStorageRouting {
         let default_engine = value
             .get("default_engine")
             .and_then(|v| v.as_str())
-            .unwrap_or("sketch_warm_tier");
+            .unwrap_or("asap_query");
         let default = parse_engine_string(default_engine).with_context(|| {
             format!(
                 "backend-storage-routing JSON: invalid default_engine '{}'",
@@ -619,23 +617,23 @@ impl BackendStorageRouting {
             }
             let mut targets: Vec<RoutingTarget> = Vec::with_capacity(targets_arr.len());
             for (j, t) in targets_arr.iter().enumerate() {
-                let engine_str = t
-                    .get("engine")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "backend-storage-routing JSON: metric '{}' targets[{}] missing 'engine'",
-                            name, j,
-                        )
-                    })?;
+                let engine_str = t.get("engine").and_then(|v| v.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "backend-storage-routing JSON: metric '{}' targets[{}] missing 'engine'",
+                        name,
+                        j,
+                    )
+                })?;
                 let backend = parse_engine_string(engine_str).with_context(|| {
                     format!(
                         "backend-storage-routing JSON: metric '{}' targets[{}] invalid engine '{}'",
                         name, j, engine_str,
                     )
                 })?;
-                let applies_to_query_shape =
-                    t.get("applies_to_query_shape").and_then(|v| v.as_array()).map(|arr| {
+                let applies_to_query_shape = t
+                    .get("applies_to_query_shape")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
                         arr.iter()
                             .filter_map(|s| s.as_str())
                             .map(parse_query_shape_string)
@@ -687,10 +685,7 @@ impl BackendStorageRouting {
     pub fn lookup(&self, metric_name: &str) -> StorageBackend {
         match self.metrics.get(metric_name) {
             Some(targets) => {
-                let backend = targets
-                    .first()
-                    .map(|t| t.backend)
-                    .unwrap_or(self.default);
+                let backend = targets.first().map(|t| t.backend).unwrap_or(self.default);
                 debug!(
                     metric = metric_name,
                     backend = ?backend,
@@ -766,10 +761,7 @@ impl BackendStorageRouting {
                 // Pass 3: the first target, regardless of filter
                 // (only reachable when the metric only has
                 // shape-specific targets and none matched).
-                let backend = targets
-                    .first()
-                    .map(|t| t.backend)
-                    .unwrap_or(self.default);
+                let backend = targets.first().map(|t| t.backend).unwrap_or(self.default);
                 debug!(
                     metric = metric_name,
                     shape = ?shape,
@@ -823,38 +815,18 @@ impl Default for BackendStorageRouting {
 }
 
 /// Map a JSON `engine` string into a backend `StorageBackend` variant.
-/// Phase α accepts both the controller's vocabulary (`thanos_archive`)
-/// and the existing YAML's vocabulary (`gorilla_s3_archive`) — both
-/// resolve to `StorageBackend::GorillaS3Archive` because the cold-archive
-/// engine registered today serves both via `GorillaQueryEngine`.
+/// Only the two public query engine ids are accepted:
+/// `asap_query` and `thanos_query`.
 /// `unknown_engine` returns an error so a typo doesn't silently turn
 /// into a default-routing footgun.
 fn parse_engine_string(s: &str) -> Result<StorageBackend> {
-    match s {
-        "sketch_warm_tier" | "sketch_warm" => Ok(StorageBackend::SketchWarmTier),
-        // `thanos_archive` is the controller-emitted name; the backend
-        // currently registers the Gorilla-S3 cold archive under
-        // `gorilla_archive` / `gorilla_s3_archive`. They map to the
-        // same `StorageBackend` variant for Phase α — when a real
-        // Thanos engine lands the parser can split the two.
-        "thanos_archive" | "gorilla_s3_archive" | "gorilla_archive" => {
-            Ok(StorageBackend::GorillaS3Archive)
-        }
-        "double_write" => Ok(StorageBackend::DoubleWrite),
-        // Phase ε.2: the controller's Mode 3
-        // (`RawAtEdgePrometheusArchive`) emits this when a metric's
-        // raw data is shipped to Prometheus's native OTLP receiver.
-        // The backend's `PrometheusForwardEngine` (in
-        // `engines::prometheus::forward`) registers under this id
-        // when `ASAP_PROMETHEUS_QUERY_URL` is set.
-        "prometheus_remote" => Ok(StorageBackend::PrometheusRemote),
-        other => Err(anyhow::anyhow!(
-            "unknown engine '{}': expected one of \
-             [sketch_warm_tier, thanos_archive, gorilla_s3_archive, double_write, \
-             prometheus_remote]",
-            other,
-        )),
-    }
+    parse_storage_backend_engine_id(s).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown engine '{}': expected one of [{}]",
+            s,
+            CANONICAL_QUERY_ENGINE_IDS.join(", "),
+        )
+    })
 }
 
 /// Map a JSON `applies_to_query_shape` string into a backend
@@ -967,9 +939,8 @@ pub struct HotReloadBackendStorageRouting {
     /// Map keyed by tenant id. Wrapped in `Arc<HashMap>` so swaps can
     /// publish a fresh map atomically; readers snapshot the whole map
     /// once and pick the tenant's `Arc<BackendStorageRouting>`.
-    inner: std::sync::Arc<
-        arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>,
-    >,
+    inner:
+        std::sync::Arc<arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>>,
 }
 
 impl HotReloadBackendStorageRouting {
@@ -1047,10 +1018,7 @@ impl HotReloadBackendStorageRouting {
     /// the single-tenant convenience accessor. Returns the `Arc`
     /// that was just replaced (or `None` when no prior entry
     /// existed) for callers that want to log the diff.
-    pub fn swap(
-        &self,
-        new: BackendStorageRouting,
-    ) -> std::sync::Arc<BackendStorageRouting> {
+    pub fn swap(&self, new: BackendStorageRouting) -> std::sync::Arc<BackendStorageRouting> {
         // Preserve the original return type (always returns the
         // previous Arc, fabricating an empty one when none existed)
         // so callers depending on the old contract don't break.
@@ -1078,8 +1046,7 @@ impl HotReloadBackendStorageRouting {
         // for *different* tenants don't lose updates.
         loop {
             let cur = self.inner.load_full();
-            let mut next: HashMap<String, std::sync::Arc<BackendStorageRouting>> =
-                (*cur).clone();
+            let mut next: HashMap<String, std::sync::Arc<BackendStorageRouting>> = (*cur).clone();
             let prev = next.insert(tenant.to_string(), new_arc.clone());
             let next_arc = std::sync::Arc::new(next);
             // `compare_and_swap` returns the value that was actually
@@ -1122,11 +1089,14 @@ mod tests {
     #[test]
     fn empty_router_routes_everything_to_warm_tier() {
         let r = BackendStorageRouting::empty();
-        assert_eq!(r.lookup("anything"), StorageBackend::SketchWarmTier);
-        assert_eq!(r.lookup("http_requests_total"), StorageBackend::SketchWarmTier);
+        assert_eq!(r.lookup("anything"), StorageBackend::SketchStore);
+        assert_eq!(
+            r.lookup("http_requests_total"),
+            StorageBackend::SketchStore
+        );
         assert_eq!(
             r.lookup_with_shape("anything", QueryShape::Count),
-            StorageBackend::SketchWarmTier
+            StorageBackend::SketchStore
         );
     }
 
@@ -1134,45 +1104,42 @@ mod tests {
     fn yaml_with_per_metric_override_routes_correctly_v6_1_form() {
         // v6.1 form: `metrics:` map. Each value is a single backend.
         let yaml = r#"
-default: sketch_warm_tier
+default: sketch_store
 metrics:
-  http_requests_total: gorilla_s3_archive
-  audit_events: gorilla_s3_archive
+  http_requests_total: gorilla_object_store
+  audit_events: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(
             r.lookup("http_requests_total"),
-            StorageBackend::GorillaS3Archive
+            StorageBackend::GorillaObjectStore
         );
-        assert_eq!(
-            r.lookup("audit_events"),
-            StorageBackend::GorillaS3Archive
-        );
-        assert_eq!(r.lookup("unlisted"), StorageBackend::SketchWarmTier);
+        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.lookup("unlisted"), StorageBackend::SketchStore);
         assert_eq!(r.len(), 2);
     }
 
     #[test]
     fn yaml_default_only_routes_all_metrics_to_default() {
-        let yaml = "default: gorilla_s3_archive\n";
+        let yaml = "default: gorilla_object_store\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        assert_eq!(r.lookup("anything"), StorageBackend::GorillaS3Archive);
+        assert_eq!(r.lookup("anything"), StorageBackend::GorillaObjectStore);
         assert!(r.is_empty());
-        assert_eq!(r.default_backend(), StorageBackend::GorillaS3Archive);
+        assert_eq!(r.default_backend(), StorageBackend::GorillaObjectStore);
     }
 
     #[test]
-    fn yaml_omitted_default_falls_back_to_sketch_warm() {
-        let yaml = "metrics:\n  foo: gorilla_s3_archive\n";
+    fn yaml_omitted_default_falls_back_to_asap_query() {
+        let yaml = "metrics:\n  foo: gorilla_object_store\n";
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
-        assert_eq!(r.lookup("foo"), StorageBackend::GorillaS3Archive);
-        assert_eq!(r.lookup("bar"), StorageBackend::SketchWarmTier);
+        assert_eq!(r.lookup("foo"), StorageBackend::GorillaObjectStore);
+        assert_eq!(r.lookup("bar"), StorageBackend::SketchStore);
     }
 
     #[test]
     fn empty_yaml_is_valid_and_empty() {
         let r = BackendStorageRouting::from_yaml_str("").expect("empty parse");
-        assert_eq!(r.lookup("foo"), StorageBackend::SketchWarmTier);
+        assert_eq!(r.lookup("foo"), StorageBackend::SketchStore);
         assert!(r.is_empty());
     }
 
@@ -1190,58 +1157,58 @@ metrics:
         // targets — the default warm-tier slot and a cold-archive
         // slot scoped to count/topk/rate_post_hoc.
         let yaml = r#"
-default: sketch_warm_tier
+default: sketch_store
 routes:
   - metric: http_requests_total
     targets:
-      - backend: sketch_warm_tier
-      - backend: gorilla_s3_archive
+      - backend: sketch_store
+      - backend: gorilla_object_store
         applies_to_query_shape: [count, topk, rate_post_hoc]
   - metric: http_freshness_probe_warm
     targets:
-      - backend: sketch_warm_tier
+      - backend: sketch_store
   - metric: http_freshness_probe_archive
     targets:
-      - backend: gorilla_s3_archive
+      - backend: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
 
         // Count + topk + rate_post_hoc → archive.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Count),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Topk),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::RatePostHoc),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
 
         // Quantile + sum_over_time + everything else → warm.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Sum),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Other),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
 
         // Single-target metrics keep v6.1 semantics regardless of shape.
         assert_eq!(
             r.lookup_with_shape("http_freshness_probe_warm", QueryShape::LastOverTime),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_freshness_probe_archive", QueryShape::LastOverTime),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
@@ -1251,7 +1218,7 @@ routes:
         // to the same backend (no dual-routing).
         let yaml = r#"
 metrics:
-  audit_events: gorilla_s3_archive
+  audit_events: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         for shape in [
@@ -1263,8 +1230,8 @@ metrics:
         ] {
             assert_eq!(
                 r.lookup_with_shape("audit_events", shape),
-                StorageBackend::GorillaS3Archive,
-                "shape={shape:?} must resolve to gorilla_s3_archive (single-target)",
+                StorageBackend::GorillaObjectStore,
+                "shape={shape:?} must resolve to thanos_query (single-target)",
             );
         }
     }
@@ -1274,26 +1241,26 @@ metrics:
         // Both `metrics:` and `routes:` populated; a metric in BOTH
         // wins from `routes:` (multi-target overrides single-target).
         let yaml = r#"
-default: sketch_warm_tier
+default: sketch_store
 metrics:
-  http_requests_total: gorilla_s3_archive
+  http_requests_total: gorilla_object_store
 routes:
   - metric: http_requests_total
     targets:
-      - backend: sketch_warm_tier
-      - backend: gorilla_s3_archive
+      - backend: sketch_store
+      - backend: gorilla_object_store
         applies_to_query_shape: [count]
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         // Default slot (warm) wins for non-count shapes.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         // Count → archive.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Count),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         // The `metrics:` entry was overridden by the multi-target
         // `routes:` entry (the single-target archive vanished).
@@ -1320,19 +1287,19 @@ routes:
         metrics.insert(
             "x".to_string(),
             vec![
-                RoutingTarget::for_shapes(StorageBackend::GorillaS3Archive, vec![QueryShape::Count]),
                 RoutingTarget::for_shapes(
-                    StorageBackend::SketchWarmTier,
-                    vec![QueryShape::Topk],
+                    StorageBackend::GorillaObjectStore,
+                    vec![QueryShape::Count],
                 ),
+                RoutingTarget::for_shapes(StorageBackend::SketchStore, vec![QueryShape::Topk]),
             ],
         );
-        let r = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+        let r = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
         // No filter matches `Quantile`; must return the first target's
         // backend.
         assert_eq!(
             r.lookup_with_shape("x", QueryShape::Quantile),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
@@ -1402,14 +1369,14 @@ routes:
 
     fn fixture_json() -> serde_json::Value {
         serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [
                 {
                     "name": "http_requests_total",
                     "targets": [
-                        { "engine": "sketch_warm_tier" },
+                        { "engine": "asap_query" },
                         {
-                            "engine": "thanos_archive",
+                            "engine": "thanos_query",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "deriv",
                                 "absent", "rate_post_hoc", "count"
@@ -1421,9 +1388,9 @@ routes:
                 {
                     "name": "request_latency_seconds",
                     "targets": [
-                        { "engine": "sketch_warm_tier" },
+                        { "engine": "asap_query" },
                         {
-                            "engine": "thanos_archive",
+                            "engine": "thanos_query",
                             "applies_to_query_shape": [
                                 "histogram_quantile", "delta", "absent",
                                 "rate_post_hoc", "topk", "count"
@@ -1438,50 +1405,50 @@ routes:
     #[test]
     fn json_payload_parses_controller_fixture() {
         let r = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
-        assert_eq!(r.default_backend(), StorageBackend::SketchWarmTier);
+        assert_eq!(r.default_backend(), StorageBackend::SketchStore);
         assert_eq!(r.len(), 2);
 
         // http_requests_total: histogram_quantile / delta / etc → archive,
         // quantile / sum / topk → warm.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Delta),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Count),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::Topk),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
         // LastOverTime not in the archive's filter list → falls
         // through to the default (warm) slot.
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::LastOverTime),
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
         );
     }
 
     #[test]
     fn json_payload_unknown_shape_defaults_to_other() {
         let value = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [
                 {
                     "name": "x",
                     "targets": [
-                        { "engine": "sketch_warm_tier" },
+                        { "engine": "asap_query" },
                         {
-                            "engine": "thanos_archive",
+                            "engine": "thanos_query",
                             "applies_to_query_shape": ["some_future_shape", "count"]
                         }
                     ]
@@ -1493,18 +1460,18 @@ routes:
         // to QueryShape::Other (silently — forward-compat).
         assert_eq!(
             r.lookup_with_shape("x", QueryShape::Count),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             r.lookup_with_shape("x", QueryShape::Other),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
     #[test]
     fn json_payload_invalid_engine_errors() {
         let value = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [{
                 "name": "x",
                 "targets": [{ "engine": "not_a_real_engine" }]
@@ -1524,7 +1491,7 @@ routes:
     #[test]
     fn json_payload_empty_targets_errors() {
         let value = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [{ "name": "x", "targets": [] }]
         });
         let err = BackendStorageRouting::from_json_payload(&value).expect_err("must reject");
@@ -1533,7 +1500,7 @@ routes:
 
     #[test]
     fn json_payload_missing_metrics_errors() {
-        let value = serde_json::json!({ "default_engine": "sketch_warm_tier" });
+        let value = serde_json::json!({ "default_engine": "asap_query" });
         let err = BackendStorageRouting::from_json_payload(&value).expect_err("must reject");
         assert!(err.to_string().contains("metrics"));
     }
@@ -1542,28 +1509,28 @@ routes:
     fn json_payload_default_engine_optional_falls_back_to_warm() {
         let value = serde_json::json!({
             "metrics": [
-                { "name": "x", "targets": [{ "engine": "sketch_warm_tier" }] }
+                { "name": "x", "targets": [{ "engine": "asap_query" }] }
             ]
         });
         let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
-        assert_eq!(r.default_backend(), StorageBackend::SketchWarmTier);
+        assert_eq!(r.default_backend(), StorageBackend::SketchStore);
     }
 
     #[test]
-    fn json_payload_back_compat_gorilla_s3_archive_alias() {
+    fn json_payload_back_compat_thanos_query_alias() {
         // An older deploy might emit the YAML's vocabulary instead of
-        // `thanos_archive`; both must parse and resolve the same.
+        // `thanos_query`; both must parse and resolve the same.
         let value = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [{
                 "name": "audit_events",
                 "targets": [
-                    { "engine": "gorilla_s3_archive" }
+                    { "engine": "thanos_query" }
                 ]
             }]
         });
         let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
-        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaS3Archive);
+        assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
     }
 
     /// Phase ε.2: the controller's Mode 3
@@ -1576,7 +1543,7 @@ routes:
     #[test]
     fn json_payload_prometheus_remote_parses_to_prometheus_remote_backend() {
         let value = serde_json::json!({
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [{
                 "name": "node_cpu_seconds_total",
                 "targets": [
@@ -1600,19 +1567,16 @@ routes:
     #[test]
     fn replace_swaps_table_in_place() {
         let mut r = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
-            HashMap::from([(
-                "old_metric".to_string(),
-                StorageBackend::GorillaS3Archive,
-            )]),
+            StorageBackend::SketchStore,
+            HashMap::from([("old_metric".to_string(), StorageBackend::GorillaObjectStore)]),
         );
         let new = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
         r.replace(new);
         // Old metric is gone; new metrics are visible.
-        assert_eq!(r.lookup("old_metric"), StorageBackend::SketchWarmTier);
+        assert_eq!(r.lookup("old_metric"), StorageBackend::SketchStore);
         assert_eq!(
             r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
@@ -1628,7 +1592,7 @@ routes:
         assert_eq!(snap.len(), 2);
         assert_eq!(
             snap.lookup_with_shape("http_requests_total", QueryShape::Delta),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
@@ -1642,9 +1606,9 @@ routes:
                 let mut metrics = HashMap::new();
                 metrics.insert(
                     format!("metric_{i}"),
-                    vec![RoutingTarget::always(StorageBackend::GorillaS3Archive)],
+                    vec![RoutingTarget::always(StorageBackend::GorillaObjectStore)],
                 );
-                let new = BackendStorageRouting::new(StorageBackend::SketchWarmTier, metrics);
+                let new = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
                 writer_hr.swap(new);
             }
         });
@@ -1678,7 +1642,8 @@ routes:
 
     #[test]
     fn classifies_histogram_quantile_correctly() {
-        let e = parse("histogram_quantile(0.99, sum by (le) (rate(http_request_duration_bucket[5m])))");
+        let e =
+            parse("histogram_quantile(0.99, sum by (le) (rate(http_request_duration_bucket[5m])))");
         assert_eq!(classify_query_shape(&e), QueryShape::HistogramQuantile);
     }
 
@@ -1715,10 +1680,10 @@ routes:
     fn json_payload_tenant_field_is_picked_up_when_present() {
         let value = serde_json::json!({
             "tenant": "tenant-a",
-            "default_engine": "sketch_warm_tier",
+            "default_engine": "asap_query",
             "metrics": [
                 { "name": "http_requests_total",
-                  "targets": [{ "engine": "sketch_warm_tier" }] }
+                  "targets": [{ "engine": "asap_query" }] }
             ]
         });
         let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
@@ -1730,9 +1695,9 @@ routes:
         // Existing YAMLs in the wild don't have `tenant:` — they
         // must keep parsing and resolve to [`DEFAULT_TENANT`].
         let yaml = r#"
-default: sketch_warm_tier
+default: sketch_store
 metrics:
-  http_requests_total: gorilla_s3_archive
+  http_requests_total: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), DEFAULT_TENANT);
@@ -1742,9 +1707,9 @@ metrics:
     fn yaml_tenant_field_is_picked_up_when_present() {
         let yaml = r#"
 tenant: tenant-b
-default: sketch_warm_tier
+default: sketch_store
 metrics:
-  http_requests_total: gorilla_s3_archive
+  http_requests_total: gorilla_object_store
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         assert_eq!(r.tenant(), "tenant-b");
@@ -1757,40 +1722,34 @@ metrics:
         let hr = HotReloadBackendStorageRouting::empty();
         // Push tenant-a's table.
         let table_a = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
-            HashMap::from([(
-                "metric_a".to_string(),
-                StorageBackend::GorillaS3Archive,
-            )]),
+            StorageBackend::SketchStore,
+            HashMap::from([("metric_a".to_string(), StorageBackend::GorillaObjectStore)]),
         );
         hr.swap_tenant("tenant-a", table_a);
         // Push tenant-b's table.
         let table_b = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
-            HashMap::from([(
-                "metric_b".to_string(),
-                StorageBackend::GorillaS3Archive,
-            )]),
+            StorageBackend::SketchStore,
+            HashMap::from([("metric_b".to_string(), StorageBackend::GorillaObjectStore)]),
         );
         hr.swap_tenant("tenant-b", table_b);
 
         // Replace tenant-a only.
         let table_a_v2 = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
-            HashMap::from([(
-                "metric_a_v2".to_string(),
-                StorageBackend::GorillaS3Archive,
-            )]),
+            StorageBackend::SketchStore,
+            HashMap::from([("metric_a_v2".to_string(), StorageBackend::GorillaObjectStore)]),
         );
         hr.swap_tenant("tenant-a", table_a_v2);
 
         // tenant-a now reflects v2; tenant-b is unchanged.
         let snap_a = hr.snapshot_for_tenant("tenant-a");
-        assert_eq!(snap_a.lookup("metric_a"), StorageBackend::SketchWarmTier);
-        assert_eq!(snap_a.lookup("metric_a_v2"), StorageBackend::GorillaS3Archive);
+        assert_eq!(snap_a.lookup("metric_a"), StorageBackend::SketchStore);
+        assert_eq!(
+            snap_a.lookup("metric_a_v2"),
+            StorageBackend::GorillaObjectStore
+        );
         let snap_b = hr.snapshot_for_tenant("tenant-b");
-        assert_eq!(snap_b.lookup("metric_b"), StorageBackend::GorillaS3Archive);
-        assert_eq!(snap_b.lookup("metric_a_v2"), StorageBackend::SketchWarmTier);
+        assert_eq!(snap_b.lookup("metric_b"), StorageBackend::GorillaObjectStore);
+        assert_eq!(snap_b.lookup("metric_a_v2"), StorageBackend::SketchStore);
     }
 
     #[test]
@@ -1800,10 +1759,10 @@ metrics:
         let hr = HotReloadBackendStorageRouting::empty();
         // Default tenant has an explicit override.
         let default_table = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
+            StorageBackend::SketchStore,
             HashMap::from([(
                 "shared_metric".to_string(),
-                StorageBackend::GorillaS3Archive,
+                StorageBackend::GorillaObjectStore,
             )]),
         );
         hr.swap_tenant(DEFAULT_TENANT, default_table);
@@ -1812,13 +1771,13 @@ metrics:
         let snap = hr.snapshot_for_tenant("nonexistent-tenant");
         assert_eq!(
             snap.lookup("shared_metric"),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
         // Default tenant: same answer.
         let snap_default = hr.snapshot_for_tenant(DEFAULT_TENANT);
         assert_eq!(
             snap_default.lookup("shared_metric"),
-            StorageBackend::GorillaS3Archive,
+            StorageBackend::GorillaObjectStore,
         );
     }
 
@@ -1829,11 +1788,8 @@ metrics:
         // the map key is the source of truth.
         let hr = HotReloadBackendStorageRouting::empty();
         let mut table = BackendStorageRouting::new_from_single_targets(
-            StorageBackend::SketchWarmTier,
-            HashMap::from([(
-                "m".to_string(),
-                StorageBackend::GorillaS3Archive,
-            )]),
+            StorageBackend::SketchStore,
+            HashMap::from([("m".to_string(), StorageBackend::GorillaObjectStore)]),
         );
         table = table.with_tenant("WRONG-TENANT");
         hr.swap_tenant("right-tenant", table);

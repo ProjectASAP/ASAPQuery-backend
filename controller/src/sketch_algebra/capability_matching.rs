@@ -167,10 +167,7 @@ pub fn is_valid_pair(sketch: SketchKind, statistic: StatisticClass) -> bool {
 /// `sketch_family_override` (treated as `QueryWorkload::sketch_type_override`
 /// at the planner-rules layer) wins over the capability-matched default —
 /// see `planner::rules::bind_workload_typed`.
-pub fn pick_family(
-    statistic: StatisticClass,
-    accuracy: AccuracyPreference,
-) -> Option<SketchKind> {
+pub fn pick_family(statistic: StatisticClass, accuracy: AccuracyPreference) -> Option<SketchKind> {
     use AccuracyPreference::*;
     use SketchKind::*;
     use StatisticClass::*;
@@ -198,9 +195,7 @@ pub fn pick_family(
 /// The name-matching is exact (case-sensitive) to keep the contract row
 /// the single source of truth — a typo'd metric name should fall through
 /// to the AggType default rather than silently bind to the wrong family.
-pub fn classify_demo_metric(
-    metric_name: &str,
-) -> Option<(StatisticClass, AccuracyPreference)> {
+pub fn classify_demo_metric(metric_name: &str) -> Option<(StatisticClass, AccuracyPreference)> {
     use AccuracyPreference::*;
     use StatisticClass::*;
     Some(match metric_name {
@@ -224,11 +219,23 @@ mod tests {
 
     #[test]
     fn ddsketch_is_quantile_only() {
-        assert!(is_valid_pair(SketchKind::DDSketch, StatisticClass::Quantile));
-        assert!(!is_valid_pair(SketchKind::DDSketch, StatisticClass::Cardinality));
+        assert!(is_valid_pair(
+            SketchKind::DDSketch,
+            StatisticClass::Quantile
+        ));
+        assert!(!is_valid_pair(
+            SketchKind::DDSketch,
+            StatisticClass::Cardinality
+        ));
         assert!(!is_valid_pair(SketchKind::DDSketch, StatisticClass::TopK));
-        assert!(!is_valid_pair(SketchKind::DDSketch, StatisticClass::Frequency));
-        assert!(!is_valid_pair(SketchKind::DDSketch, StatisticClass::SumRateCount));
+        assert!(!is_valid_pair(
+            SketchKind::DDSketch,
+            StatisticClass::Frequency
+        ));
+        assert!(!is_valid_pair(
+            SketchKind::DDSketch,
+            StatisticClass::SumRateCount
+        ));
     }
 
     #[test]
@@ -237,7 +244,10 @@ mod tests {
         assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::Cardinality));
         assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::TopK));
         assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::Frequency));
-        assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::SumRateCount));
+        assert!(!is_valid_pair(
+            SketchKind::Kll,
+            StatisticClass::SumRateCount
+        ));
     }
 
     #[test]
@@ -246,16 +256,31 @@ mod tests {
         assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::Quantile));
         assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::TopK));
         assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::Frequency));
-        assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::SumRateCount));
+        assert!(!is_valid_pair(
+            SketchKind::Hll,
+            StatisticClass::SumRateCount
+        ));
     }
 
     #[test]
     fn countsketch_is_topk_only() {
         assert!(is_valid_pair(SketchKind::CountSketch, StatisticClass::TopK));
-        assert!(!is_valid_pair(SketchKind::CountSketch, StatisticClass::Quantile));
-        assert!(!is_valid_pair(SketchKind::CountSketch, StatisticClass::Cardinality));
-        assert!(!is_valid_pair(SketchKind::CountSketch, StatisticClass::Frequency));
-        assert!(!is_valid_pair(SketchKind::CountSketch, StatisticClass::SumRateCount));
+        assert!(!is_valid_pair(
+            SketchKind::CountSketch,
+            StatisticClass::Quantile
+        ));
+        assert!(!is_valid_pair(
+            SketchKind::CountSketch,
+            StatisticClass::Cardinality
+        ));
+        assert!(!is_valid_pair(
+            SketchKind::CountSketch,
+            StatisticClass::Frequency
+        ));
+        assert!(!is_valid_pair(
+            SketchKind::CountSketch,
+            StatisticClass::SumRateCount
+        ));
     }
 
     #[test]
@@ -266,7 +291,10 @@ mod tests {
         assert!(is_valid_pair(SketchKind::Cms, StatisticClass::TopK));
         assert!(!is_valid_pair(SketchKind::Cms, StatisticClass::Quantile));
         assert!(!is_valid_pair(SketchKind::Cms, StatisticClass::Cardinality));
-        assert!(!is_valid_pair(SketchKind::Cms, StatisticClass::SumRateCount));
+        assert!(!is_valid_pair(
+            SketchKind::Cms,
+            StatisticClass::SumRateCount
+        ));
     }
 
     #[test]
@@ -303,7 +331,10 @@ mod tests {
 
     #[test]
     fn pick_family_cardinality_picks_hll() {
-        for pref in [AccuracyPreference::RelativeError, AccuracyPreference::RankError] {
+        for pref in [
+            AccuracyPreference::RelativeError,
+            AccuracyPreference::RankError,
+        ] {
             assert_eq!(
                 pick_family(StatisticClass::Cardinality, pref),
                 Some(SketchKind::Hll),

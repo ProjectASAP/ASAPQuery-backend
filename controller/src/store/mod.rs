@@ -107,22 +107,26 @@ impl PlanStore {
     /// Returns `None` if no previous plan exists.
     pub fn diff(&self, metric: &str) -> Result<Option<PlanDiff>, StoreError> {
         let inner = self.inner.read().unwrap();
-        let e = inner.entries.get(metric)
+        let e = inner
+            .entries
+            .get(metric)
             .ok_or_else(|| StoreError::NotFound(metric.to_string()))?;
-        let Some(prev) = &e.previous else { return Ok(None) };
+        let Some(prev) = &e.previous else {
+            return Ok(None);
+        };
         let curr = &e.current;
         let diff = PlanDiff {
             sketch_type_changed: prev.agent_config.sketch_type != curr.agent_config.sketch_type,
-            prev_sketch_type:    prev.agent_config.sketch_type.to_string(),
-            curr_sketch_type:    curr.agent_config.sketch_type.to_string(),
-            delta_transmission_changed:
-                prev.agent_config.delta_transmission != curr.agent_config.delta_transmission,
+            prev_sketch_type: prev.agent_config.sketch_type.to_string(),
+            curr_sketch_type: curr.agent_config.sketch_type.to_string(),
+            delta_transmission_changed: prev.agent_config.delta_transmission
+                != curr.agent_config.delta_transmission,
             prev_delta_transmission: prev.agent_config.delta_transmission,
             curr_delta_transmission: curr.agent_config.delta_transmission,
             mode_changed: prev.agent_config.mode != curr.agent_config.mode,
-            prev_mode:    prev.agent_config.mode.to_string(),
-            curr_mode:    curr.agent_config.mode.to_string(),
-            updated_at:   e.updated_at,
+            prev_mode: prev.agent_config.mode.to_string(),
+            curr_mode: curr.agent_config.mode.to_string(),
+            updated_at: e.updated_at,
         };
         Ok(Some(diff))
     }
@@ -131,16 +135,16 @@ impl PlanStore {
 /// A human-readable summary of what changed between the current and previous plan.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlanDiff {
-    pub sketch_type_changed:       bool,
-    pub prev_sketch_type:          String,
-    pub curr_sketch_type:          String,
+    pub sketch_type_changed: bool,
+    pub prev_sketch_type: String,
+    pub curr_sketch_type: String,
     pub delta_transmission_changed: bool,
-    pub prev_delta_transmission:   bool,
-    pub curr_delta_transmission:   bool,
-    pub mode_changed:              bool,
-    pub prev_mode:                 String,
-    pub curr_mode:                 String,
-    pub updated_at:                DateTime<Utc>,
+    pub prev_delta_transmission: bool,
+    pub curr_delta_transmission: bool,
+    pub mode_changed: bool,
+    pub prev_mode: String,
+    pub curr_mode: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

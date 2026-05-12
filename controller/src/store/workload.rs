@@ -12,7 +12,9 @@ pub struct WorkloadStore {
 
 impl WorkloadStore {
     pub fn new() -> Self {
-        Self { inner: RwLock::new(HashMap::new()) }
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn set(&self, metric: impl Into<String>, wl: QueryWorkload, wc: WorkloadCharacteristics) {
@@ -32,23 +34,23 @@ impl WorkloadStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AggType;
     use std::collections::HashMap;
     use std::time::Duration;
-    use crate::types::AggType;
 
     fn wl(name: &str) -> QueryWorkload {
         QueryWorkload {
-            metric_name:          name.into(),
-            label_filters:        HashMap::new(),
-            group_by_labels:      vec![],
-            aggregations:         vec![AggType::Quantile],
-            time_window:          Duration::from_secs(300),
-            repeat_every:         None,
-            accuracy_sla:         0.01,
-            latency_sla:          None,
+            metric_name: name.into(),
+            label_filters: HashMap::new(),
+            group_by_labels: vec![],
+            aggregations: vec![AggType::Quantile],
+            time_window: Duration::from_secs(300),
+            repeat_every: None,
+            accuracy_sla: 0.01,
+            latency_sla: None,
             sketch_type_override: None,
-            exact_required:       false,
-            quantiles:            vec![],
+            exact_required: false,
+            quantiles: vec![],
         }
     }
 

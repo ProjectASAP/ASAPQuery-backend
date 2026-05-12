@@ -204,13 +204,9 @@ impl SketchExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::{
-        AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind,
-    };
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::sketch_algebra::params::{
-        CountSketchParams, DDSketchParams, HllParams, KllParams,
-    };
+    use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
+    use crate::sketch_algebra::params::{CountSketchParams, DDSketchParams, HllParams, KllParams};
     use crate::types_v2::AccuracyTarget;
     use std::time::Duration;
 

@@ -15,11 +15,11 @@ use crate::types::SketchType;
 
 #[derive(Debug, Clone)]
 pub struct CollectorMetrics {
-    pub agent_id:          String,
+    pub agent_id: String,
     pub sketch_size_bytes: f64,
     pub cpu_seconds_total: f64,
-    pub samples_ingested:  f64,
-    pub error_rate:        f64,
+    pub samples_ingested: f64,
+    pub error_rate: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,40 +33,40 @@ impl std::fmt::Display for ViolationKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ViolationKind::Bandwidth => write!(f, "bandwidth"),
-            ViolationKind::Accuracy  => write!(f, "accuracy"),
-            ViolationKind::Cpu       => write!(f, "cpu"),
+            ViolationKind::Accuracy => write!(f, "accuracy"),
+            ViolationKind::Cpu => write!(f, "cpu"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Violation {
-    pub agent_id:  String,
-    pub kind:      ViolationKind,
-    pub observed:  f64,
+    pub agent_id: String,
+    pub kind: ViolationKind,
+    pub observed: f64,
     pub threshold: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
-    pub max_sketch_size_bytes:    f64,
-    pub max_error_rate:           f64,
+    pub max_sketch_size_bytes: f64,
+    pub max_error_rate: f64,
     pub max_cpu_micros_per_sample: f64,
 }
 
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            max_sketch_size_bytes:     5.0 * 1024.0 * 1024.0, // 5 MB
-            max_error_rate:            0.02,                   // 2 %
-            max_cpu_micros_per_sample: 5.0,                    // 5 µs/sample
+            max_sketch_size_bytes: 5.0 * 1024.0 * 1024.0, // 5 MB
+            max_error_rate: 0.02,                         // 2 %
+            max_cpu_micros_per_sample: 5.0,               // 5 µs/sample
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Endpoint {
-    pub agent_id:    String,
+    pub agent_id: String,
     pub metrics_url: String,
     /// The sketch type currently deployed to this agent; used to attribute
     /// scraped metrics to the right EMA bucket.
@@ -75,50 +75,54 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn new(agent_id: impl Into<String>, metrics_url: impl Into<String>) -> Self {
-        Self { agent_id: agent_id.into(), metrics_url: metrics_url.into(), sketch_type: None }
+        Self {
+            agent_id: agent_id.into(),
+            metrics_url: metrics_url.into(),
+            sketch_type: None,
+        }
     }
 }
 
 /// Data reported to the `on_metrics` callback after each successful scrape.
 #[derive(Debug, Clone)]
 pub struct ScrapedData {
-    pub agent_id:              String,
+    pub agent_id: String,
     /// The sketch type configured on this endpoint at scrape time (if known).
-    pub sketch_type:           Option<SketchType>,
+    pub sketch_type: Option<SketchType>,
     /// Current total sketch size in bytes at the agent.
-    pub sketch_size_bytes:     f64,
+    pub sketch_size_bytes: f64,
     /// Derived µs/sample over the last scrape window; `None` on the very first
     /// scrape because there is no previous baseline yet.
     pub cpu_micros_per_sample: Option<f64>,
 }
 
-pub type OnViolationFn = Arc<dyn Fn(Violation)  + Send + Sync>;
-pub type OnMetricsFn   = Arc<dyn Fn(ScrapedData) + Send + Sync>;
+pub type OnViolationFn = Arc<dyn Fn(Violation) + Send + Sync>;
+pub type OnMetricsFn = Arc<dyn Fn(ScrapedData) + Send + Sync>;
 
 // ── Scraper ───────────────────────────────────────────────────────────────────
 
 pub struct Scraper {
-    endpoints:    Arc<RwLock<Vec<Endpoint>>>,
-    thresholds:   Thresholds,
+    endpoints: Arc<RwLock<Vec<Endpoint>>>,
+    thresholds: Thresholds,
     on_violation: OnViolationFn,
-    on_metrics:   Option<OnMetricsFn>,
-    interval:     Duration,
-    client:       reqwest::Client,
-    last:         Mutex<HashMap<String, CollectorMetrics>>,
+    on_metrics: Option<OnMetricsFn>,
+    interval: Duration,
+    client: reqwest::Client,
+    last: Mutex<HashMap<String, CollectorMetrics>>,
 }
 
 impl Scraper {
     pub fn new(
-        endpoints:    Vec<Endpoint>,
-        thresholds:   Thresholds,
+        endpoints: Vec<Endpoint>,
+        thresholds: Thresholds,
         on_violation: OnViolationFn,
-        interval:     Duration,
+        interval: Duration,
     ) -> Self {
         Self {
-            endpoints:    Arc::new(RwLock::new(endpoints)),
+            endpoints: Arc::new(RwLock::new(endpoints)),
             thresholds,
             on_violation,
-            on_metrics:   None,
+            on_metrics: None,
             interval,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
@@ -175,26 +179,29 @@ impl Scraper {
         let endpoints = self.endpoints.read().await.clone();
         for ep in &endpoints {
             match self.scrape(ep).await {
-                Ok(m)  => self.analyze(&m, ep.sketch_type.as_ref()),
+                Ok(m) => self.analyze(&m, ep.sketch_type.as_ref()),
                 Err(e) => warn!(agent = %ep.agent_id, "scrape failed: {e}"),
             }
         }
     }
 
     async fn scrape(&self, ep: &Endpoint) -> anyhow::Result<CollectorMetrics> {
-        let text = self.client
+        let text = self
+            .client
             .get(&ep.metrics_url)
-            .send().await
+            .send()
+            .await
             .context("GET metrics")?
-            .text().await
+            .text()
+            .await
             .context("read body")?;
 
         let mut m = CollectorMetrics {
-            agent_id:          ep.agent_id.clone(),
+            agent_id: ep.agent_id.clone(),
             sketch_size_bytes: 0.0,
             cpu_seconds_total: 0.0,
-            samples_ingested:  0.0,
-            error_rate:        0.0,
+            samples_ingested: 0.0,
+            error_rate: 0.0,
         };
         parse_prometheus_text(&text, &mut m);
         Ok(m)
@@ -204,9 +211,9 @@ impl Scraper {
         // Bandwidth / sketch size.
         if m.sketch_size_bytes > self.thresholds.max_sketch_size_bytes {
             (self.on_violation)(Violation {
-                agent_id:  m.agent_id.clone(),
-                kind:      ViolationKind::Bandwidth,
-                observed:  m.sketch_size_bytes,
+                agent_id: m.agent_id.clone(),
+                kind: ViolationKind::Bandwidth,
+                observed: m.sketch_size_bytes,
                 threshold: self.thresholds.max_sketch_size_bytes,
             });
         }
@@ -214,9 +221,9 @@ impl Scraper {
         // Accuracy / error rate.
         if m.error_rate > self.thresholds.max_error_rate {
             (self.on_violation)(Violation {
-                agent_id:  m.agent_id.clone(),
-                kind:      ViolationKind::Accuracy,
-                observed:  m.error_rate,
+                agent_id: m.agent_id.clone(),
+                kind: ViolationKind::Accuracy,
+                observed: m.error_rate,
                 threshold: self.thresholds.max_error_rate,
             });
         }
@@ -224,15 +231,15 @@ impl Scraper {
         // CPU: compare δCPU/δsamples with the previous scrape.
         let mut last = self.last.lock().unwrap();
         let cpu_micros = if let Some(prev) = last.get(&m.agent_id) {
-            let delta_samples = m.samples_ingested  - prev.samples_ingested;
-            let delta_cpu     = m.cpu_seconds_total - prev.cpu_seconds_total;
+            let delta_samples = m.samples_ingested - prev.samples_ingested;
+            let delta_cpu = m.cpu_seconds_total - prev.cpu_seconds_total;
             if delta_samples > 0.0 {
                 let micros_per_sample = (delta_cpu / delta_samples) * 1e6;
                 if micros_per_sample > self.thresholds.max_cpu_micros_per_sample {
                     (self.on_violation)(Violation {
-                        agent_id:  m.agent_id.clone(),
-                        kind:      ViolationKind::Cpu,
-                        observed:  micros_per_sample,
+                        agent_id: m.agent_id.clone(),
+                        kind: ViolationKind::Cpu,
+                        observed: micros_per_sample,
                         threshold: self.thresholds.max_cpu_micros_per_sample,
                     });
                 }
@@ -249,9 +256,9 @@ impl Scraper {
         // Fire on_metrics callback so callers can feed EMA / telemetry.
         if let Some(cb) = &self.on_metrics {
             cb(ScrapedData {
-                agent_id:              m.agent_id.clone(),
-                sketch_type:           sketch_type.cloned(),
-                sketch_size_bytes:     m.sketch_size_bytes,
+                agent_id: m.agent_id.clone(),
+                sketch_type: sketch_type.cloned(),
+                sketch_size_bytes: m.sketch_size_bytes,
                 cpu_micros_per_sample: cpu_micros,
             });
         }
@@ -263,20 +270,26 @@ impl Scraper {
 fn parse_prometheus_text(text: &str, m: &mut CollectorMetrics) {
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         // Handle lines with optional labels: metric_name{...} value [timestamp]
         // Split on whitespace to get name and value parts.
         let parts: Vec<&str> = line.splitn(2, ' ').collect();
-        if parts.len() < 2 { continue; }
+        if parts.len() < 2 {
+            continue;
+        }
         // Strip label block {…} from the metric name, if any.
         let name = parts[0].split('{').next().unwrap_or(parts[0]);
         let val_str = parts[1].split_whitespace().next().unwrap_or("");
-        let Ok(val) = val_str.parse::<f64>() else { continue };
+        let Ok(val) = val_str.parse::<f64>() else {
+            continue;
+        };
         match name {
-            "otelcol_sketch_size_bytes"                  => m.sketch_size_bytes = val,
-            "process_cpu_seconds_total"                  => m.cpu_seconds_total = val,
-            "otelcol_processor_accepted_metric_points"   => m.samples_ingested  = val,
-            "otelcol_sketch_error_rate"                  => m.error_rate        = val,
+            "otelcol_sketch_size_bytes" => m.sketch_size_bytes = val,
+            "process_cpu_seconds_total" => m.cpu_seconds_total = val,
+            "otelcol_processor_accepted_metric_points" => m.samples_ingested = val,
+            "otelcol_sketch_error_rate" => m.error_rate = val,
             _ => {}
         }
     }
@@ -287,7 +300,7 @@ fn parse_prometheus_text(text: &str, m: &mut CollectorMetrics) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::get};
+    use axum::{routing::get, Router};
     use tokio::net::TcpListener;
 
     const NORMAL_PAYLOAD: &str = "
@@ -312,11 +325,12 @@ otelcol_sketch_error_rate 0.05
 ";
 
     async fn serve_metrics(payload: &'static str) -> String {
-        let app = Router::new().route("/metrics",
-            get(move || async move { payload }));
+        let app = Router::new().route("/metrics", get(move || async move { payload }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         format!("http://{addr}/metrics")
     }
 
@@ -381,7 +395,9 @@ otelcol_sketch_error_rate 0.05
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
         let violations: Arc<Mutex<Vec<Violation>>> = Arc::new(Mutex::new(vec![]));
         let v2 = Arc::clone(&violations);
@@ -395,22 +411,21 @@ otelcol_sketch_error_rate 0.05
         s.scrape_all().await; // delta → CPU violation
 
         let v = violations.lock().unwrap();
-        assert!(v.iter().any(|vio| vio.kind == ViolationKind::Cpu),
-            "expected CPU violation, got: {v:?}");
+        assert!(
+            v.iter().any(|vio| vio.kind == ViolationKind::Cpu),
+            "expected CPU violation, got: {v:?}"
+        );
     }
 
     #[tokio::test]
     async fn multiple_endpoints_only_bad_violates() {
-        let ok_url  = serve_metrics(NORMAL_PAYLOAD).await;
+        let ok_url = serve_metrics(NORMAL_PAYLOAD).await;
         let bad_url = serve_metrics(HIGH_BANDWIDTH_PAYLOAD).await;
 
         let violations: Arc<Mutex<Vec<Violation>>> = Arc::new(Mutex::new(vec![]));
         let v2 = Arc::clone(&violations);
         let s = Arc::new(Scraper::new(
-            vec![
-                Endpoint::new("ok",  ok_url),
-                Endpoint::new("bad", bad_url),
-            ],
+            vec![Endpoint::new("ok", ok_url), Endpoint::new("bad", bad_url)],
             Thresholds::default(),
             Arc::new(move |v| v2.lock().unwrap().push(v)),
             Duration::from_secs(60),
@@ -418,8 +433,10 @@ otelcol_sketch_error_rate 0.05
         s.scrape_all().await;
 
         let v = violations.lock().unwrap();
-        assert!(v.iter().all(|vio| vio.agent_id == "bad"),
-            "only bad agent should violate: {v:?}");
+        assert!(
+            v.iter().all(|vio| vio.agent_id == "bad"),
+            "only bad agent should violate: {v:?}"
+        );
         assert!(v.iter().any(|vio| vio.agent_id == "bad"));
     }
 
@@ -433,8 +450,8 @@ otelcol_sketch_error_rate 0.05
     #[test]
     fn violation_kind_display() {
         assert_eq!(ViolationKind::Bandwidth.to_string(), "bandwidth");
-        assert_eq!(ViolationKind::Accuracy.to_string(),  "accuracy");
-        assert_eq!(ViolationKind::Cpu.to_string(),       "cpu");
+        assert_eq!(ViolationKind::Accuracy.to_string(), "accuracy");
+        assert_eq!(ViolationKind::Cpu.to_string(), "cpu");
     }
 
     #[tokio::test]

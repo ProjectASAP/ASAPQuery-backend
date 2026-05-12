@@ -96,8 +96,8 @@ pub use asap_precompute_rs::{CardinalitySketch, FrequencySketch, QuantileSketch}
 pub fn unwrap_envelope_state(
     bytes: &[u8],
 ) -> Result<Option<SketchState>, Box<dyn std::error::Error>> {
-    let env = ProtoSketchEnvelope::decode(bytes)
-        .map_err(|e| format!("decode SketchEnvelope: {e}"))?;
+    let env =
+        ProtoSketchEnvelope::decode(bytes).map_err(|e| format!("decode SketchEnvelope: {e}"))?;
     Ok(env.sketch_state)
 }
 
@@ -190,18 +190,16 @@ pub fn reconstruct_via_runtime(
                 .map_err(|e| format!("KLLWrapper snapshot: {e}"))?;
             Ok(ReconstructedSketch::Kll { snapshot_bytes })
         }
-        SketchType::HLLSketch | SketchType::CountSketch | SketchType::CountMinSketch => Err(
-            format!(
+        SketchType::HLLSketch | SketchType::CountSketch | SketchType::CountMinSketch => {
+            Err(format!(
                 "reconstruct_via_runtime({sketch_type:?}): byte parity for \
                  HLL / CountSketch / CountMinSketch not yet in upstream \
                  asap_sketchlib — tracked at ProjectASAP/ASAPCollector#243. \
                  Caller must fall back to backend's per-accumulator decoder."
             )
-            .into(),
-        ),
-        SketchType::Unspecified => {
-            Err("reconstruct_via_runtime: SketchType::Unspecified".into())
+            .into())
         }
+        SketchType::Unspecified => Err("reconstruct_via_runtime: SketchType::Unspecified".into()),
     }
 }
 
@@ -253,11 +251,7 @@ pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::sketches::ddsketch::DdSketc
         store_offset: sk.store_offset,
         count: sk.count,
         sum: sk.sum,
-        min: if sk.count == 0 {
-            f64::INFINITY
-        } else {
-            sk.min
-        },
+        min: if sk.count == 0 { f64::INFINITY } else { sk.min },
         max: if sk.count == 0 {
             f64::NEG_INFINITY
         } else {
@@ -351,8 +345,8 @@ mod tests {
             w.update(i as f64);
         }
         let original_bytes = w.snapshot().expect("snapshot ok");
-        let reconstructed = reconstruct_via_runtime(SketchType::DDSketch, &original_bytes)
-            .expect("reconstruct ok");
+        let reconstructed =
+            reconstruct_via_runtime(SketchType::DDSketch, &original_bytes).expect("reconstruct ok");
         let dd = match reconstructed {
             ReconstructedSketch::DdSketch(d) => d,
             ReconstructedSketch::Kll { .. } => panic!("got KLL, expected DDSketch"),
@@ -379,24 +373,16 @@ mod tests {
             b.update(i as f64);
         }
         // Reach into the wrapper's inner via snapshot/decode.
-        let a_inner = match reconstruct_via_runtime(
-            SketchType::DDSketch,
-            &a.snapshot().unwrap(),
-        )
-        .unwrap()
-        {
-            ReconstructedSketch::DdSketch(d) => d,
-            _ => panic!(),
-        };
-        let b_inner = match reconstruct_via_runtime(
-            SketchType::DDSketch,
-            &b.snapshot().unwrap(),
-        )
-        .unwrap()
-        {
-            ReconstructedSketch::DdSketch(d) => d,
-            _ => panic!(),
-        };
+        let a_inner =
+            match reconstruct_via_runtime(SketchType::DDSketch, &a.snapshot().unwrap()).unwrap() {
+                ReconstructedSketch::DdSketch(d) => d,
+                _ => panic!(),
+            };
+        let b_inner =
+            match reconstruct_via_runtime(SketchType::DDSketch, &b.snapshot().unwrap()).unwrap() {
+                ReconstructedSketch::DdSketch(d) => d,
+                _ => panic!(),
+            };
         let merged = merge_ddsketches_via_runtime(&a_inner, &b_inner).expect("merge ok");
         assert_eq!(merged.count, 20);
     }

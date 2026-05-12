@@ -205,7 +205,7 @@ matches the metric+labels+capability), fall through to Thanos.
 
 - `asap-query-engine/src/routing/backend_storage_routing.rs` —
   swap "shape allow-list" for "warm-first, archive-fallthrough".
-- `asap-query-engine/src/engines/router.rs` (EngineRouter) — add
+- `asap-query-engine/src/routing/query_engine_routing.rs` (EngineRouter) — add
   a `query_with_fallthrough` path.
 
 **Acceptance test:** Same PromQL `count(http_requests_total)` and

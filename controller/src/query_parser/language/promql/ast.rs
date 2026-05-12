@@ -27,12 +27,20 @@ pub struct PromQLAst {
 impl PromQLAst {
     /// Construct from the legacy parser's two outputs.
     pub fn new(source: String, expr: QueryExpr, summary: ParsedQuery) -> Self {
-        Self { source, expr, summary }
+        Self {
+            source,
+            expr,
+            summary,
+        }
     }
 
     /// Borrow the algebra tree.
-    pub fn expr(&self) -> &QueryExpr { &self.expr }
+    pub fn expr(&self) -> &QueryExpr {
+        &self.expr
+    }
 
     /// Borrow the flat summary.
-    pub fn summary(&self) -> &ParsedQuery { &self.summary }
+    pub fn summary(&self) -> &ParsedQuery {
+        &self.summary
+    }
 }

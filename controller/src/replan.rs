@@ -45,11 +45,11 @@ fn short_hash(s: &str) -> String {
 // ── Replanner ─────────────────────────────────────────────────────────────────
 
 pub struct Replanner {
-    planner:        Arc<BaselinePlanner>,
-    plan_store:     Arc<PlanStore>,
+    planner: Arc<BaselinePlanner>,
+    plan_store: Arc<PlanStore>,
     workload_store: Arc<WorkloadStore>,
-    opamp:          Arc<OpampServer>,
-    scraper:        Arc<Scraper>,
+    opamp: Arc<OpampServer>,
+    scraper: Arc<Scraper>,
     opamp_endpoint: String,
     /// Optional client for pushing newly-generated `StreamingConfig`
     /// YAML to the ASAPQuery-backend's `/api/v1/streaming-config`
@@ -76,11 +76,11 @@ pub struct Replanner {
 
 impl Replanner {
     pub fn new(
-        planner:        Arc<BaselinePlanner>,
-        plan_store:     Arc<PlanStore>,
+        planner: Arc<BaselinePlanner>,
+        plan_store: Arc<PlanStore>,
         workload_store: Arc<WorkloadStore>,
-        opamp:          Arc<OpampServer>,
-        scraper:        Arc<Scraper>,
+        opamp: Arc<OpampServer>,
+        scraper: Arc<Scraper>,
         opamp_endpoint: impl Into<String>,
     ) -> Self {
         Self {
@@ -122,7 +122,9 @@ impl Replanner {
     /// Record that `agent_id` is serving `metric`. Called from `handle_plan`
     /// after pushing configs so violations can be mapped back to a metric.
     pub async fn register_agent(&self, agent_id: impl Into<String>, metric: impl Into<String>) {
-        self.agent_to_metric.write().await
+        self.agent_to_metric
+            .write()
+            .await
             .insert(agent_id.into(), metric.into());
     }
 
@@ -203,8 +205,7 @@ impl Replanner {
         // skip the stitch — the legacy single-pipeline emit still
         // covers correctness for the metric being replanned.
         if let Some(registry) = self.workload_registry.as_ref() {
-            edge_cfg.metric_to_family =
-                collect_metric_to_family(registry, &self.workload_store);
+            edge_cfg.metric_to_family = collect_metric_to_family(registry, &self.workload_store);
         }
 
         // OpAMP `on_connect` doesn't expose the agent's runtime
@@ -213,7 +214,13 @@ impl Replanner {
         // assumption `main::handle_plan`'s typed push path makes
         // (`push_to_role(Agent, …)` with edge YAML, no runtime
         // dispatch).
-        emit_for_runtime(AgentRuntime::AsapOtel, &edge_cfg, &self.opamp_endpoint, None).ok()
+        emit_for_runtime(
+            AgentRuntime::AsapOtel,
+            &edge_cfg,
+            &self.opamp_endpoint,
+            None,
+        )
+        .ok()
     }
 
     /// Push the current plan config to a specific agent.
@@ -237,7 +244,9 @@ impl Replanner {
         let metric = self.agent_to_metric.read().await.get(agent_id).cloned();
         let Some(metric) = metric else { return false };
 
-        let Ok(plan) = self.plan_store.get(&metric) else { return false };
+        let Ok(plan) = self.plan_store.get(&metric) else {
+            return false;
+        };
 
         let yaml = if stage_split::typed_stage_split_enabled() {
             match self.try_emit_typed_edge_yaml(&metric) {
@@ -273,10 +282,15 @@ impl Replanner {
             }
         };
 
-        self.opamp.push(agent_id, RemoteConfig {
-            config_hash: short_hash(&yaml),
-            yaml,
-        }).await;
+        self.opamp
+            .push(
+                agent_id,
+                RemoteConfig {
+                    config_hash: short_hash(&yaml),
+                    yaml,
+                },
+            )
+            .await;
         info!(agent = agent_id, metric = %metric, "pushed config to reconnecting agent");
         true
     }
@@ -309,7 +323,8 @@ impl Replanner {
             match self.try_emit_typed_edge_yaml_for_workload(&workload) {
                 Some(y) => {
                     info!(
-                        metric, bytes = y.len(),
+                        metric,
+                        bytes = y.len(),
                         "[USE_TYPED_STAGE_SPLIT] re-plan emitted typed edge YAML"
                     );
                     Some(y)
@@ -327,9 +342,13 @@ impl Replanner {
             generate_agent_config(&plan.agent_config, &self.opamp_endpoint).ok()
         };
         if let Some(yaml) = agent_yaml {
-            let cfg = RemoteConfig { config_hash: short_hash(&yaml), yaml };
+            let cfg = RemoteConfig {
+                config_hash: short_hash(&yaml),
+                yaml,
+            };
             let agents = self.agent_to_metric.read().await;
-            let target_agents: Vec<String> = agents.iter()
+            let target_agents: Vec<String> = agents
+                .iter()
                 .filter(|(_, m)| m.as_str() == metric)
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -339,10 +358,15 @@ impl Replanner {
             }
         }
         if let Ok(yaml) = generate_backend_config(&plan.backend_config, &self.opamp_endpoint) {
-            self.opamp.push_to_role(
-                AgentRole::Backend,
-                RemoteConfig { config_hash: short_hash(&yaml), yaml },
-            ).await;
+            self.opamp
+                .push_to_role(
+                    AgentRole::Backend,
+                    RemoteConfig {
+                        config_hash: short_hash(&yaml),
+                        yaml,
+                    },
+                )
+                .await;
         }
 
         // Push the ASAPQuery-backend StreamingConfig YAML via HTTP if a
@@ -369,7 +393,9 @@ impl Replanner {
         // Update scraper endpoint sketch types for correct EMA attribution.
         let sketch_type = plan.agent_config.sketch_type;
         for agent_id in self.opamp.connected_agents().await {
-            self.scraper.set_sketch_type(&agent_id, sketch_type.clone()).await;
+            self.scraper
+                .set_sketch_type(&agent_id, sketch_type.clone())
+                .await;
         }
 
         info!(metric, sketch_type = %sketch_type, "re-plan complete");
@@ -379,7 +405,9 @@ impl Replanner {
     /// Re-plans all metrics whose `valid_until` has already passed.
     pub async fn replan_expired(&self) {
         let expired = self.plan_store.expired(chrono::Utc::now());
-        if expired.is_empty() { return; }
+        if expired.is_empty() {
+            return;
+        }
         info!(count = expired.len(), "re-planning expired metrics");
         for metric in expired {
             self.replan_metric(&metric).await;
@@ -396,7 +424,10 @@ impl Replanner {
                 self.replan_metric(&m).await;
             }
             None => {
-                warn!(agent = agent_id, "SLA violation but no metric mapping found; re-planning all expired");
+                warn!(
+                    agent = agent_id,
+                    "SLA violation but no metric mapping found; re-planning all expired"
+                );
                 self.replan_expired().await;
             }
         }
@@ -429,33 +460,39 @@ mod tests {
     use crate::types::*;
 
     fn make_replanner() -> Arc<Replanner> {
-        let plan_store     = Arc::new(PlanStore::new());
+        let plan_store = Arc::new(PlanStore::new());
         let workload_store = Arc::new(WorkloadStore::new());
-        let planner        = Arc::new(BaselinePlanner::new(CostModelPlanner::new()));
-        let opamp          = Arc::new(crate::opamp::OpampServer::new());
-        let scraper        = Arc::new(crate::monitor::Scraper::new(
-            vec![], crate::monitor::Thresholds::default(),
-            Arc::new(|_| {}), Duration::from_secs(60),
+        let planner = Arc::new(BaselinePlanner::new(CostModelPlanner::new()));
+        let opamp = Arc::new(crate::opamp::OpampServer::new());
+        let scraper = Arc::new(crate::monitor::Scraper::new(
+            vec![],
+            crate::monitor::Thresholds::default(),
+            Arc::new(|_| {}),
+            Duration::from_secs(60),
         ));
         Arc::new(Replanner::new(
-            planner, plan_store, workload_store, opamp, scraper,
+            planner,
+            plan_store,
+            workload_store,
+            opamp,
+            scraper,
             "ws://ctrl:4320/v1/opamp",
         ))
     }
 
     fn test_workload(metric: &str) -> (QueryWorkload, WorkloadCharacteristics) {
         let wl = QueryWorkload {
-            metric_name:          metric.into(),
-            label_filters:        HashMap::new(),
-            group_by_labels:      vec![],
-            aggregations:         vec![AggType::Quantile],
-            time_window:          Duration::from_secs(300),
-            repeat_every:         None,
-            accuracy_sla:         0.01,
-            latency_sla:          None,
+            metric_name: metric.into(),
+            label_filters: HashMap::new(),
+            group_by_labels: vec![],
+            aggregations: vec![AggType::Quantile],
+            time_window: Duration::from_secs(300),
+            repeat_every: None,
+            accuracy_sla: 0.01,
+            latency_sla: None,
             sketch_type_override: None,
-            exact_required:       false,
-            quantiles:            vec![],
+            exact_required: false,
+            quantiles: vec![],
         };
         (wl, WorkloadCharacteristics::default())
     }
@@ -465,7 +502,10 @@ mod tests {
             agent_config: AgentCollectorConfig {
                 output_mode: OutputMode::Sketch,
                 sketch_type: SketchType::DDSketch,
-                sketch_params: SketchParams::DDSketch { relative_accuracy: 0.01, quantiles: vec![0.5, 0.99] },
+                sketch_params: SketchParams::DDSketch {
+                    relative_accuracy: 0.01,
+                    quantiles: vec![0.5, 0.99],
+                },
                 aggregate_by: vec![],
                 label_matchers: vec![],
                 window_duration: None,
@@ -583,7 +623,10 @@ mod tests {
             let lock = TYPED_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
             let previous = std::env::var("USE_TYPED_STAGE_SPLIT").ok();
             std::env::set_var("USE_TYPED_STAGE_SPLIT", "1");
-            Self { previous, _lock: lock }
+            Self {
+                previous,
+                _lock: lock,
+            }
         }
     }
     impl Drop for TypedEnvGuard {
@@ -674,10 +717,14 @@ mod tests {
 
         // Legacy single-pipeline DDSketch output has NONE of the
         // typed-path processors.
-        assert!(!yaml.contains("gorillas3"),
-            "legacy path must not emit gorillas3 processor:\n{yaml}");
-        assert!(!yaml.contains("metrics/warm_passthrough"),
-            "legacy path must not emit warm-passthrough pipeline:\n{yaml}");
+        assert!(
+            !yaml.contains("gorillas3"),
+            "legacy path must not emit gorillas3 processor:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("metrics/warm_passthrough"),
+            "legacy path must not emit warm-passthrough pipeline:\n{yaml}"
+        );
 
         // Restore.
         match prior {

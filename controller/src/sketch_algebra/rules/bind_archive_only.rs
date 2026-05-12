@@ -67,8 +67,8 @@ impl Rule for BindArchiveOnly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::{LabelFilter, Schema, Source, WindowKind};
     use crate::intent_algebra::schema::{Column, DataType};
+    use crate::intent_algebra::{LabelFilter, Schema, Source, WindowKind};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {

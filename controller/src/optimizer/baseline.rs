@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::types::{CollectionPlan, QueryWorkload, WorkloadCharacteristics};
 use crate::optimizer::cost::CostModelPlanner;
+use crate::types::{CollectionPlan, QueryWorkload, WorkloadCharacteristics};
 
 pub struct BaselinePlanner {
     inner: CostModelPlanner,
@@ -51,7 +51,10 @@ impl BaselinePlanner {
 
         // Slow path: first request for this metric — run cost optimisation.
         let plan = self.inner.plan(workload, wc);
-        self.cache.write().unwrap().insert(key.clone(), plan.clone());
+        self.cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), plan.clone());
         plan
     }
 
@@ -73,23 +76,23 @@ impl BaselinePlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::AggType;
     use std::collections::HashMap;
     use std::time::Duration;
-    use crate::types::AggType;
 
     fn workload(metric: &str) -> QueryWorkload {
         QueryWorkload {
-            metric_name:         metric.into(),
-            label_filters:       HashMap::new(),
-            group_by_labels:     vec![],
-            aggregations:        vec![AggType::Quantile],
-            time_window:         Duration::from_secs(300),
-            repeat_every:        None,
-            accuracy_sla:        0.01,
-            latency_sla:         None,
+            metric_name: metric.into(),
+            label_filters: HashMap::new(),
+            group_by_labels: vec![],
+            aggregations: vec![AggType::Quantile],
+            time_window: Duration::from_secs(300),
+            repeat_every: None,
+            accuracy_sla: 0.01,
+            latency_sla: None,
             sketch_type_override: None,
-            exact_required:      false,
-            quantiles:           vec![0.99],
+            exact_required: false,
+            quantiles: vec![0.99],
         }
     }
 
@@ -110,14 +113,13 @@ mod tests {
     #[test]
     fn second_call_returns_same_plan() {
         let p = planner();
-        let first  = p.plan(&workload("latency"), None);
+        let first = p.plan(&workload("latency"), None);
         // Change the workload — the baseline planner must ignore it.
         let mut w2 = workload("latency");
         w2.aggregations = vec![AggType::Cardinality];
         let second = p.plan(&w2, None);
         assert_eq!(
-            first.agent_config.sketch_type,
-            second.agent_config.sketch_type,
+            first.agent_config.sketch_type, second.agent_config.sketch_type,
             "baseline plan must not change even when workload changes"
         );
     }
@@ -143,8 +145,7 @@ mod tests {
         // workload and should produce an equivalent plan.
         let second = p.plan(&workload("latency"), None);
         assert_eq!(
-            first.agent_config.sketch_type,
-            second.agent_config.sketch_type,
+            first.agent_config.sketch_type, second.agent_config.sketch_type,
             "same workload after reset should produce the same sketch type"
         );
     }

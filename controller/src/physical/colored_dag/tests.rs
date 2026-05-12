@@ -11,13 +11,13 @@ use std::time::Duration;
 
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{LabelFilter, QueryExpr, Schema, Source, WindowKind};
+use crate::physical::colored_dag::allocator::StageAllocator;
+use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
+use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::params::{
     DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
 use crate::sketch_algebra::sketch_expr::{EstimateOp, MergeAlgebra, SketchExpr};
-use crate::physical::colored_dag::allocator::StageAllocator;
-use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
-use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::types_v2::{AccuracyTarget, BindingName};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────

@@ -2540,9 +2540,10 @@ aggregations:
             total_buckets > 0,
             "query returned a key entry but with zero buckets — persistence is half-broken"
         );
-        let any_in_first_window = results.values().flat_map(|v| v.iter()).any(|(range, _)| {
-            range.0 == 60_000 && range.1 == 90_000
-        });
+        let any_in_first_window = results
+            .values()
+            .flat_map(|v| v.iter())
+            .any(|(range, _)| range.0 == 60_000 && range.1 == 90_000);
         assert!(
             any_in_first_window,
             "no bucket landed in the closed window [60_000, 90_000) — persistence pathway misroutes"

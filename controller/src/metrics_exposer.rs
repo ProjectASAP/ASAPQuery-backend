@@ -166,9 +166,13 @@ impl MetricsRegistry {
         registry.register(Box::new(latency_p99.clone())).unwrap();
         registry.register(Box::new(memory_bytes.clone())).unwrap();
         registry.register(Box::new(last_seen_unix.clone())).unwrap();
-        registry.register(Box::new(batches_received.clone())).unwrap();
+        registry
+            .register(Box::new(batches_received.clone()))
+            .unwrap();
         registry.register(Box::new(records_stored.clone())).unwrap();
-        registry.register(Box::new(records_evicted.clone())).unwrap();
+        registry
+            .register(Box::new(records_evicted.clone()))
+            .unwrap();
         registry.register(Box::new(decode_errors.clone())).unwrap();
 
         Arc::new(Self {
@@ -195,7 +199,9 @@ impl MetricsRegistry {
         // plan_id label permanently emitting a stale value.
         self.active_plan_id.reset();
         for metric in plan_store.metrics() {
-            let Ok(plan) = plan_store.get(&metric) else { continue };
+            let Ok(plan) = plan_store.get(&metric) else {
+                continue;
+            };
             // Stable hash of the plan's debug repr — good enough for
             // a label value, doesn't need to be cryptographic.
             let mut hasher = DefaultHasher::new();
@@ -416,9 +422,8 @@ mod tests {
         assert!(text.contains(
             "asap_runtime_throughput_items_per_sec{impl=\"oxide\",sketch=\"cms\",source=\"dc-a\"}"
         ));
-        assert!(text.contains(
-            "asap_runtime_latency_p99_ns{impl=\"lib\",sketch=\"hll\",source=\"dc-a\"}"
-        ));
+        assert!(text
+            .contains("asap_runtime_latency_p99_ns{impl=\"lib\",sketch=\"hll\",source=\"dc-a\"}"));
     }
 
     #[test]
@@ -460,7 +465,10 @@ mod tests {
 
         let plan_store = Arc::new(PlanStore::new());
         plan_store.set("http_requests_total", make_plan(SketchType::DDSketch, 600));
-        plan_store.set("http_requests_total_latency_ms", make_plan(SketchType::HLL, 600));
+        plan_store.set(
+            "http_requests_total_latency_ms",
+            make_plan(SketchType::HLL, 600),
+        );
 
         let registry = MetricsRegistry::new();
         registry.refresh_plan_ids(&plan_store);

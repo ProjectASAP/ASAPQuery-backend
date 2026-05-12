@@ -252,7 +252,7 @@ ASAPQuery/
 ├── asap-query-engine/        # Rust query processor
 │   ├── src/
 │   │   ├── drivers/          # Ingest, query adapters, servers
-│   │   ├── engines/          # Query execution (SimpleEngine)
+│   │   ├── query-engines/    # Query execution (SimpleEngine)
 │   │   ├── stores/           # Data storage (SimpleMapStore)
 │   │   ├── data_model/       # Core data structures
 │   │   ├── precompute_operators/  # Sketch operators

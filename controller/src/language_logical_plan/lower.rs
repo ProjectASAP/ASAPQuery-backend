@@ -26,9 +26,7 @@ pub enum LoweringError {
 /// `query_parser::parse_query_expr` and stashed inside [`PromQLAst`]).
 /// We just re-tag it as the PromQL L2 variant and project the flat
 /// summary; no re-parsing or re-walking is required.
-pub fn lower_to_logical_plan(
-    ast: &LanguageAst,
-) -> Result<LanguageLogicalPlan, LoweringError> {
+pub fn lower_to_logical_plan(ast: &LanguageAst) -> Result<LanguageLogicalPlan, LoweringError> {
     match ast {
         LanguageAst::PromQL(p) => Ok(lower_promql(p)),
     }

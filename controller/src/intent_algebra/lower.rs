@@ -260,7 +260,9 @@ mod tests {
                 }
                 // Mid: Window
                 match child.as_ref() {
-                    QueryExpr::Window { kind, size, child, .. } => {
+                    QueryExpr::Window {
+                        kind, size, child, ..
+                    } => {
                         assert_eq!(*kind, WindowKind::Sliding);
                         assert_eq!(*size, std::time::Duration::from_secs(300));
                         // Leaf: Scan
@@ -305,10 +307,9 @@ mod tests {
 
     #[test]
     fn lower_promql_with_group_by() {
-        let parsed = parse_query(
-            "sum by (host) (quantile_over_time(0.95, latency{env=\"prod\"}[1m]))",
-        )
-        .expect("parse");
+        let parsed =
+            parse_query("sum by (host) (quantile_over_time(0.95, latency{env=\"prod\"}[1m]))")
+                .expect("parse");
         let expr = lower_parsed_query(&parsed, AccuracyTarget::Epsilon(0.05)).expect("lower");
         let schema = expr.output_schema().expect("output_schema");
         // `host` is a group-by → it lands in unique_keys at position 0
@@ -319,10 +320,9 @@ mod tests {
 
     #[test]
     fn lower_promql_cardinality() {
-        let parsed = parse_query(
-            "count by (user_id) (count_over_time(active_users{env=\"prod\"}[5m]))",
-        )
-        .expect("parse");
+        let parsed =
+            parse_query("count by (user_id) (count_over_time(active_users{env=\"prod\"}[5m]))")
+                .expect("parse");
         let expr = lower_parsed_query(&parsed, AccuracyTarget::Epsilon(0.01)).expect("lower");
         let schema = expr.output_schema().expect("output_schema");
         // Cardinality intent → output column named `cardinality` of dtype Int64.

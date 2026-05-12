@@ -1,9 +1,9 @@
-//! `GorillaQueryEngine` planner + per-statistic exact executor.
+//! Gorilla archive query planner + per-statistic exact executor.
 //!
 //! Step-1 of the JSONL-deprecation refactor merged the previous
 //! `query_planner.rs` (PromQL → [`QueryPlan`]) and `exact_executor.rs`
 //! (per-statistic `[`ExactExecutor`]` dispatch) into a single
-//! `engine.rs` so the engine's data flow is readable top-to-bottom
+//! `archive_query.rs` so the archive data flow is readable top-to-bottom
 //! in one file: parse PromQL → plan → execute.
 //!
 //! The two halves keep their existing structure inside the merged
@@ -174,14 +174,8 @@ fn plan_from_ast(ast: &Expr, now_ms: i64) -> Result<QueryPlan, String> {
 fn plan_from_call(call: &Call, now_ms: i64) -> Result<QueryPlan, String> {
     let name = call.func.name.to_lowercase();
     match name.as_str() {
-        "sum_over_time"
-        | "count_over_time"
-        | "avg_over_time"
-        | "min_over_time"
-        | "max_over_time"
-        | "last_over_time"
-        | "rate"
-        | "increase" => {
+        "sum_over_time" | "count_over_time" | "avg_over_time" | "min_over_time"
+        | "max_over_time" | "last_over_time" | "rate" | "increase" => {
             let ms = expect_single_matrix_arg(&call.args, &name)?;
             let (metric, range_ms) = matrix_metric_and_range_ms(ms);
             let stat = match name.as_str() {
@@ -373,8 +367,6 @@ pub(crate) fn extract_label_matchers(vs: &VectorSelector) -> (Vec<LabelMatcher>,
     (supported, has_unsupported)
 }
 
-
-
 // =====================================================================
 // Executor
 // =====================================================================
@@ -435,13 +427,17 @@ impl ExactExecutor {
             QueryStatistic::MaxOverTime => {
                 self.execute_streaming_additive(plan, AdditiveOp::Max).await
             }
-            QueryStatistic::Rate => self.execute_streaming_additive(plan, AdditiveOp::Rate).await,
+            QueryStatistic::Rate => {
+                self.execute_streaming_additive(plan, AdditiveOp::Rate)
+                    .await
+            }
             QueryStatistic::Increase => {
                 self.execute_streaming_additive(plan, AdditiveOp::Increase)
                     .await
             }
             QueryStatistic::LastOverTime => {
-                self.execute_streaming_additive(plan, AdditiveOp::Last).await
+                self.execute_streaming_additive(plan, AdditiveOp::Last)
+                    .await
             }
             QueryStatistic::QuantileOverTime { phi } => self.execute_quantile(plan, *phi).await,
             QueryStatistic::TopK { k } => self.execute_topk(plan, *k).await,
@@ -477,8 +473,7 @@ impl ExactExecutor {
             "gorilla-engine: streaming additive over chunks"
         );
 
-        let (filtered_chunks, postings_outcome) =
-            self.apply_postings_filter(plan, &chunks).await;
+        let (filtered_chunks, postings_outcome) = self.apply_postings_filter(plan, &chunks).await;
 
         let mut acc = AdditiveAccumulator::new(op);
         let mut samples_scanned: usize = 0;
@@ -585,8 +580,7 @@ impl ExactExecutor {
         // are pre-mvp/v5 multi-series chunks that don't pin a
         // single series — keep them (they may carry matching
         // series; correctness > pruning).
-        let series_set: std::collections::BTreeSet<u64> =
-            hits.series_ids.iter().copied().collect();
+        let series_set: std::collections::BTreeSet<u64> = hits.series_ids.iter().copied().collect();
         let filtered: Vec<ChunkRef> = chunks
             .iter()
             .filter(|c| c.label_hash == 0 || series_set.contains(&c.label_hash))
@@ -711,8 +705,7 @@ impl ExactExecutor {
             .list_chunks(&plan.metric, start_ms, end_ms)
             .await?;
         let total_chunks = chunks.len();
-        let (filtered_chunks, postings_outcome) =
-            self.apply_postings_filter(plan, &chunks).await;
+        let (filtered_chunks, postings_outcome) = self.apply_postings_filter(plan, &chunks).await;
         let chunks_fetched = filtered_chunks.len();
         let mut buffer: Vec<RawSample> = Vec::new();
         let limit = self.config.max_buffered_samples;

@@ -40,17 +40,16 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use sqlparser::ast::{
-    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, GroupByExpr, Join, JoinConstraint,
-    JoinOperator, LimitClause, ObjectName, OrderBy, OrderByExpr, OrderByKind,
-    Query, Select, SelectItem, SetExpr, SetOperator, Statement, TableFactor,
-    Value, ValueWithSpan,
+    BinaryOperator, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentList,
+    FunctionArguments, GroupByExpr, Join, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+    OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, Statement,
+    TableFactor, Value, ValueWithSpan,
 };
 use sqlparser::dialect::GenericDialect;
 
 use crate::intent_algebra::legacy_expr::{
-    AggFunc, AggItem as AlgAggItem, BinaryOpKind, ColumnRef, JoinKind, LiteralValue,
-    ProjectItem, QueryExpr, ScalarExpr, SetOpKind, SortKey, SourceSpec,
+    AggFunc, AggItem as AlgAggItem, BinaryOpKind, ColumnRef, JoinKind, LiteralValue, ProjectItem,
+    QueryExpr, ScalarExpr, SetOpKind, SortKey, SourceSpec,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -63,7 +62,9 @@ pub fn parse_sql_expr(sql: &str) -> anyhow::Result<QueryExpr> {
     let dialect = GenericDialect {};
     let mut stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
         .with_context(|| format!("SQL parse error: {sql:?}"))?;
-    let stmt = stmts.pop().ok_or_else(|| anyhow!("no SQL statement found"))?;
+    let stmt = stmts
+        .pop()
+        .ok_or_else(|| anyhow!("no SQL statement found"))?;
     let query = match stmt {
         Statement::Query(q) => *q,
         other => return Err(anyhow!("expected SELECT, got {:?}", other)),
@@ -75,16 +76,24 @@ pub fn parse_sql_expr(sql: &str) -> anyhow::Result<QueryExpr> {
 
 fn extract_query_expr(query: &Query) -> anyhow::Result<QueryExpr> {
     let order_by: Vec<OrderByExpr> = match &query.order_by {
-        Some(OrderBy { kind: OrderByKind::Expressions(exprs), .. }) => exprs.clone(),
+        Some(OrderBy {
+            kind: OrderByKind::Expressions(exprs),
+            ..
+        }) => exprs.clone(),
         _ => vec![],
     };
     let (limit_n, offset_n) = match &query.limit_clause {
-        Some(LimitClause::LimitOffset { limit: Some(e), offset, .. }) => {
-            (Some(e.clone()), offset.as_ref().and_then(|o| expr_to_u64(&o.value)))
-        }
-        Some(LimitClause::OffsetCommaLimit { limit: e, offset, .. }) => {
-            (Some(e.clone()), Some(expr_to_u64(offset).unwrap_or(0)))
-        }
+        Some(LimitClause::LimitOffset {
+            limit: Some(e),
+            offset,
+            ..
+        }) => (
+            Some(e.clone()),
+            offset.as_ref().and_then(|o| expr_to_u64(&o.value)),
+        ),
+        Some(LimitClause::OffsetCommaLimit {
+            limit: e, offset, ..
+        }) => (Some(e.clone()), Some(expr_to_u64(offset).unwrap_or(0))),
         _ => (None, None),
     };
     let limit_val = limit_n.as_ref().and_then(|e| expr_to_u64(e));
@@ -95,22 +104,27 @@ fn extract_query_expr(query: &Query) -> anyhow::Result<QueryExpr> {
 }
 
 fn extract_set_expr_qe(
-    set_expr:   &SetExpr,
-    order_by:   &[OrderByExpr],
-    limit_n:    Option<u64>,
-    offset_n:   u64,
+    set_expr: &SetExpr,
+    order_by: &[OrderByExpr],
+    limit_n: Option<u64>,
+    offset_n: u64,
 ) -> anyhow::Result<QueryExpr> {
     match set_expr {
         SetExpr::Select(sel) => extract_select_qe(sel, order_by, limit_n, offset_n),
         SetExpr::Query(inner) => extract_query_expr(inner),
 
         // UNION / INTERSECT / EXCEPT
-        SetExpr::SetOperation { left, right, op, set_quantifier } => {
+        SetExpr::SetOperation {
+            left,
+            right,
+            op,
+            set_quantifier,
+        } => {
             use sqlparser::ast::{SetOperator, SetQuantifier};
-            let left_qe  = extract_set_expr_qe(left,  &[], None, 0)?;
+            let left_qe = extract_set_expr_qe(left, &[], None, 0)?;
             let right_qe = extract_set_expr_qe(right, &[], None, 0)?;
             let kind = match op {
-                SetOperator::Union     => SetOpKind::Union,
+                SetOperator::Union => SetOpKind::Union,
                 SetOperator::Intersect => SetOpKind::Intersect,
                 SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
             };
@@ -118,7 +132,7 @@ fn extract_set_expr_qe(
             Ok(QueryExpr::SetOp {
                 kind,
                 all,
-                left:  Box::new(left_qe),
+                left: Box::new(left_qe),
                 right: Box::new(right_qe),
             })
         }
@@ -129,18 +143,18 @@ fn extract_set_expr_qe(
 // ── SELECT-level extraction ───────────────────────────────────────────────────
 
 fn extract_select_qe(
-    sel:      &Select,
+    sel: &Select,
     order_by: &[OrderByExpr],
-    limit_n:  Option<u64>,
+    limit_n: Option<u64>,
     offset_n: u64,
 ) -> anyhow::Result<QueryExpr> {
-    let metric_name   = extract_table_name(sel)?;
-    let where_scalar  = sel.selection.as_ref().map(sql_expr_to_scalar);
-    let group_keys    = extract_group_by(&sel.group_by);
+    let metric_name = extract_table_name(sel)?;
+    let where_scalar = sel.selection.as_ref().map(sql_expr_to_scalar);
+    let group_keys = extract_group_by(&sel.group_by);
     let having_scalar = sel.having.as_ref().map(sql_expr_to_scalar);
-    let agg_items     = collect_agg_items_qe(&sel.projection);
-    let join_qe       = extract_join_qe(sel);
-    let window_spec   = extract_group_by_window(&sel.group_by);
+    let agg_items = collect_agg_items_qe(&sel.projection);
+    let join_qe = extract_join_qe(sel);
+    let window_spec = extract_group_by_window(&sel.group_by);
 
     let source = QueryExpr::Source(SourceSpec {
         name: metric_name.clone(),
@@ -148,17 +162,20 @@ fn extract_select_qe(
 
     // WHERE → Filter
     let after_where = match where_scalar {
-        Some(pred) => QueryExpr::Filter { pred, input: Box::new(source) },
-        None       => source,
+        Some(pred) => QueryExpr::Filter {
+            pred,
+            input: Box::new(source),
+        },
+        None => source,
     };
 
     // JOIN
     let after_join = if let Some((inner_table, join_kind, join_pred)) = join_qe {
         let inner_source = QueryExpr::Source(SourceSpec { name: inner_table });
         QueryExpr::Join {
-            kind:  join_kind,
-            pred:  join_pred,
-            left:  Box::new(after_where),
+            kind: join_kind,
+            pred: join_pred,
+            left: Box::new(after_where),
             right: Box::new(inner_source),
         }
     } else {
@@ -169,8 +186,8 @@ fn extract_select_qe(
     let after_window = if let Some(ws) = window_spec {
         QueryExpr::Window {
             duration: ws.size,
-            slide:    ws.slide,
-            input:    Box::new(after_join),
+            slide: ws.slide,
+            input: Box::new(after_join),
         }
     } else {
         after_join
@@ -180,14 +197,17 @@ fn extract_select_qe(
     let after_agg = if agg_items.is_empty() {
         // No aggregation — bare projection with possible DISTINCT.
         let cols = collect_project_items(&sel.projection);
-        QueryExpr::Project { cols, input: Box::new(after_window) }
+        QueryExpr::Project {
+            cols,
+            input: Box::new(after_window),
+        }
     } else {
         let having = having_scalar;
         QueryExpr::Aggregate {
-            keys:   group_keys,
-            aggs:   agg_items,
+            keys: group_keys,
+            aggs: agg_items,
             having,
-            input:  Box::new(after_window),
+            input: Box::new(after_window),
         }
     };
 
@@ -195,18 +215,28 @@ fn extract_select_qe(
     let after_sort = if order_by.is_empty() {
         after_agg
     } else {
-        let keys: Vec<SortKey> = order_by.iter().map(|o| SortKey {
-            col:         expr_to_col_name(&o.expr).unwrap_or_else(|| "?".into()),
-            desc:        matches!(o.options.asc, Some(false) | None),
-            nulls_first: None,
-        }).collect();
-        QueryExpr::Sort { keys, input: Box::new(after_agg) }
+        let keys: Vec<SortKey> = order_by
+            .iter()
+            .map(|o| SortKey {
+                col: expr_to_col_name(&o.expr).unwrap_or_else(|| "?".into()),
+                desc: matches!(o.options.asc, Some(false) | None),
+                nulls_first: None,
+            })
+            .collect();
+        QueryExpr::Sort {
+            keys,
+            input: Box::new(after_agg),
+        }
     };
 
     // LIMIT / OFFSET
     let result = match limit_n {
-        Some(n) => QueryExpr::Limit { n, offset: offset_n, input: Box::new(after_sort) },
-        None    => after_sort,
+        Some(n) => QueryExpr::Limit {
+            n,
+            offset: offset_n,
+            input: Box::new(after_sort),
+        },
+        None => after_sort,
     };
 
     Ok(result)
@@ -218,9 +248,9 @@ fn collect_agg_items_qe(projection: &[SelectItem]) -> Vec<AlgAggItem> {
     let mut out = Vec::new();
     for item in projection {
         let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(e)               => (e, None),
+            SelectItem::UnnamedExpr(e) => (e, None),
             SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
-            _                                         => continue,
+            _ => continue,
         };
         collect_agg_from_expr_qe(expr, alias, &mut out);
     }
@@ -230,14 +260,22 @@ fn collect_agg_items_qe(projection: &[SelectItem]) -> Vec<AlgAggItem> {
 fn collect_agg_from_expr_qe(expr: &Expr, alias: Option<String>, out: &mut Vec<AlgAggItem>) {
     match expr {
         Expr::Function(f) => {
-            let fn_name = f.name.0.last()
+            let fn_name = f
+                .name
+                .0
+                .last()
                 .and_then(|i| i.as_ident())
                 .map(|id| id.value.to_uppercase())
                 .unwrap_or_default();
 
             let (distinct, args) = match &f.args {
-                FunctionArguments::List(FunctionArgumentList { duplicate_treatment, args, .. }) => {
-                    let is_distinct = matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
+                FunctionArguments::List(FunctionArgumentList {
+                    duplicate_treatment,
+                    args,
+                    ..
+                }) => {
+                    let is_distinct =
+                        matches!(duplicate_treatment, Some(DuplicateTreatment::Distinct));
                     (is_distinct, args.as_slice())
                 }
                 _ => (false, &[][..]),
@@ -247,23 +285,23 @@ fn collect_agg_from_expr_qe(expr: &Expr, alias: Option<String>, out: &mut Vec<Al
 
             let func = match fn_name.as_str() {
                 "COUNT" if distinct => AggFunc::CountDistinct,
-                "COUNT"             => AggFunc::Count,
-                "SUM"               => AggFunc::Sum,
-                "AVG"               => AggFunc::Avg,
-                "MIN"               => AggFunc::Min,
-                "MAX"               => AggFunc::Max,
-                _                   => return,
+                "COUNT" => AggFunc::Count,
+                "SUM" => AggFunc::Sum,
+                "AVG" => AggFunc::Avg,
+                "MIN" => AggFunc::Min,
+                "MAX" => AggFunc::Max,
+                _ => return,
             };
 
             out.push(AlgAggItem {
-                alias:    alias.unwrap_or_else(|| fn_name.to_lowercase()),
+                alias: alias.unwrap_or_else(|| fn_name.to_lowercase()),
                 func,
                 col,
                 distinct,
             });
         }
         Expr::BinaryOp { left, right, .. } => {
-            collect_agg_from_expr_qe(left,  None, out);
+            collect_agg_from_expr_qe(left, None, out);
             collect_agg_from_expr_qe(right, None, out);
         }
         Expr::Nested(inner) => collect_agg_from_expr_qe(inner, alias, out),
@@ -272,21 +310,24 @@ fn collect_agg_from_expr_qe(expr: &Expr, alias: Option<String>, out: &mut Vec<Al
 }
 
 fn collect_project_items(projection: &[SelectItem]) -> Vec<ProjectItem> {
-    projection.iter().filter_map(|item| match item {
-        SelectItem::UnnamedExpr(e) => Some(ProjectItem {
-            alias: None,
-            expr:  sql_expr_to_scalar(e),
-        }),
-        SelectItem::ExprWithAlias { expr, alias } => Some(ProjectItem {
-            alias: Some(alias.value.clone()),
-            expr:  sql_expr_to_scalar(expr),
-        }),
-        SelectItem::Wildcard(_) => Some(ProjectItem {
-            alias: None,
-            expr:  ScalarExpr::Column("*".into()),
-        }),
-        _ => None,
-    }).collect()
+    projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::UnnamedExpr(e) => Some(ProjectItem {
+                alias: None,
+                expr: sql_expr_to_scalar(e),
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => Some(ProjectItem {
+                alias: Some(alias.value.clone()),
+                expr: sql_expr_to_scalar(expr),
+            }),
+            SelectItem::Wildcard(_) => Some(ProjectItem {
+                alias: None,
+                expr: ScalarExpr::Column("*".into()),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 // ── AST helpers: aggregation arguments ───────────────────────────────────────
@@ -313,33 +354,39 @@ fn first_col_from_args(args: &[FunctionArg]) -> ColumnRef {
 
 /// Window spec extracted from a TUMBLE() or HOP() call in GROUP BY.
 struct SqlWindowSpec {
-    size:     Duration,
-    slide:    Option<Duration>,
+    size: Duration,
+    slide: Option<Duration>,
     time_col: Option<String>,
 }
 
 fn extract_group_by(group_by: &GroupByExpr) -> Vec<String> {
     let exprs = match group_by {
-        GroupByExpr::All(_)         => return vec![],
+        GroupByExpr::All(_) => return vec![],
         GroupByExpr::Expressions(e, _) => e,
     };
-    exprs.iter().filter_map(|e| match e {
-        Expr::Identifier(id)             => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts)  => parts.last().map(|i| i.value.clone()),
-        // Skip TUMBLE/HOP function calls — extracted separately.
-        Expr::Function(f) => {
-            let name = f.name.0.last()
-                .and_then(|i| i.as_ident())
-                .map(|id| id.value.to_uppercase())
-                .unwrap_or_default();
-            if name == "TUMBLE" || name == "HOP" || name == "TIME_BUCKET" {
-                None
-            } else {
-                None // unknown function in GROUP BY — skip
+    exprs
+        .iter()
+        .filter_map(|e| match e {
+            Expr::Identifier(id) => Some(id.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+            // Skip TUMBLE/HOP function calls — extracted separately.
+            Expr::Function(f) => {
+                let name = f
+                    .name
+                    .0
+                    .last()
+                    .and_then(|i| i.as_ident())
+                    .map(|id| id.value.to_uppercase())
+                    .unwrap_or_default();
+                if name == "TUMBLE" || name == "HOP" || name == "TIME_BUCKET" {
+                    None
+                } else {
+                    None // unknown function in GROUP BY — skip
+                }
             }
-        }
-        _                                => None,
-    }).collect()
+            _ => None,
+        })
+        .collect()
 }
 
 /// Extract a TUMBLE / HOP / time_bucket window from the GROUP BY clause.
@@ -355,7 +402,10 @@ fn extract_group_by_window(group_by: &GroupByExpr) -> Option<SqlWindowSpec> {
     };
     for expr in exprs {
         if let Expr::Function(f) = expr {
-            let name = f.name.0.last()
+            let name = f
+                .name
+                .0
+                .last()
                 .and_then(|i| i.as_ident())
                 .map(|id| id.value.to_uppercase())
                 .unwrap_or_default();
@@ -370,20 +420,32 @@ fn extract_group_by_window(group_by: &GroupByExpr) -> Option<SqlWindowSpec> {
                     // TUMBLE(ts_col, interval)
                     let time_col = func_arg_to_col_name(&args[0]);
                     let size = func_arg_to_duration(&args[1])?;
-                    return Some(SqlWindowSpec { size, slide: None, time_col });
+                    return Some(SqlWindowSpec {
+                        size,
+                        slide: None,
+                        time_col,
+                    });
                 }
                 "HOP" if args.len() >= 3 => {
                     // HOP(ts_col, slide_interval, size_interval)
                     let time_col = func_arg_to_col_name(&args[0]);
                     let slide = func_arg_to_duration(&args[1])?;
-                    let size  = func_arg_to_duration(&args[2])?;
-                    return Some(SqlWindowSpec { size, slide: Some(slide), time_col });
+                    let size = func_arg_to_duration(&args[2])?;
+                    return Some(SqlWindowSpec {
+                        size,
+                        slide: Some(slide),
+                        time_col,
+                    });
                 }
                 "TIME_BUCKET" if args.len() >= 2 => {
                     // time_bucket('5 minutes', ts_col) — first arg is interval string
                     let size = func_arg_to_duration(&args[0])?;
                     let time_col = func_arg_to_col_name(&args[1]);
-                    return Some(SqlWindowSpec { size, slide: None, time_col });
+                    return Some(SqlWindowSpec {
+                        size,
+                        slide: None,
+                        time_col,
+                    });
                 }
                 _ => {}
             }
@@ -394,10 +456,10 @@ fn extract_group_by_window(group_by: &GroupByExpr) -> Option<SqlWindowSpec> {
 
 fn func_arg_to_col_name(arg: &FunctionArg) -> Option<String> {
     match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) =>
-            Some(id.value.clone()),
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) =>
-            parts.last().map(|i| i.value.clone()),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.clone()),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+            parts.last().map(|i| i.value.clone())
+        }
         _ => None,
     }
 }
@@ -426,17 +488,15 @@ fn expr_to_duration(expr: &Expr) -> Option<Duration> {
             let secs = match unit {
                 sqlparser::ast::DateTimeField::Second => val,
                 sqlparser::ast::DateTimeField::Minute => val * 60,
-                sqlparser::ast::DateTimeField::Hour   => val * 3600,
-                sqlparser::ast::DateTimeField::Day    => val * 86400,
+                sqlparser::ast::DateTimeField::Hour => val * 3600,
+                sqlparser::ast::DateTimeField::Day => val * 86400,
                 _ => return None,
             };
             Some(Duration::from_secs(secs))
         }
         // '5 minutes' string (time_bucket style)
         Expr::Value(vws) => match &vws.value {
-            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
-                parse_duration_string(s)
-            }
+            Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => parse_duration_string(s),
             _ => None,
         },
         _ => None,
@@ -476,7 +536,8 @@ fn parse_duration_string(s: &str) -> Option<Duration> {
 // ── AST helpers: table name ───────────────────────────────────────────────────
 
 fn extract_table_name(sel: &Select) -> anyhow::Result<String> {
-    sel.from.first()
+    sel.from
+        .first()
         .and_then(|t| match &t.relation {
             TableFactor::Table { name, .. } => Some(object_name_str(name)),
             _ => None,
@@ -485,7 +546,8 @@ fn extract_table_name(sel: &Select) -> anyhow::Result<String> {
 }
 
 fn object_name_str(name: &ObjectName) -> String {
-    name.0.iter()
+    name.0
+        .iter()
         .map(|i| i.as_ident().map(|id| id.value.as_str()).unwrap_or(""))
         .collect::<Vec<_>>()
         .join(".")
@@ -496,37 +558,63 @@ fn object_name_str(name: &ObjectName) -> String {
 fn sql_expr_to_scalar(expr: &Expr) -> ScalarExpr {
     match expr {
         Expr::Identifier(id) => ScalarExpr::Column(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => {
-            ScalarExpr::Column(parts.iter().map(|i| i.value.as_str()).collect::<Vec<_>>().join("."))
-        }
+        Expr::CompoundIdentifier(parts) => ScalarExpr::Column(
+            parts
+                .iter()
+                .map(|i| i.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        ),
         Expr::Value(vws) => sql_value_to_scalar(&vws.value),
         Expr::BinaryOp { left, op, right } => {
             let lhs = sql_expr_to_scalar(left);
             let rhs = sql_expr_to_scalar(right);
             let bop = sql_binop_to_algebra(op);
-            ScalarExpr::BinaryOp { op: bop, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+            ScalarExpr::BinaryOp {
+                op: bop,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            }
         }
         Expr::IsNull(inner) => ScalarExpr::IsNull {
-            expr:    Box::new(sql_expr_to_scalar(inner)),
+            expr: Box::new(sql_expr_to_scalar(inner)),
             negated: false,
         },
         Expr::IsNotNull(inner) => ScalarExpr::IsNull {
-            expr:    Box::new(sql_expr_to_scalar(inner)),
+            expr: Box::new(sql_expr_to_scalar(inner)),
             negated: true,
         },
-        Expr::Between { expr, negated, low, high } => ScalarExpr::Between {
-            expr:    Box::new(sql_expr_to_scalar(expr)),
-            low:     Box::new(sql_expr_to_scalar(low)),
-            high:    Box::new(sql_expr_to_scalar(high)),
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => ScalarExpr::Between {
+            expr: Box::new(sql_expr_to_scalar(expr)),
+            low: Box::new(sql_expr_to_scalar(low)),
+            high: Box::new(sql_expr_to_scalar(high)),
             negated: *negated,
         },
-        Expr::InList { expr, list, negated } => ScalarExpr::InList {
-            expr:    Box::new(sql_expr_to_scalar(expr)),
-            list:    list.iter().map(sql_expr_to_scalar).collect(),
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => ScalarExpr::InList {
+            expr: Box::new(sql_expr_to_scalar(expr)),
+            list: list.iter().map(sql_expr_to_scalar).collect(),
             negated: *negated,
         },
-        Expr::Like { expr, pattern, negated, .. } => {
-            let op = if *negated { BinaryOpKind::NotLike } else { BinaryOpKind::Like };
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            ..
+        } => {
+            let op = if *negated {
+                BinaryOpKind::NotLike
+            } else {
+                BinaryOpKind::Like
+            };
             ScalarExpr::BinaryOp {
                 op,
                 lhs: Box::new(sql_expr_to_scalar(expr)),
@@ -535,7 +623,10 @@ fn sql_expr_to_scalar(expr: &Expr) -> ScalarExpr {
         }
         Expr::Nested(inner) => sql_expr_to_scalar(inner),
         Expr::Function(f) => {
-            let name = f.name.0.last()
+            let name = f
+                .name
+                .0
+                .last()
                 .and_then(|i| i.as_ident())
                 .map(|id| id.value.clone())
                 .unwrap_or_default();
@@ -547,8 +638,9 @@ fn sql_expr_to_scalar(expr: &Expr) -> ScalarExpr {
 
 fn sql_value_to_scalar(v: &Value) -> ScalarExpr {
     match v {
-        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) =>
-            ScalarExpr::Literal(LiteralValue::Str(s.clone())),
+        Value::SingleQuotedString(s) | Value::DoubleQuotedString(s) => {
+            ScalarExpr::Literal(LiteralValue::Str(s.clone()))
+        }
         Value::Number(n, _) => {
             if let Ok(i) = n.parse::<i64>() {
                 ScalarExpr::Literal(LiteralValue::Int(i))
@@ -559,31 +651,31 @@ fn sql_value_to_scalar(v: &Value) -> ScalarExpr {
             }
         }
         Value::Boolean(b) => ScalarExpr::Literal(LiteralValue::Bool(*b)),
-        Value::Null        => ScalarExpr::Literal(LiteralValue::Null),
-        _                  => ScalarExpr::Literal(LiteralValue::Null),
+        Value::Null => ScalarExpr::Literal(LiteralValue::Null),
+        _ => ScalarExpr::Literal(LiteralValue::Null),
     }
 }
 
 fn sql_binop_to_algebra(op: &BinaryOperator) -> BinaryOpKind {
     match op {
-        BinaryOperator::Plus      => BinaryOpKind::Add,
-        BinaryOperator::Minus     => BinaryOpKind::Sub,
-        BinaryOperator::Multiply  => BinaryOpKind::Mul,
-        BinaryOperator::Divide    => BinaryOpKind::Div,
-        BinaryOperator::Modulo    => BinaryOpKind::Mod,
-        BinaryOperator::Eq        => BinaryOpKind::Eq,
-        BinaryOperator::NotEq     => BinaryOpKind::Ne,
-        BinaryOperator::Lt        => BinaryOpKind::Lt,
-        BinaryOperator::LtEq      => BinaryOpKind::Le,
-        BinaryOperator::Gt        => BinaryOpKind::Gt,
-        BinaryOperator::GtEq      => BinaryOpKind::Ge,
-        BinaryOperator::And       => BinaryOpKind::And,
-        BinaryOperator::Or        => BinaryOpKind::Or,
+        BinaryOperator::Plus => BinaryOpKind::Add,
+        BinaryOperator::Minus => BinaryOpKind::Sub,
+        BinaryOperator::Multiply => BinaryOpKind::Mul,
+        BinaryOperator::Divide => BinaryOpKind::Div,
+        BinaryOperator::Modulo => BinaryOpKind::Mod,
+        BinaryOperator::Eq => BinaryOpKind::Eq,
+        BinaryOperator::NotEq => BinaryOpKind::Ne,
+        BinaryOperator::Lt => BinaryOpKind::Lt,
+        BinaryOperator::LtEq => BinaryOpKind::Le,
+        BinaryOperator::Gt => BinaryOpKind::Gt,
+        BinaryOperator::GtEq => BinaryOpKind::Ge,
+        BinaryOperator::And => BinaryOpKind::And,
+        BinaryOperator::Or => BinaryOpKind::Or,
         BinaryOperator::BitwiseAnd => BinaryOpKind::BitAnd,
-        BinaryOperator::BitwiseOr  => BinaryOpKind::BitOr,
+        BinaryOperator::BitwiseOr => BinaryOpKind::BitOr,
         BinaryOperator::BitwiseXor => BinaryOpKind::BitXor,
         BinaryOperator::StringConcat => BinaryOpKind::Concat,
-        _                          => BinaryOpKind::Eq, // unknown → eq
+        _ => BinaryOpKind::Eq, // unknown → eq
     }
 }
 
@@ -597,16 +689,11 @@ fn extract_join_qe(sel: &Select) -> Option<(String, JoinKind, Option<ScalarExpr>
         _ => return None,
     };
     let (kind, pred) = match &join.join_operator {
-        JoinOperator::Inner(c) =>
-            (JoinKind::Inner, join_constraint_to_scalar(c)),
-        JoinOperator::LeftOuter(c) =>
-            (JoinKind::LeftOuter, join_constraint_to_scalar(c)),
-        JoinOperator::RightOuter(c) =>
-            (JoinKind::RightOuter, join_constraint_to_scalar(c)),
-        JoinOperator::FullOuter(c) =>
-            (JoinKind::FullOuter, join_constraint_to_scalar(c)),
-        JoinOperator::CrossJoin(_) =>
-            (JoinKind::Cross, None),
+        JoinOperator::Inner(c) => (JoinKind::Inner, join_constraint_to_scalar(c)),
+        JoinOperator::LeftOuter(c) => (JoinKind::LeftOuter, join_constraint_to_scalar(c)),
+        JoinOperator::RightOuter(c) => (JoinKind::RightOuter, join_constraint_to_scalar(c)),
+        JoinOperator::FullOuter(c) => (JoinKind::FullOuter, join_constraint_to_scalar(c)),
+        JoinOperator::CrossJoin(_) => (JoinKind::Cross, None),
         _ => return None,
     };
     Some((inner_table, kind, pred))
@@ -633,7 +720,7 @@ fn expr_to_u64(expr: &Expr) -> Option<u64> {
 
 fn expr_to_col_name(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::Identifier(id)            => Some(id.value.clone()),
+        Expr::Identifier(id) => Some(id.value.clone()),
         Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
         _ => None,
     }
@@ -667,7 +754,9 @@ mod tests {
 
     #[test]
     fn count_star_group_by_is_frequency() {
-        let pq = pq("SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID");
+        let pq = pq(
+            "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID",
+        );
         assert!(pq.aggregations.contains(&AggType::Frequency));
         assert!(pq.group_by_labels.contains(&"AdvEngineID".to_string()));
     }
@@ -681,10 +770,8 @@ mod tests {
 
     #[test]
     fn count_star_order_by_desc_limit_is_topk() {
-        let pq = pq(
-            "SELECT SearchPhrase, COUNT(*) AS c FROM hits \
-             WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10",
-        );
+        let pq = pq("SELECT SearchPhrase, COUNT(*) AS c FROM hits \
+             WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC LIMIT 10");
         assert!(pq.aggregations.contains(&AggType::Frequency));
     }
 
@@ -721,7 +808,10 @@ mod tests {
     #[test]
     fn where_equality_captured() {
         let pq = pq("SELECT COUNT(*) FROM hits WHERE sectype = 'E' GROUP BY symbol");
-        assert_eq!(pq.label_filters.get("sectype").map(String::as_str), Some("E"));
+        assert_eq!(
+            pq.label_filters.get("sectype").map(String::as_str),
+            Some("E")
+        );
     }
 
     #[test]
@@ -738,9 +828,18 @@ mod tests {
             "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) \
              FROM hits GROUP BY RegionID ORDER BY c DESC LIMIT 10",
         );
-        assert!(pq.aggregations.contains(&AggType::Cardinality), "missing cardinality");
-        assert!(pq.aggregations.contains(&AggType::Frequency),   "missing frequency");
-        assert!(pq.aggregations.contains(&AggType::Quantile),    "missing quantile");
+        assert!(
+            pq.aggregations.contains(&AggType::Cardinality),
+            "missing cardinality"
+        );
+        assert!(
+            pq.aggregations.contains(&AggType::Frequency),
+            "missing frequency"
+        );
+        assert!(
+            pq.aggregations.contains(&AggType::Quantile),
+            "missing quantile"
+        );
         // SUM adds exact_required alongside sketch ops
         assert!(pq.exact_required, "SUM should set exact_required");
     }
@@ -808,7 +907,10 @@ mod tests {
             "SELECT symbol, AVG(price) FROM trades \
              GROUP BY symbol, TUMBLE(ts, INTERVAL '5' MINUTE)",
         );
-        assert!(has_windowed_agg(&expr), "expected WindowedAgg in tree, got {expr:?}");
+        assert!(
+            has_windowed_agg(&expr),
+            "expected WindowedAgg in tree, got {expr:?}"
+        );
     }
 
     #[test]
@@ -817,7 +919,10 @@ mod tests {
             "SELECT symbol, COUNT(*) FROM trades \
              GROUP BY symbol, HOP(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE)",
         );
-        assert!(has_windowed_agg(&expr), "expected WindowedAgg in tree, got {expr:?}");
+        assert!(
+            has_windowed_agg(&expr),
+            "expected WindowedAgg in tree, got {expr:?}"
+        );
     }
 
     #[test]
@@ -826,7 +931,10 @@ mod tests {
             "SELECT symbol, AVG(price) FROM trades \
              GROUP BY symbol, time_bucket('5 minutes', ts)",
         );
-        assert!(has_windowed_agg(&expr), "expected WindowedAgg in tree, got {expr:?}");
+        assert!(
+            has_windowed_agg(&expr),
+            "expected WindowedAgg in tree, got {expr:?}"
+        );
     }
 
     #[test]
@@ -838,8 +946,10 @@ mod tests {
         );
         match &expr {
             QueryExpr::Aggregate { input, .. } => {
-                assert!(matches!(input.as_ref(), QueryExpr::Window { .. }),
-                    "expected Window inside Aggregate, got {input:?}");
+                assert!(
+                    matches!(input.as_ref(), QueryExpr::Window { .. }),
+                    "expected Window inside Aggregate, got {input:?}"
+                );
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }

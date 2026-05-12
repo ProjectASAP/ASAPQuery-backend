@@ -1,13 +1,16 @@
+use crate::types::*;
 use anyhow::Context;
 use serde_json::json;
-use crate::types::*;
 
 /// Generates an OTel collector YAML string for the backend merge collector.
 ///
 /// **SP-9**: when `staged.has_dedup` is true a `dedup` processor is inserted
 /// before the merge processor in the pipeline, honouring the `Dedup` node
 /// assignment from [`crate::planner::stage_split::split_expr_by_stage`].
-pub fn generate_backend_config(cfg: &BackendCollectorConfig, opamp_endpoint: &str) -> anyhow::Result<String> {
+pub fn generate_backend_config(
+    cfg: &BackendCollectorConfig,
+    opamp_endpoint: &str,
+) -> anyhow::Result<String> {
     generate_backend_config_staged(cfg, None, opamp_endpoint)
 }
 
@@ -26,10 +29,7 @@ pub fn generate_backend_config_staged(
     let mut pipeline_processors: Vec<serde_json::Value> = vec![];
 
     if has_dedup {
-        processors.insert(
-            "dedup".into(),
-            json!({ "mode": "dedup" }),
-        );
+        processors.insert("dedup".into(), json!({ "mode": "dedup" }));
         pipeline_processors.push(json!("dedup"));
     }
 
@@ -69,8 +69,14 @@ mod tests {
             group_by: vec!["host.name".into()],
         };
         let yaml = generate_backend_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
-        assert!(yaml.contains("ddsketch_merge"), "YAML should contain merge key\n{yaml}");
-        assert!(yaml.contains("host.name"),      "YAML should contain group_by\n{yaml}");
+        assert!(
+            yaml.contains("ddsketch_merge"),
+            "YAML should contain merge key\n{yaml}"
+        );
+        assert!(
+            yaml.contains("host.name"),
+            "YAML should contain group_by\n{yaml}"
+        );
     }
 
     #[test]
@@ -86,7 +92,10 @@ mod tests {
     #[test]
     fn contains_opamp_endpoint() {
         let ep = "ws://custom-ctrl:9000/v1/opamp";
-        let cfg = BackendCollectorConfig { merge_sketch_type: SketchType::KLL, group_by: vec![] };
+        let cfg = BackendCollectorConfig {
+            merge_sketch_type: SketchType::KLL,
+            group_by: vec![],
+        };
         let yaml = generate_backend_config(&cfg, ep).unwrap();
         assert!(yaml.contains(ep), "YAML should contain endpoint\n{yaml}");
     }
@@ -97,9 +106,17 @@ mod tests {
             merge_sketch_type: SketchType::HLL,
             group_by: vec!["user_id".into()],
         };
-        let staged = BackendSubPlan { has_dedup: true, has_merge: true, group_by: vec![] };
-        let yaml = generate_backend_config_staged(&cfg, Some(&staged), "ws://ctrl:4320/v1/opamp").unwrap();
-        assert!(yaml.contains("dedup:"), "YAML should contain dedup processor\n{yaml}");
+        let staged = BackendSubPlan {
+            has_dedup: true,
+            has_merge: true,
+            group_by: vec![],
+        };
+        let yaml =
+            generate_backend_config_staged(&cfg, Some(&staged), "ws://ctrl:4320/v1/opamp").unwrap();
+        assert!(
+            yaml.contains("dedup:"),
+            "YAML should contain dedup processor\n{yaml}"
+        );
         // dedup must appear before merge in the pipeline list
         let dedup_pos = yaml.find("- dedup").expect("missing dedup in pipeline");
         let merge_pos = yaml.find("- HLL_merge").expect("missing merge in pipeline");
@@ -112,9 +129,16 @@ mod tests {
             merge_sketch_type: SketchType::DDSketch,
             group_by: vec![],
         };
-        let staged = BackendSubPlan { has_dedup: false, has_merge: true, group_by: vec![] };
-        let yaml = generate_backend_config_staged(&cfg, Some(&staged), "ws://ctrl:4320/v1/opamp").unwrap();
-        assert!(!yaml.contains("dedup"), "YAML must not contain dedup\n{yaml}");
+        let staged = BackendSubPlan {
+            has_dedup: false,
+            has_merge: true,
+            group_by: vec![],
+        };
+        let yaml =
+            generate_backend_config_staged(&cfg, Some(&staged), "ws://ctrl:4320/v1/opamp").unwrap();
+        assert!(
+            !yaml.contains("dedup"),
+            "YAML must not contain dedup\n{yaml}"
+        );
     }
 }
-

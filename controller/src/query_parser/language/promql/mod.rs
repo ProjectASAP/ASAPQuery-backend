@@ -7,8 +7,8 @@
 
 pub mod ast;
 
-use super::{Language, ParseError};
 use super::language_ast::LanguageAst;
+use super::{Language, ParseError};
 use crate::query_parser::{parse_query, parse_query_expr};
 use crate::types_v2::QueryLanguage;
 
@@ -30,10 +30,14 @@ impl Language for PromQLLanguage {
         // Delegate to the existing parser — both entry points re-parse the
         // same string today; the cost is negligible (microseconds) and we
         // get the legacy `ParsedQuery` for free for back-compat callers.
-        let expr = parse_query_expr(source)
-            .map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
-        let summary = parse_query(source)
-            .map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
-        Ok(LanguageAst::PromQL(PromQLAst::new(source.to_string(), expr, summary)))
+        let expr =
+            parse_query_expr(source).map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
+        let summary =
+            parse_query(source).map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
+        Ok(LanguageAst::PromQL(PromQLAst::new(
+            source.to_string(),
+            expr,
+            summary,
+        )))
     }
 }

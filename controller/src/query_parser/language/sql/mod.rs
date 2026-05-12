@@ -5,8 +5,8 @@
 //! is not exposed via the new [`Language`] trait yet. A real impl wraps
 //! `sqlparser` and emits a `SqlAst` analogous to [`super::promql::PromQLAst`].
 
-use super::{Language, ParseError};
 use super::language_ast::LanguageAst;
+use super::{Language, ParseError};
 use crate::types_v2::QueryLanguage;
 
 /// SQL implementation of the [`Language`] trait. Currently stubbed.

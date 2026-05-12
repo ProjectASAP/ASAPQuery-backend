@@ -182,11 +182,7 @@ impl WireWorkload {
     /// [`WorkloadCharacteristics`] + a window duration. Useful for the
     /// planner's wire-cost decision when the caller already has a
     /// `WorkloadCharacteristics` for the delta model.
-    pub fn from_chars(
-        wc: &WorkloadCharacteristics,
-        window_secs: u64,
-        accuracy_sla: f64,
-    ) -> Self {
+    pub fn from_chars(wc: &WorkloadCharacteristics, window_secs: u64, accuracy_sla: f64) -> Self {
         let samples_per_window =
             (wc.samples_per_sec_per_series * window_secs as f64).round() as u64;
         Self {
@@ -322,8 +318,7 @@ pub fn est_wire_bytes_per_window_per_series(
     table: &WireCostTable,
 ) -> u64 {
     match mode {
-        BindMode::SketchAtEdge { family }
-        | BindMode::RawAtEdgeSketchAtBackend { family } => {
+        BindMode::SketchAtEdge { family } | BindMode::RawAtEdgeSketchAtBackend { family } => {
             // Same edge → backend wire footprint either way (the sketch
             // state crosses the gateway in mode 1, the raw samples then
             // sketched do in mode 2; backend ingest cost is mode-2-higher
@@ -359,10 +354,18 @@ mod tests {
     #[test]
     fn break_even_table_at_50_bytes_per_sample() {
         let t = WireCostTable::default();
-        assert_eq!(break_even_samples(t.ddsketch_delta, 50), 16, "DDSketch+delta");
+        assert_eq!(
+            break_even_samples(t.ddsketch_delta, 50),
+            16,
+            "DDSketch+delta"
+        );
         assert_eq!(break_even_samples(t.kll_full, 50), 64, "KLL full");
         assert_eq!(break_even_samples(t.hll_delta, 50), 204, "HLL+delta");
-        assert_eq!(break_even_samples(t.count_min_delta, 50), 84, "Count-Min+delta");
+        assert_eq!(
+            break_even_samples(t.count_min_delta, 50),
+            84,
+            "Count-Min+delta"
+        );
         assert_eq!(
             break_even_samples(t.count_sketch_delta, 50),
             5_004,
@@ -378,11 +381,8 @@ mod tests {
         let table = WireCostTable::default();
         let w = WireWorkload::default_phase_eps_1();
         // 60 samples × 50 B = 3 000 B raw.
-        let raw = est_wire_bytes_per_window_per_series(
-            &BindMode::RawAtEdgePrometheusArchive,
-            &w,
-            &table,
-        );
+        let raw =
+            est_wire_bytes_per_window_per_series(&BindMode::RawAtEdgePrometheusArchive, &w, &table);
         assert_eq!(raw, 3_000);
         // DDSketch state — 600 + 200 = 800 B. Sketch wins.
         let ddsketch = est_wire_bytes_per_window_per_series(

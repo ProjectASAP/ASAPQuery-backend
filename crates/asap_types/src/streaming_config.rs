@@ -19,7 +19,7 @@ pub struct StreamingConfig {
     /// Phase-5 capability-routing axis: which storage tier serves this
     /// per-metric runtime config. The controller pushes this when planning
     /// (see `docs/design-gorilla-s3-cold-engine.md` §8); pre-Phase-5
-    /// configs decode with `#[serde(default)]` to `SketchWarmTier` so
+    /// configs decode with `#[serde(default)]` to `SketchStore` so
     /// existing deploys keep dispatching to `SimpleEngine`.
     #[serde(default)]
     pub storage_backend: StorageBackend,
@@ -161,19 +161,19 @@ mod tests {
     use super::*;
 
     /// Pre-Phase-5 deploys serialize `StreamingConfig` without the
-    /// `storage_backend` field; deserialize must default to `SketchWarmTier`
+    /// `storage_backend` field; deserialize must default to `SketchStore`
     /// so the router keeps dispatching to `SimpleEngine` unchanged.
     #[test]
     fn deserialize_legacy_yaml_defaults_to_warm_tier() {
         let yaml = "{\"aggregation_configs\":{}}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("legacy decode");
-        assert_eq!(cfg.storage_backend(), StorageBackend::SketchWarmTier);
+        assert_eq!(cfg.storage_backend(), StorageBackend::SketchStore);
     }
 
     #[test]
     fn deserialize_with_explicit_archive_pin() {
-        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_s3_archive\"}";
+        let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
-        assert_eq!(cfg.storage_backend(), StorageBackend::GorillaS3Archive);
+        assert_eq!(cfg.storage_backend(), StorageBackend::GorillaObjectStore);
     }
 }

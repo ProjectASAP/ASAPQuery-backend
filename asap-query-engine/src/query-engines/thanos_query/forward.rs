@@ -1,40 +1,36 @@
-//! `PrometheusForwardEngine` — HTTP forwarder to a Prometheus
-//! `/api/v1/query` endpoint for Phase ε.2 of the planner
-//! consolidation.
+//! `ThanosQueryEngine` — HTTP forwarder to a `thanos-query`
+//! sidecar for Path A2 of the Step-2 archive deprecation.
 //!
-//! The controller's Mode 3 (`RawAtEdgePrometheusArchive`) routes a
-//! metric's queries to Prometheus directly when the metric's data is
-//! shipped raw to Prometheus's native OTLP receiver (no warm-tier
-//! sketch, no Gorilla archive — Prometheus owns the storage). Phase
-//! ε.1 (controller) emits `engine: prometheus_remote` in the
-//! `BackendStorageRouting` JSON so the backend's dispatcher can pick
-//! the new engine; Phase ε.2 (this file + main.rs wiring) registers
-//! that engine on the `EngineRouter` so the dispatcher's
-//! `engine_by_id` lookup hits the forwarder.
+//! Step-2.1 (PR #311) teaches `gorillas3processor` to emit
+//! Prometheus TSDB block format; Step-2.2 (PR #310) adds a
+//! `thanos-store-gateway` + `thanos-query` pair to the demo overlay.
+//! Step-2.3 (this file) wires the backend to forward archive-tier
+//! PromQL queries to that sidecar over HTTP.
 //!
 //! Operating modes are selected by the
-//! [`ASAP_PROMETHEUS_QUERY_URL_ENV`] env var, consulted at backend
+//! [`ASAP_THANOS_QUERY_URL_ENV`] env var, consulted at backend
 //! startup:
 //!
-//! * **Phase ε.2 mode** (env set) — `PrometheusForwardEngine` is
-//!   registered in the [`crate::routing::EngineRouter`] under id
-//!   `prometheus_remote`. Routing-table entries that target this
-//!   engine POST to `${ASAP_PROMETHEUS_QUERY_URL}/api/v1/query` and
+//! * **Path A2 mode** (env set) — `ThanosQueryEngine` is
+//!   registered in the [`crate::routing::EngineRouter`]. Archive
+//!   queries POST to `${ASAP_THANOS_QUERY_URL}/api/v1/query` and
 //!   the answer is wrapped in ASAP's standard
 //!   [`crate::engines::QueryResult`] shape.
-//! * **Off** (env unset) — engine is not registered. Routing-table
-//!   entries that reference `prometheus_remote` surface a
-//!   `NoEngineRegistered` 503 from the HTTP handler — the correct
-//!   fail-loud behaviour for a misconfigured deploy.
+//! * **Legacy mode** (env unset) — the in-process
+//!   [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+//!   handles archive queries from the per-hour Gorilla chunks that
+//!   [`crate::stores::gorilla_object_store::GorillaS3Store`] streams
+//!   from S3 / MinIO.
+//!   Phase δ deletes this leg after Path A2 is verified
+//!   end-to-end.
 //!
-//! This is a near-mirror of [`crate::engines::gorilla::thanos_forward`]
-//! (the Step-2.3 archive forwarder), pointed at Prometheus's standard
-//! `/api/v1/query` endpoint instead of a `thanos-query` sidecar. The
-//! two engines coexist: `thanos_archive` answers archive-tier queries
-//! over Prometheus TSDB blocks emitted by `gorillas3processor`;
-//! `prometheus_remote` answers queries for metrics whose raw data is
-//! shipped to Prometheus's native OTLP receiver (no ASAP archive at
-//! all).
+//! The two modes are mutually exclusive: when Path A2 is active,
+//! both the legacy id (`thanos_query`) and the alias id
+//! (`thanos_query`) point at the same `ThanosQueryEngine`
+//! instance, so the per-metric `BackendStorageRouting` config can
+//! target either name without surprise. See the binary's
+//! `register_thanos_or_thanos_query` helper for the
+//! registration site.
 
 use std::time::{Duration, Instant};
 
@@ -45,7 +41,7 @@ use tracing::{debug, warn};
 
 use crate::data_model::KeyByLabelValues;
 use crate::engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
-use crate::routing::engine_router::{EngineCapabilities, QueryEngine};
+use crate::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
 // ---------------------------------------------------------------------------
@@ -57,84 +53,86 @@ use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 // ---------------------------------------------------------------------------
 
 /// Env var consulted at backend startup. When set, the binary
-/// registers a [`PrometheusForwardEngine`] pointing at the URL and
-/// the router dispatches `prometheus_remote` queries to it. When
-/// unset, the engine is not registered.
-pub const ASAP_PROMETHEUS_QUERY_URL_ENV: &str = "ASAP_PROMETHEUS_QUERY_URL";
+/// registers a [`ThanosQueryEngine`] pointing at the URL and the
+/// router dispatches archive-tier queries to it. When unset, the
+/// legacy in-process [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+/// handles archive queries.
+pub const ASAP_THANOS_QUERY_URL_ENV: &str = "ASAP_THANOS_QUERY_URL";
 
-/// Default upstream URL when `ASAP_PROMETHEUS_QUERY_URL` is set to
-/// the empty string or contains only whitespace. Mirrors the demo
-/// overlay's default service name + port (Prometheus's standard
-/// HTTP API port is `9090`).
-pub const DEFAULT_PROMETHEUS_QUERY_URL: &str = "http://prometheus:9090";
+/// Default upstream URL when `ASAP_THANOS_QUERY_URL` is set to the
+/// empty string or contains only whitespace. Mirrors the demo
+/// overlay's default service name + port (Step-2.2's
+/// `mvp-thanos-archive.yml` pins `thanos-query:10903`).
+pub const DEFAULT_THANOS_QUERY_URL: &str = "http://thanos-query:10903";
 
-/// `data_source_id` the [`PrometheusForwardEngine`] registers under.
-/// Pinned so dashboards / e2e scripts and the per-metric
-/// `BackendStorageRouting` config can byte-compare without parsing.
-pub const DATA_SOURCE_PROMETHEUS_REMOTE_ID: &str = "prometheus_remote";
+/// `data_source_id` the [`ThanosQueryEngine`] registers under
+/// for explicit per-query overrides via the `X-ASAP-Engine` header
+/// or the `?engine=` query param. Pinned so dashboards / e2e
+/// scripts can byte-compare without parsing.
+pub const DATA_SOURCE_THANOS_QUERY_ID: &str = asap_types::ENGINE_ID_THANOS_QUERY;
 
-/// Marker line every `PrometheusForwardEngine` answer carries on its
-/// `infos` array. Pinned so dashboards and the upcoming Phase 3
+/// Marker line every `ThanosQueryEngine` answer carries on its
+/// `infos` array. Pinned so dashboards and the upcoming Step-2.4
 /// e2e demo can byte-compare without parsing.
-pub const DATA_SOURCE_PROMETHEUS_REMOTE_INFO: &str = "data_source: prometheus_remote";
+pub const DATA_SOURCE_THANOS_QUERY_INFO: &str = "data_source: thanos_query";
 
-/// `data_source_quirk` line surfaced when the upstream Prometheus
-/// instance is unreachable (network error / 5xx / timeout). Pinned
-/// so the upcoming e2e demo can pin the fail-loud behaviour.
-pub const QUIRK_PROMETHEUS_UNREACHABLE: &str = "data_source_quirk: prometheus_unreachable";
+/// `data_source_quirk` line surfaced when the upstream
+/// `thanos-query` sidecar is unreachable (network error / 5xx /
+/// timeout). Pinned so the upcoming Step-2.4 e2e demo can pin the
+/// fail-loud behaviour.
+pub const QUIRK_THANOS_UNREACHABLE: &str = "data_source_quirk: thanos_unreachable";
 
-/// Default request timeout for the forwarded query. Generous enough
-/// that Prometheus has room to answer big range queries, tight
-/// enough that the backend doesn't pile up in-flight requests on a
-/// wedged upstream.
-pub const DEFAULT_PROMETHEUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default request timeout for the forwarded query. Generous
+/// enough that thanos-query has room to do its own store-gateway
+/// fan-out, tight enough that the backend doesn't pile up
+/// in-flight requests on a wedged sidecar.
+pub const DEFAULT_THANOS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Config + engine.
 // ---------------------------------------------------------------------------
 
-/// Tunable runtime knobs for [`PrometheusForwardEngine`]. Built
-/// from env via [`PrometheusForwardConfig::from_env`].
+/// Tunable runtime knobs for [`ThanosQueryEngine`]. Built from
+/// env via [`ThanosQueryConfig::from_env`].
 #[derive(Debug, Clone)]
-pub struct PrometheusForwardConfig {
-    /// Base URL of the upstream Prometheus instance — e.g.
-    /// `http://prometheus:9090`. The engine appends `/api/v1/query`
-    /// (or `/api/v1/query_range`) when forwarding. Trailing slash is
-    /// tolerated; both forms are normalised.
+pub struct ThanosQueryConfig {
+    /// Base URL of the upstream `thanos-query` sidecar — e.g.
+    /// `http://thanos-query:10903`. The engine appends
+    /// `/api/v1/query` (or `/api/v1/query_range`) when forwarding.
+    /// Trailing slash is tolerated; both forms are normalised.
     pub base_url: String,
     /// Wall-clock timeout per forwarded request.
     pub request_timeout: Duration,
 }
 
-impl Default for PrometheusForwardConfig {
+impl Default for ThanosQueryConfig {
     fn default() -> Self {
         Self {
-            base_url: DEFAULT_PROMETHEUS_QUERY_URL.to_string(),
-            request_timeout: DEFAULT_PROMETHEUS_REQUEST_TIMEOUT,
+            base_url: DEFAULT_THANOS_QUERY_URL.to_string(),
+            request_timeout: DEFAULT_THANOS_REQUEST_TIMEOUT,
         }
     }
 }
 
-impl PrometheusForwardConfig {
-    /// Build a config from the [`ASAP_PROMETHEUS_QUERY_URL_ENV`] env
+impl ThanosQueryConfig {
+    /// Build a config from the [`ASAP_THANOS_QUERY_URL_ENV`] env
     /// var, returning `None` when the var is unset / empty / blank
-    /// (the binary should then skip registering the forwarder; a
-    /// routing-table entry referencing `prometheus_remote` will
-    /// surface a `NoEngineRegistered` 503).
+    /// (the binary should then fall through to the legacy
+    /// in-process engine path).
     ///
-    /// A whitespace-only value is treated as unset rather than as a
-    /// malformed URL: we don't want a stray
-    /// `ASAP_PROMETHEUS_QUERY_URL=` in a `.env` to silently flip
-    /// Phase ε.2 on with the default host name.
+    /// A whitespace-only value is treated as unset rather than as
+    /// a malformed URL: we don't want a stray `ASAP_THANOS_QUERY_URL=`
+    /// in a `.env` to silently flip Path A2 on with the default
+    /// host name.
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var(ASAP_PROMETHEUS_QUERY_URL_ENV).ok()?;
+        let raw = std::env::var(ASAP_THANOS_QUERY_URL_ENV).ok()?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return None;
         }
         Some(Self {
             base_url: trimmed.trim_end_matches('/').to_string(),
-            request_timeout: DEFAULT_PROMETHEUS_REQUEST_TIMEOUT,
+            request_timeout: DEFAULT_THANOS_REQUEST_TIMEOUT,
         })
     }
 
@@ -143,67 +141,76 @@ impl PrometheusForwardConfig {
     }
 }
 
-/// Forwards PromQL queries to an upstream Prometheus instance over
-/// HTTP and wraps the response in ASAP's standard
+/// Forwards PromQL queries to an upstream `thanos-query` sidecar
+/// over HTTP and wraps the response in ASAP's standard
 /// [`QueryResult`] shape.
 ///
 /// Implements the [`QueryEngine`] trait so the
 /// [`crate::routing::EngineRouter`] can hold it as `Arc<dyn
-/// QueryEngine>`. Reports `data_source_id = "prometheus_remote"`
-/// and (for the compatibility-list dispatch path) `storage_backend =
-/// StorageBackend::PrometheusRemote` — Mode 3 gives the
-/// Prometheus-native metrics their own slot in the routing matrix
-/// (the data never lands in ASAP storage so no warm-tier / archive
-/// failover is meaningful).
-pub struct PrometheusForwardEngine {
-    config: PrometheusForwardConfig,
+/// QueryEngine>`. Reports `data_source_id =
+/// "thanos_query"` and (for the compatibility-list dispatch path)
+/// `storage_backend = StorageBackend::GorillaObjectStore` — Path A2
+/// re-uses the archive tier slot in the routing matrix, so any
+/// metric configured for `GorillaObjectStore` keeps routing through
+/// the archive tier; only the engine answering changes.
+pub struct ThanosQueryEngine {
+    config: ThanosQueryConfig,
     client: reqwest::Client,
+    /// Pinned id we register under.
+    data_source_id: &'static str,
 }
 
-impl PrometheusForwardEngine {
+impl ThanosQueryEngine {
     /// Build with an explicit config. Used by tests + the binary's
     /// startup wiring.
-    pub fn new(config: PrometheusForwardConfig) -> Result<Self, PrometheusForwardError> {
+    pub fn new(config: ThanosQueryConfig) -> Result<Self, ThanosQueryError> {
         let client = reqwest::Client::builder()
             .timeout(config.request_timeout)
             .build()
-            .map_err(|e| PrometheusForwardError::ConfigInvalid(e.to_string()))?;
-        Ok(Self { config, client })
+            .map_err(|e| ThanosQueryError::ConfigInvalid(e.to_string()))?;
+        Ok(Self {
+            config,
+            client,
+            data_source_id: DATA_SOURCE_THANOS_QUERY_ID,
+        })
     }
 
     /// Build the production config from
-    /// [`ASAP_PROMETHEUS_QUERY_URL_ENV`] or return `None` when the
-    /// env var is unset / blank. The binary calls this; if it
-    /// returns `None`, the engine is not registered.
-    pub fn from_env() -> Option<Result<Self, PrometheusForwardError>> {
-        PrometheusForwardConfig::from_env().map(Self::new)
+    /// [`ASAP_THANOS_QUERY_URL_ENV`] or return `None` when the env
+    /// var is unset / blank. The binary calls this first; if it
+    /// returns `None`, the legacy in-process Gorilla object-store
+    /// executor is registered instead.
+    pub fn from_env() -> Option<Result<Self, ThanosQueryError>> {
+        ThanosQueryConfig::from_env().map(Self::new)
     }
 
     /// Read-only access to the configured base URL — useful for
-    /// diagnostics + the upcoming Phase 3 demo's startup banner.
+    /// diagnostics + the upcoming Step-2.4 demo's startup banner.
     pub fn base_url(&self) -> &str {
         &self.config.base_url
     }
 
-    /// The infos a successful forwarded answer carries. Pinned so
-    /// tests + dashboards can byte-compare without re-implementing
-    /// the wire path.
+    /// The infos a successful forwarded answer carries. The
+    /// `data_source: thanos_query` line is added by the HTTP
+    /// handler's `annotate_data_source` step (driven from
+    /// `capabilities().data_source_id`), so tests pin the strings
+    /// here without re-implementing the wire path.
     pub fn success_infos(elapsed_ms: u128) -> Vec<String> {
         vec![
-            DATA_SOURCE_PROMETHEUS_REMOTE_INFO.to_string(),
+            DATA_SOURCE_THANOS_QUERY_INFO.to_string(),
             AccuracyProfile::exact().summary(),
             format!("query_latency_ms: {elapsed_ms}"),
         ]
     }
 
-    /// The infos a forwarded-but-failed answer carries. Includes the
-    /// quirk line so the upcoming e2e demo can pin fail-loud
-    /// behaviour.
+    /// The infos a forwarded-but-failed answer carries. Includes
+    /// the quirk line so the upcoming Step-2.4 e2e demo can pin
+    /// fail-loud behaviour.
     pub fn unreachable_infos(reason: &str, elapsed_ms: u128) -> Vec<String> {
         vec![
-            DATA_SOURCE_PROMETHEUS_REMOTE_INFO.to_string(),
-            QUIRK_PROMETHEUS_UNREACHABLE.to_string(),
-            format!("prometheus_unreachable_reason: {reason}"),
+            DATA_SOURCE_THANOS_QUERY_INFO.to_string(),
+            QUIRK_THANOS_UNREACHABLE.to_string(),
+            format!("thanos_unreachable_reason: {reason}"),
             format!("query_latency_ms: {elapsed_ms}"),
         ]
     }
@@ -211,15 +218,15 @@ impl PrometheusForwardEngine {
     /// Forward `query` to `${base_url}/api/v1/query` and parse the
     /// Prometheus-format response back into a [`QueryResult`].
     ///
-    /// Errors are folded into [`PrometheusForwardError`] variants —
+    /// Errors are folded into [`ThanosQueryError`] variants —
     /// the [`QueryEngine`] impl decides how to surface each.
-    pub async fn query(&self, query: &str) -> Result<QueryResult, PrometheusForwardError> {
+    pub async fn query(&self, query: &str) -> Result<QueryResult, ThanosQueryError> {
         let started = Instant::now();
         let url = self.config.instant_endpoint();
         debug!(
             url = %url,
             query = query,
-            "prometheus-forward: issuing instant query",
+            "thanos-forward: issuing instant query",
         );
 
         let resp = self
@@ -228,89 +235,88 @@ impl PrometheusForwardEngine {
             .form(&[("query", query)])
             .send()
             .await
-            .map_err(|e| PrometheusForwardError::Unreachable(e.to_string()))?;
+            .map_err(|e| ThanosQueryError::Unreachable(e.to_string()))?;
 
         let status = resp.status();
         if status.is_server_error() {
-            return Err(PrometheusForwardError::Unreachable(format!(
+            return Err(ThanosQueryError::Unreachable(format!(
                 "upstream returned {status}",
             )));
         }
         if !status.is_success() {
-            // Treat 4xx as a "bad query" / capability miss — the
-            // upstream Prometheus didn't accept it (malformed
-            // PromQL, unknown metric, etc.).
+            // Treat 4xx as a "bad query" / capability miss — it's
+            // not an unreachable upstream, it's a query the
+            // sidecar doesn't accept.
             let body = resp.text().await.unwrap_or_default();
-            return Err(PrometheusForwardError::BadQuery {
+            return Err(ThanosQueryError::BadQuery {
                 status: status.as_u16(),
                 body,
             });
         }
 
-        let payload: PrometheusResponse = resp
+        let payload: ThanosResponse = resp
             .json()
             .await
-            .map_err(|e| PrometheusForwardError::ParseError(e.to_string()))?;
+            .map_err(|e| ThanosQueryError::ParseError(e.to_string()))?;
 
         let elapsed_ms = started.elapsed().as_millis();
-        let result = build_result_from_prometheus_payload(payload, elapsed_ms)
-            .map_err(PrometheusForwardError::ParseError)?;
+        let result = build_result_from_thanos_payload(payload, elapsed_ms)
+            .map_err(ThanosQueryError::ParseError)?;
         Ok(result)
     }
 }
 
 #[async_trait]
-impl QueryEngine for PrometheusForwardEngine {
+impl QueryEngine for ThanosQueryEngine {
     async fn execute(&self, query: &str) -> Result<QueryResult, crate::engines::EngineError> {
         match self.query(query).await {
             Ok(result) => Ok(result),
-            Err(PrometheusForwardError::Unreachable(reason)) => {
-                // Surface fail-loud as a backend error. Mode 3
-                // metrics have no failover slot, so the router will
-                // return AllFailed → the HTTP handler turns it into
-                // a 503 with the `prometheus_unreachable` quirk infos.
+            Err(ThanosQueryError::Unreachable(reason)) => {
+                // Surface fail-loud as a backend error so the
+                // router's failover sequence can fall through to
+                // the warm-tier sketch on a `DoubleWrite` deploy.
+                // The wrapped result also carries the quirk infos
+                // for direct (non-router) callers — see the test
+                // `unreachable_returns_quirk_infos_in_wrapped_result`.
                 warn!(
-                    engine = DATA_SOURCE_PROMETHEUS_REMOTE_ID,
+                    engine = self.data_source_id,
                     error = %reason,
-                    "prometheus-forward: upstream unreachable",
+                    "thanos-forward: upstream unreachable",
                 );
                 Err(crate::engines::EngineError::backend(
-                    DATA_SOURCE_PROMETHEUS_REMOTE_ID,
-                    format!("prometheus_unreachable: {reason}"),
+                    self.data_source_id,
+                    format!("thanos_unreachable: {reason}"),
                 ))
             }
-            Err(PrometheusForwardError::BadQuery { status, body }) => {
+            Err(ThanosQueryError::BadQuery { status, body }) => {
                 Err(crate::engines::EngineError::capability_miss(
-                    DATA_SOURCE_PROMETHEUS_REMOTE_ID,
-                    format!("prometheus rejected query (status {status}): {body}"),
+                    self.data_source_id,
+                    format!("thanos rejected query (status {status}): {body}"),
                 ))
             }
-            Err(PrometheusForwardError::ParseError(msg)) => {
-                Err(crate::engines::EngineError::backend(
-                    DATA_SOURCE_PROMETHEUS_REMOTE_ID,
-                    format!("prometheus response parse error: {msg}"),
-                ))
-            }
-            Err(PrometheusForwardError::ConfigInvalid(msg)) => {
-                Err(crate::engines::EngineError::backend(
-                    DATA_SOURCE_PROMETHEUS_REMOTE_ID,
-                    format!("prometheus client misconfigured: {msg}"),
-                ))
-            }
+            Err(ThanosQueryError::ParseError(msg)) => Err(crate::engines::EngineError::backend(
+                self.data_source_id,
+                format!("thanos response parse error: {msg}"),
+            )),
+            Err(ThanosQueryError::ConfigInvalid(msg)) => Err(crate::engines::EngineError::backend(
+                self.data_source_id,
+                format!("thanos client misconfigured: {msg}"),
+            )),
         }
     }
 
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
-            data_source_id: DATA_SOURCE_PROMETHEUS_REMOTE_ID,
-            // Mode 3 owns its own routing slot; the metric's data is
-            // shipped to Prometheus, not to ASAP-managed storage.
-            storage_backend: asap_types::StorageBackend::PrometheusRemote,
+            data_source_id: self.data_source_id,
+            // Re-uses the archive tier slot in the routing
+            // matrix; Path A2 swaps the engine answering, not the
+            // tier classification. See module docstring.
+            storage_backend: asap_types::StorageBackend::GorillaObjectStore,
             // Forwarder doesn't materialise samples locally;
-            // upstream Prometheus owns the memory budget. We surface
-            // a generous ceiling so the cost-aware dispatcher
-            // (Phase-6) prefers the forwarder for large streams once
-            // it lands.
+            // upstream thanos-query owns the memory budget. We
+            // surface a generous ceiling so the cost-aware
+            // dispatcher (Phase-6) prefers thanos for large
+            // streams once it lands.
             supports_streams_above_bytes: usize::MAX,
         }
     }
@@ -321,13 +327,13 @@ impl QueryEngine for PrometheusForwardEngine {
 // ---------------------------------------------------------------------------
 
 /// Subset of the Prometheus HTTP API response shape we actually
-/// consume. `serde` ignores unknown fields, so future Prometheus
+/// consume. `serde` ignores unknown fields, so future thanos
 /// extensions don't break parsing.
 #[derive(Debug, Deserialize)]
-struct PrometheusResponse {
+struct ThanosResponse {
     status: String,
     #[serde(default)]
-    data: Option<PrometheusData>,
+    data: Option<ThanosData>,
     #[serde(rename = "errorType", default)]
     error_type: Option<String>,
     #[serde(default)]
@@ -335,50 +341,66 @@ struct PrometheusResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct PrometheusData {
+struct ThanosData {
     #[serde(rename = "resultType", default)]
     result_type: String,
     #[serde(default)]
     result: Vec<Value>,
 }
 
-/// Build an ASAP [`QueryResult`] from a parsed Prometheus payload.
+/// Build an ASAP [`QueryResult`] from a parsed thanos payload.
 /// Pulled out as a pure function so the unit tests can pin the
 /// wrapping behaviour without spinning up a TCP listener.
-fn build_result_from_prometheus_payload(
-    payload: PrometheusResponse,
+fn build_result_from_thanos_payload(
+    payload: ThanosResponse,
     elapsed_ms: u128,
 ) -> Result<QueryResult, String> {
     if payload.status != "success" {
         let detail = payload.error.unwrap_or_else(|| "unknown error".to_string());
-        let kind = payload.error_type.unwrap_or_else(|| "execution".to_string());
-        return Err(format!("prometheus error ({kind}): {detail}"));
+        let kind = payload
+            .error_type
+            .unwrap_or_else(|| "execution".to_string());
+        return Err(format!("thanos error ({kind}): {detail}"));
     }
     let data = payload
         .data
-        .ok_or_else(|| "prometheus response missing `data`".to_string())?;
+        .ok_or_else(|| "thanos response missing `data`".to_string())?;
 
     let mut result = match data.result_type.as_str() {
         "vector" => parse_vector(&data.result)?,
         "matrix" => parse_matrix(&data.result)?,
-        // Scalar / string result types are valid PromQL but the ASAP
-        // wire shape only models vector / matrix. Surface as a parse
-        // error so callers see the upstream type rather than an
-        // empty vector.
+        // Scalar / string result types are valid PromQL but the
+        // ASAP wire shape only models vector / matrix. Surface as
+        // a parse error so callers see the upstream type rather
+        // than an empty vector.
         other => {
             return Err(format!(
-                "prometheus response carried unsupported resultType={other:?}"
+                "thanos response carried unsupported resultType={other:?}"
             ));
         }
     };
 
-    // Pin an exact-accuracy envelope on every wrapped answer. Mode 3
-    // reads from Prometheus's TSDB — the underlying samples are the
-    // raw OTLP-ingested points, so the answer is exact (ε = 0,
-    // δ = 0).
+    // Pin an exact-accuracy envelope on every wrapped answer.
+    // Path A2 reads from the Prometheus TSDB blocks
+    // `gorillas3processor` emits in Step-2.1 — the underlying
+    // samples are the raw chunks, not sketches, so the answer is
+    // exact (ε = 0, δ = 0).
     let envelope = AccuracyEnvelope::single(AccuracyProfile::exact());
     result = result.with_accuracy(envelope);
 
+    // Surface the wrapping infos via the result's `warnings`
+    // field. `warnings` is the only `QueryResult` channel that
+    // flows through `convert_query_result_to_prometheus` to the
+    // wire response's top-level `warnings: []` array; the
+    // `infos: []` array is appended downstream from the
+    // PrometheusResponse adapter (`with_accuracy` already mirrors
+    // a one-liner there). For dashboards that pin
+    // `data_source: thanos_query` byte-compares, the HTTP
+    // handler's `annotate_data_source` step adds the marker line
+    // to `infos` after dispatch — but only when the engine reports
+    // the `thanos_query` id; aliased registrations under
+    // `thanos_query` get the gorilla marker instead, which is
+    // fine for Path A2 backwards compat.
     let _ = elapsed_ms; // surfaced via tests directly via `success_infos`.
     Ok(result)
 }
@@ -452,12 +474,12 @@ fn parse_matrix(values: &[Value]) -> Result<QueryResult, String> {
     Ok(QueryResult::matrix(series))
 }
 
-/// Best-effort label extraction. Prometheus returns the `metric`
-/// field as a `{"__name__": "...", "label": "value"}` object; we
-/// flatten the values into `KeyByLabelValues` (the same shape the
+/// Best-effort label extraction. Thanos returns the `metric` field
+/// as a `{"__name__": "...", "label": "value"}` object; we flatten
+/// the values into `KeyByLabelValues` (the same shape the
 /// in-process engine pins on its results). Unknown / non-object
 /// shapes fall through to an empty label set rather than failing
-/// the parse — the wrapped `data_source: prometheus_remote` info is
+/// the parse — the wrapped `data_source: thanos_query` info is
 /// the meaningful annotation.
 fn labels_from_metric(metric: &Value) -> KeyByLabelValues {
     if let Some(obj) = metric.as_object() {
@@ -482,47 +504,46 @@ fn labels_from_metric(metric: &Value) -> KeyByLabelValues {
 /// envelope; the public `query` method returns the richer surface
 /// for tests and direct callers.
 #[derive(Debug, thiserror::Error)]
-pub enum PrometheusForwardError {
+pub enum ThanosQueryError {
     /// Upstream returned a network error / timeout / 5xx —
-    /// dashboard-level "prometheus is down."
-    #[error("prometheus unreachable: {0}")]
+    /// dashboard-level "thanos is down."
+    #[error("thanos unreachable: {0}")]
     Unreachable(String),
     /// Upstream returned a 4xx — the query is malformed from
-    /// Prometheus's point of view, not a backend failure.
-    #[error("prometheus rejected query (HTTP {status}): {body}")]
+    /// thanos's point of view, not a backend failure.
+    #[error("thanos rejected query (HTTP {status}): {body}")]
     BadQuery {
-        /// The 4xx status code Prometheus returned.
+        /// The 4xx status code thanos returned.
         status: u16,
         /// The (possibly empty) response body.
         body: String,
     },
     /// Upstream returned a 2xx but the body wasn't parseable as a
     /// Prometheus-format response.
-    #[error("prometheus response parse error: {0}")]
+    #[error("thanos response parse error: {0}")]
     ParseError(String),
-    /// reqwest client construction failed (TLS / DNS resolver init
-    /// etc.). Surfaces only at engine construction.
-    #[error("prometheus client config invalid: {0}")]
+    /// reqwest client construction failed (TLS / DNS resolver
+    /// init etc.). Surfaces only at engine construction.
+    #[error("thanos client config invalid: {0}")]
     ConfigInvalid(String),
 }
 
 // ---------------------------------------------------------------------------
 // Helpers re-exported for the engine's test module + the binary's
-// conditional registration.
+// "alias under the legacy slot" registration.
 // ---------------------------------------------------------------------------
 
 /// Convenience combinator the binary uses at startup: try
-/// [`PrometheusForwardEngine::from_env`]; if it returns `None`, the
-/// caller skips registration and the routing table will surface a
-/// clear "engine not registered" error if it ever references
-/// `prometheus_remote`.
+/// [`ThanosQueryEngine::from_env`]; if it returns `None`, the
+/// caller falls through to the legacy in-process
+/// [`crate::stores::gorilla_object_store::GorillaQueryEngine`] path.
 ///
 /// Returning `Result<Option<...>, ...>` instead of unwrapping in
-/// `main.rs` keeps the construction failure (bad URL / bad TLS init)
-/// inspectable so the binary can emit a helpful warning instead of
-/// crashing on startup.
-pub fn engine_from_env() -> Result<Option<PrometheusForwardEngine>, PrometheusForwardError> {
-    match PrometheusForwardEngine::from_env() {
+/// `main.rs` keeps the construction failure (bad URL / bad TLS
+/// init) inspectable so the binary can emit a helpful warning
+/// instead of crashing on startup.
+pub fn engine_from_env() -> Result<Option<ThanosQueryEngine>, ThanosQueryError> {
+    match ThanosQueryEngine::from_env() {
         Some(Ok(engine)) => Ok(Some(engine)),
         Some(Err(e)) => Err(e),
         None => Ok(None),
@@ -537,8 +558,9 @@ pub fn engine_from_env() -> Result<Option<PrometheusForwardEngine>, PrometheusFo
 #[cfg(any(test, feature = "extra_debugging"))]
 pub mod test_support {
     //! Test-only helpers for spinning up an in-process mock
-    //! Prometheus instance. Used by the unit + integration tests
-    //! below.
+    //! `thanos-query` sidecar. Used by the unit + integration
+    //! tests below and by the `routing/query_engine_routing.rs` tests
+    //! once they grow Path A2 coverage.
 
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
@@ -552,19 +574,20 @@ pub mod test_support {
     /// Returns `(base_url, join_handle)`. Drop the handle to stop
     /// serving (the test runtime tears down anyway when the
     /// `#[tokio::test]` future completes).
-    pub async fn spawn_mock_prometheus(canned_body: &'static str) -> (String, JoinHandle<()>) {
+    pub async fn spawn_mock_thanos(canned_body: &'static str) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let local: SocketAddr = listener.local_addr().expect("local_addr");
         let base_url = format!("http://{local}");
 
         let app: Router = Router::new()
             .route("/api/v1/query", post(move || async move { canned_body }))
-            .route("/api/v1/query_range", post(move || async move { canned_body }));
+            .route(
+                "/api/v1/query_range",
+                post(move || async move { canned_body }),
+            );
 
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .await
-                .expect("mock_prometheus serve");
+            axum::serve(listener, app).await.expect("mock_thanos serve");
         });
 
         // Best-effort: yield once so the listener is definitely
@@ -573,10 +596,10 @@ pub mod test_support {
         (base_url, handle)
     }
 
-    /// Same as [`spawn_mock_prometheus`] but the handler always
-    /// returns `503 Service Unavailable`. Used by the "unreachable
-    /// upstream" test.
-    pub async fn spawn_mock_prometheus_503() -> (String, JoinHandle<()>) {
+    /// Same as [`spawn_mock_thanos`] but the handler always
+    /// returns `503 Service Unavailable`. Used by the
+    /// "unreachable upstream" test.
+    pub async fn spawn_mock_thanos_503() -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let local: SocketAddr = listener.local_addr().expect("local_addr");
         let base_url = format!("http://{local}");
@@ -592,7 +615,7 @@ pub mod test_support {
         let handle = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
-                .expect("mock_prometheus_503 serve");
+                .expect("mock_thanos_503 serve");
         });
         tokio::task::yield_now().await;
         (base_url, handle)
@@ -600,8 +623,8 @@ pub mod test_support {
 
     /// Best-effort env-var override scope guard. Used by the
     /// `from_env` tests to set / unset
-    /// `ASAP_PROMETHEUS_QUERY_URL` without leaking onto sibling
-    /// tests. Tests that touch this guard are serialised on a global
+    /// `ASAP_THANOS_QUERY_URL` without leaking onto sibling tests.
+    /// Tests that touch this guard are serialised on a global
     /// mutex so they don't race.
     pub struct EnvGuard {
         key: &'static str,
@@ -632,9 +655,9 @@ pub mod test_support {
     }
 
     /// Global mutex that serialises tests touching
-    /// `ASAP_PROMETHEUS_QUERY_URL` (and any other process-wide env
-    /// var). Use as `let _g = ENV_LOCK.lock().unwrap();` at the top
-    /// of every env-touching test.
+    /// `ASAP_THANOS_QUERY_URL` (and any other process-wide env
+    /// var). Use as `let _g = ENV_LOCK.lock().unwrap();` at the
+    /// top of every env-touching test.
     pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A minimal canned vector response — `up{job="prometheus"} 1`
@@ -658,15 +681,13 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        spawn_mock_prometheus, spawn_mock_prometheus_503, CANNED_VECTOR_BODY, ENV_LOCK,
+        spawn_mock_thanos, spawn_mock_thanos_503, CANNED_VECTOR_BODY, ENV_LOCK,
     };
     use super::*;
     use crate::engines::query_result::QueryResult;
-    use crate::routing::engine_router::{EngineRouter, QueryEngine as RouterQueryEngine};
-    use std::sync::Arc;
 
-    fn config_for(url: &str) -> PrometheusForwardConfig {
-        PrometheusForwardConfig {
+    fn config_for(url: &str) -> ThanosQueryConfig {
+        ThanosQueryConfig {
             base_url: url.trim_end_matches('/').to_string(),
             request_timeout: Duration::from_secs(5),
         }
@@ -674,13 +695,13 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_promql_and_wraps_response() {
-        let (url, _handle) = spawn_mock_prometheus(CANNED_VECTOR_BODY).await;
-        let engine = PrometheusForwardEngine::new(config_for(&url)).expect("engine");
+        let (url, _handle) = spawn_mock_thanos(CANNED_VECTOR_BODY).await;
+        let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
         let result = engine.query("up").await.expect("ok response");
 
-        let infos = PrometheusForwardEngine::success_infos(0);
+        let infos = ThanosQueryEngine::success_infos(0);
         assert!(
-            infos.iter().any(|s| s == DATA_SOURCE_PROMETHEUS_REMOTE_INFO),
+            infos.iter().any(|s| s == DATA_SOURCE_THANOS_QUERY_INFO),
             "success_infos must carry the data_source marker; got {infos:?}",
         );
         assert!(
@@ -697,49 +718,48 @@ mod tests {
                 assert_eq!(iv.values.len(), 1);
                 assert_eq!(iv.values[0].value, 1.0);
                 let env = iv.accuracy.expect("envelope attached");
-                assert!(env.summary().contains("kind=exact"));
+                assert_eq!(env.summary().contains("kind=exact"), true);
             }
             other => panic!("expected Vector result, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn capabilities_report_prometheus_remote_id() {
+    async fn capabilities_report_thanos_query_id() {
         // No upstream needed — we only inspect capabilities.
-        let engine =
-            PrometheusForwardEngine::new(config_for("http://127.0.0.1:1")).expect("engine");
+        let engine = ThanosQueryEngine::new(config_for("http://127.0.0.1:1")).expect("engine");
         let caps = engine.capabilities();
-        assert_eq!(caps.data_source_id, DATA_SOURCE_PROMETHEUS_REMOTE_ID);
+        assert_eq!(caps.data_source_id, DATA_SOURCE_THANOS_QUERY_ID);
         assert_eq!(
             caps.storage_backend,
-            asap_types::StorageBackend::PrometheusRemote,
-            "Phase ε.2 owns its own slot in the routing matrix",
+            asap_types::StorageBackend::GorillaObjectStore,
+            "Path A2 re-uses the archive tier slot in the routing matrix",
         );
     }
 
     #[tokio::test]
     async fn unreachable_upstream_returns_503_quirk_via_engine_trait() {
-        let (url, _handle) = spawn_mock_prometheus_503().await;
-        let engine = PrometheusForwardEngine::new(config_for(&url)).expect("engine");
+        let (url, _handle) = spawn_mock_thanos_503().await;
+        let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
 
         // The richer surface returns Unreachable.
         let direct = engine.query("up").await;
         match direct {
-            Err(PrometheusForwardError::Unreachable(_)) => {}
+            Err(ThanosQueryError::Unreachable(_)) => {}
             other => panic!("expected Unreachable error, got {other:?}"),
         }
 
         // The trait surface folds it into a `Backend` error so the
-        // router's failover sequence (which for `PrometheusRemote`
-        // is just itself) returns AllFailed → the HTTP handler turns
-        // it into a 503 with the `prometheus_unreachable` quirk infos.
-        let trait_path = RouterQueryEngine::execute(&engine, "up").await;
+        // router falls through to the warm-tier sketch on a
+        // `DoubleWrite` deploy. The HTTP handler turns this into a
+        // 503 with the `thanos_unreachable` quirk infos.
+        let trait_path = QueryEngine::execute(&engine, "up").await;
         match trait_path {
             Err(crate::engines::EngineError::Backend { engine_id, message }) => {
-                assert_eq!(engine_id, DATA_SOURCE_PROMETHEUS_REMOTE_ID);
+                assert_eq!(engine_id, DATA_SOURCE_THANOS_QUERY_ID);
                 assert!(
-                    message.contains("prometheus_unreachable"),
-                    "Backend error must carry prometheus_unreachable marker; got {message:?}",
+                    message.contains("thanos_unreachable"),
+                    "Backend error must carry thanos_unreachable marker; got {message:?}",
                 );
             }
             other => panic!("expected Backend error, got {other:?}"),
@@ -747,43 +767,40 @@ mod tests {
 
         // The unreachable_infos helper exposes the wire shape
         // dashboards / e2e demos pin against.
-        let infos = PrometheusForwardEngine::unreachable_infos("upstream returned 503", 0);
-        assert!(infos.iter().any(|s| s == QUIRK_PROMETHEUS_UNREACHABLE));
-        assert!(infos.iter().any(|s| s.contains("prometheus_unreachable_reason")));
+        let infos = ThanosQueryEngine::unreachable_infos("upstream returned 503", 0);
+        assert!(infos.iter().any(|s| s == QUIRK_THANOS_UNREACHABLE));
+        assert!(infos
+            .iter()
+            .any(|s| s.contains("thanos_unreachable_reason")));
     }
 
     #[tokio::test]
     async fn config_from_env_returns_none_when_unset() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::unset(ASAP_PROMETHEUS_QUERY_URL_ENV);
-        assert!(PrometheusForwardConfig::from_env().is_none());
+        let _scope = test_support::EnvGuard::unset(ASAP_THANOS_QUERY_URL_ENV);
+        assert!(ThanosQueryConfig::from_env().is_none());
     }
 
     #[tokio::test]
     async fn config_from_env_returns_none_when_blank() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(ASAP_PROMETHEUS_QUERY_URL_ENV, "   ");
-        assert!(PrometheusForwardConfig::from_env().is_none());
+        let _scope = test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "   ");
+        assert!(ThanosQueryConfig::from_env().is_none());
     }
 
     #[tokio::test]
     async fn config_from_env_strips_trailing_slash() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_PROMETHEUS_QUERY_URL_ENV,
-            "http://prometheus:9090/",
-        );
-        let cfg = PrometheusForwardConfig::from_env().expect("set");
-        assert_eq!(cfg.base_url, "http://prometheus:9090");
+        let _scope =
+            test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "http://thanos-query:10903/");
+        let cfg = ThanosQueryConfig::from_env().expect("set");
+        assert_eq!(cfg.base_url, "http://thanos-query:10903");
     }
 
     #[tokio::test]
     async fn engine_from_env_returns_some_when_set() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::set(
-            ASAP_PROMETHEUS_QUERY_URL_ENV,
-            "http://127.0.0.1:1",
-        );
+        let _scope = test_support::EnvGuard::set(ASAP_THANOS_QUERY_URL_ENV, "http://127.0.0.1:1");
         let engine = engine_from_env().expect("ok");
         assert!(engine.is_some(), "env set → engine constructed");
     }
@@ -791,81 +808,41 @@ mod tests {
     #[tokio::test]
     async fn engine_from_env_returns_none_when_unset() {
         let _g = ENV_LOCK.lock().expect("lock");
-        let _scope = test_support::EnvGuard::unset(ASAP_PROMETHEUS_QUERY_URL_ENV);
+        let _scope = test_support::EnvGuard::unset(ASAP_THANOS_QUERY_URL_ENV);
         let engine = engine_from_env().expect("ok");
         assert!(
             engine.is_none(),
-            "env unset → caller must skip registration",
+            "env unset → caller must use legacy engine"
         );
     }
 
-    /// Phase ε.2 router-startup contract: when the env var is set,
-    /// the binary should register the engine under `prometheus_remote`;
-    /// when unset, the engine should not be registered and the
-    /// router should not list `prometheus_remote` among its ids.
-    /// Mirrors the binary's wiring without re-running the full
-    /// `main.rs` startup sequence.
-    #[tokio::test]
-    async fn router_register_when_env_set_skip_when_unset() {
-        // Env set → engine registered.
-        {
-            let _g = ENV_LOCK.lock().expect("lock");
-            let _scope = test_support::EnvGuard::set(
-                ASAP_PROMETHEUS_QUERY_URL_ENV,
-                "http://127.0.0.1:1",
-            );
-            let mut router = EngineRouter::new();
-            if let Ok(Some(engine)) = engine_from_env() {
-                router.register(Arc::new(engine));
-            }
-            assert!(
-                router.engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID).is_some(),
-                "env set must yield prometheus_remote engine in the router",
-            );
-        }
-
-        // Env unset → engine NOT registered.
-        {
-            let _g = ENV_LOCK.lock().expect("lock");
-            let _scope = test_support::EnvGuard::unset(ASAP_PROMETHEUS_QUERY_URL_ENV);
-            let mut router = EngineRouter::new();
-            if let Ok(Some(engine)) = engine_from_env() {
-                router.register(Arc::new(engine));
-            }
-            assert!(
-                router.engine_by_id(DATA_SOURCE_PROMETHEUS_REMOTE_ID).is_none(),
-                "env unset must leave prometheus_remote unregistered",
-            );
-        }
-    }
-
     #[test]
-    fn build_result_from_prometheus_payload_rejects_non_success() {
-        let payload = PrometheusResponse {
+    fn build_result_from_thanos_payload_rejects_non_success() {
+        let payload = ThanosResponse {
             status: "error".to_string(),
             data: None,
             error_type: Some("execution".to_string()),
             error: Some("query timed out".to_string()),
         };
-        let err = build_result_from_prometheus_payload(payload, 0).unwrap_err();
+        let err = build_result_from_thanos_payload(payload, 0).unwrap_err();
         assert!(err.contains("query timed out"));
     }
 
     #[test]
-    fn build_result_from_prometheus_payload_rejects_unsupported_result_type() {
+    fn build_result_from_thanos_payload_rejects_unsupported_result_type() {
         // resultType = "scalar" is valid PromQL but unsupported in
         // ASAP's wire shape — we want a clear parse error rather
         // than an empty vector.
-        let payload = PrometheusResponse {
+        let payload = ThanosResponse {
             status: "success".to_string(),
-            data: Some(PrometheusData {
+            data: Some(ThanosData {
                 result_type: "scalar".to_string(),
                 result: vec![],
             }),
             error_type: None,
             error: None,
         };
-        let err = build_result_from_prometheus_payload(payload, 0).unwrap_err();
+        let err = build_result_from_thanos_payload(payload, 0).unwrap_err();
         assert!(err.contains("unsupported resultType"));
     }
 

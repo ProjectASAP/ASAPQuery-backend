@@ -199,13 +199,16 @@ pub fn estimate_fill_rate(
     w: &QueryWorkload,
 ) -> f64 {
     let flush_secs = flush_period_secs(plan, w);
-    let inserts_per_flush =
-        wc.samples_per_sec_per_series * wc.series_count as f64 * flush_secs;
+    let inserts_per_flush = wc.samples_per_sec_per_series * wc.series_count as f64 * flush_secs;
     let distinct = estimate_distinct_keys(inserts_per_flush, wc);
     match &plan.agent_config.sketch_params {
         SketchParams::CountMinSketch { cols, .. } => {
             let cols = *cols as f64;
-            if cols > 0.0 { (distinct / cols).min(1.0) } else { 0.05 }
+            if cols > 0.0 {
+                (distinct / cols).min(1.0)
+            } else {
+                0.05
+            }
         }
         SketchParams::CountSketch { .. } => {
             // CountSketch uses epsilon-based sizing; approximate cols ≈ 1/ε².
@@ -237,10 +240,18 @@ pub fn interpolate_compression(costs: &DeltaCosts, fill_rate: f64) -> f64 {
         costs.compression_at_fill_1pct
     } else if fill_rate <= 0.05 {
         let t = (fill_rate - 0.01) / (0.05 - 0.01);
-        lerp(costs.compression_at_fill_1pct, costs.compression_at_fill_5pct, t)
+        lerp(
+            costs.compression_at_fill_1pct,
+            costs.compression_at_fill_5pct,
+            t,
+        )
     } else if fill_rate <= 0.20 {
         let t = (fill_rate - 0.05) / (0.20 - 0.05);
-        lerp(costs.compression_at_fill_5pct, costs.compression_at_fill_20pct, t)
+        lerp(
+            costs.compression_at_fill_5pct,
+            costs.compression_at_fill_20pct,
+            t,
+        )
     } else {
         // Linear extrapolation toward 1.0 at 100 % fill.
         let t = ((fill_rate - 0.20) / 0.80).min(1.0);
@@ -268,7 +279,10 @@ pub fn raw_bytes_per_sec(wc: &WorkloadCharacteristics) -> f64 {
 /// The dim_multiplier in the existing `PlanScore` captures the QUERY fanout
 /// (how many group-by combinations exist); for bandwidth estimation we treat
 /// `series_count` as the total sketch instances after aggregation.
-pub fn sketch_full_bytes_per_sec(wc: &WorkloadCharacteristics, bytes_per_series_per_sec: f64) -> f64 {
+pub fn sketch_full_bytes_per_sec(
+    wc: &WorkloadCharacteristics,
+    bytes_per_series_per_sec: f64,
+) -> f64 {
     wc.series_count as f64 * bytes_per_series_per_sec
 }
 
@@ -309,7 +323,11 @@ pub fn decide_delta(
     let raw_bw = raw_bytes_per_sec(wc);
     let full_bw = sketch_full_bytes_per_sec(wc, bytes_per_series_per_sec);
     let flush_secs = flush_period_secs(plan, w);
-    let flush_hz = if flush_secs > 0.0 { 1.0 / flush_secs } else { 1.0 };
+    let flush_hz = if flush_secs > 0.0 {
+        1.0 / flush_secs
+    } else {
+        1.0
+    };
 
     // ── 1. Workload too small for sketching ──────────────────────────────────
     let total_sample_rate = wc.series_count as f64 * wc.samples_per_sec_per_series;
@@ -394,8 +412,7 @@ pub fn decide_delta(
     // ── 6. Memory overhead ───────────────────────────────────────────────────
     // One snapshot per sketch instance; the number of sketch instances
     // equals series_count × dim_mult (each group-by partition is separate).
-    let snapshot_mem =
-        wc.series_count as f64 * dim_mult * costs.snapshot_bytes_per_sketch as f64;
+    let snapshot_mem = wc.series_count as f64 * dim_mult * costs.snapshot_bytes_per_sketch as f64;
 
     let summary = TransmissionCostSummary {
         raw_bytes_per_sec: raw_bw,
@@ -620,7 +637,10 @@ mod tests {
         let r5 = interpolate_compression(&costs, 0.05);
         let r20 = interpolate_compression(&costs, 0.20);
         let r80 = interpolate_compression(&costs, 0.80);
-        assert!(r1 >= r5, "compression should decrease as fill rises: {r1} vs {r5}");
+        assert!(
+            r1 >= r5,
+            "compression should decrease as fill rises: {r1} vs {r5}"
+        );
         assert!(r5 >= r20, "{r5} vs {r20}");
         assert!(r20 >= r80, "{r20} vs {r80}");
     }
@@ -629,7 +649,10 @@ mod tests {
     fn compression_at_100pct_is_near_one() {
         let costs = delta_benchmark_table()[&SketchType::CountMinSketch];
         let r = interpolate_compression(&costs, 1.0);
-        assert!(r <= 1.05, "at 100 % fill compression ratio should be ~1: {r}");
+        assert!(
+            r <= 1.05,
+            "at 100 % fill compression ratio should be ~1: {r}"
+        );
     }
 
     // ── decide_delta branches ─────────────────────────────────────────────────
@@ -768,8 +791,7 @@ mod tests {
         let (_, s10) = decide_delta(&plan_10s, &w, &default_wc(), 200.0);
         let (_, s60) = decide_delta(&plan_60s, &w, &default_wc(), 200.0);
         assert!(
-            s60.delta_cpu_overhead_micros_per_sample
-                < s10.delta_cpu_overhead_micros_per_sample,
+            s60.delta_cpu_overhead_micros_per_sample < s10.delta_cpu_overhead_micros_per_sample,
             "longer flush period should lower per-sample CPU overhead: \
              10s={:.4}µs 60s={:.4}µs",
             s10.delta_cpu_overhead_micros_per_sample,

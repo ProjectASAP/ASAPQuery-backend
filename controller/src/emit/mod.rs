@@ -18,23 +18,23 @@
 pub mod agent;
 pub mod asapquery_backend;
 pub mod backend;
+pub mod otap;
 pub mod precompute;
 pub mod stage_config;
-pub mod otap;
 pub mod telegraf;
 pub mod trait_def;
 
 pub use agent::generate_agent_config;
 pub use asapquery_backend::generate_streaming_config_yaml;
 pub use backend::{generate_backend_config, generate_backend_config_staged};
-pub use precompute::{should_precompute, build_precompute_jobs, PrecomputeClient};
+pub use otap::emit_otap_dag_yaml;
+pub use precompute::{build_precompute_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{
     emit_backend_config_json, emit_backend_storage_routing,
     emit_backend_storage_routing_for_tenant, emit_backend_storage_routing_with_prometheus,
     emit_backend_storage_routing_with_prometheus_for_tenant, emit_edge_yaml, emit_gateway_yaml,
     DEFAULT_TENANT,
 };
-pub use otap::emit_otap_dag_yaml;
 pub use telegraf::emit_telegraf_toml;
 pub use trait_def::{
     InferenceConfigEmitter, InferenceConfigInput, OpampEmitter, OpampGatewayEmitter,
@@ -49,8 +49,8 @@ pub use trait_def::{
 pub use crate::workload::WorkloadRegistry;
 
 use crate::physical::colored_dag::emitter::EdgeStageConfig;
-use crate::sketch_algebra::SketchExpr;
 use crate::sketch_algebra::params::SketchKind;
+use crate::sketch_algebra::SketchExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
 
@@ -145,10 +145,8 @@ pub const WORKLOAD_ARCHIVE_WINDOW_SECS: u64 = 60;
 /// warm-passthrough routing the DDSketch processor renames them to
 /// `_quantile`, and without `gorillas3` archive write the warm engine
 /// has nothing to look at.
-pub const FRESHNESS_PROBE_METRICS: &[&str] = &[
-    "http_freshness_probe_warm",
-    "http_freshness_probe_archive",
-];
+pub const FRESHNESS_PROBE_METRICS: &[&str] =
+    &["http_freshness_probe_warm", "http_freshness_probe_archive"];
 
 /// Bootstrap/replan-scope plumbing: extend an Edge stage config with
 /// the freshness-probe metrics (`http_freshness_probe_warm` /
@@ -307,15 +305,27 @@ mod runtime_tests {
 
     #[test]
     fn agent_runtime_from_header_recognises_three_values() {
-        assert_eq!(AgentRuntime::from_header("asap-otel"), AgentRuntime::AsapOtel);
-        assert_eq!(AgentRuntime::from_header("asap-otap"), AgentRuntime::AsapOtap);
-        assert_eq!(AgentRuntime::from_header("asap-telegraf"), AgentRuntime::AsapTelegraf);
+        assert_eq!(
+            AgentRuntime::from_header("asap-otel"),
+            AgentRuntime::AsapOtel
+        );
+        assert_eq!(
+            AgentRuntime::from_header("asap-otap"),
+            AgentRuntime::AsapOtap
+        );
+        assert_eq!(
+            AgentRuntime::from_header("asap-telegraf"),
+            AgentRuntime::AsapTelegraf
+        );
     }
 
     #[test]
     fn agent_runtime_from_header_short_aliases() {
         assert_eq!(AgentRuntime::from_header("otap"), AgentRuntime::AsapOtap);
-        assert_eq!(AgentRuntime::from_header("telegraf"), AgentRuntime::AsapTelegraf);
+        assert_eq!(
+            AgentRuntime::from_header("telegraf"),
+            AgentRuntime::AsapTelegraf
+        );
     }
 
     #[test]
@@ -326,10 +336,10 @@ mod runtime_tests {
 
     #[test]
     fn emit_for_runtime_default_matches_emit_edge_yaml() {
-        use crate::sketch_algebra::params::{DDSketchParams, SketchParams};
         use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
         use crate::sketch_algebra::params::SketchKind;
+        use crate::sketch_algebra::params::{DDSketchParams, SketchParams};
 
         let cfg = EdgeStageConfig {
             source_metric: Some("m".to_string()),
@@ -348,11 +358,13 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
         };
 
-        let collector = emit_for_runtime(
-            AgentRuntime::AsapOtel, &cfg, "ws://ctrl/v1/opamp", None,
-        ).expect("collector emit ok");
+        let collector = emit_for_runtime(AgentRuntime::AsapOtel, &cfg, "ws://ctrl/v1/opamp", None)
+            .expect("collector emit ok");
         let direct = emit_edge_yaml(&cfg, "ws://ctrl/v1/opamp").expect("direct emit ok");
-        assert_eq!(collector, direct, "AsapOtel dispatch must equal emit_edge_yaml");
+        assert_eq!(
+            collector, direct,
+            "AsapOtel dispatch must equal emit_edge_yaml"
+        );
     }
 
     #[test]
@@ -371,11 +383,13 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
         };
-        let yaml = emit_for_runtime(
-            AgentRuntime::AsapOtap, &cfg, "ws://ctrl/v1/opamp", None,
-        ).expect("otap emit ok");
+        let yaml = emit_for_runtime(AgentRuntime::AsapOtap, &cfg, "ws://ctrl/v1/opamp", None)
+            .expect("otap emit ok");
         // OTAP-specific token.
-        assert!(yaml.contains("otel_dataflow/v1"), "expected OTAP DAG version\n{yaml}");
+        assert!(
+            yaml.contains("otel_dataflow/v1"),
+            "expected OTAP DAG version\n{yaml}"
+        );
     }
 
     #[test]
@@ -394,11 +408,13 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
         };
-        let toml = emit_for_runtime(
-            AgentRuntime::AsapTelegraf, &cfg, "ws://ctrl/v1/opamp", None,
-        ).expect("telegraf emit ok");
+        let toml = emit_for_runtime(AgentRuntime::AsapTelegraf, &cfg, "ws://ctrl/v1/opamp", None)
+            .expect("telegraf emit ok");
         // Telegraf-specific token.
-        assert!(toml.contains("[[inputs.opentelemetry]]"), "expected Telegraf TOML header\n{toml}");
+        assert!(
+            toml.contains("[[inputs.opentelemetry]]"),
+            "expected Telegraf TOML header\n{toml}"
+        );
     }
 
     // ── stitching-gap regression: registry walk binds all 6 contract metrics ──
@@ -415,37 +431,38 @@ mod runtime_tests {
 
     /// Mimics the pre-population loop in `main()` — turns each
     /// `WorkloadEntry` into a `QueryWorkload` via the shared `Analyzer`.
-    fn populate_store_from_registry(
-        registry: &WorkloadRegistry,
-        store: &WorkloadStore,
-    ) {
+    fn populate_store_from_registry(registry: &WorkloadRegistry, store: &WorkloadStore) {
         use crate::pipeline::{Analyzer, QuerySpec};
         use crate::types;
         use crate::types_v2;
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
             let spec = QuerySpec {
-                query_string:    entry.query_string.clone(),
-                metric_name:     entry.metric_name.clone(),
-                label_filters:   Default::default(),
+                query_string: entry.query_string.clone(),
+                metric_name: entry.metric_name.clone(),
+                label_filters: Default::default(),
                 group_by_labels: vec![],
-                aggregations:    vec!["quantile".into()],
-                time_window:     "5m".into(),
-                repeat_every:    None,
-                accuracy_sla:    entry.accuracy_sla,
-                latency_sla:     None,
-                sketch_type:     entry.sketch_family_override.clone(),
-                workload:        types::WorkloadCharacteristics::default(),
-                id:               None,
-                language:         None,
-                accuracy:         None,
-                dollars:          None,
+                aggregations: vec!["quantile".into()],
+                time_window: "5m".into(),
+                repeat_every: None,
+                accuracy_sla: entry.accuracy_sla,
+                latency_sla: None,
+                sketch_type: entry.sketch_family_override.clone(),
+                workload: types::WorkloadCharacteristics::default(),
+                id: None,
+                language: None,
+                accuracy: None,
+                dollars: None,
                 deployment_model: None,
-                shape:            types_v2::QueryShape::default(),
-                data:             types_v2::DataShape::default(),
+                shape: types_v2::QueryShape::default(),
+                data: types_v2::DataShape::default(),
             };
             if let Ok(wl) = analyzer.analyze(spec) {
-                store.set(&entry.metric_name, wl, types::WorkloadCharacteristics::default());
+                store.set(
+                    &entry.metric_name,
+                    wl,
+                    types::WorkloadCharacteristics::default(),
+                );
             }
         }
     }
@@ -503,12 +520,12 @@ mod runtime_tests {
 
         // 5 sketched metrics + http_requests_total (raw, declines binding).
         let expected: Vec<(&str, Option<SketchKind>)> = vec![
-            ("http_latency_ms",        Some(SketchKind::DDSketch)),
-            ("http_requests_total",    None),  // raw passthrough
-            ("request_size_bytes",     Some(SketchKind::Kll)),
-            ("unique_users_per_min",   Some(SketchKind::Hll)),
-            ("top_endpoint_qps",       Some(SketchKind::CountSketch)),
-            ("endpoint_request_freq",  Some(SketchKind::Cms)),
+            ("http_latency_ms", Some(SketchKind::DDSketch)),
+            ("http_requests_total", None), // raw passthrough
+            ("request_size_bytes", Some(SketchKind::Kll)),
+            ("unique_users_per_min", Some(SketchKind::Hll)),
+            ("top_endpoint_qps", Some(SketchKind::CountSketch)),
+            ("endpoint_request_freq", Some(SketchKind::Cms)),
         ];
         for (metric, want) in &expected {
             let got = map.get(*metric).cloned();
@@ -519,7 +536,10 @@ mod runtime_tests {
             );
         }
         // Routing table covers all 5 sketched metrics.
-        assert_eq!(map.len(), 5,
-            "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}");
+        assert_eq!(
+            map.len(),
+            5,
+            "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}"
+        );
     }
 }

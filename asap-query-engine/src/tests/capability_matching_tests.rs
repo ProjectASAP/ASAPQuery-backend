@@ -9,7 +9,7 @@ use crate::data_model::{
     PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig, StreamingConfig,
     WindowType,
 };
-use crate::engines::simple::engine::SimpleEngine;
+use crate::engines::asap_query::engine::SimpleEngine;
 use crate::precompute_operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;

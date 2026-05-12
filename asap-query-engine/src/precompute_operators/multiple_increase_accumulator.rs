@@ -459,21 +459,11 @@ mod tests {
 
         acc.update(
             east.clone(),
-            IncreaseAccumulator::new(
-                Measurement::new(10.0),
-                1000,
-                Measurement::new(100.0),
-                2000,
-            ),
+            IncreaseAccumulator::new(Measurement::new(10.0), 1000, Measurement::new(100.0), 2000),
         );
         acc.update(
             west.clone(),
-            IncreaseAccumulator::new(
-                Measurement::new(5.0),
-                1000,
-                Measurement::new(50.0),
-                2000,
-            ),
+            IncreaseAccumulator::new(Measurement::new(5.0), 1000, Measurement::new(50.0), 2000),
         );
 
         assert_eq!(acc.query(Statistic::Sum, &east, None).unwrap(), 100.0);

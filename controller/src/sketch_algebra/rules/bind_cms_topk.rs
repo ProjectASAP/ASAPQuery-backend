@@ -62,14 +62,8 @@ impl Rule for BindCountSketchOnTopK {
                 (a.min(*eps), *delta)
             }
             (
-                AccuracyTarget::EpsilonDelta {
-                    eps: a,
-                    delta: da,
-                },
-                AccuracyTarget::EpsilonDelta {
-                    eps: b,
-                    delta: db,
-                },
+                AccuracyTarget::EpsilonDelta { eps: a, delta: da },
+                AccuracyTarget::EpsilonDelta { eps: b, delta: db },
             ) => (a.min(*b), da.min(*db)),
         };
 

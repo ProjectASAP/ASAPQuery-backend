@@ -22,7 +22,7 @@ Cross-links to design docs:
 
 - §1 / §2 reference the schema timeline of
   [`design-sketch-db.md`](./design-sketch-db.md) §7 and the
-  combinability table of `engines/timeline_dispatch.rs`.
+  combinability table of `query-engines/timeline_dispatch.rs`.
 - §3 references the §6.3 write barrier of
   [`design-sketch-db-core.md`](./design-sketch-db-core.md).
 - §4 references the §10.5 deterministic-rebuild contract of
@@ -72,7 +72,7 @@ $[t_0, t_1), [t_1, t_2), \dots, [t_{n-1}, t_n)$, each owned by a
 single `AggSchema` with its own sketch parameters. The query
 engine evaluates the statistic per segment and feeds the per-
 segment scalars to `combine_statistic`
-(`asap-query-engine/src/engines/timeline_dispatch.rs`).
+(`asap-query-engine/src/query-engines/timeline_dispatch.rs`).
 
 ### 2.1 Statement
 
@@ -147,7 +147,7 @@ Idempotence + associativity together justify the pointwise fold.
 **L2.4 — Triangle inequality on real numbers.** Standard.
 
 **L2.5 — Combiner implementation.** `combine_statistic`
-(`asap-query-engine/src/engines/timeline_dispatch.rs:combine_statistic`)
+(`asap-query-engine/src/query-engines/timeline_dispatch.rs:combine_statistic`)
 folds segments via `fold(0.0, +)` for `Count` / `Sum`,
 `fold(None, |a,v| Some(a.map_or(v, |a| a.min(v))))` for `Min` (mut.
 mut. for `Max`), and returns `None` (so a `Partial` wrapper) for
@@ -255,7 +255,7 @@ nothing further to prove.
 
 ### 2.5 Code anchors
 
-- `asap-query-engine/src/engines/timeline_dispatch.rs`
+- `asap-query-engine/src/query-engines/timeline_dispatch.rs`
   - `combine_statistic` — the per-statistic fold (additive arm,
     `Min` / `Max` arm, non-combinable arm).
   - `CombinedResult::{Full, Partial}` — the `Full` / `Partial`
@@ -265,7 +265,7 @@ nothing further to prove.
   - `SchemaRegistry::timeline_for_metric` — disjoint covering
     (L2.1).
   - `AggSchema::config` — pinned-at-creation invariant (caveat 1).
-- `asap-query-engine/src/engines/simple_engine.rs`
+- `asap-query-engine/src/query-engines/asap_query/engine.rs`
   - `SimpleEngine::try_handle_query_promql_via_timeline` — caller
     that wires per-segment evaluation into `combine_statistic`.
 - `asap-query-engine/src/stores/sketch_db/accuracy.rs`
@@ -683,7 +683,7 @@ the paper's §theory chapter can cite both at once.
   `asap-query-engine/src/stores/sketch_db/accuracy.rs`
   (`AccuracyProfile::derive`).
 - **`combine_statistic` correctness (§2)** →
-  `asap-query-engine/src/engines/timeline_dispatch.rs`
+  `asap-query-engine/src/query-engines/timeline_dispatch.rs`
   (`CombinedResult`, `combine_statistic`).
 - **Write-barrier safety (§3)** →
   `asap-query-engine/src/stores/sketch_db/schema.rs`

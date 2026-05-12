@@ -38,9 +38,9 @@
 
 use std::collections::HashMap;
 
-use crate::sketch_algebra::SketchExpr;
 use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
+use crate::sketch_algebra::SketchExpr;
 use crate::types_v2::BindingName;
 
 /// Errors surfaced by [`StageAllocator::allocate`].
@@ -304,7 +304,10 @@ mod tests {
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
-        assert_eq!(err, AllocateError::UnsupportedTopology(Topology::SingleStage));
+        assert_eq!(
+            err,
+            AllocateError::UnsupportedTopology(Topology::SingleStage)
+        );
     }
 
     #[test]
@@ -315,7 +318,9 @@ mod tests {
             SketchParams::Kll(KllParams { k: 200 }),
             windowed_scan(),
         );
-        let dag = StageAllocator.allocate(&expr, Topology::ThreeStage).unwrap();
+        let dag = StageAllocator
+            .allocate(&expr, Topology::ThreeStage)
+            .unwrap();
         // root = SketchEstimate → Backend
         assert_eq!(dag.root().unwrap().stage, StageId::Backend);
         // node 1 = SketchAgg → Edge

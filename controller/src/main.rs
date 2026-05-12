@@ -94,7 +94,7 @@ struct AppState {
     /// post path emits a single-element `metrics:[…]` document per
     /// `handle_plan` call, so when N metrics replan in sequence only
     /// the last metric's entry survives in the backend's routing table.
-    /// That defaults the other N-1 metrics to `sketch_warm_tier`, which
+    /// That defaults the other N-1 metrics to `sketch_store`, which
     /// has no warm-tier sketch state for archive-shape queries
     /// (`count`, `topk`, `rate_post_hoc`, `histogram_quantile`,
     /// `delta`, `deriv`, `absent`) → the backend returns empty / 404 →
@@ -618,7 +618,7 @@ async fn handle_plan(
                             // each per-metric replan erases the routing
                             // entries for every other metric and the
                             // backend defaults them to
-                            // `sketch_warm_tier` (which has nothing for
+                            // `sketch_store` (which has nothing for
                             // archive-shape queries). That's the
                             // `archive_miss` failure mode for
                             // HLL/CountSketch/CountMin/KLL metrics in
@@ -2499,7 +2499,7 @@ mod api_tests {
     // `metrics:[…]` document per call, so when the demo POSTed
     // `/api/v1/plan` for each of the 5 sketched contract metrics in
     // sequence, only the LAST metric's entry survived in the backend.
-    // The other 4 metrics defaulted to `sketch_warm_tier` (which has
+    // The other 4 metrics defaulted to `sketch_store` (which has
     // no warm-tier sketch state for archive-shape queries) → the
     // demo's accuracy reducer logged `archive_miss` for those metrics
     // even though gorillas3 wrote their TSDB blocks to MinIO and
@@ -2598,7 +2598,7 @@ mod api_tests {
         // MUST list ALL 5 sketched metrics, otherwise the swap would
         // erase the routing entries for the metrics planned earlier
         // in the sequence and the backend would default them to
-        // `sketch_warm_tier` → archive_miss for those metrics' archive
+        // `sketch_store` → archive_miss for those metrics' archive
         // queries even though gorillas3's TSDB blocks are present in
         // MinIO and Thanos has them indexed.
         let last: serde_json::Value =
@@ -2618,10 +2618,10 @@ mod api_tests {
             );
         }
 
-        // Each metric entry must carry a `thanos_archive` target — the
+        // Each metric entry must carry a `thanos_query` target — the
         // archive-tier dispatch that lets backend forward archive-shape
         // queries to Thanos. Without this target the metric falls back
-        // to `default_engine: sketch_warm_tier` and the archive miss
+        // to `default_engine: sketch_store` and the archive miss
         // reproduces.
         for m in last["metrics"].as_array().unwrap() {
             let targets = m["targets"].as_array().expect("targets array");
@@ -2630,8 +2630,8 @@ mod api_tests {
                 .map(|t| t["engine"].as_str().unwrap())
                 .collect();
             assert!(
-                engines.contains(&"thanos_archive"),
-                "metric `{}` missing `thanos_archive` target; engines={engines:?}",
+                engines.contains(&"thanos_query"),
+                "metric `{}` missing `thanos_query` target; engines={engines:?}",
                 m["name"].as_str().unwrap(),
             );
         }

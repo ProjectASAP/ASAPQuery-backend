@@ -77,7 +77,7 @@ ASAPQuery-backend/
 │       │                        # in ASAPCollector)
 │       ├── bin/                 # auxiliary binaries (offline tests,
 │       │                        # logical-plan dumper)
-│       ├── engines/
+│       ├── query-engines/
 │       │   ├── simple/                # warm tier — SimpleEngine
 │       │   │                          # (33 PromQL pattern matchers)
 │       │   └── gorilla/               # archive tier

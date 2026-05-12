@@ -133,29 +133,6 @@ impl EngineRouter {
         self.engines.insert(caps.data_source_id, engine);
     }
 
-    /// Register an engine under an alias `data_source_id`, ignoring the
-    /// id reported by `engine.capabilities()`. Used by Step-2.3's
-    /// Path A2 wiring: the same `ThanosForwardEngine` instance is
-    /// registered under both its native id (`thanos_archive`, for
-    /// explicit overrides) and under the legacy archive id
-    /// (`gorilla_archive`, so the existing
-    /// `compatible_storage_backends` failover sequence finds it
-    /// transparently). The legacy in-process `GorillaQueryEngine` is
-    /// only registered when `ASAP_THANOS_QUERY_URL` is unset; the
-    /// alias mechanism guarantees the two registrations never
-    /// collide on the same id.
-    ///
-    /// If two engines claim the same `id` the later registration wins
-    /// (matches [`Self::register`]'s hot-swap contract).
-    pub fn register_aliased(&mut self, id: &'static str, engine: Arc<dyn QueryEngine>) {
-        debug!(
-            data_source_id = id,
-            engine_native_id = engine.capabilities().data_source_id,
-            "router: registering engine under alias",
-        );
-        self.engines.insert(id, engine);
-    }
-
     /// Number of engines registered. Test-only convenience.
     pub fn len(&self) -> usize {
         self.engines.len()
@@ -326,9 +303,9 @@ mod tests {
     #[tokio::test]
     async fn router_dispatches_to_warm_tier_for_sketch_metrics() {
         let mut router = EngineRouter::new();
-        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         let (archive, archive_calls) =
-            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
         router.register(warm);
         router.register(archive);
 
@@ -337,7 +314,7 @@ mod tests {
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
                 AccuracyTarget::Approximate,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::SketchStore,
             )
             .await;
         assert!(result.is_ok());
@@ -352,9 +329,9 @@ mod tests {
     #[tokio::test]
     async fn router_dispatches_to_gorilla_for_archive_metrics() {
         let mut router = EngineRouter::new();
-        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
         router.register(warm);
         router.register(gorilla);
 
@@ -363,7 +340,7 @@ mod tests {
                 "sum_over_time(audit_events[1h])",
                 Statistic::Sum,
                 AccuracyTarget::Exact,
-                StorageBackend::GorillaS3Archive,
+                StorageBackend::GorillaObjectStore,
             )
             .await;
         assert!(result.is_ok());
@@ -382,9 +359,8 @@ mod tests {
         // remaining failover after Step-1 deleted JSONL).
         let mut router = EngineRouter::new();
         let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Backend);
-        let (warm, warm_calls) =
-            StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Backend);
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         router.register(gorilla);
         router.register(warm);
 
@@ -412,14 +388,14 @@ mod tests {
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
                 AccuracyTarget::Approximate,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::SketchStore,
             )
             .await;
         match result {
             Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
                 // Step-1 deleted the JSONL failover slot, so the
-                // SketchWarmTier failover sequence is just itself.
-                assert_eq!(tried, vec![StorageBackend::SketchWarmTier]);
+                // SketchStore failover sequence is just itself.
+                assert_eq!(tried, vec![StorageBackend::SketchStore]);
                 assert!(registered.is_empty());
             }
             other => panic!("expected NoEngineRegistered, got {other:?}"),
@@ -428,11 +404,11 @@ mod tests {
 
     #[tokio::test]
     async fn router_returns_all_failed_when_every_engine_errors() {
-        // After Step-1 deleted JSONL, the SketchWarmTier failover
-        // sequence is just `[SketchWarmTier]`. A failing warm-tier
+        // After Step-1 deleted JSONL, the SketchStore failover
+        // sequence is just `[SketchStore]`. A failing warm-tier
         // engine is the only error path on this metric.
         let mut router = EngineRouter::new();
-        let (warm, _) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Backend);
+        let (warm, _) = StubEngine::new(StorageBackend::SketchStore, Outcome::Backend);
         router.register(warm);
 
         let result = router
@@ -440,7 +416,7 @@ mod tests {
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
                 AccuracyTarget::Approximate,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::SketchStore,
             )
             .await;
         match result {
@@ -454,16 +430,16 @@ mod tests {
     #[tokio::test]
     async fn engine_by_id_returns_registered_engines_or_none() {
         let mut router = EngineRouter::new();
-        let (warm, _) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (warm, _) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
         router.register(warm);
         router.register(gorilla);
 
         // Hit by id — must return the engine for that backend.
         let archive = router
-            .engine_by_id("gorilla_archive")
-            .expect("gorilla_archive engine registered");
+            .engine_by_id("thanos_query")
+            .expect("thanos_query engine registered");
         let _ = archive.execute("count(foo)").await;
         assert_eq!(
             gorilla_calls.load(Ordering::SeqCst),
@@ -477,91 +453,36 @@ mod tests {
         // Iter exposes every registered id.
         let mut ids: Vec<&str> = router.registered_ids().collect();
         ids.sort();
-        assert_eq!(ids, vec!["gorilla_archive", "sketch_warm"]);
-    }
-
-    #[tokio::test]
-    async fn register_aliased_inserts_under_explicit_id() {
-        // Step-2.3 wiring: a single ThanosForwardEngine instance is
-        // registered under both `thanos_archive` (its native id) and
-        // `gorilla_archive` (the legacy archive slot the failover
-        // sequence walks). Both lookups must hit the same engine.
-        let mut router = EngineRouter::new();
-        let (engine, calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
-        // First, register under the engine's native id (`sketch_warm`).
-        router.register(engine.clone());
-        // Then alias it under a totally different id.
-        router.register_aliased("custom_alias", engine);
-        // Both lookups must return the engine — we exercise both and
-        // verify the call counter ticked twice.
-        let native = router
-            .engine_by_id("sketch_warm")
-            .expect("native id registered");
-        let aliased = router
-            .engine_by_id("custom_alias")
-            .expect("alias registered");
-        let _ = native.execute("foo").await;
-        let _ = aliased.execute("foo").await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "both lookups must reach the same engine instance",
-        );
-
-        let mut ids: Vec<&str> = router.registered_ids().collect();
-        ids.sort();
-        assert_eq!(ids, vec!["custom_alias", "sketch_warm"]);
-    }
-
-    #[tokio::test]
-    async fn register_aliased_overrides_capability_dispatch_target() {
-        // Step-2.3 wiring continued: when `ThanosForwardEngine` is
-        // aliased onto `gorilla_archive`, the failover sequence walks
-        // the alias instead of the legacy in-process engine. We
-        // simulate this with a stub registered under
-        // `GorillaS3Archive`'s native id via the alias path.
-        let mut router = EngineRouter::new();
-        let (legacy, legacy_calls) =
-            StubEngine::new(StorageBackend::GorillaS3Archive, Outcome::Ok);
-        // Use alias to register under the gorilla_archive id
-        // explicitly (matches Step-2.3's "thanos under legacy slot"
-        // wiring).
-        router.register_aliased(
-            StorageBackend::GorillaS3Archive.data_source_id(),
-            legacy,
-        );
-
-        let result = router
-            .execute(
-                "sum_over_time(audit_events[1h])",
-                Statistic::Sum,
-                AccuracyTarget::Exact,
-                StorageBackend::GorillaS3Archive,
-            )
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ids, vec!["asap_query", "thanos_query"]);
     }
 
     #[tokio::test]
     async fn register_overwrites_same_data_source_id() {
         let mut router = EngineRouter::new();
-        let (first, first_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
-        let (second, second_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (first, first_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
+        let (second, second_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         router.register(first);
         router.register(second);
-        assert_eq!(router.len(), 1, "two registrations under same id collapse to one");
+        assert_eq!(
+            router.len(),
+            1,
+            "two registrations under same id collapse to one"
+        );
 
         let _ = router
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
                 AccuracyTarget::Approximate,
-                StorageBackend::SketchWarmTier,
+                StorageBackend::SketchStore,
             )
             .await;
         assert_eq!(first_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(second_calls.load(Ordering::SeqCst), 1, "later registration wins");
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            1,
+            "later registration wins"
+        );
     }
 
     /// Phase ε.2: a routing-table entry with
@@ -574,9 +495,8 @@ mod tests {
     #[tokio::test]
     async fn router_dispatches_to_prometheus_remote_for_mode3_metrics() {
         let mut router = EngineRouter::new();
-        let (prom, prom_calls) =
-            StubEngine::new(StorageBackend::PrometheusRemote, Outcome::Ok);
-        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchWarmTier, Outcome::Ok);
+        let (prom, prom_calls) = StubEngine::new(StorageBackend::PrometheusRemote, Outcome::Ok);
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         router.register(prom);
         router.register(warm);
 

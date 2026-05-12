@@ -390,7 +390,10 @@ mod tests {
     #[test]
     fn analyze_quantile_over_time() {
         let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, http_latency_ms[5m])");
-        assert!(a.unsupported.is_none(), "expected no unsupported reason: {a:?}");
+        assert!(
+            a.unsupported.is_none(),
+            "expected no unsupported reason: {a:?}"
+        );
         assert_eq!(a.candidates.len(), 1);
         let c = &a.candidates[0];
         assert_eq!(c.metric_name, "http_latency_ms");

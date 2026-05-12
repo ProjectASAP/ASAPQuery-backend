@@ -215,7 +215,10 @@ mod tests {
     fn golden_parity_with_backend() {
         // HLL precision=14: ε = 0.008125, kind = relative_cardinality
         let p = AccuracyProfile::derive(&SketchParams::HLL { precision: 14 });
-        assert_eq!(p.summary(), "accuracy: ε=0.008125, δ=0, kind=relative_cardinality");
+        assert_eq!(
+            p.summary(),
+            "accuracy: ε=0.008125, δ=0, kind=relative_cardinality"
+        );
 
         // KLL k=200: ε = 2.296 / √200, kind = rank_quantile, δ = 0.01
         let p = AccuracyProfile::derive(&SketchParams::KLL {

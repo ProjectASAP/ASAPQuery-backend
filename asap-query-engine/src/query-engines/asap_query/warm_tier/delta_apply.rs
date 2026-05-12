@@ -9,7 +9,7 @@
 //! format ships a sparse-but-mergeable sketch fragment.
 //!
 //! Two reducer modes, picked by the PromQL function name in
-//! [`crate::engines::warm_tier::sketch_reducer`]:
+//! [`crate::engines::asap_query::warm_tier::sketch_reducer`]:
 //!
 //! * **per-window** (`quantile`, `histogram_quantile`,
 //!   `cardinality_estimate`): emit one scalar per window. A `Full`
@@ -82,9 +82,7 @@ fn decode_full(
                 .map_err(|e| format!("deserialize KllSketch msgpack: {e}"))?;
             Ok(RollingState::Kll(sk))
         }
-        (_, e) => Err(format!(
-            "decode_full called with non-Full encoding {e:?}"
-        )),
+        (_, e) => Err(format!("decode_full called with non-Full encoding {e:?}")),
     }
 }
 
@@ -113,7 +111,9 @@ impl RollingState {
             encoding,
             SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
         ) {
-            return Err(format!("apply_delta_bytes called with non-Delta encoding {encoding:?}"));
+            return Err(format!(
+                "apply_delta_bytes called with non-Delta encoding {encoding:?}"
+            ));
         }
         match self {
             RollingState::Dd(sk) => {
@@ -129,9 +129,7 @@ impl RollingState {
                 let other = match decode_full(&DeltaSketchKind::DDSketch, bytes, full_enc) {
                     Ok(RollingState::Dd(s)) => s,
                     Ok(_) => {
-                        return Err(
-                            "decode_full(DDSketch) returned non-DDSketch state".to_string()
-                        )
+                        return Err("decode_full(DDSketch) returned non-DDSketch state".to_string())
                     }
                     Err(e) => return Err(e),
                 };
@@ -164,9 +162,7 @@ impl RollingState {
                 };
                 let other = match decode_full(&DeltaSketchKind::Kll, bytes, full_enc) {
                     Ok(RollingState::Kll(s)) => s,
-                    Ok(_) => {
-                        return Err("decode_full(Kll) returned non-Kll state".to_string())
-                    }
+                    Ok(_) => return Err("decode_full(Kll) returned non-Kll state".to_string()),
                     Err(e) => return Err(e),
                 };
                 sk.merge(&other)
@@ -278,14 +274,11 @@ where
                         RollingState::Hll(a)
                     }
                     (Some(RollingState::Kll(mut a)), RollingState::Kll(b)) => {
-                        a.merge(&b)
-                            .map_err(|e| format!("cum merge KLL: {e}"))?;
+                        a.merge(&b).map_err(|e| format!("cum merge KLL: {e}"))?;
                         RollingState::Kll(a)
                     }
                     (Some(_), _) => {
-                        return Err(
-                            "cumulative merge across sketch family mismatch".to_string()
-                        )
+                        return Err("cumulative merge across sketch family mismatch".to_string())
                     }
                 });
             }
@@ -315,11 +308,13 @@ fn dd_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
         Ok(env) => match env.sketch_state {
             Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
             Some(_) => return Err("SketchEnvelope contains non-DDSketch sketch".to_string()),
-            None => DdSketchState::decode(buffer)
-                .map_err(|e| format!("decode DDSketchState: {e}"))?,
+            None => {
+                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
+            }
         },
-        Err(_) => DdSketchState::decode(buffer)
-            .map_err(|e| format!("decode DDSketchState: {e}"))?,
+        Err(_) => {
+            DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
+        }
     };
     if !(state.alpha > 0.0 && state.alpha < 1.0) {
         return Err(format!(
@@ -380,8 +375,9 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
             None => HyperLogLogState::decode(buffer)
                 .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
         },
-        Err(_) => HyperLogLogState::decode(buffer)
-            .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+        Err(_) => {
+            HyperLogLogState::decode(buffer).map_err(|e| format!("decode HyperLogLogState: {e}"))?
+        }
     };
     if state.precision == 0 || state.precision > 20 {
         return Err(format!(

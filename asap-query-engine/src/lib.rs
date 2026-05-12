@@ -1,5 +1,6 @@
 pub mod data_model;
 pub mod drivers;
+#[path = "query-engines/mod.rs"]
 pub mod engines;
 pub mod precompute_engine;
 pub mod precompute_operators;
@@ -24,7 +25,7 @@ pub use precompute_operators::{
 
 pub use stores::{SimpleMapStore, Store, StoreResult};
 
-pub use engines::{InstantVector, QueryResult, SimpleEngine};
+pub use engines::{ASAPQueryEngine, InstantVector, QueryResult, SimpleEngine};
 
 pub use drivers::{
     HttpServer, HttpServerConfig, KafkaConsumer, KafkaConsumerConfig, OtlpReceiver,

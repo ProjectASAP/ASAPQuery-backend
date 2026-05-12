@@ -7,15 +7,14 @@
 //! has neither `ASAP_THANOS_QUERY_URL` nor `ASAP_GORILLA_S3_*` env
 //! vars set, no archive engine is registered on the
 //! [`crate::routing::EngineRouter`]. Cold queries (queries the
-//! per-metric routing table sends to `gorilla_archive` /
-//! `thanos_archive`) then surface as
+//! per-metric routing table sends to `thanos_query`) then surface as
 //! `503 NoEngineRegistered` from the HTTP handler.
 //!
 //! Treating "no archive configured" as a 503 trips up dashboards and
 //! freshness probes that just want a degraded but successful answer.
 //! This engine flips that default: when the archive env vars are
 //! unset, the binary registers a [`NoDataArchiveEngine`] under the
-//! `gorilla_archive` slot. Cold queries return an **empty result
+//! `thanos_query` slot. Cold queries return an **empty result
 //! set** with `data_source_id = "no_data_archive"` so the wire
 //! response carries enough signal for operators to notice the
 //! misconfig without breaking the request path.
@@ -68,11 +67,11 @@ impl QueryEngine for NoDataArchiveEngine {
 
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
-            data_source_id: DATA_SOURCE_ID_NO_DATA_ARCHIVE,
-            // Register under the archive slot. The binary aliases this
-            // engine onto the `gorilla_archive` id so the routing
-            // table's archive entries dispatch here transparently.
-            storage_backend: StorageBackend::GorillaS3Archive,
+            data_source_id: asap_types::ENGINE_ID_THANOS_QUERY,
+            // Register under the canonical archive query-engine id so
+            // archive entries dispatch here transparently when no real
+            // ThanosQueryEngine is configured.
+            storage_backend: StorageBackend::GorillaObjectStore,
             supports_streams_above_bytes: 0,
         }
     }
@@ -98,7 +97,7 @@ mod tests {
     fn capabilities_use_no_data_archive_id() {
         let engine = NoDataArchiveEngine::new();
         let caps = engine.capabilities();
-        assert_eq!(caps.data_source_id, "no_data_archive");
-        assert_eq!(caps.storage_backend, StorageBackend::GorillaS3Archive);
+        assert_eq!(caps.data_source_id, asap_types::ENGINE_ID_THANOS_QUERY);
+        assert_eq!(caps.storage_backend, StorageBackend::GorillaObjectStore);
     }
 }

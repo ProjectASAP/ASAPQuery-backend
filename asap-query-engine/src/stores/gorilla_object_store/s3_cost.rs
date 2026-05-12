@@ -93,8 +93,13 @@ impl S3CostCounters {
                 "asap_backend_s3_bytes_put {}\n",
                 "asap_backend_s3_bytes_got {}\n",
             ),
-            s.put_count, s.get_count, s.head_count, s.list_count, s.delete_count,
-            s.bytes_put, s.bytes_got,
+            s.put_count,
+            s.get_count,
+            s.head_count,
+            s.list_count,
+            s.delete_count,
+            s.bytes_put,
+            s.bytes_got,
         )
     }
 
@@ -105,8 +110,13 @@ impl S3CostCounters {
         format!(
             "put_count,get_count,head_count,list_count,delete_count,bytes_put,bytes_got\n\
              {},{},{},{},{},{},{}\n",
-            s.put_count, s.get_count, s.head_count, s.list_count, s.delete_count,
-            s.bytes_put, s.bytes_got,
+            s.put_count,
+            s.get_count,
+            s.head_count,
+            s.list_count,
+            s.delete_count,
+            s.bytes_put,
+            s.bytes_got,
         )
     }
 }
@@ -143,10 +153,7 @@ pub struct S3CostTrackingObjectStore {
 
 impl S3CostTrackingObjectStore {
     /// Wrap `inner` and a counter-set for the wrapper to update.
-    pub fn new(
-        inner: Arc<dyn ObjectStore>,
-        counters: Arc<S3CostCounters>,
-    ) -> Self {
+    pub fn new(inner: Arc<dyn ObjectStore>, counters: Arc<S3CostCounters>) -> Self {
         Self { inner, counters }
     }
 
@@ -175,7 +182,7 @@ impl ObjectStore for S3CostTrackingObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::gorilla::store::ObjectStore as _;
+    use crate::stores::gorilla_object_store::store::ObjectStore as _;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
@@ -236,7 +243,9 @@ mod tests {
         c.get_count.store(7, Ordering::Relaxed);
         c.bytes_got.store(1024, Ordering::Relaxed);
         let csv = c.render_csv();
-        assert!(csv.starts_with("put_count,get_count,head_count,list_count,delete_count,bytes_put,bytes_got\n"));
+        assert!(csv.starts_with(
+            "put_count,get_count,head_count,list_count,delete_count,bytes_put,bytes_got\n"
+        ));
         assert!(csv.contains("3,7,0,0,0,0,1024"));
     }
 
