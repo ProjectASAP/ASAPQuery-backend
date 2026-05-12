@@ -1,9 +1,7 @@
 use crate::stores::types::{
-    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
-};
+    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput};
 use crate::precompute_engine::accumulator_factory::{
-    create_accumulator_updater, AccumulatorUpdater,
-};
+    create_accumulator_updater, AccumulatorUpdater};
 use crate::precompute_engine::config::LateDataPolicy;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
@@ -44,8 +42,7 @@ struct GroupState {
     /// `active_panes` and `sketch_panes` (a single pane_start may have
     /// either or both populated). Entries are GC'd by
     /// `prune_pane_wall_clock_starts` after each window-close cycle.
-    pane_wall_clock_starts_ms: BTreeMap<i64, i64>,
-}
+    pane_wall_clock_starts_ms: BTreeMap<i64, i64>}
 
 impl GroupState {
     /// Drop wall-clock-start entries whose pane no longer exists in
@@ -70,8 +67,7 @@ pub struct WorkerRuntimeConfig {
     /// See `PrecomputeEngineConfig::wall_clock_grace_period_ms`. Set to a
     /// non-positive value to disable the wall-clock fallback entirely
     /// (event-time-only behaviour, matching pre-fix semantics).
-    pub wall_clock_grace_period_ms: i64,
-}
+    pub wall_clock_grace_period_ms: i64}
 
 /// Worker that processes samples for a shard of the group space.
 ///
@@ -113,8 +109,7 @@ pub struct Worker {
     /// `&mut self` only on `flush_all` and pane creation, so a single
     /// non-`Sync` cell behind a mutex is fine — but we keep the bound
     /// `Send + Sync` for clarity since `Worker` itself is `Send`.
-    now_ms_fn: Box<dyn Fn() -> i64 + Send + Sync>,
-}
+    now_ms_fn: Box<dyn Fn() -> i64 + Send + Sync>}
 
 impl Worker {
     #[allow(clippy::too_many_arguments)]
@@ -134,8 +129,7 @@ impl Worker {
             pass_raw_samples,
             raw_mode_aggregation_id,
             late_data_policy,
-            wall_clock_grace_period_ms,
-        } = runtime_config;
+            wall_clock_grace_period_ms} = runtime_config;
         Self {
             id,
             receiver,
@@ -150,8 +144,7 @@ impl Worker {
             all_worker_watermarks,
             group_count,
             wall_clock_grace_period_ms,
-            now_ms_fn: Box::new(default_now_ms),
-        }
+            now_ms_fn: Box::new(default_now_ms)}
     }
 
     /// Test/diagnostic-only setter for the wall-clock source. Replaces
@@ -174,8 +167,7 @@ impl Worker {
                     agg_id,
                     group_key,
                     samples,
-                    ingest_received_at,
-                } => {
+                    ingest_received_at} => {
                     let sample_count = samples.len();
                     let _span = debug_span!(
                         "worker_process_group",
@@ -199,8 +191,7 @@ impl Worker {
                 WorkerMessage::RawSamples {
                     series_key,
                     samples,
-                    ingest_received_at,
-                } => {
+                    ingest_received_at} => {
                     let _span = debug_span!(
                         "worker_process_raw",
                         worker_id = self.id,
@@ -221,8 +212,7 @@ impl Worker {
                     group_key,
                     timestamp_ms,
                     accumulator,
-                    ingest_received_at,
-                } => {
+                    ingest_received_at} => {
                     let _span = debug_span!(
                         "worker_process_accumulator",
                         worker_id = self.id,
@@ -296,8 +286,7 @@ impl Worker {
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
-                pane_wall_clock_starts_ms: BTreeMap::new(),
-            };
+                pane_wall_clock_starts_ms: BTreeMap::new()};
             self.group_states.insert(key.clone(), gs);
             self.group_count
                 .store(self.group_states.len(), Ordering::Relaxed);
@@ -838,8 +827,7 @@ fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
 pub fn extract_metric_name(series_key: &str) -> &str {
     match series_key.find('{') {
         Some(pos) => &series_key[..pos],
-        None => series_key,
-    }
+        None => series_key}
 }
 
 /// Extract grouping label values from a series key string based on the
@@ -868,12 +856,10 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
 
     let start = match series_key.find('{') {
         Some(pos) => pos + 1,
-        None => return labels,
-    };
+        None => return labels};
     let end = match series_key.rfind('}') {
         Some(pos) => pos,
-        None => return labels,
-    };
+        None => return labels};
 
     if start >= end {
         return labels;
@@ -886,8 +872,7 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
     while !remaining.is_empty() {
         let eq_pos = match remaining.find('=') {
             Some(pos) => pos,
-            None => break,
-        };
+            None => break};
         let key = remaining[..eq_pos].trim();
 
         let after_eq = &remaining[eq_pos + 1..];
@@ -898,8 +883,7 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
         let value_start = 1; // skip opening quote
         let value_end = match after_eq[value_start..].find('"') {
             Some(pos) => value_start + pos,
-            None => break,
-        };
+            None => break};
 
         let value = &after_eq[value_start..value_end];
         labels.insert(key, value);
@@ -986,8 +970,7 @@ fn merge_panes_for_window(
         if let Some(acc) = pane_acc {
             merged = Some(match merged {
                 None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
-            });
+                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing)});
         }
     }
 
@@ -1018,8 +1001,7 @@ fn merge_sketch_panes_for_window(
         if let Some(acc) = pane_acc {
             merged = Some(match merged {
                 None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
-            });
+                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing)});
         }
     }
 
@@ -1160,8 +1142,7 @@ mod tests {
                 pass_raw_samples: pass_raw,
                 raw_mode_aggregation_id: raw_agg_id,
                 late_data_policy: late_policy,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1648,8 +1629,7 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1701,8 +1681,7 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::ForwardToStore,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1767,7 +1746,7 @@ aggregations:
 
         let data: serde_yaml::Value = serde_yaml::from_str(yaml).expect("valid YAML");
         let streaming_config =
-            StreamingConfig::from_yaml_data(&data, None).expect("valid streaming config");
+            StreamingConfig::from_yaml_data(&data).expect("valid streaming config");
 
         assert!(streaming_config.contains(10));
 
@@ -1930,8 +1909,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -1958,8 +1936,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -1990,8 +1967,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -2031,8 +2007,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             all,
@@ -2213,8 +2188,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
-            },
+                wall_clock_grace_period_ms: 0},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -2349,8 +2323,7 @@ aggregations:
             let expected_count = match zone.as_str() {
                 "us-east" => 3,
                 "us-west" => 2,
-                other => panic!("unexpected zone {other}"),
-            };
+                other => panic!("unexpected zone {other}")};
             assert_eq!(
                 dd.inner.count, expected_count,
                 "zone {zone} must roll up exactly {expected_count} per-tuple sketches"
@@ -2397,8 +2370,7 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms,
-            },
+                wall_clock_grace_period_ms},
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],

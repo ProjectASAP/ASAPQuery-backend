@@ -20,16 +20,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use asap_types::aggregation_config::AggregationConfig;
-use asap_types::aggregation_reference::AggregationReference;
 use asap_types::enums::{AggregationType, WindowType};
-use asap_types::promql_schema::PromQLSchema;
-use asap_types::query_config::QueryConfig;
 use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
 use crate::stores::types::{
-    CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, KeyByLabelValues, PrecomputedOutput,
-    QueryLanguage, SchemaConfig, StreamingConfig,
-};
+    CleanupPolicy, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput, StreamingConfig};
 use crate::query_engines::{QueryResult, ASAPQueryEngine};
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::stores::sketch_db::store::SketchStore;
@@ -103,30 +98,11 @@ fn build_engine(
     streaming_config: Arc<StreamingConfig>,
     schemas: Arc<SchemaRegistry>,
     store: Arc<dyn Store>,
-    query_for_agg_id: u64,
+    _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
-    let mut inference_config =
-        InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
-    let promql_schema = PromQLSchema::new().add_metric(
-        METRIC.to_string(),
-        KeyByLabelNames::new(vec!["host".to_string()]),
-    );
-    inference_config.schema = SchemaConfig::PromQL(promql_schema);
-    // Pin the test query to the active agg so the probe resolution
-    // succeeds; the dispatcher still visits every timeline segment
-    // regardless of which one the probe picked.
-    inference_config.query_configs = vec![QueryConfig::new(TEST_QUERY.to_string())
-        .add_aggregation(AggregationReference::new(query_for_agg_id, None))];
-
     let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-    ASAPQueryEngine::new_with_hot_reload(
-        store,
-        inference_config,
-        hot_reload,
-        1,
-        QueryLanguage::promql,
-    )
-    .with_schema_registry(schemas)
+    ASAPQueryEngine::new_with_hot_reload(store, hot_reload, 1)
+        .with_schema_registry(schemas)
 }
 
 /// Insert a single `SumAccumulator` window at `ts` into `agg_id`.
@@ -136,8 +112,7 @@ fn build_engine(
 /// window, so a query whose range contains `ts` picks up the data.
 fn seed_sum_at(store: &SketchStore, agg_id: u64, ts: u64, host: &str, sum: f64) {
     let key = Some(KeyByLabelValues {
-        labels: vec![host.to_string()],
-    });
+        labels: vec![host.to_string()]});
     let output = PrecomputedOutput::new(ts, ts, key, agg_id);
     let acc = SumAccumulator::with_sum(sum);
     store
@@ -196,8 +171,7 @@ fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
                 iv.values[0].value
             );
         }
-        other => panic!("expected instant vector, got {other:?}"),
-    }
+        other => panic!("expected instant vector, got {other:?}")}
 }
 
 /// agg_1 Expired (coverage=Purged, unresolved); agg_2 Active with
@@ -258,8 +232,7 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
                 iv.values[0].value
             );
         }
-        other => panic!("expected instant vector, got {other:?}"),
-    }
+        other => panic!("expected instant vector, got {other:?}")}
 }
 
 /// Single-schema regression guard: when the timeline has only one
@@ -300,6 +273,5 @@ fn single_schema_query_falls_through_to_default_path() {
                 iv.values[0].value
             );
         }
-        other => panic!("expected instant vector, got {other:?}"),
-    }
+        other => panic!("expected instant vector, got {other:?}")}
 }

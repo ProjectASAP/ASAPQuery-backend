@@ -11,18 +11,16 @@
 // this same backend process — there is no longer a separate
 // `asap-controller` container in `mvp-multinode/run_demo.sh`.
 use clap::Parser;
-use data_plane::stores::types::QueryLanguage;
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
 use data_plane::stores::types::enums::{CleanupPolicy, LockStrategy};
-use data_plane::stores::types::InferenceConfig;
 use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
-use data_plane::utils::file_io::{read_inference_config, read_streaming_config};
+use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
     HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
     PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStore, StoreOutputSink,
@@ -31,20 +29,16 @@ use data_plane::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the inference config YAML — maps query patterns to
-    /// aggregation IDs so the query engine can pick the right
-    /// stored sketch for an incoming PromQL. Both spellings are
-    /// accepted; `--inference-config` is the canonical name kept
-    /// from the legacy `precompute_engine` binary's flag set, so
-    /// the existing compose / docker-compose `command:` blocks
-    /// continue to work after the binary unification (see
-    /// PR aligning the deployed-binary flag set).
-    #[arg(long, alias = "inference-config")]
-    config: Option<String>,
-
     /// File path for streaming_config
     #[arg(long)]
     streaming_config: String,
+
+    /// Cleanup policy for SketchStore retention.
+    /// `circular_buffer`: keep the N most recent windows per agg
+    /// (N comes from each aggregation's `numAggregatesToRetain`).
+    /// `no_cleanup`: never evict.
+    #[arg(long, value_enum, default_value = "circular_buffer")]
+    cleanup_policy: CleanupPolicy,
 
     /// Prometheus scrape interval (seconds). Default 30 matches
     /// the e2e harness's 30s window. ASAPQueryEngine uses this as the
@@ -110,11 +104,6 @@ struct Args {
     /// Enable profiling (currently unused, kept for compatibility)
     #[arg(long)]
     do_profiling: bool,
-
-    /// Differentiate between query languages of input query.
-    /// Default `promql` matches every production deploy.
-    #[arg(long, value_enum, default_value = "promql")]
-    query_language: QueryLanguage,
 
     /// Lock strategy for SketchStore: "global" for single mutex,
     /// "per-key" for fine-grained locking. Default `per-key`.
@@ -275,7 +264,6 @@ async fn main() -> Result<()> {
     let _log_guard = setup_logging(&args.output_dir, &args.log_level)?;
 
     info!("Starting Query Engine Rust");
-    info!("Config file: {:?}", args.config);
     info!("Output directory: {}", args.output_dir);
 
     if let Some(ingest_port) = args.ingest_port {
@@ -286,39 +274,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Read config (equivalent to utils.file_io.read_inference_config).
-    // When `--config` / `--inference-config` is omitted (the
-    // default-deploy compose case — `base.yml` only passes
-    // `--streaming-config`), build an empty `InferenceConfig` so
-    // the engine starts with no query-pattern table. This matches
-    // the legacy `precompute_engine` binary's behavior; queries
-    // that don't match a pattern fall through to the Prometheus
-    // fallback when `--forward-unsupported-queries` is set.
-    let inference_config = match args.config.as_deref() {
-        Some(path) => {
-            let cfg = read_inference_config(path, args.query_language)?;
-            info!(
-                "Loaded inference config from {} with {} query configs",
-                path,
-                cfg.query_configs.len()
-            );
-            cfg
-        }
-        None => {
-            info!(
-                "--config / --inference-config not set — starting with empty InferenceConfig \
-                 (queries with no matching pattern fall through to the Prometheus fallback when \
-                 --forward-unsupported-queries is set)"
-            );
-            InferenceConfig::new(args.query_language, CleanupPolicy::CircularBuffer)
-        }
-    };
-    info!("Inference config: {:?}", inference_config);
-
-    let streaming_config = Arc::new(read_streaming_config(
-        &args.streaming_config,
-        &inference_config,
-    )?);
+    let streaming_config = Arc::new(read_streaming_config(&args.streaming_config)?);
     info!(
         "Loaded streaming config with {} entries",
         streaming_config.get_all_aggregation_configs().len()
@@ -335,9 +291,8 @@ async fn main() -> Result<()> {
     let hot_reload_config =
         data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
-    // Setup store (equivalent to Python's SketchStore())
-    // Get cleanup policy from inference config
-    let cleanup_policy = inference_config.cleanup_policy;
+    // Setup store
+    let cleanup_policy = args.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let store = if args.persistence_enabled {
         use data_plane::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
@@ -425,10 +380,8 @@ async fn main() -> Result<()> {
     let mut engine = {
         let mut engine = ASAPQueryEngine::new_with_hot_reload(
             store.clone(),
-            inference_config,
             hot_reload_config.clone(),
             args.prometheus_scrape_interval,
-            args.query_language,
         )
         // Phase 5 wire-in (refactor 2026-05): hand the warm-tier
         // SketchIndex to the query engine so SidLookup classification
