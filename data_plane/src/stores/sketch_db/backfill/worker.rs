@@ -59,7 +59,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::backfill::{BackfillRegistry, BackfillStatus};
+use super::{BackfillRegistry, BackfillStatus};
 use super::raw_sample_reader::{LabelFilter, RawSample, RawSampleReader};
 
 /// Per-window callback invoked by [`BackfillWorker`] after reading

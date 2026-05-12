@@ -56,7 +56,7 @@ use thiserror::Error;
 use tokio::time::error::Elapsed;
 use tracing::debug;
 
-use crate::stores::schema::KeyByLabelValues;
+use crate::stores::types::KeyByLabelValues;
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 

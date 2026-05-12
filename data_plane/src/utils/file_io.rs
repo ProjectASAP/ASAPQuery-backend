@@ -1,4 +1,4 @@
-use crate::stores::schema::{InferenceConfig, QueryLanguage, StreamingConfig};
+use crate::stores::types::{InferenceConfig, QueryLanguage, StreamingConfig};
 // use crate::stores::promsketch_store::config::PromSketchConfig;
 use anyhow::{Context, Result};
 
@@ -37,7 +37,7 @@ pub fn read_streaming_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::QueryLanguage;
+    use crate::stores::types::QueryLanguage;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

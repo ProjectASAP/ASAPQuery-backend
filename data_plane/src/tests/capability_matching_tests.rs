@@ -4,7 +4,7 @@
 //! the engine falls back to searching StreamingConfig by capability, and that
 //! the existing query_config path still takes priority when an entry is present.
 
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
     PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig, StreamingConfig,
     WindowType,
@@ -14,7 +14,7 @@ use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinS
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::sketch_store::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use crate::stores::traits::Store;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;

@@ -1,4 +1,4 @@
-use crate::stores::schema::{AggregateCore, PrecomputedOutput};
+use crate::stores::types::{AggregateCore, PrecomputedOutput};
 use crate::stores::Store;
 use std::sync::{Arc, Mutex};
 use tracing::debug_span;

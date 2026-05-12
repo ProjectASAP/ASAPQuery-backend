@@ -1,4 +1,4 @@
-use crate::stores::schema::HotReloadStreamingConfig;
+use crate::stores::types::HotReloadStreamingConfig;
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use crate::stores::sketch_db::SchemaRegistry;
@@ -52,7 +52,7 @@ pub struct IngestState {
     /// follow-up will add TTL-based eviction keyed by last-seen
     /// timestamp so long-running deployments don't leak memory
     /// on retired series.
-    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::stores::schema::AggregateCore>>,
+    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::stores::types::AggregateCore>>,
     /// Phase 4 — centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
     /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
@@ -64,7 +64,7 @@ pub struct IngestState {
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (warm-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
-    pub sketch_index: Arc<crate::stores::sketch_db::sketch_index::SketchIndex>,
+    pub sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
 }
 
 impl IngestState {
@@ -76,7 +76,7 @@ impl IngestState {
     /// Returns the shared `Arc<StreamingConfig>` — no cloning of
     /// individual AggregationConfig objects, just an atomic refcount
     /// increment (~5ns).
-    pub fn config_snapshot(&self) -> Arc<crate::stores::schema::StreamingConfig> {
+    pub fn config_snapshot(&self) -> Arc<crate::stores::types::StreamingConfig> {
         self.hot_reload_config.snapshot()
     }
 }
@@ -123,7 +123,7 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::StreamingConfig;
+    use crate::stores::types::StreamingConfig;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::stores::sketch_db::SchemaRegistry;
     use asap_types::aggregation_config::AggregationConfig;
@@ -168,7 +168,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
         let streaming = StreamingConfig::new(map);
-        let hot_reload = crate::stores::schema::HotReloadStreamingConfig::new(streaming.clone());
+        let hot_reload = crate::stores::types::HotReloadStreamingConfig::new(streaming.clone());
 
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
 
@@ -183,7 +183,7 @@ mod tests {
             series_resolver: Arc::new(
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
-            sketch_index: Arc::new(crate::stores::sketch_db::sketch_index::SketchIndex::new()),
+            sketch_index: Arc::new(crate::stores::sketch_db::index::SketchIndex::new()),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

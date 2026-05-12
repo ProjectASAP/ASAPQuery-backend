@@ -8,7 +8,7 @@ pub mod tests;
 pub mod utils;
 
 // Re-export commonly used types to avoid glob import conflicts
-pub use stores::schema::{
+pub use stores::types::{
     AccumulatorFactory, AggregateCore, AggregationConfig, InferenceConfig, KeyByLabelValues,
     Measurement, MergeableAccumulator, MultipleSubpopulationAggregate,
     MultipleSubpopulationAggregateFactory, PrecomputedOutput, PromQLSchema, QueryConfig,

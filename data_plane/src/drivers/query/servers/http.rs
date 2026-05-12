@@ -163,7 +163,7 @@ pub struct HttpServer {
     store: Arc<dyn Store>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
-    hot_reload_config: Option<crate::stores::schema::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -228,7 +228,7 @@ struct AppState {
     store: Arc<dyn Store>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
-    hot_reload_config: Option<crate::stores::schema::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
@@ -308,7 +308,7 @@ impl HttpServer {
     /// endpoints return `503 Service Unavailable`.
     pub fn with_hot_reload_config(
         mut self,
-        handle: crate::stores::schema::HotReloadStreamingConfig,
+        handle: crate::stores::types::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
         self
@@ -333,7 +333,7 @@ impl HttpServer {
     /// `StreamingConfig::storage_backend()`.
     pub fn with_backend_storage_routing(
         mut self,
-        routing: Arc<crate::stores::schema::BackendStorageRouting>,
+        routing: Arc<crate::stores::types::BackendStorageRouting>,
     ) -> Self {
         self.backend_storage_routing = Some(
             crate::query_engines::routing::HotReloadBackendStorageRouting::from_arc(routing),
@@ -740,7 +740,7 @@ async fn process_query_request(
 ///
 /// v7: when the routing table has multi-target rows for the metric,
 /// the parsed AST is also classified via
-/// [`crate::stores::schema::classify_query_shape`] and the lookup picks
+/// [`crate::stores::types::classify_query_shape`] and the lookup picks
 /// the target whose `applies_to_query_shape` matches. v6.1
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
@@ -757,7 +757,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
         match promql_parser::parser::parse(query) {
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
-                    let shape = crate::stores::schema::classify_query_shape(&expr);
+                    let shape = crate::stores::types::classify_query_shape(&expr);
                     let backend = routing.lookup_with_shape(&metric_name, shape);
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
@@ -858,7 +858,7 @@ async fn try_answer_freshness_probe(
     );
 
     let element =
-        InstantVectorElement::new(crate::stores::schema::KeyByLabelValues::new(), sample.value);
+        InstantVectorElement::new(crate::stores::types::KeyByLabelValues::new(), sample.value);
     // The instant-vector timestamp is unix milliseconds — match the
     // adapter's expectations downstream (the Prometheus adapter
     // divides by 1000 to render the wire `value: [<unix_seconds>, ...]`).
@@ -1806,9 +1806,9 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
+    use crate::stores::types::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
     use crate::query_engines::ASAPQueryEngine;
-    use crate::stores::sketch_db::sketch_store::SketchStore;
+    use crate::stores::sketch_db::store::SketchStore;
     use reqwest::Client;
     use std::sync::Arc;
 
@@ -1831,13 +1831,13 @@ mod tests {
         };
 
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
@@ -1845,7 +1845,7 @@ mod tests {
             inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
 
         let mut server = HttpServer::new(config, query_engine, store);
@@ -2088,20 +2088,20 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
@@ -2571,20 +2571,20 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_config.clone(),
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let schemas = {
             use asap_types::aggregation_config::AggregationConfig;
@@ -2965,8 +2965,8 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         // Pin `storage_backend` on the streaming config so the http
         // dispatcher reads it back through the hot-reload handle.
@@ -2976,14 +2976,14 @@ aggregations:
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_arc,
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server =
             HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
@@ -3007,7 +3007,7 @@ aggregations:
     /// `setup_test_server_with_router` helper above which mocks the
     /// resolution by pinning `streaming_cfg.storage_backend` directly.
     async fn setup_test_server_with_routing_table(
-        routing: crate::stores::schema::BackendStorageRouting,
+        routing: crate::stores::types::BackendStorageRouting,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
         let adapter_config =
@@ -3018,8 +3018,8 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         // Streaming-config stays on the default `SketchStore` axis
         // — exactly what the production deploy looks like (the YAML
@@ -3030,14 +3030,14 @@ aggregations:
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_arc,
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server = HttpServer::new(config, query_engine, store)
             .with_hot_reload_config(hot_reload)
@@ -3334,7 +3334,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaObjectStore,
         );
-        let routing = crate::stores::schema::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
             metrics,
         );
@@ -3377,7 +3377,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaObjectStore,
         );
-        let routing = crate::stores::schema::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
             metrics,
         );
@@ -3407,7 +3407,7 @@ aggregations:
         // top-level `default: thanos_query` — every metric must
         // route through the router. Pins the §8 "all-metrics-archive"
         // deploy mode.
-        let routing = crate::stores::schema::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::GorillaObjectStore,
             std::collections::HashMap::new(),
         );
@@ -3445,7 +3445,7 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_count_lands_on_archive() {
-        use crate::stores::schema::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -3491,7 +3491,7 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_quantile_stays_on_warm_tier() {
-        use crate::stores::schema::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -3561,7 +3561,7 @@ aggregations:
     /// shape-classifier and dispatches to the explicitly named engine.
     #[tokio::test]
     async fn http_engine_override_header_routes_to_named_engine() {
-        use crate::stores::schema::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -3619,7 +3619,7 @@ aggregations:
     /// backwards-compatible.
     #[tokio::test]
     async fn http_engine_override_missing_uses_default_routing() {
-        use crate::stores::schema::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -3767,7 +3767,7 @@ aggregations:
     /// the test can introspect the swap result.
     async fn setup_test_server_for_storage_routing(
     ) -> (u16, crate::query_engines::routing::HotReloadBackendStorageRouting) {
-        use crate::stores::schema::{HotReloadStreamingConfig, StreamingConfig};
+        use crate::stores::types::{HotReloadStreamingConfig, StreamingConfig};
         use crate::query_engines::routing::HotReloadBackendStorageRouting;
 
         let adapter_config =
@@ -3778,22 +3778,22 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_arc,
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
         let server = HttpServer::new(config, query_engine, store)
@@ -3904,7 +3904,7 @@ aggregations:
         let (port, handle) = setup_test_server_for_storage_routing().await;
         // Pre-load the table.
         let new =
-            crate::stores::schema::BackendStorageRouting::from_json_payload(&fixture_routing_json())
+            crate::stores::types::BackendStorageRouting::from_json_payload(&fixture_routing_json())
                 .expect("parse");
         handle.swap(new);
 
@@ -4074,13 +4074,13 @@ aggregations:
         // the very next read.
         let snap = handle.snapshot();
         assert_eq!(
-            snap.lookup_with_shape("http_requests_total", crate::stores::schema::QueryShape::Count,),
+            snap.lookup_with_shape("http_requests_total", crate::stores::types::QueryShape::Count,),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             snap.lookup_with_shape(
                 "http_requests_total",
-                crate::stores::schema::QueryShape::Quantile,
+                crate::stores::types::QueryShape::Quantile,
             ),
             StorageBackend::SketchStore,
         );
@@ -4249,8 +4249,8 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_cfg =
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
@@ -4258,14 +4258,14 @@ aggregations:
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_arc,
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let mut server =
             HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
@@ -4308,20 +4308,20 @@ aggregations:
             adapter_config,
         };
         let inference_config = InferenceConfig::new(
-            crate::stores::schema::QueryLanguage::promql,
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::QueryLanguage::promql,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         );
         let streaming_arc = Arc::new(StreamingConfig::default());
         let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
             store.clone(),
             inference_config,
             streaming_arc,
             15000,
-            crate::stores::schema::QueryLanguage::promql,
+            crate::stores::types::QueryLanguage::promql,
         ));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
         let server = HttpServer::new(config, query_engine, store).with_probe_cache(cache.clone());
@@ -4930,7 +4930,7 @@ async fn handle_post_storage_routing(
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
-    let new_table = match crate::stores::schema::BackendStorageRouting::from_json_payload(&json_value) {
+    let new_table = match crate::stores::types::BackendStorageRouting::from_json_payload(&json_value) {
         Ok(t) => t,
         Err(e) => {
             let body = serde_json::json!({

@@ -69,16 +69,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::stores::schema::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
+use crate::stores::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use crate::stores::traits::Store;
 use asap_types::aggregation_config::AggregationConfig;
 
-use super::backfill::BackfillRegistry;
-use super::backfill_window_builder::build_backfilled_accumulator;
-use super::backfill_worker::WindowProcessor;
+use super::BackfillRegistry;
+use super::window_builder::build_backfilled_accumulator;
+use super::worker::WindowProcessor;
 use super::raw_sample_reader::RawSample;
-use super::schema::SchemaRegistry;
+use crate::stores::sketch_db::schema::SchemaRegistry;
 
 /// Turn a series key into the `group_key` string the
 /// grouping_labels-based partitioning produces in live ingest.
@@ -205,7 +205,7 @@ impl WindowProcessor for BackfillWindowProcessor {
             return Ok(());
         }
 
-        let mut batch: Vec<(crate::stores::schema::PrecomputedOutput, Box<dyn AggregateCore>)> =
+        let mut batch: Vec<(crate::stores::types::PrecomputedOutput, Box<dyn AggregateCore>)> =
             Vec::with_capacity(by_group.len());
 
         for (group_key, group_samples) in by_group {
@@ -220,7 +220,7 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::stores::schema::PrecomputedOutput::new_backfilled(
+            let output = crate::stores::types::PrecomputedOutput::new_backfilled(
                 window_range.0,
                 window_range.1,
                 key,
@@ -260,11 +260,11 @@ impl WindowProcessor for BackfillWindowProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::StreamingConfig;
+    use crate::stores::types::StreamingConfig;
     use crate::stores::sketch_db::backfill::BackfillSource;
-    use crate::stores::sketch_db::backfill_worker::BackfillWorker;
-    use crate::stores::sketch_db::raw_sample_reader::{LabelFilter, MockRawSampleReader};
-    use crate::stores::sketch_db::sketch_store::SketchStore;
+    use crate::stores::sketch_db::backfill::worker::BackfillWorker;
+    use crate::stores::sketch_db::backfill::raw_sample_reader::{LabelFilter, MockRawSampleReader};
+    use crate::stores::sketch_db::store::SketchStore;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;
@@ -310,7 +310,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
@@ -360,7 +360,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
@@ -387,7 +387,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
@@ -413,7 +413,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
@@ -461,7 +461,7 @@ mod tests {
 
         assert_eq!(
             registry.get(job_id).unwrap().status,
-            super::super::backfill::BackfillStatus::Complete
+            super::super::BackfillStatus::Complete
         );
         // 4 windows × 1 write each (some windows have 1 group — the
         // writes are per-window batches, not per-group entries).

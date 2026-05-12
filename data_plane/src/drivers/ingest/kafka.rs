@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::stores::schema::enums::{InputFormat, StreamingEngine};
-use crate::stores::schema::traits::SerializableToSink;
-use crate::stores::schema::PrecomputedOutput;
-use crate::stores::schema::StreamingConfig;
+use crate::stores::types::enums::{InputFormat, StreamingEngine};
+use crate::stores::types::traits::SerializableToSink;
+use crate::stores::types::PrecomputedOutput;
+use crate::stores::types::StreamingConfig;
 use crate::stores::Store;
 use crate::utils::PrecomputeDumper;
 
@@ -182,7 +182,7 @@ impl<T: Store + Send + Sync + 'static> KafkaConsumer<T> {
 
     async fn process_batch(
         &self,
-        batch: &mut Vec<(PrecomputedOutput, Box<dyn crate::stores::schema::AggregateCore>)>,
+        batch: &mut Vec<(PrecomputedOutput, Box<dyn crate::stores::types::AggregateCore>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if batch.is_empty() {
             return Ok(());
@@ -230,7 +230,7 @@ impl<T: Store + Send + Sync + 'static> KafkaConsumer<T> {
         &self,
         message: &rdkafka::message::BorrowedMessage<'_>,
     ) -> Result<
-        Option<(PrecomputedOutput, Box<dyn crate::stores::schema::AggregateCore>)>,
+        Option<(PrecomputedOutput, Box<dyn crate::stores::types::AggregateCore>)>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let message_start_time = Instant::now();

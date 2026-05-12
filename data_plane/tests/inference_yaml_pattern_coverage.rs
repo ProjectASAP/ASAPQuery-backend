@@ -25,7 +25,7 @@ fn init_test_tracing() {
     let _ = tracing_subscriber::fmt::try_init();
 }
 
-use data_plane::stores::schema::{
+use data_plane::stores::types::{
     AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
     KeyByLabelValues, PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig,
     StreamingConfig, WindowType,

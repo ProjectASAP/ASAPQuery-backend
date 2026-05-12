@@ -229,7 +229,7 @@ pub fn convert_range_result_to_prometheus(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::KeyByLabelValues;
+    use crate::stores::types::KeyByLabelValues;
     use crate::query_engines::query_result::{InstantVectorElement, RangeVectorElement};
 
     fn create_test_labels() -> KeyByLabelValues {

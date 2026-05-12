@@ -3,7 +3,7 @@ pub mod global;
 pub mod per_key;
 pub mod persistence;
 
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregateCore, CleanupPolicy, LockStrategy, PrecomputedOutput, StreamingConfig,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};
@@ -172,7 +172,7 @@ impl Store for SketchStore {
 #[cfg(test)]
 mod drop_agg_id_tests {
     use super::*;
-    use crate::stores::schema::AggregationType;
+    use crate::stores::types::AggregationType;
     use crate::precompute_engine::operators::SumAccumulator;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;

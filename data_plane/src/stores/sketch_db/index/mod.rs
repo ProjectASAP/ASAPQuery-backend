@@ -24,7 +24,7 @@ use std::sync::{Arc, RwLock};
 
 use dashmap::DashMap;
 
-use super::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
+use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
 
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
@@ -474,3 +474,7 @@ mod tests {
         assert_eq!(series[0].samples.len(), 4);
     }
 }
+
+// 2026-05 reorg: generic epoch-partitioned columnar storage lives
+// alongside the index that uses it.
+pub mod epoch_columnar;

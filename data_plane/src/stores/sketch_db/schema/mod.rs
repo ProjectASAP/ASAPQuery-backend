@@ -77,7 +77,7 @@ use asap_types::aggregation_config::AggregationConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::stores::schema::StreamingConfig;
+use crate::stores::types::StreamingConfig;
 
 /// Lifecycle state of an `aggregation_id`. Derived from the
 /// `AggSchema`'s timestamps and the current wall clock — never stored
@@ -1276,3 +1276,9 @@ mod tests {
         assert!(r.force_expire(999).is_none());
     }
 }
+
+// 2026-05 reorg: schema_eviction.rs moved alongside as a submodule.
+pub mod eviction;
+pub use eviction::{
+    warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
+};

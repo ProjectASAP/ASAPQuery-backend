@@ -5,14 +5,14 @@
 //! hardcodes "SumAccumulator", these helpers build AggregationConfig with
 //! the correct aggregation_type string.
 
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregationConfig, AggregationReference, AggregationType, CleanupPolicy, InferenceConfig,
     KeyByLabelValues, PrecomputedOutput, PromQLSchema, QueryConfig, QueryLanguage, SchemaConfig,
     StreamingConfig, WindowType,
 };
 use crate::query_engines::query_result::InstantVectorElement;
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
-use crate::stores::sketch_db::sketch_store::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use crate::stores::Store;
 use crate::AggregateCore;
 use promql_utilities::data_model::KeyByLabelNames;

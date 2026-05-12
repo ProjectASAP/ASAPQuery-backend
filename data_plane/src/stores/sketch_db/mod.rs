@@ -30,36 +30,21 @@
 
 pub mod accuracy;
 pub mod backfill;
-pub mod backfill_processor;
-pub mod backfill_service;
-pub mod backfill_window_builder;
-pub mod backfill_worker;
-pub mod epoch_columnar;
+pub mod index;
 pub mod metrics;
-pub mod prometheus_reader;
-pub mod raw_sample_reader;
 pub mod schema;
-pub mod schema_eviction;
-pub mod sketch_store;
-pub mod sketch_index;
+pub mod store;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{
-    BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus, Coverage, CreateError,
+    build_backfilled_accumulator, default_reader_factory, noop_reader_factory, BackfillJob,
+    BackfillRegistry, BackfillService, BackfillServiceConfig, BackfillServiceHandle,
+    BackfillSource, BackfillStatus, BackfillWindowProcessor, BackfillWorker, BackfillWorkerError,
+    Coverage, CreateError, LabelFilter, MockRawSampleReader, PrometheusReader, RawSample,
+    RawSampleReader, RawSampleReaderError, ReaderFactory, WindowProcessor,
 };
-pub use backfill_processor::BackfillWindowProcessor;
-pub use backfill_service::{
-    default_reader_factory, noop_reader_factory, BackfillService, BackfillServiceConfig,
-    BackfillServiceHandle, ReaderFactory,
+pub use schema::{
+    warn_if_retention_inverted, AggSchema, AggStatus, SchemaEvictionConfig, SchemaEvictionHandle,
+    SchemaEvictionService, SchemaRegistry, TimelineCoverage, TimelineSegment,
 };
-pub use backfill_window_builder::build_backfilled_accumulator;
-pub use backfill_worker::{BackfillWorker, BackfillWorkerError, WindowProcessor};
-pub use prometheus_reader::PrometheusReader;
-pub use raw_sample_reader::{
-    LabelFilter, MockRawSampleReader, RawSample, RawSampleReader, RawSampleReaderError,
-};
-pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, TimelineSegment};
-pub use schema_eviction::{
-    warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
-};
-pub use sketch_store::SketchStore;
+pub use store::SketchStore;

@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 use promql_utilities::data_model::KeyByLabelNames;
 use tempfile::TempDir;
 
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregationType, CleanupPolicy, PrecomputedOutput, StreamingConfig, WindowType,
 };
 use crate::precompute_engine::operators::SumAccumulator;
-use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
-use crate::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
+use crate::stores::sketch_db::store::per_key::SketchStorePerKey;
+use crate::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
 use crate::stores::Store;
 use crate::{AggregateCore, AggregationConfig};
 

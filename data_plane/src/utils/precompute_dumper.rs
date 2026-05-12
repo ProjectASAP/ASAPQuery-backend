@@ -1,4 +1,4 @@
-use crate::stores::schema::{AggregateCore, PrecomputedOutput};
+use crate::stores::types::{AggregateCore, PrecomputedOutput};
 use serde::Serialize;
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};

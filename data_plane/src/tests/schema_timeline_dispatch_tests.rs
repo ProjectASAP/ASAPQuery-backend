@@ -26,13 +26,13 @@ use asap_types::promql_schema::PromQLSchema;
 use asap_types::query_config::QueryConfig;
 use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
-use crate::stores::schema::{
+use crate::stores::types::{
     CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, KeyByLabelValues, PrecomputedOutput,
     QueryLanguage, SchemaConfig, StreamingConfig,
 };
 use crate::query_engines::{QueryResult, ASAPQueryEngine};
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::sketch_store::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use crate::stores::sketch_db::{AggSchema, SchemaRegistry};
 use crate::stores::Store;
 

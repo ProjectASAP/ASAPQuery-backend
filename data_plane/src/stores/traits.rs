@@ -1,4 +1,4 @@
-use crate::stores::schema::{AggregateCore, KeyByLabelValues, PrecomputedOutput};
+use crate::stores::types::{AggregateCore, KeyByLabelValues, PrecomputedOutput};
 use std::collections::HashMap;
 use std::sync::Arc;
 

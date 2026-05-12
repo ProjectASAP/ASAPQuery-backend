@@ -15,16 +15,11 @@
 //!   engine.
 //! * [`thanos_query_engine::ThanosQueryEngine`] — archive-tier query
 //!   engine.
-//! * [`prometheus_query_engine::PrometheusForwardEngine`] — HTTP-forwarder
-//!   to a Prometheus `/api/v1/query` endpoint, registered under the
-//!   `prometheus_remote` engine id when
-//!   `ASAP_PROMETHEUS_QUERY_URL` is set (Phase ε.2).
 //! * [`EngineError`] — the trait-level error envelope every
 //!   `crate::query_engines::routing::QueryEngine` impl returns.
 
 pub mod asap_query_engine;
 pub mod no_data_archive;
-pub mod prometheus_query_engine;
 pub mod query_result;
 pub mod routing;
 pub mod thanos_query_engine;
@@ -34,9 +29,6 @@ pub mod window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;
 pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
-pub use prometheus_query_engine::{
-    PrometheusForwardConfig, PrometheusForwardEngine, PrometheusForwardError,
-};
 pub use query_result::{InstantVector, QueryResult, RangeVector, RangeVectorElement, Sample};
 pub use thanos_query_engine::{
     thanos_engine_from_env, ThanosQueryConfig, ThanosQueryEngine, ThanosQueryError,

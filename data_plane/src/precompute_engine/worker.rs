@@ -1,4 +1,4 @@
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
 };
 use crate::precompute_engine::accumulator_factory::{
@@ -1070,7 +1070,7 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    use crate::stores::schema::StreamingConfig;
+    use crate::stores::types::StreamingConfig;
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
@@ -1176,8 +1176,8 @@ mod tests {
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> crate::stores::schema::HotReloadStreamingConfig {
-        crate::stores::schema::HotReloadStreamingConfig::new(crate::stores::schema::StreamingConfig::new(
+    ) -> crate::stores::types::HotReloadStreamingConfig {
+        crate::stores::types::HotReloadStreamingConfig::new(crate::stores::types::StreamingConfig::new(
             configs,
         ))
     }
@@ -2451,9 +2451,9 @@ aggregations:
     /// queried metric / agg_id.
     #[test]
     fn test_sketch_ingest_persists_and_query_returns_non_empty() {
-        use crate::stores::schema::{CleanupPolicy, StreamingConfig};
+        use crate::stores::types::{CleanupPolicy, StreamingConfig};
         use crate::precompute_engine::output_sink::StoreOutputSink;
-        use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
+        use crate::stores::sketch_db::store::per_key::SketchStorePerKey;
         use crate::stores::Store;
 
         // Streaming config: agg_id=1, 30s tumbling, DDSketch,
@@ -2487,7 +2487,7 @@ aggregations:
             0,
             rx,
             sink,
-            crate::stores::schema::HotReloadStreamingConfig::new(StreamingConfig::new(configs_map)),
+            crate::stores::types::HotReloadStreamingConfig::new(StreamingConfig::new(configs_map)),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
                 allowed_lateness_ms: 0,

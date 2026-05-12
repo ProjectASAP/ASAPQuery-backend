@@ -892,7 +892,7 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 // ---------------------------------------------------------------------------
 
 /// Per-tenant atomic-swap wrapper around `BackendStorageRouting`,
-/// mirroring [`crate::stores::schema::HotReloadStreamingConfig`]. Lets the
+/// mirroring [`crate::stores::types::HotReloadStreamingConfig`]. Lets the
 /// `POST /api/v1/storage_routing` HTTP handler swap one tenant's table
 /// at runtime without restarting the backend or touching any other
 /// tenant's table. Cloneable; clones share the underlying `ArcSwap` so

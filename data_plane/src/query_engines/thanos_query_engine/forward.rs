@@ -39,7 +39,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::stores::schema::KeyByLabelValues;
+use crate::stores::types::KeyByLabelValues;
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
 use crate::query_engines::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
 use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};

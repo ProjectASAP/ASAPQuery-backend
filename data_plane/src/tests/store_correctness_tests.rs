@@ -27,7 +27,7 @@
 //! | `contract_per_key`    | `LockStrategy::PerKey` (reference impl) |
 //! | `contract_global`     | `LockStrategy::Global`      |
 
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregationType, CleanupPolicy, KeyByLabelValues, LockStrategy, Measurement,
     SerializableToSink, StreamingConfig, WindowType,
 };

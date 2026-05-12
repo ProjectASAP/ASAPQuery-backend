@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Read as _;
 use tracing::error;
 
-use crate::stores::schema::traits::SerializableToSink;
-use crate::stores::schema::{AggregationType, KeyByLabelValues, StreamingConfig};
+use crate::stores::types::traits::SerializableToSink;
+use crate::stores::types::{AggregationType, KeyByLabelValues, StreamingConfig};
 
 /// §5.1 provenance tag on every precompute record: did this window
 /// come from live ingest or was it materialised by a backfill job?
@@ -102,7 +102,7 @@ impl PrecomputedOutput {
     // /// Serialize PrecomputedOutput with precompute data to match Python JSON format
     // pub fn serialize_to_json_with_precompute(
     //     &self,
-    //     precompute: &dyn crate::stores::schema::AggregateCore,
+    //     precompute: &dyn crate::stores::types::AggregateCore,
     // ) -> serde_json::Value {
     //     serde_json::json!({
     //         // "config": self.config.serialize_to_json(),
@@ -195,7 +195,7 @@ impl PrecomputedOutput {
         // streaming_config: &HashMap<u64, AggregationConfig>,
         streaming_config: &StreamingConfig,
     ) -> Result<
-        (Self, Box<dyn crate::stores::schema::AggregateCore>),
+        (Self, Box<dyn crate::stores::types::AggregateCore>),
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let aggregation_id = data
@@ -295,7 +295,7 @@ impl PrecomputedOutput {
     // pub fn deserialize_from_json_with_precompute(
     //     data: &serde_json::Value,
     // ) -> Result<
-    //     (Self, Box<dyn crate::stores::schema::AggregateCore>),
+    //     (Self, Box<dyn crate::stores::types::AggregateCore>),
     //     Box<dyn std::error::Error + Send + Sync>,
     // > {
     //     debug!("Deserializing PrecomputedOutput with precompute from JSON: {data}");
@@ -324,7 +324,7 @@ impl PrecomputedOutput {
     //     data: &[u8],
     //     aggregation_type: &str,
     // ) -> Result<
-    //     (Self, Box<dyn crate::stores::schema::AggregateCore>),
+    //     (Self, Box<dyn crate::stores::types::AggregateCore>),
     //     Box<dyn std::error::Error + Send + Sync>,
     // > {
     //     // First get the metadata and precompute bytes
@@ -346,7 +346,7 @@ impl PrecomputedOutput {
     // fn create_precompute_from_json(
     //     precompute_type: &str,
     //     data: &serde_json::Value,
-    // ) -> Result<Box<dyn crate::stores::schema::AggregateCore>, Box<dyn std::error::Error + Send + Sync>>
+    // ) -> Result<Box<dyn crate::stores::types::AggregateCore>, Box<dyn std::error::Error + Send + Sync>>
     // {
     //     use crate::precompute_engine::operators::*;
 
@@ -416,7 +416,7 @@ impl PrecomputedOutput {
     fn create_precompute_from_bytes(
         precompute_type: AggregationType,
         buffer: &[u8],
-    ) -> Result<Box<dyn crate::stores::schema::AggregateCore>, Box<dyn std::error::Error + Send + Sync>>
+    ) -> Result<Box<dyn crate::stores::types::AggregateCore>, Box<dyn std::error::Error + Send + Sync>>
     {
         use crate::precompute_engine::operators::*;
 

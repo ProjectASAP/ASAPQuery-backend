@@ -37,14 +37,14 @@
 //! (plan-arrival + idempotency on repeat query).
 
 #[cfg(test)]
-use crate::stores::schema::{
+use crate::stores::types::{
     CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, QueryLanguage, StreamingConfig,
 };
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::controller_client::{ControllerClient, HttpControllerClient};
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::sketch_store::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -173,7 +173,7 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
     // No fallback — we want engine-miss to be visible to the
     // test and stay out of the hot-vs-cold routing question.
     let adapter_config = AdapterConfig::new(
-        crate::stores::schema::enums::QueryProtocol::PrometheusHttp,
+        crate::stores::types::enums::QueryProtocol::PrometheusHttp,
         QueryLanguage::promql,
         None,
     );

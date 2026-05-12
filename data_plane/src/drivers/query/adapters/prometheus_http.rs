@@ -411,7 +411,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::enums::{QueryLanguage, QueryProtocol};
+    use crate::stores::types::enums::{QueryLanguage, QueryProtocol};
 
     fn create_test_adapter() -> PrometheusHttpAdapter {
         let config = AdapterConfig::new(QueryProtocol::PrometheusHttp, QueryLanguage::promql, None);

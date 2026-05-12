@@ -1,4 +1,4 @@
-use crate::stores::schema::KeyByLabelValues;
+use crate::stores::types::KeyByLabelValues;
 use crate::stores::sketch_db::AccuracyEnvelope;
 use serde::{Deserialize, Serialize};
 

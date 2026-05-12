@@ -11,16 +11,16 @@
 // this same backend process — there is no longer a separate
 // `asap-controller` container in `mvp-multinode/run_demo.sh`.
 use clap::Parser;
-use data_plane::stores::schema::QueryLanguage;
+use data_plane::stores::types::QueryLanguage;
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use data_plane::stores::schema::enums::{
+use data_plane::stores::types::enums::{
     CleanupPolicy, InputFormat, LockStrategy, StreamingEngine,
 };
-use data_plane::stores::schema::InferenceConfig;
+use data_plane::stores::types::InferenceConfig;
 use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
@@ -362,14 +362,14 @@ async fn main() -> Result<()> {
     // control-plane GET/POST endpoint. Phase 2 will extend the swap
     // to query execution and ingest routing.
     let hot_reload_config =
-        data_plane::stores::schema::HotReloadStreamingConfig::from_arc(streaming_config.clone());
+        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
     // Setup store (equivalent to Python's SketchStore())
     // Get cleanup policy from inference config
     let cleanup_policy = inference_config.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let store = if args.persistence_enabled {
-        use data_plane::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
+        use data_plane::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()
@@ -443,7 +443,7 @@ async fn main() -> Result<()> {
     let series_resolver =
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
     let sketch_index =
-        Arc::new(data_plane::stores::sketch_db::sketch_index::SketchIndex::new());
+        Arc::new(data_plane::stores::sketch_db::index::SketchIndex::new());
 
     // Setup query engine. ASAPQueryEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
@@ -697,7 +697,7 @@ async fn main() -> Result<()> {
     // dev / standalone — the YAML supplies the bootstrap, controller
     // pushes overwrite it.
     let bootstrap_routing = if let Some(routing_path) = args.backend_storage_routing.as_deref() {
-        match data_plane::stores::schema::BackendStorageRouting::from_yaml_file(routing_path) {
+        match data_plane::stores::types::BackendStorageRouting::from_yaml_file(routing_path) {
             Ok(routing) => {
                 info!(
                     "Loaded backend-storage-routing from {:?}: default={:?}, entries={}",
@@ -712,14 +712,14 @@ async fn main() -> Result<()> {
                     "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
                     routing_path, e,
                 );
-                data_plane::stores::schema::BackendStorageRouting::empty()
+                data_plane::stores::types::BackendStorageRouting::empty()
             }
         }
     } else {
         info!(
             "--backend-storage-routing not set — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
         );
-        data_plane::stores::schema::BackendStorageRouting::empty()
+        data_plane::stores::types::BackendStorageRouting::empty()
     };
     server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 

@@ -1,9 +1,9 @@
 #[cfg(test)]
-use crate::stores::schema::{CleanupPolicy, InferenceConfig, QueryLanguage, StreamingConfig};
+use crate::stores::types::{CleanupPolicy, InferenceConfig, QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::sketch_store::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::schema::QueryLanguage::promql,
+        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);
@@ -179,7 +179,7 @@ async fn test_forwarding_disabled() {
         inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::schema::QueryLanguage::promql,
+        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);
@@ -235,7 +235,7 @@ async fn test_prometheus_server_unreachable() {
         inference_config,
         streaming_config.clone(),
         15000, // 15s scrape interval
-        crate::stores::schema::QueryLanguage::promql,
+        crate::stores::types::QueryLanguage::promql,
     ));
 
     let server = HttpServer::new(config, query_engine, store);

@@ -50,11 +50,11 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::stores::schema::HotReloadStreamingConfig;
+use crate::stores::types::HotReloadStreamingConfig;
 use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillSource, BackfillStatus};
-use crate::stores::sketch_db::backfill_processor::BackfillWindowProcessor;
-use crate::stores::sketch_db::backfill_worker::BackfillWorker;
-use crate::stores::sketch_db::raw_sample_reader::{LabelFilter, RawSampleReader};
+use crate::stores::sketch_db::backfill::processor::BackfillWindowProcessor;
+use crate::stores::sketch_db::backfill::worker::BackfillWorker;
+use crate::stores::sketch_db::backfill::raw_sample_reader::{LabelFilter, RawSampleReader};
 use crate::stores::sketch_db::schema::SchemaRegistry;
 use crate::stores::traits::Store;
 
@@ -293,9 +293,9 @@ pub fn default_reader_factory() -> ReaderFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::StreamingConfig;
-    use crate::stores::sketch_db::raw_sample_reader::{MockRawSampleReader, RawSample};
-    use crate::stores::sketch_db::sketch_store::SketchStore;
+    use crate::stores::types::StreamingConfig;
+    use crate::stores::sketch_db::backfill::raw_sample_reader::{MockRawSampleReader, RawSample};
+    use crate::stores::sketch_db::store::SketchStore;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -360,7 +360,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
 
@@ -413,7 +413,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
 
@@ -453,7 +453,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
 
@@ -522,7 +522,7 @@ mod tests {
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
-            crate::stores::schema::CleanupPolicy::NoCleanup,
+            crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let registry = Arc::new(BackfillRegistry::new());
 

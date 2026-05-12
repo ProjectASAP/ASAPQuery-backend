@@ -1,4 +1,4 @@
-use crate::stores::schema::enums::{QueryLanguage, QueryProtocol};
+use crate::stores::types::enums::{QueryLanguage, QueryProtocol};
 use crate::drivers::query::fallback::FallbackClient;
 use std::sync::Arc;
 

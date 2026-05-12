@@ -2,7 +2,7 @@
 //! epochs. Decouples `flusher.rs` from `SketchStorePerKey` so the
 //! flusher can be unit-tested against a fake source.
 
-use crate::stores::schema::KeyByLabelValues;
+use crate::stores::types::KeyByLabelValues;
 
 use super::PersistResult;
 

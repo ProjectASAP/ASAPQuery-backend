@@ -1,7 +1,7 @@
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregateCore, AggregationType, CleanupPolicy, PrecomputedOutput, StreamingConfig,
 };
-use crate::stores::sketch_db::sketch_store::common::{
+use crate::stores::sketch_db::store::common::{
     EpochID, InternTable, MetricBucketMap, MutableEpoch, SealedEpoch, TimestampRange,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};

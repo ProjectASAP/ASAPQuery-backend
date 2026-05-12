@@ -424,8 +424,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::KeyByLabelValues;
-    use crate::stores::sketch_db::sketch_store::persistence::source::{
+    use crate::stores::types::KeyByLabelValues;
+    use crate::stores::sketch_db::store::persistence::source::{
         EpochSnapshot, EpochSnapshotEntry,
     };
     use std::sync::Mutex as StdMutex;

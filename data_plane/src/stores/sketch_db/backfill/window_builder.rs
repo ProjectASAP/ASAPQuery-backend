@@ -47,12 +47,12 @@
 //!   MultipleSubpopulation (update_keyed) dispatch — mirrors
 //!   `worker::apply_sample`.
 
-use crate::stores::schema::{AggregateCore, KeyByLabelValues};
+use crate::stores::types::{AggregateCore, KeyByLabelValues};
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::stores::sketch_db::raw_sample_reader::RawSample;
+use crate::stores::sketch_db::backfill::raw_sample_reader::RawSample;
 use asap_types::aggregation_config::AggregationConfig;
 
 /// Extract the MultipleSubpopulation aggregated-label key from a

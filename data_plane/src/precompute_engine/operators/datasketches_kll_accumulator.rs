@@ -1,4 +1,4 @@
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
@@ -155,7 +155,7 @@ impl DatasketchesKLLAccumulator {
 
     /// Merge multiple accumulators efficiently without cloning all of them.
     pub fn merge_multiple(
-        accumulators: &[Box<dyn crate::stores::schema::AggregateCore>],
+        accumulators: &[Box<dyn crate::stores::types::AggregateCore>],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
@@ -315,7 +315,7 @@ impl AggregateCore for DatasketchesKLLAccumulator {
         _key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::schema::SingleSubpopulationAggregate;
+        use crate::stores::types::SingleSubpopulationAggregate;
         self.query(statistic, Some(query_kwargs))
     }
 }

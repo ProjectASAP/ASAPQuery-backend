@@ -2,7 +2,7 @@
 //!
 //! Provides assertion helpers for deep equality checking of query execution contexts.
 
-use crate::stores::schema::{AggregationIdInfo, AggregationType};
+use crate::stores::types::{AggregationIdInfo, AggregationType};
 use crate::query_engines::asap_query_engine::engine::{
     QueryExecutionContext, QueryMetadata, StoreQueryParams, StoreQueryPlan,
 };

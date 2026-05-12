@@ -52,8 +52,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use super::backfill::{BackfillRegistry, BackfillStatus};
-use super::schema::{AggStatus, SchemaRegistry};
+use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
+use super::{AggStatus, SchemaRegistry};
 use crate::stores::traits::Store;
 
 /// Configuration for the eviction loop. Separate from
@@ -267,9 +267,9 @@ pub fn warn_if_retention_inverted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::schema::{AggregationType, CleanupPolicy, LockStrategy, StreamingConfig};
+    use crate::stores::types::{AggregationType, CleanupPolicy, LockStrategy, StreamingConfig};
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::{backfill::BackfillSource, sketch_store::SketchStore};
+    use crate::stores::sketch_db::{backfill::BackfillSource, store::SketchStore};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -308,7 +308,7 @@ mod tests {
 
     fn write_one(store: &SketchStore, agg_id: u64, ts: u64) {
         let acc = SumAccumulator::with_sum(1.0);
-        let output = crate::stores::schema::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
+        let output = crate::stores::types::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
         store
             .insert_precomputed_output(output, Box::new(acc))
             .unwrap();

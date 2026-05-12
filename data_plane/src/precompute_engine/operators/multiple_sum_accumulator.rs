@@ -1,4 +1,4 @@
-use crate::stores::schema::{
+use crate::stores::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, MultipleSubpopulationAggregateFactory, SerializableToSink,
 };
@@ -251,7 +251,7 @@ impl AggregateCore for MultipleSumAccumulator {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::schema::MultipleSubpopulationAggregate;
+        use crate::stores::types::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for MultipleSumAccumulator")?;

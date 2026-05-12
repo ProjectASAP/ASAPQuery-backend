@@ -14,9 +14,9 @@ use promql_utilities::data_model::KeyByLabelNames;
 use tempfile::TempDir;
 use std::time::Duration;
 
-use crate::stores::schema::{AggregationType, CleanupPolicy, StreamingConfig, WindowType};
-use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
-use crate::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
+use crate::stores::types::{AggregationType, CleanupPolicy, StreamingConfig, WindowType};
+use crate::stores::sketch_db::store::per_key::SketchStorePerKey;
+use crate::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
 use crate::AggregationConfig;
 
 fn make_streaming_config(agg_id: u64) -> Arc<StreamingConfig> {
