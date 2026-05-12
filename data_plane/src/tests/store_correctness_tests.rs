@@ -38,7 +38,7 @@ use crate::precompute_engine::operators::{
     SumAccumulator,
 };
 use crate::stores::{Store, TimestampedBucketsMap};
-use crate::{AggregateCore, AggregationConfig, PrecomputedOutput, SimpleMapStore};
+use crate::{AggregateCore, AggregationConfig, PrecomputedOutput, SketchStore};
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -88,13 +88,13 @@ fn make_store(
     strategy: LockStrategy,
     policy: CleanupPolicy,
     ids: &[(u64, AggregationType, Option<u64>, Option<u64>)],
-) -> SimpleMapStore {
+) -> SketchStore {
     let config = make_streaming_config(ids);
-    SimpleMapStore::new_with_strategy(config, policy, strategy)
+    SketchStore::new_with_strategy(config, policy, strategy)
 }
 
 /// Convenience: single agg_id=1, type Sum, no cleanup.
-fn make_store_simple(strategy: LockStrategy) -> SimpleMapStore {
+fn make_store_simple(strategy: LockStrategy) -> SketchStore {
     make_store(
         strategy,
         CleanupPolicy::NoCleanup,
@@ -985,7 +985,7 @@ fn test_concurrent_reads_return_complete_results(strategy: LockStrategy) {
 
 // ── test entry points ─────────────────────────────────────────────────────────
 
-/// Contract suite against `SimpleMapStore` with [`LockStrategy::PerKey`].
+/// Contract suite against `SketchStore` with [`LockStrategy::PerKey`].
 ///
 /// This is the reference implementation — all other stores must match its
 /// observable behaviour.
@@ -994,7 +994,7 @@ fn contract_per_key() {
     run_contract_suite(LockStrategy::PerKey);
 }
 
-/// Contract suite against `SimpleMapStore` with [`LockStrategy::Global`].
+/// Contract suite against `SketchStore` with [`LockStrategy::Global`].
 #[test]
 fn contract_global() {
     run_contract_suite(LockStrategy::Global);

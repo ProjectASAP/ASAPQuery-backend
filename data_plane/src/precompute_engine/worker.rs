@@ -2453,7 +2453,7 @@ aggregations:
     fn test_sketch_ingest_persists_and_query_returns_non_empty() {
         use crate::stores::schema::{CleanupPolicy, StreamingConfig};
         use crate::precompute_engine::output_sink::StoreOutputSink;
-        use crate::stores::sketch_db::simple_map_store::per_key::SimpleMapStorePerKey;
+        use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
         use crate::stores::Store;
 
         // Streaming config: agg_id=1, 30s tumbling, DDSketch,
@@ -2473,7 +2473,7 @@ aggregations:
 
         // A real per_key store, so the test exercises the actual
         // insert + query path the production backend uses.
-        let store = Arc::new(SimpleMapStorePerKey::new(
+        let store = Arc::new(SketchStorePerKey::new(
             streaming_config.clone(),
             CleanupPolicy::CircularBuffer,
         ));

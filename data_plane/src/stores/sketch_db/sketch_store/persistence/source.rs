@@ -1,5 +1,5 @@
 //! The trait the flusher uses to enumerate, snapshot, and evict sealed
-//! epochs. Decouples `flusher.rs` from `SimpleMapStorePerKey` so the
+//! epochs. Decouples `flusher.rs` from `SketchStorePerKey` so the
 //! flusher can be unit-tested against a fake source.
 
 use crate::stores::schema::KeyByLabelValues;
@@ -68,7 +68,7 @@ pub struct EpochSnapshotEntry {
 }
 
 /// Trait the flusher uses to discover, snapshot, and evict sealed
-/// epochs. Implemented by `SimpleMapStorePerKey`; a test fake lives in
+/// epochs. Implemented by `SketchStorePerKey`; a test fake lives in
 /// `flusher.rs`'s unit tests.
 ///
 /// Implementors guarantee that:

@@ -1,6 +1,6 @@
 //! Engine factory helpers for integration tests
 //!
-//! Provides reusable construction helpers for ASAPQueryEngine + SimpleMapStore
+//! Provides reusable construction helpers for ASAPQueryEngine + SketchStore
 //! populated with various accumulator types. Unlike TestConfigBuilder which
 //! hardcodes "SumAccumulator", these helpers build AggregationConfig with
 //! the correct aggregation_type string.
@@ -12,7 +12,7 @@ use crate::stores::schema::{
 };
 use crate::query_engines::query_result::InstantVectorElement;
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
-use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::sketch_store::SketchStore;
 use crate::stores::Store;
 use crate::AggregateCore;
 use promql_utilities::data_model::KeyByLabelNames;
@@ -98,7 +98,7 @@ pub fn create_engine_single_pop_with_aggregated(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -219,7 +219,7 @@ pub fn create_engine_dual_input(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -335,7 +335,7 @@ pub fn create_engine_two_metrics(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -440,7 +440,7 @@ pub fn create_engine_three_metrics(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -521,7 +521,7 @@ pub fn create_engine_multi_timestamp(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -602,7 +602,7 @@ pub fn create_engine_multi_timestamp_with_window(
         storage_backend: Default::default(),
     });
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

@@ -5,7 +5,7 @@
 //! engine via [`OtlpReceiver::with_ingest_state`] — routes both raw metric
 //! points and pre-built sketches through the precompute engine's worker
 //! pool. The precompute engine then performs window-aligned aggregation
-//! per `StreamingConfig` and writes results to `SimpleMapStore`.
+//! per `StreamingConfig` and writes results to `SketchStore`.
 //!
 //! Architectural flow:
 //! ```text
@@ -13,7 +13,7 @@
 //!     → OTLP gRPC/HTTP (this receiver)
 //!     → precompute engine ingest router
 //!     → workers (per (agg_id, group_key) panes)
-//!     → StoreOutputSink → SimpleMapStore
+//!     → StoreOutputSink → SketchStore
 //!     → query engine
 //! ```
 //!
@@ -1057,7 +1057,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // legacy router push stays in tandem until the
                         // query path's warm-tier reducer is wired
                         // end-to-end and the streaming-config /
-                        // SimpleMapStore call sites can be deleted.
+                        // SketchStore call sites can be deleted.
                         messages.push(WorkerMessage::AccumulatorInput {
                             agg_id: config.aggregation_id,
                             group_key,

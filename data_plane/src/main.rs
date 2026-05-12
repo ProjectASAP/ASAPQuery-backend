@@ -28,7 +28,7 @@ use data_plane::utils::file_io::{read_inference_config, read_streaming_config};
 use data_plane::{
     HttpServer, HttpServerConfig, KafkaConsumer, KafkaConsumerConfig, OtlpReceiver,
     OtlpReceiverConfig, PrecomputeEngine, PrecomputeEngineConfig, Result, ASAPQueryEngine,
-    SimpleMapStore, StoreOutputSink,
+    SketchStore, StoreOutputSink,
 };
 
 #[derive(Parser, Debug)]
@@ -145,7 +145,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "promql")]
     query_language: QueryLanguage,
 
-    /// Lock strategy for SimpleMapStore: "global" for single mutex,
+    /// Lock strategy for SketchStore: "global" for single mutex,
     /// "per-key" for fine-grained locking. Default `per-key`.
     #[arg(long, value_enum, default_value = "per-key")]
     lock_strategy: LockStrategy,
@@ -236,14 +236,14 @@ struct Args {
     #[arg(long)]
     schema_eviction_dry_run: bool,
 
-    // ---- SimpleMapStore persistence ----
+    // ---- SketchStore persistence ----
     //
     // When --persistence-enabled is set, the store is constructed via
-    // SimpleMapStore::with_persistence_per_key with the other
+    // SketchStore::with_persistence_per_key with the other
     // --persistence-* flags as the config. Forces LockStrategy::PerKey
     // regardless of --lock-strategy; the Global variant is
     // intentionally left in-memory-only.
-    /// Enable the disk-backed persistence layer for SimpleMapStore
+    /// Enable the disk-backed persistence layer for SketchStore
     #[arg(long)]
     persistence_enabled: bool,
 
@@ -364,12 +364,12 @@ async fn main() -> Result<()> {
     let hot_reload_config =
         data_plane::stores::schema::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
-    // Setup store (equivalent to Python's SimpleMapStore())
+    // Setup store (equivalent to Python's SketchStore())
     // Get cleanup policy from inference config
     let cleanup_policy = inference_config.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let store = if args.persistence_enabled {
-        use data_plane::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+        use data_plane::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()
@@ -392,7 +392,7 @@ async fn main() -> Result<()> {
                 let ten_pct = (memory_limit_bytes / 10) as u64;
                 ten_pct.min(512 * 1024 * 1024)
             });
-        let persistence_cfg = SimpleMapStorePersistenceConfig {
+        let persistence_cfg = SketchStorePersistenceConfig {
             memory_limit_bytes,
             memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
             hard_cap_bytes: memory_limit_bytes * 125 / 100,
@@ -415,15 +415,15 @@ async fn main() -> Result<()> {
             info!("--persistence-enabled forces LockStrategy::PerKey (ignoring --lock-strategy)");
         }
         Arc::new(
-            SimpleMapStore::with_persistence_per_key(
+            SketchStore::with_persistence_per_key(
                 streaming_config.clone(),
                 cleanup_policy,
                 persistence_cfg,
             )
-            .expect("SimpleMapStore::with_persistence_per_key failed"),
+            .expect("SketchStore::with_persistence_per_key failed"),
         )
     } else {
-        Arc::new(SimpleMapStore::new_with_strategy(
+        Arc::new(SketchStore::new_with_strategy(
             streaming_config.clone(),
             cleanup_policy,
             args.lock_strategy,
@@ -881,7 +881,7 @@ async fn main() -> Result<()> {
     // scans the schema registry for `Expired` schemas, cancels any
     // in-flight backfills targeting them, and drops the agg_id's
     // data from the store. Complements the age-based data retention
-    // in SimpleMapStore — see `SchemaEvictionService` module doc for
+    // in SketchStore — see `SchemaEvictionService` module doc for
     // the ordering rationale.
     let schema_eviction_handle = if let (true, Some(ingest_state)) = (
         args.enable_schema_eviction,
@@ -971,7 +971,7 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    store: Arc<SimpleMapStore>,
+    store: Arc<SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
     use std::sync::atomic::Ordering;

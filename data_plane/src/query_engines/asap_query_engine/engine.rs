@@ -4929,7 +4929,7 @@ mod hot_reload_phase2_tests {
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, QueryLanguage,
         StreamingConfig, WindowType,
     };
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
     fn dummy_agg(id: u64, metric: &str) -> crate::stores::schema::AggregationConfig {
@@ -4962,7 +4962,7 @@ mod hot_reload_phase2_tests {
 
     fn build_engine(handle: HotReloadStreamingConfig) -> ASAPQueryEngine {
         let streaming_config = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_config,
             CleanupPolicy::NoCleanup,
         ));
@@ -5033,7 +5033,7 @@ mod hot_reload_phase2_tests {
         let external_handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
         let streaming_config = external_handle.snapshot();
 
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             Arc::clone(&streaming_config),
             CleanupPolicy::NoCleanup,
         ));
@@ -5091,7 +5091,7 @@ mod e2e_feedback_loop_tests {
         StreamingConfig, WindowType,
     };
     use crate::drivers::query::controller_client::ControllerClient;
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use async_trait::async_trait;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use promql_utilities::query_logics::enums::Statistic;
@@ -5225,7 +5225,7 @@ mod e2e_feedback_loop_tests {
         }));
 
         // 3. Build ASAPQueryEngine with the handle and mock controller.
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             Arc::new(StreamingConfig::default()),
             CleanupPolicy::NoCleanup,
         ));
@@ -5345,7 +5345,7 @@ mod e2e_feedback_loop_tests {
             streaming_config_with(&req.metric, 42)
         }));
 
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             Arc::new(StreamingConfig::default()),
             CleanupPolicy::NoCleanup,
         ));
@@ -5499,7 +5499,7 @@ mod aux_pushdown_tests {
             CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, PromQLSchema, QueryLanguage,
             SchemaConfig, StreamingConfig,
         };
-        use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+        use crate::stores::sketch_db::sketch_store::SketchStore;
 
         let ic = InferenceConfig {
             schema: SchemaConfig::PromQL(PromQLSchema {
@@ -5510,7 +5510,7 @@ mod aux_pushdown_tests {
         };
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
-        let store = Arc::new(SimpleMapStore::new(sc, CleanupPolicy::NoCleanup));
+        let store = Arc::new(SketchStore::new(sc, CleanupPolicy::NoCleanup));
         ASAPQueryEngine::new_with_hot_reload(store, ic, hr, 60, QueryLanguage::promql)
     }
 
@@ -5759,7 +5759,7 @@ mod sketch_alias_resolver_tests {
         AggregationConfig, CleanupPolicy, HotReloadStreamingConfig, InferenceConfig, PromQLSchema,
         QueryLanguage, SchemaConfig, StreamingConfig, WindowType,
     };
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use std::sync::Arc;
 
     fn agg_for(id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
@@ -5794,7 +5794,7 @@ mod sketch_alias_resolver_tests {
             configs.insert((i + 1) as u64, agg_for((i + 1) as u64, m, *t));
         }
         let streaming_config = StreamingConfig::new(configs);
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             Arc::new(streaming_config.clone()),
             CleanupPolicy::NoCleanup,
         ));
@@ -6149,7 +6149,7 @@ mod warm_tier_classify_tests {
     use crate::stores::schema::{CleanupPolicy, HotReloadStreamingConfig, InferenceConfig};
     use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use crate::stores::sketch_db::sketch_index::{
         AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState,
@@ -6158,7 +6158,7 @@ mod warm_tier_classify_tests {
 
     fn build_engine_with_index(idx: Arc<SketchIndex>) -> ASAPQueryEngine {
         let streaming_config = Arc::new(crate::stores::schema::StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
             CleanupPolicy::NoCleanup,
         ));

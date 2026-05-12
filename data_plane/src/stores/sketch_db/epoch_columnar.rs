@@ -1,6 +1,6 @@
 //! Epoch-partitioned columnar storage — generic payload type.
 //!
-//! Lifted from `simple_map_store::common` (legacy SimpleMapStore index)
+//! Lifted from `sketch_store::common` (legacy SketchStore index)
 //! with the payload column type made generic so the new SketchIndex
 //! (Phase 5) can reuse the legacy's six storage optimizations
 //! (`INDEX_DESIGN.md`) without dragging in `Arc<dyn AggregateCore>`
@@ -28,7 +28,7 @@
 //!   group-by VALUES vector to a compact ID, since the SketchIndex's
 //!   sid already captures the metric identity at the level above.
 //!
-//! See INDEX_DESIGN.md in `simple_map_store/` for the full complexity
+//! See INDEX_DESIGN.md in `sketch_store/` for the full complexity
 //! analysis (Insert O(1), range query O(M) mutable / O(log N + k)
 //! sealed, etc.) — those bounds carry over verbatim because the
 //! algorithmic structure is unchanged.

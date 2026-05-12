@@ -3,7 +3,7 @@ use crate::stores::schema::{CleanupPolicy, InferenceConfig, QueryLanguage, Strea
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::sketch_store::SketchStore;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
 
     let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -168,7 +168,7 @@ async fn test_forwarding_disabled() {
 
     let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -224,7 +224,7 @@ async fn test_prometheus_server_unreachable() {
 
     let inference_config = InferenceConfig::new(QueryLanguage::promql, CleanupPolicy::NoCleanup);
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

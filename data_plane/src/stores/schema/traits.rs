@@ -52,7 +52,7 @@ pub trait AggregateCore: SerializableToSink + Send + Sync {
 
     /// Approximate in-memory byte footprint of this accumulator.
     ///
-    /// Used by the `SimpleMapStore` persistence layer to drive its
+    /// Used by the `SketchStore` persistence layer to drive its
     /// memory-pressure trigger. Not required to be exact — the flusher
     /// only needs rough proportionality. The default is a conservative
     /// 4 KiB constant; concrete types should override it with a

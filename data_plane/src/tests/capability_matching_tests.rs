@@ -14,7 +14,7 @@ use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinS
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::sketch_store::SketchStore;
 use crate::stores::traits::Store;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
@@ -70,7 +70,7 @@ fn engine_no_query_configs(
         aggregation_configs: agg_map,
         storage_backend: Default::default(),
     });
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -132,7 +132,7 @@ fn engine_with_query_config(
         aggregation_configs: agg_map,
         storage_backend: Default::default(),
     });
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

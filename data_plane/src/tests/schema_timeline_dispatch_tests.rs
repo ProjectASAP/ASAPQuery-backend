@@ -3,7 +3,7 @@
 //! Exercises the full path from a PromQL query → schema registry
 //! lookup → per-segment store query → `combine_statistic` →
 //! Prometheus `warnings`, on a real `ASAPQueryEngine` +
-//! `SimpleMapStore` + `SchemaRegistry` with two agg_ids for the
+//! `SketchStore` + `SchemaRegistry` with two agg_ids for the
 //! same metric and a reconfigure boundary inside the query range.
 //!
 //! Contract validated: queries that span a reconfigure boundary
@@ -32,7 +32,7 @@ use crate::stores::schema::{
 };
 use crate::query_engines::{QueryResult, ASAPQueryEngine};
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::sketch_store::SketchStore;
 use crate::stores::sketch_db::{AggSchema, SchemaRegistry};
 use crate::stores::Store;
 
@@ -135,7 +135,7 @@ fn build_engine(
 /// existing test-utility pattern in `engine_factories` — the engine
 /// treats those as single-point buckets aligned to the tumbling
 /// window, so a query whose range contains `ts` picks up the data.
-fn seed_sum_at(store: &SimpleMapStore, agg_id: u64, ts: u64, host: &str, sum: f64) {
+fn seed_sum_at(store: &SketchStore, agg_id: u64, ts: u64, host: &str, sum: f64) {
     let key = Some(KeyByLabelValues {
         labels: vec![host.to_string()],
     });
@@ -165,7 +165,7 @@ fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
     // agg_2: Active from the boundary onwards.
     schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -222,7 +222,7 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
     schemas.insert_raw_for_testing(fixed_schema(1, 0, Some(BOUNDARY_MS), Some(1_000)));
     schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
@@ -275,7 +275,7 @@ fn single_schema_query_falls_through_to_default_path() {
     let schemas = Arc::new(SchemaRegistry::empty());
     schemas.insert_raw_for_testing(fixed_schema(7, 0, None, None));
 
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

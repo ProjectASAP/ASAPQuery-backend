@@ -264,7 +264,7 @@ mod tests {
     use crate::stores::sketch_db::backfill::BackfillSource;
     use crate::stores::sketch_db::backfill_worker::BackfillWorker;
     use crate::stores::sketch_db::raw_sample_reader::{LabelFilter, MockRawSampleReader};
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;
@@ -308,7 +308,7 @@ mod tests {
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SimpleMapStore::new(
+        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -358,7 +358,7 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SimpleMapStore::new(
+        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -385,7 +385,7 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SimpleMapStore::new(
+        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -411,7 +411,7 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SimpleMapStore::new(
+        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
             streaming.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));

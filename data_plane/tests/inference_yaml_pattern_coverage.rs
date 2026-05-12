@@ -34,7 +34,7 @@ use data_plane::engines::ASAPQueryEngine;
 use data_plane::precompute_engine::operators::{
     DDSketchAccumulator, DatasketchesKLLAccumulator, IncreaseAccumulator, SumAccumulator,
 };
-use data_plane::stores::SimpleMapStore;
+use data_plane::stores::SketchStore;
 use data_plane::stores::Store;
 use data_plane::utils::file_io::read_inference_config;
 use data_plane::AggregateCore;
@@ -157,7 +157,7 @@ fn build_engine(
         aggregation_configs,
         storage_backend: Default::default(),
     });
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

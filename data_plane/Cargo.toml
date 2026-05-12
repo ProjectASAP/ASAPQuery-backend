@@ -80,7 +80,7 @@ asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch
 # `ASAPQuery-backend` (sibling directories under `~/repos/`) before
 # `cargo build`. The path is relative so any matching layout works.
 asap-precompute-rs = { path = "../../ASAPCollector/asap-precompute-rs" }
-# Persistence layer (SimpleMapStore parts / manifest / Tier-2 cache)
+# Persistence layer (SketchStore parts / manifest / Tier-2 cache)
 moka = { version = "0.12", features = ["sync"] }
 memmap2 = "0.9"
 crc32fast = "1.4"
@@ -107,10 +107,6 @@ lru = "0.12"
 [dev-dependencies]
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "simple_store_bench"
-harness = false
 
 [features]
 #default = ["lock_profiling", "extra_debugging"]

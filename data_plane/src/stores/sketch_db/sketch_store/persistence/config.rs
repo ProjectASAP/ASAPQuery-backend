@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Configuration for the SimpleMapStore persistence layer.
+/// Configuration for the SketchStore persistence layer.
 ///
 /// The two bounding knobs, in priority order:
 ///
@@ -22,7 +22,7 @@ use std::time::Duration;
 ///   `now - delete_older_than_ms` is deleted from disk on the next tick.
 ///   Bounds manifest size and long-running directory growth.
 #[derive(Debug, Clone)]
-pub struct SimpleMapStorePersistenceConfig {
+pub struct SketchStorePersistenceConfig {
     // ---- Primary: memory budget ----
     pub memory_limit_bytes: usize,
     pub memory_low_watermark_bytes: usize,
@@ -50,7 +50,7 @@ pub struct SimpleMapStorePersistenceConfig {
     pub part_cache_bytes: u64,
 }
 
-impl SimpleMapStorePersistenceConfig {
+impl SketchStorePersistenceConfig {
     /// Build a config with sensible defaults relative to a memory budget.
     pub fn with_memory_limit(memory_limit_bytes: usize, disk_path: PathBuf) -> Self {
         let low_water = memory_limit_bytes * 8 / 10; // 80% of high water

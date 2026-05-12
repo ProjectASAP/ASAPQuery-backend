@@ -1,7 +1,7 @@
 use crate::stores::schema::{
     AggregateCore, AggregationType, CleanupPolicy, PrecomputedOutput, StreamingConfig,
 };
-use crate::stores::sketch_db::simple_map_store::common::{
+use crate::stores::sketch_db::sketch_store::common::{
     EpochID, InternTable, MetricBucketMap, MutableEpoch, SealedEpoch, TimestampRange,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};
@@ -131,7 +131,7 @@ struct StoreData {
 }
 
 /// In-memory storage implementation using single mutex (like Python version)
-pub struct SimpleMapStoreGlobal {
+pub struct SketchStoreGlobal {
     // Single global mutex protecting all data structures
     lock: Mutex<StoreData>,
 
@@ -142,7 +142,7 @@ pub struct SimpleMapStoreGlobal {
     cleanup_policy: CleanupPolicy,
 }
 
-impl SimpleMapStoreGlobal {
+impl SketchStoreGlobal {
     pub fn new(streaming_config: Arc<StreamingConfig>, cleanup_policy: CleanupPolicy) -> Self {
         Self {
             lock: Mutex::new(StoreData {
@@ -224,7 +224,7 @@ struct BatchConfig {
 }
 
 #[async_trait::async_trait]
-impl Store for SimpleMapStoreGlobal {
+impl Store for SketchStoreGlobal {
     fn insert_precomputed_output(
         &self,
         output: PrecomputedOutput,
@@ -692,7 +692,7 @@ impl Store for SimpleMapStoreGlobal {
 
     fn close(&self) -> StoreResult<()> {
         // For in-memory store, no cleanup needed
-        info!("SimpleMapStoreGlobal closed");
+        info!("SketchStoreGlobal closed");
         Ok(())
     }
 
@@ -721,7 +721,7 @@ impl Store for SimpleMapStoreGlobal {
         info!(
             agg_id,
             evicted_windows = evicted,
-            "SimpleMapStoreGlobal::drop_agg_id"
+            "SketchStoreGlobal::drop_agg_id"
         );
         Ok(evicted)
     }

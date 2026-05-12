@@ -8,13 +8,13 @@
 //! * `sketch_db` — the in-memory + persisted sketch DB. Logical
 //!   layer (schema registry, schema timeline, backfill types /
 //!   workers / HTTP endpoints) AND the physical storage backend
-//!   (`sketch_db::simple_map_store`) are co-located under this
+//!   (`sketch_db::sketch_store`) are co-located under this
 //!   path.
 //! * `gorilla_object_store` — S3/MinIO-backed Gorilla TSDB block
 //!   store used by the archive tier.
 //!
-//! `SimpleMapStore` is re-exported at the top level
-//! (`crate::stores::SimpleMapStore`) for call-site stability.
+//! `SketchStore` is re-exported at the top level
+//! (`crate::stores::SketchStore`) for call-site stability.
 
 pub mod gorilla_object_store;
 pub mod schema;
@@ -30,5 +30,5 @@ pub use sketch_db::sketch_index::{
     AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchIndex,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };
-pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry, SimpleMapStore};
+pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry, SketchStore};
 pub use traits::*;

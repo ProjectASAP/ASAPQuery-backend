@@ -1,6 +1,5 @@
 mod common;
 pub mod global;
-pub mod legacy;
 pub mod per_key;
 pub mod persistence;
 
@@ -8,8 +7,8 @@ use crate::stores::schema::{
     AggregateCore, CleanupPolicy, LockStrategy, PrecomputedOutput, StreamingConfig,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};
-use global::SimpleMapStoreGlobal;
-use per_key::SimpleMapStorePerKey;
+use global::SketchStoreGlobal;
+use per_key::SketchStorePerKey;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,12 +30,12 @@ pub struct StoreDiagnostics {
 }
 
 /// Enum wrapper that dispatches to either global or per-key lock implementation
-pub enum SimpleMapStore {
-    Global(SimpleMapStoreGlobal),
-    PerKey(SimpleMapStorePerKey),
+pub enum SketchStore {
+    Global(SketchStoreGlobal),
+    PerKey(SketchStorePerKey),
 }
 
-impl SimpleMapStore {
+impl SketchStore {
     /// Constructor with default strategy (backward compatibility for tests)
     pub fn new(streaming_config: Arc<StreamingConfig>, cleanup_policy: CleanupPolicy) -> Self {
         Self::new_with_strategy(streaming_config, cleanup_policy, LockStrategy::PerKey)
@@ -45,8 +44,8 @@ impl SimpleMapStore {
     /// Collect diagnostic info for memory investigation.
     pub fn diagnostic_info(&self) -> StoreDiagnostics {
         match self {
-            SimpleMapStore::Global(store) => store.diagnostic_info(),
-            SimpleMapStore::PerKey(store) => store.diagnostic_info(),
+            SketchStore::Global(store) => store.diagnostic_info(),
+            SketchStore::PerKey(store) => store.diagnostic_info(),
         }
     }
 
@@ -58,10 +57,10 @@ impl SimpleMapStore {
     ) -> Self {
         match lock_strategy {
             LockStrategy::Global => {
-                SimpleMapStore::Global(SimpleMapStoreGlobal::new(streaming_config, cleanup_policy))
+                SketchStore::Global(SketchStoreGlobal::new(streaming_config, cleanup_policy))
             }
             LockStrategy::PerKey => {
-                SimpleMapStore::PerKey(SimpleMapStorePerKey::new(streaming_config, cleanup_policy))
+                SketchStore::PerKey(SketchStorePerKey::new(streaming_config, cleanup_policy))
             }
         }
     }
@@ -77,10 +76,10 @@ impl SimpleMapStore {
     pub fn with_persistence_per_key(
         streaming_config: Arc<StreamingConfig>,
         cleanup_policy: CleanupPolicy,
-        persistence_cfg: persistence::SimpleMapStorePersistenceConfig,
+        persistence_cfg: persistence::SketchStorePersistenceConfig,
     ) -> persistence::PersistResult<Self> {
-        Ok(SimpleMapStore::PerKey(
-            SimpleMapStorePerKey::with_persistence(
+        Ok(SketchStore::PerKey(
+            SketchStorePerKey::with_persistence(
                 streaming_config,
                 cleanup_policy,
                 persistence_cfg,
@@ -90,15 +89,15 @@ impl SimpleMapStore {
 }
 
 #[async_trait::async_trait]
-impl Store for SimpleMapStore {
+impl Store for SketchStore {
     fn insert_precomputed_output(
         &self,
         output: PrecomputedOutput,
         precompute: Box<dyn AggregateCore>,
     ) -> StoreResult<()> {
         match self {
-            SimpleMapStore::Global(store) => store.insert_precomputed_output(output, precompute),
-            SimpleMapStore::PerKey(store) => store.insert_precomputed_output(output, precompute),
+            SketchStore::Global(store) => store.insert_precomputed_output(output, precompute),
+            SketchStore::PerKey(store) => store.insert_precomputed_output(output, precompute),
         }
     }
 
@@ -107,8 +106,8 @@ impl Store for SimpleMapStore {
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
     ) -> StoreResult<()> {
         match self {
-            SimpleMapStore::Global(store) => store.insert_precomputed_output_batch(outputs),
-            SimpleMapStore::PerKey(store) => store.insert_precomputed_output_batch(outputs),
+            SketchStore::Global(store) => store.insert_precomputed_output_batch(outputs),
+            SketchStore::PerKey(store) => store.insert_precomputed_output_batch(outputs),
         }
     }
 
@@ -120,10 +119,10 @@ impl Store for SimpleMapStore {
         end: u64,
     ) -> Result<TimestampedBucketsMap, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            SimpleMapStore::Global(store) => {
+            SketchStore::Global(store) => {
                 store.query_precomputed_output(metric, aggregation_id, start, end)
             }
-            SimpleMapStore::PerKey(store) => {
+            SketchStore::PerKey(store) => {
                 store.query_precomputed_output(metric, aggregation_id, start, end)
             }
         }
@@ -137,10 +136,10 @@ impl Store for SimpleMapStore {
         exact_end: u64,
     ) -> Result<TimestampedBucketsMap, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            SimpleMapStore::Global(store) => {
+            SketchStore::Global(store) => {
                 store.query_precomputed_output_exact(metric, aggregation_id, exact_start, exact_end)
             }
-            SimpleMapStore::PerKey(store) => {
+            SketchStore::PerKey(store) => {
                 store.query_precomputed_output_exact(metric, aggregation_id, exact_start, exact_end)
             }
         }
@@ -150,22 +149,22 @@ impl Store for SimpleMapStore {
         &self,
     ) -> Result<HashMap<u64, u64>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            SimpleMapStore::Global(store) => store.get_earliest_timestamp_per_aggregation_id(),
-            SimpleMapStore::PerKey(store) => store.get_earliest_timestamp_per_aggregation_id(),
+            SketchStore::Global(store) => store.get_earliest_timestamp_per_aggregation_id(),
+            SketchStore::PerKey(store) => store.get_earliest_timestamp_per_aggregation_id(),
         }
     }
 
     fn close(&self) -> StoreResult<()> {
         match self {
-            SimpleMapStore::Global(store) => store.close(),
-            SimpleMapStore::PerKey(store) => store.close(),
+            SketchStore::Global(store) => store.close(),
+            SketchStore::PerKey(store) => store.close(),
         }
     }
 
     fn drop_agg_id(&self, agg_id: u64) -> StoreResult<usize> {
         match self {
-            SimpleMapStore::Global(store) => store.drop_agg_id(agg_id),
-            SimpleMapStore::PerKey(store) => store.drop_agg_id(agg_id),
+            SketchStore::Global(store) => store.drop_agg_id(agg_id),
+            SketchStore::PerKey(store) => store.drop_agg_id(agg_id),
         }
     }
 }
@@ -206,7 +205,7 @@ mod drop_agg_id_tests {
         Arc::new(StreamingConfig::new(map))
     }
 
-    fn write_one(store: &SimpleMapStore, agg_id: u64, value: f64, ts: u64) {
+    fn write_one(store: &SketchStore, agg_id: u64, value: f64, ts: u64) {
         let acc = SumAccumulator::with_sum(value);
         let output = PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
         store
@@ -214,15 +213,15 @@ mod drop_agg_id_tests {
             .expect("insert ok");
     }
 
-    fn total_buckets(store: &SimpleMapStore, metric: &str, agg_id: u64) -> usize {
+    fn total_buckets(store: &SketchStore, metric: &str, agg_id: u64) -> usize {
         let map = store
             .query_precomputed_output(metric, agg_id, 0, u64::MAX / 2)
             .expect("query ok");
         map.values().map(|v| v.len()).sum()
     }
 
-    fn make_store(strategy: LockStrategy) -> SimpleMapStore {
-        SimpleMapStore::new_with_strategy(
+    fn make_store(strategy: LockStrategy) -> SketchStore {
+        SketchStore::new_with_strategy(
             two_agg_streaming_config(),
             CleanupPolicy::NoCleanup,
             strategy,

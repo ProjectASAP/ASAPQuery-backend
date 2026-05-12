@@ -1,4 +1,4 @@
-//! Performance harness for the `SimpleMapStore` persistence layer.
+//! Performance harness for the `SketchStore` persistence layer.
 //!
 //! All tests are `#[ignore]` so they don't slow down the normal
 //! `cargo test` run. Exercise them with:
@@ -39,8 +39,8 @@ use crate::stores::schema::{
     AggregationType, CleanupPolicy, PrecomputedOutput, StreamingConfig, WindowType,
 };
 use crate::precompute_engine::operators::SumAccumulator;
-use crate::stores::sketch_db::simple_map_store::per_key::SimpleMapStorePerKey;
-use crate::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
+use crate::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
 use crate::stores::Store;
 use crate::{AggregateCore, AggregationConfig};
 
@@ -78,8 +78,8 @@ fn persistence_cfg(
     memory_limit_bytes: usize,
     hot_window_ms: Option<u64>,
     flush_interval: Duration,
-) -> SimpleMapStorePersistenceConfig {
-    SimpleMapStorePersistenceConfig {
+) -> SketchStorePersistenceConfig {
+    SketchStorePersistenceConfig {
         memory_limit_bytes,
         memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
         hard_cap_bytes: memory_limit_bytes * 125 / 100,
@@ -158,7 +158,7 @@ fn insert_throughput_in_memory_vs_persistent() {
 
     // -- baseline: in-memory, NoCleanup --
     {
-        let store = SimpleMapStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
+        let store = SketchStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
         let items = gen_items(1, N);
         let d = insert_all(&store, items, BATCH);
         println!(
@@ -182,7 +182,7 @@ fn insert_throughput_in_memory_vs_persistent() {
             None,
             Duration::from_secs(3600),
         );
-        let store = SimpleMapStorePerKey::with_persistence(
+        let store = SketchStorePerKey::with_persistence(
             streaming_config(1, Some(1024)),
             CleanupPolicy::NoCleanup,
             cfg,
@@ -207,7 +207,7 @@ fn insert_throughput_in_memory_vs_persistent() {
             Some(0),         // flush everything ASAP
             Duration::from_millis(25),
         );
-        let store = SimpleMapStorePerKey::with_persistence(
+        let store = SketchStorePerKey::with_persistence(
             streaming_config(1, Some(512)),
             CleanupPolicy::NoCleanup,
             cfg,
@@ -241,7 +241,7 @@ fn query_latency_memory_only_vs_disk_through() {
 
     // -- in-memory baseline --
     {
-        let store = SimpleMapStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
+        let store = SketchStorePerKey::new(streaming_config(1, None), CleanupPolicy::NoCleanup);
         let items = gen_items(1, POPULATE);
         insert_all(&store, items, 1_000);
 
@@ -253,7 +253,7 @@ fn query_latency_memory_only_vs_disk_through() {
     {
         let tmp = TempDir::new().unwrap();
         let cfg = persistence_cfg(&tmp, 4 * 1024 * 1024, Some(0), Duration::from_millis(10));
-        let store = SimpleMapStorePerKey::with_persistence(
+        let store = SketchStorePerKey::with_persistence(
             streaming_config(1, Some(256)),
             CleanupPolicy::NoCleanup,
             cfg,
@@ -336,7 +336,7 @@ fn flush_throughput_sustained() {
         Some(0), // flush as fast as sealed epochs arrive
         Duration::from_millis(10),
     );
-    let store = SimpleMapStorePerKey::with_persistence(
+    let store = SketchStorePerKey::with_persistence(
         streaming_config(1, Some(512)),
         CleanupPolicy::NoCleanup,
         cfg,
@@ -450,7 +450,7 @@ fn memory_bound_adherence_under_overload() {
 
     let tmp = TempDir::new().unwrap();
     let cfg = persistence_cfg(&tmp, LIMIT_BYTES, Some(0), Duration::from_millis(10));
-    let store = SimpleMapStorePerKey::with_persistence(
+    let store = SketchStorePerKey::with_persistence(
         streaming_config(1, Some(128)),
         CleanupPolicy::NoCleanup,
         cfg,

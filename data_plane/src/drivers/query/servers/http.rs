@@ -195,7 +195,7 @@ pub struct HttpServer {
     /// HTTP endpoints stay `Queued` and are visible via the list
     /// endpoint — useful shadow-mode testing before workers exist.
     backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
-    /// SimpleMapStore data-retention horizon in millis, mirroring
+    /// SketchStore data-retention horizon in millis, mirroring
     /// `--persistence-delete-older-than-secs` at the CLI. Used by the
     /// `POST /api/v1/db/backfill` handler to gate job creation via
     /// `BackfillRegistry::create_checked` (§10.5 Method B). `None`
@@ -381,7 +381,7 @@ impl HttpServer {
         self
     }
 
-    /// Declare the SimpleMapStore data-retention horizon (the value of
+    /// Declare the SketchStore data-retention horizon (the value of
     /// `--persistence-delete-older-than-secs` * 1000). When set, the
     /// `POST /api/v1/db/backfill` handler runs `create_checked` with
     /// this bound, so jobs that would write windows older than the
@@ -1808,7 +1808,7 @@ mod tests {
     use super::*;
     use crate::stores::schema::{HotReloadStreamingConfig, InferenceConfig, StreamingConfig};
     use crate::query_engines::ASAPQueryEngine;
-    use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+    use crate::stores::sketch_db::sketch_store::SketchStore;
     use reqwest::Client;
     use std::sync::Arc;
 
@@ -1835,7 +1835,7 @@ mod tests {
             crate::stores::schema::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -2092,7 +2092,7 @@ aggregations:
             crate::stores::schema::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -2575,7 +2575,7 @@ aggregations:
             crate::stores::schema::CleanupPolicy::NoCleanup,
         );
         let streaming_config = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_config.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -2974,7 +2974,7 @@ aggregations:
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -3028,7 +3028,7 @@ aggregations:
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -3784,7 +3784,7 @@ aggregations:
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -4256,7 +4256,7 @@ aggregations:
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -4312,7 +4312,7 @@ aggregations:
             crate::stores::schema::CleanupPolicy::NoCleanup,
         );
         let streaming_arc = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SimpleMapStore::new(
+        let store = Arc::new(SketchStore::new(
             streaming_arc.clone(),
             crate::stores::schema::CleanupPolicy::NoCleanup,
         ));
@@ -4588,7 +4588,7 @@ struct PrecomputeJobRequest {
 /// The controller creates PrecomputeJobs when a query's upper sub-tree
 /// (e.g., TopK or a histogram-quantile-shaped Aggregate{Quantile(φ)})
 /// requires evaluation on merged sketches.
-/// This endpoint receives that job and runs it against the SimpleMapStore.
+/// This endpoint receives that job and runs it against the SketchStore.
 async fn handle_precompute_job(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<PrecomputeJobRequest>,
@@ -5269,7 +5269,7 @@ fn service_unavailable_no_backfill() -> axum::response::Response {
 /// * `agg_id` must be known to the schema registry → 404 on miss.
 /// * `end_ms` must not extend past the agg's `created_at_ms` (no
 ///   race against live ingest) → 409 on overlap.
-/// * `start_ms` must be within the SimpleMapStore data-retention
+/// * `start_ms` must be within the SketchStore data-retention
 ///   window when one is configured (Method B) → 409 on stale range.
 ///
 /// 400 on malformed body / inverted range; 503 when no registry or

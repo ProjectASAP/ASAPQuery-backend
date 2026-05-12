@@ -2,7 +2,7 @@ use crate::stores::schema::{
     AggregateCore, AggregationType, CleanupPolicy, KeyByLabelValues, PrecomputedOutput,
     StreamingConfig,
 };
-use crate::stores::sketch_db::simple_map_store::common::{
+use crate::stores::sketch_db::sketch_store::common::{
     EpochID, InternTable, MetricBucketMap, MetricID, MutableEpoch, SealedEpoch, TimestampRange,
 };
 use crate::stores::{Store, StoreResult, TimestampedBucketsMap};
@@ -21,7 +21,7 @@ use super::persistence::{
     manifest::Manifest,
     recovery,
     source::{EpochSnapshot, EpochSnapshotEntry, EpochSource, SealedEpochRef},
-    PersistError, PersistResult, SimpleMapStorePersistenceConfig,
+    PersistError, PersistResult, SketchStorePersistenceConfig,
 };
 
 type StoreKey = u64; // aggregation_id
@@ -201,7 +201,7 @@ impl StoreKeyData {
     }
 }
 
-/// Shared state that both the outer `SimpleMapStorePerKey` and the
+/// Shared state that both the outer `SketchStorePerKey` and the
 /// background flusher hold via `Arc`. Contains the DashMap of per-agg
 /// state plus the counters the flusher needs.
 pub struct PerKeyInner {
@@ -243,7 +243,7 @@ pub struct PerKeyInner {
 }
 
 /// Persistence-related state owned by the outer store. Dropping this
-/// (via `SimpleMapStorePerKey::Drop`) shuts the flusher down cleanly.
+/// (via `SketchStorePerKey::Drop`) shuts the flusher down cleanly.
 struct PersistenceState {
     manifest: Arc<Manifest>,
     cache: PartCache,
@@ -256,14 +256,14 @@ struct PersistenceState {
 }
 
 /// In-memory storage implementation using per-key locks for concurrency
-pub struct SimpleMapStorePerKey {
+pub struct SketchStorePerKey {
     inner: Arc<PerKeyInner>,
     /// `None` when the store is in-memory-only (existing `new()` path).
     /// `Some` when constructed via `with_persistence`.
     persistence: Option<PersistenceState>,
 }
 
-impl SimpleMapStorePerKey {
+impl SketchStorePerKey {
     /// Backwards-compatible constructor. No persistence — behaves
     /// exactly like pre-persistence code.
     pub fn new(streaming_config: Arc<StreamingConfig>, cleanup_policy: CleanupPolicy) -> Self {
@@ -297,12 +297,12 @@ impl SimpleMapStorePerKey {
     pub fn with_persistence(
         streaming_config: Arc<StreamingConfig>,
         cleanup_policy: CleanupPolicy,
-        persistence_cfg: SimpleMapStorePersistenceConfig,
+        persistence_cfg: SketchStorePersistenceConfig,
     ) -> PersistResult<Self> {
         // Run recovery first so the manifest reflects on-disk state.
         let (_loaded_manifest, report) = recovery::recover(&persistence_cfg.disk_path)?;
         info!(
-            "SimpleMapStorePerKey persistence recovery: live={}, corrupt_removed={}, orphans_removed={}",
+            "SketchStorePerKey persistence recovery: live={}, corrupt_removed={}, orphans_removed={}",
             report.live_parts, report.corrupt_parts_removed, report.orphan_parts_removed
         );
 
@@ -670,7 +670,7 @@ impl SimpleMapStorePerKey {
         // TODO: replace with non-datafusion path. The previous body
         // depended on `accumulator_serde::deserialize_accumulator` from
         // the removed `engines::physical` module to materialise sketches
-        // from persisted parts. Since SimpleMapStore is deprecated and
+        // from persisted parts. Since SketchStore is deprecated and
         // the warm-tier query path is being rebuilt on top of the
         // SketchIndex, this returns Ok(()) so that callers see "no disk
         // parts" rather than panicking; the live in-memory path still
@@ -679,7 +679,7 @@ impl SimpleMapStorePerKey {
     }
 }
 
-impl Drop for SimpleMapStorePerKey {
+impl Drop for SketchStorePerKey {
     fn drop(&mut self) {
         // Dropping the PersistenceState (and therefore the FlusherHandle)
         // stops the flusher thread before the underlying Arc<PerKeyInner>
@@ -692,7 +692,7 @@ impl Drop for SimpleMapStorePerKey {
 }
 
 #[async_trait::async_trait]
-impl Store for SimpleMapStorePerKey {
+impl Store for SketchStorePerKey {
     fn insert_precomputed_output(
         &self,
         output: PrecomputedOutput,
@@ -926,7 +926,7 @@ impl Store for SimpleMapStorePerKey {
     }
 
     fn close(&self) -> StoreResult<()> {
-        info!("SimpleMapStorePerKey closed");
+        info!("SketchStorePerKey closed");
         Ok(())
     }
 
@@ -959,7 +959,7 @@ impl Store for SimpleMapStorePerKey {
         info!(
             agg_id,
             evicted_windows = evicted,
-            "SimpleMapStorePerKey::drop_agg_id"
+            "SketchStorePerKey::drop_agg_id"
         );
         Ok(evicted)
     }
@@ -999,7 +999,7 @@ impl EpochSource for PerKeyInner {
         // TODO: replace with non-datafusion path. The previous body
         // serialised sketches via
         // `accumulator_serde::serialize_accumulator_arroyo` from the
-        // removed `engines::physical` module. SimpleMapStore is
+        // removed `engines::physical` module. SketchStore is
         // deprecated; persistence is being refactored on top of the
         // SketchIndex.
         //

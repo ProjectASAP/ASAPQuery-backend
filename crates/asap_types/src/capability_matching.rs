@@ -42,7 +42,7 @@ pub const CANONICAL_QUERY_ENGINE_IDS: &[&str] = &[ENGINE_ID_ASAP_QUERY, ENGINE_I
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
-    /// Warm-tier sketch DB (today's `SimpleMapStore` + accumulators).
+    /// Warm-tier sketch DB (today's `SketchStore` + accumulators).
     /// Served by `ASAPQueryEngine`. Default for unconfigured metrics.
     #[default]
     SketchStore,

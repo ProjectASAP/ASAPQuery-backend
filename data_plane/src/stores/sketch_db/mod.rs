@@ -2,7 +2,7 @@
 //!
 //! See [`docs/design-sketch-db.md`](../../../../../docs/design-sketch-db.md)
 //! for the full architecture. This module houses the components that live
-//! "above" the existing `SimpleMapStore` and turn it into a sketch-aware
+//! "above" the existing `SketchStore` and turn it into a sketch-aware
 //! storage engine over time:
 //!
 //! * `schema` — per-`agg_id` `AggSchema` with `Active` / `Retired` /
@@ -40,7 +40,7 @@ pub mod prometheus_reader;
 pub mod raw_sample_reader;
 pub mod schema;
 pub mod schema_eviction;
-pub mod simple_map_store;
+pub mod sketch_store;
 pub mod sketch_index;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
@@ -62,4 +62,4 @@ pub use schema::{AggSchema, AggStatus, SchemaRegistry, TimelineCoverage, Timelin
 pub use schema_eviction::{
     warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
 };
-pub use simple_map_store::SimpleMapStore;
+pub use sketch_store::SketchStore;

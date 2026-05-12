@@ -5,7 +5,7 @@
 //!
 //! ## Why this exists
 //!
-//! Today's `SimpleMapStore` is keyed by `aggregation_id` but does not know
+//! Today's `SketchStore` is keyed by `aggregation_id` but does not know
 //! anything about the schema (sketch type, parameters, grouping labels,
 //! window) attached to that id beyond what's in `StreamingConfig`. The
 //! sketch DB design needs:
@@ -181,7 +181,7 @@ impl AggSchema {
 /// Default retention for a retired schema before eviction.
 /// 24 hours — covers dashboards / ad-hoc queries that may still
 /// reference the old agg_id mid-reconfigure. Shorter than the
-/// typical SimpleMapStore data retention (7d+) so schema eviction
+/// typical SketchStore data retention (7d+) so schema eviction
 /// runs first, freeing space cleanly without fighting per-record
 /// retention. Override via `SchemaRegistry::set_retention_for_testing`
 /// or the CLI flag plumbed through `SchemaEvictionService`.
@@ -654,7 +654,7 @@ impl SchemaRegistry {
 
     /// Override the retirement retention. Plumbed through from
     /// `SchemaEvictionService` at startup so deployments can pick
-    /// a retention that's ≤ their SimpleMapStore
+    /// a retention that's ≤ their SketchStore
     /// `persistence_delete_older_than` (see module-level doc on
     /// retention ordering).
     ///

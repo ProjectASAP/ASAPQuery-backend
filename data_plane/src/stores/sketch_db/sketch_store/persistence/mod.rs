@@ -1,10 +1,10 @@
-//! Persistence layer for `SimpleMapStorePerKey`.
+//! Persistence layer for `SketchStorePerKey`.
 //!
 //! See `docs/design-simple-map-store-persistence.md` for the design rationale.
 //!
 //! ## Structure
 //!
-//! * [`config`] — [`SimpleMapStorePersistenceConfig`]
+//! * [`config`] — [`SketchStorePersistenceConfig`]
 //! * [`part`] — on-disk part format (`meta.bin` + `data.bin` + `index.bin`),
 //!   writer and reader.
 //! * [`manifest`] — append-only log + periodic binary snapshot of live parts.
@@ -15,7 +15,7 @@
 //! * [`recovery`] — startup: load snapshot, replay log, verify CRCs, sweep
 //!   orphan part dirs.
 //!
-//! The submodule is intentionally decoupled from `SimpleMapStorePerKey`
+//! The submodule is intentionally decoupled from `SketchStorePerKey`
 //! via the [`EpochSource`] trait — the flusher knows nothing about the
 //! store's internal types and can be unit-tested against a fake source.
 
@@ -28,7 +28,7 @@ pub mod cache;
 pub mod flusher;
 pub mod recovery;
 
-pub use config::SimpleMapStorePersistenceConfig;
+pub use config::SketchStorePersistenceConfig;
 pub use manifest::{Manifest, PartEntry};
 pub use part::{PartId, PartReader, PartWriter, SnapshotEntry};
 pub use source::{EpochSource, SealedEpochRef};

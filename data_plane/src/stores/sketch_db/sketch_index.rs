@@ -8,7 +8,7 @@
 //!   per-window sketch state. Intern table per sid maps the group-by
 //!   VALUES vector to a compact `LabelValuesId = u32`; columnar
 //!   `MutableEpoch` + sealed-epoch ring delivers the legacy
-//!   SimpleMapStore's six storage optimizations end-to-end.
+//!   SketchStore's six storage optimizations end-to-end.
 //!
 //! Ghost sids (registered but never carrying state) are valid — they
 //! exist when an agent registers a pre-merge identity that the gateway

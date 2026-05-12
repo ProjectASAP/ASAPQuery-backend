@@ -4,14 +4,14 @@
 //!
 //! Implements the §6.2 "scheduled for deletion by the time-TTL
 //! sweep" semantics the lifecycle enum promises. Sits alongside
-//! the SimpleMapStore's age-based `persistence_delete_older_than`
+//! the SketchStore's age-based `persistence_delete_older_than`
 //! retention — the two are independent:
 //!
 //! * **Schema retention** (this module): lifecycle-driven. When a
 //!   schema is removed from `StreamingConfig` it transitions
 //!   `Active → Retired → Expired`; when `expires_at_ms` passes we
 //!   drop its `agg_id`.
-//! * **Data retention** (SimpleMapStore): age-driven. Records
+//! * **Data retention** (SketchStore): age-driven. Records
 //!   older than `persistence_delete_older_than` get swept up
 //!   regardless of schema.
 //!
@@ -269,7 +269,7 @@ mod tests {
     use super::*;
     use crate::stores::schema::{AggregationType, CleanupPolicy, LockStrategy, StreamingConfig};
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::{backfill::BackfillSource, simple_map_store::SimpleMapStore};
+    use crate::stores::sketch_db::{backfill::BackfillSource, sketch_store::SketchStore};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -306,7 +306,7 @@ mod tests {
         Arc::new(StreamingConfig::new(map))
     }
 
-    fn write_one(store: &SimpleMapStore, agg_id: u64, ts: u64) {
+    fn write_one(store: &SketchStore, agg_id: u64, ts: u64) {
         let acc = SumAccumulator::with_sum(1.0);
         let output = crate::stores::schema::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
         store
@@ -314,7 +314,7 @@ mod tests {
             .unwrap();
     }
 
-    fn total_buckets(store: &SimpleMapStore, metric: &str, agg_id: u64) -> usize {
+    fn total_buckets(store: &SketchStore, metric: &str, agg_id: u64) -> usize {
         let map = store
             .query_precomputed_output(metric, agg_id, 0, u64::MAX / 2)
             .unwrap();
@@ -327,7 +327,7 @@ mod tests {
     async fn fixture_with_expired_1() -> (
         Arc<SchemaRegistry>,
         Arc<BackfillRegistry>,
-        Arc<SimpleMapStore>,
+        Arc<SketchStore>,
     ) {
         let initial = make_streaming_config(&[1, 2]);
         let mut registry = SchemaRegistry::from_streaming_config(&initial);
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(schemas.get(1).unwrap().status(), AggStatus::Expired);
 
         let backfill = Arc::new(BackfillRegistry::new());
-        let store = Arc::new(SimpleMapStore::new_with_strategy(
+        let store = Arc::new(SketchStore::new_with_strategy(
             initial,
             CleanupPolicy::NoCleanup,
             LockStrategy::Global,
@@ -390,7 +390,7 @@ mod tests {
         let initial = make_streaming_config(&[1]);
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&initial));
         let backfill = Arc::new(BackfillRegistry::new());
-        let store = Arc::new(SimpleMapStore::new_with_strategy(
+        let store = Arc::new(SketchStore::new_with_strategy(
             initial,
             CleanupPolicy::NoCleanup,
             LockStrategy::Global,

@@ -44,7 +44,7 @@ use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::controller_client::{ControllerClient, HttpControllerClient};
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::simple_map_store::SimpleMapStore;
+use crate::stores::sketch_db::sketch_store::SketchStore;
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -152,7 +152,7 @@ async fn start_mock_controller(state: MockControllerState) -> u16 {
 
 async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingConfig) -> u16 {
     let streaming_config = hot_reload.snapshot();
-    let store = Arc::new(SimpleMapStore::new(
+    let store = Arc::new(SketchStore::new(
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));

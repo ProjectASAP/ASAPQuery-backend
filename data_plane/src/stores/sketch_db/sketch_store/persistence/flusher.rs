@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, error, info, warn};
 
-use super::config::SimpleMapStorePersistenceConfig;
+use super::config::SketchStorePersistenceConfig;
 use super::manifest::{Manifest, PartEntry};
 use super::part::{part_dir_path, PartWriter};
 use super::source::{EpochSnapshot, EpochSource, SealedEpochRef};
@@ -37,7 +37,7 @@ pub struct FlusherHandle {
 }
 
 pub(crate) struct FlusherShared {
-    pub cfg: SimpleMapStorePersistenceConfig,
+    pub cfg: SketchStorePersistenceConfig,
     pub manifest: Arc<Manifest>,
     pub next_part_id: AtomicU64,
     pub shutdown: AtomicBool,
@@ -58,7 +58,7 @@ impl FlusherHandle {
     /// Start a flusher thread. Takes an `EpochSource` (typically the
     /// store itself, wrapped in `Arc`).
     pub fn start<S>(
-        cfg: SimpleMapStorePersistenceConfig,
+        cfg: SketchStorePersistenceConfig,
         manifest: Arc<Manifest>,
         source: Arc<S>,
     ) -> PersistResult<Self>
@@ -425,7 +425,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::stores::schema::KeyByLabelValues;
-    use crate::stores::sketch_db::simple_map_store::persistence::source::{
+    use crate::stores::sketch_db::sketch_store::persistence::source::{
         EpochSnapshot, EpochSnapshotEntry,
     };
     use std::sync::Mutex as StdMutex;
@@ -511,8 +511,8 @@ mod tests {
         }
     }
 
-    fn test_cfg(disk_path: PathBuf, mem_limit: usize) -> SimpleMapStorePersistenceConfig {
-        SimpleMapStorePersistenceConfig {
+    fn test_cfg(disk_path: PathBuf, mem_limit: usize) -> SketchStorePersistenceConfig {
+        SketchStorePersistenceConfig {
             memory_limit_bytes: mem_limit,
             memory_low_watermark_bytes: mem_limit / 2,
             hard_cap_bytes: mem_limit * 2,

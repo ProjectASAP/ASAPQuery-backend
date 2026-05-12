@@ -1,9 +1,9 @@
-//! Minimal end-to-end test for `SimpleMapStorePerKey::with_persistence`.
+//! Minimal end-to-end test for `SketchStorePerKey::with_persistence`.
 //!
 //! The deeper flush-and-readback tests previously exercised the
 //! datafusion-backed `accumulator_serde` path that PR #123 removed.
 //! Rather than rebuild that SerDe (the long-term plan is to migrate
-//! persistence onto SketchIndex, not back onto SimpleMapStore), those
+//! persistence onto SketchIndex, not back onto SketchStore), those
 //! tests were retired in this commit. The single remaining test
 //! verifies the construct/drop lifecycle of the flusher thread — it
 //! does not touch the disk path.
@@ -15,8 +15,8 @@ use tempfile::TempDir;
 use std::time::Duration;
 
 use crate::stores::schema::{AggregationType, CleanupPolicy, StreamingConfig, WindowType};
-use crate::stores::sketch_db::simple_map_store::per_key::SimpleMapStorePerKey;
-use crate::stores::sketch_db::simple_map_store::persistence::SimpleMapStorePersistenceConfig;
+use crate::stores::sketch_db::sketch_store::per_key::SketchStorePerKey;
+use crate::stores::sketch_db::sketch_store::persistence::SketchStorePersistenceConfig;
 use crate::AggregationConfig;
 
 fn make_streaming_config(agg_id: u64) -> Arc<StreamingConfig> {
@@ -44,8 +44,8 @@ fn make_streaming_config(agg_id: u64) -> Arc<StreamingConfig> {
     Arc::new(StreamingConfig::new(map))
 }
 
-fn persistence_cfg(dir: &TempDir, hot_window_ms: Option<u64>) -> SimpleMapStorePersistenceConfig {
-    SimpleMapStorePersistenceConfig {
+fn persistence_cfg(dir: &TempDir, hot_window_ms: Option<u64>) -> SketchStorePersistenceConfig {
+    SketchStorePersistenceConfig {
         memory_limit_bytes: 100 * 1024 * 1024,
         memory_low_watermark_bytes: 50 * 1024 * 1024,
         hard_cap_bytes: 200 * 1024 * 1024,
@@ -62,7 +62,7 @@ fn construct_and_drop_shuts_flusher_cleanly() {
     let dir = TempDir::new().unwrap();
     let cfg = make_streaming_config(1);
     let persistence = persistence_cfg(&dir, None);
-    let store = SimpleMapStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
+    let store = SketchStorePerKey::with_persistence(cfg, CleanupPolicy::NoCleanup, persistence)
         .expect("with_persistence");
     // Dropping the store should not deadlock or panic.
     drop(store);

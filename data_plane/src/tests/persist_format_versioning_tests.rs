@@ -7,8 +7,8 @@
 //!   `stores::sketch_db::schema::PERSIST_FORMAT_VERSION` (currently 1)
 //! * `BackfillRegistry` snapshot — JSON,
 //!   `stores::sketch_db::backfill::PERSIST_FORMAT_VERSION` (currently 1)
-//! * `SimpleMapStore` part `meta.bin` — binary,
-//!   `stores::sketch_db::simple_map_store::persistence::part::PART_FORMAT_VERSION` (currently 1)
+//! * `SketchStore` part `meta.bin` — binary,
+//!   `stores::sketch_db::sketch_store::persistence::part::PART_FORMAT_VERSION` (currently 1)
 //!
 //! Each has a load path that tests `version == CURRENT`. The per-
 //! module unit tests already cover the happy-path roundtrip and a
@@ -29,7 +29,7 @@ use crate::stores::sketch_db::backfill::{
     BackfillJob, BackfillRegistry, BackfillSource, BackfillStatus,
 };
 use crate::stores::sketch_db::schema::{AggStatus, SchemaRegistry};
-use crate::stores::sketch_db::simple_map_store::persistence::part::{
+use crate::stores::sketch_db::sketch_store::persistence::part::{
     MAGIC_META, META_HEADER_SIZE, PART_FORMAT_VERSION,
 };
 
@@ -332,11 +332,11 @@ mod backfill {
     }
 }
 
-// ─── SimpleMapStore part meta.bin format ────────────────────────────────
+// ─── SketchStore part meta.bin format ────────────────────────────────
 
 mod part_meta {
     use super::*;
-    use crate::stores::sketch_db::simple_map_store::persistence::part::PartReader;
+    use crate::stores::sketch_db::sketch_store::persistence::part::PartReader;
 
     /// Build a valid 64-byte meta.bin header for part_id=1.
     fn valid_header() -> Vec<u8> {
@@ -446,7 +446,7 @@ mod v2_forward_compat {
     use super::*;
     use crate::stores::sketch_db::backfill::PERSIST_FORMAT_VERSION as BACKFILL_V;
     use crate::stores::sketch_db::schema::PERSIST_FORMAT_VERSION as SCHEMA_V;
-    use crate::stores::sketch_db::simple_map_store::persistence::part::PartReader;
+    use crate::stores::sketch_db::sketch_store::persistence::part::PartReader;
 
     /// SchemaRegistry: snapshot tagged v_current+1 must trigger safe
     /// fallback, and the rewrite must be at v_current with the new
@@ -567,7 +567,7 @@ mod v2_forward_compat {
         );
     }
 
-    /// SimpleMapStore part meta.bin: header tagged PART_FORMAT_VERSION+1
+    /// SketchStore part meta.bin: header tagged PART_FORMAT_VERSION+1
     /// must surface a `PersistError::Format`. This is the
     /// "v2-on-disk-loaded-by-v1-code" path; for parts there is no
     /// fallback (each part is opaque), so a clean error is the contract.

@@ -293,7 +293,7 @@ pub enum CreateError {
         requested_end_ms: u64,
         created_at_ms: u64,
     },
-    /// The requested `start_ms` is older than the `SimpleMapStore`
+    /// The requested `start_ms` is older than the `SketchStore`
     /// data-retention horizon — any windows the backfill writes
     /// at that range would immediately be evicted by the
     /// retention sweep. Method B from the design discussion: fail
@@ -531,7 +531,7 @@ impl BackfillRegistry {
     ///   provided): `time_range.0 >= now - data_retention_ms`.
     ///   Method B from the design discussion — fail fast instead
     ///   of letting the backfill produce windows that the
-    ///   SimpleMapStore retention sweep would immediately evict.
+    ///   SketchStore retention sweep would immediately evict.
     ///   Pass `None` to skip the check (tests, or deployments
     ///   where retention is disabled).
     ///
