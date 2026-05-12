@@ -109,6 +109,8 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         sketch_config: cfg.clone(),
         accuracy: AccuracyBound::from_config(&cfg),
         first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
     }
 }
 
@@ -123,6 +125,8 @@ fn kll_meta(sid: u64, k: u32) -> SketchInstanceMetadata {
         sketch_config: cfg.clone(),
         accuracy: AccuracyBound::from_config(&cfg),
         first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
     }
 }
 
@@ -137,6 +141,8 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
         sketch_config: cfg.clone(),
         accuracy: AccuracyBound::from_config(&cfg),
         first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
     }
 }
 
@@ -458,6 +464,8 @@ fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
         sketch_config: cfg.clone(),
         accuracy: AccuracyBound::from_config(&cfg),
         first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
     }
 }
 
@@ -472,6 +480,8 @@ fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
         sketch_config: cfg.clone(),
         accuracy: AccuracyBound::from_config(&cfg),
         first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
     }
 }
 

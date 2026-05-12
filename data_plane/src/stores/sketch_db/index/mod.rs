@@ -21,10 +21,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
+use crate::stores::sketch_db::schema::AggStatus;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
@@ -120,6 +129,15 @@ impl AccuracyBound {
 /// arrives (or `(metric, attrs)` produces a fresh sid via the
 /// SeriesIdResolver). Subsequent emits of the same sid append to the
 /// associated `SidStoreData` without re-touching this metadata.
+///
+/// **Lifecycle fields** (Phase 5 M1): mirror `AggSchema`'s
+/// `Active → Retired → Expired` state machine so the sid-keyed path
+/// has the same write-side barrier semantics as the agg_id-keyed path.
+/// `status()` is derived from `retired_at_ms` + `expires_at_ms` and
+/// the wall clock — never stored directly. M2 cuts the ingest barrier
+/// over from `SchemaRegistry::is_writable(agg_id)` to
+/// `SketchIndex::is_writable(sid)`; until then both registries run
+/// side by side.
 #[derive(Debug, Clone)]
 pub struct SketchInstanceMetadata {
     pub sid: u64,
@@ -132,6 +150,48 @@ pub struct SketchInstanceMetadata {
     pub sketch_config: SketchConfig,
     pub accuracy: AccuracyBound,
     pub first_seen_unix_ms: i64,
+
+    /// Wall-clock millis when the sid was retired (removed from the
+    /// active config). `None` while `Active`. Mirrors
+    /// `AggSchema::retired_at_ms`.
+    pub retired_at_ms: Option<u64>,
+    /// Wall-clock millis after which the sid's data may be deleted.
+    /// `None` while `Active`. Set on retirement to
+    /// `retired_at_ms + retention_ms`. Mirrors
+    /// `AggSchema::expires_at_ms`.
+    pub expires_at_ms: Option<u64>,
+}
+
+impl SketchInstanceMetadata {
+    /// Compute the current `AggStatus` against the wall clock.
+    /// Mirrors `AggSchema::status` — purely a function of timestamps.
+    pub fn status(&self) -> AggStatus {
+        let now = now_ms();
+        match (self.retired_at_ms, self.expires_at_ms) {
+            (None, _) => AggStatus::Active,
+            (Some(_), Some(exp)) if now >= exp => AggStatus::Expired,
+            (Some(_), _) => AggStatus::Retired,
+        }
+    }
+
+    /// Whether this sid accepts writes. Equivalent to
+    /// `status() == AggStatus::Active`. Phase 5 ingest barrier
+    /// (M2 cutover) will call this in place of
+    /// `SchemaRegistry::is_writable(agg_id)`.
+    pub fn is_writable(&self) -> bool {
+        matches!(self.status(), AggStatus::Active)
+    }
+
+    /// Mark the sid retired, scheduling expiry `retention` from now.
+    /// Idempotent — re-retiring a Retired sid is a no-op.
+    pub fn retire(&mut self, retention: Duration) {
+        if self.retired_at_ms.is_some() {
+            return;
+        }
+        let now = now_ms();
+        self.retired_at_ms = Some(now);
+        self.expires_at_ms = Some(now + retention.as_millis() as u64);
+    }
 }
 
 /// Per-sample sketch state. Stored as the payload column inside the
@@ -348,6 +408,74 @@ impl SketchIndex {
     pub fn instance_count(&self) -> usize {
         self.instances.read().unwrap().len()
     }
+
+    // ── Phase 5 M1: lifecycle-status surface ─────────────────────────
+    //
+    // Mirror the `SchemaRegistry` lifecycle methods so the ingest /
+    // eviction paths can cut over from `agg_id` to `sid` in M2. Until
+    // M2 lands, both registries run side by side.
+
+    /// Whether `sid` accepts writes. Equivalent to
+    /// `status(sid) == AggStatus::Active`. Returns `false` for
+    /// unknown sids (caller falls through to the `Unknown` path).
+    /// O(1) on a `RwLock::read` of the instances map.
+    pub fn is_writable(&self, sid: u64) -> bool {
+        self.instances
+            .read()
+            .ok()
+            .and_then(|m| m.get(&sid).map(|s| s.is_writable()))
+            .unwrap_or(false)
+    }
+
+    /// Iterate (clones) all instance metadata matching `status`.
+    /// Used by the eviction service to enumerate `Expired` sids
+    /// without holding a long read lock.
+    pub fn list_by_status(&self, status: AggStatus) -> Vec<SketchInstanceMetadata> {
+        let map = match self.instances.read() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        map.values().filter(|s| s.status() == status).cloned().collect()
+    }
+
+    /// Force `sid` into `Retired` status, scheduling expiry
+    /// `retention` from now. Idempotent — re-retiring a Retired or
+    /// Expired sid is a no-op and returns the unchanged metadata.
+    /// Returns `None` if the sid is unknown.
+    pub fn force_retire(&self, sid: u64, retention: Duration) -> Option<SketchInstanceMetadata> {
+        let mut map = self.instances.write().ok()?;
+        let meta = map.get_mut(&sid)?;
+        if matches!(meta.status(), AggStatus::Active) {
+            meta.retire(retention);
+        }
+        Some(meta.clone())
+    }
+
+    /// Force `sid` into `Expired` status immediately by setting both
+    /// `retired_at_ms` and `expires_at_ms` to now. Returns the new
+    /// state, or `None` if the sid is unknown. Intended for
+    /// operator / debug-endpoint use so eviction can be observed in
+    /// e2e tests without waiting out retirement retention.
+    pub fn force_expire(&self, sid: u64) -> Option<SketchInstanceMetadata> {
+        let mut map = self.instances.write().ok()?;
+        let meta = map.get_mut(&sid)?;
+        let now = now_ms();
+        meta.retired_at_ms = Some(now);
+        meta.expires_at_ms = Some(now);
+        Some(meta.clone())
+    }
+
+    /// Drop a sid's metadata + its series state. Mirrors
+    /// `SchemaRegistry::remove_schema` for the eviction path's
+    /// post-data-drop cleanup. Returns the removed metadata, or
+    /// `None` if the sid was absent.
+    pub fn remove_instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
+        let removed = self.instances.write().ok()?.remove(&sid);
+        if removed.is_some() {
+            self.series.remove(&sid);
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +495,8 @@ mod tests {
             sketch_config: cfg.clone(),
             accuracy: AccuracyBound::from_config(&cfg),
             first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
         }
     }
 
@@ -446,6 +576,100 @@ mod tests {
         });
         assert!((bound.epsilon - 0.01).abs() < 1e-9);
         assert!((bound.confidence - 1.0).abs() < 1e-9);
+    }
+
+    // ── Phase 5 M1 lifecycle tests ────────────────────────────────────
+
+    #[test]
+    fn fresh_instance_is_active_and_writable() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        let m = idx.instance(1).unwrap();
+        assert_eq!(m.status(), AggStatus::Active);
+        assert!(m.is_writable());
+        assert!(idx.is_writable(1));
+    }
+
+    #[test]
+    fn unknown_sid_is_not_writable() {
+        let idx = SketchIndex::new();
+        assert!(!idx.is_writable(999));
+    }
+
+    #[test]
+    fn force_retire_transitions_active_to_retired() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        let after = idx
+            .force_retire(1, Duration::from_secs(3600))
+            .expect("sid known");
+        assert_eq!(after.status(), AggStatus::Retired);
+        assert!(after.retired_at_ms.is_some());
+        assert!(after.expires_at_ms.is_some());
+        // is_writable now returns false through the index too.
+        assert!(!idx.is_writable(1));
+    }
+
+    #[test]
+    fn force_retire_is_idempotent() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        let first = idx.force_retire(1, Duration::from_secs(3600)).unwrap();
+        let first_retired_at = first.retired_at_ms.unwrap();
+        let first_expires_at = first.expires_at_ms.unwrap();
+        // Re-retire after a tick — same timestamps.
+        std::thread::sleep(Duration::from_millis(2));
+        let second = idx.force_retire(1, Duration::from_secs(7200)).unwrap();
+        assert_eq!(second.retired_at_ms, Some(first_retired_at));
+        assert_eq!(second.expires_at_ms, Some(first_expires_at));
+    }
+
+    #[test]
+    fn force_expire_makes_status_expired_immediately() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        let after = idx.force_expire(1).expect("sid known");
+        assert_eq!(after.status(), AggStatus::Expired);
+        assert!(!idx.is_writable(1));
+    }
+
+    #[test]
+    fn list_by_status_partitions_correctly() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        idx.register(meta(2));
+        idx.register(meta(3));
+        idx.force_retire(2, Duration::from_secs(3600));
+        idx.force_expire(3);
+
+        let active = idx.list_by_status(AggStatus::Active);
+        let retired = idx.list_by_status(AggStatus::Retired);
+        let expired = idx.list_by_status(AggStatus::Expired);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].sid, 1);
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].sid, 2);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].sid, 3);
+    }
+
+    #[test]
+    fn remove_instance_drops_metadata_and_series() {
+        let idx = SketchIndex::new();
+        idx.register(meta(1));
+        idx.append_sample(1, BTreeMap::new(), (0, 10), sample(1));
+        assert_eq!(idx.classify(1), SidLookup::Hit);
+        let removed = idx.remove_instance(1).expect("sid known");
+        assert_eq!(removed.sid, 1);
+        assert_eq!(idx.classify(1), SidLookup::Unknown);
+    }
+
+    #[test]
+    fn unknown_sid_returns_none_from_lifecycle_methods() {
+        let idx = SketchIndex::new();
+        assert!(idx.force_retire(999, Duration::from_secs(1)).is_none());
+        assert!(idx.force_expire(999).is_none());
+        assert!(idx.remove_instance(999).is_none());
     }
 
     #[test]
