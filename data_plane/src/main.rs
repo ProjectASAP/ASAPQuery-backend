@@ -838,7 +838,9 @@ async fn main() -> Result<()> {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
                 dry_run: args.schema_eviction_dry_run,
             },
-        );
+        )
+        // M2.3.6d — eviction sweeps SketchIndex too.
+        .with_sketch_index(sketch_index.clone());
         info!(
             poll_secs = args.schema_eviction_poll_secs,
             dry_run = args.schema_eviction_dry_run,

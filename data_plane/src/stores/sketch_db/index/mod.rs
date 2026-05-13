@@ -902,6 +902,54 @@ impl SketchIndex {
     }
 }
 
+impl SketchIndex {
+    /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
+    /// index whose metadata was registered against `agg_cfg`, i.e.
+    /// shares the same metric, agg_type, parameters canonicalization,
+    /// and grouping-keys set the `SketchIndexSink` used at write time.
+    /// Returns how many sids were removed. Used by
+    /// `SchemaEvictionService` to drop a retired schema's residual sid
+    /// state.
+    pub fn remove_instances_for_agg_config(
+        &self,
+        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+    ) -> usize {
+        let target_metric = agg_cfg.metric.as_str();
+        let target_agg_type = agg_cfg.aggregation_type;
+        let target_params = canonical_parameters(&agg_cfg.parameters);
+        let target_group_keys: BTreeSet<String> =
+            agg_cfg.grouping_labels.labels.iter().cloned().collect();
+
+        // Collect the matching sids under a short read lock; then call
+        // `remove_instance` per sid (which takes its own write lock).
+        let to_remove: Vec<u64> = {
+            let g = self.instances.read().unwrap();
+            g.iter()
+                .filter(|(_, m)| {
+                    if m.metric_name != target_metric {
+                        return false;
+                    }
+                    if m.group_by_keys != target_group_keys {
+                        return false;
+                    }
+                    matches!(
+                        &m.agg_kind,
+                        AggKind::Precompute { agg_type, parameters_canonical }
+                            if *agg_type == target_agg_type
+                                && parameters_canonical == &target_params
+                    )
+                })
+                .map(|(sid, _)| *sid)
+                .collect()
+        };
+        let count = to_remove.len();
+        for sid in to_remove {
+            self.remove_instance(sid);
+        }
+        count
+    }
+}
+
 /// Persistence harness for `SketchIndex` — Phase 5 M2.3.6c.
 ///
 /// Owns the manifest + flusher thread + part cache that back the
