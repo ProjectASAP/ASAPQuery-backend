@@ -53,7 +53,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
-use crate::stores::sketch_db::index::SketchIndex;
+use crate::stores::sketch_db::index::SketchStore;
 use super::{AggStatus, SchemaRegistry};
 
 /// Configuration for the eviction loop. Separate from
@@ -82,11 +82,11 @@ impl Default for SchemaEvictionConfig {
 pub struct SchemaEvictionService {
     schemas: Arc<SchemaRegistry>,
     backfill: Arc<BackfillRegistry>,
-    /// Phase 5 M2.3.6g — eviction removes sids from `SketchIndex`
+    /// Phase 5 M2.3.6g — eviction removes sids from `SketchStore`
     /// only; the legacy `Arc<dyn Store>` field is gone now that
     /// SketchStore no longer holds data (M2.3.6a) and the engine
-    /// reads exclusively from SketchIndex (M2.3.6f).
-    sketch_index: Option<Arc<SketchIndex>>,
+    /// reads exclusively from SketchStore (M2.3.6f).
+    sketch_index: Option<Arc<SketchStore>>,
     config: SchemaEvictionConfig,
 }
 
@@ -104,10 +104,10 @@ impl SchemaEvictionService {
         }
     }
 
-    /// Attach a `SketchIndex` so the eviction sweep also removes the
+    /// Attach a `SketchStore` so the eviction sweep also removes the
     /// schema's per-sid state. Returns `self` (builder-style) so
     /// existing call sites can opt in with a single chained call.
-    pub fn with_sketch_index(mut self, index: Arc<SketchIndex>) -> Self {
+    pub fn with_sketch_index(mut self, index: Arc<SketchStore>) -> Self {
         self.sketch_index = Some(index);
         self
     }
@@ -311,7 +311,7 @@ mod tests {
     }
 
     fn write_one(
-        sketch_index: &SketchIndex,
+        sketch_index: &SketchStore,
         streaming_config: &StreamingConfig,
         agg_id: u64,
         ts: u64,
@@ -329,7 +329,7 @@ mod tests {
     async fn fixture_with_expired_1() -> (
         Arc<SchemaRegistry>,
         Arc<BackfillRegistry>,
-        Arc<SketchIndex>,
+        Arc<SketchStore>,
     ) {
         let initial = make_streaming_config(&[1, 2]);
         let mut registry = SchemaRegistry::from_streaming_config(&initial);
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(schemas.get(1).unwrap().status(), AggStatus::Expired);
 
         let backfill = Arc::new(BackfillRegistry::new());
-        let sketch_index = Arc::new(SketchIndex::new());
+        let sketch_index = Arc::new(SketchStore::new());
         write_one(&sketch_index, &initial, 1, 100);
         write_one(&sketch_index, &initial, 1, 200);
         write_one(&sketch_index, &initial, 2, 300);
@@ -363,13 +363,13 @@ mod tests {
         )
         .with_sketch_index(sketch_index.clone());
 
-        // Pre-condition: SketchIndex has both agg's sids populated.
+        // Pre-condition: SketchStore has both agg's sids populated.
         assert!(sketch_index.instance_count() >= 2);
 
         svc.run_once();
 
         // Post: schema registry entry removed AND agg_1's sids gone
-        // from SketchIndex; agg_2's sid remains.
+        // from SketchStore; agg_2's sid remains.
         assert!(
             schemas.get(1).is_none(),
             "Expired schema removed from registry"
@@ -385,7 +385,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_also_removes_sketch_index_instances() {
-        // M2.3.6g — fixture now writes via SketchIndex directly, so
+        // M2.3.6g — fixture now writes via SketchStore directly, so
         // a separate "register a sid" step is redundant. The
         // post-condition is the same: agg_1's sids are gone after
         // the sweep.
@@ -416,7 +416,7 @@ mod tests {
             .count();
         assert_eq!(
             after_agg1, 0,
-            "expired agg_config's sids must be removed from SketchIndex"
+            "expired agg_config's sids must be removed from SketchStore"
         );
     }
 
@@ -425,7 +425,7 @@ mod tests {
         let initial = make_streaming_config(&[1]);
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&initial));
         let backfill = Arc::new(BackfillRegistry::new());
-        let sketch_index = Arc::new(SketchIndex::new());
+        let sketch_index = Arc::new(SketchStore::new());
         write_one(&sketch_index, &initial, 1, 100);
         let before = sketch_index.instance_count();
 
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(
             sketch_index.instance_count(),
             before,
-            "no expired schemas — SketchIndex untouched"
+            "no expired schemas — SketchStore untouched"
         );
     }
 
@@ -460,7 +460,7 @@ mod tests {
         .with_sketch_index(sketch_index.clone());
         svc.run_once();
 
-        // Dry-run: schema entry stays, SketchIndex untouched.
+        // Dry-run: schema entry stays, SketchStore untouched.
         assert!(schemas.get(1).is_some());
         assert_eq!(sketch_index.instance_count(), before);
     }

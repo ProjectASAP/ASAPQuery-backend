@@ -318,7 +318,7 @@ impl AccuracyBound {
 /// `status()` is derived from `retired_at_ms` + `expires_at_ms` and
 /// the wall clock — never stored directly. M2 cuts the ingest barrier
 /// over from `SchemaRegistry::is_writable(agg_id)` to
-/// `SketchIndex::is_writable(sid)`; until then both registries run
+/// `SketchStore::is_writable(sid)`; until then both registries run
 /// side by side.
 #[derive(Debug, Clone)]
 pub struct SketchInstanceMetadata {
@@ -437,7 +437,7 @@ pub struct SketchTimeSeries {
 
 /// Unified payload variant — what one window of one (sid, label-values
 /// vector) physically holds. Phase 5 M2.3 generalizes the storage so
-/// the same `SketchIndex` can host both sketch state and partial-
+/// the same `SketchStore` can host both sketch state and partial-
 /// accumulator (Sum / Count / Avg / Rate / MinMax) state under
 /// content-addressed sids.
 ///
@@ -506,7 +506,7 @@ impl AggPayload {
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
 /// outer DashMap stays read-mostly and per-sid writes don't block one
 /// another. Payload type is the unified [`AggPayload`] enum so one
-/// `SketchIndex` can host both sketches and precomputes.
+/// `SketchStore` can host both sketches and precomputes.
 type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 
 /// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
@@ -517,7 +517,7 @@ type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 /// rate is low (one write per first-seen sid) and reads dominate;
 /// `series` is a `DashMap` because per-sid writes happen on every DP.
 #[derive(Default)]
-pub struct SketchIndex {
+pub struct SketchStore {
     /// sid → metadata. May contain ghost sids (registered identities
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
@@ -528,7 +528,7 @@ pub struct SketchIndex {
     series: DashMap<u64, SidStore>,
 }
 
-/// Three possible outcomes of looking up a sid in the SketchIndex.
+/// Three possible outcomes of looking up a sid in the SketchStore.
 /// Query path uses this enum to drive routing decisions:
 /// - `Hit`: warm-tier sketch has data — evaluate.
 /// - `Ghost`: backend knows the identity (metadata is present) but no
@@ -543,7 +543,7 @@ pub enum SidLookup {
     Unknown,
 }
 
-impl SketchIndex {
+impl SketchStore {
     pub fn new() -> Self {
         Self::default()
     }
@@ -691,7 +691,7 @@ impl SketchIndex {
     /// belonging to one `AggregationConfig` (identified by `metric` +
     /// `agg_cfg.aggregation_type`), shaped as the legacy `Store`
     /// trait's `TimestampedBucketsMap`. Lets the query engine swap
-    /// `Store::query_precomputed_output` for `SketchIndex` without
+    /// `Store::query_precomputed_output` for `SketchStore` without
     /// reshaping its consumer code in the same PR.
     ///
     /// `start_unix_ms`, `end_unix_ms` are inclusive window bounds —
@@ -902,11 +902,11 @@ impl SketchIndex {
     }
 }
 
-impl SketchIndex {
+impl SketchStore {
     /// Phase 5 M2.3.6g — runtime-info / diagnostic helper. Returns the
     /// per-sid `first_seen_unix_ms` for every registered sid. The
     /// legacy `Store::get_earliest_timestamp_per_aggregation_id` returned
-    /// an analogous `agg_id → ts` map; this is the SketchIndex
+    /// an analogous `agg_id → ts` map; this is the SketchStore
     /// equivalent. HTTP server's `/api/v1/status/runtimeinfo` adapter
     /// surfaces it under the JSON field `earliest_timestamp_per_sid`.
     pub fn earliest_timestamps_per_sid(&self) -> std::collections::HashMap<u64, u64> {
@@ -1023,13 +1023,13 @@ impl SketchIndex {
     }
 }
 
-/// Persistence harness for `SketchIndex` — Phase 5 M2.3.6c.
+/// Persistence harness for `SketchStore` — Phase 5 M2.3.6c.
 ///
 /// Owns the manifest + flusher thread + part cache that back the
-/// sid-keyed warm tier. Constructed via [`SketchIndex::start_persistence`];
+/// sid-keyed warm tier. Constructed via [`SketchStore::start_persistence`];
 /// the flusher reads sealed epochs through the
 /// [`EpochSource`](crate::stores::sketch_db::store::persistence::EpochSource)
-/// impl on `SketchIndex` and writes parts under `disk_path/parts/`.
+/// impl on `SketchStore` and writes parts under `disk_path/parts/`.
 ///
 /// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
 /// `part_cache` field is exposed so the query path can be wired up to
@@ -1048,8 +1048,8 @@ impl SketchIndexPersistence {
     }
 }
 
-impl SketchIndex {
-    /// Spin up the persistence layer behind this `SketchIndex`. Runs
+impl SketchStore {
+    /// Spin up the persistence layer behind this `SketchStore`. Runs
     /// startup recovery (sweeps corrupt + orphan parts), opens the
     /// manifest, and starts the background flusher thread with
     /// `Arc::clone(self)` as its `EpochSource`. The returned
@@ -1070,7 +1070,7 @@ impl SketchIndex {
             live = report.live_parts,
             corrupt_removed = report.corrupt_parts_removed,
             orphans_removed = report.orphan_parts_removed,
-            "SketchIndex persistence recovery complete"
+            "SketchStore persistence recovery complete"
         );
 
         let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
@@ -1092,11 +1092,11 @@ impl SketchIndex {
 // ── Phase 5 M2.3.6b — EpochSource impl ──────────────────────────────────────
 //
 // Lets the existing persistence flusher (`store/persistence/flusher.rs`)
-// drive `SketchIndex` instead of `SketchStorePerKey`. The `agg_id: u64`
+// drive `SketchStore` instead of `SketchStorePerKey`. The `agg_id: u64`
 // field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
 // the trait keeps the historical name so the flusher / manifest /
 // part-writer stay untouched.
-impl crate::stores::sketch_db::store::persistence::EpochSource for SketchIndex {
+impl crate::stores::sketch_db::store::persistence::EpochSource for SketchStore {
     fn list_sealed_epochs(
         &self,
     ) -> Vec<crate::stores::sketch_db::store::persistence::SealedEpochRef> {
@@ -1267,7 +1267,7 @@ mod tests {
 
     #[test]
     fn ghost_classification() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(42));
         assert_eq!(idx.classify(42), SidLookup::Ghost);
         assert_eq!(idx.classify(999), SidLookup::Unknown);
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn hit_after_append() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(7));
         idx.append_sample(7, BTreeMap::new(), (1000, 1010), sample(1));
         assert_eq!(idx.classify(7), SidLookup::Hit);
@@ -1283,7 +1283,7 @@ mod tests {
 
     #[test]
     fn range_query_returns_distinct_series() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(11));
         let mut lv_a = BTreeMap::new();
         lv_a.insert("host".to_string(), "a".to_string());
@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn range_query_clips_to_window_bounds() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(13));
         let lv = BTreeMap::new();
         idx.append_sample(13, lv.clone(), (0, 10), sample(1));
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn fresh_instance_is_active_and_writable() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         let m = idx.instance(1).unwrap();
         assert_eq!(m.status(), AggStatus::Active);
@@ -1350,13 +1350,13 @@ mod tests {
 
     #[test]
     fn unknown_sid_is_not_writable() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         assert!(!idx.is_writable(999));
     }
 
     #[test]
     fn force_retire_transitions_active_to_retired() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         let after = idx
             .force_retire(1, Duration::from_secs(3600))
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn force_retire_is_idempotent() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         let first = idx.force_retire(1, Duration::from_secs(3600)).unwrap();
         let first_retired_at = first.retired_at_ms.unwrap();
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn force_expire_makes_status_expired_immediately() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         let after = idx.force_expire(1).expect("sid known");
         assert_eq!(after.status(), AggStatus::Expired);
@@ -1393,7 +1393,7 @@ mod tests {
 
     #[test]
     fn list_by_status_partitions_correctly() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         idx.register(meta(2));
         idx.register(meta(3));
@@ -1413,7 +1413,7 @@ mod tests {
 
     #[test]
     fn remove_instance_drops_metadata_and_series() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(1));
         idx.append_sample(1, BTreeMap::new(), (0, 10), sample(1));
         assert_eq!(idx.classify(1), SidLookup::Hit);
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn unknown_sid_returns_none_from_lifecycle_methods() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         assert!(idx.force_retire(999, Duration::from_secs(1)).is_none());
         assert!(idx.force_expire(999).is_none());
         assert!(idx.remove_instance(999).is_none());
@@ -1432,7 +1432,7 @@ mod tests {
 
     #[test]
     fn epoch_rotation_is_visible_to_query() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(17));
 
         // Force aggressive rotation by touching the SidStoreData
@@ -1587,7 +1587,7 @@ mod tests {
     fn precompute_payload_round_trips_through_storage() {
         use crate::precompute_engine::operators::SumAccumulator;
 
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
@@ -1623,7 +1623,7 @@ mod tests {
     fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
         use crate::precompute_engine::operators::SumAccumulator;
 
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn query_precomputes_by_agg_skips_sketch_payloads() {
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         // A SKETCH sid for the same metric — must not show up in the
         // precompute query path.
         idx.register(meta(7));
@@ -1686,7 +1686,7 @@ mod tests {
 
     /// Helper: append one sample to materialize the SidStoreData, then
     /// set its epoch_capacity so subsequent appends rotate aggressively.
-    fn with_tight_rotation(idx: &SketchIndex, sid: u64) {
+    fn with_tight_rotation(idx: &SketchStore, sid: u64) {
         idx.append_sample(sid, BTreeMap::new(), (0, 10), sample(0));
         if let Some(s) = idx.series.get(&sid) {
             let mut g = s.write().unwrap();
@@ -1698,7 +1698,7 @@ mod tests {
     #[test]
     fn epoch_source_lists_only_sealed_epochs() {
         use crate::stores::sketch_db::store::persistence::EpochSource;
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(13));
         with_tight_rotation(&idx, 13);
         idx.append_sample(13, BTreeMap::new(), (10, 20), sample(2));
@@ -1718,7 +1718,7 @@ mod tests {
     #[test]
     fn epoch_source_snapshot_round_trips_sketch_payload() {
         use crate::stores::sketch_db::store::persistence::EpochSource;
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(21));
         with_tight_rotation(&idx, 21);
         idx.append_sample(21, BTreeMap::new(), (1000, 2000), sample(0xAB));
@@ -1744,7 +1744,7 @@ mod tests {
     #[test]
     fn epoch_source_evict_drops_the_epoch() {
         use crate::stores::sketch_db::store::persistence::EpochSource;
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         idx.register(meta(31));
         with_tight_rotation(&idx, 31);
         idx.append_sample(31, BTreeMap::new(), (10, 20), sample(2));
@@ -1762,7 +1762,7 @@ mod tests {
     #[test]
     fn epoch_source_approx_memory_bytes_grows_with_sealed_state() {
         use crate::stores::sketch_db::store::persistence::EpochSource;
-        let idx = SketchIndex::new();
+        let idx = SketchStore::new();
         let before = idx.approx_memory_bytes();
         idx.register(meta(41));
         with_tight_rotation(&idx, 41);

@@ -833,7 +833,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     //   (sid!=0, no attrs)    → can't recompute the hash;
                     //                           fall back to "is this sid
                     //                           registered?" via
-                    //                           SketchIndex. Unknown → push
+                    //                           SketchStore. Unknown → push
                     //                           to `unknown_sids` and drop
                     //                           this DP (sender will
                     //                           re-emit with attrs next
@@ -1062,7 +1062,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
                         // DEPRECATED: aggregation_id-keyed write — remove
                         // after warm-tier validation. The Phase 5
-                        // SketchIndex above is the new write path; this
+                        // SketchStore above is the new write path; this
                         // legacy router push stays in tandem until the
                         // query path's warm-tier reducer is wired
                         // end-to-end and the streaming-config /
@@ -1152,7 +1152,7 @@ fn sketch_kind_handle_for(
 }
 
 /// Phase 5 helper — translate the wire-format `encoding` integer to the
-/// SketchIndex's `SketchEncoding` enum. Returns `None` for the unset
+/// SketchStore's `SketchEncoding` enum. Returns `None` for the unset
 /// (0) encoding so callers can default to `ProtoFull` (the dominant
 /// case for full-state frames).
 fn encoding_to_handle(encoding: i32) -> Option<crate::stores::sketch_db::index::SketchEncoding> {
@@ -1193,7 +1193,7 @@ struct ModifiedOtlpSketchDp {
     series_id: u64,
     /// Phase 5 — DataPoint-level start of the sketch window. Combined
     /// with `time_unix_nano` to form the `(start_ms, end_ms)` window
-    /// the SketchIndex's columnar storage keys on.
+    /// the SketchStore's columnar storage keys on.
     start_time_unix_nano: u64,
     /// Phase 5 — sketch-instance configuration lifted off the parent
     /// container. Drives `SketchInstanceMetadata.sketch_config` and the
@@ -1892,7 +1892,7 @@ mod dispatcher_tests {
 /// Phase 4 — sid-resolution gate tests. Construct an OTLP DDSketch
 /// Export with one DataPoint per scenario, run it through
 /// `route_modified_otlp_sketches_to_precompute`, and assert on the
-/// returned `unknown_series_ids` plus the SeriesIdResolver / SketchIndex
+/// returned `unknown_series_ids` plus the SeriesIdResolver / SketchStore
 /// state on the shared IngestState.
 #[cfg(test)]
 mod sid_resolution_tests {
@@ -1901,7 +1901,7 @@ mod sid_resolution_tests {
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::stores::sketch_db::SchemaRegistry;
-    use crate::stores::sketch_db::index::SketchIndex;
+    use crate::stores::sketch_db::index::SketchStore;
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -1926,7 +1926,7 @@ mod sid_resolution_tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(SeriesIdResolver::new()),
-            sketch_index: Arc::new(SketchIndex::new()),
+            sketch_index: Arc::new(SketchStore::new()),
         });
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         (state, drain)
@@ -1983,11 +1983,11 @@ mod sid_resolution_tests {
         let unknown = route_modified_otlp_sketches_to_precompute(&req, &state).await;
         assert!(unknown.is_empty(), "no unknown sids on a fresh-attrs DP");
         // M2 — sketch sid is hash-derived; resolver is not consulted on
-        // the sketch ingest path. SketchIndex is the registration set.
+        // the sketch ingest path. SketchStore is the registration set.
         assert_eq!(
             state.sketch_index.instance_count(),
             1,
-            "SketchIndex registered one instance"
+            "SketchStore registered one instance"
         );
 
         drop(state);
@@ -1997,7 +1997,7 @@ mod sid_resolution_tests {
     #[tokio::test]
     async fn unknown_sid_with_empty_attrs_is_returned_in_response() {
         let (state, drain) = make_state().await;
-        // sid != 0, no attrs — SketchIndex doesn't know it; should land
+        // sid != 0, no attrs — SketchStore doesn't know it; should land
         // in unknown_sids and the DP must be dropped (no instance
         // registered). Hash recomputation isn't possible without attrs.
         let dp = DdSketchDataPoint {

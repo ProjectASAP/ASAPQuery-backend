@@ -26,7 +26,7 @@ pub use gorilla_object_store::{
     S3CostTrackingObjectStore,
 };
 pub use sketch_db::index::{
-    AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchIndex,
+    AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };
 pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry};

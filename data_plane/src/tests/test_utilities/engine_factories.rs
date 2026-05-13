@@ -91,9 +91,9 @@ pub fn create_engine_single_pop_with_aggregated(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
 
-    // Insert data into SketchIndex via the canonical helper (M2.3.6e).
+    // Insert data into SketchStore via the canonical helper (M2.3.6e).
     let agg_cfg = streaming_config
         .get_aggregation_config(1)
         .cloned()
@@ -188,7 +188,7 @@ pub fn create_engine_dual_input(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
 
     let agg_cfg_1 = streaming_config
         .get_aggregation_config(1)
@@ -280,7 +280,7 @@ pub fn create_engine_two_metrics(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     let agg_cfg_1 = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     let agg_cfg_2 = streaming_config.get_aggregation_config(2).cloned().expect("agg 2");
     let timestamp = 1_000_000_u64;
@@ -358,7 +358,7 @@ pub fn create_engine_three_metrics(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     let agg_cfgs: Vec<_> = (1..=3)
         .map(|id| streaming_config.get_aggregation_config(id).cloned().expect("agg present"))
         .collect();
@@ -414,7 +414,7 @@ pub fn create_engine_multi_timestamp(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     let agg_cfg = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
@@ -467,7 +467,7 @@ pub fn create_engine_multi_timestamp_with_window(
         aggregation_configs,
         storage_backend: Default::default()});
 
-    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = std::sync::Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     let agg_cfg = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });

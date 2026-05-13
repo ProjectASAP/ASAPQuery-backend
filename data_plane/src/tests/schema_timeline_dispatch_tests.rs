@@ -95,7 +95,7 @@ const TEST_QUERY: &str = "sum by (host) (sensor_reading)";
 fn build_engine(
     streaming_config: Arc<StreamingConfig>,
     schemas: Arc<SchemaRegistry>,
-    sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+    sketch_index: Arc<crate::stores::sketch_db::index::SketchStore>,
     _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
     let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
@@ -105,9 +105,9 @@ fn build_engine(
 }
 
 /// Insert a single `SumAccumulator` window at `ts` into `agg_id`.
-/// M2.3.6g — SketchIndex-only after the legacy SketchStore retirement.
+/// M2.3.6g — SketchStore-only after the legacy SketchStore retirement.
 fn seed_sum_at(
-    sketch_index: &crate::stores::sketch_db::index::SketchIndex,
+    sketch_index: &crate::stores::sketch_db::index::SketchStore,
     streaming_config: &StreamingConfig,
     agg_id: u64,
     ts: u64,
@@ -148,7 +148,7 @@ fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
     // per segment:
     //   agg_1's sub-range is `[QUERY_START_MS, BOUNDARY_MS]`
     //   agg_2's sub-range is `[BOUNDARY_MS, QUERY_TIME_MS]`
-    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     seed_sum_at(&sketch_index, &streaming_config, 1, AGG1_SAMPLE_MS, "A", 10.0);
     seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
@@ -198,7 +198,7 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
 
     // Only agg_2 has data; agg_1's data is assumed gone with the
     // Purged classification.
-    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
     let engine = build_engine(streaming_config, schemas, sketch_index, 2);
@@ -245,7 +245,7 @@ fn single_schema_query_falls_through_to_default_path() {
     let schemas = Arc::new(SchemaRegistry::empty());
     schemas.insert_raw_for_testing(fixed_schema(7, 0, None, None));
 
-    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchStore::new());
     seed_sum_at(&sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
 
     let engine = build_engine(streaming_config, schemas, sketch_index, 7);

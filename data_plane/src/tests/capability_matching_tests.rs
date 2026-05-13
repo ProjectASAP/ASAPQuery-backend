@@ -11,7 +11,7 @@ use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinS
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::index::SketchIndex;
+use crate::stores::sketch_db::index::SketchStore;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -63,7 +63,7 @@ fn engine_no_query_configs(
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
         storage_backend: Default::default()});
-    let sketch_index = Arc::new(SketchIndex::new());
+    let sketch_index = Arc::new(SketchStore::new());
 
     // Insert a data point for each aggregation so queries can actually execute.
     let ts = 1_000_000_u64;
@@ -104,7 +104,7 @@ fn engine_with_query_config(
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
         storage_backend: Default::default()});
-    let sketch_index = Arc::new(SketchIndex::new());
+    let sketch_index = Arc::new(SketchStore::new());
 
     let ts = 1_000_000_u64;
     let window_ms = agg_config.window_size * 1000;

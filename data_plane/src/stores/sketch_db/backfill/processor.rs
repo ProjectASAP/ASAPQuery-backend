@@ -126,11 +126,11 @@ pub struct BackfillWindowProcessor {
     #[allow(dead_code)]
     schemas: Arc<SchemaRegistry>,
     /// Phase 5 M2.3.6g — replayed batches land here. The legacy
-    /// `Arc<dyn Store>` field is gone; SketchIndex is the only
+    /// `Arc<dyn Store>` field is gone; SketchStore is the only
     /// destination. Optional so tests that don't observe write
     /// effects can skip attaching one (the processor becomes a
     /// registry-only logger in that case).
-    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
+    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchStore>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
     /// this list.
@@ -156,11 +156,11 @@ impl BackfillWindowProcessor {
         }
     }
 
-    /// Attach a `SketchIndex` so each batch lands there. Builder-style
+    /// Attach a `SketchStore` so each batch lands there. Builder-style
     /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
         self
@@ -241,7 +241,7 @@ impl WindowProcessor for BackfillWindowProcessor {
             batch.push((output, accumulator));
         }
 
-        // Phase 5 M2.3.6g — replayed batches land in SketchIndex only.
+        // Phase 5 M2.3.6g — replayed batches land in SketchStore only.
         // No legacy SketchStore write path remains. When no
         // sketch_index is attached (tests), the writes are simply
         // dropped — the registry still records the (agg_id, range)

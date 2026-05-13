@@ -83,7 +83,7 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
 /// concrete metric.
 ///
 /// Intentionally lightweight: callers use the result to filter warm-tier
-/// candidates via `SketchIndex::instances_matching`. Any over-approximation
+/// candidates via `SketchStore::instances_matching`. Any over-approximation
 /// is tolerable — the candidates are subsequently classified, and on
 /// `Ghost` / `Unknown` outcomes the query falls through to the archive
 /// engine via the EngineRouter's `CapabilityMiss` failover.
@@ -240,7 +240,7 @@ pub struct RangeQueryExecutionContext {
 /// Simple query engine for processing PromQL-like queries against precomputed data
 pub struct ASAPQueryEngine {
     // Phase 5 M2.3.6g — `store: Arc<dyn Store>` field retired. The
-    // engine reads precomputes exclusively from `SketchIndex` after
+    // engine reads precomputes exclusively from `SketchStore` after
     // M2.3.6f. Constructor signatures no longer take a `store` arg.
     /// Hot-reloadable `StreamingConfig` handle. Internal read sites
     /// call `Self::streaming_config_snapshot()` which re-snapshots
@@ -280,7 +280,7 @@ pub struct ASAPQueryEngine {
     /// EngineRouter's archive failover (Phase 6). When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
-    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
+    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchStore>>,
     /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
     /// `main.rs`'s engine builder. When the warm-tier reducer reports a
     /// `WarmTierResult.coverage` narrower than the requested
@@ -471,13 +471,13 @@ impl ASAPQueryEngine {
         self
     }
 
-    /// Phase 5 — attach the shared `SketchIndex` so the `QueryEngine`
+    /// Phase 5 — attach the shared `SketchStore` so the `QueryEngine`
     /// trait adapter's classify+failover logic is active. Without this
     /// call, the engine keeps the pre-Phase-5 behavior (route every
     /// query through `handle_query`).
     pub fn with_sketch_index(
         mut self,
-        index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+        index: Arc<crate::stores::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(index);
         self
@@ -1043,13 +1043,13 @@ impl ASAPQueryEngine {
             params.is_exact_query
         );
 
-        // M2.3.6f — engine reads precomputes from SketchIndex only.
+        // M2.3.6f — engine reads precomputes from SketchStore only.
         // The legacy `Store::query_precomputed_output*` fallback has
         // been retired now that DualWriteSink (M2.3.4b) → SketchIndexSink
-        // (M2.3.6a) writes exclusively to SketchIndex and
+        // (M2.3.6a) writes exclusively to SketchStore and
         // BackfillService (M2.3.6e) mirrors replays there too.
         //
-        // Tests that don't attach a SketchIndex now get `Ok(empty)`
+        // Tests that don't attach a SketchStore now get `Ok(empty)`
         // here. Anything deeper than smoke-test coverage was already
         // setting one (M2.3.5b made it mandatory in production).
         let Some(idx) = self.sketch_index.as_ref() else {
@@ -1067,7 +1067,7 @@ impl ASAPQueryEngine {
         );
         let result: TimestampedBucketsMap = if params.is_exact_query {
             // Sliding-window mode requires bit-exact (start, end)
-            // match. SketchIndex's range query returns any windows
+            // match. SketchStore's range query returns any windows
             // fully within [start, end] — filter post-hoc to recover
             // the exact semantics the retired
             // `query_precomputed_output_exact` had.
@@ -5856,7 +5856,7 @@ mod cms_rate_capability_tests {
 
 /// Phase 5 — `QueryEngine::execute` warm-tier classification tests.
 /// Pre-Phase-5 the trait adapter unconditionally delegated to
-/// `handle_query`. After Phase 5 wire-in, when a `SketchIndex` is
+/// `handle_query`. After Phase 5 wire-in, when a `SketchStore` is
 /// attached, the adapter classifies first and surfaces
 /// `EngineError::CapabilityMiss(SketchStore, ...)` on Ghost / Unknown
 /// / no-instance outcomes so the EngineRouter (Phase 6) can fall
@@ -5868,11 +5868,11 @@ mod warm_tier_classify_tests {
     use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
     use crate::stores::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,
+        AccuracyBound, Capability, SketchConfig, SketchStore, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState};
     use std::collections::{BTreeMap, BTreeSet};
 
-    fn build_engine_with_index(idx: Arc<SketchIndex>) -> ASAPQueryEngine {
+    fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
         let streaming_config = Arc::new(crate::stores::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
         ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
@@ -5904,7 +5904,7 @@ mod warm_tier_classify_tests {
     async fn execute_returns_capability_miss_when_no_instance_matches() {
         // No instance for `unknown_metric` is registered → adapter must
         // capability-miss rather than burn a `handle_query` round-trip.
-        let idx = Arc::new(SketchIndex::new());
+        let idx = Arc::new(SketchStore::new());
         let engine = build_engine_with_index(idx);
         let err = engine
             .execute("unknown_metric{zone=\"z0\"}")
@@ -5929,7 +5929,7 @@ mod warm_tier_classify_tests {
         // use `quantile_over_time(...)` so the analyzer accepts the
         // shape and the per-candidate sid classification surfaces
         // the ghost miss.
-        let idx = Arc::new(SketchIndex::new());
+        let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(1, "http_latency_ms", &["zone"]));
         let engine = build_engine_with_index(idx);
         let err = engine
@@ -5964,7 +5964,7 @@ mod warm_tier_classify_tests {
         // `execute_proceeds_to_handle_query_when_all_sids_hit` test —
         // the new behavior is "bare selectors short-circuit on shape
         // rejection, regardless of index state".
-        let idx = Arc::new(SketchIndex::new());
+        let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
             2,
