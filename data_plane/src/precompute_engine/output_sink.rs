@@ -158,32 +158,6 @@ impl OutputSink for SketchIndexSink {
     }
 }
 
-/// Output sink for raw passthrough mode — forwards raw samples to the store
-/// without sketch computation. In this mode the samples are stored as
-/// SumAccumulators (one per sample).
-pub struct RawPassthroughSink {
-    store: Arc<dyn Store>,
-}
-
-impl RawPassthroughSink {
-    pub fn new(store: Arc<dyn Store>) -> Self {
-        Self { store }
-    }
-}
-
-impl OutputSink for RawPassthroughSink {
-    fn emit_batch(
-        &self,
-        outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if outputs.is_empty() {
-            return Ok(());
-        }
-        let _span = debug_span!("store_insert_raw", batch_size = outputs.len()).entered();
-        self.store.insert_precomputed_output_batch(outputs)
-    }
-}
-
 /// A capturing sink for testing that stores all emitted outputs.
 pub struct CapturingOutputSink {
     pub captured: Mutex<Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>>,
