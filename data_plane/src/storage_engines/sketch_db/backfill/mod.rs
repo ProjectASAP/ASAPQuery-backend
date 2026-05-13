@@ -54,6 +54,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use asap_types::aggregation_config::AggregationConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -145,8 +146,8 @@ pub struct BackfillJob {
     /// `create`. Unique per-process.
     pub job_id: u64,
     /// Target aggregation. The registry does not itself verify that
-    /// the agg_id is `Active` in the [`super::SchemaRegistry`] —
-    /// Phase 5c's worker consults the schema barrier before writing.
+    /// the agg_id is `Active` in any sid lifecycle table — Phase 5c's
+    /// worker consults the sid-level write barrier before writing.
     pub agg_id: u64,
     /// Inclusive-exclusive `[start_ms, end_ms)` window to rebuild.
     pub time_range: (u64, u64),
@@ -523,10 +524,14 @@ impl BackfillRegistry {
 
     /// Create a job with all §10.5 invariants enforced:
     ///
-    /// * **Known agg**: `schemas.get(agg_id)` must return `Some`.
-    /// * **Time-disjoint**: `time_range.1 <= schema.created_at_ms`
+    /// * **Time-disjoint**: `time_range.1 <= created_at_ms`
     ///   so backfill writes don't race live writes on the same
-    ///   `(agg_id, window)` pair.
+    ///   `(agg_id, window)` pair. The caller passes the agg's
+    ///   `created_at_ms` directly — in the post-schema-retirement
+    ///   world there is no `SchemaRegistry::get(agg_id)` to look
+    ///   it up from, and the caller (typically the HTTP handler
+    ///   or controller) already has the wall-clock snapshot in
+    ///   scope from its `StreamingConfig` reconcile event.
     /// * **Within data retention** (if `data_retention_ms` is
     ///   provided): `time_range.0 >= now - data_retention_ms`.
     ///   Method B from the design discussion — fail fast instead
@@ -535,30 +540,34 @@ impl BackfillRegistry {
     ///   Pass `None` to skip the check (tests, or deployments
     ///   where retention is disabled).
     ///
+    /// The `agg_id` is taken from `config.aggregation_id`; the
+    /// caller no longer threads it separately.
+    ///
     /// Errors map to distinct [`CreateError`] variants so the
     /// controller-facing HTTP endpoint can return specific 404 /
-    /// 409 / 400 statuses.
+    /// 409 / 400 statuses. `CreateError::UnknownAgg` is no longer
+    /// returned from this method — the caller proves the agg
+    /// exists by holding the `AggregationConfig` — but the variant
+    /// is kept on the enum for HTTP error-mapping compatibility
+    /// (the handler still produces it when its own lookup misses).
     pub fn create_checked(
         &self,
-        schemas: &super::SchemaRegistry,
-        agg_id: u64,
+        config: &AggregationConfig,
+        created_at_ms: u64,
         time_range: (u64, u64),
         source: BackfillSource,
         windows_total: u64,
         data_retention_ms: Option<u64>,
     ) -> Result<u64, CreateError> {
-        let schema = match schemas.get(agg_id) {
-            Some(s) => s,
-            None => return Err(CreateError::UnknownAgg { agg_id }),
-        };
+        let agg_id = config.aggregation_id;
         // Time-disjoint invariant: live ingest writes `[created_at, ∞)`
         // so backfill must stay strictly inside `[0, created_at)` or
         // touch the boundary exactly.
-        if time_range.1 > schema.created_at_ms {
+        if time_range.1 > created_at_ms {
             return Err(CreateError::Overlap {
                 agg_id,
                 requested_end_ms: time_range.1,
-                created_at_ms: schema.created_at_ms,
+                created_at_ms,
             });
         }
         // Data-retention check (Method B): if the store would
