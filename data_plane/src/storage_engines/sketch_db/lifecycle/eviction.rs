@@ -291,11 +291,27 @@ mod tests {
         agg_id: u64,
         ts: u64,
     ) -> u64 {
+        use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+        use std::sync::Arc;
         let acc = SumAccumulator::with_sum(1.0);
         let output = crate::storage_engines::types::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
         let agg_cfg = streaming_config.get_aggregation_config(agg_id).unwrap();
+        // Test-scoped resolver — each call mints fresh. Production
+        // shares one resolver across all sinks; tests don't need that
+        // because each fixture is isolated. Static-lifetime so multiple
+        // `write_one` calls in the same test share `next_sid` (matches
+        // the production single-resolver model).
+        thread_local! {
+            static RESOLVER: Arc<SeriesIdResolver> = Arc::new(SeriesIdResolver::new());
+        }
+        let resolver = RESOLVER.with(|r| r.clone());
         sketch_index
-            .ingest_precompute_for_agg_config(agg_cfg, &output, &acc)
+            .ingest_precompute_for_agg_config(
+                |m, fp, ak| resolver.resolve(m, fp, ak),
+                agg_cfg,
+                &output,
+                &acc,
+            )
             .expect("registered sid")
     }
 

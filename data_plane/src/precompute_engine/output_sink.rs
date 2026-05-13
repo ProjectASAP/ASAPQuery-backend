@@ -1,3 +1,4 @@
+use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
@@ -28,13 +29,25 @@ pub trait OutputSink: Send + Sync {
 pub struct SketchStoreSink {
     sketch_index: Arc<SketchStore>,
     hot_reload: HotReloadStreamingConfig,
+    /// Single shared resolver across the ingest + precompute paths. Under
+    /// the registry-allocated sid model (PR-1..3), this is the canonical
+    /// mint authority — precompute sids share the same `next_sid` counter
+    /// as OTel-sketch sids, so the two paths can never collide on identity
+    /// even when the same `(metric, attrs)` carries both a sketch and an
+    /// exact precompute.
+    series_resolver: Arc<SeriesIdResolver>,
 }
 
 impl SketchStoreSink {
-    pub fn new(sketch_index: Arc<SketchStore>, hot_reload: HotReloadStreamingConfig) -> Self {
+    pub fn new(
+        sketch_index: Arc<SketchStore>,
+        hot_reload: HotReloadStreamingConfig,
+        series_resolver: Arc<SeriesIdResolver>,
+    ) -> Self {
         Self {
             sketch_index,
             hot_reload,
+            series_resolver,
         }
     }
 
@@ -56,8 +69,14 @@ impl SketchStoreSink {
             );
             return false;
         };
+        let resolver = self.series_resolver.clone();
         self.sketch_index
-            .ingest_precompute_for_agg_config(agg_cfg, output, accumulator)
+            .ingest_precompute_for_agg_config(
+                |metric, fp, ak| resolver.resolve(metric, fp, ak),
+                agg_cfg,
+                output,
+                accumulator,
+            )
             .is_some()
     }
 }
@@ -195,7 +214,11 @@ mod tests {
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
 
         let sketch_index = Arc::new(SketchStore::new());
-        let sink = SketchStoreSink::new(sketch_index.clone(), hot_reload);
+        let sink = SketchStoreSink::new(
+            sketch_index.clone(),
+            hot_reload,
+            Arc::new(SeriesIdResolver::new()),
+        );
 
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
         let output = PrecomputedOutput::new(1000, 2000, Some(key), agg_id);
@@ -234,7 +257,11 @@ mod tests {
         let streaming = StreamingConfig::new(HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
         let sketch_index = Arc::new(SketchStore::new());
-        let sink = SketchStoreSink::new(sketch_index.clone(), hot_reload);
+        let sink = SketchStoreSink::new(
+            sketch_index.clone(),
+            hot_reload,
+            Arc::new(SeriesIdResolver::new()),
+        );
 
         let output = PrecomputedOutput::new(1000, 2000, None, 99);
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));

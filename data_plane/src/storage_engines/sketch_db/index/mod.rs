@@ -33,9 +33,8 @@ use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 // (`crate::storage_engines::sketch_db::index::*`) keep compiling
 // during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
-    canonical_parameters, compute_sid, AccuracyBound, AggKind, AggPayload, AggregationType,
-    Capability, SketchConfig, SketchEncoding, SketchKindHandle, SketchSampleState,
-    SketchTimeSeries,
+    canonical_parameters, AccuracyBound, AggKind, AggPayload, AggregationType, Capability,
+    SketchConfig, SketchEncoding, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };
 
 fn now_ms() -> u64 {
@@ -594,6 +593,7 @@ impl SketchStore {
     /// drop residual state cleanly.
     pub fn ingest_precompute_for_agg_config(
         &self,
+        mint_sid: impl FnOnce(&str, &str, &str) -> u64,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
@@ -618,7 +618,14 @@ impl SketchStore {
             agg_type: agg_cfg.aggregation_type,
             parameters_canonical: canonical_parameters(&agg_cfg.parameters),
         };
-        let sid = compute_sid(&agg_cfg.metric, &attrs_fp, &agg_kind);
+        // Sid mint delegated to the caller's closure — typically
+        // `|m, fp, ak| series_resolver.resolve(m, fp, ak)`. Keeps the
+        // SketchStore free of any layer-inverted dependency on the
+        // resolver type (which lives in `drivers::ingest`). Tests
+        // pass either a real local resolver or a counter-mock
+        // closure.
+        let agg_kind_canonical = agg_kind.canonical_string();
+        let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
 
         match self.instance(sid) {
             None => {
@@ -1126,72 +1133,18 @@ mod tests {
         assert_eq!(series[0].samples.len(), 4);
     }
 
-    // `compute_sketch_sid_*` tests removed alongside the function they
-    // exercised. The same identity properties (metric/attrs/kind/config
-    // disambiguate sketch sids) are now covered by the resolver's own
-    // `distinct_agg_kinds_same_series_distinct_sids` test plus the
-    // round-trip parity captured at the OTel ingest layer.
-
-    #[test]
-    fn compute_sid_precompute_is_deterministic() {
-        let kind = AggKind::Precompute {
-            agg_type: AggregationType::Sum,
-            parameters_canonical: String::new(),
-        };
-        let a = compute_sid("cpu_seconds", "zone=z0;", &kind);
-        let b = compute_sid("cpu_seconds", "zone=z0;", &kind);
-        assert_eq!(a, b);
-        assert_ne!(a, 0);
-    }
-
-    #[test]
-    fn compute_sid_sketch_vs_precompute_never_collide() {
-        // Same metric + attrs; one is a sketch, one is a precompute.
-        // The 'S'/'P' discriminator byte must make the hashes differ.
-        let sketch = AggKind::Sketch {
-            kind: SketchKindHandle::DDSketch,
-            config: SketchConfig::DDSketch {
-                relative_accuracy: 0.01,
-            },
-        };
-        let precompute = AggKind::Precompute {
-            agg_type: AggregationType::Sum,
-            parameters_canonical: String::new(),
-        };
-        let a = compute_sid("m", "zone=z0;", &sketch);
-        let b = compute_sid("m", "zone=z0;", &precompute);
-        assert_ne!(a, b, "sketch and precompute sids must not collide");
-    }
-
-    #[test]
-    fn compute_sid_precompute_distinguishes_agg_type() {
-        let sum = AggKind::Precompute {
-            agg_type: AggregationType::Sum,
-            parameters_canonical: String::new(),
-        };
-        let count = AggKind::Precompute {
-            agg_type: AggregationType::Increase,
-            parameters_canonical: String::new(),
-        };
-        let a = compute_sid("m", "zone=z0;", &sum);
-        let b = compute_sid("m", "zone=z0;", &count);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn compute_sid_precompute_distinguishes_parameters() {
-        let p1 = AggKind::Precompute {
-            agg_type: AggregationType::DatasketchesKLL,
-            parameters_canonical: "k=200;".to_string(),
-        };
-        let p2 = AggKind::Precompute {
-            agg_type: AggregationType::DatasketchesKLL,
-            parameters_canonical: "k=400;".to_string(),
-        };
-        let a = compute_sid("m", "zone=z0;", &p1);
-        let b = compute_sid("m", "zone=z0;", &p2);
-        assert_ne!(a, b);
-    }
+    // sid-hash unit tests removed alongside `compute_sid` (PR-4) and
+    // `compute_sketch_sid` (PR-3). The identity properties they
+    // exercised — `(metric, attrs, agg_kind)` discriminates sids,
+    // sketch and precompute never collide, agg_type and parameters
+    // each contribute to identity — are now covered by:
+    //
+    //  - `series_resolver::tests::distinct_agg_kinds_same_series_distinct_sids`
+    //    (the resolver's identity contract under Interpretation B)
+    //  - `AggKind::canonical_string` is exhaustive over the AggKind
+    //    enum, so two variants whose fields differ produce different
+    //    canonical strings → different resolver cache keys → different
+    //    sids by construction.
 
     #[test]
     fn canonical_parameters_is_insertion_order_independent() {

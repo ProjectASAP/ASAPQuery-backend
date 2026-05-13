@@ -124,6 +124,12 @@ pub struct BackfillWindowProcessor {
     /// effects can skip attaching one (the processor becomes a
     /// registry-only logger in that case).
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    /// Shared sid mint authority. Same `SeriesIdResolver` the OTel
+    /// ingest path uses, so backfilled precompute sids land in the
+    /// same unified namespace as live precompute / sketch sids. Only
+    /// consulted when `sketch_index` is also set (no sketch_index ⇒
+    /// no precompute write ⇒ no sid mint).
+    series_resolver: Option<Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
     /// this list.
@@ -142,6 +148,7 @@ impl BackfillWindowProcessor {
         Self {
             config,
             sketch_index: None,
+            series_resolver: None,
             registry,
             job_id,
         }
@@ -154,6 +161,19 @@ impl BackfillWindowProcessor {
         sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
+        self
+    }
+
+    /// Attach the shared `SeriesIdResolver` so precompute writes mint
+    /// sids via the same registry the OTel ingest path uses. Required
+    /// alongside [`Self::with_sketch_index`] — without a resolver the
+    /// processor still runs but skips the precompute write (registry
+    /// provenance still recorded, with a warn-log per missing call).
+    pub fn with_series_resolver(
+        mut self,
+        series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    ) -> Self {
+        self.series_resolver = Some(series_resolver);
         self
     }
 
@@ -236,10 +256,32 @@ impl WindowProcessor for BackfillWindowProcessor {
         // No legacy SketchStore write path remains. When no
         // sketch_index is attached (tests), the writes are simply
         // dropped — the registry still records the (agg_id, range)
-        // provenance below.
+        // provenance below. When sketch_index is attached but no
+        // resolver was provided, the precompute write is skipped
+        // with a warn — sid minting requires the shared resolver.
         if let Some(idx) = self.sketch_index.as_ref() {
-            for (output, accumulator) in &batch {
-                idx.ingest_precompute_for_agg_config(&config, output, accumulator.as_ref());
+            match self.series_resolver.as_ref() {
+                Some(resolver) => {
+                    for (output, accumulator) in &batch {
+                        let resolver = resolver.clone();
+                        idx.ingest_precompute_for_agg_config(
+                            |metric, fp, ak| resolver.resolve(metric, fp, ak),
+                            &config,
+                            output,
+                            accumulator.as_ref(),
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        job_id = self.job_id,
+                        agg_id,
+                        batch_size = batch.len(),
+                        "BackfillWindowProcessor has sketch_index but no \
+                         series_resolver attached; skipping precompute writes \
+                         for this window",
+                    );
+                }
             }
         }
         // Hold `batch` alive until after the registry record below,

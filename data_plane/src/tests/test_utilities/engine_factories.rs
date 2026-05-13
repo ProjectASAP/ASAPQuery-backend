@@ -5,6 +5,7 @@
 //! hardcodes "SumAccumulator", these helpers build AggregationConfig with
 //! the correct aggregation_type string.
 
+use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::storage_engines::types::{
     AggregationConfig, AggregationType, KeyByLabelValues, PrecomputedOutput, QueryLanguage,
     StreamingConfig, WindowType};
@@ -13,6 +14,26 @@ use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::AggregateCore;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
+
+/// Helper for test factories — wraps the closure-mint call with a
+/// fresh resolver and forwards to `SketchStore::ingest_precompute_for_agg_config`.
+/// Each factory gets its own resolver instance; tests are isolated so
+/// the `next_sid = 1, 2, ...` counter doesn't bleed between fixtures.
+fn ingest_with_fresh_resolver(
+    sketch_index: &crate::storage_engines::sketch_db::index::SketchStore,
+    resolver: &std::sync::Arc<SeriesIdResolver>,
+    agg_cfg: &AggregationConfig,
+    output: &PrecomputedOutput,
+    accumulator: &dyn AggregateCore,
+) -> Option<u64> {
+    let resolver = resolver.clone();
+    sketch_index.ingest_precompute_for_agg_config(
+        |m, fp, ak| resolver.resolve(m, fp, ak),
+        agg_cfg,
+        output,
+        accumulator,
+    )
+}
 use std::sync::Arc;
 
 /// Data to insert into a store: (label_values, accumulator)
@@ -92,6 +113,7 @@ pub fn create_engine_single_pop_with_aggregated(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
     // Insert data into SketchStore via the canonical helper (M2.3.6e).
     let agg_cfg = streaming_config
@@ -102,7 +124,7 @@ pub fn create_engine_single_pop_with_aggregated(
     for (label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp, timestamp, key, 1);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
 
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
@@ -189,6 +211,7 @@ pub fn create_engine_dual_input(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
 
     let agg_cfg_1 = streaming_config
         .get_aggregation_config(1)
@@ -202,12 +225,12 @@ pub fn create_engine_dual_input(
     for (label_values_opt, acc) in value_data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp, timestamp, key, 1);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg_1, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in keys_data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp, timestamp, key, 2);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg_2, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
 
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
@@ -281,18 +304,19 @@ pub fn create_engine_two_metrics(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg_1 = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     let agg_cfg_2 = streaming_config.get_aggregation_config(2).cloned().expect("agg 2");
     let timestamp = 1_000_000_u64;
     for (label_values_opt, acc) in data_a {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp, timestamp, key, 1);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg_1, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in data_b {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp, timestamp, key, 2);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg_2, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
     let _ = (query_a, query_b);
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
@@ -359,6 +383,7 @@ pub fn create_engine_three_metrics(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfgs: Vec<_> = (1..=3)
         .map(|id| streaming_config.get_aggregation_config(id).cloned().expect("agg present"))
         .collect();
@@ -369,7 +394,7 @@ pub fn create_engine_three_metrics(
         for (label_values_opt, acc) in data {
             let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
             let output = PrecomputedOutput::new(timestamp, timestamp, key, agg_id);
-            sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, acc.as_ref());
+            ingest_with_fresh_resolver(&sketch_index, &resolver, agg_cfg, &output, acc.as_ref());
         }
     }
 
@@ -415,11 +440,12 @@ pub fn create_engine_multi_timestamp(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, 1);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
 }
@@ -468,11 +494,12 @@ pub fn create_engine_multi_timestamp_with_window(
         storage_backend: Default::default()});
 
     let sketch_index = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    let resolver = std::sync::Arc::new(SeriesIdResolver::new());
     let agg_cfg = streaming_config.get_aggregation_config(1).cloned().expect("agg 1");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
         let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, 1);
-        sketch_index.ingest_precompute_for_agg_config(&agg_cfg, &output, acc.as_ref());
+        ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
 }

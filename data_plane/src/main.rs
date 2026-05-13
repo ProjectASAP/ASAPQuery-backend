@@ -459,6 +459,7 @@ async fn main() -> Result<()> {
         let output_sink = Arc::new(SketchStoreSink::new(
             sketch_index.clone(),
             hot_reload_config.clone(),
+            series_resolver.clone(),
         ));
         let engine = PrecomputeEngine::new(
             precompute_config,
@@ -745,8 +746,11 @@ async fn main() -> Result<()> {
             data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
         )
         // M2.3.6e — replayed batches land in SketchStore (the only
-        // destination after the M2.3.6g store retirement).
-        .with_sketch_index(sketch_index.clone());
+        // destination after the M2.3.6g store retirement). Resolver
+        // is the same shared mint authority as live ingest, so
+        // backfilled precompute sids share the OTel namespace.
+        .with_sketch_index(sketch_index.clone())
+        .with_series_resolver(series_resolver.clone());
         info!(
             "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
         );
