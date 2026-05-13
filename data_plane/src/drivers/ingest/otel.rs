@@ -520,7 +520,15 @@ async fn route_otlp_to_precompute(
     let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
     let mut raw_matched = 0usize;
     let mut raw_unmatched = 0usize;
-    let mut raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
+    // Schema retirement #3 (plan step #3) dropped the agg_id-keyed
+    // `schemas.is_writable` ingest barrier. The §6.3 contract still
+    // holds: `SketchStore::ingest_precompute_for_agg_config` rejects
+    // writes targeting retired/expired sids at the sid-level
+    // (per-sid `is_writable`). The retained empty map below feeds
+    // `flush_barrier_drops` so the counter / log shape doesn't
+    // change for /metrics consumers; once schema/ is fully retired
+    // the counter moves to sid-level wiring.
+    let raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
 
     for point in &points {
         let series_key = format_series_key(&point.name, &point.labels);
@@ -531,11 +539,6 @@ async fn route_otlp_to_precompute(
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
             {
-                continue;
-            }
-            // §6.3 write-side schema barrier — see ingest_handler.rs.
-            if !ingest_state.schemas.is_writable(config.aggregation_id) {
-                *raw_barrier_drops.entry(config.aggregation_id).or_default() += 1;
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -585,7 +588,10 @@ async fn route_otlp_to_precompute(
     let mut sketch_messages: Vec<WorkerMessage> = Vec::new();
     let mut sketch_matched = 0usize;
     let mut sketch_unmatched = 0usize;
-    let mut sketch_barrier_drops: HashMap<u64, u64> = HashMap::new();
+    // See `raw_barrier_drops` above — schema-keyed barrier dropped;
+    // sid-level barrier in `SketchStore` enforces §6.3 going
+    // forward.
+    let sketch_barrier_drops: HashMap<u64, u64> = HashMap::new();
     for point in &sketch_payloads {
         let series_key = format_series_key(&point.name, &point.labels);
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
@@ -596,13 +602,6 @@ async fn route_otlp_to_precompute(
                 && config.spatial_filter_normalized != point.name
                 && config.spatial_filter != point.name
             {
-                continue;
-            }
-            // §6.3 write-side schema barrier — see ingest_handler.rs.
-            if !ingest_state.schemas.is_writable(config.aggregation_id) {
-                *sketch_barrier_drops
-                    .entry(config.aggregation_id)
-                    .or_default() += 1;
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
@@ -701,7 +700,9 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
-    let mut barrier_drops: HashMap<u64, u64> = HashMap::new();
+    // Schema-keyed barrier dropped (see `raw_barrier_drops` above);
+    // sid-level barrier in `SketchStore` carries §6.3 going forward.
+    let barrier_drops: HashMap<u64, u64> = HashMap::new();
     // Phase 4 — sids the receiver did not recognize this Export. Returned
     // to the caller so the gRPC / HTTP handler can stamp them into
     // `ExportMetricsServiceResponse.unknown_series_ids`. Senders evict
@@ -1070,11 +1071,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                             && config.spatial_filter_normalized != metric.name
                             && config.spatial_filter != metric.name
                         {
-                            continue;
-                        }
-                        // §6.3 write-side schema barrier — see ingest_handler.rs.
-                        if !ingest_state.schemas.is_writable(config.aggregation_id) {
-                            *barrier_drops.entry(config.aggregation_id).or_default() += 1;
                             continue;
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
