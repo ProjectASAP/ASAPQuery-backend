@@ -21,14 +21,14 @@
 //!
 //! Sketch-typed agg-configs are not yet covered: the
 //! `AggregationConfig` shape doesn't carry a `SketchKindHandle` /
-//! `SketchConfig` natively (controller pushes them through a parallel
+//! `SketchConfig` natively (control plane pushes them through a parallel
 //! capability-routing channel). For now the reconciler treats every
 //! agg-config as a precompute signature; sketch sids never compare
 //! equal so they're never retired by this path. That matches the
 //! pre-retirement behavior: `SchemaRegistry::reconcile` only retired
 //! agg_ids in its own registry, which mirrored the
 //! `StreamingConfig.aggregation_configs` map (also precompute-only).
-//! Sketch lifecycle stays driven by the controller's eviction RPC
+//! Sketch lifecycle stays driven by the control plane's eviction RPC
 //! until M3 unifies the two.
 
 use std::collections::{BTreeSet, HashSet};

@@ -67,19 +67,19 @@ struct Args {
     #[arg(long, default_value = "http://localhost:9090")]
     prometheus_server: String,
 
-    /// DataCollector controller endpoint for capability-miss
-    /// notifications (PR G). When set, `ASAPQueryEngine` fires a
-    /// fire-and-forget POST to this URL every time a query can't
-    /// find a compatible stored aggregation, so the controller
-    /// can generate a new sketch plan. When unset (default),
-    /// capability misses fall through to the §5.2 fallback silently.
-    /// Example: `http://controller.svc:8080/api/v1/plan`
+    /// Control-plane endpoint for capability-miss notifications
+    /// (PR G). When set, `ASAPQueryEngine` fires a fire-and-forget
+    /// POST to this URL every time a query can't find a compatible
+    /// stored aggregation, so the control plane can generate a new
+    /// sketch plan. When unset (default), capability misses fall
+    /// through to the §5.2 fallback silently.
+    /// Example: `http://control-plane.svc:8080/api/v1/plan`
     ///
-    /// Falls back to the `ASAP_CONTROLLER_URL` env var when the flag
-    /// is not passed — `deploy/docker-compose/base.yml` sets the env
-    /// var so the MVP demo doesn't need a per-arg overlay.
-    #[arg(long, env = "ASAP_CONTROLLER_URL")]
-    controller_endpoint: Option<String>,
+    /// Falls back to the `ASAP_CONTROL_PLANE_URL` env var when the
+    /// flag is not passed — `deploy/docker-compose/base.yml` sets
+    /// the env var so the MVP demo doesn't need a per-arg overlay.
+    #[arg(long, env = "ASAP_CONTROL_PLANE_URL")]
+    control_plane_endpoint: Option<String>,
 
     /// Forward unsupported queries to Prometheus
     #[arg(long)]
@@ -167,7 +167,7 @@ struct Args {
 
     /// Spawn the Phase 5e backfill drain loop. When off (default),
     /// queued backfill jobs stay `Queued` forever — shadow-mode
-    /// for controller REFRESH dispatch validation. When on, a
+    /// for control plane REFRESH dispatch validation. When on, a
     /// background task picks up queued jobs and runs them through
     /// `BackfillWindowProcessor` (real sketch rebuild + store
     /// writes). Requires `--streaming-engine=precompute` so the
@@ -407,23 +407,23 @@ async fn main() -> Result<()> {
         // EngineError::CapabilityMiss when the warm tier is empty
         // / ghost / unknown.
         .with_sketch_index(sketch_index.clone());
-        if let Some(controller_endpoint) = args.controller_endpoint.as_ref() {
+        if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",
-                controller_endpoint
+                control_plane_endpoint
             );
             let client: Arc<
-                dyn data_plane::drivers::query::controller_client::ControllerClient,
+                dyn data_plane::drivers::control_plane_client::ControlPlaneClient,
             > = Arc::new(
-                data_plane::drivers::query::controller_client::HttpControllerClient::new(
-                    controller_endpoint.clone(),
+                data_plane::drivers::control_plane_client::HttpControlPlaneClient::new(
+                    control_plane_endpoint.clone(),
                 ),
             );
-            engine = engine.with_controller_client(client);
+            engine = engine.with_control_plane_client(client);
         } else {
             info!(
                 "Capability-miss notifications disabled \
-                 (pass --controller-endpoint=<url> to enable)"
+                 (pass --control-plane-endpoint=<url> to enable)"
             );
         }
         engine
@@ -575,10 +575,10 @@ async fn main() -> Result<()> {
     // the streaming-config single axis defaults to `SketchStore`.
     //
     // Phase α (MVP): even when no static YAML is loaded, install an
-    // empty hot-reload handle so the controller's first
+    // empty hot-reload handle so the control plane's first
     // `POST /api/v1/storage_routing` push lands without first-call 503
     // lossage. Operators can still hand-author the YAML for
-    // dev / standalone — the YAML supplies the bootstrap, controller
+    // dev / standalone — the YAML supplies the bootstrap, control plane
     // pushes overwrite it.
     let bootstrap_routing = if let Some(routing_path) = args.backend_storage_routing.as_deref() {
         match data_plane::storage_engines::types::BackendStorageRouting::from_yaml_file(routing_path) {
@@ -593,7 +593,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!(
-                    "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
+                    "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the control plane's first POST /api/v1/storage_routing push will fill it",
                     routing_path, e,
                 );
                 data_plane::storage_engines::types::BackendStorageRouting::empty()
@@ -601,7 +601,7 @@ async fn main() -> Result<()> {
         }
     } else {
         info!(
-            "--backend-storage-routing not set — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
+            "--backend-storage-routing not set — installing an empty routing table; the control plane's first POST /api/v1/storage_routing push will fill it",
         );
         data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
@@ -710,7 +710,7 @@ async fn main() -> Result<()> {
     // jobs and the upcoming worker pool (Phase 5e) can drain them.
     // Jobs stay `Queued` until 5e wires the worker — intentional
     // shadow-mode behaviour that lets operators validate the
-    // controller's REFRESH dispatch logic before workers exist.
+    // control plane's REFRESH dispatch logic before workers exist.
     // Phase 5g: when `--backfill-persist-path` is set, the registry
     // loads prior job records from disk and rewrites the file on
     // every state transition. When unset, the registry is
@@ -730,7 +730,7 @@ async fn main() -> Result<()> {
     // writes). Without a reader factory configured (Phase 5h), all
     // production `BackfillSource` variants fail fast with a clear
     // "no reader" error — still a step up from the old shadow
-    // mode, since the controller now gets signal that its REFRESH
+    // mode, since the control plane now gets signal that its REFRESH
     // dispatch was received but not executable.
     let backfill_service_handle = if let (true, Some(_ingest_state)) = (
         args.enable_backfill_worker,

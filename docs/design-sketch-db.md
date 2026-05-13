@@ -119,7 +119,7 @@ partially wired; "❌ not started" means spec only.
 | 13.1–13.2 | Feature flags + shadow mode | ⚠️ partial | no framework; noop backfill reader is a de-facto shadow |
 | 14 | Reconfigure workflow | ✅ | end-to-end flow works via hot-reload + backfill |
 | 15.1 | Store trait + query-engine API | ✅ | `stores/traits.rs` |
-| 15.2 | Controller `/schemas`, `/timeline`, `/backfill`, `/backfill/jobs`, streaming-config swap, retire, expire | ✅ | `drivers/query/servers/http.rs` |
+| 15.2 | Control plane `/schemas`, `/timeline`, `/backfill`, `/backfill/jobs`, streaming-config swap, retire, expire | ✅ | `drivers/query/servers/http.rs` |
 | 15.2 | `/stats`, `/cost_estimate`, `/pressure` | ❌ | planner uses hand-coded estimates |
 | 20 | Sketch profiler library | ❌ | not built |
 
@@ -135,7 +135,7 @@ The most valuable review comments land on these, collected in roadmap
 §18:
 
 1. Where do backfill-source hash seeds live? (determinism contract)
-2. Controller behavior when backfill fails partway through
+2. Control plane behavior when backfill fails partway through
 3. Exact-DB retention vs. maximum backfill horizon
 4. Partial-coverage query semantics during in-progress backfill
 5. PII / information leakage via debug APIs and TopK sketches

@@ -1,7 +1,7 @@
 //! Hot-reloadable `StreamingConfig` state.
 //!
 //! Wraps a shared `StreamingConfig` in `arc_swap::ArcSwap` so an
-//! external controller can push a new config at runtime via
+//! external control plane can push a new config at runtime via
 //! `POST /api/v1/streaming-config` without restarting the query
 //! engine binary.
 //!
@@ -25,17 +25,17 @@
 //!   new agg_ids are visible the moment a worker tries to create a
 //!   `GroupState` for them.
 //!
-//! ## Config-upgrade contract for the controller
+//! ## Config-upgrade contract for the control plane
 //!
-//! The recommended way for a controller to upgrade a metric's sketch
+//! The recommended way for a control plane to upgrade a metric's sketch
 //! parameters (or aggregation type) is **monotonic, non-reused
 //! `aggregation_id`s plus time-based retention**:
 //!
-//! 1. Controller decides to upgrade, e.g. `CMS(width=256)` →
+//! 1. Control plane decides to upgrade, e.g. `CMS(width=256)` →
 //!    `CMS(width=1024)` for `test_metric`.
-//! 2. Controller allocates a **new** `aggregation_id` (never reused),
+//! 2. Control plane allocates a **new** `aggregation_id` (never reused),
 //!    e.g. the old id was 1, the new id is 17.
-//! 3. Controller POSTs a new `StreamingConfig` where the old id is
+//! 3. Control plane POSTs a new `StreamingConfig` where the old id is
 //!    **removed** and the new id is **added**:
 //!    - before: `{1: CMS(width=256)}`
 //!    - after:  `{17: CMS(width=1024)}`
@@ -57,12 +57,12 @@
 //!      Historical data in the store under agg_id 1 is not joined
 //!      into the answer; the new sketch warms up from zero.
 //!    - Callers that need query continuity across parameter changes
-//!      should implement an overlap period at the controller (keep
+//!      should implement an overlap period at the control plane (keep
 //!      both ids in the config long enough for the new id to accrue
-//!      enough history) — this is a controller-side concern, not a
+//!      enough history) — this is a control-plane-side concern, not a
 //!      backend one.
 //!
-//! ## What the contract requires from the controller
+//! ## What the contract requires from the control plane
 //!
 //! * Assign `aggregation_id`s from a monotonically-increasing counter.
 //! * Never reuse an `aggregation_id` after it has been removed from

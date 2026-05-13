@@ -128,12 +128,12 @@ eagerly any time, at the cost of working on the live hot path twice.
 From the May 12 controller_todo doc:
 
 - **Step Z legacy_expr retirement** (4 PRs, ~8000 LOC across ~340
-  pattern-match sites) is orthogonal — operates on the controller-
+  pattern-match sites) is orthogonal — operates on the control-plane-
   side intent algebra, not on data-plane identifiers. Can run in
   parallel.
 - **Analyzer-unification α→ε** (5 PRs, 5–8 days) interacts only at
   the `Capability` enum surface in `sketch_db/index/`, which both
-  the engine-side analyzer and the controller-side analyzer consume.
+  the engine-side analyzer and the control-plane-side analyzer consume.
   Coordinate the `Capability` shape once at α; downstream is
   independent.
 

@@ -20,7 +20,7 @@
 //!
 //! * `backfill` — §10 of the design. `BackfillJob` lifecycle types
 //!   (`BackfillSource`, `BackfillStatus`, `Coverage`) plus an
-//!   in-memory `BackfillRegistry` that the controller pushes jobs
+//!   in-memory `BackfillRegistry` that the control plane pushes jobs
 //!   into and the worker pool drains. Phase 5a (this commit) lands
 //!   the data types and registry only — no I/O, no workers, no
 //!   HTTP. Follow-up phases add the `RawSampleReader` trait

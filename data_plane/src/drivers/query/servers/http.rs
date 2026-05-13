@@ -20,9 +20,9 @@ use crate::query_engines::routing::{EngineRouter, EngineRouterError, FreshnessPr
 use asap_types::{AccuracyTarget, StorageBackend};
 use promql_utilities::query_logics::enums::Statistic;
 
-// ─── Controller-pushed precompute job registry ────────────────────────────
+// ─── Control-plane-pushed precompute job registry ────────────────────────────
 //
-// The controller's `PrecomputeClient` (controller/src/config/precompute.rs)
+// The control plane's `PrecomputeClient` (control_plane/src/emit/precompute.rs)
 // registers / cancels precompute jobs via:
 //
 // * `POST   /api/v1/precompute/jobs` — body
@@ -34,11 +34,11 @@ use promql_utilities::query_logics::enums::Statistic;
 // The handler is intentionally minimal: it tracks the spec in an
 // in-memory map and acknowledges the call. No precompute work is
 // scheduled — that's a later wiring. The goal is to make the
-// controller's calls succeed instead of 404 so the controller can
+// control plane's calls succeed instead of 404 so the control plane can
 // progress its plan-push loop end-to-end.
 
-/// Body shape posted by the controller's `PrecomputeClient::register`.
-/// Matches `controller/src/config/precompute.rs::JobRequest`.
+/// Body shape posted by the control plane's `PrecomputeClient::register`.
+/// Matches `control_plane/src/emit/precompute.rs::JobRequest`.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct PrecomputeJobSpec {
     pub query: String,
@@ -170,7 +170,7 @@ pub struct HttpServer {
     /// itself defaults to `SketchStore`). Wired by the binary via
     /// [`Self::with_backend_storage_routing`]; production deploys
     /// bootstrap from `deploy/configs/backend-storage-routing.yaml`
-    /// (legacy form) or the controller's first
+    /// (legacy form) or the control plane's first
     /// `POST /api/v1/storage_routing` push (Phase α).
     ///
     /// Phase α: this field is now a `HotReloadBackendStorageRouting`
@@ -201,10 +201,10 @@ pub struct HttpServer {
     /// normal routing-table path (which goes to Thanos for the cold
     /// archive and observes the 60–90 s flush gap).
     probe_cache: Option<Arc<FreshnessProbeCache>>,
-    /// In-memory job-spec map populated by the controller's
+    /// In-memory job-spec map populated by the control plane's
     /// `POST /api/v1/precompute/jobs` calls. Always present (an empty
     /// `Default` registry is fine for binaries that never wire the
-    /// controller). Future PRs will plumb this into the precompute
+    /// control plane). Future PRs will plumb this into the precompute
     /// engine; today the handler just acks the call.
     precompute_jobs: PrecomputeJobRegistry}
 
@@ -304,7 +304,7 @@ impl HttpServer {
     /// Bootstrap typically comes from
     /// `BackendStorageRouting::from_yaml_file(...)` for legacy / dev
     /// deploys, or from `BackendStorageRouting::empty()` when the
-    /// controller will push the first table — the controller's first
+    /// control plane will push the first table — the control plane's first
     /// `POST /api/v1/storage_routing` then fills in all the entries.
     ///
     /// When the wrapper is attached, every instant query consults the
@@ -341,7 +341,7 @@ impl HttpServer {
     /// HTTP endpoints (Phase 5d) can create and inspect jobs. Jobs
     /// stay `Queued` until Phase 5e's worker pool is wired; the
     /// endpoints are still useful for shadow-mode validation of the
-    /// controller's REFRESH dispatch logic.
+    /// control plane's REFRESH dispatch logic.
     pub fn with_backfill_registry(
         mut self,
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
@@ -375,7 +375,7 @@ impl HttpServer {
         self
     }
 
-    /// Attach a [`PrecomputeJobRegistry`] used by the controller-pushed
+    /// Attach a [`PrecomputeJobRegistry`] used by the control-plane-pushed
     /// `POST /api/v1/precompute/jobs` and matching `DELETE` endpoints.
     /// Callers that don't override this share the per-server default
     /// (an empty in-memory map populated by the registration handler).
@@ -427,9 +427,9 @@ impl HttpServer {
             // The demo's `run_mvp_demo.sh` curls this for each
             // baseline; missing counters render as zeros.
             .route("/internal/s3_cost.csv", get(handle_s3_cost_csv))
-            // Controller integration endpoints
+            // Control plane integration endpoints
             .route("/api/v1/precompute", post(handle_precompute_job))
-            // Controller's `PrecomputeClient` (controller/src/config/precompute.rs)
+            // Control plane's `PrecomputeClient` (control_plane/src/emit/precompute.rs)
             // posts to `/jobs` and DELETEs by job_id. Tracks the spec
             // in memory; the `/api/v1/precompute` route stays for
             // legacy `{query_expr, granularity_secs, start, end}` callers.
@@ -447,7 +447,7 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
-            // Phase α (MVP): controller-pushed `BackendStorageRouting`
+            // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
             .route(
@@ -515,7 +515,7 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
-            // Phase α (MVP): controller-pushed `BackendStorageRouting`
+            // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
             .route(
@@ -658,7 +658,7 @@ async fn process_query_request(
     //       (e.g. `http_requests_total` → `thanos_query`) actually
     //       route through the `EngineRouter`.
     //   (b) Single-axis `StreamingConfig::storage_backend()` from the
-    //       hot-reload config (the pre-Phase-5 fallback). Pre-controller
+    //       hot-reload config (the pre-Phase-5 fallback). Pre-control-plane
     //       deploys ride this path; it always lands on `SketchStore`
     //       unless the YAML was hand-patched.
     //   (c) Default — `SketchStore`. Keeps the direct
@@ -3909,13 +3909,13 @@ aggregations:
 
     /// Per-tenant push via `X-ASAP-Tenant` header (when the body
     /// leaves `tenant` implicit). The header acts as a fallback
-    /// signal when the controller emits a tenant-agnostic body.
+    /// signal when the control plane emits a tenant-agnostic body.
     #[tokio::test]
     async fn storage_routing_post_per_tenant_via_header_when_body_implicit() {
         let (port, handle) = setup_test_server_for_storage_routing().await;
         let client = Client::new();
 
-        // Body has no `tenant` field — controller emit shape today.
+        // Body has no `tenant` field — control plane emit shape today.
         let resp = client
             .post(format!("http://127.0.0.1:{port}/api/v1/storage_routing"))
             .header("Content-Type", "application/json")
@@ -3938,7 +3938,7 @@ aggregations:
     /// Per-tenant push when neither the body's `tenant` field nor
     /// the `X-ASAP-Tenant` header are set: the swap lands in the
     /// `default` tenant slot — preserves the legacy single-tenant
-    /// contract for existing controllers that haven't been updated
+    /// contract for existing control planes that haven't been updated
     /// yet.
     #[tokio::test]
     async fn storage_routing_post_no_tenant_falls_back_to_default() {
@@ -4007,7 +4007,7 @@ aggregations:
         // the EngineRouter. We can't easily assert the response engine
         // without setting up a Gorilla mock, but we can verify the
         // swap landed by GETting the hash — that's the contract the
-        // controller relies on.
+        // control plane relies on.
         let (port, handle) = setup_test_server_for_storage_routing().await;
         let client = Client::new();
 
@@ -4409,7 +4409,7 @@ aggregations:
         );
     }
 
-    // ── Controller-pushed precompute job registry tests ───────────────────
+    // ── Control-plane-pushed precompute job registry tests ───────────────────
 
     /// `POST /api/v1/precompute/jobs` returns 200 + a `job_id`; the
     /// matching DELETE returns 204 the first time and 404 on the
@@ -4623,7 +4623,7 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
 // in-flight precompute workers all hold startup snapshots today and
 // ignore the swap until they are rebuilt — see the module doc on
 // `HotReloadStreamingConfig` for the full contract. Tests POST a new
-// config and verify it via the GET endpoint; controller integration
+// config and verify it via the GET endpoint; control plane integration
 // and per-query re-snapshot are phase 2.
 
 async fn handle_get_streaming_config(State(state): State<AppState>) -> axum::response::Response {
@@ -4734,7 +4734,7 @@ async fn handle_post_streaming_config(
 /// `GET /api/v1/storage_routing` — return a JSON snapshot of the
 /// currently-active per-metric `BackendStorageRouting` table.
 ///
-/// Useful for operators to confirm a controller push landed with the
+/// Useful for operators to confirm a control plane push landed with the
 /// expected entries. Returns 503 when the backend wasn't built with a
 /// routing-table handle (legacy deploys that loaded the YAML directly
 /// can still hit `/api/v1/streaming-config` — this endpoint is for
@@ -4770,13 +4770,13 @@ async fn handle_get_storage_routing(
 }
 
 /// `POST /api/v1/storage_routing` — replace the per-metric routing
-/// table from a controller-emitted JSON document.
+/// table from a control-plane-emitted JSON document.
 ///
 /// Body shape — see
-/// `controller/src/config/stage_config.rs::emit_backend_storage_routing`
+/// `control_plane/src/emit/stage_config.rs::emit_backend_storage_routing`
 /// (or `BackendStorageRouting::from_json_payload` in this crate for
 /// the matching parser). On 2xx the response body carries the new
-/// table's hash and entry count so the controller can verify the
+/// table's hash and entry count so the control plane can verify the
 /// installed bytes match what it pushed.
 ///
 /// Errors:
@@ -4833,7 +4833,7 @@ async fn handle_post_storage_routing(
     // Per-tenant push: the new table's tenant id is the source of
     // truth (the body's `tenant` field, defaulting to `default`).
     // The `X-ASAP-Tenant` header is honoured as a fallback when the
-    // body left the tenant field implicit — it's the controller's
+    // body left the tenant field implicit — it's the control plane's
     // primary signal for "which tenant am I pushing for".
     let tenant_from_body = new_table.tenant().to_string();
     let tenant = if tenant_from_body == crate::query_engines::routing::DEFAULT_TENANT {
@@ -4862,7 +4862,7 @@ async fn handle_post_storage_routing(
 }
 
 /// §15.2 of the sketch DB design: expose the sid catalog over HTTP so
-/// operators and the controller can inspect aggregation lifecycle
+/// operators and the control plane can inspect aggregation lifecycle
 /// state without attaching a debugger. Filter by `?status=` —
 /// `active` / `retired` / `expired` / `all` (default `all`).
 ///

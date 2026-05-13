@@ -409,7 +409,7 @@ are the binary-mode delta and can land later without blocking anything.
 
 ## 11. Open Questions
 
-1. **Backfill scheduling across the boundary.** The controller
+1. **Backfill scheduling across the boundary.** The control plane
    (`asap-planner-rs`) triggers backfill jobs today via HTTP against the
    query engine. Should that redirect through the new gRPC service in
    binary mode (preferred, keeps state in one place), or should the

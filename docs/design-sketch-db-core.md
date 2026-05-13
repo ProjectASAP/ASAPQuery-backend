@@ -28,11 +28,11 @@ changes that touch the sketch DB today.
 `SimpleMapStore` today is a KV store bucketed by `aggregation_id`. That was
 enough for "write sketches, read them back by id." It is no longer enough once:
 
-- The controller reconfigures sketches at runtime in response to a changing
+- The control plane reconfigures sketches at runtime in response to a changing
   query workload (parameter upgrades, new query patterns, retirement).
 - Queries should transparently work across those reconfigurations, with no
   data cliff at the upgrade boundary.
-- The store needs to give the controller back real workload observations
+- The store needs to give the control plane back real workload observations
   (bytes stored, query latency, merge cost) to drive cost-based planning.
 - Persistent storage means there is no implicit cleanup mechanism — any data
   written to disk stays there until something explicitly retires it.
@@ -106,7 +106,7 @@ backend is configured — S3/Gorilla, Prometheus, ClickHouse, etc.).
 | Schema evolution | §6 per-`agg_id` lifecycle, §7 schema timeline |
 | `DROP MATERIALIZED VIEW` | Retirement + expiry |
 | `REFRESH MATERIALIZED VIEW` | Backfill job from exact DB |
-| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §15 controller APIs |
+| `pg_matviews` / metadata catalog | `/api/v1/db/schemas`, §15 control plane APIs |
 | Index on the MV for faster queries | Label postings index (§5.3 — roadmap), typed aux columns (§5.1 — partially implemented) |
 
 The rest of this doc splits into two halves, mirroring the two standard
@@ -121,7 +121,7 @@ MV maintenance strategies:
   This is the piece that makes schema evolution painless.
 
 Both strategies write to the same physical store and the same per-`agg_id`
-namespace. The controller chooses between them based on workload and
+namespace. The control plane chooses between them based on workload and
 reconfigure cost (§10.6).
 
 ### 2.3 Why not just one strategy?
@@ -172,7 +172,7 @@ forever, you choose per-view and per-situation.
    sketches.
 6. **Monotonic, non-reused `aggregation_id`s.** A reconfigure that
    changes parameters is always "retire old id + create new id", never
-   "mutate in place." This is a contract on the controller; the store
+   "mutate in place." This is a contract on the control plane; the store
    enforces it via a write-side schema barrier (§6.3).
 
 ---
@@ -181,7 +181,7 @@ forever, you choose per-view and per-situation.
 
 ```
              ┌─────────────────────────────────────────────────┐
-             │  Controller                                      │
+             │  Control plane                                   │
              │  - owns StreamingConfig (the set of agg_ids)    │
              │  - monotonic id allocator, never reuses         │
              │  - triggers backfill on reconfigure             │
@@ -241,7 +241,7 @@ The sketch DB is one logical entity with multiple physical storage
 tiers. PromSketch and the precompute + LSM store are **not separate
 systems** — they are tiers of the same sketch DB. Which tier an
 `agg_id` lives on is part of its `AggSchema`, configurable by the
-controller.
+control plane.
 
 | Tier | Implementation | Compaction mechanism | Retention | Query latency | Use case |
 |---|---|---|---|---|---|
@@ -254,7 +254,7 @@ temporal resolution over time while preserving sketch-accuracy
 bounds" — but at different points along a latency/complexity curve.
 Tier 1 does it continuously in memory via EH bucket merges as windows
 age; Tier 2 does it in background compaction with explicit LSM levels.
-The controller picks per-`agg_id` which mechanism matches the
+The control plane picks per-`agg_id` which mechanism matches the
 workload: sub-ms live queries with short retention → Tier 1; weeks of
 queryable history → Tier 2; both → both.
 
@@ -270,7 +270,7 @@ incremental maintenance writes to both tiers — Tier 1 for freshness,
 Tier 2 for long retention. Query engine picks per-query based on the
 query's time range and SLA.
 
-**Tier promotion / demotion on reconfigure.** The controller can
+**Tier promotion / demotion on reconfigure.** The control plane can
 upgrade an `agg_id` from Tier 1 to Tier 2 as the workload justifies
 the long retention cost. Schema-wise this is a regular reconfigure
 (retire old id, create new id with new tier), and the Tier 2 backfill
@@ -295,7 +295,7 @@ Unifying them as tiers of one DB means:
 
 - One schema lifecycle (§6) covers both tiers; a tier upgrade is a
   regular reconfigure.
-- One controller API surface (§15) exposes stats across tiers.
+- One control plane API surface (§15) exposes stats across tiers.
 - One refresh path (§10) can write to either tier.
 - The query engine's routing logic (§7.3 per-segment dispatch) picks
   tier by the same mechanism it picks `agg_id` — the schema timeline
@@ -371,7 +371,7 @@ Two access patterns dominate:
 
 | Pattern | Source | Key order |
 |---|---|---|
-| "all groups at time T" | batch jobs, controller workload scans | `(agg_id, window_start, group_key)` |
+| "all groups at time T" | batch jobs, control plane workload scans | `(agg_id, window_start, group_key)` |
 | "one group over time range" | dashboard queries, `quantile_over_time(…) by (svc)` | `(agg_id, group_key, window_start)` |
 
 The store maintains the first as the primary index (SSTable sort order) and
@@ -387,7 +387,7 @@ reader consults for single-group time scans.
 
 ### 5.3 Label posting index
 
-For controller workload queries like "how many distinct services does
+For control plane workload queries like "how many distinct services does
 metric `X` have?" and for label filter pushdown (`service=auth`), a
 per-`agg_id` label posting index maps:
 
@@ -442,12 +442,12 @@ Implemented in `asap-query-engine/src/stores/sketch_db/schema.rs`
 ### 6.2 Status transitions
 
 ```
-┌─────────┐  controller POSTs new StreamingConfig
+┌─────────┐  control plane POSTs new StreamingConfig
 │ (none)  │  with this agg_id included
 └────┬────┘
      │ create_schema()
      ▼
-┌─────────┐  controller POSTs new StreamingConfig
+┌─────────┐  control plane POSTs new StreamingConfig
 │ Active  │  that removes this agg_id
 └────┬────┘
      │ retire_schema()
@@ -496,7 +496,7 @@ barrier rejections.
 
 Every sketch type has a **mathematically proven** error bound that
 depends only on its parameters and the sketch family — not on the
-input data. This means as soon as the controller commits to an
+input data. This means as soon as the control plane commits to an
 `AggregationConfig`, the resulting MV's accuracy guarantees are
 fixed and known. The schema metadata captures this:
 
@@ -550,7 +550,7 @@ type BoundFn = Box<dyn Fn(WindowStats) -> f64>;
 The actual ε / δ / σ formulas per sketch family are listed in
 [`design-sketch-db-performance.md`](./design-sketch-db-performance.md)
 §19.9 (theoretical bounds appendix). The point of putting them on
-`AggSchema` is so the controller can reason about
+`AggSchema` is so the control plane can reason about
 "does this sketch satisfy my query's accuracy SLA?" at plan time —
 and the query path can return the bound to the user without
 recomputation.
@@ -577,7 +577,7 @@ metric_timelines: HashMap<
 ```
 
 For each metric, an ordered list of `(time_range, agg_id)` segments
-covering its history. Non-overlapping by construction (the controller
+covering its history. Non-overlapping by construction (the control plane
 contract: a metric has one Active agg_id at a time, plus zero or more
 Retired overlapping within retention).
 
@@ -952,7 +952,7 @@ end-to-end determinism is still being validated.
 ### 10.6 When to use incremental vs refresh
 
 The two maintenance strategies (§8, §10) are not alternatives — they
-cover different situations and the controller should pick per
+cover different situations and the control plane should pick per
 situation.
 
 | Situation | Strategy | Why |
@@ -964,7 +964,7 @@ situation.
 | Onboarding a metric with historical raw data already in the exact DB | Refresh only (until catches up), then Incremental | Much cheaper than streaming a week of historical data through the live ingest path |
 | Metric with very low query rate, reconfigure | Incremental only, fall back to exact DB for historical queries | Refresh cost > fallback cost at low QPS |
 
-The controller decides by comparing estimated costs:
+The control plane decides by comparing estimated costs:
 
 ```
 cost_of_refresh = exact_db_bytes_to_scan * read_$_per_byte
@@ -974,7 +974,7 @@ cost_of_fallback = expected_queries_to_exact_DB_during_retention
 if cost_of_fallback > cost_of_refresh: trigger refresh
 ```
 
-The `/api/v1/db/cost_estimate` endpoint (§15) is what the controller
+The `/api/v1/db/cost_estimate` endpoint (§15) is what the control plane
 asks to get each side of this inequality.
 
 ### 10.7 Relationship to classical MV refresh
@@ -1015,7 +1015,7 @@ T=0:     Config = {1: CMS(256)}
          DB schemas = {1: Active}
          Live: writing to id=1
 
-T=swap:  Controller decides to upgrade to KLL(200).
+T=swap:  Control plane decides to upgrade to KLL(200).
          1. Allocates new id=17.
          2. Dual-write phase begins.
             POST /api/v1/streaming-config { 1, 17 }
@@ -1024,7 +1024,7 @@ T=swap:  Controller decides to upgrade to KLL(200).
             (Both sketches accumulating the same underlying samples.)
 
 T=swap+Δ:
-         3. Controller triggers backfill to close the historical gap
+         3. Control plane triggers backfill to close the historical gap
             for id=17:
             POST /api/v1/db/backfill {
               agg_id: 17,
@@ -1048,7 +1048,7 @@ T=backfill_done:
          A query for "last 24h" hits id=17 end-to-end, single schema.
 
 T=backfill_done+ε:
-         4. Controller removes id=1 from StreamingConfig.
+         4. Control plane removes id=1 from StreamingConfig.
             POST /api/v1/streaming-config { 17 }
             DB: schema 1 transitions Active → Retired.
             IngestState stops routing to id=1.
@@ -1065,8 +1065,8 @@ T=swap + retention:
          schema-change-oblivious index.
 ```
 
-Every step is idempotent. If the controller crashes mid-workflow, the
-DB state at any point is a valid state; the controller resumes from
+Every step is idempotent. If the control plane crashes mid-workflow, the
+DB state at any point is a valid state; the control plane resumes from
 wherever it left off by reading `/api/v1/db/schemas`.
 
 ---
@@ -1177,7 +1177,7 @@ its use case.
 **Cost**: an extra ~50 bytes per query response. Computation is
 O(1) per query. Negligible compared to the actual sketch merge.
 
-### 15.2 Controller-facing API
+### 15.2 Control-plane-facing API
 
 ```
 GET  /api/v1/db/schemas?status=<Active|Retired|Expired>
@@ -1219,8 +1219,8 @@ GET  /api/v1/db/pressure
   → { write_queue_depth, compaction_lag, memory_used, memory_limit }
 ```
 
-These are the primitives the controller uses to close its planning
-loop. Without them the controller plans in the blind; with them it
+These are the primitives the control plane uses to close its planning
+loop. Without them the control plane plans in the blind; with them it
 can run cost-based optimization with real observations.
 
 > **Status.** `GET /api/v1/db/schemas`, `/timeline`, `POST

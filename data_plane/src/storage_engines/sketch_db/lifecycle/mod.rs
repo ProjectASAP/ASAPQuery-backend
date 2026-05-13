@@ -13,7 +13,7 @@
 //!   sweeps `Expired` agg-configs (from the `SchemaRegistry`) and
 //!   removes their residual sids from `SketchStore` via
 //!   `remove_instances_for_agg_config`. Schedule-driven half of the
-//!   "controller dropped a config → its sids go away" flow.
+//!   "control plane dropped a config → its sids go away" flow.
 //!
 //! - [`reconcile::reconcile_from_streaming_config`] — sid-level mirror
 //!   of [`SchemaRegistry::reconcile`](crate::storage_engines::sketch_db::schema::SchemaRegistry::reconcile),

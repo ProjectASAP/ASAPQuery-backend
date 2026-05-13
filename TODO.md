@@ -217,17 +217,17 @@ against the sketch-bench corpus.
 
 HTTP-level e2e landed in
 [`asap-query-engine/src/tests/capability_miss_http_e2e_tests.rs`](asap-query-engine/src/tests/capability_miss_http_e2e_tests.rs).
-Spins up a real backend HTTP server + mock controller HTTP
+Spins up a real backend HTTP server + mock control plane HTTP
 server, fires a PromQL `sum(metric)` query that capability-misses,
 and measures wall-clock `time_to_plan_ready` from query issue to
 the backend observing the new `StreamingConfig` via
 `GET /api/v1/streaming-config`. Localhost floor: ~20 ms.
 
 Also asserts:
-- Mock controller received the HTTP notify with the documented
+- Mock control plane received the HTTP notify with the documented
   `{kind: "capability_miss", ...}` payload
 - Backend's hot-reload handle has the exact `agg_id` the
-  controller pushed
+  control plane pushed
 - A repeat query on the same metric does **not** fire a second
   notify (loop is idempotent under query replay)
 

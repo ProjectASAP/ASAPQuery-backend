@@ -413,8 +413,8 @@ Properties:
 
 Inside the query coordinator:
 
-1. Parse PromQL via the existing controller analyzer (single
-   authority — see `controller/src/warm_tier_analysis.rs`).
+1. Parse PromQL via the existing control plane analyzer (single
+   authority — see `control_plane/src/warm_tier_analysis.rs`).
 2. Extract the candidate's `metric`. Compute `shard_set =
    sharder(tenant, metric)`. For most queries this is exactly one
    shard.

@@ -36,16 +36,16 @@
 //! * [`WarmTierResult`] — per-series timestamped scalar samples
 //!   matching the shape of [`crate::query_engines::query_result::QueryResult::Matrix`].
 //!
-//! ## Controller unification (PromQL-shape recognition)
+//! ## Control plane unification (PromQL-shape recognition)
 //!
 //! The PromQL → `(function_name, args)` AST walker that used to live
 //! here in `promql_extract.rs` has been folded into
-//! [`controller::warm_tier_analysis::analyze_promql_for_warm_tier`].
+//! [`control_plane::warm_tier_analysis::analyze_promql_for_warm_tier`].
 //! That function is the single owner of "is this PromQL
 //! warm-tier-answerable" knowledge — it returns a
-//! [`controller::warm_tier_analysis::WarmTierAnalysis`] enumerating
+//! [`control_plane::warm_tier_analysis::WarmTierAnalysis`] enumerating
 //! the warm-tier-servable sub-expressions and the explicit
-//! [`controller::warm_tier_analysis::UnsupportedReason`] for the rest.
+//! [`control_plane::warm_tier_analysis::UnsupportedReason`] for the rest.
 //! The reducer keys off the analyzer's `required_capability` rather
 //! than re-string-matching the PromQL function name.
 //!

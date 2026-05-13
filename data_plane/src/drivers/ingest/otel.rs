@@ -1033,7 +1033,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 | SketchKindHandle::CountSketchWithHeap => {
                                     Capability::FrequencyTopk(kind)
                                 }
-                                // `Any` is the controller-side analysis-
+                                // `Any` is the control-plane-side analysis-
                                 // time wildcard — it should never appear
                                 // on the ingest path (which detects a
                                 // concrete sketch kind from the OTLP

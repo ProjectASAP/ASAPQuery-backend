@@ -16,14 +16,14 @@ services:
     volumes:
       # Mount output directory for experiment results
       - "{{ experiment_output_dir }}:/app/outputs"
-      # Mount controller output directory for configuration files (read-only)
-      - "{{ controller_remote_output_dir }}:/app/controller_output:ro"
+      # Mount control plane output directory for configuration files (read-only)
+      - "{{ control_plane_remote_output_dir }}:/app/control_plane_output:ro"
     command: [
       "--kafka-topic", "{{ kafka_topic }}",
       "--kafka-broker", "{{ kafka_host }}:9092",
       "--input-format", "{{ input_format }}",
-      "--config", "/app/controller_output/inference_config.yaml",
-      "--streaming-config", "/app/controller_output/streaming_config.yaml",
+      "--config", "/app/control_plane_output/inference_config.yaml",
+      "--streaming-config", "/app/control_plane_output/streaming_config.yaml",
       "--prometheus-server", "http://{{ prometheus_host }}:{{ prometheus_port }}",
       "--prometheus-scrape-interval", "{{ prometheus_scrape_interval }}",
       "--delete-existing-db",

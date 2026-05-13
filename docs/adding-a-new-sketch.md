@@ -10,7 +10,7 @@ recipe for *implementing* a new sketch once the decision to add it
 has been made.
 
 **Estimated effort:** ~4,000–7,000 LoC across **3 repos** (sketchlib,
-DataCollector, ASAPQuery-backend), plus controller and docs. Plan a
+DataCollector, ASAPQuery-backend), plus control plane and docs. Plan a
 multi-week effort with at least one cross-repo coordination
 checkpoint.
 
@@ -27,7 +27,7 @@ Before starting, exhaust the cheap alternatives:
    onto one of these.
 2. **Can a parameter change satisfy the SLA?** Bigger `K` for KLL,
    larger `width` for CMS, more registers for HLL. The `Sketch
-   Profiler Library` (sketch DB design §20) tells the controller
+   Profiler Library` (sketch DB design §20) tells the control plane
    the cost trade-off; often this is enough.
 3. **Is the new sketch genuinely novel (different statistic class,
    better cost frontier, different mergeability properties), or is
@@ -103,7 +103,7 @@ and bugs will only surface in production via the modified-OTLP path.
 Run the Sketch Profiler Library (sketch DB design §20) calibration
 mode against the new sketch type with a parameter grid. Commit the
 resulting `ProfilerEntry` rows to the published catalogue. The
-controller will not be able to plan with this sketch until the
+control plane will not be able to plan with this sketch until the
 catalogue knows about it.
 
 ---
@@ -365,7 +365,7 @@ fn compatible_agg_types(stat: &Statistic) -> Vec<AggregationType> {
 }
 ```
 
-Without this, even if the controller plans a Foo sketch,
+Without this, even if the control plane plans a Foo sketch,
 SimpleEngine's capability matcher won't route queries to it.
 
 ---
@@ -381,7 +381,7 @@ design doc.
 
 #### G.2 Profiler catalogue
 
-If you completed Phase A.5, the controller already has cost
+If you completed Phase A.5, the control plane already has cost
 numbers. Verify the `/api/v1/db/cost_estimate` endpoint returns
 sensible numbers for `Foo` configs.
 
@@ -443,7 +443,7 @@ These are mistakes contributors have made or will make:
    this sketch pays sketch deserialisation cost forever (sketch DB
    design §5.1). At minimum, populate `count` from the sketch's
    sample counter.
-4. **Hand-deriving CPU / memory numbers** for the controller's
+4. **Hand-deriving CPU / memory numbers** for the control plane's
    cost model. The Sketch Profiler Library (sketch DB design §20)
    exists exactly to prevent this. Always commit a calibration
    run with the new sketch.
@@ -453,7 +453,7 @@ These are mistakes contributors have made or will make:
    document it. If it could serve Tier 1, implement both.
 6. **Deferring the documentation**. The design doc and the query
    catalog are how operators decide whether to use the sketch and
-   how the controller's planner reasons about it. Undocumented
+   how the control plane's planner reasons about it. Undocumented
    sketch types in the codebase lead to operators picking
    suboptimal aggregations because they don't know the new option
    exists.

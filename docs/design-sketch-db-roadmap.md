@@ -113,11 +113,11 @@ evict everyone else's hot windows.
 
 ### 11.2 What happens when quotas are hit
 
-Policy is per-agg, set by the controller:
+Policy is per-agg, set by the control plane:
 
 | Policy | Semantics | When to use |
 |---|---|---|
-| `Reject` | New group writes return error; existing groups continue | Exact-correctness metrics; controller can react by upgrading quota or retiring the agg |
+| `Reject` | New group writes return error; existing groups continue | Exact-correctness metrics; control plane can react by upgrading quota or retiring the agg |
 | `EvictLRU` | Least-recently-written group is dropped to make room | Dashboard metrics; losing old groups is acceptable |
 | `Downsample` | Reduce sketch resolution in-place (e.g. halve CMS width) | When accuracy can degrade but coverage must continue |
 | `Backpressure` | Return a retry-after signal to the ingest source | Coordinates with upstream — DataCollector can slow its emit cadence |
@@ -177,7 +177,7 @@ Some resources are inherently shared and need a global allocator:
 - **Exact-DB read budget**: per-deployment cap on bytes-per-second
   read from the exact DB across all backfill jobs.
 
-These are hard caps. The controller treats them as signals for
+These are hard caps. The control plane treats them as signals for
 planning (e.g. don't plan a backfill if the exact-DB read budget is
 saturated by other ongoing jobs).
 
@@ -211,7 +211,7 @@ sketch_db_schema_transitions_total{from_status, to_status}
 ```
 
 These feed both the Prometheus operator dashboard and the
-controller's `/api/v1/db/stats/*` endpoints (the controller reads
+control plane's `/api/v1/db/stats/*` endpoints (the control plane reads
 aggregates across metrics; operators want per-instance detail).
 
 ### 12.2 Distributed tracing
@@ -242,7 +242,7 @@ Lifecycle events are logged at INFO with structured fields:
 ```json
 {"event": "schema_create",      "agg_id": 17, "metric": "latency", "sketch_type": "KLL", "params": {...}}
 {"event": "schema_retire",      "agg_id": 1,  "retired_at": "...", "expires_at": "..."}
-{"event": "config_swap",        "added": [17], "removed": [1], "by": "controller-a"}
+{"event": "config_swap",        "added": [17], "removed": [1], "by": "control-plane-a"}
 {"event": "backfill_start",     "job_id": 5,  "agg_id": 17, "time_range": [...], "source": "S3Gorilla"}
 {"event": "backfill_complete",  "job_id": 5,  "windows_done": 8640, "duration_s": 47.2}
 {"event": "quota_exceeded",     "agg_id": 42, "policy": "EvictLRU", "evicted_group": "..."}
@@ -293,7 +293,7 @@ POST /api/v1/query?explain=true
     }
 ```
 
-Operators and the controller use this to understand why a query
+Operators and the control plane use this to understand why a query
 went where it went.
 
 ---
@@ -429,12 +429,12 @@ table per `AggStatus`.
 5e (real rebuild logic) is scaffolded; 5f (coverage integration with
 the query path) is pending.
 Independent worker pool. `write_backfilled_window` bypass of
-WindowManager. `Coverage` tracking. Controller-facing `/backfill`
+WindowManager. `Coverage` tracking. Control-plane-facing `/backfill`
 endpoints.
 
 **Phase 6 — Controller-facing metadata APIs.** ⚠️ partial.
 `/stats`, `/timeline`, `/cost_estimate`, `/pressure`. This is what
-lets the controller's planner use real observations. Today only
+lets the control plane's planner use real observations. Today only
 `/schemas` and `/timeline` are implemented.
 
 **Phase 7 — Secondary indexes.** ❌ not started.
@@ -485,17 +485,17 @@ program of work that continues to be delivered phase by phase.
    them in `AggregationConfig.parameters`. Requires a small
    sketchlib-go / sketchlib-rust change to accept an external seed.
 
-2. **What does the controller do when a backfill fails partway
-   through?** Proposal: job_id is idempotent; controller retries
+2. **What does the control plane do when a backfill fails partway
+   through?** Proposal: job_id is idempotent; control plane retries
    with exponential backoff; if persistent failure, proceed without
    the backfilled range (query engine falls back for that subrange).
 
 3. **How much exact-DB retention is needed?** Exact-DB retention
-   must be ≥ the longest `backfill horizon` the controller ever
+   must be ≥ the longest `backfill horizon` the control plane ever
    requests, which is the longest query range users will issue that
    spans a reconfigure. If exact-DB retention is 7 days and queries
    never look back more than 24h, that's fine. Needs to be tracked
-   as a deployment-level configuration — and the controller should
+   as a deployment-level configuration — and the control plane should
    reject any upgrade plan whose backfill horizon exceeds current
    exact-DB retention.
 
@@ -517,8 +517,8 @@ program of work that continues to be delivered phase by phase.
    It's an in-memory EH-backed storage backend specialized for
    short-retention sub-millisecond queries. Tier 2 is the
    precompute + LSM parts store for longer retention. The two share
-   one schema lifecycle, one controller API surface, one refresh
-   path, and one query-engine routing layer. The controller picks
+   one schema lifecycle, one control plane API surface, one refresh
+   path, and one query-engine routing layer. The control plane picks
    per-`agg_id` whether to materialize into Tier 1, Tier 2, or both.
 
 7. **Agent clock skew.** `time_unix_nano` on every sample is
@@ -528,17 +528,17 @@ program of work that continues to be delivered phase by phase.
    frozen into both live sketches and exact-DB data, so even refresh
    doesn't fix it. Open questions: should the backend reject or
    correct samples with timestamps too far from wall clock? Should
-   skew be surfaced as per-agent metadata the controller can see?
+   skew be surfaced as per-agent metadata the control plane can see?
    Probably a hard NTP-sync requirement on agents with metrics
    exposing skew per agent.
 
-8. **Controller state and HA.** The monotonic `aggregation_id`
-   counter has to live somewhere that survives controller restarts.
-   Options: controller persists its own state (requires a DB for
-   the controller); controller reads `max(agg_id)` from backend's
+8. **Control plane state and HA.** The monotonic `aggregation_id`
+   counter has to live somewhere that survives control plane restarts.
+   Options: control plane persists its own state (requires a DB for
+   the control plane); control plane reads `max(agg_id)` from backend's
    `/api/v1/db/schemas` at startup (simple but needs CAS for
-   multi-controller-replica HA to avoid two controllers allocating
-   the same id). Also: who wins if two controllers disagree on
+   multi-control-plane-replica HA to avoid two control planes allocating
+   the same id). Also: who wins if two control planes disagree on
    what the current `StreamingConfig` should be? Leader election
    or backend-side CAS is needed before HA is viable. This is out
    of scope for the sketch DB itself but affects the design

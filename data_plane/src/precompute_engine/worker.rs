@@ -630,7 +630,7 @@ impl Worker {
     /// 4. Advance idle groups to the global watermark, closing due windows
     ///
     /// Remove GroupStates whose agg_id is no longer in the current
-    /// config (i.e. the controller removed the aggregation). Groups
+    /// config (i.e. the control plane removed the aggregation). Groups
     /// with non-empty panes are kept until flush_all closes their
     /// windows; once both pane maps are empty, the GroupState shell
     /// is freed.

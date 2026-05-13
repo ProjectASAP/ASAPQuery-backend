@@ -7,12 +7,12 @@ edition.workspace = true
 # Internal crates (workspace)
 promql_utilities.workspace = true
 asap_types.workspace = true
-# Phase 9: controller is now an in-process library inside the backend
-# binary. Wiring up the in-process OpAMP server + capability-map
+# Phase 9: the control plane is now an in-process library inside the
+# backend binary. Wiring up the in-process OpAMP server + capability-map
 # exposure is a follow-up after Phase 4 (centralized series_id
-# resolver). For now this dep just makes the controller crate
+# resolver). For now this dep just makes the control_plane crate
 # compile in the workspace and importable from main.rs.
-controller = { path = "../controller" }
+control_plane = { path = "../control_plane" }
 
 # Shared external (workspace)
 serde.workspace = true

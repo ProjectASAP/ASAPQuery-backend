@@ -15,13 +15,13 @@ services:
       - RUST_BACKTRACE=1
     volumes:
       - "{{ experiment_output_dir }}:/app/outputs"
-      - "{{ controller_remote_output_dir }}:/app/controller_output:ro"
+      - "{{ control_plane_remote_output_dir }}:/app/control_plane_output:ro"
     command: [
       "--kafka-topic", "{{ kafka_topic }}",
       "--kafka-broker", "kafka:9092", # Uses kafka container service name instead of IP
       "--input-format", "{{ input_format }}",
-      "--config", "/app/controller_output/inference_config.yaml",
-      "--streaming-config", "/app/controller_output/streaming_config.yaml",
+      "--config", "/app/control_plane_output/inference_config.yaml",
+      "--streaming-config", "/app/control_plane_output/streaming_config.yaml",
       "--prometheus-server", "http://prometheus:9090",
       "--prometheus-scrape-interval", "{{ prometheus_scrape_interval }}",
       "--delete-existing-db",
@@ -42,8 +42,8 @@ services:
         condition: service_completed_successfully # Wait for Kafka topics to be created
       prometheus:
         condition: service_healthy
-      controller:
-        condition: service_completed_successfully # Wait for controller to generate configs
+      control_plane:
+        condition: service_completed_successfully # Wait for control plane to generate configs
       arroyosketch:
         condition: service_completed_successfully # Wait for pipeline configuration
     restart: no
