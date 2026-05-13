@@ -487,6 +487,20 @@ impl AggPayload {
             AggPayload::Sketch(_) => None,
         }
     }
+
+    /// Approximate in-memory byte footprint of the payload — used by
+    /// the persistence layer's memory-pressure trigger. Sketch
+    /// payloads report their byte buffer length (the dominant cost);
+    /// precompute payloads forward to the accumulator's own
+    /// `approx_memory_bytes()`.
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            AggPayload::Sketch(s) => {
+                s.bytes.len() + std::mem::size_of::<SketchSampleState>()
+            }
+            AggPayload::Precompute(p) => p.approx_memory_bytes(),
+        }
+    }
 }
 
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
@@ -885,6 +899,151 @@ impl SketchIndex {
             self.series.remove(&sid);
         }
         removed
+    }
+}
+
+// ── Phase 5 M2.3.6b — EpochSource impl ──────────────────────────────────────
+//
+// Lets the existing persistence flusher (`store/persistence/flusher.rs`)
+// drive `SketchIndex` instead of `SketchStorePerKey`. The `agg_id: u64`
+// field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
+// the trait keeps the historical name so the flusher / manifest /
+// part-writer stay untouched.
+impl crate::stores::sketch_db::store::persistence::EpochSource for SketchIndex {
+    fn list_sealed_epochs(
+        &self,
+    ) -> Vec<crate::stores::sketch_db::store::persistence::SealedEpochRef> {
+        use crate::stores::sketch_db::store::persistence::SealedEpochRef;
+        let mut out = Vec::new();
+        for entry in self.series.iter() {
+            let sid = *entry.key();
+            let Ok(data) = entry.value().read() else {
+                continue;
+            };
+            for (epoch_id, epoch) in data.sealed_epochs.iter() {
+                if let Some((_, max_end)) = epoch.time_bounds() {
+                    let approx_bytes: usize =
+                        epoch.entries.iter().map(|(_, _, p)| p.approx_bytes()).sum();
+                    out.push(SealedEpochRef {
+                        agg_id: sid,
+                        epoch_id: *epoch_id,
+                        end_ts: max_end,
+                        approx_bytes,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn snapshot_sealed_epoch(
+        &self,
+        sid: u64,
+        epoch_id: u64,
+    ) -> crate::stores::sketch_db::store::persistence::PersistResult<
+        Option<crate::stores::sketch_db::store::persistence::source::EpochSnapshot>,
+    > {
+        use crate::stores::sketch_db::store::persistence::source::{
+            EpochSnapshot, EpochSnapshotEntry,
+        };
+        use crate::stores::sketch_db::store::persistence::PersistError;
+
+        let Some(store_ref) = self.series.get(&sid) else {
+            return Ok(None);
+        };
+        let data = store_ref
+            .read()
+            .map_err(|_| PersistError::Internal(format!("sid {sid}: read lock poisoned")))?;
+        let Some(epoch) = data.sealed_epochs.get(&epoch_id) else {
+            return Ok(None);
+        };
+        let Some((min_ts, max_ts)) = epoch.time_bounds() else {
+            return Ok(None);
+        };
+
+        // Resolve sketch_kind once from instance metadata so sketch
+        // payloads can label their bytes for read-back dispatch.
+        // Precompute payloads pull their type_name directly from the
+        // accumulator trait.
+        let sketch_kind_label: Option<String> = {
+            self.instances
+                .read()
+                .ok()
+                .and_then(|g| g.get(&sid).cloned())
+                .and_then(|m| match &m.agg_kind {
+                    AggKind::Sketch { kind, .. } => Some(format!("{:?}", kind)),
+                    AggKind::Precompute { .. } => None,
+                })
+        };
+
+        let mut entries = Vec::with_capacity(epoch.entries.len());
+        let mut approx_bytes: usize = 0;
+        for (window, label_id, payload) in &epoch.entries {
+            let label_map = data.intern.resolve(*label_id).cloned();
+            let label_kv = label_map.and_then(|m| {
+                if m.is_empty() {
+                    None
+                } else {
+                    Some(crate::stores::types::KeyByLabelValues {
+                        labels: m.values().cloned().collect(),
+                    })
+                }
+            });
+            let (type_name, bytes) = match payload {
+                AggPayload::Sketch(s) => (
+                    sketch_kind_label
+                        .clone()
+                        .unwrap_or_else(|| "UnknownSketch".to_string()),
+                    s.bytes.clone(),
+                ),
+                AggPayload::Precompute(p) => (p.type_name().to_string(), {
+                    use asap_types::traits::SerializableToSink;
+                    p.serialize_to_bytes()
+                }),
+            };
+            approx_bytes += payload.approx_bytes();
+            entries.push(EpochSnapshotEntry {
+                start_ts: window.0,
+                end_ts: window.1,
+                label: label_kv,
+                sketch_type_name: type_name,
+                sketch_bytes: bytes,
+            });
+        }
+
+        Ok(Some(EpochSnapshot {
+            agg_id: sid,
+            epoch_id,
+            min_ts,
+            max_ts,
+            entries,
+            approx_bytes,
+        }))
+    }
+
+    fn evict_sealed_epoch(&self, sid: u64, epoch_id: u64) {
+        let Some(store_ref) = self.series.get(&sid) else {
+            return;
+        };
+        let Ok(mut data) = store_ref.write() else {
+            return;
+        };
+        data.sealed_epochs.remove(&epoch_id);
+    }
+
+    fn approx_memory_bytes(&self) -> usize {
+        let mut total = 0usize;
+        for entry in self.series.iter() {
+            let Ok(data) = entry.value().read() else {
+                continue;
+            };
+            for epoch in data.sealed_epochs.values() {
+                for (_, _, payload) in &epoch.entries {
+                    total += payload.approx_bytes();
+                }
+            }
+        }
+        total
     }
 }
 
@@ -1336,6 +1495,93 @@ mod tests {
             10_000,
         );
         assert!(result.is_empty(), "sketch sids must not surface");
+    }
+
+    /// Helper: append one sample to materialize the SidStoreData, then
+    /// set its epoch_capacity so subsequent appends rotate aggressively.
+    fn with_tight_rotation(idx: &SketchIndex, sid: u64) {
+        idx.append_sample(sid, BTreeMap::new(), (0, 10), sample(0));
+        if let Some(s) = idx.series.get(&sid) {
+            let mut g = s.write().unwrap();
+            g.epoch_capacity = Some(1);
+            g.max_epochs = 8;
+        }
+    }
+
+    #[test]
+    fn epoch_source_lists_only_sealed_epochs() {
+        use crate::stores::sketch_db::store::persistence::EpochSource;
+        let idx = SketchIndex::new();
+        idx.register(meta(13));
+        with_tight_rotation(&idx, 13);
+        idx.append_sample(13, BTreeMap::new(), (10, 20), sample(2));
+        idx.append_sample(13, BTreeMap::new(), (20, 30), sample(3));
+
+        let refs = idx.list_sealed_epochs();
+        assert!(
+            !refs.is_empty(),
+            "rotation should have produced at least one sealed epoch"
+        );
+        assert!(
+            refs.iter().all(|r| r.agg_id == 13),
+            "all sealed-epoch refs come from sid=13"
+        );
+    }
+
+    #[test]
+    fn epoch_source_snapshot_round_trips_sketch_payload() {
+        use crate::stores::sketch_db::store::persistence::EpochSource;
+        let idx = SketchIndex::new();
+        idx.register(meta(21));
+        with_tight_rotation(&idx, 21);
+        idx.append_sample(21, BTreeMap::new(), (1000, 2000), sample(0xAB));
+        idx.append_sample(21, BTreeMap::new(), (2000, 3000), sample(0xCD));
+
+        let refs = idx.list_sealed_epochs();
+        let first = refs.first().expect("a sealed epoch exists");
+        let snap = idx
+            .snapshot_sealed_epoch(first.agg_id, first.epoch_id)
+            .expect("snapshot ok")
+            .expect("populated");
+        assert_eq!(snap.agg_id, 21);
+        assert!(!snap.entries.is_empty());
+        let entry = &snap.entries[0];
+        assert!(
+            entry.sketch_type_name.starts_with("DDSketch"),
+            "sketch_type_name should reflect sid metadata's sketch_kind: {}",
+            entry.sketch_type_name
+        );
+        assert_eq!(entry.sketch_bytes.len(), 1, "single-byte sample bytes carry");
+    }
+
+    #[test]
+    fn epoch_source_evict_drops_the_epoch() {
+        use crate::stores::sketch_db::store::persistence::EpochSource;
+        let idx = SketchIndex::new();
+        idx.register(meta(31));
+        with_tight_rotation(&idx, 31);
+        idx.append_sample(31, BTreeMap::new(), (10, 20), sample(2));
+
+        let refs = idx.list_sealed_epochs();
+        let one = refs.first().cloned().expect("populated");
+        idx.evict_sealed_epoch(one.agg_id, one.epoch_id);
+        let after = idx.list_sealed_epochs();
+        assert!(
+            !after.iter().any(|r| r.epoch_id == one.epoch_id),
+            "the evicted epoch must no longer appear"
+        );
+    }
+
+    #[test]
+    fn epoch_source_approx_memory_bytes_grows_with_sealed_state() {
+        use crate::stores::sketch_db::store::persistence::EpochSource;
+        let idx = SketchIndex::new();
+        let before = idx.approx_memory_bytes();
+        idx.register(meta(41));
+        with_tight_rotation(&idx, 41);
+        idx.append_sample(41, BTreeMap::new(), (10, 20), sample(2));
+        let after = idx.approx_memory_bytes();
+        assert!(after > before, "sealed state contributes to memory total");
     }
 
     #[test]
