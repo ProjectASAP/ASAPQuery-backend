@@ -310,8 +310,24 @@ async fn main() -> Result<()> {
     // are constructed so both can be wired with a single canonical
     // instance — even when precompute is disabled, the engine still
     // needs the index for the Phase 6 archive failover trigger.
-    let series_resolver =
-        Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
+    // Under --persistence-enabled, the resolver replays its WAL on
+    // startup so the agent's cached sids stay valid across backend
+    // restarts. Without persistence (tests, stateless deploys), every
+    // restart drops the cache; agents recover via the existing
+    // `unknown_series_ids` eviction primitive — one extra round trip
+    // per identity on the first emit post-restart.
+    let series_resolver = if args.persistence_enabled {
+        use data_plane::drivers::ingest::series_resolver::SeriesIdResolver;
+        let dir = args
+            .persistence_dir
+            .as_ref()
+            .expect("--persistence-enabled requires --persistence-dir");
+        let wal_path = std::path::PathBuf::from(dir).join("series_resolver.wal");
+        info!("opening series-resolver WAL at {:?}", wal_path);
+        Arc::new(SeriesIdResolver::open(wal_path)?)
+    } else {
+        Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
+    };
     let sketch_index =
         Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
 
