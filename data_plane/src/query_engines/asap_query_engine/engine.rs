@@ -527,20 +527,32 @@ impl ASAPQueryEngine {
         self
     }
 
-    /// Resolve the §7 schema timeline for a metric over a query range.
-    /// Thin delegate to `SchemaRegistry::timeline_for_metric` so the
-    /// engine's own query-path code does not need to reach into the
-    /// store module to build a timeline (and so dispatch-wiring
-    /// tests can mock by swapping the registry rather than
-    /// monkey-patching the engine).
+    /// Resolve the timeline of agg-signatures for a metric over a
+    /// query range. Reads exclusively from the sid catalog via
+    /// [`crate::storage_engines::sketch_db::query::timeline::timeline_for_metric`]
+    /// — schema retirement #3 routed this away from
+    /// `SchemaRegistry::timeline_for_metric`.
+    ///
+    /// When no `SketchStore` is wired (test contexts that never
+    /// installed one via [`Self::with_sketch_index`]) returns an
+    /// empty vector; downstream dispatch then bails to the default
+    /// single-agg path, identical to the pre-retirement behaviour
+    /// where an empty `SchemaRegistry` produced no segments.
     pub fn timeline_for_query(
         &self,
         metric: &str,
         t1_ms: u64,
         t2_ms: u64,
     ) -> Vec<crate::storage_engines::sketch_db::TimelineSegment> {
-        self.schema_registry
-            .timeline_for_metric(metric, t1_ms, t2_ms)
+        let Some(idx) = self.sketch_index.as_ref() else {
+            return Vec::new();
+        };
+        crate::storage_engines::sketch_db::query::timeline::timeline_for_metric(
+            idx.as_ref(),
+            metric,
+            t1_ms,
+            t2_ms,
+        )
     }
 
     /// Look up a compatible aggregation for the given requirements,
@@ -2174,7 +2186,7 @@ impl ASAPQueryEngine {
     /// Caller: the per-segment dispatch in
     /// [`Self::try_handle_query_promql_via_timeline`]. For each
     /// `TimelineSegment` returned by
-    /// [`crate::storage_engines::sketch_db::SchemaRegistry::timeline_for_metric`],
+    /// [`crate::storage_engines::sketch_db::query::timeline::timeline_for_metric`],
     /// the dispatch builds a context targeting that segment's
     /// `agg_id`, executes it against the clipped segment range,
     /// collects the scalar, and combines across segments via
@@ -2302,11 +2314,12 @@ impl ASAPQueryEngine {
             aggregation_type_for_value: agg_type})
     }
 
-    /// Per-segment dispatch across the §7 schema timeline.
+    /// Per-segment dispatch across the agg-signature timeline.
     ///
-    /// Returns `Some(result)` when `SchemaRegistry::timeline_for_metric`
-    /// yields two or more segments for the query's metric within its
-    /// time range (i.e. the query spans a reconfigure boundary).
+    /// Returns `Some(result)` when
+    /// [`Self::timeline_for_query`] yields two or more segments for the
+    /// query's metric within its time range (i.e. the query spans a
+    /// reconfigure boundary).
     /// Returns `None` otherwise (single-schema range, unparseable
     /// query, unresolved probe aggregation) so the caller falls back
     /// to the default single-agg path — that path is still correct
@@ -2364,14 +2377,33 @@ impl ASAPQueryEngine {
         let t1 = probe_context.store_plan.values_query.start_timestamp;
         let t2 = probe_context.store_plan.values_query.end_timestamp;
 
-        // Phase 2: resolve the schema timeline over [t1, t2] for this
-        // metric. Zero or one segments means the default single-agg
-        // path is already correct; bail out and let the caller use
-        // it.
+        // Phase 2: resolve the agg-signature timeline over [t1, t2]
+        // for this metric. Zero or one segments means the default
+        // single-agg path is already correct; bail out and let the
+        // caller use it.
         let segments = self.timeline_for_query(&metric_name, t1, t2);
         if segments.len() < 2 {
             return None;
         }
+
+        // Schema retirement #3: the sid-level timeline populates
+        // `agg_id` with a content-hash of the agg-signature
+        // `(metric, agg_kind, group_by_keys)` rather than with a
+        // `StreamingConfig.aggregation_id`. Until schema-retirement #5
+        // ports the per-segment dispatch to sid-level evaluation
+        // directly, the segment-→-agg_config mapping below is
+        // best-effort: if no segment's signature happens to coincide
+        // with an in-config aggregation_id, fall back to the default
+        // single-agg path so cross-reconfigure queries don't
+        // regress to "empty result + warnings".
+        let snap_for_check = self.streaming_config_snapshot();
+        if !segments
+            .iter()
+            .any(|s| snap_for_check.get_aggregation_config(s.agg_id).is_some())
+        {
+            return None;
+        }
+        drop(snap_for_check);
 
         debug!(
             metric = %metric_name,
