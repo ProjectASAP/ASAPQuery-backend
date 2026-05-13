@@ -156,7 +156,6 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
     ));
     let engine = Arc::new(
         ASAPQueryEngine::new_with_hot_reload(
-            store.clone(),
             hot_reload.clone(),
             15_000,
         )

@@ -111,11 +111,8 @@ pub fn create_engine_single_pop_with_aggregated(
 
 
 
-    ASAPQueryEngine::new(
-        store,
-        streaming_config,
-        1,
-    )
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }
 
 /// Creates a ASAPQueryEngine with dual-input (separate value and keys aggregations).
@@ -222,11 +219,8 @@ pub fn create_engine_dual_input(
 
 
 
-    ASAPQueryEngine::new(
-        store,
-        streaming_config,
-        1,
-    )
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }
 
 /// Creates a ASAPQueryEngine with two independent metrics, each with their own
@@ -315,7 +309,8 @@ pub fn create_engine_two_metrics(
 
     let _ = (query_a, query_b);
 
-    ASAPQueryEngine::new(store, streaming_config, 1)
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }
 
 /// Creates a ASAPQueryEngine with three independent metrics, each with their own
@@ -394,7 +389,8 @@ pub fn create_engine_three_metrics(
 
     let _ = (labels_a, labels_b, labels_c, query_a, query_b, query_c);
 
-    ASAPQueryEngine::new(store, streaming_config, 1)
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps for testing merge.
@@ -448,11 +444,8 @@ pub fn create_engine_multi_timestamp(
 
 
 
-    ASAPQueryEngine::new(
-        store,
-        streaming_config,
-        1,
-    )
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps and configurable window.
@@ -512,9 +505,6 @@ pub fn create_engine_multi_timestamp_with_window(
 
 
 
-    ASAPQueryEngine::new(
-        store,
-        streaming_config,
-        1,
-    )
+    let _store = store;
+    ASAPQueryEngine::new(streaming_config, 1)
 }

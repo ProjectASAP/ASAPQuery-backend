@@ -438,7 +438,6 @@ async fn main() -> Result<()> {
     // subsequent swaps.
     let mut engine = {
         let mut engine = ASAPQueryEngine::new_with_hot_reload(
-            store.clone(),
             hot_reload_config.clone(),
             args.prometheus_scrape_interval,
         )
