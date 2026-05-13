@@ -68,6 +68,8 @@
 pub mod decoders;
 pub mod delta_apply;
 pub mod sketch_reducer;
+pub mod timeline_dispatch;
+pub mod window_merger;
 
 #[cfg(test)]
 pub mod tests;
