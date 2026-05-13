@@ -82,26 +82,20 @@ impl StreamingConfig {
 
         if let Some(aggregations) = data.get("aggregations").and_then(|v| v.as_sequence()) {
             for aggregation_data in aggregations {
-                if let Some(aggregation_id) = aggregation_data.get("aggregationId") {
-                    let aggregation_id_u64 = aggregation_id.as_u64().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "aggregationId must be a valid u64, got: {:?}",
-                            aggregation_id
-                        )
-                    })?;
-                    // Read per-agg retention directly from the YAML
-                    // entry (previously was looked up via
-                    // inference_config's query→agg map).
-                    let num_aggregates_to_retain = aggregation_data
-                        .get("numAggregatesToRetain")
-                        .and_then(|v| v.as_u64());
-                    let config = AggregationConfig::from_yaml_data(
-                        aggregation_data,
-                        num_aggregates_to_retain,
-                        QueryLanguage::promql,
-                    )?;
-                    aggregation_configs.insert(aggregation_id_u64, config);
-                }
+                // Read per-agg retention directly from the YAML entry
+                // (previously was looked up via inference_config's
+                // query→agg map). `aggregationId` is no longer
+                // required — `AggregationConfig::from_yaml_data`
+                // derives it from content when absent (M2 follow-up).
+                let num_aggregates_to_retain = aggregation_data
+                    .get("numAggregatesToRetain")
+                    .and_then(|v| v.as_u64());
+                let config = AggregationConfig::from_yaml_data(
+                    aggregation_data,
+                    num_aggregates_to_retain,
+                    QueryLanguage::promql,
+                )?;
+                aggregation_configs.insert(config.aggregation_id, config);
             }
         }
 
@@ -153,5 +147,23 @@ mod tests {
         let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
         assert_eq!(cfg.storage_backend(), StorageBackend::GorillaObjectStore);
+    }
+
+    /// M2 follow-up: a streaming-config YAML that omits `aggregationId`
+    /// on every aggregation parses correctly — backend derives the id
+    /// from the agg-config content. This is the path the controller
+    /// will use once it stops emitting the field.
+    #[test]
+    fn from_yaml_data_accepts_entry_without_aggregation_id() {
+        let yaml = "\
+aggregations:\n\
+- aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
+        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
+        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode without id");
+        assert_eq!(cfg.aggregation_configs.len(), 1);
+        let (k, v) = cfg.aggregation_configs.iter().next().unwrap();
+        assert_ne!(*k, 0, "derived id is not the 0 sentinel");
+        assert_eq!(*k, v.aggregation_id, "map key matches the agg's id");
+        assert_eq!(v.metric, "cpu_seconds");
     }
 }

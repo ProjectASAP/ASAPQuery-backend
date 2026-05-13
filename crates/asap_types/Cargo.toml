@@ -11,3 +11,4 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
