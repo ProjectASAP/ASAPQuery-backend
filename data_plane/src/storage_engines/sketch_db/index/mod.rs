@@ -583,9 +583,15 @@ impl SketchStore {
     /// (archive replay) so they share one canonical sid-derivation
     /// path.
     ///
-    /// Returns the sid the entry landed under (or `None` when the
-    /// agg_config / output combination doesn't fit the precompute
-    /// model — caller logs and skips).
+    /// Returns the sid the entry landed under, or `None` when the
+    /// write is dropped: either because the agg_config / output
+    /// combination doesn't fit the precompute model (caller logs and
+    /// skips), or because the sid already exists in `Retired` /
+    /// `Expired` status. The latter is the sid-level mirror of the
+    /// `SchemaRegistry::is_writable(agg_id)` §6.3 ingest barrier:
+    /// once a sid is retired by [`crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config`]
+    /// further writes are rejected here so the eviction sweep can
+    /// drop residual state cleanly.
     pub fn ingest_precompute_for_agg_config(
         &self,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
@@ -614,19 +620,25 @@ impl SketchStore {
         };
         let sid = compute_sid(&agg_cfg.metric, &attrs_fp, &agg_kind);
 
-        if self.instance(sid).is_none() {
-            let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
-            self.register(SketchInstanceMetadata {
-                sid,
-                metric_name: agg_cfg.metric.clone(),
-                group_by_keys,
-                capability: None,
-                agg_kind: agg_kind.clone(),
-                accuracy: None,
-                first_seen_unix_ms: output.start_timestamp as i64,
-                retired_at_ms: None,
-                expires_at_ms: None,
-            });
+        match self.instance(sid) {
+            None => {
+                let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
+                self.register(SketchInstanceMetadata {
+                    sid,
+                    metric_name: agg_cfg.metric.clone(),
+                    group_by_keys,
+                    capability: None,
+                    agg_kind: agg_kind.clone(),
+                    accuracy: None,
+                    first_seen_unix_ms: output.start_timestamp as i64,
+                    retired_at_ms: None,
+                    expires_at_ms: None,
+                });
+            }
+            Some(existing) if !existing.is_writable() => {
+                return None;
+            }
+            Some(_) => {}
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
