@@ -130,7 +130,7 @@ pub struct BackfillWindowProcessor {
     /// destination. Optional so tests that don't observe write
     /// effects can skip attaching one (the processor becomes a
     /// registry-only logger in that case).
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::store::SketchStore>>,
+    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
     /// this list.
@@ -160,7 +160,7 @@ impl BackfillWindowProcessor {
     /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
         self

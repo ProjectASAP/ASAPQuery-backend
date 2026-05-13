@@ -4,7 +4,7 @@
 //! [`crate::query_engines::asap_query_engine::engine::ASAPQueryEngine`]'s
 //! `QueryEngine::execute` adapter: parse the PromQL, extract
 //! `(metric_name, label_keys)`, look up candidate sids via
-//! [`crate::storage_engines::sketch_db::store::SketchStore::instances_matching`],
+//! [`crate::storage_engines::sketch_db::index::SketchStore::instances_matching`],
 //! and classify each sid. On `Ghost`/`Unknown`, return
 //! `EngineError::CapabilityMiss(SketchStore, …)` so the
 //! `EngineRouter` fails over to the archive engine.
@@ -14,7 +14,7 @@
 //! that fall-through with **direct sketch evaluation** from
 //! [`SketchStore::query_range`]'s output: deserialize each
 //! window's sketch state, dispatch on the per-instance
-//! [`crate::storage_engines::sketch_db::store::Capability`], and reduce to a
+//! [`crate::storage_engines::sketch_db::index::Capability`], and reduce to a
 //! per-window scalar via the canonical sketch query (DDSketch /
 //! KLL → quantile, HLL → cardinality estimate, CMS / CountSketch
 //! → frequency point query, CMS-with-heap → top-k items).

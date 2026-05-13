@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     let series_resolver =
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
     let sketch_index =
-        Arc::new(data_plane::storage_engines::sketch_db::store::SketchStore::new());
+        Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
 
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all
@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
     // it stays in place until subsequent M2.3.6 sub-PRs delete the
     // legacy SketchStore wholesale.
     let _sketch_index_persistence = if args.persistence_enabled {
-        use data_plane::storage_engines::sketch_db::store::persistence::SketchStorePersistenceConfig;
+        use data_plane::storage_engines::sketch_db::index::persistence::SketchStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()
@@ -845,10 +845,10 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::storage_engines::sketch_db::store::SketchStore>,
+    sketch_index: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
-    use data_plane::storage_engines::sketch_db::store::persistence::EpochSource;
+    use data_plane::storage_engines::sketch_db::index::persistence::EpochSource;
     use std::sync::atomic::Ordering;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));

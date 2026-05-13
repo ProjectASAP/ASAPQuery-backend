@@ -64,7 +64,7 @@ pub struct IngestState {
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (warm-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
-    pub sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+    pub sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
 }
 
 impl IngestState {
@@ -182,7 +182,7 @@ mod tests {
             series_resolver: Arc::new(
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });

@@ -156,7 +156,7 @@ pub struct HttpServer {
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
     /// M2.3.6g — SketchStore replaces `Arc<dyn Store>`.
-    sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+    sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
@@ -223,7 +223,7 @@ struct AppState {
     /// Phase 5 M2.3.6g — SketchStore replaces `Arc<dyn Store>` as the
     /// only data backend HTTP-side endpoints consult. Today the only
     /// consumer is the runtime-info handler.
-    sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+    sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
@@ -249,7 +249,7 @@ impl HttpServer {
     pub fn new(
         config: HttpServerConfig,
         query_engine: Arc<ASAPQueryEngine>,
-        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         // Bootstrap the capability router with `ASAPQueryEngine`
         // registered under its canonical query-engine id.
@@ -1796,7 +1796,7 @@ mod tests {
             15000,
         ));
 
-        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()));
+        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()));
         if let Some(handle) = hot_reload {
             server = server.with_hot_reload_config(handle);
         }
@@ -2039,7 +2039,7 @@ aggregations:
             streaming_config.clone(),
             15000,
         ));
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_schemas(schemas);
         server
@@ -2540,7 +2540,7 @@ aggregations:
             let sc = StreamingConfig::new(map);
             Arc::new(crate::storage_engines::sketch_db::SchemaRegistry::from_streaming_config(&sc))
         };
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
             .with_backfill_registry(registry)
             .with_schemas(schemas);
         server
@@ -2887,7 +2887,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
+            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new())).with_hot_reload_config(hot_reload);
         for engine in extra_engines {
             server = server.with_query_engine(engine);
         }
@@ -2928,7 +2928,7 @@ aggregations:
             streaming_arc,
             15000,
         ));
-        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
+        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_backend_storage_routing(Arc::new(routing));
         for engine in extra_engines {
@@ -3672,7 +3672,7 @@ aggregations:
             15000,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_hot_reload_backend_storage_routing(routing_handle.clone());
         let port = server.start_test_server().await.expect("start ok");
@@ -4126,7 +4126,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
+            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new())).with_hot_reload_config(hot_reload);
         for engine in engines {
             server = server.with_query_engine(engine);
         }
@@ -4170,7 +4170,7 @@ aggregations:
             15000,
         ));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_probe_cache(cache.clone());
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new())).with_probe_cache(cache.clone());
         let port = server
             .start_test_server()
             .await

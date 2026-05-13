@@ -280,7 +280,7 @@ pub struct ASAPQueryEngine {
     /// EngineRouter's archive failover (Phase 6). When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
-    sketch_index: Option<Arc<crate::storage_engines::sketch_db::store::SketchStore>>,
+    sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
     /// `main.rs`'s engine builder. When the warm-tier reducer reports a
     /// `WarmTierResult.coverage` narrower than the requested
@@ -477,7 +477,7 @@ impl ASAPQueryEngine {
     /// query through `handle_query`).
     pub fn with_sketch_index(
         mut self,
-        index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+        index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(index);
         self
@@ -3534,14 +3534,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `Capability` enum (defined in the controller and
                 // re-exported by `sketch_index`), so no `From`
                 // conversion is needed — just clone.
-                let required: crate::storage_engines::sketch_db::store::Capability =
+                let required: crate::storage_engines::sketch_db::index::Capability =
                     candidate.required_capability.clone();
                 let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
                 for sid in &sids {
                     match idx.classify(*sid) {
-                        crate::storage_engines::sketch_db::store::SidLookup::Hit => {}
-                        crate::storage_engines::sketch_db::store::SidLookup::Ghost
-                        | crate::storage_engines::sketch_db::store::SidLookup::Unknown => {
+                        crate::storage_engines::sketch_db::index::SidLookup::Hit => {}
+                        crate::storage_engines::sketch_db::index::SidLookup::Ghost
+                        | crate::storage_engines::sketch_db::index::SidLookup::Unknown => {
                             return Err(crate::query_engines::EngineError::capability_miss(
                                 asap_types::StorageBackend::SketchStore.data_source_id(),
                                 format!(
@@ -5867,7 +5867,7 @@ mod warm_tier_classify_tests {
     use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
     use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
-    use crate::storage_engines::sketch_db::store::{
+    use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchConfig, SketchStore, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState};
     use std::collections::{BTreeMap, BTreeSet};
@@ -5889,7 +5889,7 @@ mod warm_tier_classify_tests {
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
             capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
-            agg_kind: crate::storage_engines::sketch_db::store::AggKind::Sketch {
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                 kind: SketchKindHandle::DDSketch,
                 config: cfg.clone(),
             },
@@ -5972,7 +5972,7 @@ mod warm_tier_classify_tests {
             (1_000, 1_010),
             SketchSampleState {
                 bytes: vec![0],
-                encoding: crate::storage_engines::sketch_db::store::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
         );
 
         let engine = build_engine_with_index(idx);

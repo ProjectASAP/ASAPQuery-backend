@@ -118,10 +118,10 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
 mod tests {
     use super::*;
     use crate::storage_engines::types::KeyByLabelValues;
-    use crate::storage_engines::sketch_db::store::persistence::part::{
+    use crate::storage_engines::sketch_db::index::persistence::part::{
         part_dir_path, PartWriter,
     };
-    use crate::storage_engines::sketch_db::store::persistence::source::{
+    use crate::storage_engines::sketch_db::index::persistence::source::{
         EpochSnapshot, EpochSnapshotEntry,
     };
     use tempfile::TempDir;
@@ -183,7 +183,7 @@ mod tests {
         let report_write = PartWriter::write_part(&part_dir, 42, &[dummy_snapshot()]).unwrap();
         manifest
             .append_add(
-                crate::storage_engines::sketch_db::store::persistence::manifest::PartEntry {
+                crate::storage_engines::sketch_db::index::persistence::manifest::PartEntry {
                     part_id: 42,
                     min_ts: report_write.min_ts,
                     max_ts: report_write.max_ts,
