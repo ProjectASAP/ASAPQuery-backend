@@ -902,6 +902,72 @@ impl SketchIndex {
     }
 }
 
+/// Persistence harness for `SketchIndex` — Phase 5 M2.3.6c.
+///
+/// Owns the manifest + flusher thread + part cache that back the
+/// sid-keyed warm tier. Constructed via [`SketchIndex::start_persistence`];
+/// the flusher reads sealed epochs through the
+/// [`EpochSource`](crate::stores::sketch_db::store::persistence::EpochSource)
+/// impl on `SketchIndex` and writes parts under `disk_path/parts/`.
+///
+/// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
+/// `part_cache` field is exposed so the query path can be wired up to
+/// read-back from disk in a subsequent sub-PR; today it sits idle
+/// because the in-memory `query_range` doesn't yet consult it.
+pub struct SketchIndexPersistence {
+    pub manifest: Arc<crate::stores::sketch_db::store::persistence::Manifest>,
+    pub part_cache: crate::stores::sketch_db::store::persistence::cache::PartCache,
+    pub flusher: crate::stores::sketch_db::store::persistence::flusher::FlusherHandle,
+    pub parts_root: std::path::PathBuf,
+}
+
+impl SketchIndexPersistence {
+    pub fn shutdown(&mut self) {
+        self.flusher.shutdown();
+    }
+}
+
+impl SketchIndex {
+    /// Spin up the persistence layer behind this `SketchIndex`. Runs
+    /// startup recovery (sweeps corrupt + orphan parts), opens the
+    /// manifest, and starts the background flusher thread with
+    /// `Arc::clone(self)` as its `EpochSource`. The returned
+    /// `SketchIndexPersistence` MUST stay alive for the lifetime of
+    /// the index — dropping it shuts the flusher down and stops
+    /// flushing to disk.
+    pub fn start_persistence(
+        self: &Arc<Self>,
+        cfg: crate::stores::sketch_db::store::persistence::SketchStorePersistenceConfig,
+    ) -> crate::stores::sketch_db::store::persistence::PersistResult<SketchIndexPersistence>
+    {
+        use crate::stores::sketch_db::store::persistence::{
+            cache::PartCache, flusher::FlusherHandle, recovery, Manifest,
+        };
+
+        let (_loaded_manifest, report) = recovery::recover(&cfg.disk_path)?;
+        tracing::info!(
+            live = report.live_parts,
+            corrupt_removed = report.corrupt_parts_removed,
+            orphans_removed = report.orphan_parts_removed,
+            "SketchIndex persistence recovery complete"
+        );
+
+        let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
+        let parts_root =
+            crate::stores::sketch_db::store::persistence::flusher::parts_root(&cfg.disk_path);
+        let part_cache = PartCache::new(parts_root.clone(), cfg.part_cache_bytes);
+
+        let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
+
+        Ok(SketchIndexPersistence {
+            manifest,
+            part_cache,
+            flusher,
+            parts_root,
+        })
+    }
+}
+
 // ── Phase 5 M2.3.6b — EpochSource impl ──────────────────────────────────────
 //
 // Lets the existing persistence flusher (`store/persistence/flusher.rs`)
