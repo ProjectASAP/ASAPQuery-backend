@@ -903,6 +903,19 @@ impl SketchIndex {
 }
 
 impl SketchIndex {
+    /// Phase 5 M2.3.6g — runtime-info / diagnostic helper. Returns the
+    /// per-sid `first_seen_unix_ms` for every registered sid. The
+    /// legacy `Store::get_earliest_timestamp_per_aggregation_id` returned
+    /// an analogous `agg_id → ts` map; this is the SketchIndex
+    /// equivalent. HTTP server's `/api/v1/status/runtimeinfo` adapter
+    /// surfaces it under the JSON field `earliest_timestamp_per_sid`.
+    pub fn earliest_timestamps_per_sid(&self) -> std::collections::HashMap<u64, u64> {
+        let g = self.instances.read().unwrap();
+        g.iter()
+            .map(|(sid, m)| (*sid, m.first_seen_unix_ms.max(0) as u64))
+            .collect()
+    }
+
     /// Phase 5 M2.3.6e — write-side helper. Given an
     /// `AggregationConfig` and one `(PrecomputedOutput, AggregateCore)`
     /// pair (the shape both the live worker AND the backfill processor

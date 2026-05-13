@@ -360,18 +360,14 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 
     async fn handle_runtime_info(
         &self,
-        store: Arc<dyn crate::stores::Store>,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     ) -> Result<Json<Value>, StatusCode> {
         debug!("Handling runtime info request in Prometheus adapter");
 
-        // Get earliest timestamp per aggregation ID from store
-        let earliest_timestamps = match store.get_earliest_timestamp_per_aggregation_id() {
-            Ok(timestamps) => timestamps,
-            Err(e) => {
-                error!("Error getting earliest timestamps: {}", e);
-                HashMap::new()
-            }
-        };
+        // M2.3.6g — earliest timestamps now come from SketchIndex's
+        // per-sid `first_seen_unix_ms` metadata. Wire field renamed
+        // accordingly below.
+        let earliest_timestamps = sketch_index.earliest_timestamps_per_sid();
 
         // Get runtime info from fallback if available
         let mut runtime_data = if let Some(fallback) = &self.config.fallback {
@@ -390,13 +386,12 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
         // Merge local data with fallback data
         if let Some(data_obj) = runtime_data.as_object_mut() {
             data_obj.insert(
-                "earliest_timestamp_per_aggregation_id".to_string(),
+                "earliest_timestamp_per_sid".to_string(),
                 serde_json::to_value(earliest_timestamps).unwrap_or(json!({})),
             );
         } else {
-            // If runtime_data is not an object, just create a new one with local data
             runtime_data = json!({
-                "earliest_timestamp_per_aggregation_id": earliest_timestamps
+                "earliest_timestamp_per_sid": earliest_timestamps
             });
         }
 

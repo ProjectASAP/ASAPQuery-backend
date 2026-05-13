@@ -610,7 +610,7 @@ async fn main() -> Result<()> {
     // design, §6). When precompute isn't enabled, the registry is
     // absent and the swap handler no-ops on schema reconciliation
     // (legacy per-batch reconcile in ingest still works).
-    let mut server = HttpServer::new(http_config, engine, store.clone())
+    let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
         .with_hot_reload_config(hot_reload_config.clone())
         .with_probe_cache(probe_cache.clone());
 

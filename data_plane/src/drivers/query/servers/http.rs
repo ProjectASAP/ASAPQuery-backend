@@ -156,7 +156,8 @@ pub struct HttpServer {
     /// `KeyByLabelNames` Prometheus needs to populate the `metric`
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
-    store: Arc<dyn Store>,
+    /// M2.3.6g — SketchIndex replaces `Arc<dyn Store>`.
+    sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
@@ -220,7 +221,10 @@ struct AppState {
     query_engine: Arc<ASAPQueryEngine>,
     /// See [`HttpServer::query_router`].
     query_router: Arc<EngineRouter>,
-    store: Arc<dyn Store>,
+    /// Phase 5 M2.3.6g — SketchIndex replaces `Arc<dyn Store>` as the
+    /// only data backend HTTP-side endpoints consult. Today the only
+    /// consumer is the runtime-info handler.
+    sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
@@ -246,7 +250,7 @@ impl HttpServer {
     pub fn new(
         config: HttpServerConfig,
         query_engine: Arc<ASAPQueryEngine>,
-        store: Arc<dyn Store>,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     ) -> Self {
         // Bootstrap the capability router with `ASAPQueryEngine`
         // registered under its canonical query-engine id.
@@ -257,7 +261,7 @@ impl HttpServer {
             config,
             query_engine,
             query_router,
-            store,
+            sketch_index,
             hot_reload_config: None,
             backend_storage_routing: None,
             schemas: None,
@@ -427,7 +431,7 @@ impl HttpServer {
             config: self.config.clone(),
             query_engine: self.query_engine,
             query_router: self.query_router,
-            store: self.store,
+            sketch_index: self.sketch_index,
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -518,7 +522,7 @@ impl HttpServer {
             config: self.config.clone(),
             query_engine: self.query_engine.clone(),
             query_router: self.query_router.clone(),
-            store: self.store.clone(),
+            sketch_index: self.sketch_index.clone(),
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
@@ -1541,7 +1545,7 @@ async fn handle_runtime_info(
     // Delegate to adapter for protocol-specific handling
     state
         .adapter
-        .handle_runtime_info_with_headers(state.store.clone(), forwarding_headers)
+        .handle_runtime_info_with_headers(state.sketch_index.clone(), forwarding_headers)
         .await
 }
 
@@ -1798,7 +1802,7 @@ mod tests {
             15000,
         ));
 
-        let mut server = HttpServer::new(config, query_engine, store);
+        let mut server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) };
         if let Some(handle) = hot_reload {
             server = server.with_hot_reload_config(handle);
         }
@@ -2045,7 +2049,7 @@ aggregations:
             streaming_config.clone(),
             15000,
         ));
-        let server = HttpServer::new(config, query_engine, store)
+        let server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }
             .with_hot_reload_config(hot_reload)
             .with_schemas(schemas);
         server
@@ -2550,7 +2554,7 @@ aggregations:
             let sc = StreamingConfig::new(map);
             Arc::new(crate::stores::sketch_db::SchemaRegistry::from_streaming_config(&sc))
         };
-        let server = HttpServer::new(config, query_engine, store)
+        let server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }
             .with_backfill_registry(registry)
             .with_schemas(schemas);
         server
@@ -2901,7 +2905,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
+            { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }.with_hot_reload_config(hot_reload);
         for engine in extra_engines {
             server = server.with_query_engine(engine);
         }
@@ -2946,7 +2950,7 @@ aggregations:
             streaming_arc,
             15000,
         ));
-        let mut server = HttpServer::new(config, query_engine, store)
+        let mut server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }
             .with_hot_reload_config(hot_reload)
             .with_backend_storage_routing(Arc::new(routing));
         for engine in extra_engines {
@@ -3694,7 +3698,7 @@ aggregations:
             15000,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
-        let server = HttpServer::new(config, query_engine, store)
+        let server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }
             .with_hot_reload_config(hot_reload)
             .with_hot_reload_backend_storage_routing(routing_handle.clone());
         let port = server.start_test_server().await.expect("start ok");
@@ -4152,7 +4156,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, store).with_hot_reload_config(hot_reload);
+            { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }.with_hot_reload_config(hot_reload);
         for engine in engines {
             server = server.with_query_engine(engine);
         }
@@ -4200,7 +4204,7 @@ aggregations:
             15000,
         ));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
-        let server = HttpServer::new(config, query_engine, store).with_probe_cache(cache.clone());
+        let server = { let _store = store; let idx = Arc::new(crate::stores::sketch_db::index::SketchIndex::new()); HttpServer::new(config, query_engine, idx) }.with_probe_cache(cache.clone());
         let port = server
             .start_test_server()
             .await
@@ -4557,21 +4561,14 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    match state.store.get_earliest_timestamp_per_aggregation_id() {
-        Ok(timestamps) => {
-            let body = serde_json::json!({
-                "status": "success",
-                "aggregation_count": timestamps.len(),
-                "earliest_timestamps": timestamps});
-            (StatusCode::OK, axum::Json(body)).into_response()
-        }
-        Err(e) => {
-            let body = serde_json::json!({
-                "status": "error",
-                "error": format!("{}", e)});
-            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response()
-        }
-    }
+    // M2.3.6g — earliest timestamps come from SketchIndex's per-sid
+    // `first_seen_unix_ms` metadata. Always succeeds (no I/O).
+    let timestamps = state.sketch_index.earliest_timestamps_per_sid();
+    let body = serde_json::json!({
+        "status": "success",
+        "sid_count": timestamps.len(),
+        "earliest_timestamps_per_sid": timestamps});
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 // ─── StreamingConfig hot-reload (PR E) ───────────────────────────────────
