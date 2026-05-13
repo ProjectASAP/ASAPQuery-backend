@@ -903,6 +903,66 @@ impl SketchIndex {
 }
 
 impl SketchIndex {
+    /// Phase 5 M2.3.6e — write-side helper. Given an
+    /// `AggregationConfig` and one `(PrecomputedOutput, AggregateCore)`
+    /// pair (the shape both the live worker AND the backfill processor
+    /// emit), compute the precompute sid, register a metadata entry on
+    /// first sight, and append the payload window. Used by
+    /// `SketchIndexSink` (live ingest) and `BackfillWindowProcessor`
+    /// (archive replay) so they share one canonical sid-derivation
+    /// path.
+    ///
+    /// Returns the sid the entry landed under (or `None` when the
+    /// agg_config / output combination doesn't fit the precompute
+    /// model — caller logs and skips).
+    pub fn ingest_precompute_for_agg_config(
+        &self,
+        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        output: &crate::stores::types::PrecomputedOutput,
+        accumulator: &dyn crate::stores::types::AggregateCore,
+    ) -> Option<u64> {
+        let label_values_vec = output
+            .key
+            .as_ref()
+            .map(|k| k.labels.clone())
+            .unwrap_or_default();
+        let key_names = &agg_cfg.grouping_labels.labels;
+        let mut attrs_fp = String::new();
+        let mut label_values_map: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
+            attrs_fp.push_str(k);
+            attrs_fp.push('=');
+            attrs_fp.push_str(v);
+            attrs_fp.push(';');
+            label_values_map.insert(k.clone(), v.clone());
+        }
+
+        let agg_kind = AggKind::Precompute {
+            agg_type: agg_cfg.aggregation_type,
+            parameters_canonical: canonical_parameters(&agg_cfg.parameters),
+        };
+        let sid = compute_sid(&agg_cfg.metric, &attrs_fp, &agg_kind);
+
+        if self.instance(sid).is_none() {
+            let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
+            self.register(SketchInstanceMetadata {
+                sid,
+                metric_name: agg_cfg.metric.clone(),
+                group_by_keys,
+                capability: None,
+                agg_kind: agg_kind.clone(),
+                accuracy: None,
+                first_seen_unix_ms: output.start_timestamp as i64,
+                retired_at_ms: None,
+                expires_at_ms: None,
+            });
+        }
+
+        let window = (output.start_timestamp, output.end_timestamp);
+        self.append_precompute(sid, label_values_map, window, accumulator.clone_boxed_core());
+        Some(sid)
+    }
+
     /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
     /// index whose metadata was registered against `agg_cfg`, i.e.
     /// shares the same metric, agg_type, parameters canonicalization,

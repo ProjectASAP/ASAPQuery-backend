@@ -795,7 +795,9 @@ async fn main() -> Result<()> {
             hot_reload_config.clone(),
             data_plane::stores::sketch_db::default_reader_factory(),
             data_plane::stores::sketch_db::BackfillServiceConfig::default(),
-        );
+        )
+        // M2.3.6e — replayed batches mirror into SketchIndex too.
+        .with_sketch_index(sketch_index.clone());
         info!(
             "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
         );

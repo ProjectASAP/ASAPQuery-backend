@@ -1,11 +1,7 @@
-use crate::stores::sketch_db::index::{
-    canonical_parameters, compute_sid, AccuracyBound, AggKind, SketchIndex,
-    SketchInstanceMetadata,
-};
+use crate::stores::sketch_db::index::SketchIndex;
 use crate::stores::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::stores::types::{AggregateCore, PrecomputedOutput};
 use crate::stores::Store;
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tracing::{debug_span, warn};
 
@@ -81,64 +77,13 @@ impl SketchIndexSink {
         let Some(agg_cfg) = cfg.get_aggregation_config(output.aggregation_id) else {
             warn!(
                 agg_id = output.aggregation_id,
-                "DualWriteSink: agg_config missing from streaming snapshot; skipping SketchIndex write"
+                "SketchIndexSink: agg_config missing from streaming snapshot; skipping write"
             );
             return false;
         };
-
-        // Canonicalize the per-DP attrs. AggregationConfig's
-        // grouping_labels.labels is sorted at construction; align
-        // with KeyByLabelValues.labels positionally.
-        let label_values_vec = output
-            .key
-            .as_ref()
-            .map(|k| k.labels.clone())
-            .unwrap_or_default();
-        let key_names = &agg_cfg.grouping_labels.labels;
-        let mut attrs_fp = String::new();
-        let mut label_values_map: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
-            attrs_fp.push_str(k);
-            attrs_fp.push('=');
-            attrs_fp.push_str(v);
-            attrs_fp.push(';');
-            label_values_map.insert(k.clone(), v.clone());
-        }
-
-        let agg_kind = AggKind::Precompute {
-            agg_type: agg_cfg.aggregation_type,
-            parameters_canonical: canonical_parameters(&agg_cfg.parameters),
-        };
-        let sid = compute_sid(&agg_cfg.metric, &attrs_fp, &agg_kind);
-
-        // Register the sid in SketchIndex on first sight. M2.3.3
-        // doesn't compute `Capability` / `AccuracyBound` for
-        // precomputes (they answer exact stats), so both stay `None`.
-        if self.sketch_index.instance(sid).is_none() {
-            let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
-            self.sketch_index.register(SketchInstanceMetadata {
-                sid,
-                metric_name: agg_cfg.metric.clone(),
-                group_by_keys,
-                capability: None,
-                agg_kind: agg_kind.clone(),
-                accuracy: None,
-                first_seen_unix_ms: output.start_timestamp as i64,
-                retired_at_ms: None,
-                expires_at_ms: None,
-            });
-            let _ = AccuracyBound::from_config; // silence unused if all paths skip
-        }
-
-        let window = (output.start_timestamp, output.end_timestamp);
-        self.sketch_index.append_precompute(
-            sid,
-            label_values_map,
-            window,
-            accumulator.clone_boxed_core(),
-        );
-        true
+        self.sketch_index
+            .ingest_precompute_for_agg_config(agg_cfg, output, accumulator)
+            .is_some()
     }
 }
 
@@ -233,7 +178,7 @@ impl OutputSink for NoopOutputSink {
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::index::SidLookup;
+    use crate::stores::sketch_db::index::{AggKind, SidLookup};
     use crate::stores::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
