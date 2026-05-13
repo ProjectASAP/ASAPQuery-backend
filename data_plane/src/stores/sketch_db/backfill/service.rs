@@ -97,7 +97,7 @@ pub struct BackfillService {
     schemas: Arc<SchemaRegistry>,
     /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
     /// the legacy `Arc<dyn Store>` field is gone.
-    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchStore>>,
+    sketch_index: Option<Arc<crate::stores::sketch_db::store::SketchStore>>,
     config_source: HotReloadStreamingConfig,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
@@ -125,7 +125,7 @@ impl BackfillService {
     /// there. Builder-style; safe to omit (legacy tests).
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::stores::sketch_db::index::SketchStore>,
+        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
         self

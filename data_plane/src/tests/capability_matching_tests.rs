@@ -11,7 +11,7 @@ use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinS
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::index::SketchStore;
+use crate::stores::sketch_db::store::SketchStore;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
 use std::sync::Arc;

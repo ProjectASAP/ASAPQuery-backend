@@ -25,7 +25,7 @@ pub use gorilla_object_store::{
     GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample, S3CostCounters, S3CostSnapshot,
     S3CostTrackingObjectStore,
 };
-pub use sketch_db::index::{
+pub use sketch_db::store::{
     AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };

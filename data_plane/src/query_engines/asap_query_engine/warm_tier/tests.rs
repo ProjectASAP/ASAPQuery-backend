@@ -16,7 +16,7 @@ use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
 
 use crate::query_engines::asap_query_engine::warm_tier::{SketchReducer, WarmTierError};
-use crate::stores::sketch_db::index::{
+use crate::stores::sketch_db::store::{
     AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchStore, SketchInstanceMetadata,
     SketchKindHandle, SketchSampleState,
 };

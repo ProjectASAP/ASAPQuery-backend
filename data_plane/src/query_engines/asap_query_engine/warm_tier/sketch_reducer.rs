@@ -64,7 +64,7 @@ use crate::query_engines::asap_query_engine::warm_tier::decoders::{
 use crate::query_engines::asap_query_engine::warm_tier::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
-use crate::stores::sketch_db::index::{
+use crate::stores::sketch_db::store::{
     Capability, SketchEncoding, SketchStore, SketchInstanceMetadata, SketchKindHandle,
     SketchSampleState,
 };
