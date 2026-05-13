@@ -99,7 +99,6 @@ fn engine_no_query_configs(
 
 
     ASAPQueryEngine::new(
-        store,
         streaming_config,
         1,
     )
@@ -136,7 +135,6 @@ fn engine_with_query_config(
 
 
     ASAPQueryEngine::new(
-        store,
         streaming_config,
         1,
     )

@@ -239,7 +239,9 @@ pub struct RangeQueryExecutionContext {
 
 /// Simple query engine for processing PromQL-like queries against precomputed data
 pub struct ASAPQueryEngine {
-    store: Arc<dyn Store>,
+    // Phase 5 M2.3.6g — `store: Arc<dyn Store>` field retired. The
+    // engine reads precomputes exclusively from `SketchIndex` after
+    // M2.3.6f. Constructor signatures no longer take a `store` arg.
     /// Hot-reloadable `StreamingConfig` handle. Internal read sites
     /// call `Self::streaming_config_snapshot()` which re-snapshots
     /// from this handle, so runtime swaps pushed through PR #10's
@@ -300,12 +302,11 @@ impl ASAPQueryEngine {
     /// variant stays as the simple entry point for tests, binaries,
     /// and legacy callers that don't own a `HotReloadStreamingConfig`.
     pub fn new(
-        store: Arc<dyn Store>,
         streaming_config: Arc<StreamingConfig>,
         prometheus_scrape_interval: u64,
     ) -> Self {
         let hot_reload = crate::stores::types::HotReloadStreamingConfig::from_arc(streaming_config);
-        Self::new_with_hot_reload(store, hot_reload, prometheus_scrape_interval)
+        Self::new_with_hot_reload(hot_reload, prometheus_scrape_interval)
     }
 
     /// Construct a `ASAPQueryEngine` that shares a `HotReloadStreamingConfig`
@@ -313,7 +314,6 @@ impl ASAPQueryEngine {
     /// the constructor `main.rs` should call so `POST /api/v1/streaming-config`
     /// is observable by the next query.
     pub fn new_with_hot_reload(
-        store: Arc<dyn Store>,
         streaming_config_source: crate::stores::types::HotReloadStreamingConfig,
         prometheus_scrape_interval: u64,
     ) -> Self {
@@ -450,7 +450,6 @@ impl ASAPQueryEngine {
         );
 
         Self {
-            store,
             streaming_config_source,
             prometheus_scrape_interval,
             controller_patterns,
@@ -4763,15 +4762,11 @@ mod hot_reload_phase2_tests {
 
     fn build_engine(handle: HotReloadStreamingConfig) -> ASAPQueryEngine {
         let streaming_config = Arc::new(StreamingConfig::default());
-        let store = Arc::new(SketchStore::new(
+        let _store = Arc::new(SketchStore::new(
             streaming_config,
             CleanupPolicy::NoCleanup,
         ));
-        ASAPQueryEngine::new_with_hot_reload(
-            store,
-            handle,
-            15000,
-        )
+        ASAPQueryEngine::new_with_hot_reload(handle, 15000)
     }
 
     #[test]
@@ -4834,11 +4829,8 @@ mod hot_reload_phase2_tests {
             Arc::clone(&streaming_config),
             CleanupPolicy::NoCleanup,
         ));
-        let engine = ASAPQueryEngine::new(
-            store,
-            streaming_config,
-            15000,
-        );
+        let _store = store;
+        let engine = ASAPQueryEngine::new(streaming_config, 15000);
 
         // External swap should NOT be visible inside the engine — the
         // legacy constructor snapshotted the initial Arc into its own
@@ -5021,11 +5013,8 @@ mod e2e_feedback_loop_tests {
             Arc::new(StreamingConfig::default()),
             CleanupPolicy::NoCleanup,
         ));
-        let engine = ASAPQueryEngine::new_with_hot_reload(
-            store,
-            hot_reload.clone(),
-            15000,
-        )
+        let _store = store;
+        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
         .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
 
         // 4. Initial snapshot: empty.
@@ -5136,11 +5125,8 @@ mod e2e_feedback_loop_tests {
             Arc::new(StreamingConfig::default()),
             CleanupPolicy::NoCleanup,
         ));
-        let engine = ASAPQueryEngine::new_with_hot_reload(
-            store,
-            hot_reload.clone(),
-            15000,
-        )
+        let _store = store;
+        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
         .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
 
         let requirements = asap_types::query_requirements::QueryRequirements {
@@ -5280,7 +5266,8 @@ mod aux_pushdown_tests {
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
         let store = Arc::new(SketchStore::new(sc, CleanupPolicy::NoCleanup));
-        ASAPQueryEngine::new_with_hot_reload(store, hr, 60)
+        let _store = store;
+        ASAPQueryEngine::new_with_hot_reload(hr, 60)
     }
 
     #[test]
@@ -5563,11 +5550,8 @@ mod sketch_alias_resolver_tests {
             CleanupPolicy::NoCleanup,
         ));
         let hot_reload = HotReloadStreamingConfig::from_arc(Arc::new(streaming_config));
-        ASAPQueryEngine::new_with_hot_reload(
-            store,
-            hot_reload,
-            1,
-        )
+        let _store = store;
+        ASAPQueryEngine::new_with_hot_reload(hot_reload, 1)
     }
 
     #[test]
@@ -5925,12 +5909,8 @@ mod warm_tier_classify_tests {
             CleanupPolicy::NoCleanup,
         ));
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        ASAPQueryEngine::new_with_hot_reload(
-            store,
-            hot_reload,
-            15000,
-        )
-        .with_sketch_index(idx)
+        let _store = store;
+        ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
     }
 
     fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {

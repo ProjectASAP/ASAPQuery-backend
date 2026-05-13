@@ -78,7 +78,6 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         CleanupPolicy::NoCleanup,
     ));
     let query_engine = Arc::new(ASAPQueryEngine::new(
-        store.clone(),
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));
@@ -167,7 +166,6 @@ async fn test_forwarding_disabled() {
     ));
 
     let query_engine = Arc::new(ASAPQueryEngine::new(
-        store.clone(),
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));
@@ -218,7 +216,6 @@ async fn test_prometheus_server_unreachable() {
     ));
 
     let query_engine = Arc::new(ASAPQueryEngine::new(
-        store.clone(),
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));

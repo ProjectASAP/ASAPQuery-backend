@@ -97,12 +97,12 @@ const TEST_QUERY: &str = "sum by (host) (sensor_reading)";
 fn build_engine(
     streaming_config: Arc<StreamingConfig>,
     schemas: Arc<SchemaRegistry>,
-    store: Arc<dyn Store>,
+    _store: Arc<dyn Store>,
     sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
     let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-    ASAPQueryEngine::new_with_hot_reload(store, hot_reload, 1)
+    ASAPQueryEngine::new_with_hot_reload(hot_reload, 1)
         .with_schema_registry(schemas)
         .with_sketch_index(sketch_index)
 }

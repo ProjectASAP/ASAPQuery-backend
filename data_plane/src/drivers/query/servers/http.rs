@@ -1794,7 +1794,6 @@ mod tests {
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_config.clone(),
             15000,
         ));
@@ -2043,7 +2042,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_config.clone(),
             15000,
         ));
@@ -2519,7 +2517,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_config.clone(),
             15000,
         ));
@@ -2900,7 +2897,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_arc,
             15000,
         ));
@@ -2947,7 +2943,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_arc,
             15000,
         ));
@@ -3695,7 +3690,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_arc,
             15000,
         ));
@@ -4154,7 +4148,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_arc,
             15000,
         ));
@@ -4203,7 +4196,6 @@ aggregations:
             crate::stores::types::CleanupPolicy::NoCleanup,
         ));
         let query_engine = Arc::new(ASAPQueryEngine::new(
-            store.clone(),
             streaming_arc,
             15000,
         ));
