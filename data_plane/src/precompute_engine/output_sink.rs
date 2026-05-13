@@ -41,39 +41,27 @@ impl OutputSink for StoreOutputSink {
     }
 }
 
-/// Phase 5 M2.3.4 — fan precompute writes out to BOTH the legacy
-/// `SketchStore` (so the existing query path keeps working) AND the
-/// new sid-keyed `SketchIndex` (so the M2.3.5 query path has data to
-/// read). When M2.3.5 lands, the legacy fan-out half can be retired
-/// in M2.3.6.
+/// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
+/// precomputes to `SketchIndex` only; the legacy `SketchStore`
+/// agg_id-keyed write path is retired.
 ///
-/// Why the dual write:
-/// - The legacy `Store::insert_precomputed_output_batch` keys on
-///   `aggregation_id`. The query engine still reads from it for
-///   precomputes.
-/// - `SketchIndex::append_precompute` keys on content-derived `sid`
-///   (M2.3.3). It's where precomputes WILL live, but no consumer
-///   reads from it yet.
+/// Reads already prefer `SketchIndex` (M2.3.5b's engine cut-over),
+/// so the legacy store no longer receives traffic from either side.
+/// Once the data-plane crate's `Store` trait and `stores/sketch_db/store/*`
+/// modules are deleted (subsequent M2.3.6 sub-PRs), `SketchIndex`
+/// will be renamed to `SketchStore` and this type can collapse into
+/// the previously-existing `StoreOutputSink` shape.
 ///
 /// Per-batch overhead: one streaming-config snapshot read + per-row
-/// agg-id lookup, sid hash, and `Box<dyn AggregateCore>` clone. The
-/// clone goes through `clone_boxed_core` (already paid by ingest
-/// code that copies accumulators between layers), so the cost is
-/// linear in the batch size with a small constant.
-pub struct DualWriteSink {
-    store: Arc<dyn Store>,
+/// agg-id lookup, sid hash, and `Box<dyn AggregateCore>` clone.
+pub struct SketchIndexSink {
     sketch_index: Arc<SketchIndex>,
     hot_reload: HotReloadStreamingConfig,
 }
 
-impl DualWriteSink {
-    pub fn new(
-        store: Arc<dyn Store>,
-        sketch_index: Arc<SketchIndex>,
-        hot_reload: HotReloadStreamingConfig,
-    ) -> Self {
+impl SketchIndexSink {
+    pub fn new(sketch_index: Arc<SketchIndex>, hot_reload: HotReloadStreamingConfig) -> Self {
         Self {
-            store,
             sketch_index,
             hot_reload,
         }
@@ -81,9 +69,9 @@ impl DualWriteSink {
 
     /// Best-effort write to `SketchIndex` for one PrecomputedOutput.
     /// Logs and skips on missing agg_config or other transient
-    /// inconsistencies — the legacy SketchStore write still happens,
-    /// so a SketchIndex miss is recoverable. Returns whether the
-    /// SketchIndex write actually landed (for tests / observability).
+    /// inconsistencies — a SketchIndex miss is recoverable in
+    /// practice because the controller will re-emit the agg_config
+    /// on its next reconcile pass.
     fn append_to_index(
         &self,
         output: &PrecomputedOutput,
@@ -154,7 +142,7 @@ impl DualWriteSink {
     }
 }
 
-impl OutputSink for DualWriteSink {
+impl OutputSink for SketchIndexSink {
     fn emit_batch(
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
@@ -162,13 +150,11 @@ impl OutputSink for DualWriteSink {
         if outputs.is_empty() {
             return Ok(());
         }
-        let _span = debug_span!("dual_write_insert", batch_size = outputs.len()).entered();
-        // Mirror the writes to SketchIndex first so the legacy write
-        // path still owns the source-of-truth error semantics.
+        let _span = debug_span!("sketch_index_insert", batch_size = outputs.len()).entered();
         for (output, accumulator) in &outputs {
             self.append_to_index(output, accumulator.as_ref());
         }
-        self.store.insert_precomputed_output_batch(outputs)
+        Ok(())
     }
 }
 
@@ -274,8 +260,7 @@ mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
     use crate::stores::sketch_db::index::SidLookup;
-    use crate::stores::sketch_db::store::SketchStore;
-    use crate::stores::types::{CleanupPolicy, KeyByLabelValues, StreamingConfig};
+    use crate::stores::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -307,9 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_write_mirrors_to_store_and_index() {
-        // Set up the dual-write sink with a real SketchStore + SketchIndex
-        // backed by a one-entry streaming config.
+    fn sketch_index_sink_writes_to_index() {
         let agg_id = 7;
         let cfg = sum_agg_config(agg_id, "cpu_seconds", &["zone"]);
         let mut configs = HashMap::new();
@@ -317,39 +300,22 @@ mod tests {
         let streaming = StreamingConfig::new(configs);
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
 
-        let store = Arc::new(SketchStore::new(
-            Arc::new(streaming),
-            CleanupPolicy::NoCleanup,
-        )) as Arc<dyn Store>;
         let sketch_index = Arc::new(SketchIndex::new());
-        let sink = DualWriteSink::new(store.clone(), sketch_index.clone(), hot_reload);
+        let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
 
-        // One PrecomputedOutput in the batch.
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
         let output = PrecomputedOutput::new(1000, 2000, Some(key), agg_id);
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
 
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
 
-        // Legacy SketchStore: at least one bucket landed for the agg_id.
-        let map = store
-            .query_precomputed_output("cpu_seconds", agg_id, 0, u64::MAX / 2)
-            .expect("legacy query ok");
-        assert!(
-            !map.is_empty(),
-            "legacy SketchStore should have at least one bucket"
-        );
-
-        // New SketchIndex: exactly one sid registered (precompute
-        // variant) and it classifies as Hit.
         assert_eq!(
             sketch_index.instance_count(),
             1,
             "SketchIndex should have one precompute instance"
         );
-        let instances = sketch_index.list_by_status(
-            crate::stores::sketch_db::schema::AggStatus::Active,
-        );
+        let instances = sketch_index
+            .list_by_status(crate::stores::sketch_db::schema::AggStatus::Active);
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
         let sid = meta.sid;
@@ -368,27 +334,17 @@ mod tests {
     }
 
     #[test]
-    fn dual_write_skips_unknown_agg_id_gracefully() {
-        // Streaming config does NOT contain agg_id=99. The legacy
-        // SketchStore write should still succeed; the SketchIndex
-        // write is silently skipped (logged at warn but no error).
+    fn sketch_index_sink_skips_unknown_agg_id_gracefully() {
+        // Streaming config does NOT contain agg_id=99 — the sink
+        // skips it (warn log) rather than panicking.
         let streaming = StreamingConfig::new(HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
-        let store = Arc::new(SketchStore::new(
-            Arc::new(streaming),
-            CleanupPolicy::NoCleanup,
-        )) as Arc<dyn Store>;
         let sketch_index = Arc::new(SketchIndex::new());
-        let sink = DualWriteSink::new(store.clone(), sketch_index.clone(), hot_reload);
+        let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
 
         let output = PrecomputedOutput::new(1000, 2000, None, 99);
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
-        let result = sink.emit_batch(vec![(output, acc)]);
-
-        // Legacy write may fail or succeed depending on the store's
-        // tolerance for unknown agg_ids — what we care about is that
-        // the SketchIndex didn't get a junk registration.
-        let _ = result;
+        sink.emit_batch(vec![(output, acc)]).expect("emit ok");
         assert_eq!(sketch_index.instance_count(), 0);
     }
 }
