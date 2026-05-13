@@ -75,14 +75,18 @@ pub enum SketchConfig {
 }
 
 /// What kind of aggregation a `sid` identifies. M2.3 generalization
-/// — sids cover BOTH opaque-sketch state and partial-accumulator
-/// (Sum / Count / Avg / Rate / MinMax) state, so a single store can
-/// host both.
+/// — sids cover BOTH opaque-sketch state and exact-aggregation state
+/// (Sum / Count / Avg / Rate / MinMax / SetAggregator / …), so a
+/// single store can host both.
 ///
-/// The sid hash distinguishes the two branches structurally: a
-/// `Sketch` sid is content-addressed over `(metric, attrs,
-/// sketch_kind, sketch_config)`; a `Precompute` sid is content-
-/// addressed over `(metric, attrs, agg_type, parameters)`.
+/// The sid resolver distinguishes the two branches structurally:
+/// a `Sketch` sid keys on `(metric, attrs, sketch_kind, sketch_config,
+/// spatial_filter)`; an `ExactAgg` sid keys on `(metric, attrs,
+/// agg_type, parameters, spatial_filter)`. The spatial_filter
+/// participates in identity so two policies differing only in
+/// their ingest-side label predicate (e.g. `status="200"` vs
+/// `status="500"`) mint distinct sids even after the filter
+/// dimension is projected out by group-by.
 #[derive(Debug, Clone)]
 pub enum AggKind {
     /// Opaque sketch state — DDSketch, KLL, HLL, CountMin, CountSketch.
@@ -91,11 +95,23 @@ pub enum AggKind {
     Sketch {
         kind: SketchKindHandle,
         config: SketchConfig,
+        /// Canonical form of the policy's spatial-filter predicate,
+        /// produced by [`asap_types::utils::normalize_spatial_filter`]
+        /// (e.g. `{status="200",zone="us-east"}`). Empty string when
+        /// the policy has no spatial filter.
+        spatial_filter_canonical: String,
     },
-    /// Partial-accumulator state — Sum, Count, Avg, Rate, MinMax,
+    /// Exact aggregation state — Sum, Count, Avg, Rate, MinMax,
     /// SetAggregator, etc. Payload at storage layer is whatever the
     /// per-accumulator serializer produces.
-    Precompute {
+    ///
+    /// Variant name history: previously `AggKind::Precompute` — the
+    /// rename to `ExactAgg` (PR `refactor/sid-identity-spatial-filter-and-rename`)
+    /// reflects that `precompute_engine/` is the *engine* that
+    /// produces both sketch and exact-aggregation outputs, while this
+    /// variant names what the *payload* is. The two had been
+    /// confusingly conflated.
+    ExactAgg {
         agg_type: AggregationType,
         /// Stable canonical encoding of the agg's
         /// `parameters: HashMap<String, Value>` — sorted keys, each
@@ -103,6 +119,9 @@ pub enum AggKind {
         /// string so equality / hashing stay cheap and independent of
         /// the original HashMap's iteration order.
         parameters_canonical: String,
+        /// Canonical form of the policy's spatial-filter predicate;
+        /// see the `Sketch` variant's field doc.
+        spatial_filter_canonical: String,
     },
 }
 
