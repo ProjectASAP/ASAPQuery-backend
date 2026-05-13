@@ -26,8 +26,10 @@
 //!   the read path (sid + label values + per-window samples).
 //! - [`AccuracyBound`] — `(epsilon, confidence)` derived from a
 //!   `SketchConfig`. Surfaces in HTTP response headers.
-//! - [`compute_sid`] / [`compute_sketch_sid`] — the canonical sid
-//!   hash. Deterministic across hosts; defines the sid identity.
+//! - [`compute_sid`] — the canonical sid hash used today only by the
+//!   precompute ingest path (`SketchStore::ingest_precompute_for_agg_config`).
+//!   The OTel sketch ingest path moved to `SeriesIdResolver` (Option B
+//!   — registry-allocated sids); the precompute path follows in PR-4.
 //! - [`canonical_parameters`] — helper that renders a parameters
 //!   `HashMap` into the canonical string form
 //!   `AggKind::Precompute::parameters_canonical` expects.
@@ -120,41 +122,91 @@ pub fn canonical_parameters(
     buf
 }
 
-// ── sid hash ────────────────────────────────────────────────────────────────
-
-/// Compute a deterministic `series_id` (sid) for one sketch instance.
-///
-/// Folds the four DataPoint inputs the backend has at ingest time —
-/// `metric_name`, `attrs` (keys + values, canonicalized), `sketch_kind`,
-/// and `sketch_config` — into a 64-bit xxhash. Same inputs always
-/// produce the same sid across restarts and across hosts.
-///
-/// `attrs_fingerprint` MUST be the canonical fingerprint string
-/// (`canonical_attrs_fingerprint` — keys sorted, joined `k=v;`); the
-/// hash is sensitive to whitespace, ordering, and trailing separator.
-///
-/// sid=0 is reserved on the wire (means "unresolved"); if a real input
-/// hashes to 0 (vanishingly unlikely with 64-bit xxhash), we perturb
-/// to 1.
-pub fn compute_sketch_sid(
-    metric_name: &str,
-    attrs_fingerprint: &str,
-    sketch_kind: SketchKindHandle,
-    sketch_config: &SketchConfig,
-) -> u64 {
-    compute_sid(
-        metric_name,
-        attrs_fingerprint,
-        &AggKind::Sketch {
-            kind: sketch_kind,
-            config: sketch_config.clone(),
-        },
-    )
+impl AggKind {
+    /// Stable string form of this `AggKind`, used as the third element
+    /// of the `SeriesIdResolver` cache key and as the `agg_kind_canonical`
+    /// field in the resolver's WAL.
+    ///
+    /// Sid identity is `(metric, attrs_fingerprint, agg_kind_canonical)`
+    /// — the same canonical tuple that the retired
+    /// [`compute_sketch_sid`] / [`compute_sid`] functions hashed over,
+    /// just rendered as a string for the registry-allocated mint path
+    /// instead of byte-fed to xxh64. Two `AggKind`s that compare equal
+    /// MUST produce the same canonical string; two that differ in any
+    /// observable parameter MUST produce different strings.
+    ///
+    /// Format:
+    /// - `Sketch { kind: DDSketch, config: DDSketch{rel_acc: 0.01} }`
+    ///   → `"sketch:DDSketch:D:0.01"`
+    /// - `Sketch { kind: Kll, config: Kll{k: 200} }`
+    ///   → `"sketch:Kll:K:200"`
+    /// - `Precompute { agg_type: Sum, parameters_canonical: "" }`
+    ///   → `"precompute:Sum:"`
+    pub fn canonical_string(&self) -> String {
+        match self {
+            AggKind::Sketch { kind, config } => {
+                format!(
+                    "sketch:{}:{}",
+                    sketch_kind_canonical(*kind),
+                    sketch_config_canonical(config),
+                )
+            }
+            AggKind::Precompute {
+                agg_type,
+                parameters_canonical,
+            } => {
+                // `AggregationType`'s `Display` impl is stable
+                // (matches the snake-case form on the wire) and
+                // `parameters_canonical` is already canonicalized
+                // upstream (see [`canonical_parameters`]).
+                format!("precompute:{}:{}", agg_type, parameters_canonical)
+            }
+        }
+    }
 }
 
-/// Generalized version of [`compute_sketch_sid`] covering both sketch
-/// and precompute aggregations. Same `(metric, attrs, agg_kind)` tuple
-/// always yields the same sid.
+fn sketch_kind_canonical(k: SketchKindHandle) -> &'static str {
+    match k {
+        SketchKindHandle::DDSketch => "DDSketch",
+        SketchKindHandle::Kll => "Kll",
+        SketchKindHandle::Hll => "Hll",
+        SketchKindHandle::CountSketch => "CountSketch",
+        SketchKindHandle::CountMin => "CountMin",
+        SketchKindHandle::CmsWithHeap => "CmsWithHeap",
+        SketchKindHandle::CountSketchWithHeap => "CountSketchWithHeap",
+        // `Any` is the analysis-time wildcard; never reaches the
+        // ingest path which detects a concrete kind from the OTLP
+        // wire variant. Mapping it to a unique tag anyway keeps the
+        // canonical form total.
+        SketchKindHandle::Any => "Any",
+    }
+}
+
+fn sketch_config_canonical(cfg: &SketchConfig) -> String {
+    match cfg {
+        SketchConfig::DDSketch { relative_accuracy } => {
+            format!("D:{relative_accuracy}")
+        }
+        SketchConfig::Kll { k } => format!("K:{k}"),
+        SketchConfig::Hll { precision } => format!("H:{precision}"),
+        SketchConfig::CountSketch { rows, cols } => format!("S:{rows}:{cols}"),
+        SketchConfig::CountMin { rows, cols } => format!("M:{rows}:{cols}"),
+    }
+}
+
+// ── sid hash ────────────────────────────────────────────────────────────────
+//
+// `compute_sketch_sid` was retired alongside the OTel ingest path's
+// migration to `SeriesIdResolver` (Option B — registry-allocated sids).
+// The remaining `compute_sid` function is still called by
+// `SketchStore::ingest_precompute_for_agg_config` for PRECOMPUTE
+// aggregations; that path migrates to the resolver in PR-4, at which
+// point `compute_sid` and its `sketch_kind_tag` / `encode_sketch_config`
+// helpers will go away too. Sketch sids today come exclusively from the
+// resolver — same authority as precompute sids will after PR-4.
+
+/// Generalized content-addressed sid hash. Same `(metric, attrs, agg_kind)`
+/// tuple always yields the same sid.
 ///
 /// The two branches encode disjointly: a `Sketch` payload starts with
 /// `sketch_kind_tag` (1..=7), while a `Precompute` payload starts with

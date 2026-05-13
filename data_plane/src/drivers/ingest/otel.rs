@@ -218,29 +218,39 @@ impl MetricsService for MetricsServiceImpl {
         Response<asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsResponse>,
         Status,
     > {
-        use asap_otel_proto::tonic::collector::metrics::v1::{
-            ResolveSeriesIDsResponse, SeriesAssignment,
-        };
+        use asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsResponse;
+
+        // Pre-resolve handshake is structurally redundant with the
+        // canonical Export path under Interpretation B (sid identity is
+        // `(metric, attrs_fingerprint, agg_kind_canonical)` and
+        // `agg_kind` isn't carried in `SeriesQuery`). On the first
+        // Export with attrs, the backend resolves the correct sid and
+        // echoes it back via `ExportMetricsServiceResponse.series_assignments`
+        // — that's the canonical channel, and it also handles every
+        // cache-divergence failure mode (proto comment at
+        // `ExportMetricsServiceResponse.unknown_series_ids:100-104`).
+        //
+        // The RPC is kept as a stable surface so older patched
+        // exporters that still call it don't see `Unimplemented`. The
+        // returned `assignments` vec is empty; the agent's local cache
+        // stays cold and the first real Export populates it.
+        //
+        // Follow-up: drop the RPC entirely (proto change), OR extend
+        // `SeriesQuery` to carry `agg_kind_canonical` so this can
+        // perform a real pre-resolve. Today's stub is the no-harm path.
         let req = request.into_inner();
-        let mut assignments = Vec::with_capacity(req.queries.len());
-        if let Some(state) = &self.shared.ingest_state {
-            for q in req.queries {
-                // The fingerprint travels as opaque bytes on the wire, but
-                // the resolver hashes it as a string (the sender's
-                // canonical fingerprint algorithm matches our
-                // `canonical_attrs_fingerprint`). UTF-8 is lossy here only
-                // for malformed inputs — those produce a degraded but
-                // deterministic key, never a panic.
-                let fp = String::from_utf8_lossy(&q.attributes_fingerprint).into_owned();
-                let sid = state.series_resolver.resolve(&q.metric_name, &fp);
-                assignments.push(SeriesAssignment {
-                    attributes_fingerprint: q.attributes_fingerprint,
-                    series_id: sid,
-                    ..Default::default()
-                });
-            }
+        if !req.queries.is_empty() {
+            warn!(
+                queries = req.queries.len(),
+                "ResolveSeriesIDs RPC called with non-empty batch; \
+                 returning empty assignments — sid identity now \
+                 includes agg_kind which this RPC doesn't carry. \
+                 Agent will mint on first Export with attrs.",
+            );
         }
-        Ok(Response::new(ResolveSeriesIDsResponse { assignments }))
+        Ok(Response::new(ResolveSeriesIDsResponse {
+            assignments: Vec::new(),
+        }))
     }
 }
 
@@ -935,8 +945,24 @@ async fn route_modified_otlp_sketches_to_precompute(
                             }
                         }
                     } else {
-                        let assigned =
-                            ingest_state.series_resolver.resolve(&metric.name, &fp);
+                        // Build the canonical AggKind string for this DP so
+                        // the resolver's cache key is `(metric, fp, agg_kind)`.
+                        // Two DPs over the same (metric, attrs) but different
+                        // sketch kinds/configs (e.g. DDSketch vs Kll, or two
+                        // DDSketches at different relative_accuracy) get
+                        // SEPARATE sids — matching the identity model the
+                        // retired `compute_sketch_sid` hashed over.
+                        let kind_for_sid = sketch_kind_handle_for(&dp);
+                        let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
+                            kind: kind_for_sid,
+                            config: dp.container_config.clone(),
+                        };
+                        let agg_kind_canonical = agg_kind.canonical_string();
+                        let assigned = ingest_state.series_resolver.resolve(
+                            &metric.name,
+                            &fp,
+                            &agg_kind_canonical,
+                        );
                         if dp.series_id != 0 && dp.series_id != assigned {
                             // Sender's cached sid disagrees with the
                             // resolver's binding — sender's cache is

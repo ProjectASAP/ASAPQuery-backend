@@ -33,9 +33,9 @@ use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 // (`crate::storage_engines::sketch_db::index::*`) keep compiling
 // during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
-    canonical_parameters, compute_sid, compute_sketch_sid, AccuracyBound, AggKind, AggPayload,
-    AggregationType, Capability, SketchConfig, SketchEncoding, SketchKindHandle,
-    SketchSampleState, SketchTimeSeries,
+    canonical_parameters, compute_sid, AccuracyBound, AggKind, AggPayload, AggregationType,
+    Capability, SketchConfig, SketchEncoding, SketchKindHandle, SketchSampleState,
+    SketchTimeSeries,
 };
 
 fn now_ms() -> u64 {
@@ -1126,60 +1126,11 @@ mod tests {
         assert_eq!(series[0].samples.len(), 4);
     }
 
-    #[test]
-    fn compute_sketch_sid_is_deterministic() {
-        let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let a = compute_sketch_sid("http_requests_total", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        let b = compute_sketch_sid("http_requests_total", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        assert_eq!(a, b);
-        assert_ne!(a, 0);
-    }
-
-    #[test]
-    fn compute_sketch_sid_distinguishes_metric() {
-        let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let a = compute_sketch_sid("metric_a", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        let b = compute_sketch_sid("metric_b", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn compute_sketch_sid_distinguishes_attrs_values() {
-        let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        let b = compute_sketch_sid("m", "zone=z1;", SketchKindHandle::DDSketch, &cfg);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn compute_sketch_sid_distinguishes_sketch_kind() {
-        let cfg_dd = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let cfg_kll = SketchConfig::Kll { k: 200 };
-        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_dd);
-        let b = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::Kll, &cfg_kll);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn compute_sketch_sid_distinguishes_container_config() {
-        let cfg_a = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let cfg_b = SketchConfig::DDSketch {
-            relative_accuracy: 0.005,
-        };
-        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_a);
-        let b = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_b);
-        assert_ne!(a, b);
-    }
+    // `compute_sketch_sid_*` tests removed alongside the function they
+    // exercised. The same identity properties (metric/attrs/kind/config
+    // disambiguate sketch sids) are now covered by the resolver's own
+    // `distinct_agg_kinds_same_series_distinct_sids` test plus the
+    // round-trip parity captured at the OTel ingest layer.
 
     #[test]
     fn compute_sid_precompute_is_deterministic() {
@@ -1456,26 +1407,11 @@ mod tests {
         assert!(precompute.as_precompute().is_some());
     }
 
-    #[test]
-    fn compute_sketch_sid_matches_new_compute_sid_for_sketch_branch() {
-        // The legacy `compute_sketch_sid` wrapper must produce
-        // the exact same value as `compute_sid` with an
-        // `AggKind::Sketch` — otherwise existing ingest sids
-        // would skew across the migration.
-        let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01,
-        };
-        let legacy = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
-        let new = compute_sid(
-            "m",
-            "zone=z0;",
-            &AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
-                config: cfg,
-            },
-        );
-        assert_eq!(legacy, new);
-    }
+    // `compute_sketch_sid_matches_new_compute_sid_for_sketch_branch`
+    // removed — it tested parity between two hash wrappers, and the
+    // outer wrapper is now gone. The remaining `compute_sid_*` tests
+    // exercise the encoding properties that PR-4 will lean on when it
+    // migrates the precompute path to the resolver.
 }
 
 // 2026-05 reorg: generic epoch-partitioned columnar storage lives

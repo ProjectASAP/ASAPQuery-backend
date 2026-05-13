@@ -32,14 +32,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-/// Canonical fingerprint key — `(metric_name, attrs_fingerprint)`.
+/// Canonical sid identity — `(metric_name, attrs_fingerprint, agg_kind_canonical)`.
 ///
-/// `attrs_fingerprint` is a string produced by canonicalizing the
-/// attribute set: keys sorted lexicographically, then `key=value;`-joined.
-/// This matches the format the patched OTel-Go exporter writes into
-/// `SeriesAssignment.attributes_fingerprint`, so cache hits across the
-/// agent's exporter cache and this backend resolver align bit-exactly.
-type CacheKey = (String, String);
+/// This is the same 3-tuple that the retired `compute_sketch_sid` /
+/// `compute_sid` functions hashed over, just held as a string key
+/// for the registry-allocated mint path.
+///
+/// - `attrs_fingerprint` — keys sorted lexicographically, then
+///   `key=value;`-joined. Matches the patched OTel-Go exporter so
+///   sender and receiver agree bit-exactly.
+/// - `agg_kind_canonical` — the stable string form of `AggKind` (see
+///   `sketch_db::data::AggKind::canonical_string`). Distinguishes
+///   different aggregations over the same series — e.g. a DDSketch
+///   and a Sum on the same `(metric, attrs)` get separate sids.
+type CacheKey = (String, String, String);
 
 /// Idempotent compute-or-mint resolver. Atomic per-key — concurrent
 /// `resolve()` calls for the same `(metric, attrs)` from different agents
@@ -98,7 +104,10 @@ impl SeriesIdResolver {
         let cache: DashMap<CacheKey, u64> = DashMap::new();
         let mut max_sid: u64 = 0;
         for r in records {
-            cache.insert((r.metric, r.attrs_fingerprint), r.sid);
+            cache.insert(
+                (r.metric, r.attrs_fingerprint, r.agg_kind_canonical),
+                r.sid,
+            );
             if r.sid > max_sid {
                 max_sid = r.sid;
             }
@@ -112,11 +121,15 @@ impl SeriesIdResolver {
         })
     }
 
-    /// Resolve `(metric_name, attrs)` to a series_id. Returns the existing
-    /// sid if this `(metric, attrs)` tuple was already registered;
-    /// otherwise mints a fresh sid, durably persists the binding (when
-    /// a non-noop backend is wired), caches it, and returns the new
-    /// value.
+    /// Resolve `(metric, attrs, agg_kind)` to a series_id. Returns the
+    /// existing sid if this 3-tuple was already registered; otherwise
+    /// mints a fresh sid, durably persists the binding (when a non-noop
+    /// backend is wired), caches it, and returns the new value.
+    ///
+    /// `agg_kind_canonical` is the stable string form of
+    /// [`sketch_db::data::AggKind`] (call its `canonical_string()`
+    /// method at the call site). It's a string here so the resolver
+    /// doesn't take a dep on storage_engines.
     ///
     /// Idempotent: repeated calls with the same input ALWAYS return the
     /// same sid for the lifetime of the cache. With `FilePersistence`,
@@ -129,8 +142,17 @@ impl SeriesIdResolver {
     /// the resolver stays in-memory-correct. Next restart will not
     /// recover the lost mint, and the agent will hit the eviction
     /// recovery path (one extra round trip with attrs).
-    pub fn resolve(&self, metric_name: &str, attrs_fingerprint: &str) -> u64 {
-        let key = (metric_name.to_string(), attrs_fingerprint.to_string());
+    pub fn resolve(
+        &self,
+        metric_name: &str,
+        attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
+    ) -> u64 {
+        let key = (
+            metric_name.to_string(),
+            attrs_fingerprint.to_string(),
+            agg_kind_canonical.to_string(),
+        );
         // Fast path: read-only check on the cache before taking the
         // bucket's write lock. DashMap's `get` takes a shard read lock;
         // the common case (a hit on a known identity) never serializes
@@ -145,10 +167,12 @@ impl SeriesIdResolver {
         // is durable before any caller observes the sid.
         let entry = self.cache.entry(key).or_insert_with(|| {
             let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) =
-                self.persistence
-                    .append(sid, metric_name, attrs_fingerprint)
-            {
+            if let Err(e) = self.persistence.append(
+                sid,
+                metric_name,
+                attrs_fingerprint,
+                agg_kind_canonical,
+            ) {
                 warn!(
                     metric = %metric_name,
                     sid,
@@ -163,12 +187,18 @@ impl SeriesIdResolver {
     }
 
     /// Look up an existing sid without minting. Returns `None` if the
-    /// `(metric, attrs)` tuple is not in the cache. Used by the OTLP
-    /// receive path to check whether an incoming sid (without attrs) is
-    /// recognized — sids the backend doesn't recognize go into the
-    /// response's `unknown_series_ids` so the sender re-sends with attrs.
-    pub fn lookup(&self, metric_name: &str, attrs_fingerprint: &str) -> Option<u64> {
-        let key = (metric_name.to_string(), attrs_fingerprint.to_string());
+    /// `(metric, attrs, agg_kind)` tuple is not in the cache.
+    pub fn lookup(
+        &self,
+        metric_name: &str,
+        attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
+    ) -> Option<u64> {
+        let key = (
+            metric_name.to_string(),
+            attrs_fingerprint.to_string(),
+            agg_kind_canonical.to_string(),
+        );
         self.cache.get(&key).map(|v| *v)
     }
 
@@ -194,18 +224,20 @@ impl Default for SeriesIdResolver {
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 //
-// The resolver's `(metric, fp) → sid` cache is in-memory only by default.
-// Under `--persistence-enabled`, a `FilePersistence` backend writes a WAL
-// record per fresh mint; the resolver replays it on startup so the agent's
-// cached sids stay valid across backend restarts.
+// The resolver's `(metric, fp, agg_kind) → sid` cache is in-memory only
+// by default. Under `--persistence-enabled`, a `FilePersistence` backend
+// writes a WAL record per fresh mint; the resolver replays it on startup
+// so the agent's cached sids stay valid across backend restarts.
 //
-// WAL format v1:
-//   header: 8 bytes  → b"ASAPSRP\x01"
+// WAL format v2 (current; v1 was attrs-only, never shipped to prod):
+//   header: 8 bytes  → b"ASAPSRP\x02"
 //   record: 8 bytes  → sid (u64 little-endian)
 //           4 bytes  → metric_len (u32 LE)
 //           metric_len bytes → metric utf8
 //           4 bytes  → fp_len (u32 LE)
 //           fp_len bytes → fp utf8
+//           4 bytes  → agg_kind_len (u32 LE)
+//           agg_kind_len bytes → agg_kind_canonical utf8
 //
 // Append-only; sids are minted once and never rewritten, so the log size
 // is proportional to live cardinality. At 100M sids (~5GB) compaction
@@ -224,6 +256,7 @@ pub struct ResolverRecord {
     pub sid: u64,
     pub metric: String,
     pub attrs_fingerprint: String,
+    pub agg_kind_canonical: String,
 }
 
 /// Durability hook for [`SeriesIdResolver`]. Implementations decide
@@ -231,9 +264,9 @@ pub struct ResolverRecord {
 /// tests and stateless deployments; `FilePersistence` is the production
 /// answer under `--persistence-enabled`.
 pub trait SeriesResolverPersistence: Send + Sync {
-    /// Durably record a fresh `(sid, metric, fp)` binding. MUST be
-    /// flushed to stable storage before returning `Ok` — the resolver
-    /// only returns the sid to its caller after this returns.
+    /// Durably record a fresh `(sid, metric, fp, agg_kind)` binding.
+    /// MUST be flushed to stable storage before returning `Ok` — the
+    /// resolver only returns the sid to its caller after this returns.
     /// On error, the binding is in-memory-only; the caller logs and
     /// continues.
     fn append(
@@ -241,6 +274,7 @@ pub trait SeriesResolverPersistence: Send + Sync {
         sid: u64,
         metric: &str,
         attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
     ) -> std::io::Result<()>;
 
     /// Read every durable binding in append order. Called once at
@@ -254,7 +288,13 @@ pub trait SeriesResolverPersistence: Send + Sync {
 pub struct NoopPersistence;
 
 impl SeriesResolverPersistence for NoopPersistence {
-    fn append(&self, _sid: u64, _metric: &str, _fp: &str) -> std::io::Result<()> {
+    fn append(
+        &self,
+        _sid: u64,
+        _metric: &str,
+        _fp: &str,
+        _agg_kind_canonical: &str,
+    ) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -272,15 +312,16 @@ pub struct FilePersistence {
     path: PathBuf,
 }
 
-const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x01";
+const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x02";
 /// Reject any single field whose length-prefix exceeds these caps. A
 /// corrupted file might claim huge field lengths; without these bounds
 /// the replay loop could allocate gigabytes of zeros before discovering
 /// the lengths don't match the actual content. The caps are far above
 /// any realistic input — metric names are tens of bytes, fingerprints
-/// are hundreds.
+/// are hundreds, agg_kind canonical strings are tens.
 const MAX_METRIC_LEN: usize = 16 * 1024;
 const MAX_FP_LEN: usize = 64 * 1024;
+const MAX_AGG_KIND_LEN: usize = 4 * 1024;
 
 impl FilePersistence {
     /// Open or create the WAL at `path`. On a fresh file, writes the
@@ -334,13 +375,13 @@ impl SeriesResolverPersistence for FilePersistence {
         sid: u64,
         metric: &str,
         fp: &str,
+        agg_kind_canonical: &str,
     ) -> std::io::Result<()> {
         let metric_bytes = metric.as_bytes();
         let fp_bytes = fp.as_bytes();
-        let metric_len: u32 = metric_bytes
-            .len()
-            .try_into()
-            .map_err(|_| {
+        let agg_kind_bytes = agg_kind_canonical.as_bytes();
+        let metric_len: u32 =
+            metric_bytes.len().try_into().map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "metric name longer than u32::MAX bytes",
@@ -352,6 +393,13 @@ impl SeriesResolverPersistence for FilePersistence {
                 "fingerprint longer than u32::MAX bytes",
             )
         })?;
+        let agg_kind_len: u32 =
+            agg_kind_bytes.len().try_into().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "agg_kind_canonical longer than u32::MAX bytes",
+                )
+            })?;
 
         let mut f = self.file.lock().unwrap();
         f.write_all(&sid.to_le_bytes())?;
@@ -359,6 +407,8 @@ impl SeriesResolverPersistence for FilePersistence {
         f.write_all(metric_bytes)?;
         f.write_all(&fp_len.to_le_bytes())?;
         f.write_all(fp_bytes)?;
+        f.write_all(&agg_kind_len.to_le_bytes())?;
+        f.write_all(agg_kind_bytes)?;
         // Durability barrier: caller must not observe the sid until the
         // record is on stable storage. fsync is the slow part of the
         // mint path (a few ms on SSD) but it's amortized — minting is
@@ -459,11 +509,27 @@ fn read_one_record(f: &mut File) -> ReadOne {
         return ReadOne::Torn;
     }
 
+    if f.read_exact(&mut len_buf).is_err() {
+        return ReadOne::Torn;
+    }
+    let agg_kind_len = u32::from_le_bytes(len_buf) as usize;
+    if agg_kind_len > MAX_AGG_KIND_LEN {
+        return ReadOne::Torn;
+    }
+    let mut agg_kind_bytes = vec![0u8; agg_kind_len];
+    if f.read_exact(&mut agg_kind_bytes).is_err() {
+        return ReadOne::Torn;
+    }
+
     let metric = match String::from_utf8(metric_bytes) {
         Ok(s) => s,
         Err(_) => return ReadOne::Torn,
     };
     let attrs_fingerprint = match String::from_utf8(fp_bytes) {
+        Ok(s) => s,
+        Err(_) => return ReadOne::Torn,
+    };
+    let agg_kind_canonical = match String::from_utf8(agg_kind_bytes) {
         Ok(s) => s,
         Err(_) => return ReadOne::Torn,
     };
@@ -476,6 +542,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
             sid,
             metric,
             attrs_fingerprint,
+            agg_kind_canonical,
         },
         new_offset,
     )
@@ -507,28 +574,49 @@ pub fn canonical_attrs_fingerprint(attrs: &[(&str, &str)]) -> String {
 mod tests {
     use super::*;
 
+    /// Stand-in canonical `AggKind` string. Tests don't care about the
+    /// specific encoding — the resolver only uses the value for key
+    /// equality. Production callers compute this via
+    /// `AggKind::canonical_string()`.
+    const TEST_AGG: &str = "sketch:DDSketch:D:0.01";
+
     #[test]
     fn idempotent_same_input_same_sid() {
         let r = SeriesIdResolver::new();
-        let sid1 = r.resolve("http_requests_total", "zone=z0;");
-        let sid2 = r.resolve("http_requests_total", "zone=z0;");
+        let sid1 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
+        let sid2 = r.resolve("http_requests_total", "zone=z0;", TEST_AGG);
         assert_eq!(sid1, sid2, "same input must produce same sid");
     }
 
     #[test]
     fn distinct_inputs_distinct_sids() {
         let r = SeriesIdResolver::new();
-        let s_z0 = r.resolve("metric_a", "zone=z0;");
-        let s_z1 = r.resolve("metric_a", "zone=z1;");
+        let s_z0 = r.resolve("metric_a", "zone=z0;", TEST_AGG);
+        let s_z1 = r.resolve("metric_a", "zone=z1;", TEST_AGG);
         assert_ne!(s_z0, s_z1);
     }
 
     #[test]
     fn distinct_metrics_same_attrs_distinct_sids() {
         let r = SeriesIdResolver::new();
-        let s_a = r.resolve("metric_a", "zone=z0;");
-        let s_b = r.resolve("metric_b", "zone=z0;");
+        let s_a = r.resolve("metric_a", "zone=z0;", TEST_AGG);
+        let s_b = r.resolve("metric_b", "zone=z0;", TEST_AGG);
         assert_ne!(s_a, s_b);
+    }
+
+    #[test]
+    fn distinct_agg_kinds_same_series_distinct_sids() {
+        // Two aggregations over the same (metric, attrs) tuple — e.g.
+        // a DDSketch and a Sum on `http_latency_ms{zone=z0}` — get
+        // SEPARATE sids. This is the core property of Interpretation B:
+        // sid identity is `(metric, attrs, agg_kind)`.
+        let r = SeriesIdResolver::new();
+        let s_dd = r.resolve("http_latency_ms", "zone=z0;", "sketch:DDSketch:D:0.01");
+        let s_sum = r.resolve("http_latency_ms", "zone=z0;", "precompute:Sum:");
+        assert_ne!(
+            s_dd, s_sum,
+            "different agg_kinds over the same series must mint distinct sids",
+        );
     }
 
     #[test]
@@ -542,9 +630,11 @@ mod tests {
     #[test]
     fn lookup_returns_existing_without_mint() {
         let r = SeriesIdResolver::new();
-        let sid = r.resolve("m", "k=v;");
-        assert_eq!(r.lookup("m", "k=v;"), Some(sid));
-        assert_eq!(r.lookup("m", "k=v2;"), None);
+        let sid = r.resolve("m", "k=v;", TEST_AGG);
+        assert_eq!(r.lookup("m", "k=v;", TEST_AGG), Some(sid));
+        assert_eq!(r.lookup("m", "k=v2;", TEST_AGG), None);
+        // Same (metric, attrs) but different agg_kind is a miss.
+        assert_eq!(r.lookup("m", "k=v;", "precompute:Sum:"), None);
     }
 }
 
@@ -565,13 +655,16 @@ mod persistence_tests {
         assert!(records.is_empty());
     }
 
+    const TEST_AGG: &str = "sketch:DDSketch:D:0.01";
+
     #[test]
     fn append_then_replay_round_trips() {
         let dir = TempDir::new().unwrap();
         let p = FilePersistence::open(wal_path(&dir)).unwrap();
-        p.append(1, "metric_a", "zone=z0;").unwrap();
-        p.append(2, "metric_a", "zone=z1;").unwrap();
-        p.append(3, "metric_b", "zone=z0;").unwrap();
+        p.append(1, "metric_a", "zone=z0;", TEST_AGG).unwrap();
+        p.append(2, "metric_a", "zone=z1;", TEST_AGG).unwrap();
+        p.append(3, "metric_b", "zone=z0;", "precompute:Sum:")
+            .unwrap();
 
         // Reopen to confirm durability across handle close.
         drop(p);
@@ -581,8 +674,10 @@ mod persistence_tests {
         assert_eq!(records[0].sid, 1);
         assert_eq!(records[0].metric, "metric_a");
         assert_eq!(records[0].attrs_fingerprint, "zone=z0;");
+        assert_eq!(records[0].agg_kind_canonical, TEST_AGG);
         assert_eq!(records[1].sid, 2);
         assert_eq!(records[2].metric, "metric_b");
+        assert_eq!(records[2].agg_kind_canonical, "precompute:Sum:");
     }
 
     #[test]
@@ -603,8 +698,8 @@ mod persistence_tests {
         // header but truncated payload).
         {
             let p = FilePersistence::open(path.clone()).unwrap();
-            p.append(1, "m", "k=v;").unwrap();
-            p.append(2, "m", "k=w;").unwrap();
+            p.append(1, "m", "k=v;", TEST_AGG).unwrap();
+            p.append(2, "m", "k=w;", TEST_AGG).unwrap();
         }
         // Manually append a torn record: sid (8B) + metric_len=999
         // (claims 999 bytes of metric but we write 0 bytes after).
@@ -628,7 +723,7 @@ mod persistence_tests {
         );
         // After truncation, subsequent appends pick up from the
         // truncated EOF — no gap, no rewrite of historical records.
-        p.append(3, "m", "k=x;").unwrap();
+        p.append(3, "m", "k=x;", TEST_AGG).unwrap();
         drop(p);
         let p2 = FilePersistence::open(path).unwrap();
         let records2 = p2.replay().unwrap();
@@ -645,7 +740,7 @@ mod persistence_tests {
         let path = wal_path(&dir);
         {
             let p = FilePersistence::open(path.clone()).unwrap();
-            p.append(1, "m", "k=v;").unwrap();
+            p.append(1, "m", "k=v;", TEST_AGG).unwrap();
         }
         {
             use std::io::Write;
@@ -668,9 +763,9 @@ mod persistence_tests {
         // First process: mint three bindings.
         {
             let r = SeriesIdResolver::open(path.clone()).unwrap();
-            let s1 = r.resolve("m", "k=v0;");
-            let s2 = r.resolve("m", "k=v1;");
-            let s3 = r.resolve("m", "k=v2;");
+            let s1 = r.resolve("m", "k=v0;", TEST_AGG);
+            let s2 = r.resolve("m", "k=v1;", TEST_AGG);
+            let s3 = r.resolve("m", "k=v2;", TEST_AGG);
             assert_eq!(s1, 1);
             assert_eq!(s2, 2);
             assert_eq!(s3, 3);
@@ -679,11 +774,31 @@ mod persistence_tests {
         // a fresh input mints sid=4 (max replayed + 1).
         {
             let r = SeriesIdResolver::open(path).unwrap();
-            assert_eq!(r.resolve("m", "k=v0;"), 1);
-            assert_eq!(r.resolve("m", "k=v1;"), 2);
-            assert_eq!(r.resolve("m", "k=v2;"), 3);
-            let fresh = r.resolve("m", "k=v3;");
+            assert_eq!(r.resolve("m", "k=v0;", TEST_AGG), 1);
+            assert_eq!(r.resolve("m", "k=v1;", TEST_AGG), 2);
+            assert_eq!(r.resolve("m", "k=v2;", TEST_AGG), 3);
+            let fresh = r.resolve("m", "k=v3;", TEST_AGG);
             assert_eq!(fresh, 4, "next_sid resumes at max(replayed)+1");
+        }
+    }
+
+    #[test]
+    fn resolver_open_distinguishes_agg_kinds_on_replay() {
+        // Same (metric, attrs) but two agg_kinds — both replay to the
+        // resolver as distinct keys, and re-resolving each returns its
+        // original sid.
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+        {
+            let r = SeriesIdResolver::open(path.clone()).unwrap();
+            let s_dd = r.resolve("m", "k=v0;", "sketch:DDSketch:D:0.01");
+            let s_sum = r.resolve("m", "k=v0;", "precompute:Sum:");
+            assert_ne!(s_dd, s_sum);
+        }
+        {
+            let r = SeriesIdResolver::open(path).unwrap();
+            assert_eq!(r.resolve("m", "k=v0;", "sketch:DDSketch:D:0.01"), 1);
+            assert_eq!(r.resolve("m", "k=v0;", "precompute:Sum:"), 2);
         }
     }
 
@@ -692,10 +807,10 @@ mod persistence_tests {
         // Sanity check: NoopPersistence is the back-compat path; resolver
         // bindings reset across construction.
         let r1 = SeriesIdResolver::new();
-        let s1 = r1.resolve("m", "k=v;");
+        let s1 = r1.resolve("m", "k=v;", TEST_AGG);
         drop(r1);
         let r2 = SeriesIdResolver::new();
-        let s2 = r2.resolve("m", "k=v;");
+        let s2 = r2.resolve("m", "k=v;", TEST_AGG);
         // Both resolvers start fresh, so both mint sid=1.
         assert_eq!(s1, 1);
         assert_eq!(s2, 1);
@@ -709,7 +824,7 @@ mod persistence_tests {
         // and don't re-attempt append.
         struct FailingPersistence;
         impl SeriesResolverPersistence for FailingPersistence {
-            fn append(&self, _: u64, _: &str, _: &str) -> std::io::Result<()> {
+            fn append(&self, _: u64, _: &str, _: &str, _: &str) -> std::io::Result<()> {
                 Err(std::io::Error::other("simulated I/O failure"))
             }
             fn replay(&self) -> std::io::Result<Vec<ResolverRecord>> {
@@ -717,10 +832,10 @@ mod persistence_tests {
             }
         }
         let r = SeriesIdResolver::with_persistence(Arc::new(FailingPersistence));
-        let sid = r.resolve("m", "k=v;");
+        let sid = r.resolve("m", "k=v;", TEST_AGG);
         assert_eq!(sid, 1, "resolver returns the sid despite persistence error");
         // Second call hits the cache; no second append attempt.
-        let sid2 = r.resolve("m", "k=v;");
+        let sid2 = r.resolve("m", "k=v;", TEST_AGG);
         assert_eq!(sid, sid2);
     }
 }
