@@ -22,8 +22,8 @@ use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
-    DualWriteSink, HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig,
-    PrecomputeEngine, PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStore,
+    HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
+    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchIndexSink, SketchStore,
 };
 
 #[derive(Parser, Debug)]
@@ -435,12 +435,13 @@ async fn main() -> Result<()> {
             wall_clock_grace_period_ms: 5_000,
             schema_persist_path: args.schema_persist_path.clone(),
         };
-        // M2.3.4b — DualWriteSink mirrors precompute writes into the
-        // legacy SketchStore (still serves queries) AND the new
-        // SketchIndex (sid-keyed precompute path; query path migration
-        // is M2.3.5). Replaces StoreOutputSink.
-        let output_sink = Arc::new(DualWriteSink::new(
-            store.clone(),
+        // M2.3.6 — sketch-only sink. Precompute writes now go to
+        // `SketchIndex` exclusively; the legacy `SketchStore` no
+        // longer receives traffic from either ingest (this sink) or
+        // queries (engine M2.3.5b cut-over). The `store` Arc kept
+        // below is for the eviction service + diagnostic plumbing
+        // until subsequent M2.3.6 sub-PRs delete those too.
+        let output_sink = Arc::new(SketchIndexSink::new(
             sketch_index.clone(),
             hot_reload_config.clone(),
         ));
