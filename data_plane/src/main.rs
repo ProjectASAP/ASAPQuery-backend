@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     let series_resolver =
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
     let sketch_index =
-        Arc::new(data_plane::stores::sketch_db::index::SketchStore::new());
+        Arc::new(data_plane::stores::sketch_db::store::SketchStore::new());
 
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all
@@ -845,7 +845,7 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::stores::sketch_db::index::SketchStore>,
+    sketch_index: Arc<data_plane::stores::sketch_db::store::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
     use data_plane::stores::sketch_db::store::persistence::EpochSource;

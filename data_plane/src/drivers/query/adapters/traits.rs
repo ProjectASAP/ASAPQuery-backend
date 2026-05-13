@@ -154,12 +154,12 @@ pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send
     /// backend.
     async fn handle_runtime_info(
         &self,
-        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchStore>,
+        sketch_index: std::sync::Arc<crate::stores::sketch_db::store::SketchStore>,
     ) -> Result<Json<Value>, StatusCode>;
 
     async fn handle_runtime_info_with_headers(
         &self,
-        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchStore>,
+        sketch_index: std::sync::Arc<crate::stores::sketch_db::store::SketchStore>,
         headers: HashMap<String, String>,
     ) -> Result<Json<Value>, StatusCode> {
         // Default implementation ignores headers and calls the old method
