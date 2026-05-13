@@ -170,7 +170,7 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
         port: 0,
         handle_http_requests: true,
         adapter_config};
-    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new());
+    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let server = HttpServer::new(config, engine, idx).with_hot_reload_config(hot_reload.clone());
     server
         .start_test_server()

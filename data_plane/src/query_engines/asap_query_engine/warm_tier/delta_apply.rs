@@ -34,7 +34,7 @@ use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::HllSketch;
 use asap_sketchlib::sketches::kll::KllSketch;
 
-use crate::storage_engines::sketch_db::store::{SketchEncoding, SketchSampleState};
+use crate::storage_engines::sketch_db::index::{SketchEncoding, SketchSampleState};
 
 /// Whether a sketch family supports delta-via-merge (DD/KLL) or
 /// delta-via-`apply_delta` (HLL). The reducer reads bytes through

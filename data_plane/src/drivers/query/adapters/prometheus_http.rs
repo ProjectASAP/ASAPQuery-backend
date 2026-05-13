@@ -360,7 +360,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 
     async fn handle_runtime_info(
         &self,
-        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Result<Json<Value>, StatusCode> {
         debug!("Handling runtime info request in Prometheus adapter");
 

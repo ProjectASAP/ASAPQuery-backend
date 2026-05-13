@@ -30,7 +30,7 @@ use crate::storage_engines::sketch_db::schema::AggStatus;
 
 // Phase-5 reorg: payload taxonomy + sid hashing + accuracy moved to
 // `sketch_db::data`. Re-exported here so existing call sites
-// (`crate::storage_engines::sketch_db::store::*`) keep compiling
+// (`crate::storage_engines::sketch_db::index::*`) keep compiling
 // during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
     canonical_parameters, compute_sid, compute_sketch_sid, AccuracyBound, AggKind, AggPayload,
@@ -674,7 +674,7 @@ impl SketchStore {
 /// Owns the manifest + flusher thread + part cache that back the
 /// sid-keyed warm tier. Constructed via [`SketchStore::start_persistence`];
 /// the flusher reads sealed epochs through the
-/// [`EpochSource`](crate::storage_engines::sketch_db::store::persistence::EpochSource)
+/// [`EpochSource`](crate::storage_engines::sketch_db::index::persistence::EpochSource)
 /// impl on `SketchStore` and writes parts under `disk_path/parts/`.
 ///
 /// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
@@ -682,9 +682,9 @@ impl SketchStore {
 /// read-back from disk in a subsequent sub-PR; today it sits idle
 /// because the in-memory `query_range` doesn't yet consult it.
 pub struct SketchIndexPersistence {
-    pub manifest: Arc<crate::storage_engines::sketch_db::store::persistence::Manifest>,
-    pub part_cache: crate::storage_engines::sketch_db::store::persistence::cache::PartCache,
-    pub flusher: crate::storage_engines::sketch_db::store::persistence::flusher::FlusherHandle,
+    pub manifest: Arc<crate::storage_engines::sketch_db::index::persistence::Manifest>,
+    pub part_cache: crate::storage_engines::sketch_db::index::persistence::cache::PartCache,
+    pub flusher: crate::storage_engines::sketch_db::index::persistence::flusher::FlusherHandle,
     pub parts_root: std::path::PathBuf,
 }
 
@@ -704,10 +704,10 @@ impl SketchStore {
     /// flushing to disk.
     pub fn start_persistence(
         self: &Arc<Self>,
-        cfg: crate::storage_engines::sketch_db::store::persistence::SketchStorePersistenceConfig,
-    ) -> crate::storage_engines::sketch_db::store::persistence::PersistResult<SketchIndexPersistence>
+        cfg: crate::storage_engines::sketch_db::index::persistence::SketchStorePersistenceConfig,
+    ) -> crate::storage_engines::sketch_db::index::persistence::PersistResult<SketchIndexPersistence>
     {
-        use crate::storage_engines::sketch_db::store::persistence::{
+        use crate::storage_engines::sketch_db::index::persistence::{
             cache::PartCache, flusher::FlusherHandle, recovery, Manifest,
         };
 
@@ -721,7 +721,7 @@ impl SketchStore {
 
         let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
         let parts_root =
-            crate::storage_engines::sketch_db::store::persistence::flusher::parts_root(&cfg.disk_path);
+            crate::storage_engines::sketch_db::index::persistence::flusher::parts_root(&cfg.disk_path);
         let part_cache = PartCache::new(parts_root.clone(), cfg.part_cache_bytes);
 
         let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
@@ -742,11 +742,11 @@ impl SketchStore {
 // field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
 // the trait keeps the historical name so the flusher / manifest /
 // part-writer stay untouched.
-impl crate::storage_engines::sketch_db::store::persistence::EpochSource for SketchStore {
+impl crate::storage_engines::sketch_db::index::persistence::EpochSource for SketchStore {
     fn list_sealed_epochs(
         &self,
-    ) -> Vec<crate::storage_engines::sketch_db::store::persistence::SealedEpochRef> {
-        use crate::storage_engines::sketch_db::store::persistence::SealedEpochRef;
+    ) -> Vec<crate::storage_engines::sketch_db::index::persistence::SealedEpochRef> {
+        use crate::storage_engines::sketch_db::index::persistence::SealedEpochRef;
         let mut out = Vec::new();
         for entry in self.series.iter() {
             let sid = *entry.key();
@@ -773,13 +773,13 @@ impl crate::storage_engines::sketch_db::store::persistence::EpochSource for Sket
         &self,
         sid: u64,
         epoch_id: u64,
-    ) -> crate::storage_engines::sketch_db::store::persistence::PersistResult<
-        Option<crate::storage_engines::sketch_db::store::persistence::source::EpochSnapshot>,
+    ) -> crate::storage_engines::sketch_db::index::persistence::PersistResult<
+        Option<crate::storage_engines::sketch_db::index::persistence::source::EpochSnapshot>,
     > {
-        use crate::storage_engines::sketch_db::store::persistence::source::{
+        use crate::storage_engines::sketch_db::index::persistence::source::{
             EpochSnapshot, EpochSnapshotEntry,
         };
-        use crate::storage_engines::sketch_db::store::persistence::PersistError;
+        use crate::storage_engines::sketch_db::index::persistence::PersistError;
 
         let Some(store_ref) = self.series.get(&sid) else {
             return Ok(None);
@@ -1343,7 +1343,7 @@ mod tests {
 
     #[test]
     fn epoch_source_lists_only_sealed_epochs() {
-        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::index::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(13));
         with_tight_rotation(&idx, 13);
@@ -1363,7 +1363,7 @@ mod tests {
 
     #[test]
     fn epoch_source_snapshot_round_trips_sketch_payload() {
-        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::index::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(21));
         with_tight_rotation(&idx, 21);
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn epoch_source_evict_drops_the_epoch() {
-        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::index::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(31));
         with_tight_rotation(&idx, 31);
@@ -1407,7 +1407,7 @@ mod tests {
 
     #[test]
     fn epoch_source_approx_memory_bytes_grows_with_sealed_state() {
-        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::index::persistence::EpochSource;
         let idx = SketchStore::new();
         let before = idx.approx_memory_bytes();
         idx.register(meta(41));
@@ -1459,6 +1459,6 @@ mod tests {
 pub mod epoch_columnar;
 
 // `persistence` moved up to `sketch_db::persistence`. Re-exported here
-// so legacy `crate::storage_engines::sketch_db::store::persistence::*`
+// so legacy `crate::storage_engines::sketch_db::index::persistence::*`
 // paths continue working without consumer changes.
 pub use crate::storage_engines::sketch_db::persistence;

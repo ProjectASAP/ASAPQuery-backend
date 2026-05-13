@@ -1,4 +1,4 @@
-use crate::storage_engines::sketch_db::store::SketchStore;
+use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::{Arc, Mutex};
@@ -153,7 +153,7 @@ impl OutputSink for NoopOutputSink {
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::storage_engines::sketch_db::store::{AggKind, SidLookup};
+    use crate::storage_engines::sketch_db::index::{AggKind, SidLookup};
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;

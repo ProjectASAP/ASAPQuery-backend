@@ -31,10 +31,10 @@
 pub mod accuracy;
 pub mod backfill;
 pub mod data;
+pub mod index;
 pub mod metrics;
 pub mod persistence;
 pub mod schema;
-pub mod store;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{

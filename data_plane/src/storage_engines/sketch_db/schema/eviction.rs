@@ -53,7 +53,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
-use crate::storage_engines::sketch_db::store::SketchStore;
+use crate::storage_engines::sketch_db::index::SketchStore;
 use super::{AggStatus, SchemaRegistry};
 
 /// Configuration for the eviction loop. Separate from

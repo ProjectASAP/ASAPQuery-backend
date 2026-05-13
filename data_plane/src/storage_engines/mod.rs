@@ -8,7 +8,7 @@
 //! * `sketch_db` — the in-memory + persisted sketch DB. Logical
 //!   layer (schema registry, schema timeline, backfill types /
 //!   workers / HTTP endpoints) AND the physical storage backend
-//!   (`sketch_db::store`) are co-located under this path.
+//!   (`sketch_db::index`) are co-located under this path.
 //! * `gorilla_object_store` — S3/MinIO-backed Gorilla TSDB block
 //!   store used by the archive tier.
 //!
@@ -25,7 +25,7 @@ pub use gorilla_object_store::{
     GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample, S3CostCounters, S3CostSnapshot,
     S3CostTrackingObjectStore,
 };
-pub use sketch_db::store::{
+pub use sketch_db::index::{
     AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };
