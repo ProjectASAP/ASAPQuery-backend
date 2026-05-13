@@ -435,10 +435,65 @@ pub struct SketchTimeSeries {
     pub samples: BTreeMap<i64, SketchSampleState>,
 }
 
+/// Unified payload variant — what one window of one (sid, label-values
+/// vector) physically holds. Phase 5 M2.3 generalizes the storage so
+/// the same `SketchIndex` can host both sketch state and partial-
+/// accumulator (Sum / Count / Avg / Rate / MinMax) state under
+/// content-addressed sids.
+///
+/// Each sid stores exactly one variant for its entire lifetime — the
+/// variant is fixed by the sid's `agg_kind` at registration. Mixing
+/// variants under one sid is a logic error the storage layer doesn't
+/// guard against (a mismatch crashes the reducer at runtime). The
+/// ingest path is responsible for not doing that.
+#[derive(Clone)]
+pub enum AggPayload {
+    /// Opaque sketch state — see [`SketchSampleState`].
+    Sketch(SketchSampleState),
+    /// Partial-accumulator state — Sum / Count / Avg / Rate / MinMax.
+    /// Cloned via the `Clone` impl on `Box<dyn AggregateCore>` (which
+    /// dispatches through `clone_boxed_core`).
+    Precompute(Box<dyn crate::stores::types::AggregateCore>),
+}
+
+impl std::fmt::Debug for AggPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggPayload::Sketch(s) => f.debug_tuple("Sketch").field(s).finish(),
+            AggPayload::Precompute(p) => f
+                .debug_struct("Precompute")
+                .field("type_name", &p.type_name())
+                .finish(),
+        }
+    }
+}
+
+impl AggPayload {
+    /// Return the sketch payload if this is a sketch variant; `None`
+    /// otherwise. The warm-tier sketch reducer uses this to filter
+    /// non-sketch payloads out of its `query_range` results.
+    pub fn as_sketch(&self) -> Option<&SketchSampleState> {
+        match self {
+            AggPayload::Sketch(s) => Some(s),
+            AggPayload::Precompute(_) => None,
+        }
+    }
+
+    /// Return the precompute payload if this is a precompute variant;
+    /// `None` otherwise. The precompute query path (M2.3.5) uses this.
+    pub fn as_precompute(&self) -> Option<&dyn crate::stores::types::AggregateCore> {
+        match self {
+            AggPayload::Precompute(p) => Some(p.as_ref()),
+            AggPayload::Sketch(_) => None,
+        }
+    }
+}
+
 /// Per-sid storage value — wraps `SidStoreData` in an `RwLock` so the
 /// outer DashMap stays read-mostly and per-sid writes don't block one
-/// another.
-type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, SketchSampleState>>>;
+/// another. Payload type is the unified [`AggPayload`] enum so one
+/// `SketchIndex` can host both sketches and precomputes.
+type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 
 /// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
 /// SimpleStore lookup once Phase 5 wiring lands at the streaming engine
@@ -528,7 +583,32 @@ impl SketchIndex {
             .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
             .clone();
         let mut guard = store.write().unwrap();
-        guard.insert(window, series_label_values, sample);
+        guard.insert(window, series_label_values, AggPayload::Sketch(sample));
+    }
+
+    /// Append a window's precompute (Sum/Count/Avg/Rate/MinMax) state
+    /// under `sid`. Mirror of [`Self::append_sample`] for the
+    /// precompute branch — Phase 5 M2.3.3.
+    ///
+    /// Caller invariant: `sid` was registered with
+    /// `AggKind::Precompute { .. }`. Mixing sketch + precompute
+    /// payloads under one sid is a logic error this layer doesn't
+    /// guard against (it'll crash the reducer at runtime, not silently
+    /// corrupt).
+    pub fn append_precompute(
+        &self,
+        sid: u64,
+        series_label_values: BTreeMap<String, String>,
+        window: TimestampRange,
+        payload: Box<dyn crate::stores::types::AggregateCore>,
+    ) {
+        let store = self
+            .series
+            .entry(sid)
+            .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
+            .clone();
+        let mut guard = store.write().unwrap();
+        guard.insert(window, series_label_values, AggPayload::Precompute(payload));
     }
 
     /// Range-query the warm-tier state for one sid. Window-end-keyed
@@ -550,25 +630,32 @@ impl SketchIndex {
         let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
             HashMap::new();
 
-        let mut buf: Vec<(TimestampRange, LabelValuesId, &SketchSampleState)> = Vec::new();
+        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
         guard
             .current_epoch
             .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
         for (win, label_id, payload) in &buf {
-            by_label_id
-                .entry(*label_id)
-                .or_default()
-                .insert(win.1 as i64, (*payload).clone());
+            // Filter to sketch-variant payloads only; precompute sids
+            // (M2.3) are served via the precompute query path
+            // (M2.3.5).
+            if let Some(s) = payload.as_sketch() {
+                by_label_id
+                    .entry(*label_id)
+                    .or_default()
+                    .insert(win.1 as i64, s.clone());
+            }
         }
         buf.clear();
 
         for sealed in guard.sealed_epochs.values() {
             sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
-                by_label_id
-                    .entry(*label_id)
-                    .or_default()
-                    .insert(win.1 as i64, (*payload).clone());
+                if let Some(s) = payload.as_sketch() {
+                    by_label_id
+                        .entry(*label_id)
+                        .or_default()
+                        .insert(win.1 as i64, s.clone());
+                }
             }
             buf.clear();
         }
@@ -1037,6 +1124,57 @@ mod tests {
         p_ba.insert("beta".to_string(), serde_json::json!(2));
         p_ba.insert("alpha".to_string(), serde_json::json!(1));
         assert_eq!(canonical_parameters(&p_ab), canonical_parameters(&p_ba));
+    }
+
+    #[test]
+    fn precompute_payload_round_trips_through_storage() {
+        use crate::precompute_engine::operators::SumAccumulator;
+
+        let idx = SketchIndex::new();
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let mut precompute_meta = meta(42);
+        precompute_meta.capability = None;
+        precompute_meta.accuracy = None;
+        precompute_meta.agg_kind = AggKind::Precompute {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+        };
+        let _ = cfg; // silence unused-binding lint
+        idx.register(precompute_meta);
+
+        idx.append_precompute(
+            42,
+            BTreeMap::new(),
+            (1000, 1010),
+            Box::new(SumAccumulator::with_sum(5.0)),
+        );
+
+        // Sketch-side query_range filters out precompute payloads, so
+        // a precompute sid produces no SketchTimeSeries entries even
+        // though the storage has data.
+        let series = idx.query_range(42, 0, 5000);
+        assert!(
+            series.iter().all(|s| s.samples.is_empty()),
+            "precompute payloads must not surface as sketch results"
+        );
+        assert_eq!(idx.classify(42), SidLookup::Hit, "storage has data — Hit");
+    }
+
+    #[test]
+    fn agg_payload_accessors_are_disjoint() {
+        let sketch = AggPayload::Sketch(SketchSampleState {
+            bytes: vec![0xAA],
+            encoding: SketchEncoding::ProtoFull,
+        });
+        assert!(sketch.as_sketch().is_some());
+        assert!(sketch.as_precompute().is_none());
+
+        use crate::precompute_engine::operators::SumAccumulator;
+        let precompute = AggPayload::Precompute(Box::new(SumAccumulator::with_sum(1.0)));
+        assert!(precompute.as_sketch().is_none());
+        assert!(precompute.as_precompute().is_some());
     }
 
     #[test]
