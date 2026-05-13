@@ -5003,9 +5003,12 @@ mod e2e_feedback_loop_tests {
         //    that covers the requested metric. This mirrors DC's
         //    replanner running and POSTing via its BackendClient.
         let mock = Arc::new(InProcessMockController::new(hot_reload.clone(), |req| {
-            // Use a deterministic agg_id derived from the metric
-            // name (same strategy as DC's
-            // asapquery_backend::deterministic_agg_id from PR #156).
+            // Mock controller mints an explicit id here just to keep
+            // the test self-contained. In production, the
+            // `controller::emit::asapquery_backend` emitter no longer
+            // writes `aggregationId` (M2.2) and the backend derives
+            // one via `compute_agg_config_id`; explicit ids in the
+            // YAML are still honored for backwards compatibility.
             let id: u64 = {
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
@@ -5092,9 +5095,9 @@ mod e2e_feedback_loop_tests {
         assert_eq!(recorded[0].statistics, vec![Statistic::Sum]);
         assert_eq!(recorded[0].data_range_ms, Some(60_000));
 
-        // 9. And the aggregation_id is the deterministic hash the
-        //    planner produced — not a random value. This pins the
-        //    DC #156 deterministic_agg_id contract.
+        // 9. And the aggregation_id is the deterministic value the
+        //    mock controller produced — not a random one. Explicit
+        //    ids in YAML are still honored after M2.2.
         let new_ids: Vec<u64> = snap_after.aggregation_configs.keys().copied().collect();
         assert_eq!(new_ids.len(), 1);
         let id = new_ids[0];
@@ -5109,7 +5112,7 @@ mod e2e_feedback_loop_tests {
         };
         assert_eq!(
             id, expected_id,
-            "deterministic_agg_id contract: same metric → same id"
+            "explicit YAML aggregationId honored unchanged"
         );
     }
 
