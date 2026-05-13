@@ -371,6 +371,65 @@ async fn main() -> Result<()> {
     let sketch_index =
         Arc::new(data_plane::stores::sketch_db::index::SketchIndex::new());
 
+    // M2.3.6c — also start a persistence layer behind the SketchIndex
+    // when --persistence-enabled. SketchIndex is now where all
+    // precompute + sketch writes land (M2.3.6a), so flushing it to
+    // disk is what makes Phase 5 warm-tier state survive restarts.
+    // The legacy `SketchStore::with_persistence_per_key` flusher
+    // constructed above is now a no-op (its source has no writes) —
+    // it stays in place until subsequent M2.3.6 sub-PRs delete the
+    // legacy SketchStore wholesale.
+    let _sketch_index_persistence = if args.persistence_enabled {
+        use data_plane::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
+        let disk_path = args
+            .persistence_dir
+            .clone()
+            .expect("--persistence-enabled requires --persistence-dir");
+        let memory_limit_bytes = args.persistence_memory_limit_mb * 1024 * 1024;
+        let hot_window_ms = if args.persistence_hot_window_secs == 0 {
+            None
+        } else {
+            Some(args.persistence_hot_window_secs * 1000)
+        };
+        let delete_older_than_ms = if args.persistence_delete_older_than_secs == 0 {
+            None
+        } else {
+            Some(args.persistence_delete_older_than_secs * 1000)
+        };
+        let part_cache_bytes = args
+            .persistence_part_cache_mb
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or_else(|| {
+                let ten_pct = (memory_limit_bytes / 10) as u64;
+                ten_pct.min(512 * 1024 * 1024)
+            });
+        let index_persistence_dir =
+            std::path::PathBuf::from(&disk_path).join("sketch_index");
+        let cfg = SketchStorePersistenceConfig {
+            memory_limit_bytes,
+            memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
+            hard_cap_bytes: memory_limit_bytes * 125 / 100,
+            hot_window_ms,
+            delete_older_than_ms,
+            flush_interval: std::time::Duration::from_millis(
+                args.persistence_flush_interval_ms,
+            ),
+            disk_path: index_persistence_dir.clone(),
+            part_cache_bytes,
+        };
+        info!(
+            "SketchIndex persistence enabled: disk_path={:?}",
+            index_persistence_dir
+        );
+        Some(
+            sketch_index
+                .start_persistence(cfg)
+                .expect("SketchIndex::start_persistence failed"),
+        )
+    } else {
+        None
+    };
+
     // Setup query engine. ASAPQueryEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
     // to /api/v1/streaming-config is observable by the next query
