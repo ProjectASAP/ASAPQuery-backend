@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_yaml;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::enums::{QueryLanguage, WindowType};
 use crate::traits::SerializableToSink;
 use crate::utils::normalize_spatial_filter;
 use promql_utilities::data_model::KeyByLabelNames;
 use promql_utilities::query_logics::enums::AggregationType;
+use xxhash_rust::xxh64::xxh64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregationConfig {
@@ -46,6 +47,61 @@ pub struct AggregationIdInfo {
 }
 
 // TODO: need to implement deserialization methods
+
+/// Derive a stable `aggregation_id` from the agg-config content when the
+/// controller-emitted YAML omits the `aggregationId` field. Phase 5 M2
+/// follow-up: same (metric, agg_type, sub_type, parameters,
+/// grouping_labels) tuple always yields the same id, so the controller
+/// no longer needs to mint one. xxh64 keeps the id portable across
+/// hosts (vs `std::hash::DefaultHasher`, which is not stable).
+///
+/// Parameters are canonicalized via BTreeMap so map iteration order
+/// doesn't affect the result. The fingerprint format is private to
+/// this function — never persisted, never compared across versions.
+///
+/// 0 is reserved as a sentinel in legacy test fixtures; if a real
+/// input hashes to 0 (vanishingly unlikely), we perturb to 1.
+pub fn compute_agg_config_id(
+    metric: &str,
+    aggregation_type: &AggregationType,
+    aggregation_sub_type: &str,
+    parameters: &HashMap<String, Value>,
+    grouping_labels: &KeyByLabelNames,
+) -> u64 {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(metric.as_bytes());
+    buf.push(0);
+    // AggregationType: Serialize impl yields a stable string repr.
+    buf.extend_from_slice(
+        serde_json::to_string(aggregation_type)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    buf.push(0);
+    buf.extend_from_slice(aggregation_sub_type.as_bytes());
+    buf.push(0);
+    // Canonicalize parameters: sort by key, render each value via
+    // serde_json so nested structure is encoded deterministically.
+    let sorted: BTreeMap<&String, &Value> = parameters.iter().collect();
+    for (k, v) in sorted {
+        buf.extend_from_slice(k.as_bytes());
+        buf.push(b'=');
+        buf.extend_from_slice(serde_json::to_string(v).unwrap_or_default().as_bytes());
+        buf.push(b';');
+    }
+    buf.push(0);
+    // grouping_labels.labels is already sorted at construction.
+    for l in &grouping_labels.labels {
+        buf.extend_from_slice(l.as_bytes());
+        buf.push(b',');
+    }
+    let h = xxh64(&buf, 0);
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
 
 impl AggregationConfig {
     #[allow(clippy::too_many_arguments)]
@@ -110,9 +166,10 @@ impl AggregationConfig {
     pub fn deserialize_from_json(
         data: &Value,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let aggregation_id = data["aggregationId"]
-            .as_u64()
-            .ok_or("Missing aggregationId")?;
+        // M2 follow-up — `aggregationId` is now optional. When the
+        // controller-emitted YAML omits it, we derive a deterministic
+        // id from the agg-config content.
+        let explicit_id = data["aggregationId"].as_u64();
 
         let aggregation_type: AggregationType = data["aggregationType"]
             .as_str()
@@ -171,6 +228,16 @@ impl AggregationConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        let aggregation_id = explicit_id.unwrap_or_else(|| {
+            compute_agg_config_id(
+                &metric,
+                &aggregation_type,
+                &aggregation_sub_type,
+                &parameters,
+                &grouping_labels,
+            )
+        });
+
         Ok(Self::new(
             aggregation_id,
             aggregation_type,
@@ -204,9 +271,9 @@ impl AggregationConfig {
         num_aggregates_to_retain: Option<u64>,
         query_language: QueryLanguage,
     ) -> Result<Self, anyhow::Error> {
-        let aggregation_id = aggregation_data["aggregationId"]
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("Missing aggregationId"))?;
+        // M2 follow-up — `aggregationId` is optional. When the
+        // controller-emitted YAML omits it, derive from content below.
+        let explicit_id = aggregation_data["aggregationId"].as_u64();
 
         let labels = &aggregation_data["labels"];
         let grouping_labels = KeyByLabelNames::new(
@@ -292,6 +359,16 @@ impl AggregationConfig {
             }
         };
 
+        let aggregation_id = explicit_id.unwrap_or_else(|| {
+            compute_agg_config_id(
+                &metric,
+                &aggregation_type,
+                &aggregation_sub_type,
+                &parameters,
+                &grouping_labels,
+            )
+        });
+
         Ok(Self::new(
             aggregation_id,
             aggregation_type,
@@ -346,5 +423,99 @@ impl SerializableToSink for AggregationConfig {
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
         self.original_yaml.as_bytes().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_yaml(with_id: bool) -> serde_yaml::Value {
+        let id_line = if with_id { "aggregationId: 42\n" } else { "" };
+        let yaml = format!(
+            "{id_line}aggregationType: DDSketch\naggregationSubType: ''\nmetric: http_latency_ms\nlabels:\n  grouping: [zone]\n  rollup: []\n  aggregated: []\nparameters:\n  relative_accuracy: 0.01\nwindowSize: 30\nwindowType: tumbling\nspatialFilter: ''\n",
+            id_line = id_line
+        );
+        serde_yaml::from_str(&yaml).expect("yaml parses")
+    }
+
+    #[test]
+    fn explicit_aggregation_id_is_honored() {
+        let cfg = AggregationConfig::from_yaml_data(
+            &sample_yaml(true),
+            None,
+            QueryLanguage::promql,
+        )
+        .expect("parse ok");
+        assert_eq!(cfg.aggregation_id, 42);
+    }
+
+    #[test]
+    fn missing_aggregation_id_is_derived_deterministically() {
+        let a = AggregationConfig::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::promql,
+        )
+        .expect("parse without id");
+        let b = AggregationConfig::from_yaml_data(
+            &sample_yaml(false),
+            None,
+            QueryLanguage::promql,
+        )
+        .expect("parse without id again");
+        assert_eq!(
+            a.aggregation_id, b.aggregation_id,
+            "same content yields same derived id"
+        );
+        assert_ne!(a.aggregation_id, 0, "derived id is never the 0 sentinel");
+    }
+
+    #[test]
+    fn derived_id_changes_with_metric() {
+        let mut params = HashMap::new();
+        params.insert("relative_accuracy".to_string(), serde_json::json!(0.01));
+        let grouping = KeyByLabelNames::new(vec!["zone".to_string()]);
+        let a = compute_agg_config_id(
+            "http_latency_ms",
+            &AggregationType::DDSketch,
+            "",
+            &params,
+            &grouping,
+        );
+        let b = compute_agg_config_id(
+            "cpu_seconds",
+            &AggregationType::DDSketch,
+            "",
+            &params,
+            &grouping,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derived_id_changes_with_parameters() {
+        let grouping = KeyByLabelNames::new(vec!["zone".to_string()]);
+        let mut p1 = HashMap::new();
+        p1.insert("relative_accuracy".to_string(), serde_json::json!(0.01));
+        let mut p2 = HashMap::new();
+        p2.insert("relative_accuracy".to_string(), serde_json::json!(0.005));
+        let a = compute_agg_config_id("m", &AggregationType::DDSketch, "", &p1, &grouping);
+        let b = compute_agg_config_id("m", &AggregationType::DDSketch, "", &p2, &grouping);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derived_id_independent_of_parameters_insertion_order() {
+        let grouping = KeyByLabelNames::new(vec!["zone".to_string()]);
+        let mut p_ab = HashMap::new();
+        p_ab.insert("alpha".to_string(), serde_json::json!(1));
+        p_ab.insert("beta".to_string(), serde_json::json!(2));
+        let mut p_ba = HashMap::new();
+        p_ba.insert("beta".to_string(), serde_json::json!(2));
+        p_ba.insert("alpha".to_string(), serde_json::json!(1));
+        let a = compute_agg_config_id("m", &AggregationType::DDSketch, "", &p_ab, &grouping);
+        let b = compute_agg_config_id("m", &AggregationType::DDSketch, "", &p_ba, &grouping);
+        assert_eq!(a, b);
     }
 }
