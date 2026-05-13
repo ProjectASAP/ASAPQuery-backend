@@ -120,9 +120,11 @@ mod tests {
     use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap as StdHashMap;
 
-    fn cfg(id: u64, metric: &str) -> AggregationConfig {
+    fn cfg(_id: u64, metric: &str) -> AggregationConfig {
+        // `_id` is unused after PR 5 — identity is derived from
+        // content. Kept as a parameter so existing call sites in the
+        // tests below don't churn.
         AggregationConfig::new(
-            id,
             AggregationType::Sum,
             String::new(),
             StdHashMap::new(),
@@ -154,11 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn aggregation_id_does_not_affect_indexing() {
-        // Two configs with different aggregation_ids but otherwise
-        // identical content collapse to ONE entry (because their
-        // fingerprints are equal). This is the content-addressing
-        // contract.
+    fn identical_configs_collapse_to_one_entry() {
+        // PR 5: identity IS the content. Two configs that are
+        // byte-for-byte identical on the policy-relevant fields
+        // collapse to ONE entry — there's no way to distinguish them
+        // anymore.
         let a = cfg(1, "http_lat");
         let b = cfg(99, "http_lat");
         let (reg, collisions) = PolicyRegistry::from_configs_with_collisions(vec![a, b]);
@@ -169,7 +171,7 @@ mod tests {
     #[test]
     fn distinct_policies_keep_distinct_entries() {
         let a = cfg(1, "http_lat");
-        let b = cfg(1, "cpu_pct"); // same id, different metric → distinct policies
+        let b = cfg(1, "cpu_pct"); // different metric → distinct policies
         let (reg, collisions) = PolicyRegistry::from_configs_with_collisions(vec![a, b]);
         assert_eq!(reg.len(), 2);
         assert_eq!(collisions, 0);

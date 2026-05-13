@@ -21,6 +21,10 @@ mod tests {
 
     #[test]
     fn test_read_streaming_config() {
+        // PR 5: `aggregationId: 1` is silently dropped on read — the
+        // streaming-config map key is the policy fingerprint derived
+        // from content. The legacy field stays in this fixture to
+        // exercise the "ignored cleanly" path.
         let streaming_yaml_content = r#"
 aggregations:
 - aggregationId: 1
@@ -46,7 +50,11 @@ aggregations:
         let config =
             read_streaming_config(streaming_temp_file.path().to_str().unwrap()).unwrap();
         assert!(!config.aggregation_configs.is_empty());
-        let agg = config.get_aggregation_config(1).expect("agg 1");
+        let agg = config
+            .get_all_aggregation_configs()
+            .values()
+            .next()
+            .expect("one agg");
         assert_eq!(agg.num_aggregates_to_retain, Some(6));
     }
 }

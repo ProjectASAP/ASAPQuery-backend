@@ -312,14 +312,15 @@ mod tests {
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;
 
-    fn sum_config(agg_id: u64, metric: &str, grouping: Vec<&str>) -> AggregationConfig {
+    fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> AggregationConfig {
+        // `_agg_id` is unused after PR 5 — identity is content-addressed
+        // via `PolicyFingerprint::from_config`.
         let grouping_labels = if grouping.is_empty() {
             KeyByLabelNames::empty()
         } else {
             KeyByLabelNames::from_names(grouping.into_iter().map(String::from).collect())
         };
         AggregationConfig::new(
-            agg_id,
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -340,18 +341,19 @@ mod tests {
 
     fn streaming_config_with(config: AggregationConfig) -> Arc<StreamingConfig> {
         let mut map = std::collections::HashMap::new();
-        map.insert(config.aggregation_id, config);
+        map.insert(config.aggregation_id(), config);
         Arc::new(StreamingConfig::new(map))
     }
 
     #[tokio::test]
     async fn happy_path_writes_one_output_per_group() {
         let cfg = sum_config(1, "latency", vec!["svc"]);
+        let fp = cfg.aggregation_id();
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
-            1,
+            fp,
             (0, 100),
             BackfillSource::Prometheus { url: "x".into() },
             1,
@@ -380,13 +382,13 @@ mod tests {
             },
         ];
         processor
-            .process_window(1, (0, 100), samples)
+            .process_window(fp, (0, 100), samples)
             .await
             .expect("happy path");
 
         // Registry records exactly one (agg_id, range) entry (per-window, not per-group).
         let written = registry.windows_written_by(job_id);
-        assert_eq!(written, vec![(1u64, (0u64, 100u64))]);
+        assert_eq!(written, vec![(fp, (0u64, 100u64))]);
     }
 
     #[tokio::test]
@@ -414,18 +416,19 @@ mod tests {
     #[tokio::test]
     async fn empty_samples_complete_without_write() {
         let cfg = sum_config(1, "m", vec![]);
+        let fp = cfg.aggregation_id();
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
-            1,
+            fp,
             (0, 10),
             BackfillSource::Prometheus { url: "x".into() },
             1,
         );
         let processor =
             BackfillWindowProcessor::new(hot, registry.clone(), job_id);
-        processor.process_window(1, (0, 10), vec![]).await.unwrap();
+        processor.process_window(fp, (0, 10), vec![]).await.unwrap();
         // Empty window: no provenance record (nothing was written).
         assert!(registry.windows_written_by(job_id).is_empty());
     }
@@ -435,11 +438,12 @@ mod tests {
         // Exercise the full chain: BackfillWorker drives the
         // processor over a job that covers 4 windows.
         let cfg = sum_config(1, "latency", vec!["svc"]);
+        let fp = cfg.aggregation_id();
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
-            1,
+            fp,
             (0, 40),
             BackfillSource::Prometheus { url: "x".into() },
             4,
@@ -491,10 +495,10 @@ mod tests {
         assert_eq!(written.len(), 4);
         // Each recorded window corresponds to a writable window
         // (non-empty). Ordering is the worker's iteration order.
-        assert_eq!(written[0], (1, (0, 10)));
-        assert_eq!(written[1], (1, (10, 20)));
-        assert_eq!(written[2], (1, (20, 30)));
-        assert_eq!(written[3], (1, (30, 40)));
+        assert_eq!(written[0], (fp, (0, 10)));
+        assert_eq!(written[1], (fp, (10, 20)));
+        assert_eq!(written[2], (fp, (20, 30)));
+        assert_eq!(written[3], (fp, (30, 40)));
 
         // Smoke test: the worker didn't fail mid-run. Window
         // assertions above are sufficient.
@@ -590,6 +594,7 @@ mod tests {
     fn create_checked_rejects_end_past_created_at() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
+        let expected_fp = cfg.aggregation_id();
         let created = now_ms();
         let registry = BackfillRegistry::new();
 
@@ -605,7 +610,7 @@ mod tests {
             )
             .expect_err("overlap should be rejected");
         match err {
-            CreateError::Overlap { agg_id, .. } => assert_eq!(agg_id, 1),
+            CreateError::Overlap { agg_id, .. } => assert_eq!(agg_id, expected_fp),
             other => panic!("expected Overlap, got {other:?}"),
         }
     }
@@ -639,6 +644,7 @@ mod tests {
     fn create_checked_rejects_start_older_than_data_retention() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
+        let expected_fp = cfg.aggregation_id();
         let created = now_ms();
         let registry = BackfillRegistry::new();
         // Created-at is now_ms(), so data retention of 1 hour with
@@ -660,7 +666,7 @@ mod tests {
                 requested_start_ms,
                 earliest_retained_ms,
             } => {
-                assert_eq!(agg_id, 1);
+                assert_eq!(agg_id, expected_fp);
                 assert_eq!(requested_start_ms, 0);
                 assert!(earliest_retained_ms > 0);
             }

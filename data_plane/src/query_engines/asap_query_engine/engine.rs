@@ -4736,9 +4736,9 @@ mod hot_reload_phase2_tests {
         StreamingConfig, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
-    fn dummy_agg(id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+    fn dummy_agg(_id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed.
         crate::storage_engines::types::AggregationConfig::new(
-            id,
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -4757,10 +4757,14 @@ mod hot_reload_phase2_tests {
         )
     }
 
-    fn cfg_with_agg(id: u64, metric: &str) -> StreamingConfig {
+    /// Returns the StreamingConfig and the policy-fingerprint u64 that
+    /// became the map key for the single inserted agg.
+    fn cfg_with_agg(id: u64, metric: &str) -> (StreamingConfig, u64) {
         let mut map = std::collections::HashMap::new();
-        map.insert(id, dummy_agg(id, metric));
-        StreamingConfig::new(map)
+        let cfg = dummy_agg(id, metric);
+        let fp = cfg.aggregation_id();
+        map.insert(fp, cfg);
+        (StreamingConfig::new(map), fp)
     }
 
     fn build_engine(handle: HotReloadStreamingConfig) -> ASAPQueryEngine {
@@ -4770,11 +4774,12 @@ mod hot_reload_phase2_tests {
 
     #[test]
     fn streaming_config_snapshot_starts_at_initial_config() {
-        let handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let (cfg, fp) = cfg_with_agg(101, "metric_a");
+        let handle = HotReloadStreamingConfig::new(cfg);
         let engine = build_engine(handle);
         let snap = engine.streaming_config_snapshot();
         assert_eq!(snap.aggregation_configs.len(), 1);
-        assert!(snap.aggregation_configs.contains_key(&101));
+        assert!(snap.aggregation_configs.contains_key(&fp));
     }
 
     #[test]
@@ -4784,34 +4789,35 @@ mod hot_reload_phase2_tests {
         // effect on the next snapshot call — this is the guarantee
         // that makes POST /api/v1/streaming-config actually useful
         // for query-time behavior.
-        let handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let (cfg_a, fp_a) = cfg_with_agg(101, "metric_a");
+        let (cfg_b, fp_b) = cfg_with_agg(202, "metric_b");
+        let handle = HotReloadStreamingConfig::new(cfg_a);
         let engine = build_engine(handle.clone());
 
-        // Initial snapshot: id 101 only.
+        // Initial snapshot: metric_a only.
         let snap_before = engine.streaming_config_snapshot();
         assert_eq!(snap_before.aggregation_configs.len(), 1);
-        assert!(snap_before.aggregation_configs.contains_key(&101));
-        assert!(!snap_before.aggregation_configs.contains_key(&202));
+        assert!(snap_before.aggregation_configs.contains_key(&fp_a));
+        assert!(!snap_before.aggregation_configs.contains_key(&fp_b));
 
         // Simulate a control plane push via `HotReloadStreamingConfig::swap`.
         // Clones of the handle share the same underlying ArcSwap, so a
         // swap on `handle` is observable through the engine's stored
         // clone.
-        handle.swap(cfg_with_agg(202, "metric_b"));
+        handle.swap(cfg_b);
 
-        // Next snapshot: id 202, id 101 gone. This is exactly what a
-        // POST-push-then-query sequence must produce.
+        // Next snapshot: metric_b, metric_a gone.
         let snap_after = engine.streaming_config_snapshot();
         assert_eq!(snap_after.aggregation_configs.len(), 1);
-        assert!(snap_after.aggregation_configs.contains_key(&202));
-        assert!(!snap_after.aggregation_configs.contains_key(&101));
+        assert!(snap_after.aggregation_configs.contains_key(&fp_b));
+        assert!(!snap_after.aggregation_configs.contains_key(&fp_a));
 
         // The old snapshot is still internally consistent — it's a
         // separate Arc that was cheap-cloned before the swap and
         // continues to reflect the pre-swap state. This matches the
         // per-query-entry-snapshot contract: a query that started
         // before the swap sees old config for its entire execution.
-        assert!(snap_before.aggregation_configs.contains_key(&101));
+        assert!(snap_before.aggregation_configs.contains_key(&fp_a));
     }
 
     #[test]
@@ -4821,7 +4827,8 @@ mod hot_reload_phase2_tests {
         // internally, so external swaps must NOT leak in. This is
         // the behavior tests and binaries that don't own a shared
         // handle depend on.
-        let external_handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
+        let (cfg_a, fp_a) = cfg_with_agg(101, "metric_a");
+        let external_handle = HotReloadStreamingConfig::new(cfg_a);
         let streaming_config = external_handle.snapshot();
 
         let engine = ASAPQueryEngine::new(streaming_config, 15000);
@@ -4829,16 +4836,17 @@ mod hot_reload_phase2_tests {
         // External swap should NOT be visible inside the engine — the
         // legacy constructor snapshotted the initial Arc into its own
         // fresh hot-reload wrapper.
-        external_handle.swap(cfg_with_agg(999, "metric_swapped"));
+        let (cfg_swapped, fp_swapped) = cfg_with_agg(999, "metric_swapped");
+        external_handle.swap(cfg_swapped);
 
         let engine_snap = engine.streaming_config_snapshot();
         assert_eq!(engine_snap.aggregation_configs.len(), 1);
         assert!(
-            engine_snap.aggregation_configs.contains_key(&101),
+            engine_snap.aggregation_configs.contains_key(&fp_a),
             "legacy `new` constructor should pin the initial config, \
              external swaps to unrelated handles must not leak in"
         );
-        assert!(!engine_snap.aggregation_configs.contains_key(&999));
+        assert!(!engine_snap.aggregation_configs.contains_key(&fp_swapped));
     }
 }
 
@@ -4876,9 +4884,9 @@ mod e2e_feedback_loop_tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    fn agg_for_metric(id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+    fn agg_for_metric(_id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed.
         crate::storage_engines::types::AggregationConfig::new(
-            id,
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -4899,7 +4907,8 @@ mod e2e_feedback_loop_tests {
 
     fn streaming_config_with(metric: &str, id: u64) -> StreamingConfig {
         let mut map = std::collections::HashMap::new();
-        map.insert(id, agg_for_metric(id, metric));
+        let cfg = agg_for_metric(id, metric);
+        map.insert(cfg.aggregation_id(), cfg);
         StreamingConfig::new(map)
     }
 
@@ -5069,25 +5078,14 @@ mod e2e_feedback_loop_tests {
         assert_eq!(recorded[0].statistics, vec![Statistic::Sum]);
         assert_eq!(recorded[0].data_range_ms, Some(60_000));
 
-        // 9. And the aggregation_id is the deterministic value the
-        //    mock controller produced — not a random one. Explicit
-        //    ids in YAML are still honored after M2.2.
+        // 9. PR 5: the aggregation_id on the wire is now a content-
+        //    addressed `PolicyFingerprint` derived from the agg's
+        //    metric / type / parameters. Pinning the exact id would
+        //    couple the test to the fingerprint algorithm; instead
+        //    assert it's deterministic-non-zero.
         let new_ids: Vec<u64> = snap_after.aggregation_configs.keys().copied().collect();
         assert_eq!(new_ids.len(), 1);
-        let id = new_ids[0];
-        // Re-derive the expected id using the same algorithm as the
-        // planner closure above.
-        let expected_id: u64 = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            "http_requests_total".hash(&mut h);
-            h.finish().saturating_add(1)
-        };
-        assert_eq!(
-            id, expected_id,
-            "explicit YAML aggregationId honored unchanged"
-        );
+        assert_ne!(new_ids[0], 0, "fingerprint is never the 0 sentinel");
     }
 
     /// Second-order check: after the loop closes, a repeat miss on
@@ -5145,10 +5143,11 @@ mod e2e_feedback_loop_tests {
         let second = engine.find_compatible_aggregation_with_miss_notify(&requirements);
         let after_count = mock.call_count.load(Ordering::Relaxed);
 
-        // At minimum: the snapshot is populated.
+        // At minimum: the snapshot is populated. PR 5: keys are
+        // content-addressed fingerprints, so we just assert the entry
+        // count rather than a specific u64.
         let snap = engine.streaming_config_snapshot();
         assert_eq!(snap.aggregation_configs.len(), 1);
-        assert!(snap.aggregation_configs.contains_key(&42));
 
         // Second call fires at most once more — the point is that
         // the runtime doesn't spin into a loop retrying the same
@@ -5393,15 +5392,24 @@ mod forced_agg_id_tests {
             data,
             query,
         );
+        // PR 5: `create_engine_single_pop` keys the streaming config
+        // on the policy fingerprint; pull the only id out of the live
+        // snapshot rather than hardcoding `1`.
+        let agg_id = *engine
+            .streaming_config_snapshot()
+            .aggregation_configs
+            .keys()
+            .next()
+            .expect("one agg config registered");
         let ctx = engine.build_query_execution_context_promql_for_agg_id(
             query.to_string(),
             1000.0,
-            1, // `create_engine_single_pop` wires agg_id=1
+            agg_id,
         );
         assert!(ctx.is_some(), "forced valid agg_id should yield a context");
         let ctx = ctx.unwrap();
-        assert_eq!(ctx.agg_info.aggregation_id_for_value, 1);
-        assert_eq!(ctx.agg_info.aggregation_id_for_key, 1);
+        assert_eq!(ctx.agg_info.aggregation_id_for_value, agg_id);
+        assert_eq!(ctx.agg_info.aggregation_id_for_key, agg_id);
     }
 
     /// Unknown `agg_id` returns `None` without panicking or
@@ -5450,11 +5458,17 @@ mod forced_agg_id_tests {
             data,
             query,
         );
+        let agg_id = *engine
+            .streaming_config_snapshot()
+            .aggregation_configs
+            .keys()
+            .next()
+            .expect("one agg config registered");
         let auto = engine
             .build_query_execution_context_promql(query.to_string(), 1000.0)
             .unwrap();
         let forced = engine
-            .build_query_execution_context_promql_for_agg_id(query.to_string(), 1000.0, 1)
+            .build_query_execution_context_promql_for_agg_id(query.to_string(), 1000.0, agg_id)
             .unwrap();
         assert_eq!(
             auto.agg_info.aggregation_id_for_value,
@@ -5494,9 +5508,9 @@ mod sketch_alias_resolver_tests {
         StreamingConfig, WindowType};
     use std::sync::Arc;
 
-    fn agg_for(id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
+    fn agg_for(_id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed.
         AggregationConfig::new(
-            id,
             agg_type,
             String::new(),
             HashMap::new(),

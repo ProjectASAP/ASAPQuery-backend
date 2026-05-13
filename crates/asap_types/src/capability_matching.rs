@@ -443,7 +443,7 @@ pub fn find_compatible_aggregation(
                     );
                 if !ok {
                     debug!(
-                        agg_id = c.aggregation_id,
+                        agg_id = c.aggregation_id(),
                         agg_type = %c.aggregation_type,
                         metric = %c.metric,
                         window_size_s = c.window_size,
@@ -469,7 +469,7 @@ pub fn find_compatible_aggregation(
         debug!(
             statistic = ?stat,
             num_candidates = candidates.len(),
-            chosen_agg_id = candidates[0].aggregation_id,
+            chosen_agg_id = candidates[0].aggregation_id(),
             chosen_agg_type = %candidates[0].aggregation_type,
             chosen_window_size_s = candidates[0].window_size,
             "capability matching: found candidates, chose best",
@@ -518,17 +518,17 @@ pub fn find_compatible_aggregation(
 
     debug!(
         metric = %requirements.metric,
-        value_agg_id = value_agg.aggregation_id,
+        value_agg_id = value_agg.aggregation_id(),
         value_agg_type = %value_agg.aggregation_type,
-        key_agg_id = key_agg.aggregation_id,
+        key_agg_id = key_agg.aggregation_id(),
         key_agg_type = %key_agg.aggregation_type,
         "capability matching: resolved",
     );
 
     Some(AggregationIdInfo {
-        aggregation_id_for_value: value_agg.aggregation_id,
+        aggregation_id_for_value: value_agg.aggregation_id(),
         aggregation_type_for_value: value_agg.aggregation_type,
-        aggregation_id_for_key: key_agg.aggregation_id,
+        aggregation_id_for_key: key_agg.aggregation_id(),
         aggregation_type_for_key: key_agg.aggregation_type,
     })
 }
@@ -546,7 +546,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn make_config(
-        id: u64,
+        _id: u64,
         metric: &str,
         agg_type: &str,
         sub_type: &str,
@@ -555,11 +555,14 @@ mod tests {
         grouping: &[&str],
         spatial_filter: &str,
     ) -> AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed
+        // via `PolicyFingerprint::from_config`. Kept as a parameter so
+        // the wide-coverage assertions in this module's test cases
+        // don't churn.
         let grouping_labels =
             KeyByLabelNames::new(grouping.iter().map(|s| s.to_string()).collect());
         let spatial_filter_normalized = normalize_spatial_filter(spatial_filter);
         AggregationConfig {
-            aggregation_id: id,
             aggregation_type: agg_type.parse::<AggregationType>().expect("valid agg type"),
             aggregation_sub_type: sub_type.to_string(),
             parameters: HashMap::new(),
@@ -597,7 +600,7 @@ mod tests {
 
     fn single_config(config: AggregationConfig) -> HashMap<u64, AggregationConfig> {
         let mut m = HashMap::new();
-        m.insert(config.aggregation_id, config);
+        m.insert(config.aggregation_id(), config);
         m
     }
 
@@ -605,27 +608,22 @@ mod tests {
 
     #[test]
     fn basic_sum_match() {
-        let configs = single_config(make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], ""));
+        let cfg = make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], "");
+        let expected = cfg.aggregation_id();
+        let configs = single_config(cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req("cpu", &[Statistic::Sum], Some(300_000), &[], ""),
         );
         assert!(result.is_some());
-        assert_eq!(result.unwrap().aggregation_id_for_value, 1);
+        assert_eq!(result.unwrap().aggregation_id_for_value, expected);
     }
 
     #[test]
     fn quantile_any_value_finds_kll() {
-        let configs = single_config(make_config(
-            2,
-            "lat",
-            "DatasketchesKLL",
-            "",
-            300,
-            "tumbling",
-            &[],
-            "",
-        ));
+        let cfg = make_config(2, "lat", "DatasketchesKLL", "", 300, "tumbling", &[], "");
+        let expected = cfg.aggregation_id();
+        let configs = single_config(cfg);
         // quantile value (0.5 or 0.9) is NOT part of QueryRequirements — both should find the same config
         let r1 = find_compatible_aggregation(
             &configs,
@@ -635,27 +633,20 @@ mod tests {
             &configs,
             &req("lat", &[Statistic::Quantile], Some(300_000), &[], ""),
         );
-        assert_eq!(r1.unwrap().aggregation_id_for_value, 2);
-        assert_eq!(r2.unwrap().aggregation_id_for_value, 2);
+        assert_eq!(r1.unwrap().aggregation_id_for_value, expected);
+        assert_eq!(r2.unwrap().aggregation_id_for_value, expected);
     }
 
     #[test]
     fn quantile_matches_hydrarkll() {
-        let configs = single_config(make_config(
-            3,
-            "lat",
-            "HydraKLL",
-            "",
-            300,
-            "tumbling",
-            &[],
-            "",
-        ));
+        let cfg = make_config(3, "lat", "HydraKLL", "", 300, "tumbling", &[], "");
+        let expected = cfg.aggregation_id();
+        let configs = single_config(cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req("lat", &[Statistic::Quantile], Some(300_000), &[], ""),
         );
-        assert_eq!(result.unwrap().aggregation_id_for_value, 3);
+        assert_eq!(result.unwrap().aggregation_id_for_value, expected);
     }
 
     #[test]
@@ -744,21 +735,18 @@ mod tests {
 
     #[test]
     fn window_priority_largest_wins() {
+        let small = make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], "");
+        let large = make_config(2, "cpu", "Sum", "", 900, "tumbling", &[], "");
+        let expected = large.aggregation_id();
         let mut configs = HashMap::new();
-        configs.insert(
-            1,
-            make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], ""),
-        );
-        configs.insert(
-            2,
-            make_config(2, "cpu", "Sum", "", 900, "tumbling", &[], ""),
-        );
+        configs.insert(small.aggregation_id(), small);
+        configs.insert(large.aggregation_id(), large);
         // 900_000 ms is divisible by both 300 s and 900 s — prefer 900 s
         let result = find_compatible_aggregation(
             &configs,
             &req("cpu", &[Statistic::Sum], Some(900_000), &[], ""),
         );
-        assert_eq!(result.unwrap().aggregation_id_for_value, 2);
+        assert_eq!(result.unwrap().aggregation_id_for_value, expected);
     }
 
     #[test]
@@ -986,40 +974,21 @@ mod tests {
 
     #[test]
     fn multi_pop_finds_key_agg() {
+        let value_cfg =
+            make_config(10, "req", "CountMinSketchWithHeap", "", 300, "tumbling", &[], "");
+        let key_cfg = make_config(11, "req", "DeltaSetAggregator", "", 300, "tumbling", &[], "");
+        let expected_value = value_cfg.aggregation_id();
+        let expected_key = key_cfg.aggregation_id();
         let mut configs = HashMap::new();
-        configs.insert(
-            10,
-            make_config(
-                10,
-                "req",
-                "CountMinSketchWithHeap",
-                "",
-                300,
-                "tumbling",
-                &[],
-                "",
-            ),
-        );
-        configs.insert(
-            11,
-            make_config(
-                11,
-                "req",
-                "DeltaSetAggregator",
-                "",
-                300,
-                "tumbling",
-                &[],
-                "",
-            ),
-        );
+        configs.insert(value_cfg.aggregation_id(), value_cfg);
+        configs.insert(key_cfg.aggregation_id(), key_cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req("req", &[Statistic::Topk], Some(300_000), &[], ""),
         );
         let info = result.unwrap();
-        assert_eq!(info.aggregation_id_for_value, 10);
-        assert_eq!(info.aggregation_id_for_key, 11);
+        assert_eq!(info.aggregation_id_for_value, expected_value);
+        assert_eq!(info.aggregation_id_for_key, expected_key);
     }
 
     #[test]
@@ -1046,24 +1015,11 @@ mod tests {
 
     #[test]
     fn avg_finds_sum_and_count() {
+        let sum = make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], "");
+        let cnt = make_config(2, "cpu", "CountMinSketch", "", 300, "tumbling", &["job"], "");
         let mut configs = HashMap::new();
-        configs.insert(
-            1,
-            make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], ""),
-        );
-        configs.insert(
-            2,
-            make_config(
-                2,
-                "cpu",
-                "CountMinSketch",
-                "",
-                300,
-                "tumbling",
-                &["job"],
-                "",
-            ),
-        );
+        configs.insert(sum.aggregation_id(), sum);
+        configs.insert(cnt.aggregation_id(), cnt);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1079,25 +1035,12 @@ mod tests {
 
     #[test]
     fn avg_different_windows_rejected() {
-        let mut configs = HashMap::new();
-        configs.insert(
-            1,
-            make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], ""),
-        );
+        let sum = make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], "");
         // Count config has different window_size — must be rejected
-        configs.insert(
-            2,
-            make_config(
-                2,
-                "cpu",
-                "CountMinSketch",
-                "",
-                900,
-                "tumbling",
-                &["job"],
-                "",
-            ),
-        );
+        let cnt = make_config(2, "cpu", "CountMinSketch", "", 900, "tumbling", &["job"], "");
+        let mut configs = HashMap::new();
+        configs.insert(sum.aggregation_id(), sum);
+        configs.insert(cnt.aggregation_id(), cnt);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1260,20 +1203,19 @@ mod tests {
     /// agg cleanly.
     #[test]
     fn ddsketch_resolves_quantile_query_post_fix() {
-        let mut configs = HashMap::new();
-        configs.insert(
+        let cfg = make_config(
             42,
-            make_config(
-                42,
-                "http_requests_total_latency_ms",
-                "DDSketch",
-                "",
-                60,
-                "tumbling",
-                &[],
-                "",
-            ),
+            "http_requests_total_latency_ms",
+            "DDSketch",
+            "",
+            60,
+            "tumbling",
+            &[],
+            "",
         );
+        let expected = cfg.aggregation_id();
+        let mut configs = HashMap::new();
+        configs.insert(cfg.aggregation_id(), cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1287,11 +1229,11 @@ mod tests {
         let info = result.expect(
             "post-fix: capability matching must resolve quantile_over_time against a DDSketch-only config",
         );
-        assert_eq!(info.aggregation_id_for_value, 42);
+        assert_eq!(info.aggregation_id_for_value, expected);
         assert_eq!(info.aggregation_type_for_value, AggregationType::DDSketch);
         // DDSketch is single-population (not is_multi_population_value_type),
         // so the matcher pairs it with itself for the key agg.
-        assert_eq!(info.aggregation_id_for_key, 42);
+        assert_eq!(info.aggregation_id_for_key, expected);
     }
 
     /// Regression test for the pre-fix bug: a query for `Statistic::Sum`
@@ -1301,35 +1243,33 @@ mod tests {
     /// `DeltaSetAggregator` key aggregation.
     #[test]
     fn cms_resolves_sum_query_post_fix() {
-        let mut configs = HashMap::new();
-        configs.insert(
+        let value_cfg = make_config(
             42,
-            make_config(
-                42,
-                "http_requests_total",
-                "CountMinSketch",
-                "sum",
-                300,
-                "tumbling",
-                &[],
-                "",
-            ),
+            "http_requests_total",
+            "CountMinSketch",
+            "sum",
+            300,
+            "tumbling",
+            &[],
+            "",
         );
         // CountMinSketch is a multi-population value type and
         // `find_compatible_aggregation` requires a paired key aggregation.
-        configs.insert(
+        let key_cfg = make_config(
             43,
-            make_config(
-                43,
-                "http_requests_total",
-                "DeltaSetAggregator",
-                "",
-                300,
-                "tumbling",
-                &[],
-                "",
-            ),
+            "http_requests_total",
+            "DeltaSetAggregator",
+            "",
+            300,
+            "tumbling",
+            &[],
+            "",
         );
+        let expected_value = value_cfg.aggregation_id();
+        let expected_key = key_cfg.aggregation_id();
+        let mut configs = HashMap::new();
+        configs.insert(value_cfg.aggregation_id(), value_cfg);
+        configs.insert(key_cfg.aggregation_id(), key_cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1343,12 +1283,12 @@ mod tests {
         let info = result.expect(
             "post-fix: capability matching must resolve sum_over_time against a CMS-only config",
         );
-        assert_eq!(info.aggregation_id_for_value, 42);
+        assert_eq!(info.aggregation_id_for_value, expected_value);
         assert_eq!(
             info.aggregation_type_for_value,
             AggregationType::CountMinSketch
         );
-        assert_eq!(info.aggregation_id_for_key, 43);
+        assert_eq!(info.aggregation_id_for_key, expected_key);
     }
 
     // -----------------------------------------------------------------------

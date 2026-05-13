@@ -828,7 +828,6 @@ mod tests {
 
         let make_config = |agg_type: AggregationType, sub_type: &str| {
             AggregationConfig::new(
-                1,
                 agg_type,
                 sub_type.to_string(),
                 HashMap::new(),
@@ -911,7 +910,6 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("K".to_string(), serde_json::Value::from(50_u64));
         let config = AggregationConfig::new(
-            1,
             AggregationType::SingleSubpopulation,
             "DatasketchesKLL".to_string(),
             params,

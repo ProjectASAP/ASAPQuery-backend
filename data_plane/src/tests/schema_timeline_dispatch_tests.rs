@@ -35,9 +35,9 @@ const METRIC: &str = "sensor_reading";
 const QUERY_TIME_SEC: f64 = 501.0;
 const QUERY_TIME_MS: u64 = 501_000;
 
-fn make_agg_config(id: u64) -> AggregationConfig {
+fn make_agg_config(_id: u64) -> AggregationConfig {
+    // `_id` is unused after PR 5 — identity is content-addressed.
     AggregationConfig::new(
-        id,
         AggregationType::Sum,
         String::new(),
         HashMap::new(),
@@ -130,15 +130,17 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
 /// path handles the query, no warnings attach.
 #[test]
 fn single_schema_query_falls_through_to_default_path() {
+    let cfg = make_agg_config(7);
+    let agg_id = cfg.aggregation_id();
     let mut agg_map = HashMap::new();
-    agg_map.insert(7u64, make_agg_config(7));
+    agg_map.insert(agg_id, cfg);
     let streaming_config = Arc::new(StreamingConfig::new(agg_map));
 
     let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     // Single ingest registers exactly one sid in the catalog → the
     // sid-level `timeline_for_metric` returns one segment → the
     // dispatcher bails to the default single-agg path.
-    seed_sum_at(&sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
+    seed_sum_at(&sketch_index, &streaming_config, agg_id, QUERY_TIME_MS, "A", 42.0);
 
     let engine = build_engine(streaming_config, sketch_index);
 

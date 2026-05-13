@@ -63,10 +63,12 @@ pub struct PolicyFingerprint(pub u64);
 
 impl PolicyFingerprint {
     /// Sentinel "unset / legacy" fingerprint produced by
-    /// `PolicyFingerprint::default()`. Callers that haven't yet been
-    /// migrated to compute the real fingerprint hand this through;
-    /// downstream consumers (sinks, registries) treat it as
-    /// "fall back to `aggregation_id` lookup". Removed in PR 5.
+    /// `PolicyFingerprint::default()`. PR 5 retired the
+    /// `aggregation_id` field on `AggregationConfig`, so there's no
+    /// legacy id to fall back to anymore — production sinks now treat
+    /// `UNSET` as a control-plane bug worth surfacing. Callers should
+    /// always populate `policy_fp` via [`Self::from_config`] at
+    /// construction.
     pub const UNSET: PolicyFingerprint = PolicyFingerprint(0);
 
     /// True when this fingerprint is the [`Self::UNSET`] sentinel.
@@ -186,7 +188,6 @@ mod tests {
         spatial_filter: &str,
     ) -> AggregationConfig {
         AggregationConfig::new(
-            0,
             agg_type,
             String::new(),
             params,
@@ -254,16 +255,17 @@ mod tests {
         assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
     }
 
+    /// Pre-PR-5 the `aggregation_id` field on `AggregationConfig` was
+    /// excluded from the fingerprint hash. PR 5 deletes the field
+    /// entirely — identity *is* the fingerprint — so this is now
+    /// vacuously true. Kept as a doc-comment anchor; no runtime test
+    /// is needed.
     #[test]
-    fn aggregation_id_does_not_affect_fingerprint() {
-        let mut a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
-        let mut b = a.clone();
-        a.aggregation_id = 7;
-        b.aggregation_id = 42;
+    fn aggregation_id_accessor_equals_fingerprint_u64() {
+        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
         assert_eq!(
-            PolicyFingerprint::from_config(&a),
-            PolicyFingerprint::from_config(&b),
-            "aggregation_id is incidental, not part of policy identity"
+            a.aggregation_id(),
+            PolicyFingerprint::from_config(&a).as_u64(),
         );
     }
 

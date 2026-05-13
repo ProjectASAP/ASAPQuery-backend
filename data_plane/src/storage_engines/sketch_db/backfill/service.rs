@@ -327,9 +327,9 @@ mod tests {
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Mutex;
 
-    fn sum_config(agg_id: u64, metric: &str) -> AggregationConfig {
+    fn sum_config(_agg_id: u64, metric: &str) -> AggregationConfig {
+        // `_agg_id` is unused after PR 5 — identity is content-addressed.
         AggregationConfig::new(
-            agg_id,
             AggregationType::Sum,
             String::new(),
             std::collections::HashMap::new(),
@@ -350,7 +350,7 @@ mod tests {
 
     fn streaming_with(cfg: AggregationConfig) -> Arc<StreamingConfig> {
         let mut m = std::collections::HashMap::new();
-        m.insert(cfg.aggregation_id, cfg);
+        m.insert(cfg.aggregation_id(), cfg);
         Arc::new(StreamingConfig::new(m))
     }
 
@@ -380,6 +380,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_drains_queued_job_to_complete() {
         let cfg = sum_config(1, "latency");
+        let agg_fp = cfg.aggregation_id();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -412,7 +413,7 @@ mod tests {
         let handle = service.spawn();
 
         let job_id = registry.create(
-            1,
+            agg_fp,
             (0, 20),
             BackfillSource::Prometheus { url: "x".into() },
             2,
@@ -426,6 +427,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_marks_job_failed_when_reader_factory_fails() {
         let cfg = sum_config(1, "latency");
+        let agg_fp = cfg.aggregation_id();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -441,7 +443,7 @@ mod tests {
         let handle = service.spawn();
 
         let job_id = registry.create(
-            1,
+            agg_fp,
             (0, 20),
             BackfillSource::Prometheus { url: "x".into() },
             1,
@@ -459,6 +461,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_processes_multiple_jobs_in_id_order() {
         let cfg = sum_config(1, "latency");
+        let agg_fp = cfg.aggregation_id();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -482,19 +485,19 @@ mod tests {
         let handle = service.spawn();
 
         let job1 = registry.create(
-            1,
+            agg_fp,
             (0, 10),
             BackfillSource::Prometheus { url: "a".into() },
             1,
         );
         let job2 = registry.create(
-            1,
+            agg_fp,
             (0, 10),
             BackfillSource::Prometheus { url: "b".into() },
             1,
         );
         let job3 = registry.create(
-            1,
+            agg_fp,
             (0, 10),
             BackfillSource::Prometheus { url: "c".into() },
             1,

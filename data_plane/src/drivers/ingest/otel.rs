@@ -558,7 +558,7 @@ async fn route_otlp_to_precompute(
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
             by_group
-                .entry((config.aggregation_id, group_key))
+                .entry((config.aggregation_id(), group_key))
                 .or_default()
                 .push((series_key.clone(), ts_ms, point.value));
             matched = true;
@@ -637,7 +637,7 @@ async fn route_otlp_to_precompute(
                     }
                 };
             sketch_messages.push(WorkerMessage::AccumulatorInput {
-                agg_id: config.aggregation_id,
+                agg_id: config.aggregation_id(),
                 group_key,
                 timestamp_ms: ts_ms,
                 accumulator,
@@ -1186,7 +1186,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // end-to-end and the streaming-config /
                         // SketchStore call sites can be deleted.
                         messages.push(WorkerMessage::AccumulatorInput {
-                            agg_id: config.aggregation_id,
+                            agg_id: config.aggregation_id(),
                             group_key,
                             timestamp_ms: ts_ms,
                             accumulator: accumulator.clone_boxed_core(),

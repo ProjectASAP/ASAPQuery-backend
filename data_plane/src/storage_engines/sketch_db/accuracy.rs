@@ -434,7 +434,6 @@ mod tests {
 
     fn base_config(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
         AggregationConfig::new(
-            1,
             agg_type,
             String::new(),
             params,

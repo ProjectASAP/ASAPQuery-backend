@@ -124,7 +124,6 @@ mod tests {
 
     fn sum_config() -> AggregationConfig {
         AggregationConfig::new(
-            1,
             AggregationType::Sum,
             String::new(),
             HashMap::new(),

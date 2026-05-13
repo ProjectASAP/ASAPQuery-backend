@@ -257,7 +257,6 @@ mod tests {
 
     fn sum_agg_config(id: u64) -> AggregationConfig {
         AggregationConfig {
-            aggregation_id: id,
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
@@ -277,12 +276,20 @@ mod tests {
         }
     }
 
-    fn make_streaming_config(ids: &[u64]) -> Arc<StreamingConfig> {
+    /// Build a streaming-config keyed on the policy-fingerprint u64
+    /// derived from each dummy_agg. Returns the config plus the
+    /// marker_id → fingerprint mapping so callers can look up the
+    /// right key.
+    fn make_streaming_config(ids: &[u64]) -> (Arc<StreamingConfig>, HashMap<u64, u64>) {
         let mut map = HashMap::new();
+        let mut id_to_fp = HashMap::new();
         for &id in ids {
-            map.insert(id, sum_agg_config(id));
+            let cfg = sum_agg_config(id);
+            let fp = cfg.aggregation_id();
+            id_to_fp.insert(id, fp);
+            map.insert(fp, cfg);
         }
-        Arc::new(StreamingConfig::new(map))
+        (Arc::new(StreamingConfig::new(map)), id_to_fp)
     }
 
     fn write_one(
@@ -319,11 +326,11 @@ mod tests {
     /// sid as `Expired` so the sweep picks them up while metric_2's
     /// sids stay `Active`.
     fn fixture_with_expired_metric_1() -> (Arc<BackfillRegistry>, Arc<SketchStore>) {
-        let initial = make_streaming_config(&[1, 2]);
+        let (initial, id_to_fp) = make_streaming_config(&[1, 2]);
         let sketch_index = Arc::new(SketchStore::new());
-        let sid_a = write_one(&sketch_index, &initial, 1, 100);
-        let _ = write_one(&sketch_index, &initial, 1, 200);
-        let _ = write_one(&sketch_index, &initial, 2, 300);
+        let sid_a = write_one(&sketch_index, &initial, id_to_fp[&1], 100);
+        let _ = write_one(&sketch_index, &initial, id_to_fp[&1], 200);
+        let _ = write_one(&sketch_index, &initial, id_to_fp[&2], 300);
         // Both metric_1 writes share the same agg-signature → one
         // sid; mark it Expired directly. metric_2's sid stays Active.
         sketch_index.force_expire(sid_a);
@@ -372,10 +379,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_is_noop_without_expired_sids() {
-        let initial = make_streaming_config(&[1]);
+        let (initial, id_to_fp) = make_streaming_config(&[1]);
         let backfill = Arc::new(BackfillRegistry::new());
         let sketch_index = Arc::new(SketchStore::new());
-        let _ = write_one(&sketch_index, &initial, 1, 100);
+        let _ = write_one(&sketch_index, &initial, id_to_fp[&1], 100);
         let before = sketch_index.instance_count();
 
         let svc = SchemaEvictionService::new(

@@ -193,7 +193,6 @@ mod tests {
 
     fn agg_config(metric: &str, agg_type: AggregationType, group_by: Vec<&str>) -> AggregationConfig {
         AggregationConfig::new(
-            0,
             agg_type,
             String::new(),
             HashMap::new(),

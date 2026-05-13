@@ -23,15 +23,16 @@ use std::sync::Arc;
 
 /// Build a minimal `AggregationConfig`.
 fn make_agg_config(
-    id: u64,
+    _id: u64,
     metric: &str,
     agg_type: AggregationType,
     window_size_s: u64,
     window_type: WindowType,
     grouping: &[&str],
 ) -> AggregationConfig {
+    // `_id` is unused after PR 5 — identity is content-addressed via
+    // `PolicyFingerprint::from_config`.
     AggregationConfig {
-        aggregation_id: id,
         aggregation_type: agg_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -59,7 +60,7 @@ fn engine_no_query_configs(
 ) -> ASAPQueryEngine {
     let mut agg_map = HashMap::new();
     for c in &agg_configs {
-        agg_map.insert(c.aggregation_id, c.clone());
+        agg_map.insert(c.aggregation_id(), c.clone());
     }
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
@@ -70,7 +71,7 @@ fn engine_no_query_configs(
     let ts = 1_000_000_u64;
     for c in &agg_configs {
         let window_ms = c.window_size * 1000;
-        let output = PrecomputedOutput::new(ts - window_ms, ts, None, c.aggregation_id);
+        let output = PrecomputedOutput::new(ts - window_ms, ts, None, c.aggregation_id());
         let acc: Box<dyn crate::AggregateCore> = match c.aggregation_type.as_str() {
             "DatasketchesKLL" => {
                 let mut kll = DatasketchesKLLAccumulator::new(200);
@@ -105,7 +106,7 @@ fn engine_with_query_config(
     agg_config: AggregationConfig,
     promql_query: &str,
 ) -> ASAPQueryEngine {
-    let agg_id = agg_config.aggregation_id;
+    let agg_id = agg_config.aggregation_id();
     let mut agg_map = HashMap::new();
     agg_map.insert(agg_id, agg_config.clone());
     let streaming_config = Arc::new(StreamingConfig {
@@ -149,6 +150,7 @@ fn capability_fallback_fires_when_no_config() {
         WindowType::Tumbling,
         &[],
     );
+    let expected = agg.aggregation_id();
     let engine = engine_no_query_configs("cpu", &[], vec![agg]);
 
     // sum_over_time(cpu[5m]) — 5 min = 300 s matches the 300 s tumbling config
@@ -158,7 +160,7 @@ fn capability_fallback_fires_when_no_config() {
         ctx.is_some(),
         "Expected capability matching to find a compatible aggregation"
     );
-    assert_eq!(ctx.unwrap().agg_info.aggregation_id_for_value, 1);
+    assert_eq!(ctx.unwrap().agg_info.aggregation_id_for_value, expected);
 }
 
 /// When a query_config entry exists, the engine must use it (not capability matching).
@@ -173,14 +175,15 @@ fn config_path_takes_priority_over_capability_matching() {
         WindowType::Tumbling,
         &[],
     );
+    let expected = agg.aggregation_id();
     let engine = engine_with_query_config("cpu", &[], agg, "sum_over_time(cpu[5m])");
 
     let ctx = engine
         .build_query_execution_context_promql("sum_over_time(cpu[5m])".to_string(), 1000.0)
         .expect("should succeed via config path");
 
-    // The config path routes to agg_id=42
-    assert_eq!(ctx.agg_info.aggregation_id_for_value, 42);
+    // The config path routes via the config's policy fingerprint.
+    assert_eq!(ctx.agg_info.aggregation_id_for_value, expected);
 }
 
 /// A query for quantile(0.5) and quantile(0.9) should both resolve to the same
@@ -262,17 +265,18 @@ fn priority_largest_window_wins() {
         WindowType::Tumbling,
         &[],
     );
+    let expected_large = large.aggregation_id();
     let engine = engine_no_query_configs("cpu", &[], vec![small, large]);
 
     // sum_over_time(cpu[15m]) = 900 s — both 300 s and 900 s configs match (900 = 3×300),
-    // but the largest window (900 s, id=2) should be preferred.
+    // but the largest window should be preferred.
     let ctx = engine
         .build_query_execution_context_promql("sum_over_time(cpu[15m])".to_string(), 1000.0)
         .expect("should find a compatible aggregation");
 
     assert_eq!(
-        ctx.agg_info.aggregation_id_for_value, 2,
-        "The 900 s (id=2) aggregation should be preferred over the 300 s (id=1)"
+        ctx.agg_info.aggregation_id_for_value, expected_large,
+        "The 900 s aggregation should be preferred over the 300 s one"
     );
 }
 
@@ -302,6 +306,8 @@ fn cms_only_backend_resolves_sum_over_time_via_capability_matching() {
         WindowType::Tumbling,
         &[],
     );
+    let expected_value = cms.aggregation_id();
+    let expected_key = key_agg.aggregation_id();
     let engine = engine_no_query_configs("http_requests_total", &[], vec![cms, key_agg]);
 
     let ctx = engine
@@ -315,8 +321,8 @@ fn cms_only_backend_resolves_sum_over_time_via_capability_matching() {
         );
 
     assert_eq!(
-        ctx.agg_info.aggregation_id_for_value, 100,
-        "Capability matching should route Sum to the CMS aggregation (id=100)",
+        ctx.agg_info.aggregation_id_for_value, expected_value,
+        "Capability matching should route Sum to the CMS aggregation",
     );
     assert_eq!(
         ctx.agg_info.aggregation_type_for_value,
@@ -324,7 +330,7 @@ fn cms_only_backend_resolves_sum_over_time_via_capability_matching() {
         "Resolved value aggregation type must be CountMinSketch",
     );
     assert_eq!(
-        ctx.agg_info.aggregation_id_for_key, 101,
-        "CMS is multi-population — must be paired with the DeltaSetAggregator (id=101)",
+        ctx.agg_info.aggregation_id_for_key, expected_key,
+        "CMS is multi-population — must be paired with the DeltaSetAggregator",
     );
 }

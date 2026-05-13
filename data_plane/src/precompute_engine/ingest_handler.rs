@@ -107,9 +107,11 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn make_config(agg_id: u64, metric: &str) -> AggregationConfig {
+    fn make_config(_agg_id: u64, metric: &str) -> AggregationConfig {
+        // `_agg_id` is unused after PR 5 — identity is content-addressed
+        // via `PolicyFingerprint::from_config`. Kept as a parameter to
+        // avoid churning the call sites below.
         AggregationConfig::new(
-            agg_id,
             AggregationType::CountMinSketch,
             String::new(),
             std::collections::HashMap::new(),
