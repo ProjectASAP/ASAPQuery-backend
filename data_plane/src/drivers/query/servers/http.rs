@@ -2556,26 +2556,67 @@ aggregations:
     /// catalog (sibling slice migrates `create_checked`'s signature).
     async fn setup_test_server_with_backfill_and_sids(
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
-        active_sids: &[u64],
+        active_agg_ids: &[u64],
     ) -> u16 {
+        use asap_types::aggregation_config::AggregationConfig;
+        use asap_types::enums::{AggregationType, WindowType};
+        use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+        use std::collections::HashMap;
+
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
             adapter_config};
-        let streaming_config = Arc::new(StreamingConfig::default());
+        // Build a StreamingConfig with one Sum agg per `active_agg_ids`
+        // so the backfill handler's agg-config lookup (post-schema-
+        // retirement) can find them. The matching sid in the catalog
+        // is registered via the canonical ingest path so its content
+        // hash matches what `create_checked` would compute.
+        let mut agg_map = HashMap::new();
+        for agg_id in active_agg_ids {
+            let metric = format!("metric_{agg_id}");
+            let cfg = AggregationConfig {
+                aggregation_id: *agg_id,
+                aggregation_type: AggregationType::Sum,
+                aggregation_sub_type: String::new(),
+                parameters: HashMap::new(),
+                grouping_labels: KeyByLabelNames::empty(),
+                aggregated_labels: KeyByLabelNames::empty(),
+                rollup_labels: KeyByLabelNames::empty(),
+                original_yaml: String::new(),
+                window_size: 1,
+                slide_interval: 1,
+                window_type: WindowType::Tumbling,
+                spatial_filter: String::new(),
+                spatial_filter_normalized: String::new(),
+                metric: metric.clone(),
+                num_aggregates_to_retain: None,
+                table_name: None,
+                value_column: None,
+            };
+            agg_map.insert(*agg_id, cfg);
+        }
+        let streaming_config = Arc::new(StreamingConfig::new(agg_map));
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config.clone());
         let query_engine = Arc::new(ASAPQueryEngine::new(
             streaming_config.clone(),
             15000,
         ));
         let sketch_index =
             Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-        for sid in active_sids {
-            register_precompute_sid(&sketch_index, *sid, &format!("metric_{sid}"), &[]);
+        for agg_id in active_agg_ids {
+            register_precompute_sid(
+                &sketch_index,
+                *agg_id,
+                &format!("metric_{agg_id}"),
+                &[],
+            );
         }
         let server = HttpServer::new(config, query_engine, sketch_index)
-            .with_backfill_registry(registry);
+            .with_backfill_registry(registry)
+            .with_hot_reload_config(hot_reload);
         server
             .start_test_server()
             .await
@@ -5128,14 +5169,58 @@ async fn handle_post_backfill_job(
     }
 
     // Schema retirement final cut: the legacy `SchemaRegistry` is
-    // gone, so the §10.5 invariants are now checked against the sid
-    // catalog (`SketchStore`). The sibling slice that migrates
-    // `backfill::create_checked` is expected to land the
-    // `&SchemaRegistry → &SketchStore` parameter swap; this call
-    // site mirrors the new contract.
+    // gone. `create_checked` now takes the `AggregationConfig`
+    // directly + an explicit `created_at_ms`. We look up the
+    // config from the streaming-config snapshot; if it's missing
+    // we surface the same 404 `UnknownAgg` the registry used to
+    // produce. `created_at_ms` is the earliest `first_seen_unix_ms`
+    // across the sid catalog for this agg-config's signature —
+    // the post-retirement analogue of `AggSchema.created_at_ms`
+    // (which tracked wall-clock when the agg first appeared in a
+    // streaming-config swap). If no sid has ingested for this
+    // config yet, fall back to wall-clock now so the time-disjoint
+    // invariant degrades to "live ingest hasn't started".
+    let Some(handle) = state.hot_reload_config.as_ref() else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "hot-reload streaming-config handle not attached; backfill agg lookup requires HttpServer::with_hot_reload_config"});
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    let snapshot = handle.snapshot();
+    let agg_cfg = match snapshot.get_aggregation_config(req.agg_id) {
+        Some(c) => c.clone(),
+        None => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("unknown agg_id {} (not in streaming-config snapshot)", req.agg_id)});
+            return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
+        }
+    };
+    let created_at_ms = {
+        // Earliest live first_seen_unix_ms for this metric, if any
+        // sid in the catalog has actually ingested data. A sid that
+        // was registered without data has `first_seen_unix_ms == 0`,
+        // which we treat as "no live ingest yet" rather than
+        // "ingest started at the unix epoch" — backfill can then
+        // cover up to wall-clock-now.
+        let earliest = state
+            .sketch_index
+            .snapshot_instances()
+            .into_iter()
+            .filter(|m| m.metric_name == agg_cfg.metric)
+            .map(|m| m.first_seen_unix_ms.max(0) as u64)
+            .filter(|t| *t > 0)
+            .min();
+        earliest.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        })
+    };
     match registry.create_checked(
-        state.sketch_index.as_ref(),
-        req.agg_id,
+        &agg_cfg,
+        created_at_ms,
         (req.start_ms, req.end_ms),
         req.source,
         req.windows_total,

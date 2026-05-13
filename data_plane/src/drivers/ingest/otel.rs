@@ -465,21 +465,19 @@ fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) 
 /// config are dropped with a debug log — the precompute engine only
 /// maintains state for configured metrics.
 ///
-/// Flush a per-driver `HashMap<agg_id, count>` of §6.3 write-barrier
-/// drops into `IngestState::record_barrier_drop`, emitting a single
-/// debug log summarising the batch. Called from every OTLP routing
-/// function after its inner loop finishes, so a query against the
-/// `/metrics` endpoint sees a unified `samples_blocked_by_schema_barrier`
-/// counter regardless of which OTLP variant the DataCollector is
-/// shipping.
-fn flush_barrier_drops(state: &IngestState, drops: &HashMap<u64, u64>, driver_tag: &'static str) {
+/// Log a per-driver `HashMap<agg_id, count>` of §6.3 write-barrier
+/// drops. Post-schema-retirement the agg_id-keyed
+/// `IngestState::record_barrier_drop` counter is gone — the
+/// sid-level barrier inside `SketchStore::ingest_precompute_for_agg_config`
+/// silently rejects retired-sid writes without crossing this
+/// observer. The function is kept (callers still hand it an empty
+/// map) so the call shape doesn't churn; if the map is non-empty
+/// it emits a single debug log for forensic visibility.
+fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_tag: &'static str) {
     if drops.is_empty() {
         return;
     }
     let total: u64 = drops.values().sum();
-    for (agg_id, count) in drops {
-        state.record_barrier_drop(*agg_id, *count);
-    }
     debug!(
         driver = driver_tag,
         total_dropped = total,
