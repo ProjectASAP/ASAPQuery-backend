@@ -26,10 +26,10 @@
 //!   the read path (sid + label values + per-window samples).
 //! - [`AccuracyBound`] — `(epsilon, confidence)` derived from a
 //!   `SketchConfig`. Surfaces in HTTP response headers.
-//! - [`compute_sid`] — the canonical sid hash used today only by the
-//!   precompute ingest path (`SketchStore::ingest_precompute_for_agg_config`).
-//!   The OTel sketch ingest path moved to `SeriesIdResolver` (Option B
-//!   — registry-allocated sids); the precompute path follows in PR-4.
+//! - sid minting is no longer in this module — `SeriesIdResolver`
+//!   (in `drivers::ingest::series_resolver`) is the single mint
+//!   authority for every sid in the system. `AggKind::canonical_string()`
+//!   here produces the third element of the resolver's cache key.
 //! - [`canonical_parameters`] — helper that renders a parameters
 //!   `HashMap` into the canonical string form
 //!   `AggKind::Precompute::parameters_canonical` expects.
@@ -41,7 +41,9 @@
 //! - [`AggregationType`] — the agg-type enum that
 //!   `AggKind::Precompute` carries.
 
-use xxhash_rust::xxh64::xxh64;
+// `xxhash_rust::xxh64` import retired alongside `compute_sid` (PR-4).
+// Sid minting is now registry-allocated via `SeriesIdResolver` — no
+// content-addressed hash is computed at this layer.
 
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
@@ -196,102 +198,13 @@ fn sketch_config_canonical(cfg: &SketchConfig) -> String {
 
 // ── sid hash ────────────────────────────────────────────────────────────────
 //
-// `compute_sketch_sid` was retired alongside the OTel ingest path's
-// migration to `SeriesIdResolver` (Option B — registry-allocated sids).
-// The remaining `compute_sid` function is still called by
-// `SketchStore::ingest_precompute_for_agg_config` for PRECOMPUTE
-// aggregations; that path migrates to the resolver in PR-4, at which
-// point `compute_sid` and its `sketch_kind_tag` / `encode_sketch_config`
-// helpers will go away too. Sketch sids today come exclusively from the
-// resolver — same authority as precompute sids will after PR-4.
-
-/// Generalized content-addressed sid hash. Same `(metric, attrs, agg_kind)`
-/// tuple always yields the same sid.
-///
-/// The two branches encode disjointly: a `Sketch` payload starts with
-/// `sketch_kind_tag` (1..=7), while a `Precompute` payload starts with
-/// the byte `b'P'` (ASCII 80), which no sketch tag will ever produce.
-/// So an attacker (or a colliding hash input) can't force a sketch sid
-/// to overlap a precompute sid at the encoding level.
-///
-/// Critically, the `Sketch` branch is bit-identical to the historical
-/// `compute_sketch_sid` byte layout — existing sketch sids the M2
-/// wire format introduced stay stable across this generalization.
-pub fn compute_sid(
-    metric_name: &str,
-    attrs_fingerprint: &str,
-    agg_kind: &AggKind,
-) -> u64 {
-    let mut buf: Vec<u8> =
-        Vec::with_capacity(metric_name.len() + attrs_fingerprint.len() + 32);
-    buf.extend_from_slice(metric_name.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(attrs_fingerprint.as_bytes());
-    buf.push(0);
-    match agg_kind {
-        AggKind::Sketch { kind, config } => {
-            buf.push(sketch_kind_tag(*kind));
-            buf.push(0);
-            encode_sketch_config(config, &mut buf);
-        }
-        AggKind::Precompute {
-            agg_type,
-            parameters_canonical,
-        } => {
-            buf.push(b'P');
-            buf.push(0);
-            buf.extend_from_slice(agg_type.as_str().as_bytes());
-            buf.push(0);
-            buf.extend_from_slice(parameters_canonical.as_bytes());
-        }
-    }
-    let h = xxh64(&buf, 0);
-    if h == 0 {
-        1
-    } else {
-        h
-    }
-}
-
-fn sketch_kind_tag(k: SketchKindHandle) -> u8 {
-    match k {
-        SketchKindHandle::DDSketch => 1,
-        SketchKindHandle::Kll => 2,
-        SketchKindHandle::Hll => 3,
-        SketchKindHandle::CountSketch => 4,
-        SketchKindHandle::CountMin => 5,
-        SketchKindHandle::CmsWithHeap => 6,
-        SketchKindHandle::CountSketchWithHeap => 7,
-        SketchKindHandle::Any => 0,
-    }
-}
-
-fn encode_sketch_config(cfg: &SketchConfig, buf: &mut Vec<u8>) {
-    match cfg {
-        SketchConfig::DDSketch { relative_accuracy } => {
-            buf.push(b'D');
-            buf.extend_from_slice(&relative_accuracy.to_le_bytes());
-        }
-        SketchConfig::Kll { k } => {
-            buf.push(b'K');
-            buf.extend_from_slice(&k.to_le_bytes());
-        }
-        SketchConfig::Hll { precision } => {
-            buf.push(b'H');
-            buf.extend_from_slice(&precision.to_le_bytes());
-        }
-        SketchConfig::CountSketch { rows, cols } => {
-            buf.push(b'S');
-            buf.extend_from_slice(&rows.to_le_bytes());
-            buf.extend_from_slice(&cols.to_le_bytes());
-        }
-        SketchConfig::CountMin { rows, cols } => {
-            buf.push(b'M');
-            buf.extend_from_slice(&rows.to_le_bytes());
-            buf.extend_from_slice(&cols.to_le_bytes());
-        }
-    }
-}
+// `compute_sid` was retired alongside `compute_sketch_sid` (PR-3) and
+// the precompute ingest migration (PR-4). All sid minting now flows
+// through `SeriesIdResolver` — one registry-allocated u64 per
+// `(metric, attrs_fingerprint, agg_kind_canonical)` triple, shared
+// across the OTel sketch ingest path and the precompute output path.
+// See `AggKind::canonical_string` for the agg-kind canonicalization
+// that replaces the byte-layout this hash used to produce.
 
 // ── Accuracy ────────────────────────────────────────────────────────────────
 

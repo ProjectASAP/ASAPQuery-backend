@@ -96,6 +96,9 @@ pub struct BackfillService {
     /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
     /// the legacy `Arc<dyn Store>` field is gone.
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
+    /// Shared sid mint authority — wired alongside `sketch_index` so
+    /// backfilled precompute sids share the namespace with live ingest.
+    series_resolver: Option<Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>>,
     config_source: HotReloadStreamingConfig,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
@@ -111,6 +114,7 @@ impl BackfillService {
         Self {
             registry,
             sketch_index: None,
+            series_resolver: None,
             config_source,
             reader_factory,
             service_config,
@@ -124,6 +128,19 @@ impl BackfillService {
         sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
+        self
+    }
+
+    /// Attach the shared `SeriesIdResolver` so the per-job
+    /// `BackfillWindowProcessor` mints sids via the same registry the
+    /// OTel ingest path uses. Builder-style; should be paired with
+    /// [`Self::with_sketch_index`] in production (without it,
+    /// processor writes are skipped with a warn).
+    pub fn with_series_resolver(
+        mut self,
+        series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
+    ) -> Self {
+        self.series_resolver = Some(series_resolver);
         self
     }
 
@@ -198,6 +215,9 @@ impl BackfillService {
             );
             if let Some(idx) = self.sketch_index.as_ref() {
                 processor = processor.with_sketch_index(idx.clone());
+            }
+            if let Some(resolver) = self.series_resolver.as_ref() {
+                processor = processor.with_series_resolver(resolver.clone());
             }
             let worker = BackfillWorker::new(self.registry.clone());
 

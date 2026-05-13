@@ -88,10 +88,21 @@ fn seed_sum_at(
 ) {
     let key = Some(KeyByLabelValues {
         labels: vec![host.to_string()]});
+    use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+    use std::sync::Arc as StdArc;
     let output = PrecomputedOutput::new(ts, ts, key, agg_id);
     let acc = SumAccumulator::with_sum(sum);
     if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
-        sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, &acc);
+        thread_local! {
+            static RESOLVER: StdArc<SeriesIdResolver> = StdArc::new(SeriesIdResolver::new());
+        }
+        let resolver = RESOLVER.with(|r| r.clone());
+        sketch_index.ingest_precompute_for_agg_config(
+            |m, fp, ak| resolver.resolve(m, fp, ak),
+            agg_cfg,
+            &output,
+            &acc,
+        );
     }
     let _ = (ts, host);
 }

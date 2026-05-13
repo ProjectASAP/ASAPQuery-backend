@@ -4,6 +4,7 @@
 //! the engine falls back to searching StreamingConfig by capability, and that
 //! the existing query_config path still takes priority when an entry is present.
 
+use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::storage_engines::types::{
     AggregationConfig, AggregationType, PrecomputedOutput, StreamingConfig, WindowType};
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
@@ -82,7 +83,13 @@ fn engine_no_query_configs(
             }
             "DeltaSetAggregator" => Box::new(DeltaSetAggregatorAccumulator::new()),
             _ => Box::new(SumAccumulator::with_sum(42.0))};
-        sketch_index.ingest_precompute_for_agg_config(c, &output, acc.as_ref());
+        let resolver = Arc::new(SeriesIdResolver::new());
+        sketch_index.ingest_precompute_for_agg_config(
+            |m, fp, ak| resolver.resolve(m, fp, ak),
+            c,
+            &output,
+            acc.as_ref(),
+        );
     }
 
     let schema_label_names =
@@ -110,7 +117,13 @@ fn engine_with_query_config(
     let window_ms = agg_config.window_size * 1000;
     let output = PrecomputedOutput::new(ts - window_ms, ts, None, agg_id);
     let acc = SumAccumulator::with_sum(99.0);
-    sketch_index.ingest_precompute_for_agg_config(&agg_config, &output, &acc);
+    let resolver = Arc::new(SeriesIdResolver::new());
+    sketch_index.ingest_precompute_for_agg_config(
+        |m, fp, ak| resolver.resolve(m, fp, ak),
+        &agg_config,
+        &output,
+        &acc,
+    );
 
     let schema_label_names =
         KeyByLabelNames::new(schema_labels.iter().map(|s| s.to_string()).collect());
