@@ -2,7 +2,7 @@
 //!
 //! Per `control_plane/docs/design.md` §1219: "L4 chose the sketch family +
 //! params. L5 colors the DAG by `StageId` and emits per-executor
-//! configs. Same `SketchExpr` input; topology and emitter differ per
+//! configs. Same `PhysicalExpr` input; topology and emitter differ per
 //! deployment model."
 //!
 //! Phase E ships [`ThreeStageEmitter`] for the DC topology (edge →
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 
 /// Errors surfaced by [`Emitter::emit_per_stage`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -147,7 +147,7 @@ pub struct EdgeStageConfig {
     /// archive list (e.g. the freshness probes), and from explicit
     /// out-of-DAG opt-ins by callers that don't go through stage-split
     /// (the freshness probe path is the canonical example: it doesn't
-    /// drop a `SketchExpr` node, but the agent still has to land its
+    /// drop a `PhysicalExpr` node, but the agent still has to land its
     /// counter samples in MinIO so the Gorilla-S3 / Thanos archive
     /// can answer `last_over_time(...)`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -324,7 +324,7 @@ pub enum AggregationInput {
 pub struct BackendReadout {
     /// Aggregation this readout reads from.
     pub aggregation_id: String,
-    /// Readout op (mirror of `SketchExpr::SketchEstimate::op`).
+    /// Readout op (mirror of `PhysicalExpr::SketchEstimate::op`).
     pub op: EstimateOp,
 }
 
@@ -401,7 +401,7 @@ impl Emitter for ThreeStageEmitter {
         // SketchAgg up-front so SketchMerge / SketchEstimate emission
         // (pass 2) can resolve them regardless of node-table order.
         for node in &dag.nodes {
-            if let (SketchExpr::SketchAgg { .. }, StageId::Edge) = (&node.expr, node.stage) {
+            if let (PhysicalExpr::SketchAgg { .. }, StageId::Edge) = (&node.expr, node.stage) {
                 let aggregation_id = format!("agg{next_agg_index}");
                 next_agg_index += 1;
                 sketch_agg_ids.insert(node.id.0, aggregation_id);
@@ -414,12 +414,12 @@ impl Emitter for ThreeStageEmitter {
                 // Edge: source metric + label filters from Logical
                 // — the wrapped L3 sub-tree may be Scan, Window{Scan},
                 // Aggregate{Window{Scan}} etc., so descend recursively.
-                (SketchExpr::Logical(qe), StageId::Edge) => {
+                (PhysicalExpr::Logical(qe), StageId::Edge) => {
                     extract_edge_facts(qe, &mut edge);
                 }
                 // Edge: SketchAgg becomes one EdgeSketchProcessor.
                 (
-                    SketchExpr::SketchAgg {
+                    PhysicalExpr::SketchAgg {
                         sketch_type,
                         params,
                         ..
@@ -451,7 +451,7 @@ impl Emitter for ThreeStageEmitter {
                 // (looked up via the DAG's edges table so identical
                 // child sub-trees don't collide on a position-by-expr
                 // search).
-                (SketchExpr::SketchMerge { .. }, StageId::Gateway) => {
+                (PhysicalExpr::SketchMerge { .. }, StageId::Gateway) => {
                     if let Some((kind, aid)) =
                         first_sketch_child_via_edges(dag, node.id, &sketch_agg_ids)
                     {
@@ -465,7 +465,7 @@ impl Emitter for ThreeStageEmitter {
                 // Backend: SketchEstimate → one readout entry. The
                 // matching aggregation_id comes from the descendant
                 // SketchAgg (resolved by walking the DAG edges table).
-                (SketchExpr::SketchEstimate { op, .. }, StageId::Backend) => {
+                (PhysicalExpr::SketchEstimate { op, .. }, StageId::Backend) => {
                     let aid = resolve_descendant_agg_id_via_edges(dag, node.id, &sketch_agg_ids)
                         .unwrap_or_else(|| format!("agg{}", readouts.len()));
                     readouts.push(BackendReadout {
@@ -479,7 +479,7 @@ impl Emitter for ThreeStageEmitter {
                 // pipeline. Backend gets a `prometheus_remote` storage
                 // routing target (no aggregation entry).
                 (
-                    SketchExpr::RawAtEdgePrometheusArchive {
+                    PhysicalExpr::RawAtEdgePrometheusArchive {
                         metric,
                         window,
                         label_proj,
@@ -508,7 +508,7 @@ impl Emitter for ThreeStageEmitter {
                 // BackendAggregation with the family the backend will
                 // build at ingest. The aggregation_input=raw flag is
                 // emitted by `emit_backend_config_json`.
-                (SketchExpr::RawAtEdgeSketchAtBackend { family, params, .. }, StageId::Edge) => {
+                (PhysicalExpr::RawAtEdgeSketchAtBackend { family, params, .. }, StageId::Edge) => {
                     let aid = format!("agg{next_agg_index}");
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
@@ -570,7 +570,7 @@ pub(crate) fn edge_processor_name(kind: &SketchKind) -> Result<String, EmitError
 
 /// Recursively descend an L3 [`crate::intent_algebra::QueryExpr`]
 /// gathering edge-stage facts (source metric name, label filters,
-/// window size). The L3 sub-tree wrapped in a `SketchExpr::Logical`
+/// window size). The L3 sub-tree wrapped in a `PhysicalExpr::Logical`
 /// can be `Scan`, `Window{Scan}`, `Aggregate{Window{Scan}}`, etc.,
 /// so a recursive descent is necessary to surface the leaf metric.
 fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStageConfig) {
@@ -655,24 +655,24 @@ fn first_sketch_child_via_edges(
     for cid in children_of(dag, parent) {
         let cnode = dag.nodes.get(cid.0)?;
         match &cnode.expr {
-            SketchExpr::SketchAgg { sketch_type, .. } => {
+            PhysicalExpr::SketchAgg { sketch_type, .. } => {
                 if let Some(aid) = sketch_agg_ids.get(&cid.0) {
                     return Some((sketch_type.clone(), aid.clone()));
                 }
             }
-            SketchExpr::LetBinding { .. } | SketchExpr::SketchMerge { .. } => {
+            PhysicalExpr::LetBinding { .. } | PhysicalExpr::SketchMerge { .. } => {
                 if let Some(found) = first_sketch_child_via_edges(dag, cid, sketch_agg_ids) {
                     return Some(found);
                 }
             }
-            SketchExpr::Ref { name } => {
+            PhysicalExpr::Ref { name } => {
                 // Resolve the ref to its binding's expr id, then recurse.
                 if let Some(bid) = dag
                     .nodes
                     .iter()
                     .enumerate()
                     .find_map(|(i, n)| match &n.expr {
-                        SketchExpr::LetBinding { name: n2, .. } if n2 == name => Some(i),
+                        PhysicalExpr::LetBinding { name: n2, .. } if n2 == name => Some(i),
                         _ => None,
                     })
                 {

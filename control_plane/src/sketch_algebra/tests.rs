@@ -11,7 +11,7 @@ use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::{
     bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_kll_quantile::BindKllOnQuantile, Rule,
 };
-use crate::sketch_algebra::sketch_expr::{EstimateOp, MergeAlgebra, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -66,65 +66,65 @@ fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
 // ── Serde round-trip across all variants ──────────────────────────────────────
 
 #[test]
-fn sketch_expr_serde_roundtrip() {
+fn physical_expr_serde_roundtrip() {
     use crate::sketch_algebra::params::{CmsParams, CountSketchParams, DDSketchParams, HllParams};
     let cases = vec![
-        SketchExpr::Logical(windowed_scan()),
-        SketchExpr::SketchAgg {
+        PhysicalExpr::Logical(windowed_scan()),
+        PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Kll,
             params: SketchParams::Kll(KllParams { k: 200 }),
-            child: Box::new(SketchExpr::Logical(windowed_scan())),
+            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         },
-        SketchExpr::SketchEstimate {
+        PhysicalExpr::SketchEstimate {
             op: EstimateOp::Quantile { q: 0.5 },
-            child: Box::new(SketchExpr::SketchAgg {
+            child: Box::new(PhysicalExpr::SketchAgg {
                 sketch_type: SketchKind::DDSketch,
                 params: SketchParams::DDSketch(DDSketchParams { alpha: 0.005 }),
-                child: Box::new(SketchExpr::Logical(windowed_scan())),
+                child: Box::new(PhysicalExpr::Logical(windowed_scan())),
             }),
         },
-        SketchExpr::SketchMerge {
+        PhysicalExpr::SketchMerge {
             algebra: MergeAlgebra::Union,
             children: vec![
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type: SketchKind::Hll,
                     params: SketchParams::Hll(HllParams { precision: 14 }),
-                    child: Box::new(SketchExpr::Logical(windowed_scan())),
+                    child: Box::new(PhysicalExpr::Logical(windowed_scan())),
                 },
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type: SketchKind::Hll,
                     params: SketchParams::Hll(HllParams { precision: 14 }),
-                    child: Box::new(SketchExpr::Logical(windowed_scan())),
+                    child: Box::new(PhysicalExpr::Logical(windowed_scan())),
                 },
             ],
         },
-        SketchExpr::LetBinding {
+        PhysicalExpr::LetBinding {
             name: BindingName::new("kll_state"),
-            expr: Box::new(SketchExpr::SketchAgg {
+            expr: Box::new(PhysicalExpr::SketchAgg {
                 sketch_type: SketchKind::CountSketch,
                 params: SketchParams::CountSketch(CountSketchParams {
                     w: 2048,
                     d: 5,
                     with_heap: false,
                 }),
-                child: Box::new(SketchExpr::Logical(windowed_scan())),
+                child: Box::new(PhysicalExpr::Logical(windowed_scan())),
             }),
-            child: Box::new(SketchExpr::Ref {
+            child: Box::new(PhysicalExpr::Ref {
                 name: BindingName::new("kll_state"),
             }),
         },
-        SketchExpr::Ref {
+        PhysicalExpr::Ref {
             name: BindingName::new("alone"),
         },
-        SketchExpr::SketchAgg {
+        PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Cms,
             params: SketchParams::Cms(CmsParams { w: 2048, d: 5 }),
-            child: Box::new(SketchExpr::Logical(windowed_scan())),
+            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         },
     ];
     for c in cases {
         let json = serde_json::to_string(&c).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
     }
 }
@@ -140,10 +140,10 @@ fn bind_kll_quantile_basic() {
         .apply(&expr, &AccuracyTarget::Epsilon(0.01))
         .expect("KLL rule should bind a Quantile{0.99, ε=0.01}");
     match bound {
-        SketchExpr::SketchEstimate { op, child } => {
+        PhysicalExpr::SketchEstimate { op, child } => {
             assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
             match *child {
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type,
                     params,
                     child,
@@ -152,7 +152,7 @@ fn bind_kll_quantile_basic() {
                     assert_eq!(params, SketchParams::Kll(KllParams { k: 200 }));
                     assert!(matches!(
                         *child,
-                        SketchExpr::Logical(QueryExpr::Window { .. })
+                        PhysicalExpr::Logical(QueryExpr::Window { .. })
                     ));
                 }
                 other => panic!("expected SketchAgg, got {other:?}"),
@@ -169,10 +169,10 @@ fn bind_ddsketch_quantile_basic() {
         .apply(&expr, &AccuracyTarget::Epsilon(0.01))
         .expect("DDSketch rule should bind a Quantile{0.99, ε=0.01}");
     match bound {
-        SketchExpr::SketchEstimate { op, child } => {
+        PhysicalExpr::SketchEstimate { op, child } => {
             assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
             match *child {
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type,
                     params,
                     ..
@@ -200,8 +200,8 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
         .expect("bind_query_expr should not error");
     match bound {
-        SketchExpr::SketchEstimate { child, .. } => match *child {
-            SketchExpr::SketchAgg { sketch_type, .. } => {
+        PhysicalExpr::SketchEstimate { child, .. } => match *child {
+            PhysicalExpr::SketchAgg { sketch_type, .. } => {
                 assert_eq!(
                     sketch_type,
                     SketchKind::DDSketch,
@@ -237,10 +237,10 @@ fn bind_cms_topk_basic() {
     )
     .expect("bind_query_expr should not error");
     match bound {
-        SketchExpr::SketchEstimate { op, child } => {
+        PhysicalExpr::SketchEstimate { op, child } => {
             assert_eq!(op, EstimateOp::TopK { k: 10 });
             match *child {
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type,
                     params,
                     ..
@@ -277,10 +277,10 @@ fn bind_hll_cardinality_basic() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
     match bound {
-        SketchExpr::SketchEstimate { op, child } => {
+        PhysicalExpr::SketchEstimate { op, child } => {
             assert_eq!(op, EstimateOp::Cardinality);
             match *child {
-                SketchExpr::SketchAgg {
+                PhysicalExpr::SketchAgg {
                     sketch_type,
                     params,
                     ..
@@ -306,7 +306,7 @@ fn bind_hll_cardinality_basic() {
 #[test]
 fn bind_no_match_passes_through_logical() {
     // Sum is exact at L3 — no `Bind*` rule covers it. Should pass
-    // through unchanged in `SketchExpr::Logical`.
+    // through unchanged in `PhysicalExpr::Logical`.
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Sum],
@@ -315,7 +315,7 @@ fn bind_no_match_passes_through_logical() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     assert!(
-        matches!(bound, SketchExpr::Logical(QueryExpr::Aggregate { .. })),
+        matches!(bound, PhysicalExpr::Logical(QueryExpr::Aggregate { .. })),
         "Sum should pass through as Logical(Aggregate{{Sum}})"
     );
 }
@@ -328,7 +328,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
     let expr = agg_quantile(0.99, AccuracyTarget::Exact);
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     assert!(
-        matches!(bound, SketchExpr::Logical(QueryExpr::Aggregate { .. })),
+        matches!(bound, PhysicalExpr::Logical(QueryExpr::Aggregate { .. })),
         "Exact accuracy should disable sketch binding and pass through as Logical"
     );
 }
@@ -340,28 +340,28 @@ fn bind_exact_accuracy_disables_quantile_binding() {
 /// is the shared `SketchAgg`.
 #[test]
 fn let_binding_ref_through_sketch_dag() {
-    let shared_agg = SketchExpr::SketchAgg {
+    let shared_agg = PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let expr = SketchExpr::LetBinding {
+    let expr = PhysicalExpr::LetBinding {
         name: BindingName::new("kll_state"),
         expr: Box::new(shared_agg),
-        child: Box::new(SketchExpr::SketchMerge {
+        child: Box::new(PhysicalExpr::SketchMerge {
             algebra: MergeAlgebra::Union,
             // Two `SketchEstimate` parents reading the shared sketch via
             // `Ref` — the design.md §6 line ~1339 two-tier fan-in shape.
             children: vec![
-                SketchExpr::SketchEstimate {
+                PhysicalExpr::SketchEstimate {
                     op: EstimateOp::Quantile { q: 0.99 },
-                    child: Box::new(SketchExpr::Ref {
+                    child: Box::new(PhysicalExpr::Ref {
                         name: BindingName::new("kll_state"),
                     }),
                 },
-                SketchExpr::SketchEstimate {
+                PhysicalExpr::SketchEstimate {
                     op: EstimateOp::Quantile { q: 0.95 },
-                    child: Box::new(SketchExpr::Ref {
+                    child: Box::new(PhysicalExpr::Ref {
                         name: BindingName::new("kll_state"),
                     }),
                 },
@@ -372,7 +372,7 @@ fn let_binding_ref_through_sketch_dag() {
     // shape survives wire encoding (the L4 type checker, when it lands,
     // will assert the matching sketch-state schema on each `Ref` reader).
     let json = serde_json::to_string(&expr).unwrap();
-    let back: SketchExpr = serde_json::from_str(&json).unwrap();
+    let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
     assert_eq!(expr, back);
 }
 
@@ -400,10 +400,10 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        SketchExpr::SketchEstimate { op, child } => {
+        PhysicalExpr::SketchEstimate { op, child } => {
             assert!(matches!(op, EstimateOp::Quantile { .. }));
             match *child {
-                SketchExpr::SketchAgg { sketch_type, .. } => {
+                PhysicalExpr::SketchAgg { sketch_type, .. } => {
                     assert!(matches!(
                         sketch_type,
                         SketchKind::Kll | SketchKind::DDSketch
@@ -432,7 +432,7 @@ fn phase_b_pattern_only_temporal_sum_falls_through_to_logical() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     // Sum is exact → no SketchAgg, just a Logical pass-through.
-    assert!(matches!(bound, SketchExpr::Logical(_)));
+    assert!(matches!(bound, PhysicalExpr::Logical(_)));
 }
 
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
@@ -449,7 +449,7 @@ fn phase_b_pattern_only_spatial_aggregate_preserves_by_clause() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        SketchExpr::Logical(QueryExpr::Aggregate { by, .. }) => {
+        PhysicalExpr::Logical(QueryExpr::Aggregate { by, .. }) => {
             assert_eq!(by, vec![1]);
         }
         other => panic!("expected Logical(Aggregate), got {other:?}"),
@@ -472,7 +472,7 @@ fn phase_b_pattern_temporal_and_spatial_combined() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     // Rate has no warm-tier sketch family today — expect Logical.
-    assert!(matches!(bound, SketchExpr::Logical(_)));
+    assert!(matches!(bound, PhysicalExpr::Logical(_)));
 }
 
 /// Phase β archive-only intent: any of the no-warm-tier-family entries
@@ -501,7 +501,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     // The archive-only rule's output is a Logical pass-through carrying
     // the original Aggregate. Downstream emitters check archive_only().
     match bound {
-        SketchExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
+        PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
             assert_eq!(aggs, vec![intent]);
         }
         other => panic!("expected Logical(Aggregate(Absent)), got {other:?}"),
@@ -523,11 +523,11 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
 // pins the expected (sketch_kind | archive-only) outcome.
 
 /// Helper: parse a PromQL string, lower to L3, bind to L4. Returns the
-/// produced `SketchExpr` for assertion. The control plane's `parse_query`
+/// produced `PhysicalExpr` for assertion. The control plane's `parse_query`
 /// returns a `ParsedQuery`; `lower_parsed_query` builds the L3 IR from
 /// it under the supplied accuracy target; `bind_query_expr` is the L3→L4
 /// bottom-up walk.
-fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> SketchExpr {
+fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
     let parsed =
         crate::query_parser::parse_query(query).unwrap_or_else(|e| panic!("parse {query}: {e}"));
     let qe = crate::intent_algebra::lower_parsed_query(&parsed, accuracy.clone())
@@ -535,68 +535,68 @@ fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> SketchExpr {
     bind_query_expr(&qe, accuracy).unwrap_or_else(|e| panic!("bind {query}: {e}"))
 }
 
-/// Walk a `SketchExpr` and collect every `SketchAgg`'s sketch_kind. The
+/// Walk a `PhysicalExpr` and collect every `SketchAgg`'s sketch_kind. The
 /// number of entries + the kind set is the wire-equivalent of
 /// asap-planner-rs's "aggregation_id rows in StreamingConfig output".
-fn collect_sketch_kinds(expr: &SketchExpr) -> Vec<SketchKind> {
+fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SketchKind> {
     let mut out = Vec::new();
-    fn walk(e: &SketchExpr, out: &mut Vec<SketchKind>) {
+    fn walk(e: &PhysicalExpr, out: &mut Vec<SketchKind>) {
         match e {
-            SketchExpr::SketchAgg {
+            PhysicalExpr::SketchAgg {
                 sketch_type, child, ..
             } => {
                 out.push(sketch_type.clone());
                 walk(child, out);
             }
-            SketchExpr::SketchEstimate { child, .. } => walk(child, out),
-            SketchExpr::SketchMerge { children, .. } => {
+            PhysicalExpr::SketchEstimate { child, .. } => walk(child, out),
+            PhysicalExpr::SketchMerge { children, .. } => {
                 for c in children {
                     walk(c, out);
                 }
             }
-            SketchExpr::LetBinding { expr, child, .. } => {
+            PhysicalExpr::LetBinding { expr, child, .. } => {
                 walk(expr, out);
                 walk(child, out);
             }
-            SketchExpr::Logical(_) | SketchExpr::Ref { .. } => {}
+            PhysicalExpr::Logical(_) | PhysicalExpr::Ref { .. } => {}
             // Phase ε.1 — the new placement variants don't carry a
             // SketchAgg child the legacy walk recognises. Mode 2 records
             // its own family directly; Mode 3 has no sketch at all.
-            SketchExpr::RawAtEdgeSketchAtBackend { family, child, .. } => {
+            PhysicalExpr::RawAtEdgeSketchAtBackend { family, child, .. } => {
                 out.push(family.clone());
                 walk(child, out);
             }
-            SketchExpr::RawAtEdgePrometheusArchive { .. } => {}
+            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => {}
         }
     }
     walk(expr, &mut out);
     out
 }
 
-/// Walk a `SketchExpr` and detect whether the binding ended in a
+/// Walk a `PhysicalExpr` and detect whether the binding ended in a
 /// `Logical`-wrapped `Aggregate` carrying an archive-only intent. This is
 /// the L4 signal that the L5 emitter routes the StreamingConfig entry
 /// to the cold tier rather than the warm one.
-fn binding_is_archive(expr: &SketchExpr) -> bool {
+fn binding_is_archive(expr: &PhysicalExpr) -> bool {
     match expr {
-        SketchExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
+        PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
             aggs.iter().any(|a| a.archive_only())
         }
-        SketchExpr::Logical(_) => false,
-        SketchExpr::SketchEstimate { child, .. } => binding_is_archive(child),
-        SketchExpr::SketchAgg { child, .. } => binding_is_archive(child),
-        SketchExpr::SketchMerge { children, .. } => children.iter().any(binding_is_archive),
-        SketchExpr::LetBinding { expr, child, .. } => {
+        PhysicalExpr::Logical(_) => false,
+        PhysicalExpr::SketchEstimate { child, .. } => binding_is_archive(child),
+        PhysicalExpr::SketchAgg { child, .. } => binding_is_archive(child),
+        PhysicalExpr::SketchMerge { children, .. } => children.iter().any(binding_is_archive),
+        PhysicalExpr::LetBinding { expr, child, .. } => {
             binding_is_archive(expr) || binding_is_archive(child)
         }
-        SketchExpr::Ref { .. } => false,
+        PhysicalExpr::Ref { .. } => false,
         // Phase ε.1 — Mode 3 routes to the prometheus_remote engine
         // (its own engine ID), which the L5 emitter handles via
         // emit_backend_storage_routing rather than the warm-vs-archive
         // gate this helper guards. Treat as not-archive: this helper is
         // about cold-tier scan-vs-warm-tier-sketch decisions, not Mode 3.
-        SketchExpr::RawAtEdgeSketchAtBackend { child, .. } => binding_is_archive(child),
-        SketchExpr::RawAtEdgePrometheusArchive { .. } => false,
+        PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => binding_is_archive(child),
+        PhysicalExpr::RawAtEdgePrometheusArchive { .. } => false,
     }
 }
 
@@ -712,7 +712,7 @@ fn phase_b_e2e_topk_well_formed() {
     // Either a CountSketch / KLL / DDSketch fires (warm path) or it's a
     // Logical pass-through (engine handles it). Both are accepted L4
     // shapes — Phase β's contract is just "doesn't panic, produces a
-    // legitimate SketchExpr".
+    // legitimate PhysicalExpr".
     let _ = collect_sketch_kinds(&bound);
 }
 
@@ -794,7 +794,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         let bound =
             bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("bind should succeed");
         match bound {
-            SketchExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
+            PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
                 assert_eq!(aggs.len(), 1);
                 assert!(
                     aggs[0].archive_only(),

@@ -20,7 +20,7 @@
 //!   HTTP query handler consults via `BackendStorageRouting::lookup_with_shape`.
 //!
 //! These four functions are deliberately **stage-shaped**, not
-//! plan-shaped: the typed L5 emitter has already split the SketchExpr
+//! plan-shaped: the typed L5 emitter has already split the PhysicalExpr
 //! across edge / gateway / backend, so each function only sees the slice
 //! that's relevant to its executor. The legacy emitters in
 //! [`crate::config::agent`] / [`crate::config::backend`] still operate
@@ -45,7 +45,7 @@ use crate::physical::colored_dag::emitter::{
 };
 use crate::physical::colored_dag::stage_id::StageId;
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
-use crate::sketch_algebra::sketch_expr::EstimateOp;
+use crate::sketch_algebra::physical_expr::EstimateOp;
 
 // ── YAML structural types ─────────────────────────────────────────────────────
 //
@@ -2119,7 +2119,7 @@ mod tests {
     // ── Phase β: emit_backend_config_json snapshot for new pattern coverage ──
     //
     // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
-    // bind to `SketchExpr::Logical` rather than producing a `BackendAggregation`,
+    // bind to `PhysicalExpr::Logical` rather than producing a `BackendAggregation`,
     // so they correctly stay OUT of the warm-tier StreamingConfig the
     // backend's ASAPQueryEngine receives. Phase α wires the archive routing
     // entry separately. This snapshot pins that contract.

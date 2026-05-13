@@ -18,7 +18,7 @@
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::Rule;
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
 
 /// Bind a single-intent `Aggregate{Quantile{q, accuracy}}` to KLL.
@@ -40,7 +40,7 @@ impl Rule for BindKllOnQuantile {
         5
     }
 
-    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
         // Only the single-intent Aggregate{Quantile{...}} shape binds —
         // multi-intent Aggregates and TopK-shaped quantiles take other
         // rules.
@@ -77,7 +77,7 @@ impl Rule for BindKllOnQuantile {
 
         let k = kll_k_for_eps(eps);
 
-        Some(SketchExpr::estimate_over_agg(
+        Some(PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q },
             SketchKind::Kll,
             SketchParams::Kll(KllParams { k }),

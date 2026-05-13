@@ -1,14 +1,14 @@
 //! Layer 4 sketch-state schema.
 //!
 //! Per `control_plane/docs/design.md` §6.4 ("Per-node input/output spec for
-//! `SketchExpr`", around line ~618). L4 introduces a new field type into
+//! `PhysicalExpr`", around line ~618). L4 introduces a new field type into
 //! `Schema`: `DataType::Sketch(SketchKind, SketchParams)`. This module
 //! defines that extension as a parallel typed layer that the L4 type
 //! checker consults.
 //!
 //! Keeping this in a parallel struct (rather than mutating the L3
 //! `intent_algebra::DataType`) avoids touching the recently-shipped L3
-//! IR. The L4 type checker asks: "for this `SketchExpr` node, what is
+//! IR. The L4 type checker asks: "for this `PhysicalExpr` node, what is
 //! the input sketch-state schema, and what is the output?" Each `Bind*`
 //! rule populates an [`SketchStateSchema`] when it produces a
 //! sketch-state-bearing node.
@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
 
-/// Sketch-state schema annotation on a [`crate::sketch_algebra::SketchExpr`]
+/// Sketch-state schema annotation on a [`crate::sketch_algebra::PhysicalExpr`]
 /// edge. Carries the family + params + the catalog-capability flags so
 /// the L4 type checker can decide locally whether a downstream node may
 /// merge / subtract / delete from the state.
@@ -56,7 +56,7 @@ pub struct SketchStateSchema {
 /// [`crate::sketch_algebra::capability::SketchCapability`] (perf /
 /// cost-model profile). The two structs live side-by-side: this one is
 /// the **L4 type-system / plan-time** surface — sealed onto every
-/// `SketchExpr` edge by the binding rule and consulted by the type
+/// `PhysicalExpr` edge by the binding rule and consulted by the type
 /// checker. `SketchCapability` is the **perf / feasibility / intent-
 /// routing** surface — consumed by the optimizer and cost model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

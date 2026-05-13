@@ -50,7 +50,7 @@ pub use crate::workload::WorkloadRegistry;
 
 use crate::physical::colored_dag::emitter::EdgeStageConfig;
 use crate::sketch_algebra::params::SketchKind;
-use crate::sketch_algebra::SketchExpr;
+use crate::sketch_algebra::PhysicalExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
 
@@ -211,14 +211,14 @@ pub fn extend_edge_with_demo_plumbing(
 
 // ── MVP §46: planner ↔ 5-sketch emitter stitching ──────────────────────────────
 //
-// PR #339 (planner) classifies a single metric and produces a `SketchExpr`
+// PR #339 (planner) classifies a single metric and produces a `PhysicalExpr`
 // pinning a sketch family. PR #340 (emitter) gates the 5-sketch
 // routing-connector wire shape on `EdgeStageConfig::metric_to_family`
 // being non-empty. Until this stitch shipped, nothing populated the
 // HashMap — the typed bootstrap / replan paths emitted single-pipeline
 // YAML and the routing-connector path stayed dormant.
 //
-// `extract_root_sketch_kind` walks a `SketchExpr` tree and returns the
+// `extract_root_sketch_kind` walks a `PhysicalExpr` tree and returns the
 // committed sketch family — looking through `SketchEstimate`,
 // `SketchAgg`, `SketchMerge`, `LetBinding`, and `RawAtEdgeSketchAtBackend`.
 // `SketchAgg::sketch_type` is the canonical source of truth (the typed
@@ -232,7 +232,7 @@ pub fn extend_edge_with_demo_plumbing(
 // `emit_edge_yaml_5sketch_routing` path expects (absent metrics
 // fall through to `metrics/raw_passthrough`).
 
-/// Walk a `SketchExpr` tree and return the first `SketchAgg::sketch_type`
+/// Walk a `PhysicalExpr` tree and return the first `SketchAgg::sketch_type`
 /// (or the `RawAtEdgeSketchAtBackend::family` Mode-2 equivalent). The
 /// canonical shape produced by `bind_workload_typed` is
 /// `SketchEstimate { child: SketchAgg { sketch_type, … } }`, so this is
@@ -244,20 +244,20 @@ pub fn extend_edge_with_demo_plumbing(
 /// (`Logical`-only, unresolved `Ref`, raw Mode-3 archive). These map
 /// onto the raw-passthrough default pipeline in the routing emitter,
 /// which is correct.
-pub fn extract_root_sketch_kind(expr: &SketchExpr) -> Option<SketchKind> {
+pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
     match expr {
-        SketchExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
-        SketchExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
-        SketchExpr::SketchEstimate { child, .. } => extract_root_sketch_kind(child),
-        SketchExpr::SketchMerge { children, .. } => {
+        PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
+        PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
+        PhysicalExpr::SketchEstimate { child, .. } => extract_root_sketch_kind(child),
+        PhysicalExpr::SketchMerge { children, .. } => {
             children.iter().find_map(extract_root_sketch_kind)
         }
-        SketchExpr::LetBinding { expr, child, .. } => {
+        PhysicalExpr::LetBinding { expr, child, .. } => {
             extract_root_sketch_kind(expr).or_else(|| extract_root_sketch_kind(child))
         }
-        SketchExpr::Logical(_)
-        | SketchExpr::Ref { .. }
-        | SketchExpr::RawAtEdgePrometheusArchive { .. } => None,
+        PhysicalExpr::Logical(_)
+        | PhysicalExpr::Ref { .. }
+        | PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
     }
 }
 
@@ -285,14 +285,14 @@ pub fn collect_metric_to_family(
         let Some((workload, _wc)) = workload_store.get(&entry.metric_name) else {
             continue;
         };
-        let Some(sketch_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
+        let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
             // `http_requests_total` and other raw-passthrough metrics
             // land here — correctly excluded so they fall through to
             // the routing connector's default `metrics/raw_passthrough`
             // pipeline in the emitter.
             continue;
         };
-        if let Some(kind) = extract_root_sketch_kind(&sketch_expr) {
+        if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
             out.insert(entry.metric_name.clone(), kind);
         }
     }

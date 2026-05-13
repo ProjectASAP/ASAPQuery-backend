@@ -6,14 +6,14 @@
 //! `Deriv`, `PredictLinear`, `HoltWinters`, `Idelta`, `Irate`, `Resets`,
 //! `Changes`). It matches a single-intent
 //! `Aggregate` carrying any of those, and emits an
-//! [`SketchExpr::Logical`] pass-through. The L5 emitter looks at the
+//! [`PhysicalExpr::Logical`] pass-through. The L5 emitter looks at the
 //! enclosed [`AggIntent::archive_only`] flag and routes the corresponding
 //! StreamingConfig entry to the archive (Gorilla / Thanos) tier rather
 //! than the warm sketch tier.
 //!
 //! Why a rule rather than the recursive walker's default?
 //! `lower::bind_recursive` already wraps unmatched `Aggregate` in
-//! `SketchExpr::Logical`, but that branch fires on EVERY unmatched
+//! `PhysicalExpr::Logical`, but that branch fires on EVERY unmatched
 //! aggregate — including intents the planner is still trying to bind
 //! (an `Aggregate{Sum}` over a tabular leaf, etc.). Surfacing the
 //! archive-only cases through an explicit named rule lets the
@@ -28,7 +28,7 @@
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::rules::Rule;
-use crate::sketch_algebra::sketch_expr::SketchExpr;
+use crate::sketch_algebra::physical_expr::PhysicalExpr;
 use crate::types_v2::AccuracyTarget;
 
 /// Route `Aggregate{<archive-only intent>}` to a `Logical` pass-through.
@@ -48,13 +48,13 @@ impl Rule for BindArchiveOnly {
         1
     }
 
-    fn apply(&self, expr: &QueryExpr, _accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+    fn apply(&self, expr: &QueryExpr, _accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
         match expr {
             QueryExpr::Aggregate { aggs, .. } => {
                 // Single-intent Aggregate is the canonical Phase β shape;
                 // multi-intent fans out to per-intent rules elsewhere.
                 if aggs.len() == 1 && aggs[0].archive_only() {
-                    Some(SketchExpr::Logical(expr.clone()))
+                    Some(PhysicalExpr::Logical(expr.clone()))
                 } else {
                     None
                 }
@@ -134,7 +134,7 @@ mod tests {
             .apply(&expr, &AccuracyTarget::Epsilon(0.01))
             .expect("rule should match Absent");
         match out {
-            SketchExpr::Logical(inner) => assert_eq!(inner, expr),
+            PhysicalExpr::Logical(inner) => assert_eq!(inner, expr),
             other => panic!("expected Logical pass-through, got {other:?}"),
         }
     }

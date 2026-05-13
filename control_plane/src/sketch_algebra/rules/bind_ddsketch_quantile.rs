@@ -23,7 +23,7 @@
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::Rule;
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
 
 /// Bind a single-intent `Aggregate{Quantile{q, accuracy}}` to DDSketch.
@@ -41,7 +41,7 @@ impl Rule for BindDDSketchOnQuantile {
         6
     }
 
-    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
         let (q, intent_accuracy, child) = match expr {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
@@ -74,7 +74,7 @@ impl Rule for BindDDSketchOnQuantile {
             return None;
         }
 
-        Some(SketchExpr::estimate_over_agg(
+        Some(PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q },
             SketchKind::DDSketch,
             SketchParams::DDSketch(DDSketchParams { alpha }),

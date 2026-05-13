@@ -1,9 +1,9 @@
-//! L5 stage allocator — colours a `SketchExpr` DAG by `StageId`.
+//! L5 stage allocator — colours a `PhysicalExpr` DAG by `StageId`.
 //!
 //! Per `control_plane/docs/design.md` §6 (line ~810):
 //!
 //! ```ignore
-//! // generic stage allocator — given a SketchExpr tree + a topology, decide which
+//! // generic stage allocator — given a PhysicalExpr tree + a topology, decide which
 //! // ops land on which stage subject to constraints. Stage-level only; per-executor
 //! // fan-out happens in the deployment model's PhysicalPlanner using the executor
 //! // list from `DeploymentConstraints::executors()`.
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 
 use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::SketchExpr;
+use crate::sketch_algebra::PhysicalExpr;
 use crate::types_v2::BindingName;
 
 /// Errors surfaced by [`StageAllocator::allocate`].
@@ -67,7 +67,7 @@ impl StageAllocator {
     /// return [`AllocateError::UnsupportedTopology`].
     pub fn allocate(
         &self,
-        expr: &SketchExpr,
+        expr: &PhysicalExpr,
         topology: Topology,
     ) -> Result<ColoredDag, AllocateError> {
         match topology {
@@ -95,7 +95,7 @@ struct ThreeStageWalker {
 impl ThreeStageWalker {
     /// Recursively visit `expr`, append its colored node to the DAG,
     /// and return its `(NodeId, StageId)`.
-    fn visit(&mut self, expr: &SketchExpr) -> Result<(NodeId, StageId), AllocateError> {
+    fn visit(&mut self, expr: &PhysicalExpr) -> Result<(NodeId, StageId), AllocateError> {
         // Reserve a slot for this node up-front so child IDs are
         // strictly larger than the parent's; downstream `cut_edges`
         // analysis assumes parents come before children in `nodes`.
@@ -113,12 +113,12 @@ impl ThreeStageWalker {
             // `Aggregate{exact}` lands on edge if its child is an edge
             // (scrape locality); `Ref` resolves through the lexical
             // scope map.
-            SketchExpr::Logical(qe) => self.colour_logical(qe)?,
+            PhysicalExpr::Logical(qe) => self.colour_logical(qe)?,
 
             // ── SketchAgg: always edge per design.md §6 batched-queries
             // table. The "SketchAgg whose child is a Scan MUST be on
             // Edge" invariant is automatically satisfied.
-            SketchExpr::SketchAgg { child, .. } => {
+            PhysicalExpr::SketchAgg { child, .. } => {
                 let (cid, _) = self.visit(child)?;
                 self.dag.edges.push((id, cid));
                 StageId::Edge
@@ -128,7 +128,7 @@ impl ThreeStageWalker {
             // The "SketchEstimate MUST be on the same stage as its
             // consumers (typically Backend)" invariant is satisfied
             // because consumers above SketchEstimate are also backend.
-            SketchExpr::SketchEstimate { child, .. } => {
+            PhysicalExpr::SketchEstimate { child, .. } => {
                 let (cid, child_stage) = self.visit(child)?;
                 self.dag.edges.push((id, cid));
                 // If child is on edge or gateway, this is a cross-stage
@@ -139,7 +139,7 @@ impl ThreeStageWalker {
 
             // ── SketchMerge: gateway under three-stage. Children are
             // edge SketchAgg outputs.
-            SketchExpr::SketchMerge { children, .. } => {
+            PhysicalExpr::SketchMerge { children, .. } => {
                 for child in children {
                     let (cid, _) = self.visit(child)?;
                     self.dag.edges.push((id, cid));
@@ -149,7 +149,7 @@ impl ThreeStageWalker {
 
             // ── LetBinding: colour by the bound expression's stage,
             // and bring the binding into scope before walking the body.
-            SketchExpr::LetBinding { name, expr, child } => {
+            PhysicalExpr::LetBinding { name, expr, child } => {
                 let (eid, expr_stage) = self.visit(expr)?;
                 self.dag.edges.push((id, eid));
                 self.scope.insert(name.as_str().to_string(), expr_stage);
@@ -160,7 +160,7 @@ impl ThreeStageWalker {
 
             // ── Ref: colour matches the binding's stage. Unresolved
             // refs bubble up as `AllocateError::UnresolvedRef`.
-            SketchExpr::Ref { name } => self
+            PhysicalExpr::Ref { name } => self
                 .scope
                 .get(name.as_str())
                 .copied()
@@ -170,7 +170,7 @@ impl ThreeStageWalker {
             // Edge ships raw OTLP — we stage as Edge so the L5 emitter's
             // edge-side YAML pipeline picks it up; the sketch construction
             // itself happens at the backend (no edge sketch processor).
-            SketchExpr::RawAtEdgeSketchAtBackend { child, .. } => {
+            PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => {
                 let (cid, _) = self.visit(child)?;
                 self.dag.edges.push((id, cid));
                 StageId::Edge
@@ -179,7 +179,7 @@ impl ThreeStageWalker {
             // ── Phase ε.1 Mode 3: raw at edge, ships directly to
             // Prometheus's native OTLP receiver. The agent pipeline picks
             // this up via `asap.mode=prometheus_archive` routing.
-            SketchExpr::RawAtEdgePrometheusArchive { .. } => StageId::Edge,
+            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => StageId::Edge,
         };
 
         // Patch in the resolved stage now that children have been visited.
@@ -205,15 +205,15 @@ impl ThreeStageWalker {
             // `Aggregate{exact}` (e.g. `Max`) → Edge, and the *root of
             // q3* (the same Aggregate after a SketchMerge / Merge) →
             // Backend. Phase E's Logical wrapper does not surface a
-            // SketchExpr-level Merge over exact streams, so the L3
+            // PhysicalExpr-level Merge over exact streams, so the L3
             // Aggregate node reachable here is always the per-window
             // edge form. Final-readout placement happens at the
-            // SketchExpr-level (root of q3 wrapped in a SketchMerge
+            // PhysicalExpr-level (root of q3 wrapped in a SketchMerge
             // sibling structure) — Phase G+ adds an explicit
-            // `Logical(Merge)` SketchExpr variant for the gateway hop.
+            // `Logical(Merge)` PhysicalExpr variant for the gateway hop.
             QE::Aggregate { .. } => Ok(StageId::Edge),
             // Lexical scope for L3 LetBinding / Ref — mirrors the
-            // SketchExpr-level handling.
+            // PhysicalExpr-level handling.
             QE::LetBinding { name, expr, child } => {
                 let expr_stage = self.colour_logical(expr)?;
                 self.scope.insert(name.as_str().to_string(), expr_stage);
@@ -248,7 +248,7 @@ impl ThreeStageWalker {
 // stage lookup keyed by binding name.
 pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<StageId> {
     dag.nodes.iter().find_map(|n| match &n.expr {
-        SketchExpr::LetBinding { name: n2, .. } if n2 == name => Some(n.stage),
+        PhysicalExpr::LetBinding { name: n2, .. } if n2 == name => Some(n.stage),
         _ => None,
     })
 }
@@ -261,7 +261,7 @@ mod tests {
     use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{QueryExpr, Schema, Source, WindowKind};
     use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
-    use crate::sketch_algebra::sketch_expr::EstimateOp;
+    use crate::sketch_algebra::physical_expr::EstimateOp;
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn allocate_unsupported_topology_errors() {
-        let leaf = SketchExpr::Logical(ts_scan());
+        let leaf = PhysicalExpr::Logical(ts_scan());
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn three_stage_quantile_dag_basic() {
-        let expr = SketchExpr::estimate_over_agg(
+        let expr = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.99 },
             SketchKind::Kll,
             SketchParams::Kll(KllParams { k: 200 }),

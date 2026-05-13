@@ -98,7 +98,7 @@ pub enum AggIntent {
 
     // ── Archive-only intents (Phase β migration) ─────────────────────────
     // Intents below have no warm-tier sketch family today; the L4 binder
-    // emits a `SketchExpr::Logical` pass-through and the L5 emitter routes
+    // emits a `PhysicalExpr::Logical` pass-through and the L5 emitter routes
     // them to the cold archive tier (Gorilla / Thanos). Adding a streaming
     // sketch family for any of these is a follow-up — the L3 vocabulary
     // captures the intent so the routing decision is layered above intent.

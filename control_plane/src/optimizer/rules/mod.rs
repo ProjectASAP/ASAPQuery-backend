@@ -28,7 +28,7 @@ pub fn typed_sketch_algebra_enabled() -> bool {
     )
 }
 
-/// Bind a `QueryWorkload` into the typed L4 [`crate::sketch_algebra::SketchExpr`]
+/// Bind a `QueryWorkload` into the typed L4 [`crate::sketch_algebra::PhysicalExpr`]
 /// IR, when callers want to inspect the typed binding alongside the
 /// legacy `CollectionPlan` output.
 ///
@@ -60,9 +60,9 @@ pub fn typed_sketch_algebra_enabled() -> bool {
 ///
 /// Phase B (MVP v6) wires `main::handle_plan` to call this whenever
 /// the parallel `USE_TYPED_STAGE_SPLIT` gate is enabled — the bound
-/// `SketchExpr` is then fed into `planner::stage_split::split_typed_three_stage`
+/// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
-pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::SketchExpr> {
+pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::PhysicalExpr> {
     use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source, WindowKind};
     use crate::sketch_algebra::capability_matching::{
@@ -248,10 +248,10 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::S
 fn bind_cms_with_heap_on_topk(
     expr: &crate::intent_algebra::QueryExpr,
     accuracy: &crate::types_v2::AccuracyTarget,
-) -> Option<crate::sketch_algebra::SketchExpr> {
+) -> Option<crate::sketch_algebra::PhysicalExpr> {
     use crate::intent_algebra::{AggIntent, QueryExpr};
     use crate::sketch_algebra::params::{CmsParams, SketchKind, SketchParams};
-    use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+    use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
     use crate::types_v2::AccuracyTarget;
 
     let (k_topk, intent_accuracy, child) = match expr {
@@ -290,7 +290,7 @@ fn bind_cms_with_heap_on_topk(
     let w = w.max(2);
     let d = d.max(1);
 
-    Some(SketchExpr::estimate_over_agg(
+    Some(PhysicalExpr::estimate_over_agg(
         EstimateOp::TopK { k: k_topk },
         SketchKind::Cms,
         SketchParams::Cms(CmsParams { w, d }),
@@ -604,7 +604,7 @@ mod tests {
     //
     // The shared MVP demo contract pins six metric→family rows. These tests
     // drive each row through `bind_workload_typed` and assert the bound
-    // `SketchExpr` carries the expected sketch family. The contract:
+    // `PhysicalExpr` carries the expected sketch family. The contract:
     //
     // | metric                  | family       |
     // |-------------------------|--------------|
@@ -616,22 +616,22 @@ mod tests {
     // | `endpoint_request_freq` | CMS          |
 
     use crate::sketch_algebra::params::SketchKind;
-    use crate::sketch_algebra::sketch_expr::SketchExpr;
+    use crate::sketch_algebra::physical_expr::PhysicalExpr;
 
     /// Walk the L4 binding output and pull out the `SketchAgg`'s family.
     /// Returns `None` if no `SketchAgg` node is present (raw / pure
     /// logical pass-through).
-    fn extract_family(expr: &SketchExpr) -> Option<SketchKind> {
+    fn extract_family(expr: &PhysicalExpr) -> Option<SketchKind> {
         match expr {
-            SketchExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
-            SketchExpr::SketchEstimate { child, .. } => extract_family(child),
-            SketchExpr::SketchMerge { children, .. } => children.iter().find_map(extract_family),
-            SketchExpr::LetBinding { expr, child, .. } => {
+            PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
+            PhysicalExpr::SketchEstimate { child, .. } => extract_family(child),
+            PhysicalExpr::SketchMerge { children, .. } => children.iter().find_map(extract_family),
+            PhysicalExpr::LetBinding { expr, child, .. } => {
                 extract_family(expr).or_else(|| extract_family(child))
             }
-            SketchExpr::Logical(_) | SketchExpr::Ref { .. } => None,
-            SketchExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
-            SketchExpr::RawAtEdgePrometheusArchive { .. } => None,
+            PhysicalExpr::Logical(_) | PhysicalExpr::Ref { .. } => None,
+            PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
+            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
         }
     }
 
@@ -824,7 +824,7 @@ mod tests {
     fn all_six_contract_metrics_produce_expected_family() {
         // Single test that drives the full contract row set through
         // `bind_workload_typed` — this is the per-task acceptance test
-        // ("verify each produces the expected `SketchExpr` family").
+        // ("verify each produces the expected `PhysicalExpr` family").
         let cases: Vec<(&str, AggType, Option<SketchKind>)> = vec![
             ("http_requests_total", AggType::Frequency, None),
             (

@@ -17,7 +17,7 @@ use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::params::{
     DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
-use crate::sketch_algebra::sketch_expr::{EstimateOp, MergeAlgebra, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -73,8 +73,8 @@ fn windowed_scan() -> QueryExpr {
 
 /// `SketchEstimate{Quantile{0.99}}{SketchAgg{KLL}{Logical(Window{Scan})}}`
 /// — the §6 single-query trace input.
-fn quantile_kll_dag() -> SketchExpr {
-    SketchExpr::estimate_over_agg(
+fn quantile_kll_dag() -> PhysicalExpr {
+    PhysicalExpr::estimate_over_agg(
         EstimateOp::Quantile { q: 0.99 },
         SketchKind::Kll,
         SketchParams::Kll(KllParams { k: 200 }),
@@ -95,7 +95,7 @@ fn allocator_three_stage_basic() {
     // Logical(Scan) — Phase E walks the Logical(Window) child via the
     // SketchAgg path; the inner Scan only surfaces if Logical is
     // recursively unfolded. Today Logical wraps the entire L3 sub-tree
-    // as a single SketchExpr node, so the count is 3.
+    // as a single PhysicalExpr node, so the count is 3.
     assert!(
         dag.nodes.len() >= 3,
         "expected at least 3 nodes, got {}",
@@ -105,14 +105,14 @@ fn allocator_three_stage_basic() {
     let agg = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::SketchAgg { .. }))
+        .find(|n| matches!(n.expr, PhysicalExpr::SketchAgg { .. }))
         .expect("SketchAgg present");
     assert_eq!(agg.stage, StageId::Edge);
     // Logical wrapper of Window is colored Edge.
     let win_or_scan = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::Logical(_)))
+        .find(|n| matches!(n.expr, PhysicalExpr::Logical(_)))
         .expect("Logical present");
     assert_eq!(win_or_scan.stage, StageId::Edge);
 }
@@ -121,10 +121,10 @@ fn allocator_three_stage_basic() {
 fn allocator_sketch_agg_under_scan_pinned_edge() {
     // Exact design.md §6 invariant: a SketchAgg whose child is a Scan
     // (wrapped in Logical) MUST land on Edge.
-    let expr = SketchExpr::SketchAgg {
+    let expr = PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Hll,
         params: SketchParams::Hll(HllParams { precision: 14 }),
-        child: Box::new(SketchExpr::Logical(ts_scan("events", None))),
+        child: Box::new(PhysicalExpr::Logical(ts_scan("events", None))),
     };
     let dag = StageAllocator
         .allocate(&expr, Topology::ThreeStage)
@@ -142,7 +142,7 @@ fn allocator_sketch_estimate_pinned_backend() {
     let est = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::SketchEstimate { .. }))
+        .find(|n| matches!(n.expr, PhysicalExpr::SketchEstimate { .. }))
         .expect("SketchEstimate present");
     assert_eq!(est.stage, StageId::Backend);
 }
@@ -151,17 +151,17 @@ fn allocator_sketch_estimate_pinned_backend() {
 fn allocator_let_binding_color_propagates() {
     // LetBinding takes the bound expression's stage. Bind a
     // SketchAgg{KLL} (edge) and verify the LetBinding node colors edge.
-    let inner_agg = SketchExpr::SketchAgg {
+    let inner_agg = PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let bind = SketchExpr::LetBinding {
+    let bind = PhysicalExpr::LetBinding {
         name: BindingName::new("kll_state"),
         expr: Box::new(inner_agg),
-        child: Box::new(SketchExpr::SketchEstimate {
+        child: Box::new(PhysicalExpr::SketchEstimate {
             op: EstimateOp::Quantile { q: 0.95 },
-            child: Box::new(SketchExpr::Ref {
+            child: Box::new(PhysicalExpr::Ref {
                 name: BindingName::new("kll_state"),
             }),
         }),
@@ -172,7 +172,7 @@ fn allocator_let_binding_color_propagates() {
     let let_node = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::LetBinding { .. }))
+        .find(|n| matches!(n.expr, PhysicalExpr::LetBinding { .. }))
         .expect("LetBinding present");
     // LetBinding takes its expr's stage → Edge.
     assert_eq!(let_node.stage, StageId::Edge);
@@ -182,17 +182,17 @@ fn allocator_let_binding_color_propagates() {
 fn allocator_ref_resolves_to_binding_stage() {
     // Ref takes the stage of its binding. Same fixture as above; Ref
     // child of SketchEstimate must color Edge (the binding's stage).
-    let inner_agg = SketchExpr::SketchAgg {
+    let inner_agg = PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let bind = SketchExpr::LetBinding {
+    let bind = PhysicalExpr::LetBinding {
         name: BindingName::new("shared"),
         expr: Box::new(inner_agg),
-        child: Box::new(SketchExpr::SketchEstimate {
+        child: Box::new(PhysicalExpr::SketchEstimate {
             op: EstimateOp::Quantile { q: 0.5 },
-            child: Box::new(SketchExpr::Ref {
+            child: Box::new(PhysicalExpr::Ref {
                 name: BindingName::new("shared"),
             }),
         }),
@@ -203,7 +203,7 @@ fn allocator_ref_resolves_to_binding_stage() {
     let ref_node = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::Ref { .. }))
+        .find(|n| matches!(n.expr, PhysicalExpr::Ref { .. }))
         .expect("Ref present");
     assert_eq!(ref_node.stage, StageId::Edge);
 }
@@ -211,16 +211,16 @@ fn allocator_ref_resolves_to_binding_stage() {
 #[test]
 fn allocator_sketch_merge_lands_gateway() {
     // SketchMerge over edge-built KLL sketches → Gateway.
-    let one_agg = || SketchExpr::SketchAgg {
+    let one_agg = || PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let merge = SketchExpr::SketchMerge {
+    let merge = PhysicalExpr::SketchMerge {
         algebra: MergeAlgebra::Union,
         children: vec![one_agg(), one_agg()],
     };
-    let with_estimate = SketchExpr::SketchEstimate {
+    let with_estimate = PhysicalExpr::SketchEstimate {
         op: EstimateOp::Quantile { q: 0.99 },
         child: Box::new(merge),
     };
@@ -230,7 +230,7 @@ fn allocator_sketch_merge_lands_gateway() {
     let merge_node = dag
         .nodes
         .iter()
-        .find(|n| matches!(n.expr, SketchExpr::SketchMerge { .. }))
+        .find(|n| matches!(n.expr, PhysicalExpr::SketchMerge { .. }))
         .expect("SketchMerge present");
     assert_eq!(merge_node.stage, StageId::Gateway);
     assert_eq!(dag.root().unwrap().stage, StageId::Backend);
@@ -242,16 +242,16 @@ fn allocator_sketch_merge_lands_gateway() {
 fn emitter_three_stage_emits_three_configs() {
     // Build a DAG with all three stages occupied: SketchEstimate over
     // SketchMerge over two SketchAggs.
-    let one_agg = || SketchExpr::SketchAgg {
+    let one_agg = || PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let merge = SketchExpr::SketchMerge {
+    let merge = PhysicalExpr::SketchMerge {
         algebra: MergeAlgebra::Union,
         children: vec![one_agg(), one_agg()],
     };
-    let root = SketchExpr::SketchEstimate {
+    let root = PhysicalExpr::SketchEstimate {
         op: EstimateOp::Quantile { q: 0.99 },
         child: Box::new(merge),
     };
@@ -288,7 +288,7 @@ fn emitter_edge_config_has_correct_processor_kll() {
 
 #[test]
 fn emitter_edge_config_has_correct_processor_ddsketch() {
-    let expr = SketchExpr::estimate_over_agg(
+    let expr = PhysicalExpr::estimate_over_agg(
         EstimateOp::Quantile { q: 0.99 },
         SketchKind::DDSketch,
         SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
@@ -367,22 +367,22 @@ fn end_to_end_quantile_workload() {
     // table (Edge: SketchAgg + Logical(Scan/Window/Aggregate{Max});
     // Gateway: SketchMerge + Merge; Backend: SketchEstimate + final
     // root).
-    let agg = || SketchExpr::SketchAgg {
+    let agg = || PhysicalExpr::SketchAgg {
         sketch_type: SketchKind::Kll,
         params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(SketchExpr::Logical(windowed_scan())),
+        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
-    let merge_kll = SketchExpr::SketchMerge {
+    let merge_kll = PhysicalExpr::SketchMerge {
         algebra: MergeAlgebra::Union,
         children: vec![agg(), agg(), agg()],
     };
     // Two SketchEstimate readouts hanging off the merge — the typed
-    // SketchExpr is single-rooted, so we model the workload as the
+    // PhysicalExpr is single-rooted, so we model the workload as the
     // higher of the two readouts (q=0.99) and assert the underlying
     // colouring is correct. The second readout (q=0.95) is exercised
     // by `allocator_let_binding_color_propagates` and the per-rule
     // tests above.
-    let q99 = SketchExpr::SketchEstimate {
+    let q99 = PhysicalExpr::SketchEstimate {
         op: EstimateOp::Quantile { q: 0.99 },
         child: Box::new(merge_kll),
     };
