@@ -236,7 +236,7 @@ estimate, not a hard guarantee — good enough to drive policy, and the alternat
 ### Configuration
 
 New struct, threaded through `PrecomputeEngineConfig` and loaded from the
-same YAML / controller channel as the existing streaming config. The two
+same YAML / control plane channel as the existing streaming config. The two
 knobs match the priority order in the problem statement: **memory budget
 first, time watermark second**.
 
@@ -732,7 +732,7 @@ Does not change:
 - `SimpleMapStoreGlobal` is intentionally left in-memory-only. Persistence
   targets `PerKey`, which is the production path. Adding it to `Global` is a
   small follow-up if anyone needs it.
-- Query planning, the controller client, and the precompute engine's output
+- Query planning, the control plane client, and the precompute engine's output
   sink are untouched. The store's `Store` trait signature does not change.
 
 ---

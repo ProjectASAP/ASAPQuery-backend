@@ -230,7 +230,7 @@ impl<'a> SketchReducer<'a> {
     }
 
     /// Map a [`Capability`] to a [`QueryFamily`]. This is the canonical
-    /// dispatch path after Step 2a: the controller's analyzer hands
+    /// dispatch path after Step 2a: the control plane's analyzer hands
     /// each `WarmTierCandidate` a `required_capability`, and the
     /// reducer picks a family without ever matching on the PromQL
     /// function-name string.

@@ -6,13 +6,13 @@
 The query backend of the **ASAP** observability system.
 
 ASAPQuery-backend exposes a **single PromQL HTTP surface** that
-internally dispatches to one of two engines based on the controller's
+internally dispatches to one of two engines based on the control plane's
 plan and the query's shape:
 
 - **Warm tier** — in-process `SimpleEngine` over a sketch precompute
   store (DDSketch / KLL / HLL / CountSketch / Count-Min Sketch).
   Sub-millisecond responses with bounded `(ε, δ)` accuracy for
-  controller-planned query shapes.
+  control-plane-planned query shapes.
 - **Archive tier** — Prometheus `promql.Engine` (via Thanos
   store-gateway and thanos-query) over Gorilla-XOR-compressed raw
   chunks on object storage. Exact PromQL surface for ad-hoc and
@@ -49,7 +49,7 @@ plan and the query's shape:
 
 | | Warm sketch tier | Archive tier (Thanos + Gorilla on S3) |
 |---|---|---|
-| What it serves | Controller-planned shapes (planned `(metric, W, L, agg_type)` triples) | Anything PromQL — ad-hoc, post-hoc, un-planned shapes |
+| What it serves | Control-plane-planned shapes (planned `(metric, W, L, agg_type)` triples) | Anything PromQL — ad-hoc, post-hoc, un-planned shapes |
 | Accuracy | bounded ε per sketch family | exact (`ε=0, δ=0, kind=exact`) |
 | Latency | µs–ms (RAM lookup) | 10s–100s of ms (object-store reads) |
 | Cost | sketch state RAM at the backend | object-store storage + per-query S3 GETs |

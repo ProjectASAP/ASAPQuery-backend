@@ -299,7 +299,7 @@ pub fn noop_reader_factory() -> ReaderFactory {
 ///
 /// All other variants (`S3Gorilla`, `OtherSketch`) return a clear
 /// "not yet implemented" error, which the worker surfaces on
-/// `BackfillJob::error_message` so the controller / operator sees
+/// `BackfillJob::error_message` so the control plane / operator sees
 /// exactly which reader is missing.
 pub fn default_reader_factory() -> ReaderFactory {
     Arc::new(|source| {

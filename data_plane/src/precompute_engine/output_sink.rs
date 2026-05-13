@@ -54,7 +54,7 @@ impl SketchStoreSink {
     /// Best-effort write to `SketchStore` for one PrecomputedOutput.
     /// Logs and skips on missing agg_config or other transient
     /// inconsistencies — a SketchStore miss is recoverable in
-    /// practice because the controller will re-emit the agg_config
+    /// practice because the control plane will re-emit the agg_config
     /// on its next reconcile pass.
     fn append_to_index(
         &self,

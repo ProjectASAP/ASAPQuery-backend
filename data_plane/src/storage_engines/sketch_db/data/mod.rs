@@ -37,7 +37,7 @@
 //! ## Re-exports for callers
 //!
 //! - [`Capability`] / [`SketchKindHandle`] — the canonical
-//!   controller-side capability vocabulary.
+//!   control-plane-side capability vocabulary.
 //! - [`AggregationType`] — the agg-type enum that
 //!   `AggKind::Precompute` carries.
 
@@ -48,12 +48,12 @@
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
 // Step 2a consolidated all capability state into
-// `controller::sketch_algebra::capability`. The backend re-exports the
+// `control_plane::sketch_algebra::capability`. The backend re-exports the
 // canonical types so there's exactly one definition in the codebase.
 // `is_satisfied_by` (used by the engine warm-tier hook) lives on the
-// controller-side `Capability` impl.
+// control-plane-side `Capability` impl.
 
-pub use controller::sketch_algebra::{Capability, SketchKindHandle};
+pub use control_plane::sketch_algebra::{Capability, SketchKindHandle};
 
 /// Re-export so callers don't need to depend on promql_utilities
 /// directly for the agg_type tag.

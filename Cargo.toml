@@ -5,7 +5,7 @@ members = [
     "crates/asap_otel_proto",
     "crates/asap_types",
     "data_plane",
-    "controller",
+    "control_plane",
 ]
 
 [workspace.package]

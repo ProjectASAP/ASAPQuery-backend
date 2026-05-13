@@ -7,7 +7,7 @@
 >
 > **Audience:** anyone deciding whether to adopt the sketch DB for a
 > workload, tuning parameters, or building the cost model in the
-> controller.
+> control plane.
 >
 > **Status.** §19 is an analysis, not implementation. §20 describes a
 > library that does not exist yet.
@@ -136,12 +136,12 @@ The sketch DB intentionally does not replace TSDB for:
   on an unplanned dimension falls through to the exact DB.
 - **Low query rate** (few queries per day against a given metric) —
   the pre-computation cost of maintaining sketches is not amortized.
-  The controller's cost model should decline to materialize a sketch
+  The control plane's cost model should decline to materialize a sketch
   for such metrics.
 
 ### 19.7 Cost-model break-even
 
-Very rough formula the controller can use to decide whether a metric
+Very rough formula the control plane can use to decide whether a metric
 is worth sketching:
 
 ```
@@ -152,14 +152,14 @@ sketch_value = query_rate
 sketch_cost  = agent_cpu_for_sketching
              + backend_memory_for_live_sketches
              + backend_storage_for_parts
-             + controller_planning_overhead
+             + control_plane_planning_overhead
 
 materialize_if: sketch_value > sketch_cost
 ```
 
 For high-QPS dashboard metrics with high cardinality, `sketch_value`
 easily dominates. For cold metrics or exact-required metrics, it does
-not and the controller should leave them on the exact-DB path only.
+not and the control plane should leave them on the exact-DB path only.
 
 ### 19.8 Summary
 
@@ -186,7 +186,7 @@ purposes.
 These are the formulas every `AccuracyProfile` (core §6.4) is derived
 from. They are mathematical guarantees from the sketch's defining
 papers, not empirical estimates — given parameters and a sketch
-type, the controller and the query path know the bound exactly.
+type, the control plane and the query path know the bound exactly.
 
 | Sketch | Parameters | Statistic answered | Error bound | Confidence |
 |---|---|---|---|---|
@@ -250,14 +250,14 @@ of every sketch type are **measured**, not derived. Different
 implementations of the same sketch family — sketchlib-rust vs
 sketchlib-go, branch A vs branch B of either, different parameter
 choices — have different real-world behaviour even when the
-theoretical accuracy is identical. The controller's cost model
+theoretical accuracy is identical. The control plane's cost model
 (core §15.2 `/api/v1/db/cost_estimate`, core §10.6 incremental-vs-
 refresh decision) needs real measurements to plan well.
 
 This section describes a separate library — the **Sketch Profiler**
 — that is shared across the sketch DB, sketchlib-rust, sketchlib-go,
-and the controller. It is not part of the sketch DB itself; it is the
-measurement substrate the sketch DB and the controller both consume.
+and the control plane. It is not part of the sketch DB itself; it is the
+measurement substrate the sketch DB and the control plane both consume.
 
 ### 20.1 What it measures
 
@@ -279,7 +279,7 @@ profile)` tuple, the profiler collects:
 These are collected per sketch type, per parameter set, and per
 target architecture (x86_64 vs arm64 vs the agent's actual CPU
 model). The profiler stores results in a published catalogue that
-the controller reads at planning time and the operator inspects
+the control plane reads at planning time and the operator inspects
 when picking parameters for a new aggregation.
 
 ### 20.2 How it runs
@@ -301,7 +301,7 @@ The profiler is a standalone binary in its own crate
   changes, allocator regressions).
 - **What-if** — given a `(sketch_type, parameters, expected_qps,
   expected_cardinality)` tuple, returns predicted CPU/memory/latency
-  numbers. The controller calls this at plan time. It also takes a
+  numbers. The control plane calls this at plan time. It also takes a
   query workload as input and returns the predicted `query_latency`
   per statistic.
 
@@ -342,9 +342,9 @@ struct ProfilerEntry {
 }
 ```
 
-### 20.4 How the controller uses it
+### 20.4 How the control plane uses it
 
-The controller's planner (core §15.2) replaces hand-coded
+The control plane's planner (core §15.2) replaces hand-coded
 constants and crude formulas with calls into the profiler:
 
 ```

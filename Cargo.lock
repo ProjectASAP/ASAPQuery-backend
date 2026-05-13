@@ -847,7 +847,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "controller"
+name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1056,7 +1056,7 @@ dependencies = [
  "bincode",
  "chrono",
  "clap 4.6.1",
- "controller",
+ "control_plane",
  "crc32fast",
  "criterion",
  "dashmap",

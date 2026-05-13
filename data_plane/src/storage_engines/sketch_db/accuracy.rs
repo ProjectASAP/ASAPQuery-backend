@@ -6,7 +6,7 @@
 //! Given the `aggregation_type` + `parameters` pinned on an
 //! `AggSchema`, the registry can expose the theoretical accuracy
 //! bound of every query answer computed from it — so users and
-//! controllers see "this quantile is within ε relative error with
+//! control planes see "this quantile is within ε relative error with
 //! probability 1 - δ" as a first-class part of the schema, not a
 //! number they have to rederive from the sketch literature.
 //!
@@ -325,7 +325,7 @@ fn ddsketch_alpha(config: &AggregationConfig) -> f64 {
 
 /// CMS-with-heap heap size (the `k` in "top-k retention"). Read
 /// from `parameters["heap_size"]` with a default of 100 —
-/// matches the default the controller's planner uses when the
+/// matches the default the control plane's planner uses when the
 /// caller didn't override.
 fn cms_heap_size(config: &AggregationConfig) -> u64 {
     config

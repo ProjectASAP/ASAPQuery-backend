@@ -29,7 +29,7 @@ graph TB
         A[Arroyo Streaming]
         K[Kafka]
         Q[QueryEngine]
-        C[Controller]
+        C[Control Plane]
         AS[ArroyoSketch]
     end
 
@@ -144,7 +144,7 @@ How sketches are configured:
 ```mermaid
 graph LR
     U[User] -->|edit| CC[controller-config.yaml]
-    CC --> C[Controller]
+    CC --> C[Control Plane]
     C -->|analyze queries| C
     C -->|streaming_config.yaml| AS[ArroyoSketch]
     C -->|inference_config.yaml| Q[QueryEngine]
@@ -163,7 +163,7 @@ graph LR
    - List of queries to accelerate
    - Metric metadata (labels, types)
 
-2. **Controller** analyzes the query workload:
+2. **Control Plane** analyzes the query workload:
    - Determines which sketch algorithms to use (DDSketch, KLL, etc.)
    - Computes sketch parameters (size, accuracy)
    - Generates `streaming_config.yaml` for Arroyo

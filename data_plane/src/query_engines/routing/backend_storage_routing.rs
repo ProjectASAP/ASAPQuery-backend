@@ -86,7 +86,7 @@
 //!
 //! ## Out of scope
 //!
-//! * Hot reload — the controller's plan-push is the long-term answer
+//! * Hot reload — the control plane's plan-push is the long-term answer
 //!   for per-metric routing; this YAML layer is the bridge that
 //!   unblocks issue #46 criteria ④/⑤/⑥ until the plan-push lands.
 //! * Per-`(metric, statistic, accuracy)` granularity — `StorageBackend`
@@ -117,9 +117,9 @@ use tracing::{debug, info};
 /// approximate sketch is misleading) or serves with worse precision
 /// than the archive (rate post-hoc).
 ///
-/// Phase α (controller-emitted routing tables) adds `HistogramQuantile`
+/// Phase α (control-plane-emitted routing tables) adds `HistogramQuantile`
 /// / `Delta` / `Deriv` / `Absent` — these are PromQL shapes no warm-tier
-/// sketch can serve and the controller's emitter reliably routes them
+/// sketch can serve and the control plane's emitter reliably routes them
 /// to the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,7 +137,7 @@ pub enum QueryShape {
     /// Marked "post-hoc" because the warm tier's pre-computed
     /// `Increase` aggregation answers `rate` natively for known
     /// queries, so this shape only kicks in for ad-hoc rate queries
-    /// the controller didn't pre-plan for.
+    /// the control plane didn't pre-plan for.
     RatePostHoc,
     /// `quantile_over_time(φ, <metric>[<range>])` and
     /// `quantile(...)` aggregations. Warm tier serves natively via
@@ -174,7 +174,7 @@ pub enum QueryShape {
 }
 
 impl QueryShape {
-    /// Stable string tag used in YAML / JSON. Mirrors the controller's
+    /// Stable string tag used in YAML / JSON. Mirrors the control plane's
     /// `config::stage_config::emit_backend_storage_routing` shape
     /// vocabulary — the wire form is the canonical PromQL function
     /// name (or a `_` prefixed variant for shapes without a single
@@ -369,7 +369,7 @@ impl RoutingTarget {
 
 /// Tenant id used when the deploy is single-tenant (no `X-ASAP-Tenant`
 /// header on the request and no explicit `tenant` field on the
-/// controller-emitted JSON). Multi-tenant deployments thread an
+/// control-plane-emitted JSON). Multi-tenant deployments thread an
 /// explicit non-`default` id through both surfaces.
 pub const DEFAULT_TENANT: &str = "default";
 
@@ -530,9 +530,9 @@ impl BackendStorageRouting {
         Ok(routing)
     }
 
-    /// Phase α (MVP): parse a controller-emitted JSON document into a
+    /// Phase α (MVP): parse a control-plane-emitted JSON document into a
     /// fresh routing table. The schema mirrors
-    /// `controller/src/config/stage_config.rs::emit_backend_storage_routing`:
+    /// `control_plane/src/emit/stage_config.rs::emit_backend_storage_routing`:
     ///
     /// ```json
     /// {
@@ -550,18 +550,18 @@ impl BackendStorageRouting {
     /// }
     /// ```
     ///
-    /// Engine-name compatibility (controller → backend `StorageBackend`):
+    /// Engine-name compatibility (control plane → backend `StorageBackend`):
     ///
     /// * `asap_query` → `SketchStore`
     /// * `thanos_query` → `GorillaObjectStore` storage, served by
     ///   `ThanosQueryEngine`.
     ///
     /// Unknown query-shape strings are mapped to [`QueryShape::Other`]
-    /// rather than failing the parse — the controller's vocabulary may
+    /// rather than failing the parse — the control plane's vocabulary may
     /// drift forward of the backend's. Empty `targets` arrays are
     /// rejected (same contract as `from_yaml_str`).
     ///
-    /// Side fields (e.g. `warm_tier_native_shapes`) the controller emits
+    /// Side fields (e.g. `warm_tier_native_shapes`) the control plane emits
     /// for operator inspection are ignored — the JSON parser pulls only
     /// `default_engine` and `metrics:[...]`.
     pub fn from_json_payload(value: &JsonValue) -> Result<Self> {
@@ -831,7 +831,7 @@ fn parse_engine_string(s: &str) -> Result<StorageBackend> {
 
 /// Map a JSON `applies_to_query_shape` string into a backend
 /// `QueryShape`. Unknown shapes are mapped to [`QueryShape::Other`] —
-/// the controller's vocabulary may emit shape names a backend revision
+/// the control plane's vocabulary may emit shape names a backend revision
 /// doesn't yet understand, and `Other` is the safe fall-through (the
 /// archive's claim list typically includes `Other` so unknowns still
 /// route to the archive).
@@ -852,7 +852,7 @@ fn parse_query_shape_string(s: &str) -> QueryShape {
 }
 
 /// Compute a stable, short hash of a `BackendStorageRouting` table for
-/// the swap handler's response. The controller uses this to verify the
+/// the swap handler's response. The control plane uses this to verify the
 /// backend installed exactly the bytes it pushed (cheap drift check on
 /// every plan emit).
 ///
@@ -922,7 +922,7 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 /// ## Write path
 ///
 /// The swap handler calls [`Self::swap_tenant`] with the tenant id
-/// and the new table parsed from the controller's JSON. The previous
+/// and the new table parsed from the control plane's JSON. The previous
 /// `Arc` is dropped when the last in-flight reader goes out of scope.
 ///
 /// ## Bootstrap
@@ -932,7 +932,7 @@ pub fn routing_table_hash(table: &BackendStorageRouting) -> String {
 ///   `DEFAULT_TENANT` table loaded from
 ///   `deploy/configs/backend-storage-routing.yaml` (legacy
 ///   bootstrap; preserved for dev / standalone deployments).
-/// * `Self::empty()` — start with an empty table; the controller's
+/// * `Self::empty()` — start with an empty table; the control plane's
 ///   first push fills it.
 #[derive(Clone)]
 pub struct HotReloadBackendStorageRouting {
@@ -962,7 +962,7 @@ impl HotReloadBackendStorageRouting {
     /// first push lands. Specifically, the [`DEFAULT_TENANT`]
     /// entry is pre-populated with an empty table so single-tenant
     /// deploys never see a "tenant unknown" miss before the first
-    /// controller push.
+    /// control plane push.
     pub fn empty() -> Self {
         Self::new(BackendStorageRouting::empty())
     }
@@ -1403,7 +1403,7 @@ routes:
     }
 
     #[test]
-    fn json_payload_parses_controller_fixture() {
+    fn json_payload_parses_control_plane_fixture() {
         let r = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
         assert_eq!(r.default_backend(), StorageBackend::SketchStore);
         assert_eq!(r.len(), 2);
@@ -1533,7 +1533,7 @@ routes:
         assert_eq!(r.lookup("audit_events"), StorageBackend::GorillaObjectStore);
     }
 
-    /// Phase ε.2: the controller's Mode 3
+    /// Phase ε.2: the control plane's Mode 3
     /// (`RawAtEdgePrometheusArchive`) emits `engine: prometheus_remote`
     /// in the routing JSON for metrics whose raw data is shipped to
     /// Prometheus's native OTLP receiver. The backend's parser must
@@ -1670,7 +1670,7 @@ routes:
     #[test]
     fn json_payload_tenant_field_is_optional_and_defaults_to_default() {
         // A JSON without a `tenant` field — the existing single-tenant
-        // controller emit shape — must parse cleanly and resolve to
+        // control plane emit shape — must parse cleanly and resolve to
         // the [`DEFAULT_TENANT`] tenant.
         let r = BackendStorageRouting::from_json_payload(&fixture_json()).expect("parse");
         assert_eq!(r.tenant(), DEFAULT_TENANT);

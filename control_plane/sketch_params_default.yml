@@ -1,0 +1,36 @@
+# Sketch parameter defaults for the control plane planner.
+#
+# All values here are the compiled-in defaults.  Override any field to
+# customise sketch sizing without recompiling.
+#
+# Env var: CONTROLLER_SKETCH_DEFAULTS=path/to/this/file.yaml
+
+# Quantile grid used when the query does not specify explicit φ values.
+quantile_grid: [0.0, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]
+
+ddsketch:
+  # DDSketch relative accuracy (α).  Lower = more buckets = higher memory.
+  relative_accuracy: 0.01
+
+kll:
+  # Minimum k parameter (clamped from ⌈1/accuracy_sla⌉).
+  min_k: 32
+
+hll:
+  # HLL precision for coarse SLA (accuracy > precision_threshold).
+  precision_coarse: 10
+  # HLL precision for fine SLA (accuracy ≤ precision_threshold).
+  precision_fine: 14
+  # SLA boundary between coarse and fine precision bands.
+  precision_threshold: 0.02
+
+count_sketch:
+  # Relative error bound (ε ≈ 1/√cols for equivalent width).
+  epsilon: 0.022
+  # Error probability (δ ≈ e^(−rows) for equivalent depth).
+  delta: 0.007
+
+count_min_sketch:
+  rows: 5
+  cols: 2048
+  metric_name: "countsketch_partition"

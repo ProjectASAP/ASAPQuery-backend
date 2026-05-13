@@ -56,7 +56,7 @@ pub struct RawSample {
 /// Narrow subset of PromQL label matchers the backfill reader must
 /// honour. Exactly one metric name plus zero or more equality
 /// matchers on grouping labels — no regex, no negation, no
-/// lexicographic ranges. The controller picks the subset of
+/// lexicographic ranges. The control plane picks the subset of
 /// `AggregationConfig.grouping_labels` that should gate the read.
 ///
 /// Rationale: every supported exact-DB backend (Prometheus,

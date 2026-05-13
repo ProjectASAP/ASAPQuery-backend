@@ -88,7 +88,7 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
 /// `Ghost` / `Unknown` outcomes the query falls through to the archive
 /// engine via the EngineRouter's `CapabilityMiss` failover.
 /// Legacy `(metric_name, group_by_keys)` extractor — superseded by
-/// `controller::warm_tier_analysis::analyze_promql_for_warm_tier`,
+/// `control_plane::warm_tier_analysis::analyze_promql_for_warm_tier`,
 /// which returns the full `WarmTierAnalysis` (capability, function
 /// name + args, range). Kept around as `#[allow(dead_code)]` because
 /// downstream code (range-query pipeline, range-step planner) still
@@ -253,13 +253,13 @@ pub struct ASAPQueryEngine {
     /// a POST is immediately visible to the next query.
     streaming_config_source: crate::storage_engines::types::HotReloadStreamingConfig,
     prometheus_scrape_interval: u64,
-    controller_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>,
-    /// Optional `ControllerClient` used to notify the DataCollector
-    /// controller when a query hits a capability miss
+    control_plane_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>,
+    /// Optional `ControlPlaneClient` used to notify the control plane
+    /// when a query hits a capability miss
     /// (`find_compatible_aggregation` returns `None`). When `None`,
     /// misses fall through to the §5.2 fallback silently, matching
-    /// pre-PR-G behavior. Set via `with_controller_client`.
-    controller_client: Option<Arc<dyn crate::drivers::query::controller_client::ControllerClient>>,
+    /// pre-PR-G behavior. Set via `with_control_plane_client`.
+    control_plane_client: Option<Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>>,
     /// Phase 5 — warm-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
@@ -415,20 +415,20 @@ impl ASAPQueryEngine {
                 PromQLPattern::new(pattern)
             };
 
-        // Create controller patterns
-        let mut controller_patterns = HashMap::new();
-        controller_patterns.insert(
+        // Create control plane patterns
+        let mut control_plane_patterns = HashMap::new();
+        control_plane_patterns.insert(
             QueryPatternType::OnlyTemporal,
             vec![
                 temporal_pattern("quantile", &temporal_pattern_blocks),
                 temporal_pattern("generic", &temporal_pattern_blocks),
             ],
         );
-        controller_patterns.insert(
+        control_plane_patterns.insert(
             QueryPatternType::OnlySpatial,
             vec![spatial_pattern("generic", &spatial_pattern_blocks)],
         );
-        controller_patterns.insert(
+        control_plane_patterns.insert(
             QueryPatternType::OneTemporalOneSpatial,
             vec![
                 spatial_of_temporal_pattern(&temporal_pattern_blocks["quantile"]),
@@ -439,8 +439,8 @@ impl ASAPQueryEngine {
         Self {
             streaming_config_source,
             prometheus_scrape_interval,
-            controller_patterns,
-            controller_client: None,
+            control_plane_patterns,
+            control_plane_client: None,
             sketch_index: None,
             archive_engine: None}
     }
@@ -485,17 +485,17 @@ impl ASAPQueryEngine {
         self.streaming_config_source.snapshot()
     }
 
-    /// Attach a `ControllerClient` so capability misses fire a
+    /// Attach a `ControlPlaneClient` so capability misses fire a
     /// fire-and-forget notification to the DataCollector controller.
     /// Builder-style method — takes self by value and returns it so
     /// construction in `main.rs` chains neatly. Without this call,
     /// capability misses fall through to the §5.2 fallback silently,
     /// matching pre-PR-G behavior.
-    pub fn with_controller_client(
+    pub fn with_control_plane_client(
         mut self,
-        client: Arc<dyn crate::drivers::query::controller_client::ControllerClient>,
+        client: Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>,
     ) -> Self {
-        self.controller_client = Some(client);
+        self.control_plane_client = Some(client);
         self
     }
 
@@ -529,7 +529,7 @@ impl ASAPQueryEngine {
 
     /// Look up a compatible aggregation for the given requirements,
     /// and if none exists, fire a capability-miss notification to
-    /// the controller (fire-and-forget, does not block the query).
+    /// the control plane (fire-and-forget, does not block the query).
     /// Wraps the plain `streaming_config.find_compatible_aggregation`
     /// with the PR G telemetry call-out.
     fn find_compatible_aggregation_with_miss_notify(
@@ -539,8 +539,8 @@ impl ASAPQueryEngine {
         let streaming_config = self.streaming_config_snapshot();
         let result = streaming_config.find_compatible_aggregation(requirements);
         if result.is_none() {
-            crate::drivers::query::controller_client::spawn_capability_miss_notify(
-                &self.controller_client,
+            crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                &self.control_plane_client,
                 requirements,
             );
         }
@@ -578,7 +578,7 @@ impl ASAPQueryEngine {
     fn resolve_metric_labels(&self, metric: &str) -> Option<KeyByLabelNames> {
         // Streaming-config-derived label set. Previously this had a
         // fast-path through `inference_config.schema`; that source
-        // was retired with InferenceConfig. The controller drives
+        // was retired with InferenceConfig. The control plane drives
         // capability matching against `aggregation_configs` directly,
         // so we derive the label union from those configs.
         //
@@ -693,7 +693,7 @@ impl ASAPQueryEngine {
         // alone to decide whether the metric is locally known. The
         // old `inference_config.schema` lookup was a secondary path
         // for schema-defined-but-aggregation-less metrics; with the
-        // controller driving plans dynamically, every known metric
+        // control plane driving plans dynamically, every known metric
         // has a corresponding aggregation_config.
         let bare_present = metric_known(&metric);
         if bare_present {
@@ -1308,7 +1308,7 @@ impl ASAPQueryEngine {
         let query_time = Self::convert_query_time_to_data_time(time);
 
         let mut found_match = None;
-        for (pattern_type, patterns) in &self.controller_patterns {
+        for (pattern_type, patterns) in &self.control_plane_patterns {
             for pattern in patterns {
                 let match_result = pattern.matches(arm_ast);
                 if match_result.matches {
@@ -1780,7 +1780,7 @@ impl ASAPQueryEngine {
     //     };
 
     //     let mut found_match = None;
-    //     for (pattern_type, patterns) in &self.controller_patterns {
+    //     for (pattern_type, patterns) in &self.control_plane_patterns {
     //         for pattern in patterns {
     //             let match_result = pattern.matches(&ast);
     //             if match_result.matches {
@@ -2208,7 +2208,7 @@ impl ASAPQueryEngine {
         let pattern_match_start_time = Instant::now();
 
         let mut found_match = None;
-        for (pattern_type, patterns) in &self.controller_patterns {
+        for (pattern_type, patterns) in &self.control_plane_patterns {
             for pattern in patterns {
                 debug!(
                     "Trying pattern type: {:?} for query: {}",
@@ -2244,7 +2244,7 @@ impl ASAPQueryEngine {
 
     /// Resolve which aggregation covers a PromQL query: try the
     /// `QueryConfig` exact-string match first, then fall back to
-    /// capability-based matching (with controller miss-notification
+    /// capability-based matching (with control plane miss-notification
     /// if wired). Extracted from `build_query_execution_context_promql`
     /// so the per-segment timeline dispatch can choose NOT to
     /// auto-resolve (it has a forced agg_id from the timeline).
@@ -2269,7 +2269,7 @@ impl ASAPQueryEngine {
     /// to a single-aggregation `QueryConfig` match.
     ///
     /// Returns `None` if the agg_id isn't in the current
-    /// `StreamingConfig` — either a stale controller posted a
+    /// `StreamingConfig` — either a stale control plane posted a
     /// backfill for a removed agg, or the timeline contains a
     /// retired entry whose config was evicted. Either way the
     /// per-segment dispatch will skip this segment as
@@ -2407,7 +2407,7 @@ impl ASAPQueryEngine {
                 Some(c) => c,
                 None => {
                     // agg_id no longer in the current StreamingConfig
-                    // (e.g. controller pushed a swap that dropped
+                    // (e.g. control plane pushed a swap that dropped
                     // this entry between timeline resolution and
                     // dispatch). Classify as unresolved.
                     unresolved.push(segment.clone());
@@ -3432,7 +3432,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         query: &str,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError> {
         // Phase 9 controller-unification (2026-05) — the warm-tier
-        // hook is now a thin driver around the controller's
+        // hook is now a thin driver around the control plane's
         // `analyze_promql_for_warm_tier`. The analyzer is the single
         // owner of "is this PromQL warm-tier-answerable" knowledge.
         // We drop into one of three branches:
@@ -3464,9 +3464,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //    over to archive (no per-candidate hybrid stitch yet —
         //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
-            let analysis = controller::warm_tier_analysis::analyze_promql_for_warm_tier(query);
+            let analysis = control_plane::warm_tier_analysis::analyze_promql_for_warm_tier(query);
 
-            // Branch 1 — the controller analyzer rejects the shape.
+            // Branch 1 — the control plane analyzer rejects the shape.
             if let Some(reason) = &analysis.unsupported {
                 return Err(crate::query_engines::EngineError::capability_miss(
                     asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -3535,7 +3535,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
                 // Verify each sid carries the analyzer's required
                 // capability. After Step 2a there's exactly one
-                // `Capability` enum (defined in the controller and
+                // `Capability` enum (defined in the control plane and
                 // re-exported by `sketch_index`), so no `From`
                 // conversion is needed — just clone.
                 let required: crate::storage_engines::sketch_db::index::Capability =
@@ -4793,7 +4793,7 @@ mod hot_reload_phase2_tests {
         assert!(snap_before.aggregation_configs.contains_key(&101));
         assert!(!snap_before.aggregation_configs.contains_key(&202));
 
-        // Simulate a controller push via `HotReloadStreamingConfig::swap`.
+        // Simulate a control plane push via `HotReloadStreamingConfig::swap`.
         // Clones of the handle share the same underlying ArcSwap, so a
         // swap on `handle` is observable through the engine's stored
         // clone.
@@ -4868,7 +4868,7 @@ mod e2e_feedback_loop_tests {
     use crate::storage_engines::types::{
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
-    use crate::drivers::query::controller_client::ControllerClient;
+    use crate::drivers::control_plane_client::ControlPlaneClient;
     use async_trait::async_trait;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use promql_utilities::query_logics::enums::Statistic;
@@ -4915,7 +4915,7 @@ mod e2e_feedback_loop_tests {
     ///      `BackendClient::push_streaming_config` POSTs to the
     ///      backend's `/api/v1/streaming-config` endpoint on a real
     ///      cross-binary deployment.
-    struct InProcessMockController {
+    struct InProcessMockControlPlane {
         calls: Mutex<Vec<asap_types::query_requirements::QueryRequirements>>,
         call_count: AtomicUsize,
         hot_reload: HotReloadStreamingConfig,
@@ -4925,7 +4925,7 @@ mod e2e_feedback_loop_tests {
                 + Sync,
         >}
 
-    impl InProcessMockController {
+    impl InProcessMockControlPlane {
         fn new(
             hot_reload: HotReloadStreamingConfig,
             planner: impl Fn(&asap_types::query_requirements::QueryRequirements) -> StreamingConfig
@@ -4942,7 +4942,7 @@ mod e2e_feedback_loop_tests {
     }
 
     #[async_trait]
-    impl ControllerClient for InProcessMockController {
+    impl ControlPlaneClient for InProcessMockControlPlane {
         async fn notify_capability_miss(
             &self,
             requirements: &asap_types::query_requirements::QueryRequirements,
@@ -4984,10 +4984,10 @@ mod e2e_feedback_loop_tests {
         // 2. Mock controller: when a miss comes in, generate a config
         //    that covers the requested metric. This mirrors DC's
         //    replanner running and POSTing via its BackendClient.
-        let mock = Arc::new(InProcessMockController::new(hot_reload.clone(), |req| {
+        let mock = Arc::new(InProcessMockControlPlane::new(hot_reload.clone(), |req| {
             // Mock controller mints an explicit id here just to keep
             // the test self-contained. In production, the
-            // `controller::emit::asapquery_backend` emitter no longer
+            // `control_plane::emit::asapquery_backend` emitter no longer
             // writes `aggregationId` (M2.2) and the backend derives
             // one via `compute_agg_config_id`; explicit ids in the
             // YAML are still honored for backwards compatibility.
@@ -5003,7 +5003,7 @@ mod e2e_feedback_loop_tests {
 
         // 3. Build ASAPQueryEngine with the handle and mock controller.
         let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
-        .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
+        .with_control_plane_client(mock.clone() as Arc<dyn ControlPlaneClient>);
 
         // 4. Initial snapshot: empty.
         let snap_before = engine.streaming_config_snapshot();
@@ -5105,12 +5105,12 @@ mod e2e_feedback_loop_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn capability_miss_idempotent_on_repeat() {
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let mock = Arc::new(InProcessMockController::new(hot_reload.clone(), |req| {
+        let mock = Arc::new(InProcessMockControlPlane::new(hot_reload.clone(), |req| {
             streaming_config_with(&req.metric, 42)
         }));
 
         let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
-        .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
+        .with_control_plane_client(mock.clone() as Arc<dyn ControlPlaneClient>);
 
         let requirements = asap_types::query_requirements::QueryRequirements {
             metric: "latency_ms".to_string(),
@@ -5517,7 +5517,7 @@ mod sketch_alias_resolver_tests {
 
     /// Build a ASAPQueryEngine whose streaming-config holds the supplied
     /// (metric, agg_type) pairs and whose schema is empty (matches the
-    /// production warm-tier deploy where the controller drives the
+    /// production warm-tier deploy where the control plane drives the
     /// label set).
     fn engine_with(metrics: &[(&str, AggregationType)]) -> ASAPQueryEngine {
         let mut configs = HashMap::new();
@@ -5960,7 +5960,7 @@ mod warm_tier_classify_tests {
     async fn execute_rejects_bare_selector_via_analyzer() {
         // Phase-9 controller-unified behavior: a bare vector selector
         // (no call node) is rejected by
-        // `controller::warm_tier_analysis::analyze_promql_for_warm_tier`
+        // `control_plane::warm_tier_analysis::analyze_promql_for_warm_tier`
         // with `UnsupportedReason::NoCallNodeFound` BEFORE the sid
         // index is even consulted. The archive engine answers raw
         // selectors directly, so this is the right place for the

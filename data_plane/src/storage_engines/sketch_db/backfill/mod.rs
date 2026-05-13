@@ -218,7 +218,7 @@ pub enum Coverage {
 ///   concurrent `create` calls observe the same id.
 /// * Read paths (`get`, `list`, `by_status`) take only a `read()`
 ///   lock on the inner map; writes take `write()`. A single `RwLock`
-///   fits the workload — backfill creations are human / controller
+///   fits the workload — backfill creations are human / control plane
 ///   triggered, much rarer than reads.
 /// * All state transitions go through `update_status` (or the sugar
 ///   methods `start` / `mark_complete` / `mark_failed` / `cancel`)
@@ -278,7 +278,7 @@ pub type WrittenWindow = (u64, (u64, u64));
 pub const PERSIST_FORMAT_VERSION: u32 = 1;
 
 /// Errors returned by [`BackfillRegistry::create_checked`]. Exists
-/// so the controller-facing HTTP endpoint can render distinct
+/// so the control-plane-facing HTTP endpoint can render distinct
 /// 400 vs 404 vs 409 depending on which invariant was violated,
 /// rather than swallowing the detail in a string.
 #[derive(Debug, PartialEq, Eq)]
@@ -530,7 +530,7 @@ impl BackfillRegistry {
     ///   `created_at_ms` directly — in the post-schema-retirement
     ///   world there is no `SchemaRegistry::get(agg_id)` to look
     ///   it up from, and the caller (typically the HTTP handler
-    ///   or controller) already has the wall-clock snapshot in
+    ///   or control plane) already has the wall-clock snapshot in
     ///   scope from its `StreamingConfig` reconcile event.
     /// * **Within data retention** (if `data_retention_ms` is
     ///   provided): `time_range.0 >= now - data_retention_ms`.
@@ -544,7 +544,7 @@ impl BackfillRegistry {
     /// caller no longer threads it separately.
     ///
     /// Errors map to distinct [`CreateError`] variants so the
-    /// controller-facing HTTP endpoint can return specific 404 /
+    /// control-plane-facing HTTP endpoint can return specific 404 /
     /// 409 / 400 statuses. `CreateError::UnknownAgg` is no longer
     /// returned from this method — the caller proves the agg
     /// exists by holding the `AggregationConfig` — but the variant
@@ -848,7 +848,7 @@ impl BackfillRegistry {
         // *now* (intuitive meaning of "anything older than 0ms ago"),
         // including jobs that completed in the same millisecond as
         // this call — which is the common case in tests and in
-        // controller-driven eviction loops where both timestamps
+        // control-plane-driven eviction loops where both timestamps
         // come from the same wall clock.
         map.retain(|_, job| {
             !(job.status.is_terminal() && job.completed_at_ms.map(|t| t <= cutoff).unwrap_or(false))
