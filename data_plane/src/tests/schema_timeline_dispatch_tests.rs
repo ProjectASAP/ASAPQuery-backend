@@ -98,23 +98,35 @@ fn build_engine(
     streaming_config: Arc<StreamingConfig>,
     schemas: Arc<SchemaRegistry>,
     store: Arc<dyn Store>,
+    sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
     let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
     ASAPQueryEngine::new_with_hot_reload(store, hot_reload, 1)
         .with_schema_registry(schemas)
+        .with_sketch_index(sketch_index)
 }
 
 /// Insert a single `SumAccumulator` window at `ts` into `agg_id`.
-/// Uses `(ts, ts)` for the window start/end pair to match the
-/// existing test-utility pattern in `engine_factories` — the engine
-/// treats those as single-point buckets aligned to the tumbling
-/// window, so a query whose range contains `ts` picks up the data.
-fn seed_sum_at(store: &SketchStore, agg_id: u64, ts: u64, host: &str, sum: f64) {
+/// Mirrors the live ingest path's M2.3.6e write-path: data lands in
+/// BOTH the legacy SketchStore AND the new SketchIndex so the
+/// engine's M2.3.6f read path (SketchIndex-only) sees it.
+fn seed_sum_at(
+    store: &SketchStore,
+    sketch_index: &crate::stores::sketch_db::index::SketchIndex,
+    streaming_config: &StreamingConfig,
+    agg_id: u64,
+    ts: u64,
+    host: &str,
+    sum: f64,
+) {
     let key = Some(KeyByLabelValues {
         labels: vec![host.to_string()]});
     let output = PrecomputedOutput::new(ts, ts, key, agg_id);
     let acc = SumAccumulator::with_sum(sum);
+    if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
+        sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, &acc);
+    }
     store
         .insert_precomputed_output(output, Box::new(acc))
         .expect("seed insert must succeed");
@@ -148,10 +160,11 @@ fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
     // per segment:
     //   agg_1's sub-range is `[QUERY_START_MS, BOUNDARY_MS]`
     //   agg_2's sub-range is `[BOUNDARY_MS, QUERY_TIME_MS]`
-    seed_sum_at(&store, 1, AGG1_SAMPLE_MS, "A", 10.0);
-    seed_sum_at(&store, 2, AGG2_SAMPLE_MS, "A", 20.0);
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    seed_sum_at(&store, &sketch_index, &streaming_config, 1, AGG1_SAMPLE_MS, "A", 10.0);
+    seed_sum_at(&store, &sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
-    let engine = build_engine(streaming_config, schemas, store, 2);
+    let engine = build_engine(streaming_config, schemas, store, sketch_index, 2);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
@@ -201,9 +214,10 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
     ));
     // Only agg_2 has data; agg_1's data is assumed gone with the
     // Purged classification.
-    seed_sum_at(&store, 2, AGG2_SAMPLE_MS, "A", 20.0);
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    seed_sum_at(&store, &sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
-    let engine = build_engine(streaming_config, schemas, store, 2);
+    let engine = build_engine(streaming_config, schemas, store, sketch_index, 2);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
@@ -251,9 +265,10 @@ fn single_schema_query_falls_through_to_default_path() {
         streaming_config.clone(),
         CleanupPolicy::NoCleanup,
     ));
-    seed_sum_at(&store, 7, QUERY_TIME_MS, "A", 42.0);
+    let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
+    seed_sum_at(&store, &sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
 
-    let engine = build_engine(streaming_config, schemas, store, 7);
+    let engine = build_engine(streaming_config, schemas, store, sketch_index, 7);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)

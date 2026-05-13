@@ -1044,101 +1044,51 @@ impl ASAPQueryEngine {
             params.is_exact_query
         );
 
-        // M2.3.5b — when a `SketchIndex` is attached AND the agg
-        // config is resolvable, read precomputes from SketchIndex
-        // (sid-keyed) instead of the legacy SketchStore. DualWriteSink
-        // mirrors writes to both, so the data is identical; this just
-        // moves the read off the agg_id-keyed store. When sketch_index
-        // is `None` (tests without one) or the agg_cfg is missing
-        // (eviction race), fall back to the legacy store.
-        if let Some(idx) = self.sketch_index.as_ref() {
-            let cfg = self.streaming_config_snapshot();
-            if let Some(agg_cfg) = cfg.get_aggregation_config(params.aggregation_id) {
-                let raw = idx.query_precomputes_by_agg(
-                    &params.metric,
-                    agg_cfg.aggregation_type,
-                    params.start_timestamp,
-                    params.end_timestamp,
-                );
-                let result: TimestampedBucketsMap = if params.is_exact_query {
-                    // Sliding-window mode requires bit-exact (start,
-                    // end) match. SketchIndex's range query returns
-                    // any windows fully within [start, end] — filter
-                    // post-hoc to recover the exact semantics the
-                    // legacy `query_precomputed_output_exact` had.
-                    raw.into_iter()
-                        .map(|(k, v)| {
-                            let filtered: Vec<_> = v
-                                .into_iter()
-                                .filter(|((s, e), _)| {
-                                    *s == params.start_timestamp
-                                        && *e == params.end_timestamp
-                                })
-                                .collect();
-                            (k, filtered)
-                        })
-                        .filter(|(_, v)| !v.is_empty())
-                        .collect()
-                } else {
-                    raw
-                };
-                return Ok(result);
-            }
-        }
-
-        let store_query_start_time = Instant::now();
-
-        let result = if params.is_exact_query {
-            debug!(
-                "Sliding window query: Looking for exact window [{}, {}]",
-                params.start_timestamp, params.end_timestamp
-            );
-            let res = self.store.query_precomputed_output_exact(
-                &params.metric,
-                params.aggregation_id,
-                params.start_timestamp,
-                params.end_timestamp,
-            );
-            if let Ok(ref outputs) = res {
-                let store_query_duration = store_query_start_time.elapsed();
-                debug!(
-                    "Sliding window exact query took: {:.2}ms, found {} unique keys",
-                    store_query_duration.as_secs_f64() * 1000.0,
-                    outputs.len()
-                );
-            }
-            res
-        } else {
-            debug!(
-                "Tumbling window query: range [{}, {}]",
-                params.start_timestamp, params.end_timestamp
-            );
-            let res = self.store.query_precomputed_output(
-                &params.metric,
-                params.aggregation_id,
-                params.start_timestamp,
-                params.end_timestamp,
-            );
-            if res.is_ok() {
-                let store_query_duration = store_query_start_time.elapsed();
-                debug!(
-                    "Tumbling window range query took: {:.2}ms",
-                    store_query_duration.as_secs_f64() * 1000.0
-                );
-            }
-            res
+        // M2.3.6f — engine reads precomputes from SketchIndex only.
+        // The legacy `Store::query_precomputed_output*` fallback has
+        // been retired now that DualWriteSink (M2.3.4b) → SketchIndexSink
+        // (M2.3.6a) writes exclusively to SketchIndex and
+        // BackfillService (M2.3.6e) mirrors replays there too.
+        //
+        // Tests that don't attach a SketchIndex now get `Ok(empty)`
+        // here. Anything deeper than smoke-test coverage was already
+        // setting one (M2.3.5b made it mandatory in production).
+        let Some(idx) = self.sketch_index.as_ref() else {
+            return Ok(TimestampedBucketsMap::new());
         };
-
-        result.map_err(|e| {
-            format!(
-                "Error querying store for metric {}, agg {}, range [{}, {}]: {}",
-                params.metric,
-                params.aggregation_id,
-                params.start_timestamp,
-                params.end_timestamp,
-                e
-            )
-        })
+        let cfg = self.streaming_config_snapshot();
+        let Some(agg_cfg) = cfg.get_aggregation_config(params.aggregation_id) else {
+            return Ok(TimestampedBucketsMap::new());
+        };
+        let raw = idx.query_precomputes_by_agg(
+            &params.metric,
+            agg_cfg.aggregation_type,
+            params.start_timestamp,
+            params.end_timestamp,
+        );
+        let result: TimestampedBucketsMap = if params.is_exact_query {
+            // Sliding-window mode requires bit-exact (start, end)
+            // match. SketchIndex's range query returns any windows
+            // fully within [start, end] — filter post-hoc to recover
+            // the exact semantics the retired
+            // `query_precomputed_output_exact` had.
+            raw.into_iter()
+                .map(|(k, v)| {
+                    let filtered: Vec<_> = v
+                        .into_iter()
+                        .filter(|((s, e), _)| {
+                            *s == params.start_timestamp
+                                && *e == params.end_timestamp
+                        })
+                        .collect();
+                    (k, filtered)
+                })
+                .filter(|(_, v)| !v.is_empty())
+                .collect()
+        } else {
+            raw
+        };
+        Ok(result)
     }
 
     /// Executes the full store query plan and returns merged results
