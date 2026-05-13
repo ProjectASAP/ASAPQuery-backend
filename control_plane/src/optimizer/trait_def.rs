@@ -10,7 +10,7 @@
 //!   fixed-point [`crate::optimizer::engine::QueryOptimizer`] over the
 //!   legacy [`crate::intent_algebra::legacy_expr::QueryExpr`] IR.
 //! * The Phase-C bind-rule trait [`crate::sketch_algebra::rules::Rule`]
-//!   lowers L3 → L4 [`crate::sketch_algebra::SketchExpr`] on the
+//!   lowers L3 → L4 [`crate::sketch_algebra::PhysicalExpr`] on the
 //!   canonical [`crate::intent_algebra::QueryExpr`] IR.
 //!
 //! Both feed into the same "rule library" the engine driver consults, so

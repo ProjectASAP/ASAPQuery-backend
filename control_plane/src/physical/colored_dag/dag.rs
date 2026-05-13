@@ -1,13 +1,13 @@
-//! L5 colored DAG — `SketchExpr` nodes painted with `StageId`.
+//! L5 colored DAG — `PhysicalExpr` nodes painted with `StageId`.
 //!
 //! Per `control_plane/docs/design.md` §3 (line ~123): "A 'stage assignment'
-//! is a colouring of the L4-bound `SketchExpr` DAG by `StageId`, with
+//! is a colouring of the L4-bound `PhysicalExpr` DAG by `StageId`, with
 //! sketch-merge / data-shipping nodes inserted on the cut edges."
 //!
 //! [`ColoredDag`] is the IR the [`crate::physical::colored_dag::Emitter`]
 //! consumes. It carries:
 //!
-//! - the `nodes` vector (every visited `SketchExpr` node keyed by
+//! - the `nodes` vector (every visited `PhysicalExpr` node keyed by
 //!   [`NodeId`], with its assigned `StageId`),
 //! - the `edges` vector (parent → child references from the DAG walk),
 //!   carried so future Phase G+ work can detect cross-stage cut edges
@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::SketchExpr;
+use crate::sketch_algebra::PhysicalExpr;
 
 /// Stable position-based identifier for a node within a `ColoredDag`.
 /// `NodeId(0)` is the root; depth-first walk order otherwise.
@@ -37,22 +37,22 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// One entry in the colored DAG: a `SketchExpr` node + its assigned
+/// One entry in the colored DAG: a `PhysicalExpr` node + its assigned
 /// `StageId`.
 ///
 /// `expr` is a clone of the node's surface variant (children are NOT
 /// recursively cloned — the `child` payload is replaced with a sentinel
 /// to keep the colored-DAG flat; structural information lives in
 /// [`ColoredDag::edges`]). Test-friendly variant: when callers want the
-/// full sub-tree they can rebuild from the original `SketchExpr` using
+/// full sub-tree they can rebuild from the original `PhysicalExpr` using
 /// `NodeId` as the index.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColoredNode {
     /// Position-based identifier — index into `ColoredDag::nodes`.
     pub id: NodeId,
-    /// The `SketchExpr` node (full sub-tree as originally walked — Phase
+    /// The `PhysicalExpr` node (full sub-tree as originally walked — Phase
     /// E does not strip children, so emitters can read what they need).
-    pub expr: SketchExpr,
+    pub expr: PhysicalExpr,
     /// Stage this node was painted with.
     pub stage: StageId,
 }
@@ -60,7 +60,7 @@ pub struct ColoredNode {
 /// L5 colored DAG. The output of [`crate::physical::colored_dag::StageAllocator::allocate`].
 ///
 /// Per design.md §6: "L5 colors the DAG by `StageId` and emits
-/// per-executor configs. Same `SketchExpr` input; topology and emitter
+/// per-executor configs. Same `PhysicalExpr` input; topology and emitter
 /// differ per deployment model."
 ///
 /// `Default::default()` returns the empty `Topology::ThreeStage` shape —
@@ -96,7 +96,7 @@ impl Default for ColoredDag {
 }
 
 impl ColoredDag {
-    /// Root node (the original `SketchExpr` root). `None` only for the
+    /// Root node (the original `PhysicalExpr` root). `None` only for the
     /// degenerate empty DAG.
     pub fn root(&self) -> Option<&ColoredNode> {
         self.nodes.first()
@@ -146,25 +146,25 @@ mod tests {
     use super::*;
     use crate::intent_algebra::QueryExpr;
     use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
-    use crate::sketch_algebra::sketch_expr::EstimateOp;
-    use crate::sketch_algebra::SketchExpr;
+    use crate::sketch_algebra::physical_expr::EstimateOp;
+    use crate::sketch_algebra::PhysicalExpr;
 
-    fn dummy_logical() -> SketchExpr {
-        SketchExpr::Logical(QueryExpr::Ref {
+    fn dummy_logical() -> PhysicalExpr {
+        PhysicalExpr::Logical(QueryExpr::Ref {
             name: crate::types_v2::BindingName::new("dummy"),
         })
     }
 
-    fn dummy_agg() -> SketchExpr {
-        SketchExpr::SketchAgg {
+    fn dummy_agg() -> PhysicalExpr {
+        PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Kll,
             params: SketchParams::Kll(KllParams { k: 200 }),
             child: Box::new(dummy_logical()),
         }
     }
 
-    fn dummy_estimate() -> SketchExpr {
-        SketchExpr::SketchEstimate {
+    fn dummy_estimate() -> PhysicalExpr {
+        PhysicalExpr::SketchEstimate {
             op: EstimateOp::Quantile { q: 0.99 },
             child: Box::new(dummy_agg()),
         }

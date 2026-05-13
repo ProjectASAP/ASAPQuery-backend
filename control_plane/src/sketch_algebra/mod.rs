@@ -2,7 +2,7 @@
 //!
 //! Phase C introduces the L4 vocabulary the planner pivots on:
 //!
-//! - [`SketchExpr`] — the L4 algebra DAG (sketch-bound, language-orthogonal,
+//! - [`PhysicalExpr`] — the L4 algebra DAG (sketch-bound, language-orthogonal,
 //!   deployment-independent). Single-rooted per query; multi-root
 //!   workload-level fan-in lives one layer up in
 //!   `types_v2::WorkloadPlan`.
@@ -16,7 +16,7 @@
 //!   that fires `Bind*` rules.
 //! - [`rules`] — the `Bind*` rule family. Each rule pattern-matches on a
 //!   `QueryExpr::Aggregate` shape, reads the `AccuracyTarget`, and emits
-//!   a typed `SketchExpr` with the sketch family + parameters committed.
+//!   a typed `PhysicalExpr` with the sketch family + parameters committed.
 //!
 //! Scope reduction (per orchestrator spec): the variant set ships the
 //! subset DC + PromQL needs. `SketchJoin`, `SketchSubtract`,
@@ -36,7 +36,7 @@ pub mod capability_matching;
 pub mod lower;
 pub mod rules;
 pub mod schema;
-pub mod sketch_expr;
+pub mod physical_expr;
 pub mod sketch_params;
 
 // Back-compat alias. External call sites that imported
@@ -61,4 +61,4 @@ pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
 pub use schema::{SketchStateMetadata, SketchStateSchema};
-pub use sketch_expr::{EstimateOp, MergeAlgebra, SketchExpr};
+pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};

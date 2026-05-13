@@ -401,7 +401,7 @@ pub enum QueryExpr {
     },
 
     /// ⊕ — union of sub-results from independent stages or shards (the
-    /// exact-merge case). Sketch unions live in `SketchExpr`, not here.
+    /// exact-merge case). Sketch unions live in `PhysicalExpr`, not here.
     Merge {
         children: Vec<QueryExpr>,
     },

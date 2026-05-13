@@ -509,14 +509,14 @@ async fn handle_plan(
     // ── Phase B (MVP v6): typed L5 stage_split → per-stage emitter ────────────
     // Behind the `USE_TYPED_STAGE_SPLIT` env-var gate so existing
     // control plane behaviour is unchanged unless explicitly opted in.
-    // When enabled, the workload is bound to a `SketchExpr`, the typed
+    // When enabled, the workload is bound to a `PhysicalExpr`, the typed
     // L5 path produces a `HashMap<StageId, StageConfig>`, and each
     // per-stage config is materialised into wire bytes via the emitters
     // in `config::stage_config`. Phase C will plumb deployment-aware
     // endpoint resolution + a real backend POST.
     if physical::stage_split::typed_stage_split_enabled() {
-        if let Some(sketch_expr) = optimizer::rules::bind_workload_typed(&workload) {
-            if let Some(configs) = physical::stage_split::split_typed_three_stage(&sketch_expr) {
+        if let Some(physical_expr) = optimizer::rules::bind_workload_typed(&workload) {
+            if let Some(configs) = physical::stage_split::split_typed_three_stage(&physical_expr) {
                 for (stage_id, stage_cfg) in configs {
                     match stage_cfg {
                         crate::physical::colored_dag::StageConfig::Edge(edge) => {
@@ -1028,7 +1028,7 @@ async fn emit_bootstrap_typed(
     // 2-3. Walk candidates: first metric that pre-populated the
     //      workload store AND binds via the typed path provides the
     //      base edge_cfg shape.
-    let mut chosen: Option<(String, crate::sketch_algebra::SketchExpr)> = None;
+    let mut chosen: Option<(String, crate::sketch_algebra::PhysicalExpr)> = None;
     for cand in &candidates {
         let Some((wl, _wc)) = st.workload_store.get(cand) else { continue };
         if let Some(expr) = optimizer::rules::bind_workload_typed(&wl) {
@@ -1036,13 +1036,13 @@ async fn emit_bootstrap_typed(
             break;
         }
     }
-    let (metric, sketch_expr) = chosen.ok_or_else(|| {
+    let (metric, physical_expr) = chosen.ok_or_else(|| {
         anyhow!(
             "no registry metric binds via the typed path (all {} candidates declined)",
             candidates.len()
         )
     })?;
-    let configs = physical::stage_split::split_typed_three_stage(&sketch_expr)
+    let configs = physical::stage_split::split_typed_three_stage(&physical_expr)
         .ok_or_else(|| anyhow!("split_typed_three_stage returned None for `{metric}`"))?;
 
     // 4. Pick the Edge stage config and emit per-runtime. The

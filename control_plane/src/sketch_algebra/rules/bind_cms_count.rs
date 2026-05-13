@@ -23,7 +23,7 @@
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{CmsParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::Rule;
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
 
 /// Bind `Aggregate{Count}` / `Aggregate{Frequency}` to CMS.
@@ -38,7 +38,7 @@ impl Rule for BindCmsOnCount {
         5
     }
 
-    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
         let (intent_accuracy, readout, child) = match expr {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
@@ -90,7 +90,7 @@ impl Rule for BindCmsOnCount {
         let w = w.max(2);
         let d = d.max(1);
 
-        Some(SketchExpr::estimate_over_agg(
+        Some(PhysicalExpr::estimate_over_agg(
             readout,
             SketchKind::Cms,
             SketchParams::Cms(CmsParams { w, d }),

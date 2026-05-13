@@ -1,10 +1,10 @@
-//! Layer 4 IR — `SketchExpr` DAG.
+//! Layer 4 IR — `PhysicalExpr` DAG.
 //!
 //! Per `control_plane/docs/design.md` §6 "`core::sketch_algebra` — Layer 4 IR
-//! (`SketchExpr`)" (around line ~565).
+//! (`PhysicalExpr`)" (around line ~565).
 //!
 //! Two-IR split: L3 [`crate::intent_algebra::QueryExpr`] is intent-only;
-//! L4 [`SketchExpr`] is sketch-bound. `Bind*` rules consume the L3 IR
+//! L4 [`PhysicalExpr`] is sketch-bound. `Bind*` rules consume the L3 IR
 //! and produce the L4 IR with the sketch family + parameters committed.
 //!
 //! The variant set ships the subset DC + PromQL needs (the orchestrator's
@@ -59,13 +59,13 @@ pub enum MergeAlgebra {
 /// L4 algebra node. See module doc for the variant subset rationale.
 ///
 /// Serde tag is `"sketch_node"` (not `"node"`) so it doesn't collide with
-/// the L3 `QueryExpr`'s `"node"` tag — `SketchExpr::Logical(QueryExpr)`
+/// the L3 `QueryExpr`'s `"node"` tag — `PhysicalExpr::Logical(QueryExpr)`
 /// nests a JSON-tagged enum inside an internally-tagged outer enum, and
 /// reusing the same tag would surface as a `duplicate field "node"`
 /// deserialization error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "sketch_node", rename_all = "snake_case")]
-pub enum SketchExpr {
+pub enum PhysicalExpr {
     /// Logical pass-through: an L3 node that no L4 rule rewrote. A
     /// `Filter`, a row-shaped `Aggregate{Sum}`, or any other operator
     /// whose semantics are unchanged by the sketch-binding pass lives
@@ -82,7 +82,7 @@ pub enum SketchExpr {
         params: SketchParams,
         /// Input sub-tree — typically `Logical(Window{...})` or
         /// `Logical(Scan{...})`.
-        child: Box<SketchExpr>,
+        child: Box<PhysicalExpr>,
     },
 
     /// Read out a query result from a built sketch state. Inverse of
@@ -93,7 +93,7 @@ pub enum SketchExpr {
         op: EstimateOp,
         /// Sketch-state-bearing sub-tree (a `SketchAgg`, a `SketchMerge`,
         /// or a `Ref` to one).
-        child: Box<SketchExpr>,
+        child: Box<PhysicalExpr>,
     },
 
     /// Merge multiple sketches into one — set-union under
@@ -103,12 +103,12 @@ pub enum SketchExpr {
         /// Merge algebra — currently always `Union`.
         algebra: MergeAlgebra,
         /// Sketch-state-bearing inputs. All must agree on `(kind, params)`.
-        children: Vec<SketchExpr>,
+        children: Vec<PhysicalExpr>,
     },
 
     /// SQL `WITH name AS (expr) SELECT ... FROM name` / sketch-state
     /// fan-in: name a sub-expression so multiple parents can reference
-    /// it. `SketchExpr::LetBinding` carries the two-tier fan-in described
+    /// it. `PhysicalExpr::LetBinding` carries the two-tier fan-in described
     /// in design.md §1339 — outer let names a `Window` output, inner let
     /// names a `SketchAgg{KLL}` shared by two `SketchEstimate` parents
     /// reading different quantiles.
@@ -116,9 +116,9 @@ pub enum SketchExpr {
         /// Binding name; must be unique within the surrounding scope.
         name: BindingName,
         /// Bound sub-expression.
-        expr: Box<SketchExpr>,
+        expr: Box<PhysicalExpr>,
         /// In-scope sub-tree — references the binding via `Ref`.
-        child: Box<SketchExpr>,
+        child: Box<PhysicalExpr>,
     },
 
     /// Reference a `LetBinding` by name. Resolution is lexical (scope
@@ -147,7 +147,7 @@ pub enum SketchExpr {
         /// Input sub-tree — typically `Logical(Window{...})` or
         /// `Logical(Scan{...})`. Mirrors `SketchAgg`'s child field so the
         /// L5 emitter's walk uniform.
-        child: Box<SketchExpr>,
+        child: Box<PhysicalExpr>,
     },
 
     /// Mode 3 (Phase ε.1): no sketch processor at the edge — raw OTLP
@@ -178,7 +178,7 @@ pub enum SketchExpr {
     },
 }
 
-impl SketchExpr {
+impl PhysicalExpr {
     /// Convenience constructor for the canonical
     /// `SketchEstimate{SketchAgg{Logical(qe)}}` shape produced by every
     /// `Bind*` rule. Keeps rule call sites short.
@@ -188,12 +188,12 @@ impl SketchExpr {
         params: SketchParams,
         logical: QueryExpr,
     ) -> Self {
-        SketchExpr::SketchEstimate {
+        PhysicalExpr::SketchEstimate {
             op,
-            child: Box::new(SketchExpr::SketchAgg {
+            child: Box::new(PhysicalExpr::SketchAgg {
                 sketch_type,
                 params,
-                child: Box::new(SketchExpr::Logical(logical)),
+                child: Box::new(PhysicalExpr::Logical(logical)),
             }),
         }
     }
@@ -254,24 +254,24 @@ mod tests {
 
     #[test]
     fn estimate_over_agg_ctor_shape() {
-        let e = SketchExpr::estimate_over_agg(
+        let e = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.99 },
             SketchKind::Kll,
             SketchParams::Kll(KllParams { k: 200 }),
             windowed_scan(),
         );
         match e {
-            SketchExpr::SketchEstimate { op, child } => {
+            PhysicalExpr::SketchEstimate { op, child } => {
                 assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
                 match *child {
-                    SketchExpr::SketchAgg {
+                    PhysicalExpr::SketchAgg {
                         sketch_type,
                         params,
                         child,
                     } => {
                         assert_eq!(sketch_type, SketchKind::Kll);
                         assert_eq!(params, SketchParams::Kll(KllParams { k: 200 }));
-                        assert!(matches!(*child, SketchExpr::Logical(_)));
+                        assert!(matches!(*child, PhysicalExpr::Logical(_)));
                     }
                     other => panic!("expected SketchAgg, got {other:?}"),
                 }
@@ -293,77 +293,77 @@ mod tests {
     }
 
     #[test]
-    fn sketch_expr_serde_roundtrip_logical() {
-        let e = SketchExpr::Logical(agg_quantile());
+    fn physical_expr_serde_roundtrip_logical() {
+        let e = PhysicalExpr::Logical(agg_quantile());
         let json = serde_json::to_string(&e).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
 
     #[test]
-    fn sketch_expr_serde_roundtrip_sketch_agg() {
-        let e = SketchExpr::SketchAgg {
+    fn physical_expr_serde_roundtrip_sketch_agg() {
+        let e = PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Kll,
             params: SketchParams::Kll(KllParams { k: 200 }),
-            child: Box::new(SketchExpr::Logical(windowed_scan())),
+            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         };
         let json = serde_json::to_string(&e).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
 
     #[test]
-    fn sketch_expr_serde_roundtrip_estimate() {
-        let e = SketchExpr::estimate_over_agg(
+    fn physical_expr_serde_roundtrip_estimate() {
+        let e = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.95 },
             SketchKind::DDSketch,
             SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
             windowed_scan(),
         );
         let json = serde_json::to_string(&e).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
 
     #[test]
-    fn sketch_expr_serde_roundtrip_merge() {
-        let leaf = SketchExpr::SketchAgg {
+    fn physical_expr_serde_roundtrip_merge() {
+        let leaf = PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Hll,
             params: SketchParams::Hll(HllParams { precision: 14 }),
-            child: Box::new(SketchExpr::Logical(windowed_scan())),
+            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         };
-        let e = SketchExpr::SketchMerge {
+        let e = PhysicalExpr::SketchMerge {
             algebra: MergeAlgebra::Union,
             children: vec![leaf.clone(), leaf],
         };
         let json = serde_json::to_string(&e).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
 
     #[test]
-    fn sketch_expr_serde_roundtrip_let_ref() {
-        let inner_agg = SketchExpr::SketchAgg {
+    fn physical_expr_serde_roundtrip_let_ref() {
+        let inner_agg = PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::CountSketch,
             params: SketchParams::CountSketch(CountSketchParams {
                 w: 2048,
                 d: 5,
                 with_heap: true,
             }),
-            child: Box::new(SketchExpr::Logical(windowed_scan())),
+            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         };
-        let e = SketchExpr::LetBinding {
+        let e = PhysicalExpr::LetBinding {
             name: BindingName::new("kll_state"),
             expr: Box::new(inner_agg),
-            child: Box::new(SketchExpr::SketchEstimate {
+            child: Box::new(PhysicalExpr::SketchEstimate {
                 op: EstimateOp::TopK { k: 10 },
-                child: Box::new(SketchExpr::Ref {
+                child: Box::new(PhysicalExpr::Ref {
                     name: BindingName::new("kll_state"),
                 }),
             }),
         };
         let json = serde_json::to_string(&e).unwrap();
-        let back: SketchExpr = serde_json::from_str(&json).unwrap();
+        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
     }
 }

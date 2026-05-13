@@ -705,7 +705,7 @@ pub fn typed_stage_split_enabled() -> bool {
     )
 }
 
-/// Run the typed L5 path on a Phase-C-bound `SketchExpr` DAG. Returns
+/// Run the typed L5 path on a Phase-C-bound `PhysicalExpr` DAG. Returns
 /// the per-stage [`crate::physical::colored_dag::StageConfig`] map for the DC
 /// lifecycle topology.
 ///
@@ -722,7 +722,7 @@ pub fn typed_stage_split_enabled() -> bool {
 /// [`crate::config::stage_config::emit_backend_config_json`] for
 /// `Backend`. Phase C plumbs deployment-aware endpoint resolution.
 pub fn split_typed_three_stage(
-    expr: &crate::sketch_algebra::SketchExpr,
+    expr: &crate::sketch_algebra::PhysicalExpr,
 ) -> Option<std::collections::HashMap<crate::physical::colored_dag::StageId, crate::physical::colored_dag::StageConfig>>
 {
     use crate::physical::colored_dag::{
@@ -1004,7 +1004,7 @@ mod tests {
             LabelFilter, QueryExpr as L3QE, Schema, Source as L3Source, WindowKind,
         };
         use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams as L4Params};
-        use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+        use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
         use crate::physical::colored_dag::StageId;
         let scan = L3QE::Scan {
             source: L3Source::TimeSeries {
@@ -1037,7 +1037,7 @@ mod tests {
             slide: None,
             child: Box::new(scan),
         };
-        let l4 = SketchExpr::estimate_over_agg(
+        let l4 = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.99 },
             SketchKind::Kll,
             L4Params::Kll(KllParams { k: 200 }),

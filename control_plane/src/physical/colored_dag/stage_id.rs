@@ -3,7 +3,7 @@
 //! Per `control_plane/docs/design.md` §6 `core::physical` (around line ~765):
 //!
 //! - [`StageId`] — the categorical *tier* in the data lifecycle. Topology
-//!   declares which stages exist; allocator paints `SketchExpr` nodes
+//!   declares which stages exist; allocator paints `PhysicalExpr` nodes
 //!   with one of these.
 //! - [`Topology`] — the deployment-model topology shape. Phase E surfaces
 //!   only [`Topology::ThreeStage`] (DC lifecycle: edge → gateway →

@@ -185,7 +185,7 @@ mod tests {
     };
     use crate::physical::colored_dag::stage_id::StageId;
     use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
-    use crate::sketch_algebra::sketch_expr::EstimateOp;
+    use crate::sketch_algebra::physical_expr::EstimateOp;
     use std::collections::HashMap;
 
     fn empty_edge_cfg() -> EdgeStageConfig {

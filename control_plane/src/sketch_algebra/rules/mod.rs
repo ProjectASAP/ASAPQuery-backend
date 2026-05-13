@@ -1,5 +1,5 @@
 //! Layer 4 `Bind*` rules — transform L3 [`QueryExpr`] sub-trees into L4
-//! [`SketchExpr`] sub-trees.
+//! [`PhysicalExpr`] sub-trees.
 //!
 //! Per `control_plane/docs/design.md` §6 ("`core::optimizer` — Layer 4
 //! framework", around line ~689) and §6 sketch_algebra (line ~565). A
@@ -9,7 +9,7 @@
 //! 2. Reads the [`AccuracyTarget`] off the matched intent.
 //! 3. Consults the catalog (here: the family-default capability flags in
 //!    [`crate::sketch_algebra::schema::SketchStateSchema::for_kind`]).
-//! 4. Returns `Some(SketchExpr)` if it can bind, `None` otherwise.
+//! 4. Returns `Some(PhysicalExpr)` if it can bind, `None` otherwise.
 //!
 //! Rule selection is cost-aware: when multiple rules match (e.g. KLL vs
 //! DDSketch on a `Quantile` intent), the dispatcher picks one by
@@ -31,7 +31,7 @@ pub mod bind_hll_cardinality;
 pub mod bind_kll_quantile;
 
 use crate::intent_algebra::QueryExpr;
-use crate::sketch_algebra::sketch_expr::SketchExpr;
+use crate::sketch_algebra::physical_expr::PhysicalExpr;
 use crate::types_v2::AccuracyTarget;
 
 /// Bind-rule trait. Phase C keeps the trait minimal — `apply` + a
@@ -45,7 +45,7 @@ pub trait Rule: Sync {
 
     /// Lower the matched sub-tree under the given accuracy target. Return
     /// `None` if this rule does not apply to the supplied `expr`.
-    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr>;
+    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr>;
 
     /// Coarse priority used for tie-break when multiple rules match.
     /// Higher = preferred. Default 0.
@@ -56,8 +56,8 @@ pub trait Rule: Sync {
 
 /// Dispatch a `QueryExpr` sub-tree against the full Phase C rule set.
 /// Returns the highest-priority binding that fires, or `None` if no rule
-/// matches (caller wraps the input in `SketchExpr::Logical`).
-pub fn dispatch(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+/// matches (caller wraps the input in `PhysicalExpr::Logical`).
+pub fn dispatch(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(bind_kll_quantile::BindKllOnQuantile),
         Box::new(bind_ddsketch_quantile::BindDDSketchOnQuantile),
@@ -69,7 +69,7 @@ pub fn dispatch(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExp
         Box::new(bind_archive_only::BindArchiveOnly),
     ];
 
-    let mut best: Option<(u16, SketchExpr)> = None;
+    let mut best: Option<(u16, PhysicalExpr)> = None;
     for r in &rules {
         if let Some(out) = r.apply(expr, accuracy) {
             let p = r.priority();

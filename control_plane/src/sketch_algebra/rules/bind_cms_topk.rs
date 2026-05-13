@@ -1,7 +1,7 @@
 //! `BindCountSketchOnTopK` — `Aggregate{TopK{k, accuracy}}` → CountSketch-with-heap.
 //!
 //! Reference: `control_plane/docs/design.md` §6 line ~419 — "`SketchAgg
-//! { intent, col }` … L4 emits `SketchExpr::SketchAgg`" — and
+//! { intent, col }` … L4 emits `PhysicalExpr::SketchAgg`" — and
 //! `intent_algebra::AggIntent::TopK` (heavy-hitter intent) maps directly
 //! to a heavy-hitter sketch primitive. CountSketch with a heap of size
 //! `k` is the textbook fit (Charikar-Chen-Farach-Colton); CMS with a
@@ -25,7 +25,7 @@
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{CountSketchParams, SketchKind, SketchParams};
 use crate::sketch_algebra::rules::Rule;
-use crate::sketch_algebra::sketch_expr::{EstimateOp, SketchExpr};
+use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
 
 pub struct BindCountSketchOnTopK;
@@ -39,7 +39,7 @@ impl Rule for BindCountSketchOnTopK {
         5
     }
 
-    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<SketchExpr> {
+    fn apply(&self, expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
         let (k_topk, intent_accuracy, child) = match expr {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
@@ -76,7 +76,7 @@ impl Rule for BindCountSketchOnTopK {
         let w = w.max(2);
         let d = d.max(1);
 
-        Some(SketchExpr::estimate_over_agg(
+        Some(PhysicalExpr::estimate_over_agg(
             EstimateOp::TopK { k: k_topk },
             SketchKind::CountSketch,
             SketchParams::CountSketch(CountSketchParams {

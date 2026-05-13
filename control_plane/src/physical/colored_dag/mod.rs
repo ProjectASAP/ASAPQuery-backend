@@ -5,9 +5,9 @@
 //! typed L5 colouring + emitter for the DC three-stage topology
 //! (edge → gateway → backend).
 //!
-//! Pipeline position. L4 [`crate::sketch_algebra::SketchExpr`] is the
+//! Pipeline position. L4 [`crate::sketch_algebra::PhysicalExpr`] is the
 //! input — sketch-bound, language-orthogonal, deployment-independent.
-//! L5 paints each `SketchExpr` node with a [`StageId`] and emits one
+//! L5 paints each `PhysicalExpr` node with a [`StageId`] and emits one
 //! [`emitter::StageConfig`] per occupied stage. The configs become the
 //! OpAMP `RemoteConfig` payload (edge / gateway) and the backend
 //! `StreamingConfig` (backend) — Phase G+ wires the actual push.

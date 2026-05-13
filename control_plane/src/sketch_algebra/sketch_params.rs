@@ -13,7 +13,7 @@
 //! that affect cost / accuracy: the KLL sketch's `k`, DDSketch's `alpha`,
 //! HLL's `precision`, CMS's `(w, d)`. Keeping the L4 parameter shape
 //! minimal makes the `Bind*` rule signatures narrow and the typed
-//! `SketchExpr` IR independent of wire-format drift.
+//! `PhysicalExpr` IR independent of wire-format drift.
 //!
 //! Convertibility — see [`SketchParams::to_legacy`]. The legacy form is
 //! what the existing `algebra::directory::build_sketch_params` produces;

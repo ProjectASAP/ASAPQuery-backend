@@ -17,7 +17,7 @@
 //! | [`plan`] | `PlanNode` / `PlanSummary` — annotated plan tree with cost estimates + stage colouring |
 //! | [`sketch_catalog`] | Candidate sketch types per `AggIntent`, default `SketchParams`, memory estimation |
 //! | [`stage_split`] | AST-aware hierarchical stage assignment (legacy `QueryExpr` splitter) |
-//! | [`colored_dag`] | L5 typed colouring framework over the canonical [`crate::sketch_algebra::SketchExpr`] DAG (`StageId` + `Topology` + per-stage emitter) |
+//! | [`colored_dag`] | L5 typed colouring framework over the canonical [`crate::sketch_algebra::PhysicalExpr`] DAG (`StageId` + `Topology` + per-stage emitter) |
 //! | [`topology`] | Re-exports `StageId` + `Topology` from [`colored_dag::stage_id`] — design.md §5 entry point for deployment-topology descriptors |
 
 pub mod allocator;

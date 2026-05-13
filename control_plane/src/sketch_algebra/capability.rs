@@ -360,7 +360,7 @@ fn is_exact(accuracy: &AccuracyTarget) -> bool {
 /// `SketchSubtract` / `SketchDelete` at plan-time. The two have
 /// different consumers and different lifecycles — `SketchCapability`
 /// is read at every plan-rewrite call site; `SketchStateMetadata`
-/// is sealed onto each `SketchExpr` edge once the binding rule fires.
+/// is sealed onto each `PhysicalExpr` edge once the binding rule fires.
 #[derive(Debug, Clone)]
 pub struct SketchCapability {
     /// Insertion throughput (samples/sec at 1 core).

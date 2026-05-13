@@ -6,7 +6,7 @@
 //! [`crate::intent_algebra::QueryExpr`] inputs and produces L4
 //! sketch-bound output (in the legacy path: an annotated `QueryExpr`
 //! with `SketchAgg` nodes; in the canonical path: a
-//! [`crate::sketch_algebra::SketchExpr`] DAG).
+//! [`crate::sketch_algebra::PhysicalExpr`] DAG).
 //!
 //! Refactor 2026-05 (`refactor/controller-layered-cleanup`) absorbed
 //! the former `controller/src/algebra/optimizer.rs` and the entire
