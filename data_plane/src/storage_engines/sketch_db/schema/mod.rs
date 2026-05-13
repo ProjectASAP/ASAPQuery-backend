@@ -1276,8 +1276,9 @@ mod tests {
     }
 }
 
-// 2026-05 reorg: schema_eviction.rs moved alongside as a submodule.
-pub mod eviction;
-pub use eviction::{
+// Post-M2.3 reorg: eviction moved to `sketch_db::lifecycle::eviction`.
+// Legacy re-exports keep `sketch_db::schema::SchemaEvictionService` callers
+// compiling until they migrate to `sketch_db::lifecycle::*`.
+pub use crate::storage_engines::sketch_db::lifecycle::{
     warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
 };
