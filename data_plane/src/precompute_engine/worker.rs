@@ -2137,111 +2137,11 @@ aggregations:
         );
     }
 
-    /// End-to-end pin: the sweep blocker's diagnostic (`Metric ... not found
-    /// in store` + `No precomputed outputs found for metric: ...`) is reachable
-    /// only when nothing was ever inserted at `(agg_id, ...)`. This test
-    /// runs the full ingest → worker → per_key store path and then queries
-    /// the store, asserting the query returns a non-empty result for the
-    /// queried metric / agg_id.
-    #[test]
-    fn test_sketch_ingest_persists_and_query_returns_non_empty() {
-        use crate::stores::types::{CleanupPolicy, StreamingConfig};
-        use crate::precompute_engine::output_sink::StoreOutputSink;
-        use crate::stores::sketch_db::store::per_key::SketchStorePerKey;
-        use crate::stores::Store;
-
-        // Streaming config: agg_id=1, 30s tumbling, DDSketch,
-        // grouping by zone — the canonical e2e shape.
-        let cfg = make_agg_config(
-            1,
-            "http_requests_total_latency_ms_quantile",
-            AggregationType::DDSketch,
-            "",
-            30,
-            0,
-            vec!["zone"],
-        );
-        let mut configs_map = HashMap::new();
-        configs_map.insert(1u64, cfg);
-        let streaming_config = Arc::new(StreamingConfig::new(configs_map.clone()));
-
-        // A real per_key store, so the test exercises the actual
-        // insert + query path the production backend uses.
-        let store = Arc::new(SketchStorePerKey::new(
-            streaming_config.clone(),
-            CleanupPolicy::CircularBuffer,
-        ));
-        let sink: Arc<dyn OutputSink> =
-            Arc::new(StoreOutputSink::new(store.clone() as Arc<dyn Store>));
-
-        // Build a worker bound to the *real* store sink.
-        let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        let wm = Arc::new(AtomicI64::new(i64::MIN));
-        let mut worker = Worker::new(
-            0,
-            rx,
-            sink,
-            crate::stores::types::HotReloadStreamingConfig::new(StreamingConfig::new(configs_map)),
-            WorkerRuntimeConfig {
-                max_buffer_per_series: 10_000,
-                allowed_lateness_ms: 0,
-                pass_raw_samples: false,
-                raw_mode_aggregation_id: 0,
-                late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
-            Arc::new(AtomicUsize::new(0)),
-            wm.clone(),
-            vec![wm],
-        );
-
-        // Two batches across two windows so the first window closes.
-        for i in 0..5 {
-            let s = make_ddsketch(0.01, &[10.0 + i as f64]);
-            worker
-                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
-                .unwrap();
-        }
-        let s_advance = make_ddsketch(0.01, &[42.0]);
-        worker
-            .process_accumulator_input(1, "us-east", 120_000, Box::new(s_advance))
-            .unwrap();
-
-        // Now query the store the same way the PromQL warm-tier path does.
-        // The query lookup is keyed by `aggregation_id` — the metric name is
-        // diagnostic-only (per_key.rs:817 `aggregation_config.metric.clone()`).
-        // If the persistence path is wired correctly, this returns at least
-        // one bucket for the closed window [60_000, 90_000).
-        let results = store
-            .query_precomputed_output(
-                "http_requests_total_latency_ms_quantile",
-                1,
-                0,
-                u64::MAX / 2,
-            )
-            .expect("query must succeed");
-        assert!(
-            !results.is_empty(),
-            "warm-tier query returned empty even though sketches were ingested — \
-             this is the exact sweep blocker #2 symptom (`No precomputed outputs found for \
-             metric: http_requests_total_latency_ms_quantile, aggregation_id: 1`)."
-        );
-
-        // Drill into the result: at least one (key → buckets) entry, and at
-        // least one bucket lands in [60_000, 90_000).
-        let total_buckets: usize = results.values().map(|v| v.len()).sum();
-        assert!(
-            total_buckets > 0,
-            "query returned a key entry but with zero buckets — persistence is half-broken"
-        );
-        let any_in_first_window = results
-            .values()
-            .flat_map(|v| v.iter())
-            .any(|(range, _)| range.0 == 60_000 && range.1 == 90_000);
-        assert!(
-            any_in_first_window,
-            "no bucket landed in the closed window [60_000, 90_000) — persistence pathway misroutes"
-        );
-    }
+    // M2.3.6g — `test_sketch_ingest_persists_and_query_returns_non_empty`
+    // deleted: it exercised the retired SketchStore + StoreOutputSink
+    // pair end-to-end. The SketchIndexSink path (M2.3.4+) is covered
+    // by its own dedicated tests in `output_sink::tests` and by
+    // `engine::e2e_feedback_loop_tests`.
 
     /// Pin the agent-emit-shape vs. backend-grouping-config invariant from
     /// hypothesis (A) of the sweep diagnostic. The agent emits one sketch

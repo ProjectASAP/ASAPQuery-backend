@@ -1,7 +1,6 @@
 use crate::stores::sketch_db::index::SketchIndex;
 use crate::stores::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::stores::types::{AggregateCore, PrecomputedOutput};
-use crate::stores::Store;
 use std::sync::{Arc, Mutex};
 use tracing::{debug_span, warn};
 
@@ -11,30 +10,6 @@ pub trait OutputSink: Send + Sync {
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-}
-
-/// Output sink that writes directly to a `Store`.
-pub struct StoreOutputSink {
-    store: Arc<dyn Store>,
-}
-
-impl StoreOutputSink {
-    pub fn new(store: Arc<dyn Store>) -> Self {
-        Self { store }
-    }
-}
-
-impl OutputSink for StoreOutputSink {
-    fn emit_batch(
-        &self,
-        outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if outputs.is_empty() {
-            return Ok(());
-        }
-        let _span = debug_span!("store_insert", batch_size = outputs.len()).entered();
-        self.store.insert_precomputed_output_batch(outputs)
-    }
 }
 
 /// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
