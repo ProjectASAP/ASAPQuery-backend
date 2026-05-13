@@ -54,7 +54,7 @@ use tracing::{info, warn};
 
 use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
 use crate::storage_engines::sketch_db::index::SketchStore;
-use super::{AggStatus, SchemaRegistry};
+use crate::storage_engines::sketch_db::schema::{AggStatus, SchemaRegistry};
 
 /// Configuration for the eviction loop. Separate from
 /// `SchemaRegistry`'s `retirement_retention` because the service
