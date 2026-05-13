@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use xxhash_rust::xxh64::xxh64;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
 use crate::stores::sketch_db::schema::AggStatus;
@@ -57,6 +58,87 @@ pub enum SketchConfig {
     Hll { precision: u32 },
     CountSketch { rows: i32, cols: i32 },
     CountMin { rows: i32, cols: i32 },
+}
+
+/// Compute a deterministic `series_id` (sid) for one sketch instance.
+///
+/// Folds the four DataPoint inputs the backend has at ingest time —
+/// `metric_name`, `attrs` (keys + values, canonicalized), `sketch_kind`,
+/// and `sketch_config` — into a 64-bit xxhash. Same inputs always
+/// produce the same sid across restarts and across hosts, so the
+/// controller no longer needs to mint and emit an `aggregation_id` for
+/// each (metric, agg-type, params) tuple. Phase 5 M2 directive.
+///
+/// `attrs_fingerprint` MUST be the canonical fingerprint string
+/// (`canonical_attrs_fingerprint` — keys sorted, joined `k=v;`); the
+/// hash is sensitive to whitespace, ordering, and trailing separator,
+/// so callers must round-trip through that one function for the
+/// pre-flight ResolveSeriesIDs RPC and the ingest path to agree.
+///
+/// sid=0 is reserved on the wire (means "unresolved"); if a real input
+/// hashes to 0 (vanishingly unlikely with 64-bit xxhash), we perturb to
+/// 1.
+pub fn compute_sketch_sid(
+    metric_name: &str,
+    attrs_fingerprint: &str,
+    sketch_kind: SketchKindHandle,
+    sketch_config: &SketchConfig,
+) -> u64 {
+    let mut buf: Vec<u8> =
+        Vec::with_capacity(metric_name.len() + attrs_fingerprint.len() + 24);
+    buf.extend_from_slice(metric_name.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(attrs_fingerprint.as_bytes());
+    buf.push(0);
+    buf.push(sketch_kind_tag(sketch_kind));
+    buf.push(0);
+    encode_sketch_config(sketch_config, &mut buf);
+    let h = xxh64(&buf, 0);
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+fn sketch_kind_tag(k: SketchKindHandle) -> u8 {
+    match k {
+        SketchKindHandle::DDSketch => 1,
+        SketchKindHandle::Kll => 2,
+        SketchKindHandle::Hll => 3,
+        SketchKindHandle::CountSketch => 4,
+        SketchKindHandle::CountMin => 5,
+        SketchKindHandle::CmsWithHeap => 6,
+        SketchKindHandle::CountSketchWithHeap => 7,
+        SketchKindHandle::Any => 0,
+    }
+}
+
+fn encode_sketch_config(cfg: &SketchConfig, buf: &mut Vec<u8>) {
+    match cfg {
+        SketchConfig::DDSketch { relative_accuracy } => {
+            buf.push(b'D');
+            buf.extend_from_slice(&relative_accuracy.to_le_bytes());
+        }
+        SketchConfig::Kll { k } => {
+            buf.push(b'K');
+            buf.extend_from_slice(&k.to_le_bytes());
+        }
+        SketchConfig::Hll { precision } => {
+            buf.push(b'H');
+            buf.extend_from_slice(&precision.to_le_bytes());
+        }
+        SketchConfig::CountSketch { rows, cols } => {
+            buf.push(b'S');
+            buf.extend_from_slice(&rows.to_le_bytes());
+            buf.extend_from_slice(&cols.to_le_bytes());
+        }
+        SketchConfig::CountMin { rows, cols } => {
+            buf.push(b'M');
+            buf.extend_from_slice(&rows.to_le_bytes());
+            buf.extend_from_slice(&cols.to_le_bytes());
+        }
+    }
 }
 
 /// Accuracy bound derived from `SketchConfig`. Surfaced to the user via
@@ -696,6 +778,61 @@ mod tests {
         let series = idx.query_range(17, 0, 40);
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].samples.len(), 4);
+    }
+
+    #[test]
+    fn compute_sketch_sid_is_deterministic() {
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let a = compute_sketch_sid("http_requests_total", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        let b = compute_sketch_sid("http_requests_total", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        assert_eq!(a, b);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn compute_sketch_sid_distinguishes_metric() {
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let a = compute_sketch_sid("metric_a", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        let b = compute_sketch_sid("metric_b", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_sketch_sid_distinguishes_attrs_values() {
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        let b = compute_sketch_sid("m", "zone=z1;", SketchKindHandle::DDSketch, &cfg);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_sketch_sid_distinguishes_sketch_kind() {
+        let cfg_dd = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let cfg_kll = SketchConfig::Kll { k: 200 };
+        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_dd);
+        let b = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::Kll, &cfg_kll);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_sketch_sid_distinguishes_container_config() {
+        let cfg_a = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let cfg_b = SketchConfig::DDSketch {
+            relative_accuracy: 0.005,
+        };
+        let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_a);
+        let b = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_b);
+        assert_ne!(a, b);
     }
 }
 
