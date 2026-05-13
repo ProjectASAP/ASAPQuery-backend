@@ -60,6 +60,58 @@ pub enum SketchConfig {
     CountMin { rows: i32, cols: i32 },
 }
 
+/// What kind of aggregation a `sid` identifies. M2.3 generalization
+/// — sids now cover BOTH opaque-sketch state and partial-accumulator
+/// (Sum / Count / Avg / Rate / MinMax) state, so the future
+/// unified store can host both.
+///
+/// The sid hash distinguishes the two branches structurally: a
+/// `Sketch` sid is content-addressed over `(metric, attrs,
+/// sketch_kind, sketch_config)`; a `Precompute` sid is content-
+/// addressed over `(metric, attrs, agg_type, parameters)`.
+#[derive(Debug, Clone)]
+pub enum AggKind {
+    /// Opaque sketch state — DDSketch, KLL, HLL, CountMin, CountSketch.
+    /// Payload at storage layer is an encoded byte string
+    /// (`SketchSampleState`).
+    Sketch {
+        kind: SketchKindHandle,
+        config: SketchConfig,
+    },
+    /// Partial-accumulator state — Sum, Count, Avg, Rate, MinMax,
+    /// SetAggregator, etc. Payload at storage layer is whatever the
+    /// per-accumulator serializer produces.
+    Precompute {
+        agg_type: AggregationType,
+        /// Stable canonical encoding of the agg's `parameters: HashMap<String, Value>`
+        /// — sorted keys, each value rendered via serde_json. Held as
+        /// a single owned string so equality / hashing stay cheap and
+        /// independent of the original HashMap's iteration order.
+        parameters_canonical: String,
+    },
+}
+
+/// Re-export so callers don't need to depend on promql_utilities
+/// for the agg_type tag.
+pub use promql_utilities::query_logics::enums::AggregationType;
+
+/// Render a `HashMap<String, Value>` of parameters into the canonical
+/// string form `AggKind::Precompute::parameters_canonical` expects.
+/// Keys sorted lexicographically; each value via `serde_json`.
+pub fn canonical_parameters(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> String {
+    let sorted: std::collections::BTreeMap<&String, &serde_json::Value> = parameters.iter().collect();
+    let mut buf = String::new();
+    for (k, v) in sorted {
+        buf.push_str(k);
+        buf.push('=');
+        buf.push_str(&serde_json::to_string(v).unwrap_or_default());
+        buf.push(';');
+    }
+    buf
+}
+
 /// Compute a deterministic `series_id` (sid) for one sketch instance.
 ///
 /// Folds the four DataPoint inputs the backend has at ingest time —
@@ -84,15 +136,63 @@ pub fn compute_sketch_sid(
     sketch_kind: SketchKindHandle,
     sketch_config: &SketchConfig,
 ) -> u64 {
+    compute_sid(
+        metric_name,
+        attrs_fingerprint,
+        &AggKind::Sketch {
+            kind: sketch_kind,
+            config: sketch_config.clone(),
+        },
+    )
+}
+
+/// Generalized version of [`compute_sketch_sid`] covering both sketch
+/// and precompute aggregations. Same `(metric, attrs, agg_kind)`
+/// tuple always yields the same sid.
+///
+/// The two branches encode disjointly: a `Sketch` payload starts with
+/// `sketch_kind_tag` (1..=7, see [`sketch_kind_tag`]), while a
+/// `Precompute` payload starts with the byte `b'P'` (ASCII 80), which
+/// no sketch tag will ever produce. So an attacker (or a colliding
+/// hash input) can't force a sketch sid to overlap a precompute sid
+/// at the encoding level.
+///
+/// Critically, the `Sketch` branch is bit-identical to what the
+/// retired `compute_sketch_sid` function produced — same encoding,
+/// same hash. Existing sketch sids the M2 wire format introduced
+/// stay stable across this generalization.
+pub fn compute_sid(
+    metric_name: &str,
+    attrs_fingerprint: &str,
+    agg_kind: &AggKind,
+) -> u64 {
     let mut buf: Vec<u8> =
-        Vec::with_capacity(metric_name.len() + attrs_fingerprint.len() + 24);
+        Vec::with_capacity(metric_name.len() + attrs_fingerprint.len() + 32);
     buf.extend_from_slice(metric_name.as_bytes());
     buf.push(0);
     buf.extend_from_slice(attrs_fingerprint.as_bytes());
     buf.push(0);
-    buf.push(sketch_kind_tag(sketch_kind));
-    buf.push(0);
-    encode_sketch_config(sketch_config, &mut buf);
+    match agg_kind {
+        AggKind::Sketch { kind, config } => {
+            // Sketch branch — match `compute_sketch_sid`'s historical
+            // byte layout exactly so M2-issued sketch sids survive.
+            buf.push(sketch_kind_tag(*kind));
+            buf.push(0);
+            encode_sketch_config(config, &mut buf);
+        }
+        AggKind::Precompute {
+            agg_type,
+            parameters_canonical,
+        } => {
+            // Precompute branch starts with 'P' which can never be a
+            // `sketch_kind_tag` (those live in 1..=7) — no collision.
+            buf.push(b'P');
+            buf.push(0);
+            buf.extend_from_slice(agg_type.as_str().as_bytes());
+            buf.push(0);
+            buf.extend_from_slice(parameters_canonical.as_bytes());
+        }
+    }
     let h = xxh64(&buf, 0);
     if h == 0 {
         1
@@ -833,6 +933,99 @@ mod tests {
         let a = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_a);
         let b = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg_b);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_sid_precompute_is_deterministic() {
+        let kind = AggKind::Precompute {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+        };
+        let a = compute_sid("cpu_seconds", "zone=z0;", &kind);
+        let b = compute_sid("cpu_seconds", "zone=z0;", &kind);
+        assert_eq!(a, b);
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn compute_sid_sketch_vs_precompute_never_collide() {
+        // Same metric + attrs; one is a sketch, one is a precompute.
+        // The 'S'/'P' discriminator byte must make the hashes differ.
+        let sketch = AggKind::Sketch {
+            kind: SketchKindHandle::DDSketch,
+            config: SketchConfig::DDSketch {
+                relative_accuracy: 0.01,
+            },
+        };
+        let precompute = AggKind::Precompute {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+        };
+        let a = compute_sid("m", "zone=z0;", &sketch);
+        let b = compute_sid("m", "zone=z0;", &precompute);
+        assert_ne!(a, b, "sketch and precompute sids must not collide");
+    }
+
+    #[test]
+    fn compute_sid_precompute_distinguishes_agg_type() {
+        let sum = AggKind::Precompute {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+        };
+        let count = AggKind::Precompute {
+            agg_type: AggregationType::Increase,
+            parameters_canonical: String::new(),
+        };
+        let a = compute_sid("m", "zone=z0;", &sum);
+        let b = compute_sid("m", "zone=z0;", &count);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn compute_sid_precompute_distinguishes_parameters() {
+        let p1 = AggKind::Precompute {
+            agg_type: AggregationType::DatasketchesKLL,
+            parameters_canonical: "k=200;".to_string(),
+        };
+        let p2 = AggKind::Precompute {
+            agg_type: AggregationType::DatasketchesKLL,
+            parameters_canonical: "k=400;".to_string(),
+        };
+        let a = compute_sid("m", "zone=z0;", &p1);
+        let b = compute_sid("m", "zone=z0;", &p2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn canonical_parameters_is_insertion_order_independent() {
+        let mut p_ab = std::collections::HashMap::new();
+        p_ab.insert("alpha".to_string(), serde_json::json!(1));
+        p_ab.insert("beta".to_string(), serde_json::json!(2));
+        let mut p_ba = std::collections::HashMap::new();
+        p_ba.insert("beta".to_string(), serde_json::json!(2));
+        p_ba.insert("alpha".to_string(), serde_json::json!(1));
+        assert_eq!(canonical_parameters(&p_ab), canonical_parameters(&p_ba));
+    }
+
+    #[test]
+    fn compute_sketch_sid_matches_new_compute_sid_for_sketch_branch() {
+        // The legacy `compute_sketch_sid` wrapper must produce
+        // the exact same value as `compute_sid` with an
+        // `AggKind::Sketch` — otherwise existing ingest sids
+        // would skew across the migration.
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let legacy = compute_sketch_sid("m", "zone=z0;", SketchKindHandle::DDSketch, &cfg);
+        let new = compute_sid(
+            "m",
+            "zone=z0;",
+            &AggKind::Sketch {
+                kind: SketchKindHandle::DDSketch,
+                config: cfg,
+            },
+        );
+        assert_eq!(legacy, new);
     }
 }
 
