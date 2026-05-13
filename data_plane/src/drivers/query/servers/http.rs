@@ -4652,12 +4652,22 @@ async fn handle_post_streaming_config(
     // schemas and retires removed agg_ids (scheduling their data for
     // expiry after the retirement retention).
     //
+    // Schema retirement #4 wires the sid-level reconcile alongside so
+    // the sid catalog mirrors the same Active/Retired transitions. The
+    // schema half goes away when retirement #5 deletes the
+    // `SchemaRegistry`.
+    //
     // If `schemas` isn't attached (tests, legacy deployments), the
     // per-batch reconcile in IngestState still handles it — just
     // with up to one batch worth of latency.
     let (schema_added, schema_retired) = if let Some(schemas) = &state.schemas {
         let snap = handle.snapshot();
         let summary = schemas.reconcile(snap.as_ref());
+        let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+            state.sketch_index.as_ref(),
+            snap.as_ref(),
+            schemas.retirement_retention(),
+        );
         (summary.added, summary.retired)
     } else {
         (Vec::new(), Vec::new())

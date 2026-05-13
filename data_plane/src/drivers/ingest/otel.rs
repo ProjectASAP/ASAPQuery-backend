@@ -500,8 +500,19 @@ async fn route_otlp_to_precompute(
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
     // Reconcile schema registry against the snapshot — Phase 2a of
-    // the sketch DB design (`docs/design-sketch-db.md` §6).
+    // the sketch DB design (`docs/design-sketch-db.md` §6). Kept
+    // alongside the new sid-level reconcile below until the schema
+    // module is fully retired (schema retirement #5): both registries
+    // run in parallel so the §6.3 ingest barrier on
+    // `ingest_state.schemas.is_writable(agg_id)` below still sees
+    // accurate `Active/Retired/Expired` transitions while the sid
+    // catalog gets the same transitions in its own lifecycle fields.
     let _ = ingest_state.schemas.reconcile(&snap);
+    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+        ingest_state.sketch_index.as_ref(),
+        &snap,
+        ingest_state.schemas.retirement_retention(),
+    );
 
     // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
     type GroupKey = (u64, String);
@@ -677,8 +688,15 @@ async fn route_modified_otlp_sketches_to_precompute(
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
     // Reconcile schema registry against the snapshot — Phase 2a of
-    // the sketch DB design (`docs/design-sketch-db.md` §6).
+    // the sketch DB design (`docs/design-sketch-db.md` §6). Schema
+    // retirement #4 adds the sid-level reconcile alongside; see the
+    // raw-OTLP path for the rationale on running both until #5.
     let _ = ingest_state.schemas.reconcile(&snap);
+    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+        ingest_state.sketch_index.as_ref(),
+        &snap,
+        ingest_state.schemas.retirement_retention(),
+    );
     let mut messages: Vec<WorkerMessage> = Vec::new();
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;

@@ -15,13 +15,15 @@
 //!   `remove_instances_for_agg_config`. Schedule-driven half of the
 //!   "controller dropped a config → its sids go away" flow.
 //!
-//! Future content:
-//! - `reconcile_from_streaming_config` — once schema/ is retired, the
-//!   "controller-reconcile-driven bulk-retire" entrypoint moves here
-//!   and operates on sids directly.
+//! - [`reconcile::reconcile_from_streaming_config`] — sid-level mirror
+//!   of [`SchemaRegistry::reconcile`](crate::storage_engines::sketch_db::schema::SchemaRegistry::reconcile),
+//!   landed in schema-retirement #4 alongside the otel.rs reconcile
+//!   call-site migration.
 
 pub mod eviction;
+pub mod reconcile;
 
 pub use eviction::{
     warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
 };
+pub use reconcile::{reconcile_from_streaming_config, SidReconcileSummary};
