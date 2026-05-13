@@ -234,13 +234,23 @@ impl<'a> SketchReducer<'a> {
     /// each `WarmTierCandidate` a `required_capability`, and the
     /// reducer picks a family without ever matching on the PromQL
     /// function-name string.
+    ///
+    /// Returns `None` for `Capability::ExactAgg(_)` — the warm-tier
+    /// sketch reducer only handles sketch-backed sids. Exact-aggregation
+    /// state is read through `SketchStore::query_precomputes_by_agg`
+    /// (a parallel code path), so an ExactAgg capability has no
+    /// `QueryFamily` mapping here.
     #[allow(dead_code)]
-    pub(crate) fn capability_to_family(cap: &Capability) -> QueryFamily {
+    pub(crate) fn capability_to_family(cap: &Capability) -> Option<QueryFamily> {
         match cap {
-            Capability::QuantileApprox(_) => QueryFamily::Quantile,
-            Capability::CardinalityApprox => QueryFamily::Cardinality,
-            Capability::FrequencyTopk(_) => QueryFamily::FrequencyTopk,
-            Capability::FrequencyEstimate(_) => QueryFamily::FrequencyEstimate,
+            Capability::QuantileApprox(_) => Some(QueryFamily::Quantile),
+            Capability::CardinalityApprox => Some(QueryFamily::Cardinality),
+            Capability::FrequencyTopk(_) => Some(QueryFamily::FrequencyTopk),
+            Capability::FrequencyEstimate(_) => Some(QueryFamily::FrequencyEstimate),
+            // ExactAgg sids are served by the precompute query path, not
+            // the sketch reducer. Callers that hand ExactAgg to this
+            // helper should branch to the precompute path instead.
+            Capability::ExactAgg(_) => None,
         }
     }
 

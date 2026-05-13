@@ -10,6 +10,7 @@ use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
 use crate::capability_matching::find_compatible_aggregation as common_find_compatible;
 use crate::capability_matching::StorageBackend;
 use crate::enums::QueryLanguage;
+use crate::policy_registry::PolicyRegistry;
 use crate::query_requirements::QueryRequirements;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +63,20 @@ impl StreamingConfig {
 
     pub fn contains(&self, aggregation_id: u64) -> bool {
         self.aggregation_configs.contains_key(&aggregation_id)
+    }
+
+    /// Derived content-addressed view. Builds a [`PolicyRegistry`] keyed
+    /// on [`crate::PolicyFingerprint`] — the merged-sid-identity-chain
+    /// replacement for the `aggregation_id`-keyed lookup. Cheap (O(N)
+    /// over `aggregation_configs.len()`); call at swap time, not per
+    /// query, if it shows up in hot-path profiles.
+    ///
+    /// Dual-keyed transition: this method exists alongside the legacy
+    /// `get_aggregation_config(aggregation_id)` so callers can migrate
+    /// one at a time. The two views are derived from the same source —
+    /// they can never disagree.
+    pub fn policy_registry(&self) -> PolicyRegistry {
+        PolicyRegistry::from_streaming_config(self)
     }
 
     pub fn from_yaml_file(yaml_file: &str) -> Result<Self> {

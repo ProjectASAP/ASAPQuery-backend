@@ -33,6 +33,7 @@ parking_lot    = "0.12"
 prometheus     = { version = "0.13", default-features = false, features = ["process"] }
 tonic          = { version = "0.12", features = ["gzip"] }
 tokio-stream   = { version = "0.1", features = ["net"] }
+promql_utilities.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

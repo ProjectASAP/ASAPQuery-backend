@@ -1,6 +1,8 @@
 pub mod aggregation_config;
 pub mod capability_matching;
 pub mod enums;
+pub mod policy_fingerprint;
+pub mod policy_registry;
 pub mod query_requirements;
 pub mod streaming_config;
 pub mod traits;
@@ -13,5 +15,7 @@ pub use capability_matching::{
     ENGINE_ID_THANOS_QUERY,
 };
 pub use enums::*;
+pub use policy_fingerprint::PolicyFingerprint;
+pub use policy_registry::PolicyRegistry;
 pub use query_requirements::*;
 pub use streaming_config::*;
