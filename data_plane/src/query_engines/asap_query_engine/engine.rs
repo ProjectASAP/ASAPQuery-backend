@@ -1044,6 +1044,48 @@ impl ASAPQueryEngine {
             params.is_exact_query
         );
 
+        // M2.3.5b — when a `SketchIndex` is attached AND the agg
+        // config is resolvable, read precomputes from SketchIndex
+        // (sid-keyed) instead of the legacy SketchStore. DualWriteSink
+        // mirrors writes to both, so the data is identical; this just
+        // moves the read off the agg_id-keyed store. When sketch_index
+        // is `None` (tests without one) or the agg_cfg is missing
+        // (eviction race), fall back to the legacy store.
+        if let Some(idx) = self.sketch_index.as_ref() {
+            let cfg = self.streaming_config_snapshot();
+            if let Some(agg_cfg) = cfg.get_aggregation_config(params.aggregation_id) {
+                let raw = idx.query_precomputes_by_agg(
+                    &params.metric,
+                    agg_cfg.aggregation_type,
+                    params.start_timestamp,
+                    params.end_timestamp,
+                );
+                let result: TimestampedBucketsMap = if params.is_exact_query {
+                    // Sliding-window mode requires bit-exact (start,
+                    // end) match. SketchIndex's range query returns
+                    // any windows fully within [start, end] — filter
+                    // post-hoc to recover the exact semantics the
+                    // legacy `query_precomputed_output_exact` had.
+                    raw.into_iter()
+                        .map(|(k, v)| {
+                            let filtered: Vec<_> = v
+                                .into_iter()
+                                .filter(|((s, e), _)| {
+                                    *s == params.start_timestamp
+                                        && *e == params.end_timestamp
+                                })
+                                .collect();
+                            (k, filtered)
+                        })
+                        .filter(|(_, v)| !v.is_empty())
+                        .collect()
+                } else {
+                    raw
+                };
+                return Ok(result);
+            }
+        }
+
         let store_query_start_time = Instant::now();
 
         let result = if params.is_exact_query {
