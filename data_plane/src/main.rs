@@ -23,7 +23,7 @@ use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
     HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
-    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchIndexSink, SketchStore,
+    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchIndexSink,
 };
 
 #[derive(Parser, Debug)]
@@ -291,70 +291,14 @@ async fn main() -> Result<()> {
     let hot_reload_config =
         data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
-    // Setup store
+    // M2.3.6g — the legacy `SketchStore` construction is gone.
+    // Production data lives in `SketchIndex` (allocated below); the
+    // single persistence flusher behind it is set up in the
+    // `--persistence-enabled` block lower in main.rs via
+    // `SketchIndex::start_persistence`.
     let cleanup_policy = args.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
-    let store = if args.persistence_enabled {
-        use data_plane::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
-        let disk_path = args
-            .persistence_dir
-            .clone()
-            .expect("--persistence-enabled requires --persistence-dir");
-        let memory_limit_bytes = args.persistence_memory_limit_mb * 1024 * 1024;
-        let hot_window_ms = if args.persistence_hot_window_secs == 0 {
-            None
-        } else {
-            Some(args.persistence_hot_window_secs * 1000)
-        };
-        let delete_older_than_ms = if args.persistence_delete_older_than_secs == 0 {
-            None
-        } else {
-            Some(args.persistence_delete_older_than_secs * 1000)
-        };
-        let part_cache_bytes = args
-            .persistence_part_cache_mb
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or_else(|| {
-                let ten_pct = (memory_limit_bytes / 10) as u64;
-                ten_pct.min(512 * 1024 * 1024)
-            });
-        let persistence_cfg = SketchStorePersistenceConfig {
-            memory_limit_bytes,
-            memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
-            hard_cap_bytes: memory_limit_bytes * 125 / 100,
-            hot_window_ms,
-            delete_older_than_ms,
-            flush_interval: std::time::Duration::from_millis(args.persistence_flush_interval_ms),
-            disk_path: std::path::PathBuf::from(&disk_path),
-            part_cache_bytes,
-        };
-        info!(
-            "Persistence enabled: disk_path={}, memory_limit={} MiB, hot_window={:?} s, delete_older_than={:?} s, flush_interval={} ms, part_cache={} MiB",
-            disk_path,
-            args.persistence_memory_limit_mb,
-            persistence_cfg.hot_window_ms.map(|ms| ms / 1000),
-            persistence_cfg.delete_older_than_ms.map(|ms| ms / 1000),
-            args.persistence_flush_interval_ms,
-            persistence_cfg.part_cache_bytes / (1024 * 1024),
-        );
-        if !matches!(args.lock_strategy, LockStrategy::PerKey) {
-            info!("--persistence-enabled forces LockStrategy::PerKey (ignoring --lock-strategy)");
-        }
-        Arc::new(
-            SketchStore::with_persistence_per_key(
-                streaming_config.clone(),
-                cleanup_policy,
-                persistence_cfg,
-            )
-            .expect("SketchStore::with_persistence_per_key failed"),
-        )
-    } else {
-        Arc::new(SketchStore::new_with_strategy(
-            streaming_config.clone(),
-            cleanup_policy,
-            args.lock_strategy,
-        ))
-    };
+    let _ = (cleanup_policy, args.lock_strategy); // Both still parsed for backwards-compat CLI; no runtime effect.
 
     // Phase 4 + 5 wire-in (refactor 2026-05): allocate the shared
     // SeriesIdResolver + SketchIndex once. The OTLP receive path
@@ -514,10 +458,12 @@ async fn main() -> Result<()> {
         let ingest_state = engine.ingest_state();
         info!("Starting precompute engine (OTLP-fed; no HTTP ingest port)");
 
-        // Spawn periodic memory diagnostics logger
-        let diag_store = store.clone();
+        // Spawn periodic memory diagnostics logger — M2.3.6g routes
+        // through SketchIndex now that SketchStore no longer holds
+        // production data.
+        let diag_index = sketch_index.clone();
         tokio::spawn(async move {
-            spawn_memory_diagnostics(diag_store, Some(worker_diagnostics)).await;
+            spawn_memory_diagnostics(diag_index, Some(worker_diagnostics)).await;
         });
 
         let handle = tokio::spawn(async move {
@@ -899,32 +845,27 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    store: Arc<SketchStore>,
+    sketch_index: Arc<data_plane::stores::sketch_db::index::SketchIndex>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
+    use data_plane::stores::sketch_db::store::persistence::EpochSource;
     use std::sync::atomic::Ordering;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
     loop {
         interval.tick().await;
 
-        // 1. Store diagnostics
-        let store_diag = store.diagnostic_info();
+        // 1. SketchIndex diagnostics (M2.3.6g — replaces the
+        //    pre-M2.3 per-agg_id SketchStore::diagnostic_info).
+        let instance_count = sketch_index.instance_count();
+        let series_count = sketch_index.series_len();
+        let approx_bytes = sketch_index.approx_memory_bytes();
         info!(
-            "[MEMORY_DIAG] Store: {} aggregation(s), {} total time_map entries, {:.2} KB total sketch bytes",
-            store_diag.num_aggregations,
-            store_diag.total_time_map_entries,
-            store_diag.total_sketch_bytes as f64 / 1024.0,
+            "[MEMORY_DIAG] SketchIndex: {} instance(s), {} sid(s) with state, {:.2} KB approx sealed bytes",
+            instance_count,
+            series_count,
+            approx_bytes as f64 / 1024.0,
         );
-        for agg in &store_diag.per_aggregation {
-            info!(
-                "[MEMORY_DIAG]   agg_id={}: time_map_len={}, aggregate_objects={}, sketch_bytes={:.2} KB",
-                agg.aggregation_id,
-                agg.time_map_len,
-                agg.num_aggregate_objects,
-                agg.sketch_bytes as f64 / 1024.0,
-            );
-        }
 
         // 2. Worker diagnostics (precompute engine only)
         if let Some(ref diag) = worker_diagnostics {
