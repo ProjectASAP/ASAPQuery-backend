@@ -2041,9 +2041,10 @@ aggregations:
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
-            agg_kind: AggKind::Precompute {
+            agg_kind: AggKind::ExactAgg {
                 agg_type: asap_types::enums::AggregationType::Sum,
                 parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
             },
             accuracy: None,
             first_seen_unix_ms: 0,

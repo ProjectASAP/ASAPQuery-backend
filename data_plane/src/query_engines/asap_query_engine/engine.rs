@@ -5896,6 +5896,7 @@ mod warm_tier_classify_tests {
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                 kind: SketchKindHandle::DDSketch,
                 config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
             },
             accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,

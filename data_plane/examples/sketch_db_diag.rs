@@ -63,6 +63,7 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::DDSketch,
             config: cfg,
+            spatial_filter_canonical: String::new(),
         },
         first_seen_unix_ms: 0,
         retired_at_ms: None,

@@ -229,8 +229,11 @@ impl Default for SeriesIdResolver {
 // writes a WAL record per fresh mint; the resolver replays it on startup
 // so the agent's cached sids stay valid across backend restarts.
 //
-// WAL format v2 (current; v1 was attrs-only, never shipped to prod):
-//   header: 8 bytes  → b"ASAPSRP\x02"
+// WAL format v3 (current; v1 was attrs-only, never shipped to prod;
+// v2 used `agg_kind_canonical` without spatial-filter, replaced when
+// spatial_filter_canonical was folded into agg_kind_canonical to
+// distinguish filter-distinct policies on the sid identity):
+//   header: 8 bytes  → b"ASAPSRP\x03"
 //   record: 8 bytes  → sid (u64 little-endian)
 //           4 bytes  → metric_len (u32 LE)
 //           metric_len bytes → metric utf8
@@ -238,6 +241,11 @@ impl Default for SeriesIdResolver {
 //           fp_len bytes → fp utf8
 //           4 bytes  → agg_kind_len (u32 LE)
 //           agg_kind_len bytes → agg_kind_canonical utf8
+//
+// v2 WALs are not auto-migrated — pre-prod constraint. A v2 header
+// causes `FilePersistence::open` to fail with `InvalidData`; recovery
+// is to delete the file and let the resolver cold-start (the
+// `unknown_series_ids` eviction primitive handles the bandwidth blip).
 //
 // Append-only; sids are minted once and never rewritten, so the log size
 // is proportional to live cardinality. At 100M sids (~5GB) compaction
@@ -312,7 +320,7 @@ pub struct FilePersistence {
     path: PathBuf,
 }
 
-const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x02";
+const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x03";
 /// Reject any single field whose length-prefix exceeds these caps. A
 /// corrupted file might claim huge field lengths; without these bounds
 /// the replay loop could allocate gigabytes of zeros before discovering

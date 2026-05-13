@@ -126,12 +126,12 @@ impl SketchInstanceMetadata {
 
     /// Sketch-handle accessor for the legacy sketch path. Returns
     /// `Some(handle)` iff this sid is sketch-backed; `None` for
-    /// precompute-backed sids. Consumers that only meaningfully run on
-    /// sketches (e.g. the warm-tier reducer) `.expect` it.
+    /// exact-aggregation-backed sids. Consumers that only meaningfully
+    /// run on sketches (e.g. the warm-tier reducer) `.expect` it.
     pub fn sketch_kind(&self) -> Option<SketchKindHandle> {
         match &self.agg_kind {
             AggKind::Sketch { kind, .. } => Some(*kind),
-            AggKind::Precompute { .. } => None,
+            AggKind::ExactAgg { .. } => None,
         }
     }
 
@@ -139,7 +139,7 @@ impl SketchInstanceMetadata {
     pub fn sketch_config(&self) -> Option<&SketchConfig> {
         match &self.agg_kind {
             AggKind::Sketch { config, .. } => Some(config),
-            AggKind::Precompute { .. } => None,
+            AggKind::ExactAgg { .. } => None,
         }
     }
 }
@@ -245,12 +245,12 @@ impl SketchStore {
         guard.insert(window, series_label_values, AggPayload::Sketch(sample));
     }
 
-    /// Append a window's precompute (Sum/Count/Avg/Rate/MinMax) state
-    /// under `sid`. Mirror of [`Self::append_sample`] for the
-    /// precompute branch — Phase 5 M2.3.3.
+    /// Append a window's exact-aggregation (Sum/Count/Avg/Rate/MinMax)
+    /// state under `sid`. Mirror of [`Self::append_sample`] for the
+    /// exact-agg branch — Phase 5 M2.3.3.
     ///
     /// Caller invariant: `sid` was registered with
-    /// `AggKind::Precompute { .. }`. Mixing sketch + precompute
+    /// `AggKind::ExactAgg { .. }`. Mixing sketch + exact-agg
     /// payloads under one sid is a logic error this layer doesn't
     /// guard against (it'll crash the reducer at runtime, not silently
     /// corrupt).
@@ -267,7 +267,7 @@ impl SketchStore {
             .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
             .clone();
         let mut guard = store.write().unwrap();
-        guard.insert(window, series_label_values, AggPayload::Precompute(payload));
+        guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
     }
 
     /// Range-query the warm-tier state for one sid. Window-end-keyed
@@ -375,7 +375,7 @@ impl SketchStore {
                     }
                     matches!(
                         &m.agg_kind,
-                        AggKind::Precompute { agg_type: t, .. } if *t == agg_type
+                        AggKind::ExactAgg { agg_type: t, .. } if *t == agg_type
                     )
                 })
                 .map(|(sid, _)| *sid)
@@ -393,7 +393,7 @@ impl SketchStore {
                 .current_epoch
                 .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
-                if let Some(p) = payload.as_precompute() {
+                if let Some(p) = payload.as_exact_agg() {
                     let label_values_map = guard
                         .intern
                         .resolve(*label_id)
@@ -417,7 +417,7 @@ impl SketchStore {
             for sealed in guard.sealed_epochs.values() {
                 sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
                 for (win, label_id, payload) in &buf {
-                    if let Some(p) = payload.as_precompute() {
+                    if let Some(p) = payload.as_exact_agg() {
                         let label_values_map = guard
                             .intern
                             .resolve(*label_id)
@@ -614,9 +614,15 @@ impl SketchStore {
             label_values_map.insert(k.clone(), v.clone());
         }
 
-        let agg_kind = AggKind::Precompute {
+        let agg_kind = AggKind::ExactAgg {
             agg_type: agg_cfg.aggregation_type,
             parameters_canonical: canonical_parameters(&agg_cfg.parameters),
+            // The canonical spatial-filter participates in sid identity
+            // so filter-distinct policies don't collide on the same
+            // (metric, attrs, agg_kind) tuple. `spatial_filter_normalized`
+            // is the canonicalized form produced by
+            // `asap_types::utils::normalize_spatial_filter`.
+            spatial_filter_canonical: agg_cfg.spatial_filter_normalized.clone(),
         };
         // Sid mint delegated to the caller's closure — typically
         // `|m, fp, ak| series_resolver.resolve(m, fp, ak)`. Keeps the
@@ -684,7 +690,7 @@ impl SketchStore {
                     }
                     matches!(
                         &m.agg_kind,
-                        AggKind::Precompute { agg_type, parameters_canonical }
+                        AggKind::ExactAgg { agg_type, parameters_canonical, .. }
                             if *agg_type == target_agg_type
                                 && parameters_canonical == &target_params
                     )
@@ -836,7 +842,7 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                 .and_then(|g| g.get(&sid).cloned())
                 .and_then(|m| match &m.agg_kind {
                     AggKind::Sketch { kind, .. } => Some(format!("{:?}", kind)),
-                    AggKind::Precompute { .. } => None,
+                    AggKind::ExactAgg { .. } => None,
                 })
         };
 
@@ -860,7 +866,7 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                         .unwrap_or_else(|| "UnknownSketch".to_string()),
                     s.bytes.clone(),
                 ),
-                AggPayload::Precompute(p) => (p.type_name().to_string(), {
+                AggPayload::ExactAgg(p) => (p.type_name().to_string(), {
                     use asap_types::traits::SerializableToSink;
                     p.serialize_to_bytes()
                 }),
@@ -927,6 +933,7 @@ mod tests {
             agg_kind: AggKind::Sketch {
                 kind: SketchKindHandle::DDSketch,
                 config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
             },
             accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,
@@ -1168,9 +1175,10 @@ mod tests {
         let mut precompute_meta = meta(42);
         precompute_meta.capability = None;
         precompute_meta.accuracy = None;
-        precompute_meta.agg_kind = AggKind::Precompute {
+        precompute_meta.agg_kind = AggKind::ExactAgg {
             agg_type: AggregationType::Sum,
             parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
         };
         let _ = cfg; // silence unused-binding lint
         idx.register(precompute_meta);
@@ -1206,9 +1214,10 @@ mod tests {
         precompute_meta.metric_name = "cpu_seconds".into();
         precompute_meta.capability = None;
         precompute_meta.accuracy = None;
-        precompute_meta.agg_kind = AggKind::Precompute {
+        precompute_meta.agg_kind = AggKind::ExactAgg {
             agg_type: AggregationType::Sum,
             parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
         };
         idx.register(precompute_meta);
 
@@ -1352,12 +1361,12 @@ mod tests {
             encoding: SketchEncoding::ProtoFull,
         });
         assert!(sketch.as_sketch().is_some());
-        assert!(sketch.as_precompute().is_none());
+        assert!(sketch.as_exact_agg().is_none());
 
         use crate::precompute_engine::operators::SumAccumulator;
-        let precompute = AggPayload::Precompute(Box::new(SumAccumulator::with_sum(1.0)));
-        assert!(precompute.as_sketch().is_none());
-        assert!(precompute.as_precompute().is_some());
+        let exact_agg = AggPayload::ExactAgg(Box::new(SumAccumulator::with_sum(1.0)));
+        assert!(exact_agg.as_sketch().is_none());
+        assert!(exact_agg.as_exact_agg().is_some());
     }
 
     // `compute_sketch_sid_matches_new_compute_sid_for_sketch_branch`

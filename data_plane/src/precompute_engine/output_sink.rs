@@ -240,14 +240,17 @@ mod tests {
         assert!(
             matches!(
                 meta.agg_kind,
-                AggKind::Precompute {
+                AggKind::ExactAgg {
                     agg_type: AggregationType::Sum,
                     ..
                 }
             ),
-            "sid metadata should be Precompute(Sum)"
+            "sid metadata should be ExactAgg(Sum)"
         );
-        assert!(meta.capability.is_none(), "precomputes have no capability");
+        assert!(
+            meta.capability.is_none(),
+            "exact aggregations have no warm-tier sketch capability"
+        );
     }
 
     #[test]
