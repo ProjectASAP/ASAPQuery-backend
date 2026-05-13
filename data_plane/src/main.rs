@@ -790,12 +790,12 @@ async fn main() -> Result<()> {
         let service = data_plane::stores::sketch_db::BackfillService::new(
             backfill_registry.clone(),
             schemas,
-            store.clone(),
             hot_reload_config.clone(),
             data_plane::stores::sketch_db::default_reader_factory(),
             data_plane::stores::sketch_db::BackfillServiceConfig::default(),
         )
-        // M2.3.6e — replayed batches mirror into SketchIndex too.
+        // M2.3.6e — replayed batches land in SketchIndex (the only
+        // destination after the M2.3.6g store retirement).
         .with_sketch_index(sketch_index.clone());
         info!(
             "Spawning BackfillService drain loop (reader factory: default — Prometheus sources wired, S3/OtherSketch fail fast)"
@@ -834,13 +834,12 @@ async fn main() -> Result<()> {
         let svc = data_plane::stores::sketch_db::SchemaEvictionService::new(
             ingest_state.schemas.clone(),
             backfill_registry.clone(),
-            store.clone(),
             data_plane::stores::sketch_db::SchemaEvictionConfig {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
                 dry_run: args.schema_eviction_dry_run,
             },
         )
-        // M2.3.6d — eviction sweeps SketchIndex too.
+        // M2.3.6g — eviction sweeps SketchIndex (its only data backend).
         .with_sketch_index(sketch_index.clone());
         info!(
             poll_secs = args.schema_eviction_poll_secs,
