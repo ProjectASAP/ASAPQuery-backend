@@ -1458,6 +1458,7 @@ mod tests {
 // alongside the store that uses it.
 pub mod epoch_columnar;
 
-// Persistence layer (manifest + parts + flusher + part cache + recovery).
-// Reused by `SketchStore::start_persistence`.
-pub mod persistence;
+// `persistence` moved up to `sketch_db::persistence`. Re-exported here
+// so legacy `crate::storage_engines::sketch_db::store::persistence::*`
+// paths continue working without consumer changes.
+pub use crate::storage_engines::sketch_db::persistence;

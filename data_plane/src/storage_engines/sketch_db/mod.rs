@@ -32,6 +32,7 @@ pub mod accuracy;
 pub mod backfill;
 pub mod data;
 pub mod metrics;
+pub mod persistence;
 pub mod schema;
 pub mod store;
 
