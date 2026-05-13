@@ -53,6 +53,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
+use crate::stores::sketch_db::index::SketchIndex;
 use super::{AggStatus, SchemaRegistry};
 use crate::stores::traits::Store;
 
@@ -83,6 +84,11 @@ pub struct SchemaEvictionService {
     schemas: Arc<SchemaRegistry>,
     backfill: Arc<BackfillRegistry>,
     store: Arc<dyn Store>,
+    /// Phase 5 M2.3.6d — when set, the eviction service ALSO removes
+    /// the schema's residual sid state from the sketch index after
+    /// dropping data on the legacy store. Optional so test fixtures
+    /// that pre-date M2.3 stay compiling without rewiring.
+    sketch_index: Option<Arc<SketchIndex>>,
     config: SchemaEvictionConfig,
 }
 
@@ -97,8 +103,17 @@ impl SchemaEvictionService {
             schemas,
             backfill,
             store,
+            sketch_index: None,
             config,
         }
+    }
+
+    /// Attach a `SketchIndex` so the eviction sweep also removes the
+    /// schema's per-sid state. Returns `self` (builder-style) so
+    /// existing call sites can opt in with a single chained call.
+    pub fn with_sketch_index(mut self, index: Arc<SketchIndex>) -> Self {
+        self.sketch_index = Some(index);
+        self
     }
 
     /// Spawn as a tokio task. Returns a handle whose `shutdown`
@@ -206,6 +221,22 @@ impl SchemaEvictionService {
                         "SchemaEviction: drop_agg_id failed; leaving schema in registry for retry"
                     );
                     continue;
+                }
+            }
+
+            // Phase 5 M2.3.6d — remove the schema's residual sid state
+            // from the sketch index. Best-effort: a 0 count here is
+            // normal (nothing was ever ingested under that schema, or
+            // already swept by a prior tick).
+            if let Some(idx) = self.sketch_index.as_ref() {
+                let removed = idx.remove_instances_for_agg_config(&schema.config);
+                if removed > 0 {
+                    info!(
+                        agg_id,
+                        %metric,
+                        sids_removed = removed,
+                        "SchemaEviction: also dropped sids in SketchIndex"
+                    );
                 }
             }
 
@@ -382,6 +413,65 @@ mod tests {
             "Expired schema removed from registry"
         );
         assert!(schemas.get(2).is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_once_also_removes_sketch_index_instances() {
+        use crate::stores::sketch_db::index::{
+            canonical_parameters, compute_sid, AggKind, SketchIndex,
+            SketchInstanceMetadata,
+        };
+        use std::collections::BTreeSet;
+
+        let (schemas, backfill, store) = fixture_with_expired_1().await;
+        let sketch_index = Arc::new(SketchIndex::new());
+
+        // Register a precompute sid that matches the soon-to-expire
+        // agg config (agg_id=1, metric_1, Sum, no grouping). The
+        // eviction sweep should remove it.
+        let agg_cfg = sum_agg_config(1);
+        let sid = compute_sid(
+            "metric_1",
+            "",
+            &AggKind::Precompute {
+                agg_type: agg_cfg.aggregation_type,
+                parameters_canonical: canonical_parameters(&agg_cfg.parameters),
+            },
+        );
+        sketch_index.register(SketchInstanceMetadata {
+            sid,
+            metric_name: "metric_1".into(),
+            group_by_keys: BTreeSet::new(),
+            capability: None,
+            agg_kind: AggKind::Precompute {
+                agg_type: agg_cfg.aggregation_type,
+                parameters_canonical: canonical_parameters(&agg_cfg.parameters),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+        });
+        assert_eq!(sketch_index.instance_count(), 1);
+
+        let svc = SchemaEvictionService::new(
+            schemas.clone(),
+            backfill,
+            store.clone(),
+            SchemaEvictionConfig {
+                poll_interval: Duration::from_secs(60),
+                dry_run: false,
+            },
+        )
+        .with_sketch_index(sketch_index.clone());
+
+        svc.run_once();
+
+        assert_eq!(
+            sketch_index.instance_count(),
+            0,
+            "expired agg_config's sids must be removed from SketchIndex"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
