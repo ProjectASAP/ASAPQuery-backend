@@ -29,5 +29,5 @@ pub use sketch_db::index::{
     AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
 };
-pub use sketch_db::{AggSchema, AggStatus, SchemaRegistry};
+pub use sketch_db::AggStatus;
 pub use traits::*;

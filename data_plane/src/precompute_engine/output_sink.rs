@@ -209,7 +209,7 @@ mod tests {
             "SketchStore should have one precompute instance"
         );
         let instances = sketch_index
-            .list_by_status(crate::storage_engines::sketch_db::schema::AggStatus::Active);
+            .list_by_status(crate::storage_engines::sketch_db::lifecycle::AggStatus::Active);
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
         let sid = meta.sid;

@@ -260,19 +260,6 @@ pub struct ASAPQueryEngine {
     /// misses fall through to the §5.2 fallback silently, matching
     /// pre-PR-G behavior. Set via `with_controller_client`.
     controller_client: Option<Arc<dyn crate::drivers::query::controller_client::ControllerClient>>,
-    /// Per-`agg_id` schema registry used for §7 schema-timeline
-    /// dispatch (`docs/design-sketch-db.md`). The combiner lives in
-    /// [`crate::query_engines::timeline_dispatch`] and the lookup primitive
-    /// is exposed on [`crate::storage_engines::sketch_db::SchemaRegistry`];
-    /// the engine consults the registry on every query to resolve
-    /// which agg_id owns each sub-range of the query's time window.
-    ///
-    /// Defaults to an empty registry so call-sites that don't
-    /// participate in schema-timeline dispatch keep compiling.
-    /// Production wire-up (`main.rs`) uses
-    /// [`Self::with_schema_registry`] to share the same registry the
-    /// ingest path is reconciling.
-    schema_registry: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
     /// Phase 5 — warm-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
@@ -454,7 +441,6 @@ impl ASAPQueryEngine {
             prometheus_scrape_interval,
             controller_patterns,
             controller_client: None,
-            schema_registry: Arc::new(crate::storage_engines::sketch_db::SchemaRegistry::empty()),
             sketch_index: None,
             archive_engine: None}
     }
@@ -513,31 +499,17 @@ impl ASAPQueryEngine {
         self
     }
 
-    /// Attach the shared `SchemaRegistry` the ingest path is
-    /// reconciling so queries can resolve the §7 schema timeline for
-    /// a metric. Typically called from `main.rs` with the same
-    /// `Arc<SchemaRegistry>` held by `IngestState::schemas` and the
-    /// HTTP streaming-config swap handler so all three observe the
-    /// same lifecycle transitions.
-    pub fn with_schema_registry(
-        mut self,
-        registry: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
-    ) -> Self {
-        self.schema_registry = registry;
-        self
-    }
-
     /// Resolve the timeline of agg-signatures for a metric over a
     /// query range. Reads exclusively from the sid catalog via
     /// [`crate::storage_engines::sketch_db::query::timeline::timeline_for_metric`]
-    /// — schema retirement #3 routed this away from
-    /// `SchemaRegistry::timeline_for_metric`.
+    /// — schema retirement routed this away from the now-deleted
+    /// per-metric schema registry.
     ///
     /// When no `SketchStore` is wired (test contexts that never
     /// installed one via [`Self::with_sketch_index`]) returns an
     /// empty vector; downstream dispatch then bails to the default
     /// single-agg path, identical to the pre-retirement behaviour
-    /// where an empty `SchemaRegistry` produced no segments.
+    /// where an empty schema registry produced no segments.
     pub fn timeline_for_query(
         &self,
         metric: &str,

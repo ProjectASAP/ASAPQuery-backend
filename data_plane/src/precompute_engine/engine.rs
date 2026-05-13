@@ -70,28 +70,14 @@ impl PrecomputeEngine {
         // agg_configs on each ingest batch, so new aggregations from
         // a config swap are visible immediately.
         //
-        // The schema registry is initialised from the same snapshot so
-        // every initial agg_id starts in `Active` status. Subsequent
-        // ingest batches reconcile it against later config snapshots
-        // (Phase 2a of the sketch DB design). Phase 2b will move
-        // reconciliation onto the HTTP swap handler so it's
-        // event-driven instead of per-batch.
-        let initial_snapshot = hot_reload_config.snapshot();
-        let schemas = Arc::new(match config.schema_persist_path.as_ref() {
-            Some(path) => crate::storage_engines::sketch_db::SchemaRegistry::load_or_new_from_config(
-                path.clone(),
-                initial_snapshot.as_ref(),
-            ),
-            None => crate::storage_engines::sketch_db::SchemaRegistry::from_streaming_config(
-                initial_snapshot.as_ref(),
-            ),
-        });
+        // The agg_id-keyed `SchemaRegistry` has been retired — sid-level
+        // lifecycle status now lives on `SketchStore` and reconcile
+        // runs against the same snapshot the ingest path consults.
         let ingest_state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
             samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
             hot_reload_config: hot_reload_config.clone(),
-            schemas,
             pass_raw_samples: config.pass_raw_samples,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver,

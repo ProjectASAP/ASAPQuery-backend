@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
-use crate::storage_engines::sketch_db::schema::AggStatus;
+use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
 // Phase-5 reorg: payload taxonomy + sid hashing + accuracy moved to
 // `sketch_db::data`. Re-exported here so existing call sites

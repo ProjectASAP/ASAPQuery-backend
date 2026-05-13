@@ -67,7 +67,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use crate::precompute_engine::worker::parse_labels_from_series_key;
@@ -77,7 +77,6 @@ use super::BackfillRegistry;
 use super::window_builder::build_backfilled_accumulator;
 use super::worker::WindowProcessor;
 use super::raw_sample_reader::RawSample;
-use crate::storage_engines::sketch_db::schema::SchemaRegistry;
 
 /// Turn a series key into the `group_key` string the
 /// grouping_labels-based partitioning produces in live ingest.
@@ -119,12 +118,6 @@ pub struct BackfillWindowProcessor {
     /// `AggregationConfig` for `agg_id`. The snapshot is cheap
     /// (Arc refcount bump) so we don't optimise further.
     config: HotReloadStreamingConfig,
-    /// Schema registry — consulted only for defensive logging.
-    /// The time-disjoint invariant guarantees the agg_id is still
-    /// a known schema for as long as the backfill covers data
-    /// before its `created_at_ms`.
-    #[allow(dead_code)]
-    schemas: Arc<SchemaRegistry>,
     /// Phase 5 M2.3.6g — replayed batches land here. The legacy
     /// `Arc<dyn Store>` field is gone; SketchStore is the only
     /// destination. Optional so tests that don't observe write
@@ -143,13 +136,11 @@ pub struct BackfillWindowProcessor {
 impl BackfillWindowProcessor {
     pub fn new(
         config: HotReloadStreamingConfig,
-        schemas: Arc<SchemaRegistry>,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
         Self {
             config,
-            schemas,
             sketch_index: None,
             registry,
             job_id,
@@ -313,7 +304,6 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -323,7 +313,7 @@ mod tests {
         );
 
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
+            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
 
         // Two services → two groups → expect two PrecomputedOutput
         // entries for window (0, 100).
@@ -359,7 +349,6 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -367,7 +356,7 @@ mod tests {
             BackfillSource::Prometheus { url: "x".into() },
             1,
         );
-        let processor = BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
+        let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
         // agg_id=999 isn't in the StreamingConfig.
         let err = processor
             .process_window(999, (0, 10), vec![])
@@ -382,7 +371,6 @@ mod tests {
         let cfg = sum_config(1, "m", vec![]);
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -391,7 +379,7 @@ mod tests {
             1,
         );
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
+            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
         processor.process_window(1, (0, 10), vec![]).await.unwrap();
         // Empty window: no provenance record (nothing was written).
         assert!(registry.windows_written_by(job_id).is_empty());
@@ -404,7 +392,6 @@ mod tests {
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -437,7 +424,7 @@ mod tests {
         ]);
 
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
+            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
         let worker = BackfillWorker::new(registry.clone());
         worker
             .run_job(
@@ -544,21 +531,28 @@ mod tests {
 
     // ─── Time-disjoint invariant tests ─────────────────────────────────────
 
+    /// Snapshot a wall-clock millis "now" the same way the registry
+    /// does. The schema-retirement migration dropped
+    /// `AggSchema::created_at_ms`; tests now stamp their own.
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
     #[test]
     fn create_checked_rejects_end_past_created_at() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let schema = schemas.get(1).unwrap();
-        let created = schema.created_at_ms;
+        let created = now_ms();
         let registry = BackfillRegistry::new();
 
         // end_ms one past created_at_ms — should be rejected.
         let err = registry
             .create_checked(
-                &schemas,
-                1,
+                &cfg,
+                created,
                 (0, created + 1),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
@@ -574,17 +568,15 @@ mod tests {
     #[test]
     fn create_checked_accepts_end_at_boundary() {
         let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let created = schemas.get(1).unwrap().created_at_ms;
+        let created = now_ms();
         let registry = BackfillRegistry::new();
         // end_ms exactly at created_at_ms is allowed — live owns
         // [created_at, ∞) as a half-open interval on the left, so
         // the boundary point is backfill's.
         let job_id = registry
             .create_checked(
-                &schemas,
-                1,
+                &cfg,
+                created,
                 (0, created),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
@@ -592,26 +584,6 @@ mod tests {
             )
             .expect("boundary-touching range should be accepted");
         assert!(registry.get(job_id).is_some());
-    }
-
-    #[test]
-    fn create_checked_rejects_unknown_agg() {
-        use super::super::CreateError;
-        let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let registry = BackfillRegistry::new();
-        let err = registry
-            .create_checked(
-                &schemas,
-                999,
-                (0, 100),
-                BackfillSource::Prometheus { url: "x".into() },
-                1,
-                None,
-            )
-            .expect_err("unknown agg should be rejected");
-        assert!(matches!(err, CreateError::UnknownAgg { agg_id: 999 }));
     }
 
     /// Retention guard: requesting a start_ms older than the store's
@@ -622,16 +594,15 @@ mod tests {
     fn create_checked_rejects_start_older_than_data_retention() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
+        let created = now_ms();
         let registry = BackfillRegistry::new();
-        // Schema's created_at_ms is now_ms(), so data retention of
-        // 1 hour with `start_ms = 0` means we're requesting data
-        // from the epoch — way outside retention.
+        // Created-at is now_ms(), so data retention of 1 hour with
+        // `start_ms = 0` means we're requesting data from the epoch —
+        // way outside retention.
         let err = registry
             .create_checked(
-                &schemas,
-                1,
+                &cfg,
+                created,
                 (0, 1_000),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
@@ -657,16 +628,14 @@ mod tests {
     #[test]
     fn create_checked_none_retention_skips_check() {
         let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let created = schemas.get(1).unwrap().created_at_ms;
+        let created = now_ms();
         let registry = BackfillRegistry::new();
         // start_ms = 0 would normally fail any realistic retention
         // window, but None skips the check.
         let job_id = registry
             .create_checked(
-                &schemas,
-                1,
+                &cfg,
+                created,
                 (0, created),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,
@@ -681,23 +650,18 @@ mod tests {
     #[test]
     fn create_checked_accepts_start_within_retention() {
         let cfg = sum_config(1, "m", vec![]);
-        let streaming = streaming_config_with(cfg);
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = BackfillRegistry::new();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = now_ms();
         let retention = 3_600_000_u64; // 1h
                                        // start_ms = now - 30 min: well within 1h retention.
         let start = now.saturating_sub(1_800_000);
-        let created = schemas.get(1).unwrap().created_at_ms;
+        let created = now;
         // Clip end to the schema boundary so time-disjoint passes.
         let end = created.min(now);
         let job_id = registry
             .create_checked(
-                &schemas,
-                1,
+                &cfg,
+                created,
                 (start, end),
                 BackfillSource::Prometheus { url: "x".into() },
                 1,

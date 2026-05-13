@@ -380,7 +380,7 @@ async fn main() -> Result<()> {
     // (PR E phase 2). Without sharing the handle, ASAPQueryEngine
     // would take a one-time snapshot at construction and ignore
     // subsequent swaps.
-    let mut engine = {
+    let engine = {
         let mut engine = ASAPQueryEngine::new_with_hot_reload(
             hot_reload_config.clone(),
             args.prometheus_scrape_interval,
@@ -410,9 +410,6 @@ async fn main() -> Result<()> {
                  (pass --controller-endpoint=<url> to enable)"
             );
         }
-        // `Arc::new(engine)` is deferred until after the precompute
-        // engine is constructed so we can hand the same `SchemaRegistry`
-        // (§7 timeline source) to both via `with_schema_registry`.
         engine
     };
 
@@ -474,14 +471,9 @@ async fn main() -> Result<()> {
         (Some(handle), Some(ingest_state))
     };
 
-    // Hand the precompute engine's `SchemaRegistry` to the query
-    // engine so both observe the same §7 timeline (design-sketch-db.md
-    // §6 / §7). When precompute isn't enabled the engine keeps its
-    // default empty registry — queries that need the timeline will
-    // simply see no segments and fall through to the legacy path.
-    if let Some(ingest_state) = precompute_ingest_state.as_ref() {
-        engine = engine.with_schema_registry(ingest_state.schemas.clone());
-    }
+    // Schema retirement #5 — agg_id-keyed `SchemaRegistry` is gone.
+    // Both ingest and query observe the §7 timeline at the sid level
+    // via the shared `SketchStore` (already passed in above).
     let engine = Arc::new(engine);
 
     // Setup OTLP receiver (after precompute engine so it can share the ingest state)
@@ -550,12 +542,10 @@ async fn main() -> Result<()> {
     // executor that consumes plans pushed via
     // `POST /api/v1/streaming-config` and `POST /api/v1/storage_routing`.
 
-    // Forward the precompute engine's schema registry to the HTTP
-    // server so `POST /api/v1/streaming-config` can drive schema
-    // lifecycle transitions event-driven (Phase 2b of the sketch DB
-    // design, §6). When precompute isn't enabled, the registry is
-    // absent and the swap handler no-ops on schema reconciliation
-    // (legacy per-batch reconcile in ingest still works).
+    // Schema retirement #5 — the HTTP server no longer takes a
+    // `SchemaRegistry`. `POST /api/v1/streaming-config` drives
+    // lifecycle transitions at the sid level via the shared
+    // `SketchStore` (already passed in below).
     let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
         .with_hot_reload_config(hot_reload_config.clone())
         .with_probe_cache(probe_cache.clone());
@@ -695,9 +685,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(ingest_state) = precompute_ingest_state.as_ref() {
-        server = server.with_schemas(ingest_state.schemas.clone());
-    }
     if args.persistence_delete_older_than_secs > 0 {
         server = server.with_data_retention_ms(args.persistence_delete_older_than_secs * 1000);
     }
@@ -728,14 +715,15 @@ async fn main() -> Result<()> {
     // "no reader" error — still a step up from the old shadow
     // mode, since the controller now gets signal that its REFRESH
     // dispatch was received but not executable.
-    let backfill_service_handle = if let (true, Some(ingest_state)) = (
+    let backfill_service_handle = if let (true, Some(_ingest_state)) = (
         args.enable_backfill_worker,
         precompute_ingest_state.as_ref(),
     ) {
-        let schemas = ingest_state.schemas.clone();
+        // Schema retirement #5 — `BackfillService::new` no longer
+        // takes a `SchemaRegistry`; it consults sid-level lifecycle on
+        // `SketchStore` instead.
         let service = data_plane::storage_engines::sketch_db::BackfillService::new(
             backfill_registry.clone(),
-            schemas,
             hot_reload_config.clone(),
             data_plane::storage_engines::sketch_db::default_reader_factory(),
             data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
@@ -750,7 +738,7 @@ async fn main() -> Result<()> {
     } else {
         if args.enable_backfill_worker {
             warn!(
-                "--enable-backfill-worker was set but precompute engine isn't enabled; backfill service NOT spawned (it needs the schema registry)"
+                "--enable-backfill-worker was set but precompute engine isn't enabled; backfill service NOT spawned"
             );
         }
         None
@@ -762,7 +750,7 @@ async fn main() -> Result<()> {
     // data from the store. Complements the age-based data retention
     // in SketchStore — see `SchemaEvictionService` module doc for
     // the ordering rationale.
-    let schema_eviction_handle = if let (true, Some(ingest_state)) = (
+    let schema_eviction_handle = if let (true, Some(_ingest_state)) = (
         args.enable_schema_eviction,
         precompute_ingest_state.as_ref(),
     ) {
@@ -773,20 +761,21 @@ async fn main() -> Result<()> {
                 args.persistence_delete_older_than_secs,
             ))
         };
+        // Schema retirement #5 — retention check now uses the
+        // package-level default; per-registry retention overrides are
+        // gone with the agg_id-keyed `SchemaRegistry`.
         data_plane::storage_engines::sketch_db::warn_if_retention_inverted(
             data_retention_opt,
-            ingest_state.schemas.retirement_retention(),
+            data_plane::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
         );
         let svc = data_plane::storage_engines::sketch_db::SchemaEvictionService::new(
-            ingest_state.schemas.clone(),
+            sketch_index.clone(),
             backfill_registry.clone(),
             data_plane::storage_engines::sketch_db::SchemaEvictionConfig {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
                 dry_run: args.schema_eviction_dry_run,
             },
-        )
-        // M2.3.6g — eviction sweeps SketchStore (its only data backend).
-        .with_sketch_index(sketch_index.clone());
+        );
         info!(
             poll_secs = args.schema_eviction_poll_secs,
             dry_run = args.schema_eviction_dry_run,

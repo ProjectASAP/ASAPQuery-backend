@@ -55,7 +55,6 @@ use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillSour
 use crate::storage_engines::sketch_db::backfill::processor::BackfillWindowProcessor;
 use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
 use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{LabelFilter, RawSampleReader};
-use crate::storage_engines::sketch_db::schema::SchemaRegistry;
 
 /// Given a `BackfillSource`, return a reader that can read raw
 /// samples from it. Used by the service to pick a concrete reader
@@ -94,7 +93,6 @@ impl Default for BackfillServiceConfig {
 /// the loop gracefully.
 pub struct BackfillService {
     registry: Arc<BackfillRegistry>,
-    schemas: Arc<SchemaRegistry>,
     /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
     /// the legacy `Arc<dyn Store>` field is gone.
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
@@ -106,14 +104,12 @@ pub struct BackfillService {
 impl BackfillService {
     pub fn new(
         registry: Arc<BackfillRegistry>,
-        schemas: Arc<SchemaRegistry>,
         config_source: HotReloadStreamingConfig,
         reader_factory: ReaderFactory,
         service_config: BackfillServiceConfig,
     ) -> Self {
         Self {
             registry,
-            schemas,
             sketch_index: None,
             config_source,
             reader_factory,
@@ -197,7 +193,6 @@ impl BackfillService {
             // mid-job config swaps stay visible.
             let mut processor = BackfillWindowProcessor::new(
                 self.config_source.clone(),
-                self.schemas.clone(),
                 self.registry.clone(),
                 job.job_id,
             );
@@ -367,7 +362,6 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory returns a fresh mock reader per call — seeded with a
@@ -389,7 +383,6 @@ mod tests {
 
         let service = BackfillService::new(
             registry.clone(),
-            schemas,
             hot,
             reader_factory,
             BackfillServiceConfig {
@@ -415,12 +408,10 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(
             registry.clone(),
-            schemas,
             hot,
             noop_reader_factory(),
             BackfillServiceConfig {
@@ -450,7 +441,6 @@ mod tests {
         let cfg = sum_config(1, "latency");
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
 
         // Factory records the order in which it's invoked.
@@ -463,7 +453,6 @@ mod tests {
 
         let service = BackfillService::new(
             registry.clone(),
-            schemas,
             hot,
             reader_factory,
             BackfillServiceConfig {
@@ -514,12 +503,10 @@ mod tests {
         let cfg = sum_config(1, "m");
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let registry = Arc::new(BackfillRegistry::new());
 
         let service = BackfillService::new(
             registry,
-            schemas,
             hot,
             noop_reader_factory(),
             BackfillServiceConfig {
