@@ -55,7 +55,6 @@ use tracing::{info, warn};
 use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
 use crate::stores::sketch_db::index::SketchIndex;
 use super::{AggStatus, SchemaRegistry};
-use crate::stores::traits::Store;
 
 /// Configuration for the eviction loop. Separate from
 /// `SchemaRegistry`'s `retirement_retention` because the service
@@ -83,11 +82,10 @@ impl Default for SchemaEvictionConfig {
 pub struct SchemaEvictionService {
     schemas: Arc<SchemaRegistry>,
     backfill: Arc<BackfillRegistry>,
-    store: Arc<dyn Store>,
-    /// Phase 5 M2.3.6d — when set, the eviction service ALSO removes
-    /// the schema's residual sid state from the sketch index after
-    /// dropping data on the legacy store. Optional so test fixtures
-    /// that pre-date M2.3 stay compiling without rewiring.
+    /// Phase 5 M2.3.6g — eviction removes sids from `SketchIndex`
+    /// only; the legacy `Arc<dyn Store>` field is gone now that
+    /// SketchStore no longer holds data (M2.3.6a) and the engine
+    /// reads exclusively from SketchIndex (M2.3.6f).
     sketch_index: Option<Arc<SketchIndex>>,
     config: SchemaEvictionConfig,
 }
@@ -96,13 +94,11 @@ impl SchemaEvictionService {
     pub fn new(
         schemas: Arc<SchemaRegistry>,
         backfill: Arc<BackfillRegistry>,
-        store: Arc<dyn Store>,
         config: SchemaEvictionConfig,
     ) -> Self {
         Self {
             schemas,
             backfill,
-            store,
             sketch_index: None,
             config,
         }
@@ -201,44 +197,22 @@ impl SchemaEvictionService {
                 );
                 continue;
             }
-            match self.store.drop_agg_id(agg_id) {
-                Ok(evicted_windows) => {
-                    info!(
-                        agg_id,
-                        %metric,
-                        evicted_windows,
-                        retired_at_ms = ?schema.retired_at_ms,
-                        expires_at_ms = ?schema.expires_at_ms,
-                        running_backfills_cancelled = running.len(),
-                        "SchemaEviction: dropped agg_id"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        agg_id,
-                        %metric,
-                        error = %e,
-                        "SchemaEviction: drop_agg_id failed; leaving schema in registry for retry"
-                    );
-                    continue;
-                }
-            }
-
-            // Phase 5 M2.3.6d — remove the schema's residual sid state
-            // from the sketch index. Best-effort: a 0 count here is
-            // normal (nothing was ever ingested under that schema, or
-            // already swept by a prior tick).
-            if let Some(idx) = self.sketch_index.as_ref() {
-                let removed = idx.remove_instances_for_agg_config(&schema.config);
-                if removed > 0 {
-                    info!(
-                        agg_id,
-                        %metric,
-                        sids_removed = removed,
-                        "SchemaEviction: also dropped sids in SketchIndex"
-                    );
-                }
-            }
+            // Phase 5 M2.3.6g — drop the schema's sid state from the
+            // sketch index. The legacy `store.drop_agg_id` call is
+            // gone (no data lives there post-M2.3.6a).
+            let removed = match self.sketch_index.as_ref() {
+                Some(idx) => idx.remove_instances_for_agg_config(&schema.config),
+                None => 0,
+            };
+            info!(
+                agg_id,
+                %metric,
+                sids_removed = removed,
+                retired_at_ms = ?schema.retired_at_ms,
+                expires_at_ms = ?schema.expires_at_ms,
+                running_backfills_cancelled = running.len(),
+                "SchemaEviction: dropped schema"
+            );
 
             // Step 3: remove the schema record.
             self.schemas.remove_schema(agg_id);
@@ -301,6 +275,7 @@ mod tests {
     use crate::stores::types::{AggregationType, CleanupPolicy, LockStrategy, StreamingConfig};
     use crate::precompute_engine::operators::SumAccumulator;
     use crate::stores::sketch_db::{backfill::BackfillSource, store::SketchStore};
+    use crate::stores::traits::Store;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -389,25 +364,26 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_drops_expired_agg_data() {
         let (schemas, backfill, store) = fixture_with_expired_1().await;
+        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
-            store.clone(),
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
                 dry_run: false,
             },
         );
 
+        // After M2.3.6g, the eviction service no longer drops data
+        // from the legacy SketchStore (it doesn't hold a Store
+        // reference). Data lingers in the legacy store; eviction is
+        // observable through the schema registry side only.
         assert_eq!(total_buckets(&store, "metric_1", 1), 2);
         assert_eq!(total_buckets(&store, "metric_2", 2), 1);
 
         svc.run_once();
 
-        // Expired agg's data gone, active agg's data untouched.
-        assert_eq!(total_buckets(&store, "metric_1", 1), 0);
-        assert_eq!(total_buckets(&store, "metric_2", 2), 1);
-        // Schema registry entry is removed too.
+        // Schema registry entry is removed.
         assert!(
             schemas.get(1).is_none(),
             "Expired schema removed from registry"
@@ -454,10 +430,10 @@ mod tests {
         });
         assert_eq!(sketch_index.instance_count(), 1);
 
+        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
-            store.clone(),
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
                 dry_run: false,
@@ -486,10 +462,10 @@ mod tests {
         ));
         write_one(&store, 1, 100);
 
+        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
-            store.clone(),
             SchemaEvictionConfig::default(),
         );
         svc.run_once();
@@ -502,10 +478,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dry_run_logs_but_does_not_drop() {
         let (schemas, backfill, store) = fixture_with_expired_1().await;
+        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
-            store.clone(),
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
                 dry_run: true,
@@ -537,10 +513,10 @@ mod tests {
             BackfillStatus::Running
         );
 
+        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill.clone(),
-            store.clone(),
             SchemaEvictionConfig {
                 poll_interval: Duration::from_secs(60),
                 dry_run: false,
@@ -553,8 +529,10 @@ mod tests {
             backfill.get(job_id).unwrap().status,
             BackfillStatus::Cancelled
         );
-        // Agg data + schema dropped as normal.
-        assert_eq!(total_buckets(&store, "metric_1", 1), 0);
+        // M2.3.6g — legacy store data isn't actively dropped by the
+        // eviction service anymore (no `store` field on the service).
+        // Schema registry side is the observable signal.
+        let _ = total_buckets(&store, "metric_1", 1);
         assert!(schemas.get(1).is_none());
     }
 

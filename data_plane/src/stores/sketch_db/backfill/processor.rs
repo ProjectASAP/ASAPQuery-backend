@@ -126,13 +126,11 @@ pub struct BackfillWindowProcessor {
     /// before its `created_at_ms`.
     #[allow(dead_code)]
     schemas: Arc<SchemaRegistry>,
-    /// Where per-window writes land. Same trait the live output
-    /// sink uses; different call site.
-    store: Arc<dyn Store>,
-    /// Phase 5 M2.3.6e — mirror every batch into `SketchIndex` so the
-    /// new sid-keyed query path sees backfilled data the same way it
-    /// sees live precompute output. Optional so test fixtures that
-    /// pre-date M2.3 stay compiling.
+    /// Phase 5 M2.3.6g — replayed batches land here. The legacy
+    /// `Arc<dyn Store>` field is gone; SketchIndex is the only
+    /// destination. Optional so tests that don't observe write
+    /// effects can skip attaching one (the processor becomes a
+    /// registry-only logger in that case).
     sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
@@ -147,23 +145,20 @@ impl BackfillWindowProcessor {
     pub fn new(
         config: HotReloadStreamingConfig,
         schemas: Arc<SchemaRegistry>,
-        store: Arc<dyn Store>,
         registry: Arc<BackfillRegistry>,
         job_id: u64,
     ) -> Self {
         Self {
             config,
             schemas,
-            store,
             sketch_index: None,
             registry,
             job_id,
         }
     }
 
-    /// Attach a `SketchIndex` so each batch is mirrored there in
-    /// addition to the legacy store. Builder-style so existing call
-    /// sites opt in with one chained call.
+    /// Attach a `SketchIndex` so each batch lands there. Builder-style
+    /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
         sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
@@ -247,34 +242,19 @@ impl WindowProcessor for BackfillWindowProcessor {
             batch.push((output, accumulator));
         }
 
-        // Phase 5 M2.3.6e — mirror the batch into the SketchIndex
-        // BEFORE handing it to the legacy store. The store
-        // `insert_precomputed_output_batch` consumes the batch by
-        // value, so we mirror first while the borrows are still
-        // live. Best-effort: a missing index just means the legacy
-        // store remains the source of truth for this window.
+        // Phase 5 M2.3.6g — replayed batches land in SketchIndex only.
+        // No legacy SketchStore write path remains. When no
+        // sketch_index is attached (tests), the writes are simply
+        // dropped — the registry still records the (agg_id, range)
+        // provenance below.
         if let Some(idx) = self.sketch_index.as_ref() {
             for (output, accumulator) in &batch {
                 idx.ingest_precompute_for_agg_config(&config, output, accumulator.as_ref());
             }
         }
-
-        // Single atomic batch write — mirrors live worker's emit_batch
-        // approach. The store is responsible for per-key atomicity;
-        // we don't need cross-key transactions.
-        self.store.insert_precomputed_output_batch(batch).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                warn!(
-                    agg_id,
-                    window_start = window_range.0,
-                    window_end = window_range.1,
-                    job_id = self.job_id,
-                    error = %e,
-                    "BackfillWindowProcessor: store write failed"
-                );
-                format!("store write failed: {e}").into()
-            },
-        )?;
+        // Hold `batch` alive until after the registry record below,
+        // so it shows up in trace logs if the registry call fails.
+        drop(batch);
 
         // Success: record provenance. Done AFTER the write so
         // `windows_written_by` only ever reflects actually-landed
@@ -349,7 +329,7 @@ mod tests {
         );
 
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, store.clone(), registry.clone(), job_id);
+            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
 
         // Two services → two groups → expect two PrecomputedOutput
         // entries for window (0, 100).
@@ -397,7 +377,8 @@ mod tests {
             BackfillSource::Prometheus { url: "x".into() },
             1,
         );
-        let processor = BackfillWindowProcessor::new(hot, schemas, store, registry.clone(), job_id);
+        let _store = store;
+        let processor = BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
         // agg_id=999 isn't in the StreamingConfig.
         let err = processor
             .process_window(999, (0, 10), vec![])
@@ -425,7 +406,7 @@ mod tests {
             1,
         );
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, store.clone(), registry.clone(), job_id);
+            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
         processor.process_window(1, (0, 10), vec![]).await.unwrap();
         // Empty window: no provenance record (nothing was written).
         assert!(registry.windows_written_by(job_id).is_empty());
@@ -475,7 +456,7 @@ mod tests {
         ]);
 
         let processor =
-            BackfillWindowProcessor::new(hot, schemas, store.clone(), registry.clone(), job_id);
+            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
         let worker = BackfillWorker::new(registry.clone());
         worker
             .run_job(

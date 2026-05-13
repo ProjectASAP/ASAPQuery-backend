@@ -96,9 +96,8 @@ impl Default for BackfillServiceConfig {
 pub struct BackfillService {
     registry: Arc<BackfillRegistry>,
     schemas: Arc<SchemaRegistry>,
-    store: Arc<dyn Store>,
-    /// Phase 5 M2.3.6e — when set, every BackfillWindowProcessor the
-    /// service constructs mirrors its writes into this SketchIndex.
+    /// Phase 5 M2.3.6g — replayed batches land in `SketchIndex` only;
+    /// the legacy `Arc<dyn Store>` field is gone.
     sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
     config_source: HotReloadStreamingConfig,
     reader_factory: ReaderFactory,
@@ -109,7 +108,6 @@ impl BackfillService {
     pub fn new(
         registry: Arc<BackfillRegistry>,
         schemas: Arc<SchemaRegistry>,
-        store: Arc<dyn Store>,
         config_source: HotReloadStreamingConfig,
         reader_factory: ReaderFactory,
         service_config: BackfillServiceConfig,
@@ -117,7 +115,6 @@ impl BackfillService {
         Self {
             registry,
             schemas,
-            store,
             sketch_index: None,
             config_source,
             reader_factory,
@@ -202,7 +199,6 @@ impl BackfillService {
             let mut processor = BackfillWindowProcessor::new(
                 self.config_source.clone(),
                 self.schemas.clone(),
-                self.store.clone(),
                 self.registry.clone(),
                 job.job_id,
             );
@@ -397,10 +393,10 @@ mod tests {
             ])) as Arc<dyn RawSampleReader>)
         });
 
+        let _store = store;
         let service = BackfillService::new(
             registry.clone(),
             schemas,
-            store,
             hot,
             reader_factory,
             BackfillServiceConfig {
@@ -433,10 +429,10 @@ mod tests {
         ));
         let registry = Arc::new(BackfillRegistry::new());
 
+        let _store = store;
         let service = BackfillService::new(
             registry.clone(),
             schemas,
-            store,
             hot,
             noop_reader_factory(),
             BackfillServiceConfig {
@@ -481,10 +477,10 @@ mod tests {
             Ok(Arc::new(MockRawSampleReader::new(vec![])) as Arc<dyn RawSampleReader>)
         });
 
+        let _store = store;
         let service = BackfillService::new(
             registry.clone(),
             schemas,
-            store,
             hot,
             reader_factory,
             BackfillServiceConfig {
@@ -542,10 +538,10 @@ mod tests {
         ));
         let registry = Arc::new(BackfillRegistry::new());
 
+        let _store = store;
         let service = BackfillService::new(
             registry,
             schemas,
-            store,
             hot,
             noop_reader_factory(),
             BackfillServiceConfig {
