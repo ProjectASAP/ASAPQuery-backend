@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::sketch_algebra::params::SketchKind;
 use crate::types_v2::AccuracyTarget;
+use promql_utilities::query_logics::enums::AggregationType;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 
@@ -84,6 +85,31 @@ pub enum Capability {
     /// wire format can answer this. `Any` required matches either
     /// `CmsWithHeap` or `CountSketchWithHeap`.
     FrequencyTopk(SketchKindHandle),
+    /// Exact-aggregation warm-tier state — Sum / Count / MinMax / Avg /
+    /// Rate / Increase / SetAggregator etc. Backed by a per-accumulator
+    /// payload (`AggPayload::ExactAgg` in the data plane). One variant
+    /// per [`AggregationType`] — the inner enum names the concrete
+    /// accumulator family.
+    ///
+    /// Distinct from the `*Approx` variants above: the `*Approx`
+    /// capabilities serve approximate sketch-bound intents; `ExactAgg`
+    /// serves the warm-tier exact-aggregation path (the data plane's
+    /// `AggKind::ExactAgg`-backed sids). Routing an analyzer candidate
+    /// at `Capability::ExactAgg(Sum)` to a sid whose `agg_kind` is
+    /// `AggKind::ExactAgg { agg_type: Sum, .. }` is what closes the gap
+    /// between the control plane's vocabulary and the data plane's
+    /// exact-aggregation state.
+    ///
+    /// PR 6 introduces this variant + the matching machinery. The
+    /// `capability_for(&AggIntent)` lookup deliberately does NOT route
+    /// `Sum` / `Min` / `Max` / `Rate` / `Increase` / exact-accuracy
+    /// intents to `ExactAgg` yet — that re-routing is a behavior
+    /// change deferred to a follow-up. The variant is dormant on the
+    /// analyzer side until then; the matching half (`is_satisfied_by`)
+    /// is wired so that sids whose stored `Capability` is
+    /// `ExactAgg(...)` can be filtered against an `ExactAgg(...)`
+    /// required capability once callers start populating it.
+    ExactAgg(AggregationType),
 }
 
 /// Compact, hashable handle for sketch implementation choice. Mirrors
@@ -149,6 +175,12 @@ impl Capability {
             (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
                 is_heap_bearing(*have) && handles_compatible(*req, *have)
             }
+            // Exact-aggregation family: the agg_type must match exactly.
+            // There is no `Any` wildcard for ExactAgg — a Sum sid does
+            // not satisfy a MinMax requirement and vice versa. If a
+            // future PR introduces a wildcard semantic (e.g. "any
+            // single-population accumulator"), extend the match here.
+            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => req == have,
             _ => false,
         }
     }
@@ -854,6 +886,101 @@ mod tests {
         assert!(!required.is_satisfied_by(&q));
         assert!(!required.is_satisfied_by(&c));
         assert!(!required.is_satisfied_by(&bad));
+    }
+
+    // ── Capability::ExactAgg — matching ──────────────────────────────────
+
+    #[test]
+    fn is_satisfied_by_exact_agg_same_type_matches() {
+        // Sum required, Sum indexed → match. Same for every concrete
+        // AggregationType — the equality check is structural.
+        let required = Capability::ExactAgg(AggregationType::Sum);
+        let indexed = Capability::ExactAgg(AggregationType::Sum);
+        assert!(required.is_satisfied_by(&indexed));
+    }
+
+    #[test]
+    fn is_satisfied_by_exact_agg_different_types_do_not_match() {
+        // Sum required, MinMax indexed → no match. No wildcard for
+        // ExactAgg — every agg_type stands on its own.
+        let required = Capability::ExactAgg(AggregationType::Sum);
+        let indexed = Capability::ExactAgg(AggregationType::MinMax);
+        assert!(!required.is_satisfied_by(&indexed));
+    }
+
+    #[test]
+    fn is_satisfied_by_exact_agg_does_not_match_other_families() {
+        // ExactAgg is its own family — no cross-family satisfaction
+        // with QuantileApprox / CardinalityApprox / FrequencyEstimate /
+        // FrequencyTopk.
+        let required = Capability::ExactAgg(AggregationType::Sum);
+        assert!(!required
+            .is_satisfied_by(&Capability::QuantileApprox(SketchKindHandle::DDSketch)));
+        assert!(!required.is_satisfied_by(&Capability::CardinalityApprox));
+        assert!(!required
+            .is_satisfied_by(&Capability::FrequencyEstimate(SketchKindHandle::CountMin)));
+        assert!(!required
+            .is_satisfied_by(&Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)));
+
+        // And the reverse — a sketch-family required capability must
+        // not match an ExactAgg-backed sid.
+        let sketch_required = Capability::QuantileApprox(SketchKindHandle::Any);
+        let exact_indexed = Capability::ExactAgg(AggregationType::DatasketchesKLL);
+        assert!(!sketch_required.is_satisfied_by(&exact_indexed));
+    }
+
+    #[test]
+    fn exact_agg_covers_each_canonical_agg_type() {
+        // Spot-check the full AggregationType surface — each variant
+        // round-trips through Capability::ExactAgg without losing
+        // information. Documents the intended coverage of the new
+        // variant. If a future PR adds an AggregationType variant, this
+        // test (combined with the exhaustive match in `is_satisfied_by`'s
+        // `req == have` form) will not require code changes — equality
+        // is structural.
+        let cases = [
+            AggregationType::Sum,
+            AggregationType::Increase,
+            AggregationType::MinMax,
+            AggregationType::DatasketchesKLL,
+            AggregationType::MultipleSum,
+            AggregationType::MultipleIncrease,
+            AggregationType::MultipleMinMax,
+            AggregationType::HydraKLL,
+            AggregationType::CountMinSketch,
+            AggregationType::CountMinSketchWithHeap,
+            AggregationType::CountSketch,
+            AggregationType::SetAggregator,
+            AggregationType::DeltaSetAggregator,
+            AggregationType::HLL,
+            AggregationType::DDSketch,
+        ];
+        for t in cases {
+            let cap = Capability::ExactAgg(t);
+            assert!(
+                cap.is_satisfied_by(&Capability::ExactAgg(t)),
+                "ExactAgg({t:?}) should satisfy itself"
+            );
+        }
+    }
+
+    // ── capability_for: ExactAgg dormancy ────────────────────────────────
+
+    #[test]
+    fn capability_for_sum_still_returns_none_after_exact_agg_landing() {
+        // PR 6 explicitly does NOT change `capability_for` for the
+        // intents that today return `None` (Sum / Min / Max / Avg /
+        // Rate / Increase / archive-only). The `Capability::ExactAgg`
+        // variant is wired into `is_satisfied_by` but the analyzer's
+        // intent → capability bridge stays as it was — re-routing
+        // those intents to warm-tier ExactAgg is a follow-up that
+        // requires populating `SketchInstanceMetadata.capability` with
+        // `Some(Capability::ExactAgg(_))` for the ExactAgg-backed sids
+        // first.
+        assert_eq!(capability_for(&AggIntent::Sum), None);
+        // Min / Max are intentionally NOT in this dormancy list — they
+        // already route to QuantileApprox (DDSketch / KLL answer them
+        // via quantile(0) / quantile(1)) and that path is unchanged.
     }
 
     #[test]

@@ -859,6 +859,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "promql-parser 0.8.0",
+ "promql_utilities",
  "prost",
  "prost-build",
  "reqwest 0.12.28",
