@@ -673,6 +673,117 @@ impl SketchIndex {
             .collect()
     }
 
+    /// Phase 5 M2.3.5 — query the precompute payloads across every sid
+    /// belonging to one `AggregationConfig` (identified by `metric` +
+    /// `agg_cfg.aggregation_type`), shaped as the legacy `Store`
+    /// trait's `TimestampedBucketsMap`. Lets the query engine swap
+    /// `Store::query_precomputed_output` for `SketchIndex` without
+    /// reshaping its consumer code in the same PR.
+    ///
+    /// `start_unix_ms`, `end_unix_ms` are inclusive window bounds —
+    /// rows whose `(start, end)` falls within the range are returned.
+    ///
+    /// Iterates the `instances` map once. Cheap for the registry sizes
+    /// the production deployment runs at; if instance counts grow into
+    /// the millions, replace with an `agg_id → Vec<sid>` secondary
+    /// index.
+    pub fn query_precomputes_by_agg(
+        &self,
+        metric: &str,
+        agg_type: AggregationType,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> std::collections::HashMap<
+        Option<crate::stores::types::KeyByLabelValues>,
+        Vec<((u64, u64), Arc<dyn crate::stores::types::AggregateCore>)>,
+    > {
+        let mut out: std::collections::HashMap<
+            Option<crate::stores::types::KeyByLabelValues>,
+            Vec<((u64, u64), Arc<dyn crate::stores::types::AggregateCore>)>,
+        > = std::collections::HashMap::new();
+
+        // Pick the sids whose metadata describes this (metric,
+        // agg_type) tuple. We don't gate on `group_by_keys` here —
+        // the engine's query-side filtering (label matchers) handles
+        // that. Returning the superset is correct; over-returning is
+        // just a perf cost the engine already absorbs.
+        let candidate_sids: Vec<u64> = {
+            let g = self.instances.read().unwrap();
+            g.iter()
+                .filter(|(_, m)| {
+                    if m.metric_name != metric {
+                        return false;
+                    }
+                    matches!(
+                        &m.agg_kind,
+                        AggKind::Precompute { agg_type: t, .. } if *t == agg_type
+                    )
+                })
+                .map(|(sid, _)| *sid)
+                .collect()
+        };
+
+        for sid in candidate_sids {
+            let store = match self.series.get(&sid) {
+                Some(s) => s.clone(),
+                None => continue,
+            };
+            let guard = store.write().unwrap();
+            let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+            guard
+                .current_epoch
+                .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            for (win, label_id, payload) in &buf {
+                if let Some(p) = payload.as_precompute() {
+                    let label_values_map = guard
+                        .intern
+                        .resolve(*label_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let key = if label_values_map.is_empty() {
+                        None
+                    } else {
+                        Some(crate::stores::types::KeyByLabelValues {
+                            labels: label_values_map.values().cloned().collect(),
+                        })
+                    };
+                    out.entry(key).or_default().push((
+                        *win,
+                        Arc::from(p.clone_boxed_core()),
+                    ));
+                }
+            }
+            buf.clear();
+
+            for sealed in guard.sealed_epochs.values() {
+                sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+                for (win, label_id, payload) in &buf {
+                    if let Some(p) = payload.as_precompute() {
+                        let label_values_map = guard
+                            .intern
+                            .resolve(*label_id)
+                            .cloned()
+                            .unwrap_or_default();
+                        let key = if label_values_map.is_empty() {
+                            None
+                        } else {
+                            Some(crate::stores::types::KeyByLabelValues {
+                                labels: label_values_map.values().cloned().collect(),
+                            })
+                        };
+                        out.entry(key).or_default().push((
+                            *win,
+                            Arc::from(p.clone_boxed_core()),
+                        ));
+                    }
+                }
+                buf.clear();
+            }
+        }
+
+        out
+    }
+
     /// Find every registered sid whose instance matches `metric_name` and
     /// whose `group_by_keys` is a superset of (or equal to) the user's
     /// requested label-key set. Phase 5 query path uses this to pick
@@ -1160,6 +1271,71 @@ mod tests {
             "precompute payloads must not surface as sketch results"
         );
         assert_eq!(idx.classify(42), SidLookup::Hit, "storage has data — Hit");
+    }
+
+    #[test]
+    fn query_precomputes_by_agg_returns_data_grouped_by_label_values() {
+        use crate::precompute_engine::operators::SumAccumulator;
+
+        let idx = SketchIndex::new();
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
+        let _ = cfg;
+        let mut precompute_meta = meta(99);
+        precompute_meta.metric_name = "cpu_seconds".into();
+        precompute_meta.capability = None;
+        precompute_meta.accuracy = None;
+        precompute_meta.agg_kind = AggKind::Precompute {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+        };
+        idx.register(precompute_meta);
+
+        // Two writes under sid=99 with the same label_values + different
+        // windows — they should collapse into the same group_key on
+        // the way out.
+        let mut lv = BTreeMap::new();
+        lv.insert("zone".to_string(), "z0".to_string());
+        idx.append_precompute(
+            99,
+            lv.clone(),
+            (1000, 2000),
+            Box::new(SumAccumulator::with_sum(1.0)),
+        );
+        idx.append_precompute(
+            99,
+            lv,
+            (2000, 3000),
+            Box::new(SumAccumulator::with_sum(2.0)),
+        );
+
+        let result = idx.query_precomputes_by_agg(
+            "cpu_seconds",
+            AggregationType::Sum,
+            0,
+            10_000,
+        );
+        assert_eq!(result.len(), 1, "one label-values key");
+        let buckets = result.values().next().expect("populated");
+        assert_eq!(buckets.len(), 2, "two windows for that key");
+    }
+
+    #[test]
+    fn query_precomputes_by_agg_skips_sketch_payloads() {
+        let idx = SketchIndex::new();
+        // A SKETCH sid for the same metric — must not show up in the
+        // precompute query path.
+        idx.register(meta(7));
+        idx.append_sample(7, BTreeMap::new(), (1000, 2000), sample(1));
+
+        let result = idx.query_precomputes_by_agg(
+            "m",
+            AggregationType::Sum,
+            0,
+            10_000,
+        );
+        assert!(result.is_empty(), "sketch sids must not surface");
     }
 
     #[test]
