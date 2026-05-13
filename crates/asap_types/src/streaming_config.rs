@@ -110,7 +110,10 @@ impl StreamingConfig {
                     num_aggregates_to_retain,
                     QueryLanguage::promql,
                 )?;
-                aggregation_configs.insert(config.aggregation_id, config);
+                // PR 5: the map key IS the policy-fingerprint u64.
+                // `AggregationConfig::aggregation_id()` is the canonical
+                // accessor for this value.
+                aggregation_configs.insert(config.aggregation_id(), config);
             }
         }
 
@@ -164,10 +167,10 @@ mod tests {
         assert_eq!(cfg.storage_backend(), StorageBackend::GorillaObjectStore);
     }
 
-    /// M2 follow-up: a streaming-config YAML that omits `aggregationId`
-    /// on every aggregation parses correctly — backend derives the id
-    /// from the agg-config content. This is the path the controller
-    /// will use once it stops emitting the field.
+    /// PR 5: a streaming-config YAML that omits `aggregationId`
+    /// parses correctly — the backend derives identity from content
+    /// via `PolicyFingerprint::from_config`. The map key is the
+    /// fingerprint's u64 form.
     #[test]
     fn from_yaml_data_accepts_entry_without_aggregation_id() {
         let yaml = "\
@@ -178,7 +181,28 @@ aggregations:\n\
         assert_eq!(cfg.aggregation_configs.len(), 1);
         let (k, v) = cfg.aggregation_configs.iter().next().unwrap();
         assert_ne!(*k, 0, "derived id is not the 0 sentinel");
-        assert_eq!(*k, v.aggregation_id, "map key matches the agg's id");
+        assert_eq!(*k, v.aggregation_id(), "map key equals fingerprint u64");
         assert_eq!(v.metric, "cpu_seconds");
+    }
+
+    /// PR 5: a streaming-config YAML that still spells out
+    /// `aggregationId: N` parses the SAME as one without — the field
+    /// is silently dropped.
+    #[test]
+    fn from_yaml_data_ignores_explicit_aggregation_id() {
+        let with = "\
+aggregations:\n\
+- aggregationId: 42\n  aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
+        let without = "\
+aggregations:\n\
+- aggregationType: DDSketch\n  aggregationSubType: ''\n  metric: cpu_seconds\n  labels:\n    grouping: [host]\n    rollup: []\n    aggregated: []\n  parameters:\n    relative_accuracy: 0.01\n  windowSize: 30\n  windowType: tumbling\n  spatialFilter: ''\n";
+        let w: Value = serde_yaml::from_str(with).expect("with yaml ok");
+        let wo: Value = serde_yaml::from_str(without).expect("without yaml ok");
+        let cw = StreamingConfig::from_yaml_data(&w).expect("with");
+        let cwo = StreamingConfig::from_yaml_data(&wo).expect("without");
+        let (kw, _) = cw.aggregation_configs.iter().next().unwrap();
+        let (kwo, _) = cwo.aggregation_configs.iter().next().unwrap();
+        assert_eq!(kw, kwo, "explicit aggregationId in YAML must not change identity");
+        assert_ne!(*kw, 42, "the explicit value must NOT leak through as the map key");
     }
 }

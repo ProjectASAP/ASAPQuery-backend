@@ -72,13 +72,13 @@ struct MockControlPlaneState {
 /// it receives the miss. Shape matches the backend's
 /// `StreamingConfig::from_yaml_data` parser (see
 /// `asap-query-engine/examples/promql/streaming_config.yaml`).
-/// The `aggregationId` here is what the test asserts shows up on
-/// the backend after the loop closes.
-fn canned_plan_yaml(agg_id: u64, metric: &str) -> String {
+///
+/// PR 5: `aggregationId` is silently dropped on read; the test derives
+/// the expected fingerprint from the YAML's content.
+fn canned_plan_yaml(_agg_id: u64, metric: &str) -> String {
     format!(
         "aggregations:
-- aggregationId: {agg_id}
-  aggregationType: Sum
+- aggregationType: Sum
   aggregationSubType: ''
   labels:
     grouping: []
@@ -91,6 +91,20 @@ fn canned_plan_yaml(agg_id: u64, metric: &str) -> String {
   spatialFilter: ''
 "
     )
+}
+
+/// Compute the policy-fingerprint u64 the backend will derive when it
+/// parses [`canned_plan_yaml`] with the given `metric`. Lets the e2e
+/// test assert the exact id without coupling to the fingerprint algo.
+fn expected_fp_for(metric: &str) -> u64 {
+    let yaml = canned_plan_yaml(0, metric);
+    let data: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml parses");
+    let sc = asap_types::streaming_config::StreamingConfig::from_yaml_data(&data)
+        .expect("yaml decodes");
+    *sc.aggregation_configs
+        .keys()
+        .next()
+        .expect("one agg in the canned plan")
 }
 
 async fn mock_control_plane_plan_handler(
@@ -241,7 +255,9 @@ async fn spin_up_loop(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_capability_miss_feedback_loop_closes_over_http() {
     let metric = "http_e2e_metric";
-    let expected_agg_id: u64 = 4242;
+    // PR 5: the on-the-wire agg_id is the policy fingerprint of the
+    // canned plan's content; derive it here so the assertions match.
+    let expected_agg_id: u64 = expected_fp_for(metric);
 
     let (backend_url, control_plane_state, _hot_reload) = spin_up_loop(metric, expected_agg_id).await;
     let client = Client::new();

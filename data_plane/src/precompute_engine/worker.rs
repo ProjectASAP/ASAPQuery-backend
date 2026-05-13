@@ -1098,7 +1098,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     fn make_agg_config_full(
-        id: u64,
+        _id: u64,
         metric: &str,
         agg_type: AggregationType,
         agg_sub_type: &str,
@@ -1107,13 +1107,16 @@ mod tests {
         grouping: Vec<&str>,
         aggregated: Vec<&str>,
     ) -> AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed
+        // via `PolicyFingerprint::from_config`. Callers below build the
+        // streaming-config map by reading `config.aggregation_id()`
+        // from the returned value.
         let window_type = if slide_secs == 0 || slide_secs == window_secs {
             WindowType::Tumbling
         } else {
             WindowType::Sliding
         };
         AggregationConfig::new(
-            id,
             agg_type,
             agg_sub_type.to_string(),
             HashMap::new(),
@@ -1742,8 +1745,7 @@ mod tests {
     fn test_worker_from_streaming_config_yaml() {
         let yaml = r#"
 aggregations:
-- aggregationId: 10
-  aggregationType: SingleSubpopulation
+- aggregationType: SingleSubpopulation
   aggregationSubType: Sum
   labels:
     grouping: []
@@ -1762,32 +1764,38 @@ aggregations:
         let streaming_config =
             StreamingConfig::from_yaml_data(&data).expect("valid streaming config");
 
-        assert!(streaming_config.contains(10));
+        // PR 5: the streaming-config key is the policy fingerprint.
+        let agg_id = *streaming_config
+            .get_all_aggregation_configs()
+            .keys()
+            .next()
+            .expect("one agg");
+        assert!(streaming_config.contains(agg_id));
 
         let agg_configs = streaming_config.get_all_aggregation_configs().clone();
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         worker
-            .process_group_samples(10, "", group_samples("requests_total", vec![(1_000, 3.0)]))
+            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(1_000, 3.0)]))
             .unwrap();
         worker
-            .process_group_samples(10, "", group_samples("requests_total", vec![(5_000, 4.0)]))
+            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(5_000, 4.0)]))
             .unwrap();
         worker
-            .process_group_samples(10, "", group_samples("requests_total", vec![(9_000, 5.0)]))
+            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(9_000, 5.0)]))
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         worker
-            .process_group_samples(10, "", group_samples("requests_total", vec![(10_000, 0.0)]))
+            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(10_000, 0.0)]))
             .unwrap();
 
         let captured = sink.drain();
         assert_eq!(captured.len(), 1);
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 10);
+        assert_eq!(output.aggregation_id, agg_id);
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 10_000);
 
@@ -1805,7 +1813,6 @@ aggregations:
     #[test]
     fn test_extract_key_from_series() {
         let config = AggregationConfig::new(
-            1,
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),

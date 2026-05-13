@@ -214,9 +214,11 @@ mod tests {
     use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap;
 
-    fn sum_agg_config(id: u64, metric: &str, grouping_keys: &[&str]) -> AggregationConfig {
+    fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> AggregationConfig {
+        // `_id` is unused after PR 5 — identity is content-addressed
+        // via `PolicyFingerprint::from_config`. Callers obtain the id
+        // via `config.aggregation_id()`.
         AggregationConfig {
-            aggregation_id: id,
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
@@ -240,8 +242,8 @@ mod tests {
 
     #[test]
     fn sketch_index_sink_writes_to_index() {
-        let agg_id = 7;
-        let cfg = sum_agg_config(agg_id, "cpu_seconds", &["zone"]);
+        let cfg = sum_agg_config(7, "cpu_seconds", &["zone"]);
+        let agg_id = cfg.aggregation_id();
         let mut configs = HashMap::new();
         configs.insert(agg_id, cfg);
         let streaming = StreamingConfig::new(configs);

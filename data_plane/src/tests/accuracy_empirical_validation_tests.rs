@@ -37,7 +37,6 @@ use crate::storage_engines::sketch_db::accuracy::{AccuracyKind, AccuracyProfile}
 
 fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
     AggregationConfig::new(
-        1,
         agg_type,
         String::new(),
         params,

@@ -145,7 +145,6 @@ mod tests {
 
     fn dummy_agg(id: u64) -> AggregationConfig {
         AggregationConfig::new(
-            id,
             AggregationType::Sum,
             String::new(),
             HashMap::new(),
@@ -164,55 +163,71 @@ mod tests {
         )
     }
 
-    fn cfg_with_ids(ids: &[u64]) -> StreamingConfig {
+    /// Build a StreamingConfig from a list of marker `id`s. After PR 5
+    /// the map key IS the policy fingerprint, derived from
+    /// `metric_{id}`. We return both the config and the
+    /// dummy-id→fingerprint mapping so the assertions below can look
+    /// up entries.
+    fn cfg_with_ids(ids: &[u64]) -> (StreamingConfig, std::collections::HashMap<u64, u64>) {
         let mut map = HashMap::new();
+        let mut id_to_fp = std::collections::HashMap::new();
         for &id in ids {
-            map.insert(id, dummy_agg(id));
+            let cfg = dummy_agg(id);
+            let fp = cfg.aggregation_id();
+            id_to_fp.insert(id, fp);
+            map.insert(fp, cfg);
         }
-        StreamingConfig::new(map)
+        (StreamingConfig::new(map), id_to_fp)
     }
 
     #[test]
     fn snapshot_reflects_initial_config() {
-        let hr = HotReloadStreamingConfig::new(cfg_with_ids(&[1, 2, 3]));
+        let (cfg, id_to_fp) = cfg_with_ids(&[1, 2, 3]);
+        let hr = HotReloadStreamingConfig::new(cfg);
         let snap = hr.snapshot();
         assert_eq!(snap.aggregation_configs.len(), 3);
-        assert!(snap.aggregation_configs.contains_key(&2));
+        assert!(snap.aggregation_configs.contains_key(&id_to_fp[&2]));
     }
 
     #[test]
     fn swap_replaces_config_atomically() {
-        let hr = HotReloadStreamingConfig::new(cfg_with_ids(&[1, 2]));
-        let old = hr.swap(cfg_with_ids(&[3, 4, 5]));
+        let (cfg1, id_to_fp1) = cfg_with_ids(&[1, 2]);
+        let (cfg2, id_to_fp2) = cfg_with_ids(&[3, 4, 5]);
+        let hr = HotReloadStreamingConfig::new(cfg1);
+        let old = hr.swap(cfg2);
         // Old snapshot still reflects pre-swap contents.
         assert_eq!(old.aggregation_configs.len(), 2);
-        assert!(old.aggregation_configs.contains_key(&1));
+        assert!(old.aggregation_configs.contains_key(&id_to_fp1[&1]));
         // New snapshot reflects post-swap contents.
         let new_snap = hr.snapshot();
         assert_eq!(new_snap.aggregation_configs.len(), 3);
-        assert!(new_snap.aggregation_configs.contains_key(&5));
-        assert!(!new_snap.aggregation_configs.contains_key(&1));
+        assert!(new_snap.aggregation_configs.contains_key(&id_to_fp2[&5]));
+        assert!(!new_snap.aggregation_configs.contains_key(&id_to_fp1[&1]));
     }
 
     #[test]
     fn clones_share_underlying_swap() {
-        let hr = HotReloadStreamingConfig::new(cfg_with_ids(&[1]));
+        let (cfg1, _) = cfg_with_ids(&[1]);
+        let (cfg2, id_to_fp2) = cfg_with_ids(&[2, 3]);
+        let hr = HotReloadStreamingConfig::new(cfg1);
         let hr_clone = hr.clone();
-        hr.swap(cfg_with_ids(&[2, 3]));
+        hr.swap(cfg2);
         // The clone sees the swap because both handles share the
         // same ArcSwap inside.
         let snap = hr_clone.snapshot();
         assert_eq!(snap.aggregation_configs.len(), 2);
-        assert!(snap.aggregation_configs.contains_key(&3));
+        assert!(snap.aggregation_configs.contains_key(&id_to_fp2[&3]));
     }
 
     #[test]
     fn concurrent_readers_see_consistent_snapshot() {
-        let hr = HotReloadStreamingConfig::new(cfg_with_ids(&[1, 2]));
+        let (cfg1, _) = cfg_with_ids(&[1, 2]);
+        let hr = HotReloadStreamingConfig::new(cfg1);
         let hr_writer = hr.clone();
         let writer = thread::spawn(move || {
             for i in 0..50 {
-                hr_writer.swap(cfg_with_ids(&[i, i + 1, i + 2]));
+                let (c, _) = cfg_with_ids(&[i, i + 1, i + 2]);
+                hr_writer.swap(c);
             }
         });
         let hr_reader = hr.clone();

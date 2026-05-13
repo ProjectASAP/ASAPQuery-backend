@@ -1911,17 +1911,16 @@ aggregations:
         );
         assert_eq!(post_body["status"], "success");
         assert_eq!(post_body["new_aggregation_count"], 2);
+        // PR 5: the YAML's `aggregationId` fields are silently
+        // dropped — `agg_ids_added` carries fingerprint u64s.
         let added = post_body["agg_ids_added"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap())
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(
-            added,
-            std::collections::HashSet::from([101u64, 102u64]),
-            "expected both ids in added set"
-        );
+        assert_eq!(added.len(), 2, "exactly two distinct aggs were added");
+        assert!(added.iter().all(|id| *id != 0), "fingerprints are non-zero");
 
         // GET again: should reflect the two new ids.
         let after = client
@@ -1938,11 +1937,10 @@ aggregations:
         // The underlying HotReloadStreamingConfig handle (cloned into
         // the server at setup) also reflects the swap — proving that
         // downstream consumers that re-snapshot would see the new
-        // state.
+        // state. PR 5: the map is keyed on fingerprints, so just
+        // assert the entry count.
         let direct_snap = hot_reload.snapshot();
         assert_eq!(direct_snap.aggregation_configs.len(), 2);
-        assert!(direct_snap.aggregation_configs.contains_key(&101));
-        assert!(direct_snap.aggregation_configs.contains_key(&102));
     }
 
     #[tokio::test]
@@ -2178,14 +2176,19 @@ aggregations:
         // / `agg_ids_removed` / `new_aggregation_count` fields are
         // driven purely by the diff of the two configs and are
         // independent of the sid catalog.
+        //
+        // PR 5: the YAML's `aggregationId: 42` is silently dropped at
+        // parse time — the backend identity is content-addressed via
+        // `PolicyFingerprint::from_config`. The `agg_ids_added` u64
+        // in the HTTP response is the fingerprint's `as_u64()` form,
+        // NOT the literal `42` the YAML once spelled out.
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
 
         let yaml = r#"
 aggregations:
-  - aggregationId: 42
-    aggregationType: Sum
+  - aggregationType: Sum
     aggregationSubType: ''
     metric: m
     labels:
@@ -2210,7 +2213,9 @@ aggregations:
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
         assert_eq!(body["new_aggregation_count"], 1);
-        assert_eq!(body["agg_ids_added"], serde_json::json!([42]));
+        let added = body["agg_ids_added"].as_array().expect("array");
+        assert_eq!(added.len(), 1, "exactly one agg was added");
+        assert_ne!(added[0].as_u64().unwrap(), 0, "agg id is not the 0 sentinel");
         assert_eq!(body["agg_ids_removed"], serde_json::json!([]));
         // No pre-registered sids → nothing to retire.
         assert_eq!(body["sids_retired"].as_array().unwrap().len(), 0);
@@ -2436,28 +2441,30 @@ aggregations:
                     .unwrap()
             }
         };
-        let yaml = |id: u64| {
+        // PR 5: `aggregationId` is no longer wire-carried; identity is
+        // content-addressed. To produce two distinct configs we vary
+        // the window size — different content → different fingerprint.
+        let yaml = |window: u64| {
             format!(
                 r#"
 aggregations:
-  - aggregationId: {id}
-    aggregationType: Sum
+  - aggregationType: Sum
     aggregationSubType: ''
     metric: m
     labels: {{ grouping: [], rollup: [], aggregated: [] }}
     parameters: {{}}
-    windowSize: 60
+    windowSize: {window}
     windowType: tumbling
     spatialFilter: ''
 "#
             )
         };
-        assert!(post(&yaml(1)).await.status().is_success());
-        // Wait >1ms so the retire timestamp is strictly after agg 1's
-        // creation; otherwise agg 1's ownership interval is zero-width
-        // at ms resolution and timeline correctly skips it.
+        assert!(post(&yaml(60)).await.status().is_success());
+        // Wait >1ms so the retire timestamp is strictly after the
+        // first agg's creation; otherwise the ownership interval is
+        // zero-width at ms resolution and timeline correctly skips it.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        assert!(post(&yaml(2)).await.status().is_success());
+        assert!(post(&yaml(120)).await.status().is_success());
 
         // The ms range is effectively wall-clock; use [0, u64 far
         // future] to guarantee both segments fall in range.
@@ -2472,13 +2479,11 @@ aggregations:
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
         assert_eq!(body["metric"], "m");
-        // Two segments: retired agg 1 + active agg 2.
+        // Two segments: retired (window=60) + active (window=120).
         assert_eq!(body["count"], 2);
         let segs = body["segments"].as_array().unwrap();
-        assert_eq!(segs[0]["agg_id"], 1);
         assert_eq!(segs[0]["status"], "retired");
         assert_eq!(segs[0]["coverage"], "sketch");
-        assert_eq!(segs[1]["agg_id"], 2);
         assert_eq!(segs[1]["status"], "active");
     }
 
@@ -2555,10 +2560,28 @@ aggregations:
     /// `POST /api/v1/db/backfill` runs `create_checked`, which after
     /// the schema retirement final cut is expected to accept the sid
     /// catalog (sibling slice migrates `create_checked`'s signature).
+    ///
+    /// PR 5: `active_agg_ids` is now a list of test markers used to
+    /// build per-metric configs (`metric_{marker}`). The streaming
+    /// config is keyed on each config's policy fingerprint; the
+    /// returned vector lets callers translate marker→fingerprint so
+    /// HTTP POSTs target the right agg_id on the wire.
     async fn setup_test_server_with_backfill_and_sids(
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
         active_agg_ids: &[u64],
     ) -> u16 {
+        setup_test_server_with_backfill_and_sids_returning_fps(registry, active_agg_ids)
+            .await
+            .0
+    }
+
+    /// Same as `setup_test_server_with_backfill_and_sids` but also
+    /// returns the marker→fingerprint mapping so tests can compute
+    /// the fingerprint u64 they need to POST.
+    async fn setup_test_server_with_backfill_and_sids_returning_fps(
+        registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
+        active_agg_ids: &[u64],
+    ) -> (u16, std::collections::HashMap<u64, u64>) {
         use asap_types::aggregation_config::AggregationConfig;
         use asap_types::enums::{AggregationType, WindowType};
         use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -2576,10 +2599,10 @@ aggregations:
         // is registered via the canonical ingest path so its content
         // hash matches what `create_checked` would compute.
         let mut agg_map = HashMap::new();
-        for agg_id in active_agg_ids {
-            let metric = format!("metric_{agg_id}");
+        let mut marker_to_fp = std::collections::HashMap::new();
+        for marker in active_agg_ids {
+            let metric = format!("metric_{marker}");
             let cfg = AggregationConfig {
-                aggregation_id: *agg_id,
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),
@@ -2597,7 +2620,12 @@ aggregations:
                 table_name: None,
                 value_column: None,
             };
-            agg_map.insert(*agg_id, cfg);
+            // PR 5: streaming-config is keyed on the policy
+            // fingerprint. Build a marker→fingerprint map so the test
+            // POSTs the right id on the wire.
+            let fp = cfg.aggregation_id();
+            marker_to_fp.insert(*marker, fp);
+            agg_map.insert(fp, cfg);
         }
         let streaming_config = Arc::new(StreamingConfig::new(agg_map));
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config.clone());
@@ -2607,33 +2635,38 @@ aggregations:
         ));
         let sketch_index =
             Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-        for agg_id in active_agg_ids {
+        for marker in active_agg_ids {
+            let fp = marker_to_fp[marker];
             register_precompute_sid(
                 &sketch_index,
-                *agg_id,
-                &format!("metric_{agg_id}"),
+                fp,
+                &format!("metric_{marker}"),
                 &[],
             );
         }
         let server = HttpServer::new(config, query_engine, sketch_index)
             .with_backfill_registry(registry)
             .with_hot_reload_config(hot_reload);
-        server
+        let port = server
             .start_test_server()
             .await
-            .expect("Failed to start test server")
+            .expect("Failed to start test server");
+        (port, marker_to_fp)
     }
 
     #[tokio::test]
     async fn test_backfill_full_lifecycle_through_http() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
-        let server_port =
-            setup_test_server_with_backfill_and_sids(registry.clone(), &[42]).await;
+        let (server_port, marker_to_fp) =
+            setup_test_server_with_backfill_and_sids_returning_fps(registry.clone(), &[42]).await;
         let client = Client::new();
+        // PR 5: the streaming-config key is the policy fingerprint;
+        // POST the fingerprint, not the test marker.
+        let fp_42 = marker_to_fp[&42];
 
         // POST creates a Queued job.
         let req = serde_json::json!({
-            "agg_id": 42,
+            "agg_id": fp_42,
             "start_ms": 100,
             "end_ms": 500,
             "source": { "Prometheus": { "url": "http://prom.local" } },
@@ -2660,7 +2693,7 @@ aggregations:
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["job"]["status"], "queued");
-        assert_eq!(body["job"]["agg_id"], 42);
+        assert_eq!(body["job"]["agg_id"].as_u64().unwrap(), fp_42);
         assert_eq!(body["job"]["start_ms"], 100);
         assert_eq!(body["job"]["windows_total"], 4);
         assert_eq!(body["job"]["progress"], 0.0);
@@ -2851,7 +2884,8 @@ aggregations:
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         // Schema registered at `now` — any `end_ms` > created_at_ms
         // overlaps live ingest.
-        let server_port = setup_test_server_with_backfill_and_sids(registry, &[7]).await;
+        let (server_port, marker_to_fp) =
+            setup_test_server_with_backfill_and_sids_returning_fps(registry, &[7]).await;
         let client = Client::new();
         let future_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2859,7 +2893,7 @@ aggregations:
             .as_millis() as u64
             + 3_600_000;
         let req = serde_json::json!({
-            "agg_id": 7,
+            "agg_id": marker_to_fp[&7],
             "start_ms": 0,
             "end_ms": future_ms,
             "source": { "Prometheus": { "url": "http://prom.local" } },
