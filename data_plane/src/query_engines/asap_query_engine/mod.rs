@@ -10,7 +10,10 @@
 //! the JSONL leg has been deleted).
 
 pub mod engine;
-pub mod warm_tier;
+
+// Phase-5 reorg: warm-tier reducer moved to `sketch_db::query`. The
+// engine still consumes it via that canonical path.
+pub use crate::storage_engines::sketch_db::query as warm_tier;
 
 #[cfg(test)]
 pub mod tests;

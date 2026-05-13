@@ -34,6 +34,7 @@ pub mod data;
 pub mod index;
 pub mod metrics;
 pub mod persistence;
+pub mod query;
 pub mod schema;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
