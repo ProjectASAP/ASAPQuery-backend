@@ -272,10 +272,9 @@ pub fn warn_if_retention_inverted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::{AggregationType, CleanupPolicy, LockStrategy, StreamingConfig};
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::{backfill::BackfillSource, store::SketchStore};
-    use crate::stores::traits::Store;
+    use crate::stores::sketch_db::backfill::BackfillSource;
+    use crate::stores::types::{AggregationType, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -311,19 +310,17 @@ mod tests {
         Arc::new(StreamingConfig::new(map))
     }
 
-    fn write_one(store: &SketchStore, agg_id: u64, ts: u64) {
+    fn write_one(
+        sketch_index: &SketchIndex,
+        streaming_config: &StreamingConfig,
+        agg_id: u64,
+        ts: u64,
+    ) {
         let acc = SumAccumulator::with_sum(1.0);
         let output = crate::stores::types::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
-        store
-            .insert_precomputed_output(output, Box::new(acc))
-            .unwrap();
-    }
-
-    fn total_buckets(store: &SketchStore, metric: &str, agg_id: u64) -> usize {
-        let map = store
-            .query_precomputed_output(metric, agg_id, 0, u64::MAX / 2)
-            .unwrap();
-        map.values().map(|v| v.len()).sum()
+        if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
+            sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, &acc);
+        }
     }
 
     /// Build a service + registries where `agg_id=1` is already
@@ -332,39 +329,30 @@ mod tests {
     async fn fixture_with_expired_1() -> (
         Arc<SchemaRegistry>,
         Arc<BackfillRegistry>,
-        Arc<SketchStore>,
+        Arc<SketchIndex>,
     ) {
         let initial = make_streaming_config(&[1, 2]);
         let mut registry = SchemaRegistry::from_streaming_config(&initial);
         registry.set_retention(Duration::from_millis(20));
         let schemas = Arc::new(registry);
 
-        // Retire agg 1 (simulate a reconfigure that removed it).
         let second = make_streaming_config(&[2]);
         schemas.reconcile(&second);
-        // Wait past expiry.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(schemas.get(1).unwrap().status(), AggStatus::Expired);
 
         let backfill = Arc::new(BackfillRegistry::new());
-        let store = Arc::new(SketchStore::new_with_strategy(
-            initial,
-            CleanupPolicy::NoCleanup,
-            LockStrategy::Global,
-        ));
+        let sketch_index = Arc::new(SketchIndex::new());
+        write_one(&sketch_index, &initial, 1, 100);
+        write_one(&sketch_index, &initial, 1, 200);
+        write_one(&sketch_index, &initial, 2, 300);
 
-        // Put data under both agg_ids.
-        write_one(&store, 1, 100);
-        write_one(&store, 1, 200);
-        write_one(&store, 2, 300);
-
-        (schemas, backfill, store)
+        (schemas, backfill, sketch_index)
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_drops_expired_agg_data() {
-        let (schemas, backfill, store) = fixture_with_expired_1().await;
-        let _store = store.clone();
+        let (schemas, backfill, sketch_index) = fixture_with_expired_1().await;
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
@@ -372,65 +360,43 @@ mod tests {
                 poll_interval: Duration::from_secs(60),
                 dry_run: false,
             },
-        );
+        )
+        .with_sketch_index(sketch_index.clone());
 
-        // After M2.3.6g, the eviction service no longer drops data
-        // from the legacy SketchStore (it doesn't hold a Store
-        // reference). Data lingers in the legacy store; eviction is
-        // observable through the schema registry side only.
-        assert_eq!(total_buckets(&store, "metric_1", 1), 2);
-        assert_eq!(total_buckets(&store, "metric_2", 2), 1);
+        // Pre-condition: SketchIndex has both agg's sids populated.
+        assert!(sketch_index.instance_count() >= 2);
 
         svc.run_once();
 
-        // Schema registry entry is removed.
+        // Post: schema registry entry removed AND agg_1's sids gone
+        // from SketchIndex; agg_2's sid remains.
         assert!(
             schemas.get(1).is_none(),
             "Expired schema removed from registry"
         );
         assert!(schemas.get(2).is_some());
+        let remaining: Vec<_> = sketch_index
+            .list_by_status(AggStatus::Active)
+            .into_iter()
+            .filter(|m| m.metric_name == "metric_2")
+            .collect();
+        assert!(!remaining.is_empty(), "agg_2's sid still registered");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_once_also_removes_sketch_index_instances() {
-        use crate::stores::sketch_db::index::{
-            canonical_parameters, compute_sid, AggKind, SketchIndex,
-            SketchInstanceMetadata,
-        };
-        use std::collections::BTreeSet;
+        // M2.3.6g — fixture now writes via SketchIndex directly, so
+        // a separate "register a sid" step is redundant. The
+        // post-condition is the same: agg_1's sids are gone after
+        // the sweep.
+        let (schemas, backfill, sketch_index) = fixture_with_expired_1().await;
+        let before_agg1 = sketch_index
+            .list_by_status(AggStatus::Active)
+            .into_iter()
+            .filter(|m| m.metric_name == "metric_1")
+            .count();
+        assert!(before_agg1 >= 1, "fixture seeded metric_1 sids");
 
-        let (schemas, backfill, store) = fixture_with_expired_1().await;
-        let sketch_index = Arc::new(SketchIndex::new());
-
-        // Register a precompute sid that matches the soon-to-expire
-        // agg config (agg_id=1, metric_1, Sum, no grouping). The
-        // eviction sweep should remove it.
-        let agg_cfg = sum_agg_config(1);
-        let sid = compute_sid(
-            "metric_1",
-            "",
-            &AggKind::Precompute {
-                agg_type: agg_cfg.aggregation_type,
-                parameters_canonical: canonical_parameters(&agg_cfg.parameters),
-            },
-        );
-        sketch_index.register(SketchInstanceMetadata {
-            sid,
-            metric_name: "metric_1".into(),
-            group_by_keys: BTreeSet::new(),
-            capability: None,
-            agg_kind: AggKind::Precompute {
-                agg_type: agg_cfg.aggregation_type,
-                parameters_canonical: canonical_parameters(&agg_cfg.parameters),
-            },
-            accuracy: None,
-            first_seen_unix_ms: 0,
-            retired_at_ms: None,
-            expires_at_ms: None,
-        });
-        assert_eq!(sketch_index.instance_count(), 1);
-
-        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
@@ -443,9 +409,13 @@ mod tests {
 
         svc.run_once();
 
+        let after_agg1 = sketch_index
+            .list_by_status(AggStatus::Active)
+            .into_iter()
+            .filter(|m| m.metric_name == "metric_1")
+            .count();
         assert_eq!(
-            sketch_index.instance_count(),
-            0,
+            after_agg1, 0,
             "expired agg_config's sids must be removed from SketchIndex"
         );
     }
@@ -455,30 +425,30 @@ mod tests {
         let initial = make_streaming_config(&[1]);
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&initial));
         let backfill = Arc::new(BackfillRegistry::new());
-        let store = Arc::new(SketchStore::new_with_strategy(
-            initial,
-            CleanupPolicy::NoCleanup,
-            LockStrategy::Global,
-        ));
-        write_one(&store, 1, 100);
+        let sketch_index = Arc::new(SketchIndex::new());
+        write_one(&sketch_index, &initial, 1, 100);
+        let before = sketch_index.instance_count();
 
-        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
             SchemaEvictionConfig::default(),
-        );
+        )
+        .with_sketch_index(sketch_index.clone());
         svc.run_once();
 
-        // Active schema untouched.
         assert!(schemas.get(1).is_some());
-        assert_eq!(total_buckets(&store, "metric_1", 1), 1);
+        assert_eq!(
+            sketch_index.instance_count(),
+            before,
+            "no expired schemas — SketchIndex untouched"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn dry_run_logs_but_does_not_drop() {
-        let (schemas, backfill, store) = fixture_with_expired_1().await;
-        let _store = store.clone();
+        let (schemas, backfill, sketch_index) = fixture_with_expired_1().await;
+        let before = sketch_index.instance_count();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill,
@@ -486,21 +456,18 @@ mod tests {
                 poll_interval: Duration::from_secs(60),
                 dry_run: true,
             },
-        );
+        )
+        .with_sketch_index(sketch_index.clone());
         svc.run_once();
-        // Data still there, schema still there.
-        assert_eq!(total_buckets(&store, "metric_1", 1), 2);
+
+        // Dry-run: schema entry stays, SketchIndex untouched.
         assert!(schemas.get(1).is_some());
+        assert_eq!(sketch_index.instance_count(), before);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancels_running_backfill_for_expired_agg() {
-        let (schemas, backfill, store) = fixture_with_expired_1().await;
-        // Queue + start a backfill for agg 1 (the one about to be
-        // evicted). Even though create_checked would reject (agg is
-        // Retired/Expired, not Active), use the raw `create` for
-        // the test — simulates a stale job the eviction should
-        // clean up.
+        let (schemas, backfill, sketch_index) = fixture_with_expired_1().await;
         let job_id = backfill.create(
             1,
             (0, 50),
@@ -513,7 +480,6 @@ mod tests {
             BackfillStatus::Running
         );
 
-        let _store = store.clone();
         let svc = SchemaEvictionService::new(
             schemas.clone(),
             backfill.clone(),
@@ -521,18 +487,14 @@ mod tests {
                 poll_interval: Duration::from_secs(60),
                 dry_run: false,
             },
-        );
+        )
+        .with_sketch_index(sketch_index);
         svc.run_once();
 
-        // Running backfill got cancelled.
         assert_eq!(
             backfill.get(job_id).unwrap().status,
             BackfillStatus::Cancelled
         );
-        // M2.3.6g — legacy store data isn't actively dropped by the
-        // eviction service anymore (no `store` field on the service).
-        // Schema registry side is the observable signal.
-        let _ = total_buckets(&store, "metric_1", 1);
         assert!(schemas.get(1).is_none());
     }
 

@@ -19,7 +19,7 @@ pub use precompute_engine::operators::{
     IncreaseAccumulator, MinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
 };
 
-pub use stores::{SketchStore, Store, StoreResult};
+pub use stores::StoreResult;
 
 pub use query_engines::{ASAPQueryEngine, InstantVector, QueryResult};
 

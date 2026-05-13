@@ -71,7 +71,6 @@ use tracing::{debug, warn};
 
 use crate::stores::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::stores::traits::Store;
 use asap_types::aggregation_config::AggregationConfig;
 
 use super::BackfillRegistry;
@@ -273,7 +272,6 @@ mod tests {
     use crate::stores::sketch_db::backfill::BackfillSource;
     use crate::stores::sketch_db::backfill::worker::BackfillWorker;
     use crate::stores::sketch_db::backfill::raw_sample_reader::{LabelFilter, MockRawSampleReader};
-    use crate::stores::sketch_db::store::SketchStore;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;
@@ -316,10 +314,6 @@ mod tests {
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
-            streaming.clone(),
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -329,7 +323,7 @@ mod tests {
         );
 
         let processor =
-            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
+            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
 
         // Two services → two groups → expect two PrecomputedOutput
         // entries for window (0, 100).
@@ -366,10 +360,6 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
-            streaming.clone(),
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             999,
@@ -377,7 +367,6 @@ mod tests {
             BackfillSource::Prometheus { url: "x".into() },
             1,
         );
-        let _store = store;
         let processor = BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
         // agg_id=999 isn't in the StreamingConfig.
         let err = processor
@@ -394,10 +383,6 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
-            streaming.clone(),
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -406,7 +391,7 @@ mod tests {
             1,
         );
         let processor =
-            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
+            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
         processor.process_window(1, (0, 10), vec![]).await.unwrap();
         // Empty window: no provenance record (nothing was written).
         assert!(registry.windows_written_by(job_id).is_empty());
@@ -420,10 +405,6 @@ mod tests {
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-        let store: Arc<dyn Store> = Arc::new(SketchStore::new(
-            streaming.clone(),
-            crate::stores::types::CleanupPolicy::NoCleanup,
-        ));
         let registry = Arc::new(BackfillRegistry::new());
         let job_id = registry.create(
             1,
@@ -456,7 +437,7 @@ mod tests {
         ]);
 
         let processor =
-            { let _store = store.clone(); BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id) };
+            BackfillWindowProcessor::new(hot, schemas, registry.clone(), job_id);
         let worker = BackfillWorker::new(registry.clone());
         worker
             .run_job(
@@ -483,10 +464,8 @@ mod tests {
         assert_eq!(written[2], (1, (20, 30)));
         assert_eq!(written[3], (1, (30, 40)));
 
-        // Verify the store now has 4 precomputes. Hard to test
-        // exactly without digging into the store API — smoke test
-        // that the worker didn't fail mid-run is sufficient here.
-        let _ = store; // keep in scope
+        // Smoke test: the worker didn't fail mid-run. Window
+        // assertions above are sufficient.
     }
 
     /// ## The parity test (§10.5 determinism invariant)

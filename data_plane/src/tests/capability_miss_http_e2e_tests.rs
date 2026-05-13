@@ -38,12 +38,11 @@
 
 #[cfg(test)]
 use crate::stores::types::{
-    CleanupPolicy, HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
+    HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::controller_client::{ControllerClient, HttpControllerClient};
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::store::SketchStore;
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -149,11 +148,7 @@ async fn start_mock_controller(state: MockControllerState) -> u16 {
 }
 
 async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingConfig) -> u16 {
-    let streaming_config = hot_reload.snapshot();
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
+    let _streaming_config = hot_reload.snapshot();
     let engine = Arc::new(
         ASAPQueryEngine::new_with_hot_reload(
             hot_reload.clone(),
@@ -175,7 +170,6 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
         port: 0,
         handle_http_requests: true,
         adapter_config};
-    let _store = store;
     let idx = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
     let server = HttpServer::new(config, engine, idx).with_hot_reload_config(hot_reload.clone());
     server

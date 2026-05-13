@@ -3,7 +3,7 @@ use crate::query_engines::query_result::{InstantVectorElement, QueryResult, Rang
 // use crate::stores::promsketch_store::{
 //     self, is_usampling_function, metrics as ps_metrics, PromSketchStore,
 // };
-use crate::stores::{Store, TimestampedBucketsMap};
+use crate::stores::TimestampedBucketsMap;
 use core::panic;
 use promql_utilities::get_is_collapsable;
 use promql_utilities::query_logics::enums::{AggregationOperator, AggregationType, PromQLFunction};
@@ -4487,7 +4487,7 @@ mod sketch_query_tests {
     // use crate::stores::types::{CleanupPolicy, StreamingConfig};
     // use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     // use crate::stores::promsketch_store::PromSketchStore;
-    // use crate::stores::{Store, TimestampedBucketsMap};
+    // use crate::stores::TimestampedBucketsMap;
     // use std::collections::HashMap;
     // use std::sync::Arc;
 
@@ -4730,7 +4730,6 @@ mod hot_reload_phase2_tests {
     use crate::stores::types::{
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
-    use crate::stores::sketch_db::store::SketchStore;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
     fn dummy_agg(id: u64, metric: &str) -> crate::stores::types::AggregationConfig {
@@ -4761,11 +4760,7 @@ mod hot_reload_phase2_tests {
     }
 
     fn build_engine(handle: HotReloadStreamingConfig) -> ASAPQueryEngine {
-        let streaming_config = Arc::new(StreamingConfig::default());
-        let _store = Arc::new(SketchStore::new(
-            streaming_config,
-            CleanupPolicy::NoCleanup,
-        ));
+        let _ = Arc::new(StreamingConfig::default());
         ASAPQueryEngine::new_with_hot_reload(handle, 15000)
     }
 
@@ -4825,11 +4820,6 @@ mod hot_reload_phase2_tests {
         let external_handle = HotReloadStreamingConfig::new(cfg_with_agg(101, "metric_a"));
         let streaming_config = external_handle.snapshot();
 
-        let store = Arc::new(SketchStore::new(
-            Arc::clone(&streaming_config),
-            CleanupPolicy::NoCleanup,
-        ));
-        let _store = store;
         let engine = ASAPQueryEngine::new(streaming_config, 15000);
 
         // External swap should NOT be visible inside the engine — the
@@ -4875,7 +4865,6 @@ mod e2e_feedback_loop_tests {
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
     use crate::drivers::query::controller_client::ControllerClient;
-    use crate::stores::sketch_db::store::SketchStore;
     use async_trait::async_trait;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use promql_utilities::query_logics::enums::Statistic;
@@ -5009,11 +4998,6 @@ mod e2e_feedback_loop_tests {
         }));
 
         // 3. Build ASAPQueryEngine with the handle and mock controller.
-        let store = Arc::new(SketchStore::new(
-            Arc::new(StreamingConfig::default()),
-            CleanupPolicy::NoCleanup,
-        ));
-        let _store = store;
         let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
         .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
 
@@ -5121,11 +5105,6 @@ mod e2e_feedback_loop_tests {
             streaming_config_with(&req.metric, 42)
         }));
 
-        let store = Arc::new(SketchStore::new(
-            Arc::new(StreamingConfig::default()),
-            CleanupPolicy::NoCleanup,
-        ));
-        let _store = store;
         let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15000)
         .with_controller_client(mock.clone() as Arc<dyn ControllerClient>);
 
@@ -5261,12 +5240,10 @@ mod aux_pushdown_tests {
 
     fn make_engine() -> ASAPQueryEngine {
         use crate::stores::types::{CleanupPolicy, HotReloadStreamingConfig, StreamingConfig};
-        use crate::stores::sketch_db::store::SketchStore;
-
+    
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
-        let store = Arc::new(SketchStore::new(sc, CleanupPolicy::NoCleanup));
-        let _store = store;
+        let _ = sc;
         ASAPQueryEngine::new_with_hot_reload(hr, 60)
     }
 
@@ -5511,7 +5488,6 @@ mod sketch_alias_resolver_tests {
     use crate::stores::types::{
         AggregationConfig, CleanupPolicy, HotReloadStreamingConfig,
         StreamingConfig, WindowType};
-    use crate::stores::sketch_db::store::SketchStore;
     use std::sync::Arc;
 
     fn agg_for(id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
@@ -5545,12 +5521,7 @@ mod sketch_alias_resolver_tests {
             configs.insert((i + 1) as u64, agg_for((i + 1) as u64, m, *t));
         }
         let streaming_config = StreamingConfig::new(configs);
-        let store = Arc::new(SketchStore::new(
-            Arc::new(streaming_config.clone()),
-            CleanupPolicy::NoCleanup,
-        ));
         let hot_reload = HotReloadStreamingConfig::from_arc(Arc::new(streaming_config));
-        let _store = store;
         ASAPQueryEngine::new_with_hot_reload(hot_reload, 1)
     }
 
@@ -5896,7 +5867,6 @@ mod warm_tier_classify_tests {
     use crate::stores::types::{CleanupPolicy, HotReloadStreamingConfig};
     use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
-    use crate::stores::sketch_db::store::SketchStore;
     use crate::stores::sketch_db::index::{
         AccuracyBound, Capability, SketchConfig, SketchIndex, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState};
@@ -5904,12 +5874,7 @@ mod warm_tier_classify_tests {
 
     fn build_engine_with_index(idx: Arc<SketchIndex>) -> ASAPQueryEngine {
         let streaming_config = Arc::new(crate::stores::types::StreamingConfig::default());
-        let store = Arc::new(SketchStore::new(
-            streaming_config.clone(),
-            CleanupPolicy::NoCleanup,
-        ));
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        let _store = store;
         ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
     }
 

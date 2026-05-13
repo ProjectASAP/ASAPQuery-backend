@@ -5,16 +5,13 @@
 //! the existing query_config path still takes priority when an entry is present.
 
 use crate::stores::types::{
-    AggregationConfig, AggregationType, CleanupPolicy,
-    PrecomputedOutput, QueryLanguage, StreamingConfig,
-    WindowType};
+    AggregationConfig, AggregationType, PrecomputedOutput, StreamingConfig, WindowType};
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::store::SketchStore;
-use crate::stores::traits::Store;
+use crate::stores::sketch_db::index::SketchIndex;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,10 +63,7 @@ fn engine_no_query_configs(
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
         storage_backend: Default::default()});
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
+    let sketch_index = Arc::new(SketchIndex::new());
 
     // Insert a data point for each aggregation so queries can actually execute.
     let ts = 1_000_000_u64;
@@ -83,25 +77,18 @@ fn engine_no_query_configs(
                 Box::new(kll)
             }
             "CountMinSketch" => {
-                // Default CMS dimensions; for a capability-matching test we
-                // care that the engine routes here, not about the sketch
-                // accuracy parameters.
                 let cms = CountMinSketchAccumulator::new(4, 1000);
                 Box::new(cms)
             }
             "DeltaSetAggregator" => Box::new(DeltaSetAggregatorAccumulator::new()),
             _ => Box::new(SumAccumulator::with_sum(42.0))};
-        store.insert_precomputed_output(output, acc).unwrap();
+        sketch_index.ingest_precompute_for_agg_config(c, &output, acc.as_ref());
     }
 
     let schema_label_names =
         KeyByLabelNames::new(schema_labels.iter().map(|s| s.to_string()).collect());
 
-
-    ASAPQueryEngine::new(
-        streaming_config,
-        1,
-    )
+    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
 }
 
 /// Build a `ASAPQueryEngine` with both a query_config entry AND a streaming aggregation.
@@ -117,27 +104,20 @@ fn engine_with_query_config(
     let streaming_config = Arc::new(StreamingConfig {
         aggregation_configs: agg_map,
         storage_backend: Default::default()});
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
+    let sketch_index = Arc::new(SketchIndex::new());
 
     let ts = 1_000_000_u64;
     let window_ms = agg_config.window_size * 1000;
     let output = PrecomputedOutput::new(ts - window_ms, ts, None, agg_id);
-    store
-        .insert_precomputed_output(output, Box::new(SumAccumulator::with_sum(99.0)))
-        .unwrap();
+    let acc = SumAccumulator::with_sum(99.0);
+    sketch_index.ingest_precompute_for_agg_config(&agg_config, &output, &acc);
 
     let schema_label_names =
         KeyByLabelNames::new(schema_labels.iter().map(|s| s.to_string()).collect());
 
 
 
-    ASAPQueryEngine::new(
-        streaming_config,
-        1,
-    )
+    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
 }
 
 // ---------------------------------------------------------------------------
