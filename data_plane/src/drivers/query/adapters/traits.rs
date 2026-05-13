@@ -147,19 +147,19 @@ pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send
 
     /// Handle runtime info request
     ///
-    /// The adapter can query the SketchIndex for internal metrics and
+    /// The adapter can query the SketchStore for internal metrics and
     /// optionally forward to fallback backend for additional info.
     /// M2.3.6g — switched from `Arc<dyn Store>` to
-    /// `Arc<SketchIndex>` now that SketchIndex is the only data
+    /// `Arc<SketchStore>` now that SketchStore is the only data
     /// backend.
     async fn handle_runtime_info(
         &self,
-        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchIndex>,
+        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchStore>,
     ) -> Result<Json<Value>, StatusCode>;
 
     async fn handle_runtime_info_with_headers(
         &self,
-        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchIndex>,
+        sketch_index: std::sync::Arc<crate::stores::sketch_db::index::SketchStore>,
         headers: HashMap<String, String>,
     ) -> Result<Json<Value>, StatusCode> {
         // Default implementation ignores headers and calls the old method

@@ -1,4 +1,4 @@
-use crate::stores::sketch_db::index::SketchIndex;
+use crate::stores::sketch_db::index::SketchStore;
 use crate::stores::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::stores::types::{AggregateCore, PrecomputedOutput};
 use std::sync::{Arc, Mutex};
@@ -13,34 +13,34 @@ pub trait OutputSink: Send + Sync {
 }
 
 /// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
-/// precomputes to `SketchIndex` only; the legacy `SketchStore`
+/// precomputes to `SketchStore` only; the legacy `SketchStore`
 /// agg_id-keyed write path is retired.
 ///
-/// Reads already prefer `SketchIndex` (M2.3.5b's engine cut-over),
+/// Reads already prefer `SketchStore` (M2.3.5b's engine cut-over),
 /// so the legacy store no longer receives traffic from either side.
 /// Once the data-plane crate's `Store` trait and `stores/sketch_db/store/*`
-/// modules are deleted (subsequent M2.3.6 sub-PRs), `SketchIndex`
+/// modules are deleted (subsequent M2.3.6 sub-PRs), `SketchStore`
 /// will be renamed to `SketchStore` and this type can collapse into
 /// the previously-existing `StoreOutputSink` shape.
 ///
 /// Per-batch overhead: one streaming-config snapshot read + per-row
 /// agg-id lookup, sid hash, and `Box<dyn AggregateCore>` clone.
 pub struct SketchIndexSink {
-    sketch_index: Arc<SketchIndex>,
+    sketch_index: Arc<SketchStore>,
     hot_reload: HotReloadStreamingConfig,
 }
 
 impl SketchIndexSink {
-    pub fn new(sketch_index: Arc<SketchIndex>, hot_reload: HotReloadStreamingConfig) -> Self {
+    pub fn new(sketch_index: Arc<SketchStore>, hot_reload: HotReloadStreamingConfig) -> Self {
         Self {
             sketch_index,
             hot_reload,
         }
     }
 
-    /// Best-effort write to `SketchIndex` for one PrecomputedOutput.
+    /// Best-effort write to `SketchStore` for one PrecomputedOutput.
     /// Logs and skips on missing agg_config or other transient
-    /// inconsistencies — a SketchIndex miss is recoverable in
+    /// inconsistencies — a SketchStore miss is recoverable in
     /// practice because the controller will re-emit the agg_config
     /// on its next reconcile pass.
     fn append_to_index(
@@ -194,7 +194,7 @@ mod tests {
         let streaming = StreamingConfig::new(configs);
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
 
-        let sketch_index = Arc::new(SketchIndex::new());
+        let sketch_index = Arc::new(SketchStore::new());
         let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
 
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(
             sketch_index.instance_count(),
             1,
-            "SketchIndex should have one precompute instance"
+            "SketchStore should have one precompute instance"
         );
         let instances = sketch_index
             .list_by_status(crate::stores::sketch_db::schema::AggStatus::Active);
@@ -233,7 +233,7 @@ mod tests {
         // skips it (warn log) rather than panicking.
         let streaming = StreamingConfig::new(HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
-        let sketch_index = Arc::new(SketchIndex::new());
+        let sketch_index = Arc::new(SketchStore::new());
         let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
 
         let output = PrecomputedOutput::new(1000, 2000, None, 99);

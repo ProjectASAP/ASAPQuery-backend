@@ -360,11 +360,11 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 
     async fn handle_runtime_info(
         &self,
-        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchStore>,
     ) -> Result<Json<Value>, StatusCode> {
         debug!("Handling runtime info request in Prometheus adapter");
 
-        // M2.3.6g — earliest timestamps now come from SketchIndex's
+        // M2.3.6g — earliest timestamps now come from SketchStore's
         // per-sid `first_seen_unix_ms` metadata. Wire field renamed
         // accordingly below.
         let earliest_timestamps = sketch_index.earliest_timestamps_per_sid();

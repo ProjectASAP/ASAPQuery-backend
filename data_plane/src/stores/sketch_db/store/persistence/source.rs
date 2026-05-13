@@ -31,7 +31,7 @@ pub struct SealedEpochRef {
 /// sketch bytes are opaque to the persistence layer — the writer carries
 /// whatever format the SketchStore put in. (The legacy Arroyo/MessagePack
 /// path that consumed these bytes lives in deleted modules; the
-/// production read-back path will land with the SketchIndex-backed
+/// production read-back path will land with the SketchStore-backed
 /// refactor — `snapshot_sealed_epoch` returns `Ok(None)` until then.)
 #[derive(Debug, Clone)]
 pub struct EpochSnapshot {
@@ -65,7 +65,7 @@ pub struct EpochSnapshotEntry {
     pub label: Option<KeyByLabelValues>,
     /// `AggregateCore::type_name()` of the underlying sketch — recorded
     /// so a future read-back path can dispatch to the right
-    /// deserializer once the SketchIndex-backed snapshot lands.
+    /// deserializer once the SketchStore-backed snapshot lands.
     pub sketch_type_name: String,
     /// Serialized sketch payload (opaque to the persistence layer).
     pub sketch_bytes: Vec<u8>,

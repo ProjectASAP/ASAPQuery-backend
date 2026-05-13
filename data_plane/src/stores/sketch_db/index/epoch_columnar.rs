@@ -1,7 +1,7 @@
 //! Epoch-partitioned columnar storage — generic payload type.
 //!
 //! Lifted from `sketch_store::common` (legacy SketchStore index)
-//! with the payload column type made generic so the new SketchIndex
+//! with the payload column type made generic so the new SketchStore
 //! (Phase 5) can reuse the legacy's six storage optimizations
 //! (`INDEX_DESIGN.md`) without dragging in `Arc<dyn AggregateCore>`
 //! dynamic dispatch.
@@ -20,12 +20,12 @@
 //! # Differences from legacy
 //!
 //! - **Generic payload type**: `MutableEpoch<P>` instead of
-//!   `Vec<Arc<dyn AggregateCore>>`. The new SketchIndex stores
+//!   `Vec<Arc<dyn AggregateCore>>`. The new SketchStore stores
 //!   `SketchSampleState` directly (typed bytes + encoding tag) — no
 //!   dyn dispatch, no Arc cloning, payload moves into the column.
 //! - **Series-values keyed via `LabelValuesId = u32`** (renamed from
 //!   legacy `MetricID = u32`). The intern table maps the per-series
-//!   group-by VALUES vector to a compact ID, since the SketchIndex's
+//!   group-by VALUES vector to a compact ID, since the SketchStore's
 //!   sid already captures the metric identity at the level above.
 //!
 //! See INDEX_DESIGN.md in `sketch_store/` for the full complexity
@@ -55,7 +55,7 @@ pub type TimestampRange = (u64, u64);
 /// vectors live once in the intern table and are resolved on query.
 ///
 /// Bumped from legacy's `Option<KeyByLabelValues>` key to
-/// `BTreeMap<String,String>` because the new SketchIndex receives
+/// `BTreeMap<String,String>` because the new SketchStore receives
 /// canonicalized group-by attributes from the OTLP DataPoint (sorted
 /// by key already at the receive layer).
 pub struct InternTable<K: Eq + std::hash::Hash + Clone> {
@@ -110,7 +110,7 @@ impl<K: Eq + std::hash::Hash + Clone> Default for InternTable<K> {
 /// keep the range-scan hot loop hitting only `windows_col`. The
 /// payload column is owned (no `Arc` indirection); legacy used
 /// `Arc<dyn AggregateCore>` because aggregation type was variable,
-/// but the SketchIndex specializes to `SketchSampleState` (typed
+/// but the SketchStore specializes to `SketchSampleState` (typed
 /// bytes + encoding tag).
 pub struct MutableEpoch<P> {
     // Columnar storage: three parallel arrays (Opt 5)
@@ -532,7 +532,7 @@ impl<P: Clone> SealedEpoch<P> {
     }
 }
 
-/// Per-sid storage — drop-in replacement for the new SketchIndex's
+/// Per-sid storage — drop-in replacement for the new SketchStore's
 /// `series` map's value type. Pairs an active `MutableEpoch` with a
 /// rotation-ordered `BTreeMap<EpochId, SealedEpoch>`. Concurrency is
 /// owned by the outer `RwLock<SidStoreData>` (mirrors legacy's

@@ -1,7 +1,7 @@
 //! Unit tests for the warm-tier sketch reducer.
 //!
 //! Each test:
-//! 1. Builds an in-memory `SketchIndex` with one synthetic sid.
+//! 1. Builds an in-memory `SketchStore` with one synthetic sid.
 //! 2. Generates true-distribution data, builds a sketch via the
 //!    same `asap_sketchlib` types the precompute path uses, and
 //!    serializes via the proto wire format so the reducer
@@ -17,7 +17,7 @@ use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
 
 use crate::query_engines::asap_query_engine::warm_tier::{SketchReducer, WarmTierError};
 use crate::stores::sketch_db::index::{
-    AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchIndex, SketchInstanceMetadata,
+    AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchStore, SketchInstanceMetadata,
     SketchKindHandle, SketchSampleState,
 };
 
@@ -164,7 +164,7 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
 
 #[test]
 fn ddsketch_quantile_per_window_three_windows() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 1;
     idx.register(dd_meta(sid));
 
@@ -232,7 +232,7 @@ fn ddsketch_quantile_per_window_three_windows() {
 
 #[test]
 fn kll_quantile_over_time_one_window() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 2;
     let k: u32 = 200;
     idx.register(kll_meta(sid, k));
@@ -270,7 +270,7 @@ fn kll_quantile_over_time_one_window() {
 
 #[test]
 fn hll_cardinality_estimate() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 3;
     let precision: u32 = 10;
     idx.register(hll_meta(sid, precision));
@@ -313,7 +313,7 @@ fn hll_cardinality_estimate() {
 
 #[test]
 fn capability_mismatch_quantile_vs_topk() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 4;
     idx.register(dd_meta(sid));
 
@@ -347,7 +347,7 @@ fn capability_mismatch_quantile_vs_topk() {
 
 #[test]
 fn empty_returns_no_data_error() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 5;
     idx.register(dd_meta(sid));
 
@@ -377,7 +377,7 @@ fn empty_returns_no_data_error() {
 
 #[test]
 fn unsupported_function_rejects() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 6;
     idx.register(dd_meta(sid));
 
@@ -400,7 +400,7 @@ fn unsupported_function_rejects() {
 
 #[test]
 fn decode_failure_surfaces_deserialize_error() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 7;
     idx.register(dd_meta(sid));
 
@@ -430,7 +430,7 @@ fn decode_failure_surfaces_deserialize_error() {
 
 #[test]
 fn multi_series_one_per_label_value() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 8;
     let mut meta = dd_meta(sid);
     meta.group_by_keys = BTreeSet::from(["host".to_string()]);
@@ -504,7 +504,7 @@ fn msgpack_full(bytes: Vec<u8>) -> SketchSampleState {
 
 #[test]
 fn cms_with_heap_topk_returns_top_items() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 100;
     idx.register(cms_heap_meta(sid));
 
@@ -557,7 +557,7 @@ fn cms_with_heap_topk_returns_top_items() {
 
 #[test]
 fn cms_without_heap_returns_missing_heap() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 101;
     idx.register(cms_only_meta(sid));
 
@@ -602,7 +602,7 @@ fn proto_delta(bytes: Vec<u8>) -> SketchSampleState {
 
 #[test]
 fn ddsketch_cumulative_full_plus_two_deltas() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 200;
     idx.register(dd_meta(sid));
 
@@ -665,7 +665,7 @@ fn ddsketch_cumulative_full_plus_two_deltas() {
 
 #[test]
 fn hll_cumulative_full_plus_one_delta() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 201;
     let precision: u32 = 10;
     idx.register(hll_meta(sid, precision));
@@ -727,7 +727,7 @@ fn hll_cumulative_full_plus_one_delta() {
 
 #[test]
 fn coverage_reports_observed_window_range() {
-    let idx = SketchIndex::new();
+    let idx = SketchStore::new();
     let sid = 300;
     idx.register(dd_meta(sid));
 

@@ -1,16 +1,16 @@
 //! Per-Capability sketch reducer (warm-tier query evaluator).
 //!
 //! Caller has already classified all candidate sids as `Hit`
-//! against the [`SketchIndex`] (see PR #122's classify hook in
+//! against the [`SketchStore`] (see PR #122's classify hook in
 //! `simple/engine.rs::QueryEngine::execute`). This module:
 //!
 //! 1. Resolves each sid's [`Capability`] + [`SketchKindHandle`] +
-//!    [`SketchConfig`] from `SketchIndex::instance`.
+//!    [`SketchConfig`] from `SketchStore::instance`.
 //! 2. Validates that the user's PromQL function is answerable by
 //!    that capability — `quantile_over_time` only on
 //!    `QuantileApprox`, `topk` only on `FrequencyTopk`,
 //!    `count_distinct_over_time` only on `CardinalityApprox`.
-//! 3. For each sid, calls `SketchIndex::query_range` to fetch all
+//! 3. For each sid, calls `SketchStore::query_range` to fetch all
 //!    `SketchTimeSeries` (one per distinct group-by VALUES vector)
 //!    for the request window.
 //! 4. For each window's sketch state:
@@ -65,13 +65,13 @@ use crate::query_engines::asap_query_engine::warm_tier::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
 use crate::stores::sketch_db::index::{
-    Capability, SketchEncoding, SketchIndex, SketchInstanceMetadata, SketchKindHandle,
+    Capability, SketchEncoding, SketchStore, SketchInstanceMetadata, SketchKindHandle,
     SketchSampleState,
 };
 
-/// Reducer wrapping a `&SketchIndex`. Constructed per-query; cheap.
+/// Reducer wrapping a `&SketchStore`. Constructed per-query; cheap.
 pub struct SketchReducer<'a> {
-    pub index: &'a SketchIndex,
+    pub index: &'a SketchStore,
 }
 
 /// Distinct failure modes the engine maps onto the routing layer.
@@ -192,7 +192,7 @@ pub(crate) enum QueryFamily {
 }
 
 impl<'a> SketchReducer<'a> {
-    pub fn new(index: &'a SketchIndex) -> Self {
+    pub fn new(index: &'a SketchStore) -> Self {
         Self { index }
     }
 

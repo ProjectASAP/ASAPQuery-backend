@@ -4,7 +4,7 @@
 //! [`crate::query_engines::asap_query_engine::engine::ASAPQueryEngine`]'s
 //! `QueryEngine::execute` adapter: parse the PromQL, extract
 //! `(metric_name, label_keys)`, look up candidate sids via
-//! [`crate::stores::sketch_db::index::SketchIndex::instances_matching`],
+//! [`crate::stores::sketch_db::index::SketchStore::instances_matching`],
 //! and classify each sid. On `Ghost`/`Unknown`, return
 //! `EngineError::CapabilityMiss(SketchStore, …)` so the
 //! `EngineRouter` fails over to the archive engine.
@@ -12,7 +12,7 @@
 //! That hook today still falls through to `handle_query` (legacy
 //! datafusion path) on the all-`Hit` case. This module replaces
 //! that fall-through with **direct sketch evaluation** from
-//! [`SketchIndex::query_range`]'s output: deserialize each
+//! [`SketchStore::query_range`]'s output: deserialize each
 //! window's sketch state, dispatch on the per-instance
 //! [`crate::stores::sketch_db::index::Capability`], and reduce to a
 //! per-window scalar via the canonical sketch query (DDSketch /
@@ -26,7 +26,7 @@
 //!
 //! ## Public surface
 //!
-//! * [`SketchReducer`] — wraps a `&SketchIndex`, takes a
+//! * [`SketchReducer`] — wraps a `&SketchStore`, takes a
 //!   pre-classified slice of all-`Hit` sids + a function name +
 //!   args + time bounds, returns a [`WarmTierResult`].
 //! * [`WarmTierError`] — distinguishes "warm-tier doesn't support

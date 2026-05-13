@@ -292,19 +292,19 @@ async fn main() -> Result<()> {
         data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
     // M2.3.6g — the legacy `SketchStore` construction is gone.
-    // Production data lives in `SketchIndex` (allocated below); the
+    // Production data lives in `SketchStore` (allocated below); the
     // single persistence flusher behind it is set up in the
     // `--persistence-enabled` block lower in main.rs via
-    // `SketchIndex::start_persistence`.
+    // `SketchStore::start_persistence`.
     let cleanup_policy = args.cleanup_policy;
     info!("Using cleanup policy: {:?}", cleanup_policy);
     let _ = (cleanup_policy, args.lock_strategy); // Both still parsed for backwards-compat CLI; no runtime effect.
 
     // Phase 4 + 5 wire-in (refactor 2026-05): allocate the shared
-    // SeriesIdResolver + SketchIndex once. The OTLP receive path
-    // (sid resolution + unknown_series_ids stamping; SketchIndex
+    // SeriesIdResolver + SketchStore once. The OTLP receive path
+    // (sid resolution + unknown_series_ids stamping; SketchStore
     // .append_sample on every modified-OTLP sketch DP) AND the
-    // ASAPQueryEngine query path (SketchIndex.classify / query_range
+    // ASAPQueryEngine query path (SketchStore.classify / query_range
     // for warm-tier reads) hold clones of these Arcs. Allocated
     // here before BOTH the ASAPQueryEngine and the precompute engine
     // are constructed so both can be wired with a single canonical
@@ -313,10 +313,10 @@ async fn main() -> Result<()> {
     let series_resolver =
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
     let sketch_index =
-        Arc::new(data_plane::stores::sketch_db::index::SketchIndex::new());
+        Arc::new(data_plane::stores::sketch_db::index::SketchStore::new());
 
-    // M2.3.6c — also start a persistence layer behind the SketchIndex
-    // when --persistence-enabled. SketchIndex is now where all
+    // M2.3.6c — also start a persistence layer behind the SketchStore
+    // when --persistence-enabled. SketchStore is now where all
     // precompute + sketch writes land (M2.3.6a), so flushing it to
     // disk is what makes Phase 5 warm-tier state survive restarts.
     // The legacy `SketchStore::with_persistence_per_key` flusher
@@ -362,13 +362,13 @@ async fn main() -> Result<()> {
             part_cache_bytes,
         };
         info!(
-            "SketchIndex persistence enabled: disk_path={:?}",
+            "SketchStore persistence enabled: disk_path={:?}",
             index_persistence_dir
         );
         Some(
             sketch_index
                 .start_persistence(cfg)
-                .expect("SketchIndex::start_persistence failed"),
+                .expect("SketchStore::start_persistence failed"),
         )
     } else {
         None
@@ -386,7 +386,7 @@ async fn main() -> Result<()> {
             args.prometheus_scrape_interval,
         )
         // Phase 5 wire-in (refactor 2026-05): hand the warm-tier
-        // SketchIndex to the query engine so SidLookup classification
+        // SketchStore to the query engine so SidLookup classification
         // drives the Phase 6 archive failover via
         // EngineError::CapabilityMiss when the warm tier is empty
         // / ghost / unknown.
@@ -438,7 +438,7 @@ async fn main() -> Result<()> {
             schema_persist_path: args.schema_persist_path.clone(),
         };
         // M2.3.6 — sketch-only sink. Precompute writes now go to
-        // `SketchIndex` exclusively; the legacy `SketchStore` no
+        // `SketchStore` exclusively; the legacy `SketchStore` no
         // longer receives traffic from either ingest (this sink) or
         // queries (engine M2.3.5b cut-over). The `store` Arc kept
         // below is for the eviction service + diagnostic plumbing
@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
         info!("Starting precompute engine (OTLP-fed; no HTTP ingest port)");
 
         // Spawn periodic memory diagnostics logger — M2.3.6g routes
-        // through SketchIndex now that SketchStore no longer holds
+        // through SketchStore now that SketchStore no longer holds
         // production data.
         let diag_index = sketch_index.clone();
         tokio::spawn(async move {
@@ -740,7 +740,7 @@ async fn main() -> Result<()> {
             data_plane::stores::sketch_db::default_reader_factory(),
             data_plane::stores::sketch_db::BackfillServiceConfig::default(),
         )
-        // M2.3.6e — replayed batches land in SketchIndex (the only
+        // M2.3.6e — replayed batches land in SketchStore (the only
         // destination after the M2.3.6g store retirement).
         .with_sketch_index(sketch_index.clone());
         info!(
@@ -785,7 +785,7 @@ async fn main() -> Result<()> {
                 dry_run: args.schema_eviction_dry_run,
             },
         )
-        // M2.3.6g — eviction sweeps SketchIndex (its only data backend).
+        // M2.3.6g — eviction sweeps SketchStore (its only data backend).
         .with_sketch_index(sketch_index.clone());
         info!(
             poll_secs = args.schema_eviction_poll_secs,
@@ -845,7 +845,7 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::stores::sketch_db::index::SketchIndex>,
+    sketch_index: Arc<data_plane::stores::sketch_db::index::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
     use data_plane::stores::sketch_db::store::persistence::EpochSource;
@@ -855,13 +855,13 @@ async fn spawn_memory_diagnostics(
     loop {
         interval.tick().await;
 
-        // 1. SketchIndex diagnostics (M2.3.6g — replaces the
+        // 1. SketchStore diagnostics (M2.3.6g — replaces the
         //    pre-M2.3 per-agg_id SketchStore::diagnostic_info).
         let instance_count = sketch_index.instance_count();
         let series_count = sketch_index.series_len();
         let approx_bytes = sketch_index.approx_memory_bytes();
         info!(
-            "[MEMORY_DIAG] SketchIndex: {} instance(s), {} sid(s) with state, {:.2} KB approx sealed bytes",
+            "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, {:.2} KB approx sealed bytes",
             instance_count,
             series_count,
             approx_bytes as f64 / 1024.0,

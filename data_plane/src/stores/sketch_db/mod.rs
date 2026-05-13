@@ -48,4 +48,4 @@ pub use schema::{
     SchemaEvictionService, SchemaRegistry, TimelineCoverage, TimelineSegment,
 };
 // M2.3.6g — legacy `SketchStore` enum gone; `store::persistence` is the
-// retained surface, consumed by `SketchIndex::start_persistence`.
+// retained surface, consumed by `SketchStore::start_persistence`.
