@@ -9,7 +9,7 @@
 //! format ships a sparse-but-mergeable sketch fragment.
 //!
 //! Two reducer modes, picked by the PromQL function name in
-//! [`crate::query_engines::asap_query_engine::warm_tier::sketch_reducer`]:
+//! [`crate::storage_engines::sketch_db::query::sketch_reducer`]:
 //!
 //! * **per-window** (`quantile`, `histogram_quantile`,
 //!   `cardinality_estimate`): emit one scalar per window. A `Full`
