@@ -1,3 +1,4 @@
+use asap_types::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
 use crate::storage_engines::types::KeyByLabelValues;
@@ -40,11 +41,27 @@ pub struct PrecomputedOutput {
     /// forward-compat with older on-disk payloads.
     #[serde(default)]
     pub origin: Origin,
+    /// Content-addressed policy identity — the merged-sid-identity-chain
+    /// successor to [`Self::aggregation_id`]. `#[serde(default)]` on
+    /// read means records persisted before PR 4 (which adds this field)
+    /// deserialise as `PolicyFingerprint(0)`; consumers MUST tolerate
+    /// the sentinel and fall back to `aggregation_id` lookup until PR 5
+    /// retires the legacy field.
+    ///
+    /// Construction sites that have the source `AggregationConfig` in
+    /// hand should populate this via
+    /// [`PolicyFingerprint::from_config`]; sites that only have an
+    /// `aggregation_id` from legacy plumbing should use
+    /// [`Self::new`] (which leaves this as the sentinel).
+    #[serde(default)]
+    pub policy_fp: PolicyFingerprint,
 }
 
 impl PrecomputedOutput {
-    /// Construct a `Native` precompute — the default used by the
-    /// live ingest pipeline.
+    /// Construct a `Native` precompute with only an `aggregation_id` —
+    /// legacy path. `policy_fp` is left as the `PolicyFingerprint(0)`
+    /// sentinel; sinks fall back to `aggregation_id` lookup. New code
+    /// should prefer [`Self::new_with_policy_fp`].
     pub fn new(
         start_timestamp: u64,
         end_timestamp: u64,
@@ -57,13 +74,38 @@ impl PrecomputedOutput {
             key,
             aggregation_id,
             origin: Origin::Native,
+            policy_fp: PolicyFingerprint(0),
+        }
+    }
+
+    /// Construct a `Native` precompute carrying both the
+    /// `aggregation_id` (for transition compat) and the
+    /// `PolicyFingerprint`. Used by the precompute worker + OTLP sketch
+    /// ingest path now that they have the source `AggregationConfig`
+    /// in hand at emit time.
+    pub fn new_with_policy_fp(
+        start_timestamp: u64,
+        end_timestamp: u64,
+        key: Option<KeyByLabelValues>,
+        aggregation_id: u64,
+        policy_fp: PolicyFingerprint,
+    ) -> Self {
+        Self {
+            start_timestamp,
+            end_timestamp,
+            key,
+            aggregation_id,
+            origin: Origin::Native,
+            policy_fp,
         }
     }
 
     /// Construct a `Backfilled { job_id }` precompute. Called by
     /// [`crate::storage_engines::sketch_db::backfill::processor::BackfillWindowProcessor`]
     /// so each backfilled window carries its provenance back to the
-    /// originating `BackfillJob`.
+    /// originating `BackfillJob`. Legacy variant — leaves `policy_fp`
+    /// as the sentinel. New code should prefer
+    /// [`Self::new_backfilled_with_policy_fp`].
     pub fn new_backfilled(
         start_timestamp: u64,
         end_timestamp: u64,
@@ -77,6 +119,26 @@ impl PrecomputedOutput {
             key,
             aggregation_id,
             origin: Origin::Backfilled { job_id },
+            policy_fp: PolicyFingerprint(0),
+        }
+    }
+
+    /// `new_backfilled` with policy-fingerprint identity.
+    pub fn new_backfilled_with_policy_fp(
+        start_timestamp: u64,
+        end_timestamp: u64,
+        key: Option<KeyByLabelValues>,
+        aggregation_id: u64,
+        job_id: u64,
+        policy_fp: PolicyFingerprint,
+    ) -> Self {
+        Self {
+            start_timestamp,
+            end_timestamp,
+            key,
+            aggregation_id,
+            origin: Origin::Backfilled { job_id },
+            policy_fp,
         }
     }
 

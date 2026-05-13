@@ -8,6 +8,7 @@ use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use asap_types::aggregation_config::AggregationConfig;
+use asap_types::PolicyFingerprint;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -368,11 +369,12 @@ impl Worker {
                         let mut updater = create_accumulator_updater(&state.config);
                         apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
                         let key = build_group_key_label_values(group_key);
-                        let output = PrecomputedOutput::new(
+                        let output = PrecomputedOutput::new_with_policy_fp(
                             window_start as u64,
                             window_end as u64,
                             Some(key),
                             agg_id,
+                            PolicyFingerprint::from_config(&state.config),
                         );
                         emit_batch.push((output, updater.take_accumulator()));
                         debug!(
@@ -410,11 +412,12 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = PrecomputedOutput::new_with_policy_fp(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
                     agg_id,
+                    PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -501,11 +504,12 @@ impl Worker {
                     let window_start = pane_start;
                     let window_end = pane_start + state.window_manager.window_size_ms();
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = PrecomputedOutput::new_with_policy_fp(
                         window_start as u64,
                         window_end as u64,
                         Some(key),
                         agg_id,
+                        PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, incoming));
                     debug!(
@@ -552,11 +556,12 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = PrecomputedOutput::new_with_policy_fp(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
                     agg_id,
+                    PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -566,11 +571,12 @@ impl Worker {
                 merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = PrecomputedOutput::new_with_policy_fp(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
                     agg_id,
+                    PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -603,6 +609,12 @@ impl Worker {
             Vec::with_capacity(samples.len());
 
         for (ts, val) in samples {
+            // Raw-mode path does not carry an `AggregationConfig` for
+            // the source aggregation (it's an aggregation-config-less
+            // pass-through with a synthetic agg_id), so we leave
+            // `policy_fp` as the `PolicyFingerprint::UNSET` sentinel.
+            // The sink falls back to `aggregation_id` lookup — the
+            // dual-keyed transition this PR is structured around.
             let output =
                 PrecomputedOutput::new(ts as u64, ts as u64, None, self.raw_mode_aggregation_id);
             let accumulator = SumAccumulator::with_sum(val);
@@ -736,11 +748,12 @@ impl Worker {
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = PrecomputedOutput::new_with_policy_fp(
                         *window_start as u64,
                         window_end as u64,
                         Some(key),
                         *agg_id,
+                        PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -749,11 +762,12 @@ impl Worker {
                     merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = PrecomputedOutput::new_with_policy_fp(
                         *window_start as u64,
                         window_end as u64,
                         Some(key),
                         *agg_id,
+                        PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, accumulator));
                 }
