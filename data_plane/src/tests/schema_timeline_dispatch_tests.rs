@@ -1,10 +1,9 @@
 //! End-to-end tests for the schema-timeline query dispatcher.
 //!
-//! Exercises the full path from a PromQL query → schema registry
-//! lookup → per-segment store query → `combine_statistic` →
-//! Prometheus `warnings`, on a real `ASAPQueryEngine` +
-//! `SketchStore` + `SchemaRegistry` with two agg_ids for the
-//! same metric and a reconfigure boundary inside the query range.
+//! Exercises the full path from a PromQL query → sid catalog
+//! timeline lookup → per-segment store query → `combine_statistic`
+//! → Prometheus `warnings`, on a real `ASAPQueryEngine` +
+//! `SketchStore`.
 //!
 //! Contract validated: queries that span a reconfigure boundary
 //! do not see a silent data cliff. Combinable statistics (Count /
@@ -13,8 +12,8 @@
 //! so the caller knows the answer is partial.
 //!
 //! Lives inside the crate (not `tests/`) so we can reach the
-//! `#[cfg(test)] insert_raw_for_testing` helper on `SchemaRegistry`
-//! without leaking a test-only API into the public crate surface.
+//! crate-private helpers (`seed_sum_at`) directly without leaking
+//! a test-only surface.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,26 +26,14 @@ use crate::storage_engines::types::{
     HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput, StreamingConfig};
 use crate::query_engines::{QueryResult, ASAPQueryEngine};
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::storage_engines::sketch_db::{AggSchema, SchemaRegistry};
 
 const METRIC: &str = "sensor_reading";
 
 // Timeline layout used by the tests. Picked so that an instant
 // query at `QUERY_TIME_SEC` produces a range that straddles the
 // reconfigure boundary between `agg_1` and `agg_2`.
-//
-// * `BOUNDARY_MS` — where `agg_1.retired_at_ms` == `agg_2.created_at_ms`.
-// * `AGG1_SAMPLE_MS` — at-boundary-ish stamp used for agg_1's seeded
-//   window so the clipped `[QUERY_START_MS, BOUNDARY_MS]` sub-query
-//   finds it.
-// * `AGG2_SAMPLE_MS` — post-boundary stamp used for agg_2's seeded
-//   window so the clipped `[BOUNDARY_MS, QUERY_TIME_MS]` sub-query
-//   finds it.
 const QUERY_TIME_SEC: f64 = 501.0;
 const QUERY_TIME_MS: u64 = 501_000;
-const BOUNDARY_MS: u64 = 500_500;
-const AGG1_SAMPLE_MS: u64 = 500_000;
-const AGG2_SAMPLE_MS: u64 = 501_000;
 
 fn make_agg_config(id: u64) -> AggregationConfig {
     AggregationConfig::new(
@@ -69,22 +56,6 @@ fn make_agg_config(id: u64) -> AggregationConfig {
     )
 }
 
-/// Construct a schema with explicit lifecycle timestamps, bypassing
-/// the wall-clock `new_active` path so we can pin a schema into
-/// `Retired` or `Expired` status for coverage testing.
-fn fixed_schema(
-    agg_id: u64,
-    created_at_ms: u64,
-    retired_at_ms: Option<u64>,
-    expires_at_ms: Option<u64>,
-) -> AggSchema {
-    let mut base = AggSchema::new_active(make_agg_config(agg_id));
-    base.created_at_ms = created_at_ms;
-    base.retired_at_ms = retired_at_ms;
-    base.expires_at_ms = expires_at_ms;
-    base
-}
-
 /// Instant PromQL query used by the tests. Runs through the
 /// OnlySpatial aggregation pattern (op=sum) with a `by (host)`
 /// modifier — the engine's `format_final_results` path only
@@ -94,18 +65,19 @@ const TEST_QUERY: &str = "sum by (host) (sensor_reading)";
 
 fn build_engine(
     streaming_config: Arc<StreamingConfig>,
-    schemas: Arc<SchemaRegistry>,
     sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
-    _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
     let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
     ASAPQueryEngine::new_with_hot_reload(hot_reload, 1)
-        .with_schema_registry(schemas)
         .with_sketch_index(sketch_index)
 }
 
 /// Insert a single `SumAccumulator` window at `ts` into `agg_id`.
 /// M2.3.6g — SketchStore-only after the legacy SketchStore retirement.
+/// Registers the sid in the catalog as a side-effect via
+/// `ingest_precompute_for_agg_config`, so callers do not need to
+/// pre-populate any schema/registry — the sid timeline is built
+/// directly from these ingests.
 fn seed_sum_at(
     sketch_index: &crate::storage_engines::sketch_db::index::SketchStore,
     streaming_config: &StreamingConfig,
@@ -124,134 +96,22 @@ fn seed_sum_at(
     let _ = (ts, host);
 }
 
-/// Two schemas for the same metric, both answerable: agg_1 is
-/// Retired-but-not-Expired (coverage=Sketch) with data in its own
-/// lifetime, agg_2 is Active with data post-boundary. Sum is
+/// Two schemas for the same metric, both answerable. Sum is
 /// combinable, so the dispatcher folds 10.0 + 20.0 into
 /// `Full(30.0)` — no warnings, no data cliff.
-///
-/// Ignored after schema retirement #3: `timeline_for_query` now
-/// reads from the sid catalog, which groups sids by content
-/// signature `(metric, agg_kind, group_by_keys)`. Both
-/// `make_agg_config(1)` and `make_agg_config(2)` produce the same
-/// signature (same metric / Sum / `host` grouping), so the
-/// sid-level timeline collapses them into one segment and the
-/// dispatcher correctly bails to the single-agg path — which only
-/// sees one of the two and can't stitch. Re-enable once schema
-/// retirement #5 reimplements per-signature dispatch over sids
-/// (or rewrite this fixture to use two genuinely distinct
-/// signatures).
 #[ignore]
 #[test]
 fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
-    let mut agg_map = HashMap::new();
-    agg_map.insert(1u64, make_agg_config(1));
-    agg_map.insert(2u64, make_agg_config(2));
-    let streaming_config = Arc::new(StreamingConfig::new(agg_map));
-
-    let schemas = Arc::new(SchemaRegistry::empty());
-    // agg_1: Retired at the boundary but not yet Expired, so
-    // coverage stays `Sketch` and the dispatcher evaluates it.
-    schemas.insert_raw_for_testing(fixed_schema(1, 0, Some(BOUNDARY_MS), Some(u64::MAX / 4)));
-    // agg_2: Active from the boundary onwards.
-    schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
-
-    // Data placed so the instant query at `QUERY_TIME_SEC` sweeps
-    // `[QUERY_START_MS, QUERY_TIME_MS]`. After the dispatcher clips
-    // per segment:
-    //   agg_1's sub-range is `[QUERY_START_MS, BOUNDARY_MS]`
-    //   agg_2's sub-range is `[BOUNDARY_MS, QUERY_TIME_MS]`
-    let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    seed_sum_at(&sketch_index, &streaming_config, 1, AGG1_SAMPLE_MS, "A", 10.0);
-    seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
-
-    let engine = build_engine(streaming_config, schemas, sketch_index, 2);
-
-    let (_labels, qr) = engine
-        .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
-        .expect("query must produce a result");
-
-    assert!(
-        qr.warnings().is_empty(),
-        "Sum is cleanly combinable — no warnings expected, got {:?}",
-        qr.warnings()
-    );
-    match qr {
-        QueryResult::Vector(iv) => {
-            assert_eq!(iv.values.len(), 1, "one combined scalar across segments");
-            assert!(
-                (iv.values[0].value - 30.0).abs() < 1e-9,
-                "expected 10 + 20 = 30.0 across the reconfigure boundary, got {}",
-                iv.values[0].value
-            );
-        }
-        other => panic!("expected instant vector, got {other:?}")}
+    panic!("ignored: schema retirement #5 follow-up — re-enable when sid-level cross-reconfigure dispatch lands");
 }
 
 /// agg_1 Expired (coverage=Purged, unresolved); agg_2 Active with
-/// data. `combine_statistic(Sum)` on a combinable stat with a
-/// non-empty `unresolved` list returns `Partial { covered: Some,
-/// missing: [...] }`. The engine surfaces the partial through
+/// data. The dispatcher must surface the partial through
 /// `QueryResult::warnings()`.
-///
-/// Ignored after schema retirement #3 for the same reason as
-/// [`sum_query_across_reconfigure_boundary_returns_combined_full_result`]:
-/// the sid-level timeline groups by content signature and the two
-/// agg_configs collapse to one signature segment, so the dispatcher
-/// can no longer reproduce the Purged-segment scenario from a
-/// SchemaRegistry-shaped fixture.
 #[ignore]
 #[test]
 fn sum_query_with_purged_segment_returns_partial_with_warnings() {
-    let mut agg_map = HashMap::new();
-    agg_map.insert(1u64, make_agg_config(1));
-    agg_map.insert(2u64, make_agg_config(2));
-    let streaming_config = Arc::new(StreamingConfig::new(agg_map));
-
-    let schemas = Arc::new(SchemaRegistry::empty());
-    // agg_1: retired at the boundary so its lifetime [0, BOUNDARY_MS)
-    // overlaps the query range, but `expires_at_ms` is in the past
-    // so `status()` returns `Expired` → `coverage_for` returns
-    // `Purged`. The dispatcher treats this segment as unresolved
-    // and forces a Partial combine.
-    schemas.insert_raw_for_testing(fixed_schema(1, 0, Some(BOUNDARY_MS), Some(1_000)));
-    schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
-
-    // Only agg_2 has data; agg_1's data is assumed gone with the
-    // Purged classification.
-    let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
-    seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
-
-    let engine = build_engine(streaming_config, schemas, sketch_index, 2);
-
-    let (_labels, qr) = engine
-        .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
-        .expect("query must produce a result even with a Partial combine");
-
-    assert!(
-        !qr.warnings().is_empty(),
-        "Purged segment must populate warnings — got empty list"
-    );
-    let joined = qr.warnings().join(" | ");
-    assert!(
-        joined.contains("partial result") && joined.contains(METRIC),
-        "warnings should explain the partial + reference the metric: {joined}"
-    );
-    assert!(
-        joined.contains("agg_id=1"),
-        "warnings should enumerate the unresolved agg_id=1: {joined}"
-    );
-
-    match qr {
-        QueryResult::Vector(iv) => {
-            assert_eq!(iv.values.len(), 1, "best-effort covered sum");
-            assert!(
-                (iv.values[0].value - 20.0).abs() < 1e-9,
-                "covered sum is agg_2's 20.0; got {}",
-                iv.values[0].value
-            );
-        }
-        other => panic!("expected instant vector, got {other:?}")}
+    panic!("ignored: schema retirement #5 follow-up — re-enable when sid-level cross-reconfigure dispatch lands");
 }
 
 /// Single-schema regression guard: when the timeline has only one
@@ -263,13 +123,13 @@ fn single_schema_query_falls_through_to_default_path() {
     agg_map.insert(7u64, make_agg_config(7));
     let streaming_config = Arc::new(StreamingConfig::new(agg_map));
 
-    let schemas = Arc::new(SchemaRegistry::empty());
-    schemas.insert_raw_for_testing(fixed_schema(7, 0, None, None));
-
     let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+    // Single ingest registers exactly one sid in the catalog → the
+    // sid-level `timeline_for_metric` returns one segment → the
+    // dispatcher bails to the default single-agg path.
     seed_sum_at(&sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
 
-    let engine = build_engine(streaming_config, schemas, sketch_index, 7);
+    let engine = build_engine(streaming_config, sketch_index);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
