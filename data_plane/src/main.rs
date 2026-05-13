@@ -22,8 +22,8 @@ use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
-    HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
-    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStore, StoreOutputSink,
+    DualWriteSink, HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig,
+    PrecomputeEngine, PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStore,
 };
 
 #[derive(Parser, Debug)]
@@ -435,7 +435,15 @@ async fn main() -> Result<()> {
             wall_clock_grace_period_ms: 5_000,
             schema_persist_path: args.schema_persist_path.clone(),
         };
-        let output_sink = Arc::new(StoreOutputSink::new(store.clone()));
+        // M2.3.4b — DualWriteSink mirrors precompute writes into the
+        // legacy SketchStore (still serves queries) AND the new
+        // SketchIndex (sid-keyed precompute path; query path migration
+        // is M2.3.5). Replaces StoreOutputSink.
+        let output_sink = Arc::new(DualWriteSink::new(
+            store.clone(),
+            sketch_index.clone(),
+            hot_reload_config.clone(),
+        ));
         let engine = PrecomputeEngine::new(
             precompute_config,
             hot_reload_config.clone(),
