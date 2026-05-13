@@ -1,4 +1,4 @@
-use crate::stores::types::{
+use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -248,7 +248,7 @@ impl AggregateCore for DeltaSetAggregatorAccumulator {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::types::MultipleSubpopulationAggregate;
+        use crate::storage_engines::types::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for DeltaSetAggregatorAccumulator")?;

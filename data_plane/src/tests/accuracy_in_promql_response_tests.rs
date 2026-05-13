@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 use crate::drivers::query::adapters::PrometheusResponse;
-use crate::stores::sketch_db::{
+use crate::storage_engines::sketch_db::{
     AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy,
 };
 use serde_json::Value;

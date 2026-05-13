@@ -8,7 +8,7 @@
 //! - `IncrementalMerger`: Add/subtract for subtractable accumulators (future)
 //! - `SwagMerger`: Two-stack queue for non-subtractable accumulators (future)
 
-use crate::stores::types::{AggregateCore, AggregationType};
+use crate::storage_engines::types::{AggregateCore, AggregationType};
 
 /// Trait for merging buckets in a sliding window
 ///
@@ -107,7 +107,7 @@ pub fn create_window_merger(_accumulator_type: AggregationType) -> Box<dyn Windo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::{KeyByLabelValues, SerializableToSink};
+    use crate::storage_engines::types::{KeyByLabelValues, SerializableToSink};
     use serde_json::Value;
     use std::any::Any;
 

@@ -79,7 +79,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::stores::types::StreamingConfig;
+use crate::storage_engines::types::StreamingConfig;
 
 /// Thin wrapper around `ArcSwap<StreamingConfig>` with ergonomic
 /// snapshot + swap helpers. Cloneable; clones share the same
@@ -137,7 +137,7 @@ impl std::fmt::Debug for HotReloadStreamingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::AggregationConfig;
+    use crate::storage_engines::types::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::collections::HashMap;

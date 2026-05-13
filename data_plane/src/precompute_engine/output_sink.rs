@@ -1,6 +1,6 @@
-use crate::stores::sketch_db::store::SketchStore;
-use crate::stores::types::hot_reload_config::HotReloadStreamingConfig;
-use crate::stores::types::{AggregateCore, PrecomputedOutput};
+use crate::storage_engines::sketch_db::store::SketchStore;
+use crate::storage_engines::types::hot_reload_config::HotReloadStreamingConfig;
+use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
 use std::sync::{Arc, Mutex};
 use tracing::{debug_span, warn};
 
@@ -25,12 +25,12 @@ pub trait OutputSink: Send + Sync {
 ///
 /// Per-batch overhead: one streaming-config snapshot read + per-row
 /// agg-id lookup, sid hash, and `Box<dyn AggregateCore>` clone.
-pub struct SketchIndexSink {
+pub struct SketchStoreSink {
     sketch_index: Arc<SketchStore>,
     hot_reload: HotReloadStreamingConfig,
 }
 
-impl SketchIndexSink {
+impl SketchStoreSink {
     pub fn new(sketch_index: Arc<SketchStore>, hot_reload: HotReloadStreamingConfig) -> Self {
         Self {
             sketch_index,
@@ -52,7 +52,7 @@ impl SketchIndexSink {
         let Some(agg_cfg) = cfg.get_aggregation_config(output.aggregation_id) else {
             warn!(
                 agg_id = output.aggregation_id,
-                "SketchIndexSink: agg_config missing from streaming snapshot; skipping write"
+                "SketchStoreSink: agg_config missing from streaming snapshot; skipping write"
             );
             return false;
         };
@@ -62,7 +62,7 @@ impl SketchIndexSink {
     }
 }
 
-impl OutputSink for SketchIndexSink {
+impl OutputSink for SketchStoreSink {
     fn emit_batch(
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
@@ -153,8 +153,8 @@ impl OutputSink for NoopOutputSink {
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::store::{AggKind, SidLookup};
-    use crate::stores::types::{KeyByLabelValues, StreamingConfig};
+    use crate::storage_engines::sketch_db::store::{AggKind, SidLookup};
+    use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -195,7 +195,7 @@ mod tests {
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
 
         let sketch_index = Arc::new(SketchStore::new());
-        let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
+        let sink = SketchStoreSink::new(sketch_index.clone(), hot_reload);
 
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
         let output = PrecomputedOutput::new(1000, 2000, Some(key), agg_id);
@@ -209,7 +209,7 @@ mod tests {
             "SketchStore should have one precompute instance"
         );
         let instances = sketch_index
-            .list_by_status(crate::stores::sketch_db::schema::AggStatus::Active);
+            .list_by_status(crate::storage_engines::sketch_db::schema::AggStatus::Active);
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
         let sid = meta.sid;
@@ -234,7 +234,7 @@ mod tests {
         let streaming = StreamingConfig::new(HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
         let sketch_index = Arc::new(SketchStore::new());
-        let sink = SketchIndexSink::new(sketch_index.clone(), hot_reload);
+        let sink = SketchStoreSink::new(sketch_index.clone(), hot_reload);
 
         let output = PrecomputedOutput::new(1000, 2000, None, 99);
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));

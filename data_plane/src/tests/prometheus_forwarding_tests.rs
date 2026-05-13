@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::stores::types::{QueryLanguage, StreamingConfig};
+use crate::storage_engines::types::{QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
@@ -77,7 +77,7 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         15000, // 15s scrape interval
     ));
 
-    let idx = std::sync::Arc::new(crate::stores::sketch_db::store::SketchStore::new());
+    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);
     let actual_port = server
         .start_test_server()
@@ -161,7 +161,7 @@ async fn test_forwarding_disabled() {
         15000, // 15s scrape interval
     ));
 
-    let idx = std::sync::Arc::new(crate::stores::sketch_db::store::SketchStore::new());
+    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);
     let server_port = server
         .start_test_server()
@@ -207,7 +207,7 @@ async fn test_prometheus_server_unreachable() {
         15000, // 15s scrape interval
     ));
 
-    let idx = std::sync::Arc::new(crate::stores::sketch_db::store::SketchStore::new());
+    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);
     let server_port = server
         .start_test_server()

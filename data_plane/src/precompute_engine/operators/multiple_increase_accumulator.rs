@@ -1,4 +1,4 @@
-use crate::stores::types::{
+use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink, SingleSubpopulationAggregate,
 };
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::stores::types::Measurement;
+use crate::storage_engines::types::Measurement;
 use promql_utilities::query_logics::enums::Statistic;
 
 /// Accumulator that maintains separate increase accumulators for multiple keys
@@ -240,7 +240,7 @@ impl AggregateCore for MultipleIncreaseAccumulator {
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::types::MultipleSubpopulationAggregate;
+        use crate::storage_engines::types::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for MultipleIncreaseAccumulator")?;
@@ -304,7 +304,7 @@ impl MergeableAccumulator<MultipleIncreaseAccumulator> for MultipleIncreaseAccum
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::Measurement;
+    use crate::storage_engines::types::Measurement;
 
     fn create_test_increase_accumulator(start_val: f64, end_val: f64) -> IncreaseAccumulator {
         IncreaseAccumulator::new(

@@ -21,13 +21,13 @@ pub use precomputed_output::*;
 pub use traits::*;
 
 // Cross-module re-exports of asap_types data types so callers can
-// write `crate::stores::types::StreamingConfig` instead of reaching
+// write `crate::storage_engines::types::StreamingConfig` instead of reaching
 // across crates.
 pub use asap_types::aggregation_config::*;
 pub use asap_types::streaming_config::*;
 
 // Re-export the query-side routing surface so existing call sites
-// like `crate::stores::types::BackendStorageRouting` keep compiling.
+// like `crate::storage_engines::types::BackendStorageRouting` keep compiling.
 pub use crate::query_engines::routing::{
     classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting, QueryShape,
     RoutingTarget,

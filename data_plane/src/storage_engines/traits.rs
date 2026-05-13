@@ -1,4 +1,4 @@
-use crate::stores::types::{AggregateCore, KeyByLabelValues};
+use crate::storage_engines::types::{AggregateCore, KeyByLabelValues};
 use std::collections::HashMap;
 use std::sync::Arc;
 

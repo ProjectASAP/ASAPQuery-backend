@@ -50,12 +50,12 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::stores::types::HotReloadStreamingConfig;
-use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillSource, BackfillStatus};
-use crate::stores::sketch_db::backfill::processor::BackfillWindowProcessor;
-use crate::stores::sketch_db::backfill::worker::BackfillWorker;
-use crate::stores::sketch_db::backfill::raw_sample_reader::{LabelFilter, RawSampleReader};
-use crate::stores::sketch_db::schema::SchemaRegistry;
+use crate::storage_engines::types::HotReloadStreamingConfig;
+use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillSource, BackfillStatus};
+use crate::storage_engines::sketch_db::backfill::processor::BackfillWindowProcessor;
+use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
+use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{LabelFilter, RawSampleReader};
+use crate::storage_engines::sketch_db::schema::SchemaRegistry;
 
 /// Given a `BackfillSource`, return a reader that can read raw
 /// samples from it. Used by the service to pick a concrete reader
@@ -97,7 +97,7 @@ pub struct BackfillService {
     schemas: Arc<SchemaRegistry>,
     /// Phase 5 M2.3.6g — replayed batches land in `SketchStore` only;
     /// the legacy `Arc<dyn Store>` field is gone.
-    sketch_index: Option<Arc<crate::stores::sketch_db::store::SketchStore>>,
+    sketch_index: Option<Arc<crate::storage_engines::sketch_db::store::SketchStore>>,
     config_source: HotReloadStreamingConfig,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
@@ -125,7 +125,7 @@ impl BackfillService {
     /// there. Builder-style; safe to omit (legacy tests).
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
         self
@@ -305,8 +305,8 @@ pub fn default_reader_factory() -> ReaderFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::StreamingConfig;
-    use crate::stores::sketch_db::backfill::raw_sample_reader::{MockRawSampleReader, RawSample};
+    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{MockRawSampleReader, RawSample};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;

@@ -37,7 +37,7 @@
 //! (plan-arrival + idempotency on repeat query).
 
 #[cfg(test)]
-use crate::stores::types::{
+use crate::storage_engines::types::{
     HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::controller_client::{ControllerClient, HttpControllerClient};
@@ -162,15 +162,15 @@ async fn start_backend(controller_url: String, hot_reload: HotReloadStreamingCon
     // No fallback — we want engine-miss to be visible to the
     // test and stay out of the hot-vs-cold routing question.
     let adapter_config = AdapterConfig::new(
-        crate::stores::types::enums::QueryProtocol::PrometheusHttp,
-        crate::stores::types::QueryLanguage::promql,
+        crate::storage_engines::types::enums::QueryProtocol::PrometheusHttp,
+        crate::storage_engines::types::QueryLanguage::promql,
         None,
     );
     let config = HttpServerConfig {
         port: 0,
         handle_http_requests: true,
         adapter_config};
-    let idx = std::sync::Arc::new(crate::stores::sketch_db::store::SketchStore::new());
+    let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new());
     let server = HttpServer::new(config, engine, idx).with_hot_reload_config(hot_reload.clone());
     server
         .start_test_server()

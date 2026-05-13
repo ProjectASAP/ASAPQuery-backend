@@ -11,7 +11,7 @@
 //! registers + variant + HIP accumulators losslessly, so the merge +
 //! store round-trip works end-to-end without that richer query surface.
 
-use crate::stores::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::sketches::hll::{HllSketch, HllSketchDelta, HllVariant};
 use serde_json::Value;
 use std::collections::HashMap;

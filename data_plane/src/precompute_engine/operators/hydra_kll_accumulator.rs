@@ -1,5 +1,5 @@
 use crate::{
-    stores::types::{
+    storage_engines::types::{
         AggregateCore, AggregationType, MergeableAccumulator, MultipleSubpopulationAggregate,
         SerializableToSink,
     },
@@ -128,7 +128,7 @@ impl AggregateCore for HydraKllSketchAccumulator {
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::types::MultipleSubpopulationAggregate;
+        use crate::storage_engines::types::MultipleSubpopulationAggregate;
         let key_val = key
             .as_ref()
             .ok_or("Key required for HydraKllSketchAccumulator")?;

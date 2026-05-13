@@ -77,7 +77,7 @@ use asap_types::aggregation_config::AggregationConfig;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::stores::types::StreamingConfig;
+use crate::storage_engines::types::StreamingConfig;
 
 /// Lifecycle state of an `aggregation_id`. Derived from the
 /// `AggSchema`'s timestamps and the current wall clock — never stored

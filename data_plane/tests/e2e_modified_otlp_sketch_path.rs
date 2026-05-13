@@ -42,7 +42,7 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use data_plane::stores::types::StreamingConfig;
+use data_plane::storage_engines::types::StreamingConfig;
 use data_plane::drivers::ingest::{OtlpReceiver, OtlpReceiverConfig};
 use data_plane::precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
 use data_plane::precompute_engine::output_sink::CapturingOutputSink;
@@ -222,7 +222,7 @@ async fn e2e_count_min_sketch_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();
@@ -450,7 +450,7 @@ async fn e2e_count_sketch_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();
@@ -647,7 +647,7 @@ async fn e2e_kll_sketch_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();
@@ -834,7 +834,7 @@ async fn e2e_dd_sketch_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();
@@ -1008,7 +1008,7 @@ async fn e2e_hll_sketch_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();
@@ -1157,7 +1157,7 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     let sink = Arc::new(CapturingOutputSink::new());
     let engine = PrecomputeEngine::new(
         engine_config(),
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config),
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config),
         sink.clone(),
     );
     let ingest_state = engine.ingest_state();

@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::stores::types::{
+use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
 };
 use crate::precompute_engine::operators::{MultipleSumAccumulator, SumAccumulator};

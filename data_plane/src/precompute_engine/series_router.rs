@@ -1,4 +1,4 @@
-use crate::stores::types::AggregateCore;
+use crate::storage_engines::types::AggregateCore;
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::fmt;

@@ -53,7 +53,7 @@ pub struct PrometheusResponse {
     /// consumed by Grafana panels / paper artifacts that want
     /// the machine-readable (ε, δ) bound.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub accuracy: Option<crate::stores::sketch_db::AccuracyEnvelope>,
+    pub accuracy: Option<crate::storage_engines::sketch_db::AccuracyEnvelope>,
 }
 
 impl PrometheusResponse {
@@ -87,7 +87,7 @@ impl PrometheusResponse {
     /// field and mirrors a human-readable one-liner to `infos`.
     /// Chainable so both warning + accuracy paths can decorate
     /// the same `success(...)` construction.
-    pub fn with_accuracy(mut self, envelope: crate::stores::sketch_db::AccuracyEnvelope) -> Self {
+    pub fn with_accuracy(mut self, envelope: crate::storage_engines::sketch_db::AccuracyEnvelope) -> Self {
         self.infos.push(envelope.summary());
         self.accuracy = Some(envelope);
         self
@@ -360,7 +360,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 
     async fn handle_runtime_info(
         &self,
-        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Result<Json<Value>, StatusCode> {
         debug!("Handling runtime info request in Prometheus adapter");
 
@@ -406,7 +406,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::enums::{QueryLanguage, QueryProtocol};
+    use crate::storage_engines::types::enums::{QueryLanguage, QueryProtocol};
 
     fn create_test_adapter() -> PrometheusHttpAdapter {
         let config = AdapterConfig::new(QueryProtocol::PrometheusHttp, QueryLanguage::promql, None);

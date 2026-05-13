@@ -16,14 +16,14 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use data_plane::stores::types::enums::{CleanupPolicy, LockStrategy};
+use data_plane::storage_engines::types::enums::{CleanupPolicy, LockStrategy};
 use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
     HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
-    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchIndexSink,
+    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStoreSink,
 };
 
 #[derive(Parser, Debug)]
@@ -289,7 +289,7 @@ async fn main() -> Result<()> {
     // control-plane GET/POST endpoint. Phase 2 will extend the swap
     // to query execution and ingest routing.
     let hot_reload_config =
-        data_plane::stores::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
 
     // M2.3.6g — the legacy `SketchStore` construction is gone.
     // Production data lives in `SketchStore` (allocated below); the
@@ -313,7 +313,7 @@ async fn main() -> Result<()> {
     let series_resolver =
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new());
     let sketch_index =
-        Arc::new(data_plane::stores::sketch_db::store::SketchStore::new());
+        Arc::new(data_plane::storage_engines::sketch_db::store::SketchStore::new());
 
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all
@@ -324,7 +324,7 @@ async fn main() -> Result<()> {
     // it stays in place until subsequent M2.3.6 sub-PRs delete the
     // legacy SketchStore wholesale.
     let _sketch_index_persistence = if args.persistence_enabled {
-        use data_plane::stores::sketch_db::store::persistence::SketchStorePersistenceConfig;
+        use data_plane::storage_engines::sketch_db::store::persistence::SketchStorePersistenceConfig;
         let disk_path = args
             .persistence_dir
             .clone()
@@ -443,7 +443,7 @@ async fn main() -> Result<()> {
         // queries (engine M2.3.5b cut-over). The `store` Arc kept
         // below is for the eviction service + diagnostic plumbing
         // until subsequent M2.3.6 sub-PRs delete those too.
-        let output_sink = Arc::new(SketchIndexSink::new(
+        let output_sink = Arc::new(SketchStoreSink::new(
             sketch_index.clone(),
             hot_reload_config.clone(),
         ));
@@ -574,7 +574,7 @@ async fn main() -> Result<()> {
     // dev / standalone — the YAML supplies the bootstrap, controller
     // pushes overwrite it.
     let bootstrap_routing = if let Some(routing_path) = args.backend_storage_routing.as_deref() {
-        match data_plane::stores::types::BackendStorageRouting::from_yaml_file(routing_path) {
+        match data_plane::storage_engines::types::BackendStorageRouting::from_yaml_file(routing_path) {
             Ok(routing) => {
                 info!(
                     "Loaded backend-storage-routing from {:?}: default={:?}, entries={}",
@@ -589,14 +589,14 @@ async fn main() -> Result<()> {
                     "Failed to load backend-storage-routing from {:?}: {} — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
                     routing_path, e,
                 );
-                data_plane::stores::types::BackendStorageRouting::empty()
+                data_plane::storage_engines::types::BackendStorageRouting::empty()
             }
         }
     } else {
         info!(
             "--backend-storage-routing not set — installing an empty routing table; the controller's first POST /api/v1/storage_routing push will fill it",
         );
-        data_plane::stores::types::BackendStorageRouting::empty()
+        data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
     server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
@@ -634,13 +634,13 @@ async fn main() -> Result<()> {
             server = server.with_archive_query_engine(thanos_arc);
             archive_registered = true;
         }
-        Ok(None) => match data_plane::stores::gorilla_object_store::GorillaS3Config::from_env() {
+        Ok(None) => match data_plane::storage_engines::gorilla_object_store::GorillaS3Config::from_env() {
             Ok(s3_cfg) => {
-                match data_plane::stores::gorilla_object_store::GorillaS3Store::with_default_backend(
+                match data_plane::storage_engines::gorilla_object_store::GorillaS3Store::with_default_backend(
                     s3_cfg,
                 ) {
                     Ok(store) => {
-                        use data_plane::stores::{GorillaEngineConfig, GorillaQueryEngine};
+                        use data_plane::storage_engines::{GorillaEngineConfig, GorillaQueryEngine};
                         use data_plane::query_engines::routing::QueryEngine;
                         let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
                             Arc::new(store),
@@ -713,9 +713,9 @@ async fn main() -> Result<()> {
     // memory-only and restart wipes job history.
     let backfill_registry = Arc::new(match args.backfill_persist_path.as_ref() {
         Some(path) => {
-            data_plane::stores::sketch_db::BackfillRegistry::load_or_new(path.clone())
+            data_plane::storage_engines::sketch_db::BackfillRegistry::load_or_new(path.clone())
         }
-        None => data_plane::stores::sketch_db::BackfillRegistry::new(),
+        None => data_plane::storage_engines::sketch_db::BackfillRegistry::new(),
     });
     server = server.with_backfill_registry(backfill_registry.clone());
 
@@ -733,12 +733,12 @@ async fn main() -> Result<()> {
         precompute_ingest_state.as_ref(),
     ) {
         let schemas = ingest_state.schemas.clone();
-        let service = data_plane::stores::sketch_db::BackfillService::new(
+        let service = data_plane::storage_engines::sketch_db::BackfillService::new(
             backfill_registry.clone(),
             schemas,
             hot_reload_config.clone(),
-            data_plane::stores::sketch_db::default_reader_factory(),
-            data_plane::stores::sketch_db::BackfillServiceConfig::default(),
+            data_plane::storage_engines::sketch_db::default_reader_factory(),
+            data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
         )
         // M2.3.6e — replayed batches land in SketchStore (the only
         // destination after the M2.3.6g store retirement).
@@ -773,14 +773,14 @@ async fn main() -> Result<()> {
                 args.persistence_delete_older_than_secs,
             ))
         };
-        data_plane::stores::sketch_db::warn_if_retention_inverted(
+        data_plane::storage_engines::sketch_db::warn_if_retention_inverted(
             data_retention_opt,
             ingest_state.schemas.retirement_retention(),
         );
-        let svc = data_plane::stores::sketch_db::SchemaEvictionService::new(
+        let svc = data_plane::storage_engines::sketch_db::SchemaEvictionService::new(
             ingest_state.schemas.clone(),
             backfill_registry.clone(),
-            data_plane::stores::sketch_db::SchemaEvictionConfig {
+            data_plane::storage_engines::sketch_db::SchemaEvictionConfig {
                 poll_interval: std::time::Duration::from_secs(args.schema_eviction_poll_secs),
                 dry_run: args.schema_eviction_dry_run,
             },
@@ -845,10 +845,10 @@ async fn main() -> Result<()> {
 
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
-    sketch_index: Arc<data_plane::stores::sketch_db::store::SketchStore>,
+    sketch_index: Arc<data_plane::storage_engines::sketch_db::store::SketchStore>,
     worker_diagnostics: Option<Arc<PrecomputeWorkerDiagnostics>>,
 ) {
-    use data_plane::stores::sketch_db::store::persistence::EpochSource;
+    use data_plane::storage_engines::sketch_db::store::persistence::EpochSource;
     use std::sync::atomic::Ordering;
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));

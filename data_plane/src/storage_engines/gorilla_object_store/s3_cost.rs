@@ -182,7 +182,7 @@ impl ObjectStore for S3CostTrackingObjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::gorilla_object_store::store::ObjectStore as _;
+    use crate::storage_engines::gorilla_object_store::store::ObjectStore as _;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 

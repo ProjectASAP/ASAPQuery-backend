@@ -27,7 +27,7 @@ use dashmap::DashMap;
 use xxhash_rust::xxh64::xxh64;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
-use crate::stores::sketch_db::schema::AggStatus;
+use crate::storage_engines::sketch_db::schema::AggStatus;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -453,7 +453,7 @@ pub enum AggPayload {
     /// Partial-accumulator state — Sum / Count / Avg / Rate / MinMax.
     /// Cloned via the `Clone` impl on `Box<dyn AggregateCore>` (which
     /// dispatches through `clone_boxed_core`).
-    Precompute(Box<dyn crate::stores::types::AggregateCore>),
+    Precompute(Box<dyn crate::storage_engines::types::AggregateCore>),
 }
 
 impl std::fmt::Debug for AggPayload {
@@ -481,7 +481,7 @@ impl AggPayload {
 
     /// Return the precompute payload if this is a precompute variant;
     /// `None` otherwise. The precompute query path (M2.3.5) uses this.
-    pub fn as_precompute(&self) -> Option<&dyn crate::stores::types::AggregateCore> {
+    pub fn as_precompute(&self) -> Option<&dyn crate::storage_engines::types::AggregateCore> {
         match self {
             AggPayload::Precompute(p) => Some(p.as_ref()),
             AggPayload::Sketch(_) => None,
@@ -614,7 +614,7 @@ impl SketchStore {
         sid: u64,
         series_label_values: BTreeMap<String, String>,
         window: TimestampRange,
-        payload: Box<dyn crate::stores::types::AggregateCore>,
+        payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) {
         let store = self
             .series
@@ -708,12 +708,12 @@ impl SketchStore {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> std::collections::HashMap<
-        Option<crate::stores::types::KeyByLabelValues>,
-        Vec<((u64, u64), Arc<dyn crate::stores::types::AggregateCore>)>,
+        Option<crate::storage_engines::types::KeyByLabelValues>,
+        Vec<((u64, u64), Arc<dyn crate::storage_engines::types::AggregateCore>)>,
     > {
         let mut out: std::collections::HashMap<
-            Option<crate::stores::types::KeyByLabelValues>,
-            Vec<((u64, u64), Arc<dyn crate::stores::types::AggregateCore>)>,
+            Option<crate::storage_engines::types::KeyByLabelValues>,
+            Vec<((u64, u64), Arc<dyn crate::storage_engines::types::AggregateCore>)>,
         > = std::collections::HashMap::new();
 
         // Pick the sids whose metadata describes this (metric,
@@ -757,7 +757,7 @@ impl SketchStore {
                     let key = if label_values_map.is_empty() {
                         None
                     } else {
-                        Some(crate::stores::types::KeyByLabelValues {
+                        Some(crate::storage_engines::types::KeyByLabelValues {
                             labels: label_values_map.values().cloned().collect(),
                         })
                     };
@@ -781,7 +781,7 @@ impl SketchStore {
                         let key = if label_values_map.is_empty() {
                             None
                         } else {
-                            Some(crate::stores::types::KeyByLabelValues {
+                            Some(crate::storage_engines::types::KeyByLabelValues {
                                 labels: label_values_map.values().cloned().collect(),
                             })
                         };
@@ -921,7 +921,7 @@ impl SketchStore {
     /// pair (the shape both the live worker AND the backfill processor
     /// emit), compute the precompute sid, register a metadata entry on
     /// first sight, and append the payload window. Used by
-    /// `SketchIndexSink` (live ingest) and `BackfillWindowProcessor`
+    /// `SketchStoreSink` (live ingest) and `BackfillWindowProcessor`
     /// (archive replay) so they share one canonical sid-derivation
     /// path.
     ///
@@ -931,8 +931,8 @@ impl SketchStore {
     pub fn ingest_precompute_for_agg_config(
         &self,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
-        output: &crate::stores::types::PrecomputedOutput,
-        accumulator: &dyn crate::stores::types::AggregateCore,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
         let label_values_vec = output
             .key
@@ -979,7 +979,7 @@ impl SketchStore {
     /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
     /// index whose metadata was registered against `agg_cfg`, i.e.
     /// shares the same metric, agg_type, parameters canonicalization,
-    /// and grouping-keys set the `SketchIndexSink` used at write time.
+    /// and grouping-keys set the `SketchStoreSink` used at write time.
     /// Returns how many sids were removed. Used by
     /// `SchemaEvictionService` to drop a retired schema's residual sid
     /// state.
@@ -1028,7 +1028,7 @@ impl SketchStore {
 /// Owns the manifest + flusher thread + part cache that back the
 /// sid-keyed warm tier. Constructed via [`SketchStore::start_persistence`];
 /// the flusher reads sealed epochs through the
-/// [`EpochSource`](crate::stores::sketch_db::store::persistence::EpochSource)
+/// [`EpochSource`](crate::storage_engines::sketch_db::store::persistence::EpochSource)
 /// impl on `SketchStore` and writes parts under `disk_path/parts/`.
 ///
 /// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
@@ -1036,9 +1036,9 @@ impl SketchStore {
 /// read-back from disk in a subsequent sub-PR; today it sits idle
 /// because the in-memory `query_range` doesn't yet consult it.
 pub struct SketchIndexPersistence {
-    pub manifest: Arc<crate::stores::sketch_db::store::persistence::Manifest>,
-    pub part_cache: crate::stores::sketch_db::store::persistence::cache::PartCache,
-    pub flusher: crate::stores::sketch_db::store::persistence::flusher::FlusherHandle,
+    pub manifest: Arc<crate::storage_engines::sketch_db::store::persistence::Manifest>,
+    pub part_cache: crate::storage_engines::sketch_db::store::persistence::cache::PartCache,
+    pub flusher: crate::storage_engines::sketch_db::store::persistence::flusher::FlusherHandle,
     pub parts_root: std::path::PathBuf,
 }
 
@@ -1058,10 +1058,10 @@ impl SketchStore {
     /// flushing to disk.
     pub fn start_persistence(
         self: &Arc<Self>,
-        cfg: crate::stores::sketch_db::store::persistence::SketchStorePersistenceConfig,
-    ) -> crate::stores::sketch_db::store::persistence::PersistResult<SketchIndexPersistence>
+        cfg: crate::storage_engines::sketch_db::store::persistence::SketchStorePersistenceConfig,
+    ) -> crate::storage_engines::sketch_db::store::persistence::PersistResult<SketchIndexPersistence>
     {
-        use crate::stores::sketch_db::store::persistence::{
+        use crate::storage_engines::sketch_db::store::persistence::{
             cache::PartCache, flusher::FlusherHandle, recovery, Manifest,
         };
 
@@ -1075,7 +1075,7 @@ impl SketchStore {
 
         let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
         let parts_root =
-            crate::stores::sketch_db::store::persistence::flusher::parts_root(&cfg.disk_path);
+            crate::storage_engines::sketch_db::store::persistence::flusher::parts_root(&cfg.disk_path);
         let part_cache = PartCache::new(parts_root.clone(), cfg.part_cache_bytes);
 
         let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
@@ -1096,11 +1096,11 @@ impl SketchStore {
 // field on `SealedEpochRef` / `EpochSnapshot` carries a `sid` here —
 // the trait keeps the historical name so the flusher / manifest /
 // part-writer stay untouched.
-impl crate::stores::sketch_db::store::persistence::EpochSource for SketchStore {
+impl crate::storage_engines::sketch_db::store::persistence::EpochSource for SketchStore {
     fn list_sealed_epochs(
         &self,
-    ) -> Vec<crate::stores::sketch_db::store::persistence::SealedEpochRef> {
-        use crate::stores::sketch_db::store::persistence::SealedEpochRef;
+    ) -> Vec<crate::storage_engines::sketch_db::store::persistence::SealedEpochRef> {
+        use crate::storage_engines::sketch_db::store::persistence::SealedEpochRef;
         let mut out = Vec::new();
         for entry in self.series.iter() {
             let sid = *entry.key();
@@ -1127,13 +1127,13 @@ impl crate::stores::sketch_db::store::persistence::EpochSource for SketchStore {
         &self,
         sid: u64,
         epoch_id: u64,
-    ) -> crate::stores::sketch_db::store::persistence::PersistResult<
-        Option<crate::stores::sketch_db::store::persistence::source::EpochSnapshot>,
+    ) -> crate::storage_engines::sketch_db::store::persistence::PersistResult<
+        Option<crate::storage_engines::sketch_db::store::persistence::source::EpochSnapshot>,
     > {
-        use crate::stores::sketch_db::store::persistence::source::{
+        use crate::storage_engines::sketch_db::store::persistence::source::{
             EpochSnapshot, EpochSnapshotEntry,
         };
-        use crate::stores::sketch_db::store::persistence::PersistError;
+        use crate::storage_engines::sketch_db::store::persistence::PersistError;
 
         let Some(store_ref) = self.series.get(&sid) else {
             return Ok(None);
@@ -1171,7 +1171,7 @@ impl crate::stores::sketch_db::store::persistence::EpochSource for SketchStore {
                 if m.is_empty() {
                     None
                 } else {
-                    Some(crate::stores::types::KeyByLabelValues {
+                    Some(crate::storage_engines::types::KeyByLabelValues {
                         labels: m.values().cloned().collect(),
                     })
                 }
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[test]
     fn epoch_source_lists_only_sealed_epochs() {
-        use crate::stores::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(13));
         with_tight_rotation(&idx, 13);
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[test]
     fn epoch_source_snapshot_round_trips_sketch_payload() {
-        use crate::stores::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(21));
         with_tight_rotation(&idx, 21);
@@ -1743,7 +1743,7 @@ mod tests {
 
     #[test]
     fn epoch_source_evict_drops_the_epoch() {
-        use crate::stores::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
         let idx = SketchStore::new();
         idx.register(meta(31));
         with_tight_rotation(&idx, 31);
@@ -1761,7 +1761,7 @@ mod tests {
 
     #[test]
     fn epoch_source_approx_memory_bytes_grows_with_sealed_state() {
-        use crate::stores::sketch_db::store::persistence::EpochSource;
+        use crate::storage_engines::sketch_db::store::persistence::EpochSource;
         let idx = SketchStore::new();
         let before = idx.approx_memory_bytes();
         idx.register(meta(41));
