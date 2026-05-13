@@ -23,8 +23,15 @@ pub mod no_data_archive;
 pub mod query_result;
 pub mod routing;
 pub mod thanos_query_engine;
-pub mod timeline_dispatch;
-pub mod window_merger;
+
+// Post-M2.3 reorg: timeline_dispatch + window_merger are warm-tier driver
+// primitives (they reason about reconfigure boundaries that only exist
+// inside a SketchStore). They moved into `sketch_db::query`. The
+// orchestration layer consumes them through the canonical path; these
+// aliases keep legacy `query_engines::timeline_dispatch::*` callers
+// compiling.
+pub use crate::storage_engines::sketch_db::query::timeline_dispatch;
+pub use crate::storage_engines::sketch_db::query::window_merger;
 
 pub use asap_query_engine::ASAPQueryEngine;
 pub use no_data_archive::{NoDataArchiveEngine, DATA_SOURCE_ID_NO_DATA_ARCHIVE};
