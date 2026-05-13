@@ -817,29 +817,39 @@ async fn route_modified_otlp_sketches_to_precompute(
                     let series_key = format_series_key(&metric.name, &dp.attrs);
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
-                    // Phase 4 — sid resolution gate. The four cases mirror
-                    // the design doc §5.4 invariant:
-                    //   (sid=0, attrs)        → mint a fresh sid and use it
-                    //   (sid!=0, attrs)       → trust attrs; if cached value
-                    //                           disagrees, the sender's sid
-                    //                           is stale → push to
+                    // Phase 5 M2 — sid is content-addressed: a 64-bit
+                    // xxhash of `(metric_name, attrs, sketch_kind,
+                    // sketch_config)`. Same inputs → same sid across
+                    // restarts and across hosts, so the controller no
+                    // longer needs to emit `aggregationId`; the backend
+                    // derives it. Four wire cases:
+                    //   (sid=0, attrs)        → compute hash, use it
+                    //   (sid!=0, attrs)       → compute hash; if it
+                    //                           disagrees with the sender's
+                    //                           sid the sender's sid is
+                    //                           stale → push to
                     //                           `unknown_sids` so the
                     //                           response evicts it
-                    //   (sid!=0, no attrs)    → reverse-lookup; if unknown,
-                    //                           push to `unknown_sids` and
-                    //                           drop this DP (sender will
-                    //                           re-emit with attrs next pass)
+                    //   (sid!=0, no attrs)    → can't recompute the hash;
+                    //                           fall back to "is this sid
+                    //                           registered?" via
+                    //                           SketchIndex. Unknown → push
+                    //                           to `unknown_sids` and drop
+                    //                           this DP (sender will
+                    //                           re-emit with attrs next
+                    //                           pass)
                     //   (sid=0, no attrs)     → invalid wire shape, drop
                     let attrs_pairs: Vec<(&str, &str)> =
                         dp.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                     let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&attrs_pairs);
+                    let kind_for_sid = sketch_kind_handle_for(&dp);
                     let resolved_sid: Option<u64> = if attrs_pairs.is_empty() {
-                        // No attrs on the wire — sid alone must be
-                        // recognized, otherwise signal stale.
+                        // No attrs on the wire — can't recompute hash.
+                        // Accept the sid iff we've registered it before.
                         match dp.series_id {
                             0 => None,
                             sid => {
-                                if ingest_state.series_resolver.is_known(sid) {
+                                if ingest_state.sketch_index.instance(sid).is_some() {
                                     Some(sid)
                                 } else {
                                     unknown_sids.push(sid);
@@ -847,24 +857,19 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 }
                             }
                         }
-                    } else if dp.series_id == 0 {
-                        // Attrs present, no sid yet → mint or fetch.
-                        Some(
-                            ingest_state
-                                .series_resolver
-                                .resolve(&metric.name, &fp),
-                        )
                     } else {
-                        // Both populated: attrs are the source of truth.
-                        // Backend-resolved value wins; mismatched sender
-                        // sid is signalled stale.
-                        let cached = ingest_state
-                            .series_resolver
-                            .resolve(&metric.name, &fp);
-                        if cached != dp.series_id {
+                        let computed = crate::stores::sketch_db::index::compute_sketch_sid(
+                            &metric.name,
+                            &fp,
+                            kind_for_sid,
+                            &dp.container_config,
+                        );
+                        if dp.series_id != 0 && dp.series_id != computed {
+                            // Sender's cached sid disagrees with what the
+                            // backend would now compute — signal stale.
                             unknown_sids.push(dp.series_id);
                         }
-                        Some(cached)
+                        Some(computed)
                     };
                     let Some(sid) = resolved_sid else {
                         continue;
@@ -1975,7 +1980,8 @@ mod sid_resolution_tests {
 
         let unknown = route_modified_otlp_sketches_to_precompute(&req, &state).await;
         assert!(unknown.is_empty(), "no unknown sids on a fresh-attrs DP");
-        assert_eq!(state.series_resolver.len(), 1, "resolver minted one sid");
+        // M2 — sketch sid is hash-derived; resolver is not consulted on
+        // the sketch ingest path. SketchIndex is the registration set.
         assert_eq!(
             state.sketch_index.instance_count(),
             1,
@@ -1989,8 +1995,9 @@ mod sid_resolution_tests {
     #[tokio::test]
     async fn unknown_sid_with_empty_attrs_is_returned_in_response() {
         let (state, drain) = make_state().await;
-        // sid != 0, no attrs — resolver doesn't know it; should land in
-        // unknown_sids and the DP must be dropped (no instance registered).
+        // sid != 0, no attrs — SketchIndex doesn't know it; should land
+        // in unknown_sids and the DP must be dropped (no instance
+        // registered). Hash recomputation isn't possible without attrs.
         let dp = DdSketchDataPoint {
             attributes: Vec::new(),
             start_time_unix_nano: 0,
@@ -2005,7 +2012,6 @@ mod sid_resolution_tests {
 
         let unknown = route_modified_otlp_sketches_to_precompute(&req, &state).await;
         assert_eq!(unknown, vec![7777]);
-        assert_eq!(state.series_resolver.len(), 0);
         assert_eq!(state.sketch_index.instance_count(), 0);
 
         drop(state);
@@ -2014,8 +2020,11 @@ mod sid_resolution_tests {
 
     #[tokio::test]
     async fn sid_attrs_disagreement_signals_stale_sid_but_uses_resolved_value() {
+        use crate::stores::sketch_db::index::{compute_sketch_sid, SketchConfig, SketchKindHandle};
+
         let (state, drain) = make_state().await;
-        // First, mint the resolver's view by sending sid=0 with attrs.
+        // First, register the sid by sending sid=0 with attrs. Sketch
+        // sid is now hash-derived, not resolver-minted.
         let dp_seed = DdSketchDataPoint {
             attributes: vec![kv("zone", "z0")],
             start_time_unix_nano: 1_000_000,
@@ -2031,14 +2040,21 @@ mod sid_resolution_tests {
             &state,
         )
         .await;
-        let resolved_sid = state.series_resolver.lookup(
+        let expected_sid = compute_sketch_sid(
             "http_latency_ms",
             &crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", "z0")]),
+            SketchKindHandle::DDSketch,
+            &SketchConfig::DDSketch {
+                relative_accuracy: 0.01,
+            },
         );
-        let resolved_sid = resolved_sid.expect("seed mints");
+        assert!(
+            state.sketch_index.instance(expected_sid).is_some(),
+            "seed registers the hash-derived sid"
+        );
 
         // Now arrive with the same attrs but a STALE sid.
-        let stale = resolved_sid.wrapping_add(123);
+        let stale = expected_sid.wrapping_add(123);
         let dp_disagree = DdSketchDataPoint {
             attributes: vec![kv("zone", "z0")],
             start_time_unix_nano: 1_000_000,
@@ -2055,16 +2071,9 @@ mod sid_resolution_tests {
         )
         .await;
         assert_eq!(unknown, vec![stale], "stale sid should be signalled");
-        // Cache stays at the originally-resolved value — the second call
-        // returns the same sid via the canonical fingerprint.
-        let still_resolved = state
-            .series_resolver
-            .lookup(
-                "http_latency_ms",
-                &crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", "z0")]),
-            )
-            .expect("still cached");
-        assert_eq!(still_resolved, resolved_sid);
+        // The expected sid stays registered — the second DP routed to
+        // it via hash recomputation.
+        assert!(state.sketch_index.instance(expected_sid).is_some());
 
         drop(state);
         let _ = drain.await;
