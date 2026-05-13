@@ -26,7 +26,7 @@ pub use query_engines::{ASAPQueryEngine, InstantVector, QueryResult};
 pub use drivers::{HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig};
 
 pub use precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
-pub use precompute_engine::output_sink::StoreOutputSink;
+pub use precompute_engine::output_sink::{DualWriteSink, StoreOutputSink};
 pub use precompute_engine::PrecomputeEngine;
 
 pub use utils::read_streaming_config;
