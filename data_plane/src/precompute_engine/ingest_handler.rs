@@ -1,7 +1,6 @@
 use crate::storage_engines::types::HotReloadStreamingConfig;
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::sketch_db::SchemaRegistry;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::Arc;
 
@@ -24,14 +23,6 @@ pub struct IngestState {
     /// router snapshots the latest config to derive agg_configs.
     /// This replaces the old frozen `Vec<Arc<AggregationConfig>>`.
     pub hot_reload_config: HotReloadStreamingConfig,
-    /// Per-`agg_id` schema registry — Phase 2a of the sketch DB design
-    /// (`docs/design-sketch-db.md` §6). The ingest path consults
-    /// `is_writable(agg_id)` before routing data so writes targeted at
-    /// retired or expired aggregations are rejected at the boundary.
-    /// The registry is reconciled against `hot_reload_config` on each
-    /// ingest batch (cheap HashMap diff) so newly-added agg_ids are
-    /// visible immediately.
-    pub schemas: Arc<SchemaRegistry>,
     /// When true, skip group-key extraction and pass raw samples through.
     pub pass_raw_samples: bool,
     /// Per-series snapshot cache for delta-sketch reconstitution
@@ -88,21 +79,6 @@ impl IngestState {
     pub fn extract_group_key_for(series_key: &str, config: &AggregationConfig) -> String {
         extract_group_key(series_key, config)
     }
-
-    /// Record a §6.3 write-side barrier drop. Updates the in-process
-    /// `samples_blocked_by_schema_barrier` atomic and the Prometheus
-    /// `queryengine_ingest_samples_blocked_by_schema_barrier_total`
-    /// counter, both keyed by `agg_id`. Called by every ingest path
-    /// (OTLP raw points, OTLP sketch envelopes, OTLP modified-proto
-    /// sketches) so the drop rate observable on `/metrics` is a
-    /// single number regardless of which driver is active.
-    pub fn record_barrier_drop(&self, agg_id: u64, count: u64) {
-        self.samples_blocked_by_schema_barrier
-            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-        crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-            .with_label_values(&[&agg_id.to_string()])
-            .inc_by(count as f64);
-    }
 }
 
 /// Extract the group key (grouping label values joined by semicolons)
@@ -125,11 +101,9 @@ mod tests {
     use super::*;
     use crate::storage_engines::types::StreamingConfig;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::storage_engines::sketch_db::SchemaRegistry;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -169,14 +143,11 @@ mod tests {
         let streaming = StreamingConfig::new(map);
         let hot_reload = crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
 
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
-
         let state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
             samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
             hot_reload_config: hot_reload,
-            schemas,
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(
@@ -187,43 +158,6 @@ mod tests {
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         (state, drain)
-    }
-
-    /// `record_barrier_drop` is the single entry point every ingest
-    /// driver (OTLP raw / sketch / modified-proto) funnels through, so
-    /// verify both sides of the contract: the in-process atomic AND
-    /// the Prometheus `CounterVec` move together, keyed by agg_id.
-    #[tokio::test]
-    async fn record_barrier_drop_advances_atomic_and_prom_counter() {
-        let (state, drain) = setup_state(4242, "metric_helper_test").await;
-        let label = "4242";
-        let prom_baseline = crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-            .with_label_values(&[label])
-            .get();
-        let atomic_baseline = state
-            .samples_blocked_by_schema_barrier
-            .load(Ordering::Relaxed);
-
-        state.record_barrier_drop(4242, 7);
-
-        let prom_after = crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
-            .with_label_values(&[label])
-            .get();
-        let atomic_after = state
-            .samples_blocked_by_schema_barrier
-            .load(Ordering::Relaxed);
-
-        assert!(
-            (prom_after - prom_baseline - 7.0).abs() < f64::EPSILON,
-            "prom counter must advance by 7 via the helper"
-        );
-        assert_eq!(
-            atomic_after - atomic_baseline,
-            7,
-            "atomic counter must advance by 7 via the helper"
-        );
-        drop(state);
-        let _ = drain.await;
     }
 
     /// Base frame → delta frame → second delta frame path against

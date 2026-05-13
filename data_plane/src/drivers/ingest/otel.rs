@@ -499,19 +499,16 @@ async fn route_otlp_to_precompute(
     // new aggregations are visible without restart.
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
-    // Reconcile schema registry against the snapshot — Phase 2a of
-    // the sketch DB design (`docs/design-sketch-db.md` §6). Kept
-    // alongside the new sid-level reconcile below until the schema
-    // module is fully retired (schema retirement #5): both registries
-    // run in parallel so the §6.3 ingest barrier on
-    // `ingest_state.schemas.is_writable(agg_id)` below still sees
-    // accurate `Active/Retired/Expired` transitions while the sid
-    // catalog gets the same transitions in its own lifecycle fields.
-    let _ = ingest_state.schemas.reconcile(&snap);
+    // Schema retirement #5 — the agg_id-keyed `SchemaRegistry` is
+    // gone; sid-level lifecycle now lives on `SketchStore`. Reconcile
+    // against the current streaming config so newly-added /
+    // newly-retired sids transition immediately. The §6.3 ingest
+    // barrier is enforced at the sid level inside
+    // `SketchStore::ingest_precompute_for_agg_config`.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         ingest_state.sketch_index.as_ref(),
         &snap,
-        ingest_state.schemas.retirement_retention(),
+        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
 
     // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
@@ -686,15 +683,13 @@ async fn route_modified_otlp_sketches_to_precompute(
     let ingest_received_at = Instant::now();
     let snap = ingest_state.config_snapshot();
     let agg_configs = snap.get_all_aggregation_configs();
-    // Reconcile schema registry against the snapshot — Phase 2a of
-    // the sketch DB design (`docs/design-sketch-db.md` §6). Schema
-    // retirement #4 adds the sid-level reconcile alongside; see the
-    // raw-OTLP path for the rationale on running both until #5.
-    let _ = ingest_state.schemas.reconcile(&snap);
+    // Schema retirement #5 — agg_id-keyed registry retired; sid-level
+    // reconcile is the only path going forward. See the raw-OTLP
+    // routine above for the full rationale.
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         ingest_state.sketch_index.as_ref(),
         &snap,
-        ingest_state.schemas.retirement_retention(),
+        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
     let mut messages: Vec<WorkerMessage> = Vec::new();
     let mut routed = 0usize;
@@ -1914,7 +1909,6 @@ mod sid_resolution_tests {
     use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::storage_engines::sketch_db::SchemaRegistry;
     use crate::storage_engines::sketch_db::index::SketchStore;
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
@@ -1930,13 +1924,11 @@ mod sid_resolution_tests {
         let router = SeriesRouter::new(vec![tx]);
         let streaming = StreamingConfig::new(std::collections::HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
-        let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
         let state = Arc::new(IngestState {
             router,
             samples_ingested: std::sync::atomic::AtomicU64::new(0),
             samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
             hot_reload_config: hot_reload,
-            schemas,
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(SeriesIdResolver::new()),
