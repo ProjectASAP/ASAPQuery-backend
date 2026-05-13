@@ -72,6 +72,7 @@ use tracing::debug;
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use asap_types::aggregation_config::AggregationConfig;
+use asap_types::PolicyFingerprint;
 
 use super::BackfillRegistry;
 use super::window_builder::build_backfilled_accumulator;
@@ -242,13 +243,15 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
-                window_range.0,
-                window_range.1,
-                key,
-                agg_id,
-                self.job_id,
-            );
+            let output =
+                crate::storage_engines::types::PrecomputedOutput::new_backfilled_with_policy_fp(
+                    window_range.0,
+                    window_range.1,
+                    key,
+                    agg_id,
+                    self.job_id,
+                    PolicyFingerprint::from_config(&config),
+                );
             batch.push((output, accumulator));
         }
 

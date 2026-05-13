@@ -56,19 +56,53 @@ impl SketchStoreSink {
     /// inconsistencies — a SketchStore miss is recoverable in
     /// practice because the control plane will re-emit the agg_config
     /// on its next reconcile pass.
+    ///
+    /// PR 4 (sid identity chain): resolves the source `AggregationConfig`
+    /// via [`PolicyFingerprint`] first when the output carries a
+    /// non-sentinel `policy_fp`; falls back to the legacy
+    /// `aggregation_id` lookup when the field is the
+    /// `PolicyFingerprint::UNSET` sentinel (set by call sites still on
+    /// the legacy `PrecomputedOutput::new` constructor). Both paths
+    /// resolve to the same `AggregationConfig` while
+    /// `StreamingConfig::aggregation_configs` is the source of truth.
     fn append_to_index(
         &self,
         output: &PrecomputedOutput,
         accumulator: &dyn AggregateCore,
     ) -> bool {
         let cfg = self.hot_reload.snapshot();
-        let Some(agg_cfg) = cfg.get_aggregation_config(output.aggregation_id) else {
-            warn!(
-                agg_id = output.aggregation_id,
-                "SketchStoreSink: agg_config missing from streaming snapshot; skipping write"
-            );
-            return false;
-        };
+        let agg_cfg_owned;
+        let agg_cfg: &asap_types::aggregation_config::AggregationConfig =
+            if !output.policy_fp.is_unset() {
+                let registry = cfg.policy_registry();
+                match registry.get(output.policy_fp) {
+                    Some(c) => {
+                        // Clone out so the borrow on the snapshot
+                        // doesn't outlive this scope; the existing
+                        // legacy branch ALSO borrows from the snapshot,
+                        // so this is structurally equivalent.
+                        agg_cfg_owned = c.clone();
+                        &agg_cfg_owned
+                    }
+                    None => {
+                        warn!(
+                            policy_fp = %output.policy_fp,
+                            agg_id = output.aggregation_id,
+                            "SketchStoreSink: policy_fp missing from registry; skipping write"
+                        );
+                        return false;
+                    }
+                }
+            } else {
+                let Some(c) = cfg.get_aggregation_config(output.aggregation_id) else {
+                    warn!(
+                        agg_id = output.aggregation_id,
+                        "SketchStoreSink: agg_config missing from streaming snapshot; skipping write"
+                    );
+                    return false;
+                };
+                c
+            };
         let resolver = self.series_resolver.clone();
         self.sketch_index
             .ingest_precompute_for_agg_config(

@@ -56,10 +56,24 @@ use crate::aggregation_config::AggregationConfig;
 /// with an `aggregation_id` — they're both u64-shaped but they index
 /// different things (content-addressed vs. controller-allocated).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
 #[serde(transparent)]
 pub struct PolicyFingerprint(pub u64);
+
+impl PolicyFingerprint {
+    /// Sentinel "unset / legacy" fingerprint produced by
+    /// `PolicyFingerprint::default()`. Callers that haven't yet been
+    /// migrated to compute the real fingerprint hand this through;
+    /// downstream consumers (sinks, registries) treat it as
+    /// "fall back to `aggregation_id` lookup". Removed in PR 5.
+    pub const UNSET: PolicyFingerprint = PolicyFingerprint(0);
+
+    /// True when this fingerprint is the [`Self::UNSET`] sentinel.
+    pub fn is_unset(self) -> bool {
+        self.0 == 0
+    }
+}
 
 impl PolicyFingerprint {
     /// Compute the fingerprint of an [`AggregationConfig`].
