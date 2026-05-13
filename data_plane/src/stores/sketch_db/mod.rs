@@ -47,4 +47,5 @@ pub use schema::{
     warn_if_retention_inverted, AggSchema, AggStatus, SchemaEvictionConfig, SchemaEvictionHandle,
     SchemaEvictionService, SchemaRegistry, TimelineCoverage, TimelineSegment,
 };
-pub use store::SketchStore;
+// M2.3.6g — legacy `SketchStore` enum gone; `store::persistence` is the
+// retained surface, consumed by `SketchIndex::start_persistence`.

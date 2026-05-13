@@ -2,12 +2,11 @@ pub mod accuracy_empirical_validation_tests;
 pub mod accuracy_in_promql_response_tests;
 pub mod capability_matching_tests;
 pub mod capability_miss_http_e2e_tests;
-pub mod persist_format_versioning_tests;
-pub mod persistence_integration_tests;
-pub mod persistence_perf_tests;
+// M2.3.6g — legacy SketchStore-specific suites retired:
+// persist_format_versioning_tests, persistence_integration_tests,
+// persistence_perf_tests, store_correctness_tests.
 pub mod prometheus_forwarding_tests;
 pub mod schema_timeline_dispatch_tests;
-pub mod store_correctness_tests;
 pub mod trait_design_tests;
 
 #[cfg(test)]

@@ -1,9 +1,8 @@
 #[cfg(test)]
-use crate::stores::types::{CleanupPolicy, QueryLanguage, StreamingConfig};
+use crate::stores::types::{QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
-use crate::stores::sketch_db::store::SketchStore;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
@@ -73,16 +72,11 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         )};
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
     let query_engine = Arc::new(ASAPQueryEngine::new(
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));
 
-    let _store = store;
     let idx = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
     let server = HttpServer::new(config, query_engine, idx);
     let actual_port = server
@@ -162,17 +156,11 @@ async fn test_forwarding_disabled() {
         )};
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
-
     let query_engine = Arc::new(ASAPQueryEngine::new(
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));
 
-    let _store = store;
     let idx = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
     let server = HttpServer::new(config, query_engine, idx);
     let server_port = server
@@ -214,17 +202,11 @@ async fn test_prometheus_server_unreachable() {
         )};
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
-
     let query_engine = Arc::new(ASAPQueryEngine::new(
         streaming_config.clone(),
         15000, // 15s scrape interval
     ));
 
-    let _store = store;
     let idx = std::sync::Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
     let server = HttpServer::new(config, query_engine, idx);
     let server_port = server

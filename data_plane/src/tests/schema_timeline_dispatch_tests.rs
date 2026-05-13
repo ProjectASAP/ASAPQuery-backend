@@ -24,12 +24,10 @@ use asap_types::enums::{AggregationType, WindowType};
 use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
 use crate::stores::types::{
-    CleanupPolicy, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput, StreamingConfig};
+    HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput, StreamingConfig};
 use crate::query_engines::{QueryResult, ASAPQueryEngine};
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::store::SketchStore;
 use crate::stores::sketch_db::{AggSchema, SchemaRegistry};
-use crate::stores::Store;
 
 const METRIC: &str = "sensor_reading";
 
@@ -97,7 +95,6 @@ const TEST_QUERY: &str = "sum by (host) (sensor_reading)";
 fn build_engine(
     streaming_config: Arc<StreamingConfig>,
     schemas: Arc<SchemaRegistry>,
-    _store: Arc<dyn Store>,
     sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
     _query_for_agg_id: u64,
 ) -> ASAPQueryEngine {
@@ -108,11 +105,8 @@ fn build_engine(
 }
 
 /// Insert a single `SumAccumulator` window at `ts` into `agg_id`.
-/// Mirrors the live ingest path's M2.3.6e write-path: data lands in
-/// BOTH the legacy SketchStore AND the new SketchIndex so the
-/// engine's M2.3.6f read path (SketchIndex-only) sees it.
+/// M2.3.6g — SketchIndex-only after the legacy SketchStore retirement.
 fn seed_sum_at(
-    store: &SketchStore,
     sketch_index: &crate::stores::sketch_db::index::SketchIndex,
     streaming_config: &StreamingConfig,
     agg_id: u64,
@@ -127,9 +121,7 @@ fn seed_sum_at(
     if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
         sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, &acc);
     }
-    store
-        .insert_precomputed_output(output, Box::new(acc))
-        .expect("seed insert must succeed");
+    let _ = (ts, host);
 }
 
 /// Two schemas for the same metric, both answerable: agg_1 is
@@ -151,20 +143,16 @@ fn sum_query_across_reconfigure_boundary_returns_combined_full_result() {
     // agg_2: Active from the boundary onwards.
     schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
 
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
     // Data placed so the instant query at `QUERY_TIME_SEC` sweeps
     // `[QUERY_START_MS, QUERY_TIME_MS]`. After the dispatcher clips
     // per segment:
     //   agg_1's sub-range is `[QUERY_START_MS, BOUNDARY_MS]`
     //   agg_2's sub-range is `[BOUNDARY_MS, QUERY_TIME_MS]`
     let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
-    seed_sum_at(&store, &sketch_index, &streaming_config, 1, AGG1_SAMPLE_MS, "A", 10.0);
-    seed_sum_at(&store, &sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
+    seed_sum_at(&sketch_index, &streaming_config, 1, AGG1_SAMPLE_MS, "A", 10.0);
+    seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
-    let engine = build_engine(streaming_config, schemas, store, sketch_index, 2);
+    let engine = build_engine(streaming_config, schemas, sketch_index, 2);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
@@ -208,16 +196,12 @@ fn sum_query_with_purged_segment_returns_partial_with_warnings() {
     schemas.insert_raw_for_testing(fixed_schema(1, 0, Some(BOUNDARY_MS), Some(1_000)));
     schemas.insert_raw_for_testing(fixed_schema(2, BOUNDARY_MS, None, None));
 
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
     // Only agg_2 has data; agg_1's data is assumed gone with the
     // Purged classification.
     let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
-    seed_sum_at(&store, &sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
+    seed_sum_at(&sketch_index, &streaming_config, 2, AGG2_SAMPLE_MS, "A", 20.0);
 
-    let engine = build_engine(streaming_config, schemas, store, sketch_index, 2);
+    let engine = build_engine(streaming_config, schemas, sketch_index, 2);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
@@ -261,14 +245,10 @@ fn single_schema_query_falls_through_to_default_path() {
     let schemas = Arc::new(SchemaRegistry::empty());
     schemas.insert_raw_for_testing(fixed_schema(7, 0, None, None));
 
-    let store = Arc::new(SketchStore::new(
-        streaming_config.clone(),
-        CleanupPolicy::NoCleanup,
-    ));
     let sketch_index = Arc::new(crate::stores::sketch_db::index::SketchIndex::new());
-    seed_sum_at(&store, &sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
+    seed_sum_at(&sketch_index, &streaming_config, 7, QUERY_TIME_MS, "A", 42.0);
 
-    let engine = build_engine(streaming_config, schemas, store, sketch_index, 7);
+    let engine = build_engine(streaming_config, schemas, sketch_index, 7);
 
     let (_labels, qr) = engine
         .handle_query_promql(TEST_QUERY.to_string(), QUERY_TIME_SEC)
