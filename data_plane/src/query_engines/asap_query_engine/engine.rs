@@ -3564,8 +3564,13 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     let meta = match idx.instance(*sid) {
                         Some(m) => m,
                         None => continue};
-                    if required.is_satisfied_by(&meta.capability) {
-                        hit_sids.push(*sid);
+                    // Precompute-backed sids (M2.3) have `capability: None`
+                    // — the analyzer doesn't route them through this path,
+                    // but skip defensively if one slips in.
+                    if let Some(cap) = meta.capability.as_ref() {
+                        if required.is_satisfied_by(cap) {
+                            hit_sids.push(*sid);
+                        }
                     }
                 }
                 if hit_sids.is_empty() {
@@ -5946,10 +5951,12 @@ mod warm_tier_classify_tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
-            capability: Capability::QuantileApprox(SketchKindHandle::DDSketch),
-            sketch_kind: SketchKindHandle::DDSketch,
-            sketch_config: cfg.clone(),
-            accuracy: AccuracyBound::from_config(&cfg),
+            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            agg_kind: crate::stores::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::DDSketch,
+                config: cfg.clone(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,

@@ -327,10 +327,21 @@ pub struct SketchInstanceMetadata {
     /// The group-by KEY set — `dp.attributes.keys()` after the agent's
     /// `AggregateBy` rollup folded other labels into the sketch state.
     pub group_by_keys: BTreeSet<String>,
-    pub capability: Capability,
-    pub sketch_kind: SketchKindHandle,
-    pub sketch_config: SketchConfig,
-    pub accuracy: AccuracyBound,
+    /// Warm-tier capability surfaced to the analyzer. For sketch-backed
+    /// instances this is one of the `*Approx` variants; for precompute-
+    /// backed instances (M2.3+) it's `None` because precomputes answer
+    /// exact statistics — the analyzer routes them via `agg_kind` /
+    /// `agg_type` instead.
+    pub capability: Option<Capability>,
+    /// M2.3 — the canonical "what kind of aggregation lives at this
+    /// sid" descriptor. Replaces the M2-era `sketch_kind` +
+    /// `sketch_config` field pair so a single registry can host both
+    /// sketches and partial-accumulator (Sum/Count/Avg/Rate/MinMax)
+    /// state.
+    pub agg_kind: AggKind,
+    /// Approximate accuracy bound — `Some` for sketch-backed sids,
+    /// `None` for exact precomputes.
+    pub accuracy: Option<AccuracyBound>,
     pub first_seen_unix_ms: i64,
 
     /// Wall-clock millis when the sid was retired (removed from the
@@ -373,6 +384,25 @@ impl SketchInstanceMetadata {
         let now = now_ms();
         self.retired_at_ms = Some(now);
         self.expires_at_ms = Some(now + retention.as_millis() as u64);
+    }
+
+    /// Sketch-handle accessor for the legacy sketch path. Returns
+    /// `Some(handle)` iff this sid is sketch-backed; `None` for
+    /// precompute-backed sids. Consumers that only meaningfully run on
+    /// sketches (e.g. the warm-tier reducer) `.expect` it.
+    pub fn sketch_kind(&self) -> Option<SketchKindHandle> {
+        match &self.agg_kind {
+            AggKind::Sketch { kind, .. } => Some(*kind),
+            AggKind::Precompute { .. } => None,
+        }
+    }
+
+    /// Sketch-config accessor mirroring [`Self::sketch_kind`].
+    pub fn sketch_config(&self) -> Option<&SketchConfig> {
+        match &self.agg_kind {
+            AggKind::Sketch { config, .. } => Some(config),
+            AggKind::Precompute { .. } => None,
+        }
     }
 }
 
@@ -672,10 +702,12 @@ mod tests {
             sid,
             metric_name: "m".into(),
             group_by_keys: BTreeSet::new(),
-            capability: Capability::QuantileApprox(SketchKindHandle::DDSketch),
-            sketch_kind: SketchKindHandle::DDSketch,
-            sketch_config: cfg.clone(),
-            accuracy: AccuracyBound::from_config(&cfg),
+            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            agg_kind: AggKind::Sketch {
+                kind: SketchKindHandle::DDSketch,
+                config: cfg.clone(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
