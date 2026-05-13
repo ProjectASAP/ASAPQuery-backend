@@ -3,7 +3,7 @@
 //! The public query-engine surface is intentionally small:
 //! [`asap_query_engine`] answers from ASAP's sketch store, and
 //! [`thanos_query_engine`] forwards exact/archive queries to `thanos-query`.
-//! Gorilla object storage lives under [`crate::stores::gorilla_object_store`]
+//! Gorilla object storage lives under [`crate::storage_engines::gorilla_object_store`]
 //! because it is a storage implementation detail, not a public query-engine
 //! family.
 //!

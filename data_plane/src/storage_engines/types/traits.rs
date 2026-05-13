@@ -1,4 +1,4 @@
-use crate::stores::types::KeyByLabelValues;
+use crate::storage_engines::types::KeyByLabelValues;
 use serde_json::Value;
 use std::collections::HashMap;
 

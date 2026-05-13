@@ -1,4 +1,4 @@
-use crate::stores::types::{AggregateCore, AggregationType, KeyByLabelValues, Measurement};
+use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, Measurement};
 use crate::precompute_engine::operators::{
     CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
     HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,

@@ -1,7 +1,7 @@
-use crate::stores::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::HotReloadStreamingConfig;
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::stores::sketch_db::SchemaRegistry;
+use crate::storage_engines::sketch_db::SchemaRegistry;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::Arc;
 
@@ -52,7 +52,7 @@ pub struct IngestState {
     /// follow-up will add TTL-based eviction keyed by last-seen
     /// timestamp so long-running deployments don't leak memory
     /// on retired series.
-    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::stores::types::AggregateCore>>,
+    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::storage_engines::types::AggregateCore>>,
     /// Phase 4 — centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
     /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
@@ -64,7 +64,7 @@ pub struct IngestState {
     /// every modified-OTLP first-class sketch DataPoint; queried by
     /// the `ASAPQueryEngine` query path (warm-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
-    pub sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+    pub sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
 }
 
 impl IngestState {
@@ -76,7 +76,7 @@ impl IngestState {
     /// Returns the shared `Arc<StreamingConfig>` — no cloning of
     /// individual AggregationConfig objects, just an atomic refcount
     /// increment (~5ns).
-    pub fn config_snapshot(&self) -> Arc<crate::stores::types::StreamingConfig> {
+    pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::StreamingConfig> {
         self.hot_reload_config.snapshot()
     }
 }
@@ -99,7 +99,7 @@ impl IngestState {
     pub fn record_barrier_drop(&self, agg_id: u64, count: u64) {
         self.samples_blocked_by_schema_barrier
             .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-        crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+        crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
             .with_label_values(&[&agg_id.to_string()])
             .inc_by(count as f64);
     }
@@ -123,9 +123,9 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::StreamingConfig;
+    use crate::storage_engines::types::StreamingConfig;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::stores::sketch_db::SchemaRegistry;
+    use crate::storage_engines::sketch_db::SchemaRegistry;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -167,7 +167,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
         let streaming = StreamingConfig::new(map);
-        let hot_reload = crate::stores::types::HotReloadStreamingConfig::new(streaming.clone());
+        let hot_reload = crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
 
         let schemas = Arc::new(SchemaRegistry::from_streaming_config(&streaming));
 
@@ -182,7 +182,7 @@ mod tests {
             series_resolver: Arc::new(
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
-            sketch_index: Arc::new(crate::stores::sketch_db::store::SketchStore::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -197,7 +197,7 @@ mod tests {
     async fn record_barrier_drop_advances_atomic_and_prom_counter() {
         let (state, drain) = setup_state(4242, "metric_helper_test").await;
         let label = "4242";
-        let prom_baseline = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+        let prom_baseline = crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
             .with_label_values(&[label])
             .get();
         let atomic_baseline = state
@@ -206,7 +206,7 @@ mod tests {
 
         state.record_barrier_drop(4242, 7);
 
-        let prom_after = crate::stores::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
+        let prom_after = crate::storage_engines::sketch_db::metrics::SAMPLES_BLOCKED_BY_SCHEMA_BARRIER
             .with_label_values(&[label])
             .get();
         let atomic_after = state

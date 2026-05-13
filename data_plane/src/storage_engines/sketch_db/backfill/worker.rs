@@ -314,7 +314,7 @@ impl WindowProcessor for RecordingProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::sketch_db::{BackfillSource, MockRawSampleReader};
+    use crate::storage_engines::sketch_db::{BackfillSource, MockRawSampleReader};
 
     fn prom_source() -> BackfillSource {
         BackfillSource::Prometheus {

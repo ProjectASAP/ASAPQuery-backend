@@ -13,7 +13,7 @@
 //!   store used by the archive tier.
 //!
 //! `SketchStore` is re-exported at the top level
-//! (`crate::stores::SketchStore`) for call-site stability.
+//! (`crate::storage_engines::SketchStore`) for call-site stability.
 
 pub mod gorilla_object_store;
 pub mod sketch_db;

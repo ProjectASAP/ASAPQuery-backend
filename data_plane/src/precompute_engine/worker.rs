@@ -1,4 +1,4 @@
-use crate::stores::types::{
+use crate::storage_engines::types::{
     AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput};
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater};
@@ -1052,7 +1052,7 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    use crate::stores::types::StreamingConfig;
+    use crate::storage_engines::types::StreamingConfig;
     use crate::precompute_engine::config::LateDataPolicy;
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
@@ -1156,8 +1156,8 @@ mod tests {
     /// callsite.
     fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
-    ) -> crate::stores::types::HotReloadStreamingConfig {
-        crate::stores::types::HotReloadStreamingConfig::new(crate::stores::types::StreamingConfig::new(
+    ) -> crate::storage_engines::types::HotReloadStreamingConfig {
+        crate::storage_engines::types::HotReloadStreamingConfig::new(crate::storage_engines::types::StreamingConfig::new(
             configs,
         ))
     }
@@ -2139,7 +2139,7 @@ aggregations:
 
     // M2.3.6g — `test_sketch_ingest_persists_and_query_returns_non_empty`
     // deleted: it exercised the retired SketchStore + StoreOutputSink
-    // pair end-to-end. The SketchIndexSink path (M2.3.4+) is covered
+    // pair end-to-end. The SketchStoreSink path (M2.3.4+) is covered
     // by its own dedicated tests in `output_sink::tests` and by
     // `engine::e2e_feedback_loop_tests`.
 

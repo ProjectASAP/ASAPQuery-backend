@@ -2,7 +2,7 @@
 //!
 //! This module owns the public archive query engine, [`ThanosQueryEngine`].
 //! Gorilla object storage and the legacy in-process Gorilla executor live
-//! under [`crate::stores::gorilla_object_store`].
+//! under [`crate::storage_engines::gorilla_object_store`].
 
 pub mod forward;
 

@@ -33,7 +33,7 @@ use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 use promql_utilities::query_logics::enums::AggregationType;
 use serde_json::{json, Value};
 
-use crate::stores::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
+use crate::storage_engines::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
 
 fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
     AggregationConfig::new(

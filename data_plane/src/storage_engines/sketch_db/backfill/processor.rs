@@ -69,7 +69,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
-use crate::stores::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
+use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use asap_types::aggregation_config::AggregationConfig;
 
@@ -77,7 +77,7 @@ use super::BackfillRegistry;
 use super::window_builder::build_backfilled_accumulator;
 use super::worker::WindowProcessor;
 use super::raw_sample_reader::RawSample;
-use crate::stores::sketch_db::schema::SchemaRegistry;
+use crate::storage_engines::sketch_db::schema::SchemaRegistry;
 
 /// Turn a series key into the `group_key` string the
 /// grouping_labels-based partitioning produces in live ingest.
@@ -130,7 +130,7 @@ pub struct BackfillWindowProcessor {
     /// destination. Optional so tests that don't observe write
     /// effects can skip attaching one (the processor becomes a
     /// registry-only logger in that case).
-    sketch_index: Option<Arc<crate::stores::sketch_db::store::SketchStore>>,
+    sketch_index: Option<Arc<crate::storage_engines::sketch_db::store::SketchStore>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
     /// this list.
@@ -160,7 +160,7 @@ impl BackfillWindowProcessor {
     /// so existing call sites opt in with one chained call.
     pub fn with_sketch_index(
         mut self,
-        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(sketch_index);
         self
@@ -216,7 +216,7 @@ impl WindowProcessor for BackfillWindowProcessor {
             return Ok(());
         }
 
-        let mut batch: Vec<(crate::stores::types::PrecomputedOutput, Box<dyn AggregateCore>)> =
+        let mut batch: Vec<(crate::storage_engines::types::PrecomputedOutput, Box<dyn AggregateCore>)> =
             Vec::with_capacity(by_group.len());
 
         for (group_key, group_samples) in by_group {
@@ -231,7 +231,7 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::stores::types::PrecomputedOutput::new_backfilled(
+            let output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
                 window_range.0,
                 window_range.1,
                 key,
@@ -268,10 +268,10 @@ impl WindowProcessor for BackfillWindowProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::StreamingConfig;
-    use crate::stores::sketch_db::backfill::BackfillSource;
-    use crate::stores::sketch_db::backfill::worker::BackfillWorker;
-    use crate::stores::sketch_db::backfill::raw_sample_reader::{LabelFilter, MockRawSampleReader};
+    use crate::storage_engines::types::StreamingConfig;
+    use crate::storage_engines::sketch_db::backfill::BackfillSource;
+    use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
+    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{LabelFilter, MockRawSampleReader};
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;

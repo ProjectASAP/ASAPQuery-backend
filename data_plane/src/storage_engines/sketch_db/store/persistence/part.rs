@@ -99,7 +99,7 @@ pub struct SnapshotEntry {
     pub agg_id: u64,
     pub start_ts: u64,
     pub end_ts: u64,
-    pub label: Option<crate::stores::types::KeyByLabelValues>,
+    pub label: Option<crate::storage_engines::types::KeyByLabelValues>,
     pub sketch_type_name: String,
     pub sketch_bytes: Vec<u8>,
 }
@@ -559,7 +559,7 @@ impl PartReader {
             None
         } else {
             Some(
-                crate::stores::types::KeyByLabelValues::deserialize_from_bytes(label_bytes)
+                crate::storage_engines::types::KeyByLabelValues::deserialize_from_bytes(label_bytes)
                     .map_err(|e| PersistError::Format(format!("label decode: {}", e)))?,
             )
         };
@@ -593,8 +593,8 @@ fn map_file(path: &Path) -> PersistResult<Mmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::KeyByLabelValues;
-    use crate::stores::sketch_db::store::persistence::source::EpochSnapshotEntry;
+    use crate::storage_engines::types::KeyByLabelValues;
+    use crate::storage_engines::sketch_db::store::persistence::source::EpochSnapshotEntry;
     use tempfile::TempDir;
 
     fn make_snapshot() -> EpochSnapshot {

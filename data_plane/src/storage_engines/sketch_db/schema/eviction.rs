@@ -52,8 +52,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::stores::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
-use crate::stores::sketch_db::store::SketchStore;
+use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillStatus};
+use crate::storage_engines::sketch_db::store::SketchStore;
 use super::{AggStatus, SchemaRegistry};
 
 /// Configuration for the eviction loop. Separate from
@@ -273,8 +273,8 @@ pub fn warn_if_retention_inverted(
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::SumAccumulator;
-    use crate::stores::sketch_db::backfill::BackfillSource;
-    use crate::stores::types::{AggregationType, StreamingConfig};
+    use crate::storage_engines::sketch_db::backfill::BackfillSource;
+    use crate::storage_engines::types::{AggregationType, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -317,7 +317,7 @@ mod tests {
         ts: u64,
     ) {
         let acc = SumAccumulator::with_sum(1.0);
-        let output = crate::stores::types::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
+        let output = crate::storage_engines::types::PrecomputedOutput::new(ts, ts + 1000, None, agg_id);
         if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
             sketch_index.ingest_precompute_for_agg_config(agg_cfg, &output, &acc);
         }

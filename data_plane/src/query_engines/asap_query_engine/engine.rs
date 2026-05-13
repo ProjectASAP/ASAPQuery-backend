@@ -1,9 +1,9 @@
-use crate::stores::types::{AggregationIdInfo, KeyByLabelValues, StreamingConfig};
+use crate::storage_engines::types::{AggregationIdInfo, KeyByLabelValues, StreamingConfig};
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
-// use crate::stores::promsketch_store::{
+// use crate::storage_engines::promsketch_store::{
 //     self, is_usampling_function, metrics as ps_metrics, PromSketchStore,
 // };
-use crate::stores::TimestampedBucketsMap;
+use crate::storage_engines::TimestampedBucketsMap;
 use core::panic;
 use promql_utilities::get_is_collapsable;
 use promql_utilities::query_logics::enums::{AggregationOperator, AggregationType, PromQLFunction};
@@ -251,7 +251,7 @@ pub struct ASAPQueryEngine {
     /// underlying `ArcSwap`, so when `main.rs` hands the same handle
     /// to both `ASAPQueryEngine` and `HttpServer::with_hot_reload_config`,
     /// a POST is immediately visible to the next query.
-    streaming_config_source: crate::stores::types::HotReloadStreamingConfig,
+    streaming_config_source: crate::storage_engines::types::HotReloadStreamingConfig,
     prometheus_scrape_interval: u64,
     controller_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>,
     /// Optional `ControllerClient` used to notify the DataCollector
@@ -263,7 +263,7 @@ pub struct ASAPQueryEngine {
     /// Per-`agg_id` schema registry used for §7 schema-timeline
     /// dispatch (`docs/design-sketch-db.md`). The combiner lives in
     /// [`crate::query_engines::timeline_dispatch`] and the lookup primitive
-    /// is exposed on [`crate::stores::sketch_db::SchemaRegistry`];
+    /// is exposed on [`crate::storage_engines::sketch_db::SchemaRegistry`];
     /// the engine consults the registry on every query to resolve
     /// which agg_id owns each sub-range of the query's time window.
     ///
@@ -272,7 +272,7 @@ pub struct ASAPQueryEngine {
     /// Production wire-up (`main.rs`) uses
     /// [`Self::with_schema_registry`] to share the same registry the
     /// ingest path is reconciling.
-    schema_registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
+    schema_registry: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
     /// Phase 5 — warm-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
@@ -280,7 +280,7 @@ pub struct ASAPQueryEngine {
     /// EngineRouter's archive failover (Phase 6). When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
-    sketch_index: Option<Arc<crate::stores::sketch_db::store::SketchStore>>,
+    sketch_index: Option<Arc<crate::storage_engines::sketch_db::store::SketchStore>>,
     /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
     /// `main.rs`'s engine builder. When the warm-tier reducer reports a
     /// `WarmTierResult.coverage` narrower than the requested
@@ -305,7 +305,7 @@ impl ASAPQueryEngine {
         streaming_config: Arc<StreamingConfig>,
         prometheus_scrape_interval: u64,
     ) -> Self {
-        let hot_reload = crate::stores::types::HotReloadStreamingConfig::from_arc(streaming_config);
+        let hot_reload = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config);
         Self::new_with_hot_reload(hot_reload, prometheus_scrape_interval)
     }
 
@@ -314,7 +314,7 @@ impl ASAPQueryEngine {
     /// the constructor `main.rs` should call so `POST /api/v1/streaming-config`
     /// is observable by the next query.
     pub fn new_with_hot_reload(
-        streaming_config_source: crate::stores::types::HotReloadStreamingConfig,
+        streaming_config_source: crate::storage_engines::types::HotReloadStreamingConfig,
         prometheus_scrape_interval: u64,
     ) -> Self {
         // Create temporal pattern blocks
@@ -454,7 +454,7 @@ impl ASAPQueryEngine {
             prometheus_scrape_interval,
             controller_patterns,
             controller_client: None,
-            schema_registry: Arc::new(crate::stores::sketch_db::SchemaRegistry::empty()),
+            schema_registry: Arc::new(crate::storage_engines::sketch_db::SchemaRegistry::empty()),
             sketch_index: None,
             archive_engine: None}
     }
@@ -477,7 +477,7 @@ impl ASAPQueryEngine {
     /// query through `handle_query`).
     pub fn with_sketch_index(
         mut self,
-        index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Self {
         self.sketch_index = Some(index);
         self
@@ -521,7 +521,7 @@ impl ASAPQueryEngine {
     /// same lifecycle transitions.
     pub fn with_schema_registry(
         mut self,
-        registry: Arc<crate::stores::sketch_db::SchemaRegistry>,
+        registry: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
     ) -> Self {
         self.schema_registry = registry;
         self
@@ -538,7 +538,7 @@ impl ASAPQueryEngine {
         metric: &str,
         t1_ms: u64,
         t2_ms: u64,
-    ) -> Vec<crate::stores::sketch_db::TimelineSegment> {
+    ) -> Vec<crate::storage_engines::sketch_db::TimelineSegment> {
         self.schema_registry
             .timeline_for_metric(metric, t1_ms, t2_ms)
     }
@@ -1045,7 +1045,7 @@ impl ASAPQueryEngine {
 
         // M2.3.6f — engine reads precomputes from SketchStore only.
         // The legacy `Store::query_precomputed_output*` fallback has
-        // been retired now that DualWriteSink (M2.3.4b) → SketchIndexSink
+        // been retired now that DualWriteSink (M2.3.4b) → SketchStoreSink
         // (M2.3.6a) writes exclusively to SketchStore and
         // BackfillService (M2.3.6e) mirrors replays there too.
         //
@@ -1750,11 +1750,11 @@ impl ASAPQueryEngine {
     pub(crate) fn accuracy_envelope_for(
         &self,
         agg_id: u64,
-    ) -> Option<crate::stores::sketch_db::AccuracyEnvelope> {
+    ) -> Option<crate::storage_engines::sketch_db::AccuracyEnvelope> {
         let snap = self.streaming_config_snapshot();
         let cfg = snap.get_aggregation_config(agg_id)?;
-        Some(crate::stores::sketch_db::AccuracyEnvelope::single(
-            crate::stores::sketch_db::AccuracyProfile::derive(cfg),
+        Some(crate::storage_engines::sketch_db::AccuracyEnvelope::single(
+            crate::storage_engines::sketch_db::AccuracyProfile::derive(cfg),
         ))
     }
 
@@ -2174,7 +2174,7 @@ impl ASAPQueryEngine {
     /// Caller: the per-segment dispatch in
     /// [`Self::try_handle_query_promql_via_timeline`]. For each
     /// `TimelineSegment` returned by
-    /// [`crate::stores::sketch_db::SchemaRegistry::timeline_for_metric`],
+    /// [`crate::storage_engines::sketch_db::SchemaRegistry::timeline_for_metric`],
     /// the dispatch builds a context targeting that segment's
     /// `agg_id`, executes it against the clipped segment range,
     /// collects the scalar, and combines across segments via
@@ -2340,7 +2340,7 @@ impl ASAPQueryEngine {
         time: f64,
     ) -> Option<(KeyByLabelNames, QueryResult)> {
         use crate::query_engines::timeline_dispatch::{combine_statistic, CombinedResult, SegmentValue};
-        use crate::stores::sketch_db::{TimelineCoverage, TimelineSegment};
+        use crate::storage_engines::sketch_db::{TimelineCoverage, TimelineSegment};
 
         // Phase 1: shared pipeline with the default path — parse,
         // pattern-match, auto-resolve a "probe" agg. We reuse the
@@ -2547,17 +2547,17 @@ impl ASAPQueryEngine {
         // to an in-config agg drop out — their partial-ness is
         // already reflected in `warnings` above.
         let snap = self.streaming_config_snapshot();
-        let per_segment: Vec<crate::stores::sketch_db::PerSegmentAccuracy> = segments
+        let per_segment: Vec<crate::storage_engines::sketch_db::PerSegmentAccuracy> = segments
             .iter()
             .filter_map(|seg| {
                 let cfg = snap.get_aggregation_config(seg.agg_id)?;
-                Some(crate::stores::sketch_db::PerSegmentAccuracy {
+                Some(crate::storage_engines::sketch_db::PerSegmentAccuracy {
                     agg_id: seg.agg_id,
                     range_ms: [seg.start_ms as i64, seg.end_ms as i64],
-                    profile: crate::stores::sketch_db::AccuracyProfile::derive(cfg)})
+                    profile: crate::storage_engines::sketch_db::AccuracyProfile::derive(cfg)})
             })
             .collect();
-        let envelope = crate::stores::sketch_db::AccuracyEnvelope::from_segments(per_segment);
+        let envelope = crate::storage_engines::sketch_db::AccuracyEnvelope::from_segments(per_segment);
 
         let qr = QueryResult::vector_with_warnings(output, probe_context.query_time, warnings);
         let qr = match envelope {
@@ -2572,7 +2572,7 @@ impl ASAPQueryEngine {
         precomputed_outputs_map: &TimestampedBucketsMap,
         do_merge: bool,
         aggregation_type: AggregationType,
-    ) -> HashMap<Option<KeyByLabelValues>, Box<dyn crate::stores::types::AggregateCore>> {
+    ) -> HashMap<Option<KeyByLabelValues>, Box<dyn crate::storage_engines::types::AggregateCore>> {
         #[cfg(feature = "extra_debugging")]
         let start_time = Instant::now();
         #[cfg(feature = "extra_debugging")]
@@ -2638,8 +2638,8 @@ impl ASAPQueryEngine {
     /// This follows the Python merge_accumulators approach
     fn merge_accumulators(
         &self,
-        accumulators: &[Box<dyn crate::stores::types::AggregateCore>],
-    ) -> Box<dyn crate::stores::types::AggregateCore> {
+        accumulators: &[Box<dyn crate::storage_engines::types::AggregateCore>],
+    ) -> Box<dyn crate::storage_engines::types::AggregateCore> {
         if accumulators.is_empty() {
             panic!("No accumulators to merge");
         }
@@ -3385,7 +3385,7 @@ fn warm_tier_result_to_query_result(
     result: crate::query_engines::asap_query_engine::warm_tier::WarmTierResult,
     _now_ms: u64,
 ) -> crate::query_engines::query_result::QueryResult {
-    use crate::stores::types::KeyByLabelValues;
+    use crate::storage_engines::types::KeyByLabelValues;
     use crate::query_engines::query_result::{QueryResult, RangeVectorElement};
 
     let mut elements: Vec<RangeVectorElement> = Vec::with_capacity(result.series.len());
@@ -3534,14 +3534,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `Capability` enum (defined in the controller and
                 // re-exported by `sketch_index`), so no `From`
                 // conversion is needed — just clone.
-                let required: crate::stores::sketch_db::store::Capability =
+                let required: crate::storage_engines::sketch_db::store::Capability =
                     candidate.required_capability.clone();
                 let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
                 for sid in &sids {
                     match idx.classify(*sid) {
-                        crate::stores::sketch_db::store::SidLookup::Hit => {}
-                        crate::stores::sketch_db::store::SidLookup::Ghost
-                        | crate::stores::sketch_db::store::SidLookup::Unknown => {
+                        crate::storage_engines::sketch_db::store::SidLookup::Hit => {}
+                        crate::storage_engines::sketch_db::store::SidLookup::Ghost
+                        | crate::storage_engines::sketch_db::store::SidLookup::Unknown => {
                             return Err(crate::query_engines::EngineError::capability_miss(
                                 asap_types::StorageBackend::SketchStore.data_source_id(),
                                 format!(
@@ -3710,7 +3710,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
 
 #[cfg(test)]
 mod range_query_tests {
-    use crate::stores::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+    use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
     use crate::query_engines::window_merger::NaiveMerger;
     use serde_json::Value;
     use std::any::Any;
@@ -4484,10 +4484,10 @@ mod range_query_tests {
 
 #[cfg(test)]
 mod sketch_query_tests {
-    // use crate::stores::types::{CleanupPolicy, StreamingConfig};
+    // use crate::storage_engines::types::{CleanupPolicy, StreamingConfig};
     // use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
-    // use crate::stores::promsketch_store::PromSketchStore;
-    // use crate::stores::TimestampedBucketsMap;
+    // use crate::storage_engines::promsketch_store::PromSketchStore;
+    // use crate::storage_engines::TimestampedBucketsMap;
     // use std::collections::HashMap;
     // use std::sync::Arc;
 
@@ -4515,16 +4515,16 @@ mod sketch_query_tests {
     //     }
     //     fn insert_precomputed_output(
     //         &self,
-    //         _: crate::stores::types::PrecomputedOutput,
-    //         _: Box<dyn crate::stores::types::AggregateCore>,
+    //         _: crate::storage_engines::types::PrecomputedOutput,
+    //         _: Box<dyn crate::storage_engines::types::AggregateCore>,
     //     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //         panic!("NoOpStore should not be called for sketch queries");
     //     }
     //     fn insert_precomputed_output_batch(
     //         &self,
     //         _: Vec<(
-    //             crate::stores::types::PrecomputedOutput,
-    //             Box<dyn crate::stores::types::AggregateCore>,
+    //             crate::storage_engines::types::PrecomputedOutput,
+    //             Box<dyn crate::storage_engines::types::AggregateCore>,
     //         )>,
     //     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     //         panic!("NoOpStore should not be called for sketch queries");
@@ -4727,13 +4727,13 @@ mod sketch_query_tests {
 #[cfg(test)]
 mod hot_reload_phase2_tests {
     use super::*;
-    use crate::stores::types::{
+    use crate::storage_engines::types::{
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
-    fn dummy_agg(id: u64, metric: &str) -> crate::stores::types::AggregationConfig {
-        crate::stores::types::AggregationConfig::new(
+    fn dummy_agg(id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+        crate::storage_engines::types::AggregationConfig::new(
             id,
             AggregationType::Sum,
             String::new(),
@@ -4861,7 +4861,7 @@ mod hot_reload_phase2_tests {
 #[cfg(test)]
 mod e2e_feedback_loop_tests {
     use super::*;
-    use crate::stores::types::{
+    use crate::storage_engines::types::{
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
     use crate::drivers::query::controller_client::ControllerClient;
@@ -4872,8 +4872,8 @@ mod e2e_feedback_loop_tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    fn agg_for_metric(id: u64, metric: &str) -> crate::stores::types::AggregationConfig {
-        crate::stores::types::AggregationConfig::new(
+    fn agg_for_metric(id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
+        crate::storage_engines::types::AggregationConfig::new(
             id,
             AggregationType::Sum,
             String::new(),
@@ -5184,7 +5184,7 @@ mod aux_pushdown_tests {
         inner_sum: f64,
         query_calls: Arc<AtomicUsize>}
 
-    impl crate::stores::types::SerializableToSink for SpyAccumulator {
+    impl crate::storage_engines::types::SerializableToSink for SpyAccumulator {
         fn serialize_to_bytes(&self) -> Vec<u8> {
             Vec::new()
         }
@@ -5230,16 +5230,16 @@ mod aux_pushdown_tests {
             self.query_calls.fetch_add(1, Ordering::Relaxed);
             Ok(-1.0) // sentinel: fast path should not return this
         }
-        fn aux_stats(&self) -> crate::stores::types::AuxStats {
-            crate::stores::types::AuxStats {
+        fn aux_stats(&self) -> crate::storage_engines::types::AuxStats {
+            crate::storage_engines::types::AuxStats {
                 sum: Some(self.inner_sum),
-                ..crate::stores::types::AuxStats::empty()
+                ..crate::storage_engines::types::AuxStats::empty()
             }
         }
     }
 
     fn make_engine() -> ASAPQueryEngine {
-        use crate::stores::types::{CleanupPolicy, HotReloadStreamingConfig, StreamingConfig};
+        use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig, StreamingConfig};
     
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
@@ -5485,7 +5485,7 @@ mod forced_agg_id_tests {
 #[cfg(test)]
 mod sketch_alias_resolver_tests {
     use super::*;
-    use crate::stores::types::{
+    use crate::storage_engines::types::{
         AggregationConfig, CleanupPolicy, HotReloadStreamingConfig,
         StreamingConfig, WindowType};
     use std::sync::Arc;
@@ -5864,16 +5864,16 @@ mod cms_rate_capability_tests {
 #[cfg(test)]
 mod warm_tier_classify_tests {
     use super::*;
-    use crate::stores::types::{CleanupPolicy, HotReloadStreamingConfig};
+    use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
     use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
-    use crate::stores::sketch_db::store::{
+    use crate::storage_engines::sketch_db::store::{
         AccuracyBound, Capability, SketchConfig, SketchStore, SketchInstanceMetadata,
         SketchKindHandle, SketchSampleState};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
-        let streaming_config = Arc::new(crate::stores::types::StreamingConfig::default());
+        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
         ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
     }
@@ -5889,7 +5889,7 @@ mod warm_tier_classify_tests {
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
             capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
-            agg_kind: crate::stores::sketch_db::store::AggKind::Sketch {
+            agg_kind: crate::storage_engines::sketch_db::store::AggKind::Sketch {
                 kind: SketchKindHandle::DDSketch,
                 config: cfg.clone(),
             },
@@ -5972,7 +5972,7 @@ mod warm_tier_classify_tests {
             (1_000, 1_010),
             SketchSampleState {
                 bytes: vec![0],
-                encoding: crate::stores::sketch_db::store::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::store::SketchEncoding::ProtoFull},
         );
 
         let engine = build_engine_with_index(idx);
@@ -5997,7 +5997,7 @@ mod warm_tier_classify_tests {
 #[cfg(test)]
 mod hybrid_stitch_tests {
     use super::stitch_warm_and_archive;
-    use crate::stores::types::KeyByLabelValues;
+    use crate::storage_engines::types::KeyByLabelValues;
     use crate::query_engines::query_result::{QueryResult, RangeVectorElement, Sample};
 
     fn matrix_with_samples(label: &str, samples: Vec<(u64, f64)>) -> QueryResult {

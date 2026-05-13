@@ -42,7 +42,7 @@
 
 use promql_utilities::query_logics::enums::Statistic;
 
-use crate::stores::sketch_db::TimelineSegment;
+use crate::storage_engines::sketch_db::TimelineSegment;
 
 /// Result of combining per-segment scalars for a single statistic.
 ///
@@ -161,7 +161,7 @@ pub fn combine_statistic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::sketch_db::{AggStatus, TimelineCoverage};
+    use crate::storage_engines::sketch_db::{AggStatus, TimelineCoverage};
 
     fn seg(agg_id: u64, start: u64, end: u64, status: AggStatus) -> TimelineSegment {
         TimelineSegment {

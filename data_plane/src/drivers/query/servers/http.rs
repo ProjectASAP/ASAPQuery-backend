@@ -156,10 +156,10 @@ pub struct HttpServer {
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
     query_router: Arc<EngineRouter>,
     /// M2.3.6g — SketchStore replaces `Arc<dyn Store>`.
-    sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+    sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
-    hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -185,12 +185,12 @@ pub struct HttpServer {
     /// server — in that case the `POST /api/v1/streaming-config`
     /// handler still swaps the config but doesn't drive schema
     /// lifecycle transitions.
-    schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
+    schemas: Option<Arc<crate::storage_engines::sketch_db::SchemaRegistry>>,
     /// Backfill registry (sketch DB §10). `None` until Phase 5e
     /// wires a worker pool; in the interim, jobs created via the
     /// HTTP endpoints stay `Queued` and are visible via the list
     /// endpoint — useful shadow-mode testing before workers exist.
-    backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
+    backfill: Option<Arc<crate::storage_engines::sketch_db::BackfillRegistry>>,
     /// SketchStore data-retention horizon in millis, mirroring
     /// `--persistence-delete-older-than-secs` at the CLI. Used by the
     /// `POST /api/v1/db/backfill` handler to gate job creation via
@@ -223,10 +223,10 @@ struct AppState {
     /// Phase 5 M2.3.6g — SketchStore replaces `Arc<dyn Store>` as the
     /// only data backend HTTP-side endpoints consult. Today the only
     /// consumer is the runtime-info handler.
-    sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+    sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
-    hot_reload_config: Option<crate::stores::types::HotReloadStreamingConfig>,
+    hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
@@ -235,9 +235,9 @@ struct AppState {
     /// event-driven instead of on every ingest batch. When absent,
     /// the swap handler leaves the registry alone (legacy
     /// per-batch reconcile still works).
-    schemas: Option<Arc<crate::stores::sketch_db::SchemaRegistry>>,
+    schemas: Option<Arc<crate::storage_engines::sketch_db::SchemaRegistry>>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
-    backfill: Option<Arc<crate::stores::sketch_db::BackfillRegistry>>,
+    backfill: Option<Arc<crate::storage_engines::sketch_db::BackfillRegistry>>,
     /// See `HttpServer::data_retention_ms`.
     data_retention_ms: Option<u64>,
     /// See [`HttpServer::probe_cache`].
@@ -249,7 +249,7 @@ impl HttpServer {
     pub fn new(
         config: HttpServerConfig,
         query_engine: Arc<ASAPQueryEngine>,
-        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Self {
         // Bootstrap the capability router with `ASAPQueryEngine`
         // registered under its canonical query-engine id.
@@ -304,7 +304,7 @@ impl HttpServer {
     /// endpoints return `503 Service Unavailable`.
     pub fn with_hot_reload_config(
         mut self,
-        handle: crate::stores::types::HotReloadStreamingConfig,
+        handle: crate::storage_engines::types::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
         self
@@ -329,7 +329,7 @@ impl HttpServer {
     /// `StreamingConfig::storage_backend()`.
     pub fn with_backend_storage_routing(
         mut self,
-        routing: Arc<crate::stores::types::BackendStorageRouting>,
+        routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
     ) -> Self {
         self.backend_storage_routing = Some(
             crate::query_engines::routing::HotReloadBackendStorageRouting::from_arc(routing),
@@ -359,7 +359,7 @@ impl HttpServer {
     /// event-driven rather than per-ingest-batch. Without the handle
     /// the registry still gets reconciled on the next ingest batch,
     /// just less promptly.
-    pub fn with_schemas(mut self, schemas: Arc<crate::stores::sketch_db::SchemaRegistry>) -> Self {
+    pub fn with_schemas(mut self, schemas: Arc<crate::storage_engines::sketch_db::SchemaRegistry>) -> Self {
         self.schemas = Some(schemas);
         self
     }
@@ -371,7 +371,7 @@ impl HttpServer {
     /// controller's REFRESH dispatch logic.
     pub fn with_backfill_registry(
         mut self,
-        registry: Arc<crate::stores::sketch_db::BackfillRegistry>,
+        registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
     ) -> Self {
         self.backfill = Some(registry);
         self
@@ -732,7 +732,7 @@ async fn process_query_request(
 ///
 /// v7: when the routing table has multi-target rows for the metric,
 /// the parsed AST is also classified via
-/// [`crate::stores::types::classify_query_shape`] and the lookup picks
+/// [`crate::storage_engines::types::classify_query_shape`] and the lookup picks
 /// the target whose `applies_to_query_shape` matches. v6.1
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
@@ -749,7 +749,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
         match promql_parser::parser::parse(query) {
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
-                    let shape = crate::stores::types::classify_query_shape(&expr);
+                    let shape = crate::storage_engines::types::classify_query_shape(&expr);
                     let backend = routing.lookup_with_shape(&metric_name, shape);
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
@@ -849,7 +849,7 @@ async fn try_answer_freshness_probe(
     );
 
     let element =
-        InstantVectorElement::new(crate::stores::types::KeyByLabelValues::new(), sample.value);
+        InstantVectorElement::new(crate::storage_engines::types::KeyByLabelValues::new(), sample.value);
     // The instant-vector timestamp is unix milliseconds — match the
     // adapter's expectations downstream (the Prometheus adapter
     // divides by 1000 to render the wire `value: [<unix_seconds>, ...]`).
@@ -1575,7 +1575,7 @@ async fn handle_metrics() -> impl IntoResponse {
     // mvp/v5: append the S3 cost counters in Prometheus text
     // exposition. Mirrors `/internal/s3_cost.csv` — the CSV is for
     // the demo, this is for live dashboards.
-    let counters = crate::stores::gorilla_object_store::global_s3_cost_counters();
+    let counters = crate::storage_engines::gorilla_object_store::global_s3_cost_counters();
     buffer.extend_from_slice(counters.render_prometheus().as_bytes());
     (
         [(
@@ -1592,7 +1592,7 @@ async fn handle_metrics() -> impl IntoResponse {
 /// operations have been issued (the counters default to zero, so
 /// the CSV is still well-formed).
 async fn handle_s3_cost_csv() -> impl IntoResponse {
-    let counters = crate::stores::gorilla_object_store::global_s3_cost_counters();
+    let counters = crate::storage_engines::gorilla_object_store::global_s3_cost_counters();
     (
         [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
         counters.render_csv(),
@@ -1768,7 +1768,7 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stores::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use crate::query_engines::ASAPQueryEngine;
     use reqwest::Client;
     use std::sync::Arc;
@@ -1796,7 +1796,7 @@ mod tests {
             15000,
         ));
 
-        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new()));
+        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()));
         if let Some(handle) = hot_reload {
             server = server.with_hot_reload_config(handle);
         }
@@ -2026,7 +2026,7 @@ aggregations:
     /// event-driven (sketch DB design §6).
     async fn setup_test_server_with_hot_reload_and_schemas(
         hot_reload: HotReloadStreamingConfig,
-        schemas: Arc<crate::stores::sketch_db::SchemaRegistry>,
+        schemas: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
     ) -> u16 {
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -2039,7 +2039,7 @@ aggregations:
             streaming_config.clone(),
             15000,
         ));
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_schemas(schemas);
         server
@@ -2050,7 +2050,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_streaming_config_swap_drives_schema_reconcile() {
-        use crate::stores::sketch_db::{AggStatus, SchemaRegistry};
+        use crate::storage_engines::sketch_db::{AggStatus, SchemaRegistry};
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let schemas = Arc::new(SchemaRegistry::empty());
@@ -2209,7 +2209,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_get_schemas_returns_active_and_retired_with_status_filter() {
-        use crate::stores::sketch_db::SchemaRegistry;
+        use crate::storage_engines::sketch_db::SchemaRegistry;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let schemas = Arc::new(SchemaRegistry::empty());
@@ -2358,7 +2358,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_get_timeline_returns_segments_after_reconfigure() {
-        use crate::stores::sketch_db::SchemaRegistry;
+        use crate::storage_engines::sketch_db::SchemaRegistry;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let schemas = Arc::new(SchemaRegistry::empty());
@@ -2433,7 +2433,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_get_timeline_missing_param_returns_400() {
-        use crate::stores::sketch_db::SchemaRegistry;
+        use crate::storage_engines::sketch_db::SchemaRegistry;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let schemas = Arc::new(SchemaRegistry::empty());
@@ -2496,7 +2496,7 @@ aggregations:
     /// requires both registries — tests that hit that endpoint must
     /// populate the schema side here.
     async fn setup_test_server_with_backfill_and_schemas(
-        registry: Arc<crate::stores::sketch_db::BackfillRegistry>,
+        registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
         active_agg_ids: &[u64],
     ) -> u16 {
         let adapter_config =
@@ -2538,9 +2538,9 @@ aggregations:
                 map.insert(*agg_id, cfg);
             }
             let sc = StreamingConfig::new(map);
-            Arc::new(crate::stores::sketch_db::SchemaRegistry::from_streaming_config(&sc))
+            Arc::new(crate::storage_engines::sketch_db::SchemaRegistry::from_streaming_config(&sc))
         };
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
             .with_backfill_registry(registry)
             .with_schemas(schemas);
         server
@@ -2551,7 +2551,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_full_lifecycle_through_http() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         let server_port =
             setup_test_server_with_backfill_and_schemas(registry.clone(), &[42]).await;
         let client = Client::new();
@@ -2634,7 +2634,7 @@ aggregations:
         assert!(resp.status().is_success());
         assert_eq!(
             registry.get(job_id).unwrap().status,
-            crate::stores::sketch_db::BackfillStatus::Cancelled
+            crate::storage_engines::sketch_db::BackfillStatus::Cancelled
         );
 
         // Second DELETE on already-cancelled job → 409 Conflict.
@@ -2650,7 +2650,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_post_rejects_inverted_range() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         let server_port = setup_test_server_with_backfill_and_schemas(registry, &[1]).await;
         let client = Client::new();
 
@@ -2671,7 +2671,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_get_unknown_job_returns_404() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
         let client = Client::new();
         let resp = client
@@ -2729,7 +2729,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_list_bogus_status_returns_400() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
         let client = Client::new();
         let resp = client
@@ -2746,7 +2746,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_post_unknown_agg_returns_404() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         // Empty schema registry — agg_id 42 is unknown.
         let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
         let client = Client::new();
@@ -2773,7 +2773,7 @@ aggregations:
 
     #[tokio::test]
     async fn test_backfill_post_overlap_with_live_ingest_returns_409() {
-        let registry = Arc::new(crate::stores::sketch_db::BackfillRegistry::new());
+        let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         // Schema registered at `now` — any `end_ms` > created_at_ms
         // overlaps live ingest.
         let server_port = setup_test_server_with_backfill_and_schemas(registry, &[7]).await;
@@ -2887,7 +2887,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
+            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
         for engine in extra_engines {
             server = server.with_query_engine(engine);
         }
@@ -2908,7 +2908,7 @@ aggregations:
     /// `setup_test_server_with_router` helper above which mocks the
     /// resolution by pinning `streaming_cfg.storage_backend` directly.
     async fn setup_test_server_with_routing_table(
-        routing: crate::stores::types::BackendStorageRouting,
+        routing: crate::storage_engines::types::BackendStorageRouting,
         extra_engines: Vec<Arc<dyn QueryEngine>>,
     ) -> u16 {
         let adapter_config =
@@ -2928,7 +2928,7 @@ aggregations:
             streaming_arc,
             15000,
         ));
-        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new()))
+        let mut server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_backend_storage_routing(Arc::new(routing));
         for engine in extra_engines {
@@ -3106,7 +3106,7 @@ aggregations:
         #[async_trait]
         impl QueryEngine for ExactStub {
             async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
-                use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
+                use crate::storage_engines::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
                 Ok(QueryResult::vector(Vec::new(), 0)
                     .with_accuracy(AccuracyEnvelope::single(AccuracyProfile::exact())))
             }
@@ -3222,7 +3222,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaObjectStore,
         );
-        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
             metrics,
         );
@@ -3265,7 +3265,7 @@ aggregations:
             "http_requests_total".to_string(),
             StorageBackend::GorillaObjectStore,
         );
-        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
             metrics,
         );
@@ -3295,7 +3295,7 @@ aggregations:
         // top-level `default: thanos_query` — every metric must
         // route through the router. Pins the §8 "all-metrics-archive"
         // deploy mode.
-        let routing = crate::stores::types::BackendStorageRouting::new_from_single_targets(
+        let routing = crate::storage_engines::types::BackendStorageRouting::new_from_single_targets(
             StorageBackend::GorillaObjectStore,
             std::collections::HashMap::new(),
         );
@@ -3333,7 +3333,7 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_count_lands_on_archive() {
-        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -3379,7 +3379,7 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_quantile_stays_on_warm_tier() {
-        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -3449,7 +3449,7 @@ aggregations:
     /// shape-classifier and dispatches to the explicitly named engine.
     #[tokio::test]
     async fn http_engine_override_header_routes_to_named_engine() {
-        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -3507,7 +3507,7 @@ aggregations:
     /// backwards-compatible.
     #[tokio::test]
     async fn http_engine_override_missing_uses_default_routing() {
-        use crate::stores::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -3655,7 +3655,7 @@ aggregations:
     /// the test can introspect the swap result.
     async fn setup_test_server_for_storage_routing(
     ) -> (u16, crate::query_engines::routing::HotReloadBackendStorageRouting) {
-        use crate::stores::types::{HotReloadStreamingConfig, StreamingConfig};
+        use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
         use crate::query_engines::routing::HotReloadBackendStorageRouting;
 
         let adapter_config =
@@ -3672,7 +3672,7 @@ aggregations:
             15000,
         ));
         let routing_handle = HotReloadBackendStorageRouting::empty();
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new()))
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new()))
             .with_hot_reload_config(hot_reload)
             .with_hot_reload_backend_storage_routing(routing_handle.clone());
         let port = server.start_test_server().await.expect("start ok");
@@ -3780,7 +3780,7 @@ aggregations:
         let (port, handle) = setup_test_server_for_storage_routing().await;
         // Pre-load the table.
         let new =
-            crate::stores::types::BackendStorageRouting::from_json_payload(&fixture_routing_json())
+            crate::storage_engines::types::BackendStorageRouting::from_json_payload(&fixture_routing_json())
                 .expect("parse");
         handle.swap(new);
 
@@ -3950,13 +3950,13 @@ aggregations:
         // the very next read.
         let snap = handle.snapshot();
         assert_eq!(
-            snap.lookup_with_shape("http_requests_total", crate::stores::types::QueryShape::Count,),
+            snap.lookup_with_shape("http_requests_total", crate::storage_engines::types::QueryShape::Count,),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             snap.lookup_with_shape(
                 "http_requests_total",
-                crate::stores::types::QueryShape::Quantile,
+                crate::storage_engines::types::QueryShape::Quantile,
             ),
             StorageBackend::SketchStore,
         );
@@ -4126,7 +4126,7 @@ aggregations:
             15000,
         ));
         let mut server =
-            HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
+            HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_hot_reload_config(hot_reload);
         for engine in engines {
             server = server.with_query_engine(engine);
         }
@@ -4170,7 +4170,7 @@ aggregations:
             15000,
         ));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::stores::sketch_db::store::SketchStore::new())).with_probe_cache(cache.clone());
+        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::store::SketchStore::new())).with_probe_cache(cache.clone());
         let port = server
             .start_test_server()
             .await
@@ -4750,7 +4750,7 @@ async fn handle_post_storage_routing(
             return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
-    let new_table = match crate::stores::types::BackendStorageRouting::from_json_payload(&json_value) {
+    let new_table = match crate::storage_engines::types::BackendStorageRouting::from_json_payload(&json_value) {
         Ok(t) => t,
         Err(e) => {
             let body = serde_json::json!({
@@ -4799,7 +4799,7 @@ async fn handle_get_schemas(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
-    use crate::stores::sketch_db::AggStatus;
+    use crate::storage_engines::sketch_db::AggStatus;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
@@ -4841,15 +4841,15 @@ async fn handle_get_schemas(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-fn status_str(s: crate::stores::sketch_db::AggStatus) -> &'static str {
-    use crate::stores::sketch_db::AggStatus;
+fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
+    use crate::storage_engines::sketch_db::AggStatus;
     match s {
         AggStatus::Active => "active",
         AggStatus::Retired => "retired",
         AggStatus::Expired => "expired"}
 }
 
-fn schema_to_json(s: &crate::stores::sketch_db::AggSchema) -> serde_json::Value {
+fn schema_to_json(s: &crate::storage_engines::sketch_db::AggSchema) -> serde_json::Value {
     serde_json::json!({
         "agg_id": s.agg_id,
         "metric_name": s.metric_name,
@@ -4924,8 +4924,8 @@ async fn handle_post_schema_expire(
     }
 }
 
-fn coverage_str(c: crate::stores::sketch_db::TimelineCoverage) -> &'static str {
-    use crate::stores::sketch_db::TimelineCoverage;
+fn coverage_str(c: crate::storage_engines::sketch_db::TimelineCoverage) -> &'static str {
+    use crate::storage_engines::sketch_db::TimelineCoverage;
     match c {
         TimelineCoverage::Sketch => "sketch",
         TimelineCoverage::Purged => "purged"}
@@ -5018,11 +5018,11 @@ struct CreateBackfillJobRequest {
     agg_id: u64,
     start_ms: u64,
     end_ms: u64,
-    source: crate::stores::sketch_db::BackfillSource,
+    source: crate::storage_engines::sketch_db::BackfillSource,
     windows_total: u64}
 
-fn backfill_status_str(s: &crate::stores::sketch_db::BackfillStatus) -> &'static str {
-    use crate::stores::sketch_db::BackfillStatus;
+fn backfill_status_str(s: &crate::storage_engines::sketch_db::BackfillStatus) -> &'static str {
+    use crate::storage_engines::sketch_db::BackfillStatus;
     match s {
         BackfillStatus::Queued => "queued",
         BackfillStatus::Running => "running",
@@ -5031,7 +5031,7 @@ fn backfill_status_str(s: &crate::stores::sketch_db::BackfillStatus) -> &'static
         BackfillStatus::Cancelled => "cancelled"}
 }
 
-fn backfill_job_to_json(job: &crate::stores::sketch_db::BackfillJob) -> serde_json::Value {
+fn backfill_job_to_json(job: &crate::storage_engines::sketch_db::BackfillJob) -> serde_json::Value {
     serde_json::json!({
         "job_id": job.job_id,
         "agg_id": job.agg_id,
@@ -5072,7 +5072,7 @@ async fn handle_post_backfill_job(
     State(state): State<AppState>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
-    use crate::stores::sketch_db::CreateError;
+    use crate::storage_engines::sketch_db::CreateError;
     use axum::response::IntoResponse;
 
     let Some(registry) = state.backfill else {
@@ -5139,7 +5139,7 @@ async fn handle_get_backfill_jobs(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
-    use crate::stores::sketch_db::BackfillStatus;
+    use crate::storage_engines::sketch_db::BackfillStatus;
     use axum::response::IntoResponse;
 
     let Some(registry) = state.backfill else {

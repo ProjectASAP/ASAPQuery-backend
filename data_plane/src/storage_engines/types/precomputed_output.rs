@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::stores::types::KeyByLabelValues;
+use crate::storage_engines::types::KeyByLabelValues;
 
 /// Provenance tag stamped on every `PrecomputedOutput`: did this
 /// window come from live ingest or was it materialised by a backfill
@@ -12,7 +12,7 @@ use crate::stores::types::KeyByLabelValues;
 ///
 /// Read-side consumers (HTTP listing of backfilled windows, coverage
 /// UI, audit logs) belong to the backfill subsystem under
-/// [`crate::stores::sketch_db::backfill`]; today this field is
+/// [`crate::storage_engines::sketch_db::backfill`]; today this field is
 /// written but no production read site branches on it yet. Recording
 /// it eagerly means a window written before the read-side consumer
 /// lands still carries its `job_id` — readers can recover history,
@@ -61,7 +61,7 @@ impl PrecomputedOutput {
     }
 
     /// Construct a `Backfilled { job_id }` precompute. Called by
-    /// [`crate::stores::sketch_db::backfill::processor::BackfillWindowProcessor`]
+    /// [`crate::storage_engines::sketch_db::backfill::processor::BackfillWindowProcessor`]
     /// so each backfilled window carries its provenance back to the
     /// originating `BackfillJob`.
     pub fn new_backfilled(

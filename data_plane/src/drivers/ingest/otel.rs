@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::stores::types::AggregateCore;
+use crate::storage_engines::types::AggregateCore;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
 use crate::precompute_engine::operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
@@ -721,7 +721,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                 // then route each tuple through the same dispatcher.
                 let dps: Vec<ModifiedOtlpSketchDp> = match &metric.data {
                     Some(Data::Ddsketch(d)) => {
-                        let cfg = crate::stores::sketch_db::store::SketchConfig::DDSketch {
+                        let cfg = crate::storage_engines::sketch_db::store::SketchConfig::DDSketch {
                             relative_accuracy: d.relative_accuracy,
                         };
                         d.data_points
@@ -739,7 +739,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Kllsketch(k)) => {
-                        let cfg = crate::stores::sketch_db::store::SketchConfig::Kll { k: k.k };
+                        let cfg = crate::storage_engines::sketch_db::store::SketchConfig::Kll { k: k.k };
                         k.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
@@ -755,7 +755,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Countsketch(c)) => {
-                        let cfg = crate::stores::sketch_db::store::SketchConfig::CountSketch {
+                        let cfg = crate::storage_engines::sketch_db::store::SketchConfig::CountSketch {
                             rows: c.rows,
                             cols: c.cols,
                         };
@@ -774,7 +774,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Countminsketch(c)) => {
-                        let cfg = crate::stores::sketch_db::store::SketchConfig::CountMin {
+                        let cfg = crate::storage_engines::sketch_db::store::SketchConfig::CountMin {
                             rows: c.rows,
                             cols: c.cols,
                         };
@@ -793,7 +793,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Hllsketch(h)) => {
-                        let cfg = crate::stores::sketch_db::store::SketchConfig::Hll {
+                        let cfg = crate::storage_engines::sketch_db::store::SketchConfig::Hll {
                             precision: h.precision,
                         };
                         h.data_points
@@ -858,7 +858,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             }
                         }
                     } else {
-                        let computed = crate::stores::sketch_db::store::compute_sketch_sid(
+                        let computed = crate::storage_engines::sketch_db::store::compute_sketch_sid(
                             &metric.name,
                             &fp,
                             kind_for_sid,
@@ -884,7 +884,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // rollup, `attributes` is the group-by VALUES vector,
                     // and its key set IS the group-by KEY set.
                     {
-                        use crate::stores::sketch_db::store::{
+                        use crate::storage_engines::sketch_db::store::{
                             AccuracyBound, Capability, SketchEncoding, SketchInstanceMetadata,
                             SketchKindHandle, SketchSampleState,
                         };
@@ -935,7 +935,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 metric_name: metric.name.clone(),
                                 group_by_keys,
                                 capability: Some(cap),
-                                agg_kind: crate::stores::sketch_db::store::AggKind::Sketch {
+                                agg_kind: crate::storage_engines::sketch_db::store::AggKind::Sketch {
                                     kind,
                                     config: cfg.clone(),
                                 },
@@ -951,7 +951,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
-                        let window: crate::stores::sketch_db::store::epoch_columnar::TimestampRange = (
+                        let window: crate::storage_engines::sketch_db::store::epoch_columnar::TimestampRange = (
                             dp.start_time_unix_nano / 1_000_000,
                             dp.time_unix_nano / 1_000_000,
                         );
@@ -1123,8 +1123,8 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// directly for `topk` / `topk_over_time` queries.
 fn sketch_kind_handle_for(
     dp: &ModifiedOtlpSketchDp,
-) -> crate::stores::sketch_db::store::SketchKindHandle {
-    use crate::stores::sketch_db::store::SketchKindHandle;
+) -> crate::storage_engines::sketch_db::store::SketchKindHandle {
+    use crate::storage_engines::sketch_db::store::SketchKindHandle;
     match dp.kind {
         SketchKind::DdSketch => SketchKindHandle::DDSketch,
         SketchKind::Kll => SketchKindHandle::Kll,
@@ -1155,8 +1155,8 @@ fn sketch_kind_handle_for(
 /// SketchStore's `SketchEncoding` enum. Returns `None` for the unset
 /// (0) encoding so callers can default to `ProtoFull` (the dominant
 /// case for full-state frames).
-fn encoding_to_handle(encoding: i32) -> Option<crate::stores::sketch_db::store::SketchEncoding> {
-    use crate::stores::sketch_db::store::SketchEncoding;
+fn encoding_to_handle(encoding: i32) -> Option<crate::storage_engines::sketch_db::store::SketchEncoding> {
+    use crate::storage_engines::sketch_db::store::SketchEncoding;
     match encoding {
         ENCODING_PROTO => Some(SketchEncoding::ProtoFull),
         ENCODING_PROTO_DELTA => Some(SketchEncoding::ProtoDelta),
@@ -1198,7 +1198,7 @@ struct ModifiedOtlpSketchDp {
     /// Phase 5 — sketch-instance configuration lifted off the parent
     /// container. Drives `SketchInstanceMetadata.sketch_config` and the
     /// derived `AccuracyBound`.
-    container_config: crate::stores::sketch_db::store::SketchConfig,
+    container_config: crate::storage_engines::sketch_db::store::SketchConfig,
 }
 
 /// Decode the typed `sketch` bytes from a modified-OTLP
@@ -1772,7 +1772,7 @@ fn attributes_to_map(
 #[cfg(test)]
 mod dispatcher_tests {
     use super::*;
-    use crate::stores::types::AggregateCore;
+    use crate::storage_engines::types::AggregateCore;
     use crate::precompute_engine::operators::{DDSketchAccumulator, HllSketchAccumulator};
     use asap_sketchlib::sketches::ddsketch::DdSketch;
     use asap_sketchlib::sketches::hll::HllVariant;
@@ -1897,11 +1897,11 @@ mod dispatcher_tests {
 #[cfg(test)]
 mod sid_resolution_tests {
     use super::*;
-    use crate::stores::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::stores::sketch_db::SchemaRegistry;
-    use crate::stores::sketch_db::store::SketchStore;
+    use crate::storage_engines::sketch_db::SchemaRegistry;
+    use crate::storage_engines::sketch_db::store::SketchStore;
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -2022,7 +2022,7 @@ mod sid_resolution_tests {
 
     #[tokio::test]
     async fn sid_attrs_disagreement_signals_stale_sid_but_uses_resolved_value() {
-        use crate::stores::sketch_db::store::{compute_sketch_sid, SketchConfig, SketchKindHandle};
+        use crate::storage_engines::sketch_db::store::{compute_sketch_sid, SketchConfig, SketchKindHandle};
 
         let (state, drain) = make_state().await;
         // First, register the sid by sending sid=0 with attrs. Sketch

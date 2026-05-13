@@ -21,7 +21,7 @@
 //!
 //! Result wrapping pins three things:
 //!
-//! 1. an [`crate::stores::sketch_db::AccuracyEnvelope`] with
+//! 1. an [`crate::storage_engines::sketch_db::AccuracyEnvelope`] with
 //!    `kind = Exact`, ε = 0, δ = 0,
 //! 2. a `data_source: thanos_query` info line,
 //! 3. cheap diagnostics (`samples_scanned`, `chunks_fetched`).
@@ -56,9 +56,9 @@ use thiserror::Error;
 use tokio::time::error::Elapsed;
 use tracing::debug;
 
-use crate::stores::types::KeyByLabelValues;
+use crate::storage_engines::types::KeyByLabelValues;
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
-use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
+use crate::storage_engines::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
 pub use archive_query::{
     plan_query, plan_query_at, AdditiveOp, ExactExecutor, LabelMatcher, QueryPlan, QueryStatistic,

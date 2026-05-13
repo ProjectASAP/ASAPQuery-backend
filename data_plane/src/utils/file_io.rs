@@ -1,4 +1,4 @@
-use crate::stores::types::StreamingConfig;
+use crate::storage_engines::types::StreamingConfig;
 use anyhow::{Context, Result};
 
 pub fn read_streaming_config(yaml_file: &str) -> Result<StreamingConfig> {

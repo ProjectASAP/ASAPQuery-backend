@@ -1,4 +1,4 @@
-use crate::stores::types::{
+use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
@@ -257,7 +257,7 @@ impl CountMinSketchAccumulator {
 
     /// Merge multiple accumulators efficiently without cloning all of them.
     pub fn merge_multiple(
-        accumulators: &[Box<dyn crate::stores::types::AggregateCore>],
+        accumulators: &[Box<dyn crate::storage_engines::types::AggregateCore>],
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if accumulators.is_empty() {
             return Err("No accumulators to merge".into());
@@ -374,7 +374,7 @@ impl AggregateCore for CountMinSketchAccumulator {
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use crate::stores::types::MultipleSubpopulationAggregate;
+        use crate::storage_engines::types::MultipleSubpopulationAggregate;
         use promql_utilities::query_logics::enums::Statistic;
 
         // Key-provided path: route to MultipleSubpopulationAggregate::query

@@ -1,7 +1,7 @@
 use super::config::AdapterConfig;
 use super::prometheus_http::PrometheusHttpAdapter;
 use super::traits::HttpProtocolAdapter;
-use crate::stores::types::enums::QueryProtocol;
+use crate::storage_engines::types::enums::QueryProtocol;
 use std::sync::Arc;
 
 /// Factory function to create appropriate HTTP adapter based on protocol

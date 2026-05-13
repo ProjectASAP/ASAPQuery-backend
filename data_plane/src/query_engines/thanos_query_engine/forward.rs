@@ -17,9 +17,9 @@
 //!   the answer is wrapped in ASAP's standard
 //!   [`crate::query_engines::QueryResult`] shape.
 //! * **Legacy mode** (env unset) — the in-process
-//!   [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+//!   [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`]
 //!   handles archive queries from the per-hour Gorilla chunks that
-//!   [`crate::stores::gorilla_object_store::GorillaS3Store`] streams
+//!   [`crate::storage_engines::gorilla_object_store::GorillaS3Store`] streams
 //!   from S3 / MinIO.
 //!   Phase δ deletes this leg after Path A2 is verified
 //!   end-to-end.
@@ -39,10 +39,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::stores::types::KeyByLabelValues;
+use crate::storage_engines::types::KeyByLabelValues;
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
 use crate::query_engines::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
-use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
+use crate::storage_engines::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 
 // ---------------------------------------------------------------------------
 // Public constants.
@@ -55,7 +55,7 @@ use crate::stores::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
 /// Env var consulted at backend startup. When set, the binary
 /// registers a [`ThanosQueryEngine`] pointing at the URL and the
 /// router dispatches archive-tier queries to it. When unset, the
-/// legacy in-process [`crate::stores::gorilla_object_store::GorillaQueryEngine`]
+/// legacy in-process [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`]
 /// handles archive queries.
 pub const ASAP_THANOS_QUERY_URL_ENV: &str = "ASAP_THANOS_QUERY_URL";
 
@@ -536,7 +536,7 @@ pub enum ThanosQueryError {
 /// Convenience combinator the binary uses at startup: try
 /// [`ThanosQueryEngine::from_env`]; if it returns `None`, the
 /// caller falls through to the legacy in-process
-/// [`crate::stores::gorilla_object_store::GorillaQueryEngine`] path.
+/// [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`] path.
 ///
 /// Returning `Result<Option<...>, ...>` instead of unwrapping in
 /// `main.rs` keeps the construction failure (bad URL / bad TLS

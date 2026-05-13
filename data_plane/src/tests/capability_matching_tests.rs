@@ -4,14 +4,14 @@
 //! the engine falls back to searching StreamingConfig by capability, and that
 //! the existing query_config path still takes priority when an entry is present.
 
-use crate::stores::types::{
+use crate::storage_engines::types::{
     AggregationConfig, AggregationType, PrecomputedOutput, StreamingConfig, WindowType};
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
 use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-use crate::stores::sketch_db::store::SketchStore;
+use crate::storage_engines::sketch_db::store::SketchStore;
 use promql_utilities::data_model::KeyByLabelNames;
 use std::collections::HashMap;
 use std::sync::Arc;

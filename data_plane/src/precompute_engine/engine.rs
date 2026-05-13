@@ -1,4 +1,4 @@
-use crate::stores::types::HotReloadStreamingConfig;
+use crate::storage_engines::types::HotReloadStreamingConfig;
 use crate::precompute_engine::config::PrecomputeEngineConfig;
 use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::output_sink::OutputSink;
@@ -39,7 +39,7 @@ impl PrecomputeEngine {
         hot_reload_config: HotReloadStreamingConfig,
         output_sink: Arc<dyn OutputSink>,
         series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
-        sketch_index: Arc<crate::stores::sketch_db::store::SketchStore>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::store::SketchStore>,
     ) -> Self {
         let worker_group_counts = (0..config.num_workers)
             .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -78,11 +78,11 @@ impl PrecomputeEngine {
         // event-driven instead of per-batch.
         let initial_snapshot = hot_reload_config.snapshot();
         let schemas = Arc::new(match config.schema_persist_path.as_ref() {
-            Some(path) => crate::stores::sketch_db::SchemaRegistry::load_or_new_from_config(
+            Some(path) => crate::storage_engines::sketch_db::SchemaRegistry::load_or_new_from_config(
                 path.clone(),
                 initial_snapshot.as_ref(),
             ),
-            None => crate::stores::sketch_db::SchemaRegistry::from_streaming_config(
+            None => crate::storage_engines::sketch_db::SchemaRegistry::from_streaming_config(
                 initial_snapshot.as_ref(),
             ),
         });
