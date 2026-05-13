@@ -180,12 +180,6 @@ pub struct HttpServer {
     /// (`handle.snapshot().lookup_with_shape(...)`); swap is observed
     /// by the next request without restart.
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
-    /// Per-`agg_id` schema registry (sketch DB §6). `None` when the
-    /// caller hasn't wired the precompute engine into the HTTP
-    /// server — in that case the `POST /api/v1/streaming-config`
-    /// handler still swaps the config but doesn't drive schema
-    /// lifecycle transitions.
-    schemas: Option<Arc<crate::storage_engines::sketch_db::SchemaRegistry>>,
     /// Backfill registry (sketch DB §10). `None` until Phase 5e
     /// wires a worker pool; in the interim, jobs created via the
     /// HTTP endpoints stay `Queued` and are visible via the list
@@ -229,13 +223,6 @@ struct AppState {
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
-    /// Per-`agg_id` schema registry (sketch DB §6). Phase 2b wires
-    /// `POST /api/v1/streaming-config` to call `schemas.reconcile()`
-    /// on every swap so schema lifecycle transitions happen
-    /// event-driven instead of on every ingest batch. When absent,
-    /// the swap handler leaves the registry alone (legacy
-    /// per-batch reconcile still works).
-    schemas: Option<Arc<crate::storage_engines::sketch_db::SchemaRegistry>>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
     backfill: Option<Arc<crate::storage_engines::sketch_db::BackfillRegistry>>,
     /// See `HttpServer::data_retention_ms`.
@@ -263,7 +250,6 @@ impl HttpServer {
             sketch_index,
             hot_reload_config: None,
             backend_storage_routing: None,
-            schemas: None,
             backfill: None,
             data_retention_ms: None,
             probe_cache: None,
@@ -351,19 +337,6 @@ impl HttpServer {
         self
     }
 
-    /// Attach the `SchemaRegistry` that the precompute engine's
-    /// `IngestState` also holds. When attached, the
-    /// `POST /api/v1/streaming-config` handler calls
-    /// `schemas.reconcile(new_config)` after the ArcSwap store, so
-    /// schema lifecycle transitions (§6 of the sketch DB design) are
-    /// event-driven rather than per-ingest-batch. Without the handle
-    /// the registry still gets reconciled on the next ingest batch,
-    /// just less promptly.
-    pub fn with_schemas(mut self, schemas: Arc<crate::storage_engines::sketch_db::SchemaRegistry>) -> Self {
-        self.schemas = Some(schemas);
-        self
-    }
-
     /// Attach a `BackfillRegistry` so the `/api/v1/db/backfill`
     /// HTTP endpoints (Phase 5d) can create and inspect jobs. Jobs
     /// stay `Queued` until Phase 5e's worker pool is wired; the
@@ -435,7 +408,6 @@ impl HttpServer {
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
-            schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
@@ -484,11 +456,11 @@ impl HttpServer {
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route(
-                "/api/v1/db/schemas/:agg_id/retire",
+                "/api/v1/db/schemas/:sid/retire",
                 post(handle_post_schema_retire),
             )
             .route(
-                "/api/v1/db/schemas/:agg_id/expire",
+                "/api/v1/db/schemas/:sid/expire",
                 post(handle_post_schema_expire),
             )
             .route("/api/v1/db/timeline", get(handle_get_timeline))
@@ -526,7 +498,6 @@ impl HttpServer {
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
-            schemas: self.schemas.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
@@ -553,11 +524,11 @@ impl HttpServer {
             )
             .route("/api/v1/db/schemas", get(handle_get_schemas))
             .route(
-                "/api/v1/db/schemas/:agg_id/retire",
+                "/api/v1/db/schemas/:sid/retire",
                 post(handle_post_schema_retire),
             )
             .route(
-                "/api/v1/db/schemas/:agg_id/expire",
+                "/api/v1/db/schemas/:sid/expire",
                 post(handle_post_schema_expire),
             )
             .route("/api/v1/db/timeline", get(handle_get_timeline))
@@ -2020,13 +1991,16 @@ aggregations:
         assert_eq!(body["status"], "error");
     }
 
-    /// Set up a test server with both a hot-reload handle AND a schema
-    /// registry attached. Proves the Phase 2b wiring: a swap through
-    /// the HTTP handler drives schema lifecycle transitions
-    /// event-driven (sketch DB design §6).
-    async fn setup_test_server_with_hot_reload_and_schemas(
+    /// Set up a test server wired with a hot-reload handle and a
+    /// shared `SketchStore` (the sid catalog the new sid-level
+    /// reconcile reads + writes). Returns `(port, sketch_index)` so
+    /// tests can pre-register sids or inspect the catalog after a
+    /// streaming-config swap. Schema retirement final cut: the
+    /// legacy `SchemaRegistry` is gone, so there is no longer a
+    /// `schemas` parameter — every reconcile decision is sid-level.
+    async fn setup_test_server_with_hot_reload_and_sketch_index(
         hot_reload: HotReloadStreamingConfig,
-        schemas: Arc<crate::storage_engines::sketch_db::SchemaRegistry>,
+        sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> u16 {
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -2039,33 +2013,74 @@ aggregations:
             streaming_config.clone(),
             15000,
         ));
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
-            .with_hot_reload_config(hot_reload)
-            .with_schemas(schemas);
+        let server = HttpServer::new(config, query_engine, sketch_index)
+            .with_hot_reload_config(hot_reload);
         server
             .start_test_server()
             .await
             .expect("Failed to start test server")
     }
 
+    /// Helper that mints a Precompute-`Sum` sid registered as Active
+    /// against the supplied `(metric, group_by)` signature. Tests
+    /// pre-populate the sid catalog so the streaming-config swap
+    /// handler has something concrete to reconcile.
+    fn register_precompute_sid(
+        store: &crate::storage_engines::sketch_db::index::SketchStore,
+        sid: u64,
+        metric: &str,
+        group_by: &[&str],
+    ) {
+        use crate::storage_engines::sketch_db::data::AggKind;
+        use crate::storage_engines::sketch_db::index::SketchInstanceMetadata;
+        use std::collections::BTreeSet;
+        let group_by_keys: BTreeSet<String> =
+            group_by.iter().map(|s| s.to_string()).collect();
+        store.register(SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys,
+            capability: None,
+            agg_kind: AggKind::Precompute {
+                agg_type: asap_types::enums::AggregationType::Sum,
+                parameters_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+        });
+    }
+
     #[tokio::test]
-    async fn test_streaming_config_swap_drives_schema_reconcile() {
-        use crate::storage_engines::sketch_db::{AggStatus, SchemaRegistry};
+    async fn test_streaming_config_swap_drives_sid_reconcile() {
+        // Schema retirement final cut: the swap handler now drives a
+        // single sid-level reconcile (no `SchemaRegistry`). Sids that
+        // already exist in the catalog and whose content signature
+        // does not appear in the new config get force-retired; the
+        // response surfaces them under `sids_retired`. There is no
+        // `sids_added` — sids are minted lazily by the ingest path,
+        // not by the swap handler.
+        use crate::storage_engines::sketch_db::AggStatus;
+        use crate::storage_engines::sketch_db::index::SketchStore;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let schemas = Arc::new(SchemaRegistry::empty());
-        let server_port =
-            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
-                .await;
+        let sketch_index = Arc::new(SketchStore::new());
+        // Pre-register two Active sids whose signatures match the
+        // first config below; only sid 1 will survive the second
+        // swap.
+        register_precompute_sid(&sketch_index, 1, "cpu_usage", &["host"]);
+        register_precompute_sid(&sketch_index, 2, "mem_usage", &["host"]);
+        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
+            hot_reload.clone(),
+            sketch_index.clone(),
+        )
+        .await;
         let client = Client::new();
 
-        // Empty registry at start.
-        assert!(!schemas.is_writable(101));
-        assert!(!schemas.is_writable(202));
-
-        // POST a config with two agg_ids — the handler should swap
-        // the config AND reconcile the registry.
-        let yaml = r#"
+        // POST a config whose signatures cover both pre-registered
+        // sids. Nothing should retire.
+        let yaml_two = r#"
 aggregations:
   - aggregationId: 101
     aggregationType: Sum
@@ -2097,40 +2112,34 @@ aggregations:
                 "http://127.0.0.1:{server_port}/api/v1/streaming-config"
             ))
             .header("content-type", "application/x-yaml")
-            .body(yaml.to_string())
+            .body(yaml_two.to_string())
             .send()
             .await
             .expect("POST failed");
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        // The new field from Phase 2b.
-        let created = body["schemas_created"]
+        let retired_ids = body["sids_retired"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap())
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(
-            created,
-            std::collections::HashSet::from([101u64, 202u64]),
-            "expected both agg_ids in schemas_created"
+            .collect::<Vec<_>>();
+        assert!(
+            retired_ids.is_empty(),
+            "no sid should retire when every signature still appears in the new config; got {retired_ids:?}",
         );
+        assert_eq!(sketch_index.instance(1).unwrap().status(), AggStatus::Active);
+        assert_eq!(sketch_index.instance(2).unwrap().status(), AggStatus::Active);
 
-        // Registry now has Active schemas for both ids.
-        assert!(schemas.is_writable(101));
-        assert!(schemas.is_writable(202));
-        assert_eq!(schemas.get(101).unwrap().status(), AggStatus::Active);
-        assert_eq!(schemas.get(202).unwrap().status(), AggStatus::Active);
-
-        // Swap to a config that removes 101. Schema 101 should be
-        // Retired (§6.3 barrier: is_writable(101) now false).
-        let yaml2 = r#"
+        // Swap to a config that drops `mem_usage`. Sid 2's signature
+        // is now orphaned; the handler must force-retire it.
+        let yaml_one = r#"
 aggregations:
-  - aggregationId: 202
+  - aggregationId: 101
     aggregationType: Sum
     aggregationSubType: ''
-    metric: mem_usage
+    metric: cpu_usage
     labels:
       grouping: [host]
       rollup: []
@@ -2145,32 +2154,29 @@ aggregations:
                 "http://127.0.0.1:{server_port}/api/v1/streaming-config"
             ))
             .header("content-type", "application/x-yaml")
-            .body(yaml2.to_string())
+            .body(yaml_one.to_string())
             .send()
             .await
             .expect("POST failed");
         let body2: serde_json::Value = resp2.json().await.unwrap();
-        let retired = body2["schemas_retired"]
+        let retired = body2["sids_retired"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_u64().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(retired, vec![101u64]);
-
-        assert!(
-            !schemas.is_writable(101),
-            "101 retired, should be unwritable"
-        );
-        assert!(schemas.is_writable(202), "202 still active");
-        assert_eq!(schemas.get(101).unwrap().status(), AggStatus::Retired);
+        assert_eq!(retired, vec![2u64]);
+        assert_eq!(sketch_index.instance(1).unwrap().status(), AggStatus::Active);
+        assert_eq!(sketch_index.instance(2).unwrap().status(), AggStatus::Retired);
     }
 
     #[tokio::test]
-    async fn test_streaming_config_swap_without_schemas_still_succeeds() {
-        // If the HttpServer isn't wired with a schema registry, the
-        // swap handler still works — it just omits schemas_created
-        // and schemas_retired from the response.
+    async fn test_streaming_config_swap_response_shape_with_empty_catalog() {
+        // With no registered sids, the swap still works — it just
+        // produces an empty `sids_retired` array. The `agg_ids_added`
+        // / `agg_ids_removed` / `new_aggregation_count` fields are
+        // driven purely by the diff of the two configs and are
+        // independent of the sid catalog.
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
@@ -2202,58 +2208,33 @@ aggregations:
         assert!(resp.status().is_success());
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["status"], "success");
-        // Without a registry, the arrays are empty (not missing).
-        assert_eq!(body["schemas_created"].as_array().unwrap().len(), 0);
-        assert_eq!(body["schemas_retired"].as_array().unwrap().len(), 0);
+        assert_eq!(body["new_aggregation_count"], 1);
+        assert_eq!(body["agg_ids_added"], serde_json::json!([42]));
+        assert_eq!(body["agg_ids_removed"], serde_json::json!([]));
+        // No pre-registered sids → nothing to retire.
+        assert_eq!(body["sids_retired"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
-    async fn test_get_schemas_returns_active_and_retired_with_status_filter() {
-        use crate::storage_engines::sketch_db::SchemaRegistry;
+    async fn test_get_schemas_returns_active_and_retired_sids_with_status_filter() {
+        // Schema retirement final cut: `/api/v1/db/schemas` now
+        // surfaces sid-catalog entries. Pre-register two sids, then
+        // POST a streaming config that orphans one — the swap
+        // handler force-retires it.
+        use crate::storage_engines::sketch_db::index::SketchStore;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let schemas = Arc::new(SchemaRegistry::empty());
-        let server_port =
-            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
-                .await;
+        let sketch_index = Arc::new(SketchStore::new());
+        register_precompute_sid(&sketch_index, 1, "m1", &[]);
+        register_precompute_sid(&sketch_index, 2, "m2", &[]);
+        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
+            hot_reload.clone(),
+            sketch_index.clone(),
+        )
+        .await;
         let client = Client::new();
 
-        // Push an initial config with two aggregations; then swap to
-        // one, retiring the other. Exercises Active + Retired side by
-        // side in the response.
-        let yaml_two = r#"
-aggregations:
-  - aggregationId: 1
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: m1
-    labels: { grouping: [], rollup: [], aggregated: [] }
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-  - aggregationId: 2
-    aggregationType: Sum
-    aggregationSubType: ''
-    metric: m2
-    labels: { grouping: [], rollup: [], aggregated: [] }
-    parameters: {}
-    windowSize: 60
-    windowType: tumbling
-    spatialFilter: ''
-"#;
-        let resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/streaming-config"
-            ))
-            .header("content-type", "application/x-yaml")
-            .body(yaml_two.to_string())
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.status().is_success());
-
-        // Retire agg 2 by pushing a config with only agg 1.
+        // Retire sid 2 by pushing a config covering only `m1`.
         let yaml_one = r#"
 aggregations:
   - aggregationId: 1
@@ -2288,23 +2269,14 @@ aggregations:
         assert_eq!(body["status"], "success");
         assert_eq!(body["count"], 2);
         let entries = body["schemas"].as_array().unwrap();
-        // Sorted by agg_id — first is active, second is retired.
-        assert_eq!(entries[0]["agg_id"], 1);
+        // Sorted by sid — first is active, second is retired.
+        assert_eq!(entries[0]["sid"], 1);
         assert_eq!(entries[0]["status"], "active");
         assert_eq!(entries[0]["metric_name"], "m1");
         assert!(entries[0]["retired_at_ms"].is_null());
-        assert_eq!(entries[1]["agg_id"], 2);
+        assert_eq!(entries[1]["sid"], 2);
         assert_eq!(entries[1]["status"], "retired");
         assert!(entries[1]["retired_at_ms"].is_u64());
-        // Phase 6.4: accuracy_profile present on every schema. Sum
-        // is exact → ε = δ = 0, kind = "exact".
-        for e in entries {
-            let ap = &e["accuracy_profile"];
-            assert!(ap.is_object(), "accuracy_profile should be an object");
-            assert_eq!(ap["kind"], "exact", "Sum agg → exact");
-            assert_eq!(ap["epsilon"], 0.0);
-            assert_eq!(ap["delta"], 0.0);
-        }
 
         // Filter: active only.
         let resp = client
@@ -2316,7 +2288,7 @@ aggregations:
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["agg_id"], 1);
+        assert_eq!(body["schemas"][0]["sid"], 1);
 
         // Filter: retired only.
         let resp = client
@@ -2328,7 +2300,7 @@ aggregations:
             .unwrap();
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["count"], 1);
-        assert_eq!(body["schemas"][0]["agg_id"], 2);
+        assert_eq!(body["schemas"][0]["sid"], 2);
 
         // Bogus filter → 400.
         let resp = client
@@ -2342,8 +2314,11 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn test_get_schemas_without_registry_returns_503() {
-        // No schema registry attached → 503.
+    async fn test_get_schemas_with_empty_catalog_returns_empty_array() {
+        // Schema retirement final cut: the sid catalog is always
+        // attached (every `HttpServer` carries one). With no
+        // registered sids the endpoint reports an empty array, not
+        // a 503.
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
         let server_port = setup_test_server_with_hot_reload(Some(hot_reload)).await;
         let client = Client::new();
@@ -2353,7 +2328,73 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["schemas"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_post_schema_retire_and_expire_endpoints_drive_sid_catalog() {
+        // Coverage for `POST /api/v1/db/schemas/:sid/retire` and
+        // `POST /api/v1/db/schemas/:sid/expire` after the schema
+        // retirement final cut: both routes take `:sid` and drive
+        // the sid catalog directly via `SketchStore::force_retire`
+        // and `SketchStore::force_expire`. Unknown sid → 404.
+        use crate::storage_engines::sketch_db::AggStatus;
+        use crate::storage_engines::sketch_db::index::SketchStore;
+
+        let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+        let sketch_index = Arc::new(SketchStore::new());
+        register_precompute_sid(&sketch_index, 11, "cpu", &["host"]);
+        register_precompute_sid(&sketch_index, 22, "mem", &["host"]);
+        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
+            hot_reload.clone(),
+            sketch_index.clone(),
+        )
+        .await;
+        let client = Client::new();
+
+        // Retire sid 11.
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/schemas/11/retire"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["schema"]["sid"], 11);
+        assert_eq!(body["schema"]["status"], "retired");
+        assert_eq!(sketch_index.instance(11).unwrap().status(), AggStatus::Retired);
+
+        // Expire sid 22.
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/db/schemas/22/expire"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["schema"]["sid"], 22);
+        assert_eq!(body["schema"]["status"], "expired");
+        assert_eq!(sketch_index.instance(22).unwrap().status(), AggStatus::Expired);
+
+        // Unknown sid → 404 for both routes.
+        for path in ["/api/v1/db/schemas/9999/retire", "/api/v1/db/schemas/9999/expire"] {
+            let resp = client
+                .post(format!("http://127.0.0.1:{server_port}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     // Schema retirement #2 — the endpoint now reads from the sid
@@ -2365,13 +2406,15 @@ aggregations:
     #[ignore = "depends on sid-level reconcile from streaming-config (next schema-retirement sub-PR)"]
     #[tokio::test]
     async fn test_get_timeline_returns_segments_after_reconfigure() {
-        use crate::storage_engines::sketch_db::SchemaRegistry;
+        use crate::storage_engines::sketch_db::index::SketchStore;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let schemas = Arc::new(SchemaRegistry::empty());
-        let server_port =
-            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
-                .await;
+        let sketch_index = Arc::new(SketchStore::new());
+        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
+            hot_reload.clone(),
+            sketch_index.clone(),
+        )
+        .await;
         let client = Client::new();
 
         // Push initial config with agg 1 on metric "m". Then swap to
@@ -2440,13 +2483,15 @@ aggregations:
 
     #[tokio::test]
     async fn test_get_timeline_missing_param_returns_400() {
-        use crate::storage_engines::sketch_db::SchemaRegistry;
+        use crate::storage_engines::sketch_db::index::SketchStore;
 
         let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-        let schemas = Arc::new(SchemaRegistry::empty());
-        let server_port =
-            setup_test_server_with_hot_reload_and_schemas(hot_reload.clone(), schemas.clone())
-                .await;
+        let sketch_index = Arc::new(SketchStore::new());
+        let server_port = setup_test_server_with_hot_reload_and_sketch_index(
+            hot_reload.clone(),
+            sketch_index.clone(),
+        )
+        .await;
         let client = Client::new();
 
         // No metric param → 400.
@@ -2504,14 +2549,14 @@ aggregations:
 
     // ─── Phase 5d: backfill HTTP endpoint tests ─────────────────────────────
 
-    /// Build a test server wired with a backfill registry and a
-    /// `SchemaRegistry` that pre-registers the listed `agg_ids` as
-    /// Active. `POST /api/v1/db/backfill` runs `create_checked`, which
-    /// requires both registries — tests that hit that endpoint must
-    /// populate the schema side here.
-    async fn setup_test_server_with_backfill_and_schemas(
+    /// Build a test server wired with a backfill registry and a sid
+    /// catalog that pre-registers the listed sids as Active.
+    /// `POST /api/v1/db/backfill` runs `create_checked`, which after
+    /// the schema retirement final cut is expected to accept the sid
+    /// catalog (sibling slice migrates `create_checked`'s signature).
+    async fn setup_test_server_with_backfill_and_sids(
         registry: Arc<crate::storage_engines::sketch_db::BackfillRegistry>,
-        active_agg_ids: &[u64],
+        active_sids: &[u64],
     ) -> u16 {
         let adapter_config =
             AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
@@ -2524,39 +2569,13 @@ aggregations:
             streaming_config.clone(),
             15000,
         ));
-        let schemas = {
-            use asap_types::aggregation_config::AggregationConfig;
-            use asap_types::enums::{AggregationType, WindowType};
-            use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
-            let mut map: std::collections::HashMap<u64, AggregationConfig> =
-                std::collections::HashMap::new();
-            for agg_id in active_agg_ids {
-                let cfg = AggregationConfig::new(
-                    *agg_id,
-                    AggregationType::CountMinSketch,
-                    String::new(),
-                    std::collections::HashMap::new(),
-                    KeyByLabelNames::empty(),
-                    KeyByLabelNames::empty(),
-                    KeyByLabelNames::empty(),
-                    String::new(),
-                    60,
-                    60,
-                    WindowType::Tumbling,
-                    String::new(),
-                    format!("metric_{agg_id}"),
-                    None,
-                    None,
-                    None,
-                );
-                map.insert(*agg_id, cfg);
-            }
-            let sc = StreamingConfig::new(map);
-            Arc::new(crate::storage_engines::sketch_db::SchemaRegistry::from_streaming_config(&sc))
-        };
-        let server = HttpServer::new(config, query_engine, Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()))
-            .with_backfill_registry(registry)
-            .with_schemas(schemas);
+        let sketch_index =
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        for sid in active_sids {
+            register_precompute_sid(&sketch_index, *sid, &format!("metric_{sid}"), &[]);
+        }
+        let server = HttpServer::new(config, query_engine, sketch_index)
+            .with_backfill_registry(registry);
         server
             .start_test_server()
             .await
@@ -2567,7 +2586,7 @@ aggregations:
     async fn test_backfill_full_lifecycle_through_http() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         let server_port =
-            setup_test_server_with_backfill_and_schemas(registry.clone(), &[42]).await;
+            setup_test_server_with_backfill_and_sids(registry.clone(), &[42]).await;
         let client = Client::new();
 
         // POST creates a Queued job.
@@ -2665,7 +2684,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_post_rejects_inverted_range() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[1]).await;
+        let server_port = setup_test_server_with_backfill_and_sids(registry, &[1]).await;
         let client = Client::new();
 
         let req = serde_json::json!({
@@ -2686,7 +2705,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_get_unknown_job_returns_404() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
+        let server_port = setup_test_server_with_backfill_and_sids(registry, &[]).await;
         let client = Client::new();
         let resp = client
             .get(format!(
@@ -2744,7 +2763,7 @@ aggregations:
     #[tokio::test]
     async fn test_backfill_list_bogus_status_returns_400() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
-        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
+        let server_port = setup_test_server_with_backfill_and_sids(registry, &[]).await;
         let client = Client::new();
         let resp = client
             .get(format!(
@@ -2762,7 +2781,7 @@ aggregations:
     async fn test_backfill_post_unknown_agg_returns_404() {
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         // Empty schema registry — agg_id 42 is unknown.
-        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[]).await;
+        let server_port = setup_test_server_with_backfill_and_sids(registry, &[]).await;
         let client = Client::new();
         let req = serde_json::json!({
             "agg_id": 42,
@@ -2790,7 +2809,7 @@ aggregations:
         let registry = Arc::new(crate::storage_engines::sketch_db::BackfillRegistry::new());
         // Schema registered at `now` — any `end_ms` > created_at_ms
         // overlaps live ingest.
-        let server_port = setup_test_server_with_backfill_and_schemas(registry, &[7]).await;
+        let server_port = setup_test_server_with_backfill_and_sids(registry, &[7]).await;
         let client = Client::new();
         let future_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4645,41 +4664,27 @@ async fn handle_post_streaming_config(
         );
     }
 
-    // Phase 2b of the sketch DB design (docs/design-sketch-db.md §6):
-    // drive schema lifecycle transitions event-driven from the swap
-    // handler instead of running on every ingest batch. When attached,
-    // the SchemaRegistry's reconcile adds new agg_ids as Active
-    // schemas and retires removed agg_ids (scheduling their data for
-    // expiry after the retirement retention).
-    //
-    // Schema retirement #4 wires the sid-level reconcile alongside so
-    // the sid catalog mirrors the same Active/Retired transitions. The
-    // schema half goes away when retirement #5 deletes the
-    // `SchemaRegistry`.
-    //
-    // If `schemas` isn't attached (tests, legacy deployments), the
-    // per-batch reconcile in IngestState still handles it — just
-    // with up to one batch worth of latency.
-    let (schema_added, schema_retired) = if let Some(schemas) = &state.schemas {
-        let snap = handle.snapshot();
-        let summary = schemas.reconcile(snap.as_ref());
-        let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
-            state.sketch_index.as_ref(),
-            snap.as_ref(),
-            schemas.retirement_retention(),
-        );
-        (summary.added, summary.retired)
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    // Schema retirement final cut: the sid catalog is the only
+    // lifecycle registry. The legacy per-`agg_id` `SchemaRegistry` is
+    // gone, so the swap handler now drives a single sid-level
+    // reconcile (`reconcile_from_streaming_config`) which force-retires
+    // any sid whose content signature no longer appears in the new
+    // config. There is no "added" set: sids are minted lazily at the
+    // first ingest write under the new config (see
+    // `SketchStore::ingest_precompute_for_agg_config`).
+    let snap = handle.snapshot();
+    let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+        state.sketch_index.as_ref(),
+        snap.as_ref(),
+        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
+    );
 
     let body = serde_json::json!({
         "status": "success",
         "agg_ids_added": added,
         "agg_ids_removed": removed,
         "new_aggregation_count": new_ids.len(),
-        "schemas_created": schema_added,
-        "schemas_retired": schema_retired});
+        "sids_retired": sid_summary.retired});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4815,10 +4820,16 @@ async fn handle_post_storage_routing(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-/// §15.2 of the sketch DB design: expose the `SchemaRegistry` over
-/// HTTP so operators and the controller can inspect agg lifecycle
+/// §15.2 of the sketch DB design: expose the sid catalog over HTTP so
+/// operators and the controller can inspect aggregation lifecycle
 /// state without attaching a debugger. Filter by `?status=` —
 /// `active` / `retired` / `expired` / `all` (default `all`).
+///
+/// Route is kept at the historical `/api/v1/db/schemas` path so
+/// external callers don't break; the response now surfaces the
+/// sid-level [`SketchInstanceMetadata`] entries (with field `sid`
+/// instead of `agg_id`) since the per-agg_id `SchemaRegistry` has
+/// been retired.
 async fn handle_get_schemas(
     State(state): State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -4827,15 +4838,8 @@ async fn handle_get_schemas(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    let Some(schemas) = state.schemas else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "schema registry not attached; backend was built without HttpServer::with_schemas"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-
     let filter = params.get("status").map(String::as_str).unwrap_or("all");
-    let statuses: &[AggStatus] = match filter {
+    let allowed: &[AggStatus] = match filter {
         "active" => &[AggStatus::Active],
         "retired" => &[AggStatus::Retired],
         "expired" => &[AggStatus::Expired],
@@ -4850,13 +4854,14 @@ async fn handle_get_schemas(
         }
     };
 
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for status in statuses {
-        for s in schemas.list_by_status(*status) {
-            entries.push(schema_to_json(&s));
-        }
-    }
-    entries.sort_by_key(|v| v.get("agg_id").and_then(|x| x.as_u64()).unwrap_or(0));
+    let mut entries: Vec<serde_json::Value> = state
+        .sketch_index
+        .snapshot_instances()
+        .iter()
+        .filter(|m| allowed.contains(&m.status()))
+        .map(sid_instance_to_json)
+        .collect();
+    entries.sort_by_key(|v| v.get("sid").and_then(|x| x.as_u64()).unwrap_or(0));
 
     let body = serde_json::json!({
         "status": "success",
@@ -4873,76 +4878,74 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
         AggStatus::Expired => "expired"}
 }
 
-fn schema_to_json(s: &crate::storage_engines::sketch_db::AggSchema) -> serde_json::Value {
+/// JSON encoding of a single sid registry entry, replacing the legacy
+/// `schema_to_json(&AggSchema)`. The field set mirrors the schema
+/// shape where it makes sense — `status`, `retired_at_ms`,
+/// `expires_at_ms`, `metric_name` — and adds the sid-native fields
+/// (`sid`, `group_by_keys`, `agg_kind`, `first_seen_unix_ms`).
+fn sid_instance_to_json(
+    m: &crate::storage_engines::sketch_db::index::SketchInstanceMetadata,
+) -> serde_json::Value {
     serde_json::json!({
-        "agg_id": s.agg_id,
-        "metric_name": s.metric_name,
-        "status": status_str(s.status()),
-        "created_at_ms": s.created_at_ms,
-        "retired_at_ms": s.retired_at_ms,
-        "expires_at_ms": s.expires_at_ms,
-        "aggregation_type": format!("{:?}", s.config.aggregation_type),
-        "accuracy_profile": s.accuracy_profile()})
+        "sid": m.sid,
+        "metric_name": m.metric_name,
+        "status": status_str(m.status()),
+        "first_seen_unix_ms": m.first_seen_unix_ms,
+        "retired_at_ms": m.retired_at_ms,
+        "expires_at_ms": m.expires_at_ms,
+        "group_by_keys": m.group_by_keys.iter().collect::<Vec<_>>(),
+        "agg_kind": format!("{:?}", m.agg_kind)})
 }
 
-/// `POST /api/v1/db/schemas/:agg_id/retire` — manually transition an
-/// Active schema to Retired (kicking off the retirement retention
-/// clock). Idempotent: already-Retired or Expired schemas return 200
-/// with their current state unchanged. Returns 404 if the agg_id is
-/// unknown, 503 if no registry is attached.
+/// `POST /api/v1/db/schemas/:sid/retire` — manually transition an
+/// Active sid to Retired (kicking off the retirement retention
+/// clock). Idempotent: already-Retired or Expired sids return 200
+/// with their current state unchanged. Returns 404 if the sid is
+/// unknown.
 async fn handle_post_schema_retire(
     State(state): State<AppState>,
-    axum::extract::Path(agg_id): axum::extract::Path<u64>,
+    axum::extract::Path(sid): axum::extract::Path<u64>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(schemas) = state.schemas else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "schema registry not attached"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-    match schemas.force_retire(agg_id) {
-        Some(schema) => {
+    match state.sketch_index.force_retire(
+        sid,
+        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
+    ) {
+        Some(meta) => {
             let body = serde_json::json!({
                 "status": "success",
-                "schema": schema_to_json(&schema)});
+                "schema": sid_instance_to_json(&meta)});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("agg_id {agg_id} not found")});
+                "error": format!("sid {sid} not found")});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
     }
 }
 
-/// `POST /api/v1/db/schemas/:agg_id/expire` — manually transition a
-/// schema to Expired immediately. The next `SchemaEvictionService`
-/// tick drops the agg's data + removes the schema. Idempotent;
-/// 404 if the agg_id is unknown, 503 if no registry is attached.
+/// `POST /api/v1/db/schemas/:sid/expire` — manually transition a sid
+/// to Expired immediately. The next `SchemaEvictionService` tick
+/// drops the sid's data + removes the sid. Idempotent; 404 if the
+/// sid is unknown.
 async fn handle_post_schema_expire(
     State(state): State<AppState>,
-    axum::extract::Path(agg_id): axum::extract::Path<u64>,
+    axum::extract::Path(sid): axum::extract::Path<u64>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let Some(schemas) = state.schemas else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "schema registry not attached"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-    match schemas.force_expire(agg_id) {
-        Some(schema) => {
+    match state.sketch_index.force_expire(sid) {
+        Some(meta) => {
             let body = serde_json::json!({
                 "status": "success",
-                "schema": schema_to_json(&schema)});
+                "schema": sid_instance_to_json(&meta)});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
             let body = serde_json::json!({
                 "status": "error",
-                "error": format!("agg_id {agg_id} not found")});
+                "error": format!("sid {sid} not found")});
             (StatusCode::NOT_FOUND, axum::Json(body)).into_response()
         }
     }
@@ -5104,12 +5107,6 @@ async fn handle_post_backfill_job(
     let Some(registry) = state.backfill else {
         return service_unavailable_no_backfill();
     };
-    let Some(schemas) = state.schemas else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "schema registry not attached; backfill retention check requires HttpServer::with_schemas"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
 
     let req: CreateBackfillJobRequest = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -5130,8 +5127,14 @@ async fn handle_post_backfill_job(
         return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
     }
 
+    // Schema retirement final cut: the legacy `SchemaRegistry` is
+    // gone, so the §10.5 invariants are now checked against the sid
+    // catalog (`SketchStore`). The sibling slice that migrates
+    // `backfill::create_checked` is expected to land the
+    // `&SchemaRegistry → &SketchStore` parameter swap; this call
+    // site mirrors the new contract.
     match registry.create_checked(
-        &schemas,
+        state.sketch_index.as_ref(),
         req.agg_id,
         (req.start_ms, req.end_ms),
         req.source,
