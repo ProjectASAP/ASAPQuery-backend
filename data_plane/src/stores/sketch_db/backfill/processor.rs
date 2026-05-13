@@ -129,6 +129,11 @@ pub struct BackfillWindowProcessor {
     /// Where per-window writes land. Same trait the live output
     /// sink uses; different call site.
     store: Arc<dyn Store>,
+    /// Phase 5 M2.3.6e — mirror every batch into `SketchIndex` so the
+    /// new sid-keyed query path sees backfilled data the same way it
+    /// sees live precompute output. Optional so test fixtures that
+    /// pre-date M2.3 stay compiling.
+    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
     /// Registry where we record which `(agg_id, window_range)`
     /// tuples this job wrote. Phase 5f's coverage tracker reads
     /// this list.
@@ -150,9 +155,21 @@ impl BackfillWindowProcessor {
             config,
             schemas,
             store,
+            sketch_index: None,
             registry,
             job_id,
         }
+    }
+
+    /// Attach a `SketchIndex` so each batch is mirrored there in
+    /// addition to the legacy store. Builder-style so existing call
+    /// sites opt in with one chained call.
+    pub fn with_sketch_index(
+        mut self,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+    ) -> Self {
+        self.sketch_index = Some(sketch_index);
+        self
     }
 
     /// Look up the `AggregationConfig` for `agg_id` in the current
@@ -228,6 +245,18 @@ impl WindowProcessor for BackfillWindowProcessor {
                 self.job_id,
             );
             batch.push((output, accumulator));
+        }
+
+        // Phase 5 M2.3.6e — mirror the batch into the SketchIndex
+        // BEFORE handing it to the legacy store. The store
+        // `insert_precomputed_output_batch` consumes the batch by
+        // value, so we mirror first while the borrows are still
+        // live. Best-effort: a missing index just means the legacy
+        // store remains the source of truth for this window.
+        if let Some(idx) = self.sketch_index.as_ref() {
+            for (output, accumulator) in &batch {
+                idx.ingest_precompute_for_agg_config(&config, output, accumulator.as_ref());
+            }
         }
 
         // Single atomic batch write — mirrors live worker's emit_batch

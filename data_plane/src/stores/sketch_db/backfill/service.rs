@@ -97,6 +97,9 @@ pub struct BackfillService {
     registry: Arc<BackfillRegistry>,
     schemas: Arc<SchemaRegistry>,
     store: Arc<dyn Store>,
+    /// Phase 5 M2.3.6e — when set, every BackfillWindowProcessor the
+    /// service constructs mirrors its writes into this SketchIndex.
+    sketch_index: Option<Arc<crate::stores::sketch_db::index::SketchIndex>>,
     config_source: HotReloadStreamingConfig,
     reader_factory: ReaderFactory,
     service_config: BackfillServiceConfig,
@@ -115,10 +118,21 @@ impl BackfillService {
             registry,
             schemas,
             store,
+            sketch_index: None,
             config_source,
             reader_factory,
             service_config,
         }
+    }
+
+    /// Attach a `SketchIndex` so each replayed batch is also mirrored
+    /// there. Builder-style; safe to omit (legacy tests).
+    pub fn with_sketch_index(
+        mut self,
+        sketch_index: Arc<crate::stores::sketch_db::index::SketchIndex>,
+    ) -> Self {
+        self.sketch_index = Some(sketch_index);
+        self
     }
 
     /// Spawn the service as a tokio task. Returns a `BackfillServiceHandle`
@@ -185,13 +199,16 @@ impl BackfillService {
             // Build the per-job processor with the current config
             // snapshot. The processor snapshots again per window so
             // mid-job config swaps stay visible.
-            let processor = BackfillWindowProcessor::new(
+            let mut processor = BackfillWindowProcessor::new(
                 self.config_source.clone(),
                 self.schemas.clone(),
                 self.store.clone(),
                 self.registry.clone(),
                 job.job_id,
             );
+            if let Some(idx) = self.sketch_index.as_ref() {
+                processor = processor.with_sketch_index(idx.clone());
+            }
             let worker = BackfillWorker::new(self.registry.clone());
 
             let filter = LabelFilter::for_metric(
