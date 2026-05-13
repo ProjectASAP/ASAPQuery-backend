@@ -10,34 +10,24 @@
 //!     `processors: { ddsketch_merge: {...} }` + `service.pipelines`.
 //!   * `config::asapquery_backend` (this module) — ASAPQuery-backend
 //!     query engine, expects
-//!     `aggregations: [{ aggregationId, aggregationType, metric, labels,
-//!                       parameters, windowSize, windowType, spatialFilter }]`.
+//!     `aggregations: [{ aggregationType, metric, labels, parameters,
+//!                       windowSize, windowType, spatialFilter }]`.
 //!
 //! Both are generated from the same `CollectionPlan` fields but target
 //! different services. The replanner pushes the OTel YAML via OpAMP to
 //! backend-role collectors and pushes this one via HTTP to the
 //! ASAPQuery-backend's `/api/v1/streaming-config` endpoint.
+//!
+//! Phase 5 M2.2: this emitter no longer writes `aggregationId`. The
+//! backend's `AggregationConfig::from_yaml_data` derives one
+//! deterministically via `compute_agg_config_id` from the same set of
+//! fields we emit, so the explicit field is redundant.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use crate::types::{AgentCollectorConfig, CollectionPlan, SketchType};
-
-/// Stable aggregation ID used when the planner has no explicit id to
-/// assign. The ASAPQuery-backend uses `u64` agg IDs; we derive one
-/// deterministically from the metric name so the same metric always
-/// maps to the same id across successive pushes (otherwise the backend
-/// would grow unbounded as each replan introduces a new agg_id).
-pub fn deterministic_agg_id(metric: &str) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    metric.hash(&mut h);
-    // Bias away from 0 so the id space is [1, u64::MAX]; 0 is reserved
-    // in some of the backend's existing test fixtures as a sentinel.
-    h.finish().saturating_add(1)
-}
 
 /// Generate the `StreamingConfig` YAML for the ASAPQuery-backend from a
 /// single-metric `CollectionPlan`. Produces a one-element `aggregations`
@@ -73,10 +63,6 @@ pub fn generate_streaming_config_yaml(metric: &str, plan: &CollectionPlan) -> Re
     let agg_type_str = map_sketch_type_to_agg_type(&agg.sketch_type);
 
     let aggregation = serde_yaml::Mapping::from_iter([
-        (
-            serde_yaml::Value::from("aggregationId"),
-            serde_yaml::Value::from(deterministic_agg_id(metric)),
-        ),
         (
             serde_yaml::Value::from("aggregationType"),
             serde_yaml::Value::from(agg_type_str),
@@ -218,18 +204,15 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_id_is_stable_across_calls() {
-        assert_eq!(
-            deterministic_agg_id("cpu_usage"),
-            deterministic_agg_id("cpu_usage")
+    fn emitted_yaml_omits_aggregation_id() {
+        let plan = dummy_plan(SketchType::DDSketch);
+        let yaml = generate_streaming_config_yaml("cpu_usage", &plan).expect("yaml ok");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("re-parse ok");
+        let a = &parsed["aggregations"][0];
+        assert!(
+            a["aggregationId"].is_null(),
+            "controller must not emit aggregationId — backend derives it from content (M2.2)"
         );
-        assert_ne!(
-            deterministic_agg_id("cpu_usage"),
-            deterministic_agg_id("mem_usage")
-        );
-        // Id is biased away from 0 so test fixtures that use 0 as a
-        // sentinel don't accidentally collide.
-        assert_ne!(deterministic_agg_id("any"), 0);
     }
 
     #[test]
