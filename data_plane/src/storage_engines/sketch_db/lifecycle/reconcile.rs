@@ -39,7 +39,7 @@ use asap_types::streaming_config::StreamingConfig;
 
 use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
-use crate::storage_engines::sketch_db::schema::AggStatus;
+use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
 /// Sids the reconciler force-retired this call.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

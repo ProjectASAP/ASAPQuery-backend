@@ -36,7 +36,6 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod persistence;
 pub mod query;
-pub mod schema;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{
@@ -46,9 +45,8 @@ pub use backfill::{
     Coverage, CreateError, LabelFilter, MockRawSampleReader, PrometheusReader, RawSample,
     RawSampleReader, RawSampleReaderError, ReaderFactory, WindowProcessor,
 };
-pub use schema::{
-    warn_if_retention_inverted, AggSchema, AggStatus, SchemaEvictionConfig, SchemaEvictionHandle,
-    SchemaEvictionService, SchemaRegistry, TimelineCoverage, TimelineSegment,
+pub use lifecycle::{
+    warn_if_retention_inverted, AggStatus, SchemaEvictionConfig, SchemaEvictionHandle,
+    SchemaEvictionService, DEFAULT_RETIREMENT_RETENTION,
 };
-// M2.3.6g — legacy `SketchStore` enum gone; `store::persistence` is the
-// retained surface, consumed by `SketchStore::start_persistence`.
+pub use query::timeline::{TimelineCoverage, TimelineSegment};

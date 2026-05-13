@@ -44,7 +44,48 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchKindHandle};
 use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
-use crate::storage_engines::sketch_db::schema::{AggStatus, TimelineCoverage, TimelineSegment};
+use crate::storage_engines::sketch_db::lifecycle::AggStatus;
+
+/// A single `(agg_id, clipped_range)` segment returned by
+/// [`timeline_for_metric`]. Ranges are half-open: inclusive
+/// `start_ms`, exclusive `end_ms`. Segments are guaranteed
+/// non-overlapping and ordered by `start_ms` by construction.
+///
+/// `agg_id` is content-derived: a xxh64 hash of the agg-signature
+/// `(metric_name, agg_kind, group_by_keys)`. Two sids with the same
+/// signature fold into the same segment, so this id identifies a
+/// signature group rather than a single sid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineSegment {
+    pub agg_id: u64,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Lifecycle state of the underlying signature group at the
+    /// moment the timeline was computed. The query path uses this to
+    /// decide whether to read from the sketch (`Active`/`Retired`) or
+    /// surface a coverage hole (`Expired`).
+    pub status: AggStatus,
+    /// Whether data is expected to be present for this segment.
+    /// Distinct from `status` — a `Retired` signature still has its
+    /// data but a segment that falls entirely past expiry is `Purged`
+    /// even if `status` is still `Retired` at the moment of the call.
+    pub coverage: TimelineCoverage,
+}
+
+/// Coarse classification of whether a [`TimelineSegment`]'s data is
+/// expected to be readable from the sketch store. See §7.3 of the
+/// design doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimelineCoverage {
+    /// Data is (or was) written by the live ingest path and the
+    /// signature has not been expired. Query engine reads the
+    /// sketch store.
+    Sketch,
+    /// The signature has expired and its data was purged (or is
+    /// eligible for purge). Query engine falls back to the archive
+    /// engine for this segment per §7.3.
+    Purged,
+}
 
 /// Produce the per-metric timeline of `TimelineSegment`s entirely from
 /// the sid catalog, with no `SchemaRegistry` lookup. See module-level
