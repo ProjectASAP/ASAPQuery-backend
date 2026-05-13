@@ -479,6 +479,18 @@ impl SketchStore {
         self.instances.read().unwrap().len()
     }
 
+    /// Clone every registered `SketchInstanceMetadata` into a snapshot
+    /// vec. Used by read-side primitives that need to scan the whole
+    /// catalog without holding the registry lock across user code
+    /// (e.g. `query::timeline::timeline_for_metric`). O(N) clone +
+    /// O(N) memory; cheap at production catalog sizes.
+    pub fn snapshot_instances(&self) -> Vec<SketchInstanceMetadata> {
+        match self.instances.read() {
+            Ok(map) => map.values().cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     // ── Phase 5 M1: lifecycle-status surface ─────────────────────────
     //
     // Mirror the `SchemaRegistry` lifecycle methods so the ingest /
