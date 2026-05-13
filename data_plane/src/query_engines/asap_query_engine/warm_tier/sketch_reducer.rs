@@ -252,7 +252,18 @@ impl<'a> SketchReducer<'a> {
         family: QueryFamily,
         meta: &SketchInstanceMetadata,
     ) -> Result<Capability, WarmTierError> {
-        match (family, &meta.capability) {
+        // The warm-tier reducer only ever runs on sketch-backed sids
+        // (the analyzer's `instances_matching` filters on `Capability`,
+        // which is `None` for precompute-backed sids). A `None` here
+        // means upstream classification broke — surface as a missing
+        // capability rather than panicking the request path.
+        let Some(cap) = meta.capability.as_ref() else {
+            return Err(WarmTierError::UnsupportedCapability {
+                function: function_name.to_string(),
+                capability: Capability::CardinalityApprox,
+            });
+        };
+        match (family, cap) {
             (QueryFamily::Quantile, Capability::QuantileApprox(_))
             | (QueryFamily::Cardinality, Capability::CardinalityApprox)
             | (QueryFamily::FrequencyTopk, Capability::FrequencyTopk(_))
@@ -262,7 +273,7 @@ impl<'a> SketchReducer<'a> {
             // sketch matrix, so the underlying CMS / CountSketch matrix can
             // be queried point-wise without consulting it.
             | (QueryFamily::FrequencyEstimate, Capability::FrequencyTopk(_)) => {
-                Ok(meta.capability.clone())
+                Ok(cap.clone())
             }
             (_, other) => Err(WarmTierError::UnsupportedCapability {
                 function: function_name.to_string(),
@@ -355,7 +366,7 @@ impl<'a> SketchReducer<'a> {
                         if w > cov_hi {
                             cov_hi = w;
                         }
-                        let total = decode_frequency_total(sid, meta.sketch_kind, state)?;
+                        let total = decode_frequency_total(sid, meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids"), state)?;
                         samples_out.push((*w_end, total));
                     }
                     out_series.push((ts.series_label_values, samples_out));
@@ -388,7 +399,7 @@ impl<'a> SketchReducer<'a> {
                     if w_end_u64 > cov_hi {
                         cov_hi = w_end_u64;
                     }
-                    let cms_heap = match meta.sketch_kind {
+                    let cms_heap = match meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids") {
                         SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
                             // Both heap-bearing variants serialize the
                             // outer `CountMinSketchWithHeap` envelope via
@@ -409,7 +420,7 @@ impl<'a> SketchReducer<'a> {
                             // routes through QueryFamily::FrequencyEstimate).
                             return Err(WarmTierError::MissingHeap {
                                 sid,
-                                sketch_kind: meta.sketch_kind,
+                                sketch_kind: meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids"),
                             });
                         }
                         other => {
@@ -436,14 +447,17 @@ impl<'a> SketchReducer<'a> {
             }
 
             // Quantile / Cardinality with delta stitching.
-            let delta_kind = match (family, meta.sketch_kind) {
+            let delta_kind = match (family, meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids")) {
                 (QueryFamily::Quantile, SketchKindHandle::DDSketch) => DeltaSketchKind::DDSketch,
                 (QueryFamily::Quantile, SketchKindHandle::Kll) => DeltaSketchKind::Kll,
                 (QueryFamily::Cardinality, SketchKindHandle::Hll) => DeltaSketchKind::Hll,
                 _ => {
                     return Err(WarmTierError::UnsupportedCapability {
                         function: function_name.to_string(),
-                        capability: meta.capability.clone(),
+                        capability: meta
+                            .capability
+                            .clone()
+                            .unwrap_or(Capability::CardinalityApprox),
                     });
                 }
             };
