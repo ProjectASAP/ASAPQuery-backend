@@ -118,7 +118,11 @@ fn sketch_meta(sid: u64, kind: SketchKindHandle, config: SketchConfig) -> Sketch
             _ => Capability::QuantileApprox(kind),
         }),
         accuracy: Some(AccuracyBound::from_config(&config)),
-        agg_kind: AggKind::Sketch { kind, config },
+        agg_kind: AggKind::Sketch {
+            kind,
+            config,
+            spatial_filter_canonical: String::new(),
+        },
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
@@ -132,9 +136,10 @@ fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SketchI
         group_by_keys: BTreeSet::new(),
         capability: None,
         accuracy: None,
-        agg_kind: AggKind::Precompute {
+        agg_kind: AggKind::ExactAgg {
             agg_type,
             parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
         },
         first_seen_unix_ms: 0,
         retired_at_ms: None,

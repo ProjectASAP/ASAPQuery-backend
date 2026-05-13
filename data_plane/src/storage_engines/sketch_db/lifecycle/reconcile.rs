@@ -101,9 +101,10 @@ fn signature_from_meta(meta: &SketchInstanceMetadata) -> Vec<u8> {
 }
 
 fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
-    let agg_kind = AggKind::Precompute {
+    let agg_kind = AggKind::ExactAgg {
         agg_type: cfg.aggregation_type,
         parameters_canonical: canonical_parameters(&cfg.parameters),
+        spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
     };
     let group_by_keys: BTreeSet<String> = cfg.grouping_labels.labels.iter().cloned().collect();
     signature_bytes(&cfg.metric, &agg_kind, &group_by_keys)
@@ -120,7 +121,11 @@ fn build_live_signature_set(config: &StreamingConfig) -> HashSet<Vec<u8>> {
 fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
     use crate::storage_engines::sketch_db::data::{SketchConfig, SketchKindHandle};
     match agg_kind {
-        AggKind::Sketch { kind, config } => {
+        AggKind::Sketch {
+            kind,
+            config,
+            spatial_filter_canonical,
+        } => {
             buf.push(b'S');
             buf.push(match kind {
                 SketchKindHandle::DDSketch => 1,
@@ -156,15 +161,20 @@ fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
                     buf.extend_from_slice(&cols.to_le_bytes());
                 }
             }
+            buf.push(b'F');
+            buf.extend_from_slice(spatial_filter_canonical.as_bytes());
         }
-        AggKind::Precompute {
+        AggKind::ExactAgg {
             agg_type,
             parameters_canonical,
+            spatial_filter_canonical,
         } => {
             buf.push(b'P');
             buf.extend_from_slice(agg_type.as_str().as_bytes());
             buf.push(b';');
             buf.extend_from_slice(parameters_canonical.as_bytes());
+            buf.push(b'F');
+            buf.extend_from_slice(spatial_filter_canonical.as_bytes());
         }
     }
 }
@@ -215,9 +225,10 @@ mod tests {
             metric_name: metric.to_string(),
             group_by_keys,
             capability: None,
-            agg_kind: AggKind::Precompute {
+            agg_kind: AggKind::ExactAgg {
                 agg_type,
                 parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
             },
             accuracy: None,
             first_seen_unix_ms: 0,

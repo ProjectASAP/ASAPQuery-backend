@@ -108,6 +108,7 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::DDSketch,
             config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
         },
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         first_seen_unix_ms: 0,
@@ -126,6 +127,7 @@ fn kll_meta(sid: u64, k: u32) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::Kll,
             config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
         },
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         first_seen_unix_ms: 0,
@@ -144,6 +146,7 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::Hll,
             config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
         },
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         first_seen_unix_ms: 0,
@@ -469,6 +472,7 @@ fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::CmsWithHeap,
             config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
         },
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         first_seen_unix_ms: 0,
@@ -487,6 +491,7 @@ fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
         agg_kind: AggKind::Sketch {
             kind: SketchKindHandle::CountMin,
             config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
         },
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         first_seen_unix_ms: 0,

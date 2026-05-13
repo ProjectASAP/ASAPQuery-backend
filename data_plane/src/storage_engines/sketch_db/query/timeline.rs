@@ -227,19 +227,28 @@ impl AggSignatureGroup {
 
 fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
     match agg_kind {
-        AggKind::Sketch { kind, config } => {
+        AggKind::Sketch {
+            kind,
+            config,
+            spatial_filter_canonical,
+        } => {
             buf.push(b'S');
             buf.push(sketch_kind_byte(*kind));
             encode_sketch_config(config, buf);
+            buf.push(b'F');
+            buf.extend_from_slice(spatial_filter_canonical.as_bytes());
         }
-        AggKind::Precompute {
+        AggKind::ExactAgg {
             agg_type,
             parameters_canonical,
+            spatial_filter_canonical,
         } => {
             buf.push(b'P');
             buf.extend_from_slice(agg_type.as_str().as_bytes());
             buf.push(b';');
             buf.extend_from_slice(parameters_canonical.as_bytes());
+            buf.push(b'F');
+            buf.extend_from_slice(spatial_filter_canonical.as_bytes());
         }
     }
 }
@@ -319,9 +328,10 @@ mod tests {
     }
 
     fn precompute(agg_type: AggregationType) -> AggKind {
-        AggKind::Precompute {
+        AggKind::ExactAgg {
             agg_type,
             parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
         }
     }
 

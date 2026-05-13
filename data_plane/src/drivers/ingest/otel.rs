@@ -956,6 +956,12 @@ async fn route_modified_otlp_sketches_to_precompute(
                         let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
                             kind: kind_for_sid,
                             config: dp.container_config.clone(),
+                            // OTel-ingest path: no per-DP spatial filter applies
+                            // at this layer (the agent has already filtered
+                            // before emitting the sketch). The empty filter is
+                            // the canonical value for "no filter on this sid's
+                            // policy".
+                            spatial_filter_canonical: String::new(),
                         };
                         let agg_kind_canonical = agg_kind.canonical_string();
                         let assigned = ingest_state.series_resolver.resolve(
@@ -1054,6 +1060,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                                     kind,
                                     config: cfg.clone(),
+                                    spatial_filter_canonical: String::new(),
                                 },
                                 accuracy: Some(AccuracyBound::from_config(&cfg)),
                                 first_seen_unix_ms: ts_ms,

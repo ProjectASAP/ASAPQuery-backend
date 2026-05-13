@@ -9,10 +9,13 @@
 //!
 //! ## What's here
 //!
-//! - [`AggKind`] — `Sketch { kind, config } | Precompute { agg_type,
-//!   parameters_canonical }`. The discriminator that decides what
-//!   shape a sid's payload takes.
-//! - [`AggPayload`] — `Sketch(SketchSampleState) | Precompute(Box<dyn
+//! - [`AggKind`] — `Sketch { kind, config, spatial_filter_canonical }
+//!   | ExactAgg { agg_type, parameters_canonical,
+//!   spatial_filter_canonical }`. The discriminator that decides
+//!   what shape a sid's payload takes. The `spatial_filter_canonical`
+//!   field on each variant participates in sid identity so
+//!   filter-distinct policies don't collide.
+//! - [`AggPayload`] — `Sketch(SketchSampleState) | ExactAgg(Box<dyn
 //!   AggregateCore>)`. The actual byte/accumulator stored at each
 //!   (sid, window, label_values) cell.
 //! - [`SketchConfig`] — variant-specific tuning parameters
@@ -32,14 +35,14 @@
 //!   here produces the third element of the resolver's cache key.
 //! - [`canonical_parameters`] — helper that renders a parameters
 //!   `HashMap` into the canonical string form
-//!   `AggKind::Precompute::parameters_canonical` expects.
+//!   `AggKind::ExactAgg::parameters_canonical` expects.
 //!
 //! ## Re-exports for callers
 //!
 //! - [`Capability`] / [`SketchKindHandle`] — the canonical
 //!   control-plane-side capability vocabulary.
 //! - [`AggregationType`] — the agg-type enum that
-//!   `AggKind::Precompute` carries.
+//!   `AggKind::ExactAgg` carries.
 
 // `xxhash_rust::xxh64` import retired alongside `compute_sid` (PR-4).
 // Sid minting is now registry-allocated via `SeriesIdResolver` — no
@@ -75,14 +78,18 @@ pub enum SketchConfig {
 }
 
 /// What kind of aggregation a `sid` identifies. M2.3 generalization
-/// — sids cover BOTH opaque-sketch state and partial-accumulator
-/// (Sum / Count / Avg / Rate / MinMax) state, so a single store can
-/// host both.
+/// — sids cover BOTH opaque-sketch state and exact-aggregation state
+/// (Sum / Count / Avg / Rate / MinMax / SetAggregator / …), so a
+/// single store can host both.
 ///
-/// The sid hash distinguishes the two branches structurally: a
-/// `Sketch` sid is content-addressed over `(metric, attrs,
-/// sketch_kind, sketch_config)`; a `Precompute` sid is content-
-/// addressed over `(metric, attrs, agg_type, parameters)`.
+/// The sid resolver distinguishes the two branches structurally:
+/// a `Sketch` sid keys on `(metric, attrs, sketch_kind, sketch_config,
+/// spatial_filter)`; an `ExactAgg` sid keys on `(metric, attrs,
+/// agg_type, parameters, spatial_filter)`. The spatial_filter
+/// participates in identity so two policies differing only in
+/// their ingest-side label predicate (e.g. `status="200"` vs
+/// `status="500"`) mint distinct sids even after the filter
+/// dimension is projected out by group-by.
 #[derive(Debug, Clone)]
 pub enum AggKind {
     /// Opaque sketch state — DDSketch, KLL, HLL, CountMin, CountSketch.
@@ -91,11 +98,23 @@ pub enum AggKind {
     Sketch {
         kind: SketchKindHandle,
         config: SketchConfig,
+        /// Canonical form of the policy's spatial-filter predicate,
+        /// produced by [`asap_types::utils::normalize_spatial_filter`]
+        /// (e.g. `{status="200",zone="us-east"}`). Empty string when
+        /// the policy has no spatial filter.
+        spatial_filter_canonical: String,
     },
-    /// Partial-accumulator state — Sum, Count, Avg, Rate, MinMax,
+    /// Exact aggregation state — Sum, Count, Avg, Rate, MinMax,
     /// SetAggregator, etc. Payload at storage layer is whatever the
     /// per-accumulator serializer produces.
-    Precompute {
+    ///
+    /// Variant name history: previously `AggKind::Precompute` — the
+    /// rename to `ExactAgg` (PR `refactor/sid-identity-spatial-filter-and-rename`)
+    /// reflects that `precompute_engine/` is the *engine* that
+    /// produces both sketch and exact-aggregation outputs, while this
+    /// variant names what the *payload* is. The two had been
+    /// confusingly conflated.
+    ExactAgg {
         agg_type: AggregationType,
         /// Stable canonical encoding of the agg's
         /// `parameters: HashMap<String, Value>` — sorted keys, each
@@ -103,11 +122,14 @@ pub enum AggKind {
         /// string so equality / hashing stay cheap and independent of
         /// the original HashMap's iteration order.
         parameters_canonical: String,
+        /// Canonical form of the policy's spatial-filter predicate;
+        /// see the `Sketch` variant's field doc.
+        spatial_filter_canonical: String,
     },
 }
 
 /// Render a `HashMap<String, Value>` of parameters into the canonical
-/// string form `AggKind::Precompute::parameters_canonical` expects.
+/// string form `AggKind::ExactAgg::parameters_canonical` expects.
 /// Keys sorted lexicographically; each value via `serde_json`.
 pub fn canonical_parameters(
     parameters: &std::collections::HashMap<String, serde_json::Value>,
@@ -129,39 +151,49 @@ impl AggKind {
     /// of the `SeriesIdResolver` cache key and as the `agg_kind_canonical`
     /// field in the resolver's WAL.
     ///
-    /// Sid identity is `(metric, attrs_fingerprint, agg_kind_canonical)`
-    /// — the same canonical tuple that the retired
-    /// [`compute_sketch_sid`] / [`compute_sid`] functions hashed over,
-    /// just rendered as a string for the registry-allocated mint path
-    /// instead of byte-fed to xxh64. Two `AggKind`s that compare equal
-    /// MUST produce the same canonical string; two that differ in any
-    /// observable parameter MUST produce different strings.
+    /// Sid identity is `(metric, attrs_fingerprint, agg_kind_canonical)`.
+    /// Two `AggKind`s that compare equal MUST produce the same
+    /// canonical string; two that differ in any observable parameter
+    /// MUST produce different strings.
     ///
-    /// Format:
-    /// - `Sketch { kind: DDSketch, config: DDSketch{rel_acc: 0.01} }`
-    ///   → `"sketch:DDSketch:D:0.01"`
-    /// - `Sketch { kind: Kll, config: Kll{k: 200} }`
-    ///   → `"sketch:Kll:K:200"`
-    /// - `Precompute { agg_type: Sum, parameters_canonical: "" }`
-    ///   → `"precompute:Sum:"`
+    /// Format — always a `:filter=...` suffix (empty after `=` means
+    /// no spatial filter), so consumers can parse without knowing
+    /// whether a filter exists:
+    /// - `Sketch { DDSketch, α=0.01, no filter }`
+    ///   → `"sketch:DDSketch:D:0.01:filter="`
+    /// - `Sketch { Kll, k=200, status=200 }`
+    ///   → `"sketch:Kll:K:200:filter={status=\"200\"}"`
+    /// - `ExactAgg { Sum, no params, no filter }`
+    ///   → `"exact_agg:Sum::filter="`
+    /// - `ExactAgg { DatasketchesKLL, k=200, zone=us-east }`
+    ///   → `"exact_agg:DatasketchesKLL:k=200;:filter={zone=\"us-east\"}"`
     pub fn canonical_string(&self) -> String {
         match self {
-            AggKind::Sketch { kind, config } => {
+            AggKind::Sketch {
+                kind,
+                config,
+                spatial_filter_canonical,
+            } => {
                 format!(
-                    "sketch:{}:{}",
+                    "sketch:{}:{}:filter={}",
                     sketch_kind_canonical(*kind),
                     sketch_config_canonical(config),
+                    spatial_filter_canonical,
                 )
             }
-            AggKind::Precompute {
+            AggKind::ExactAgg {
                 agg_type,
                 parameters_canonical,
+                spatial_filter_canonical,
             } => {
                 // `AggregationType`'s `Display` impl is stable
                 // (matches the snake-case form on the wire) and
                 // `parameters_canonical` is already canonicalized
                 // upstream (see [`canonical_parameters`]).
-                format!("precompute:{}:{}", agg_type, parameters_canonical)
+                format!(
+                    "exact_agg:{}:{}:filter={}",
+                    agg_type, parameters_canonical, spatial_filter_canonical,
+                )
             }
         }
     }
@@ -309,18 +341,18 @@ pub struct SketchTimeSeries {
 pub enum AggPayload {
     /// Opaque sketch state — see [`SketchSampleState`].
     Sketch(SketchSampleState),
-    /// Partial-accumulator state — Sum / Count / Avg / Rate / MinMax.
+    /// Exact-aggregation state — Sum / Count / Avg / Rate / MinMax.
     /// Cloned via the `Clone` impl on `Box<dyn AggregateCore>` (which
     /// dispatches through `clone_boxed_core`).
-    Precompute(Box<dyn crate::storage_engines::types::AggregateCore>),
+    ExactAgg(Box<dyn crate::storage_engines::types::AggregateCore>),
 }
 
 impl std::fmt::Debug for AggPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AggPayload::Sketch(s) => f.debug_tuple("Sketch").field(s).finish(),
-            AggPayload::Precompute(p) => f
-                .debug_struct("Precompute")
+            AggPayload::ExactAgg(p) => f
+                .debug_struct("ExactAgg")
                 .field("type_name", &p.type_name())
                 .finish(),
         }
@@ -334,29 +366,31 @@ impl AggPayload {
     pub fn as_sketch(&self) -> Option<&SketchSampleState> {
         match self {
             AggPayload::Sketch(s) => Some(s),
-            AggPayload::Precompute(_) => None,
+            AggPayload::ExactAgg(_) => None,
         }
     }
 
-    /// Return the precompute payload if this is a precompute variant;
-    /// `None` otherwise. The precompute query path uses this.
-    pub fn as_precompute(&self) -> Option<&dyn crate::storage_engines::types::AggregateCore> {
+    /// Return the exact-aggregation payload if this is an exact-agg
+    /// variant; `None` otherwise. The exact-aggregation query path
+    /// uses this.
+    pub fn as_exact_agg(&self) -> Option<&dyn crate::storage_engines::types::AggregateCore> {
         match self {
-            AggPayload::Precompute(p) => Some(p.as_ref()),
+            AggPayload::ExactAgg(p) => Some(p.as_ref()),
             AggPayload::Sketch(_) => None,
         }
     }
 
     /// Approximate in-memory byte footprint of the payload — used by
     /// the persistence layer's memory-pressure trigger. Sketch payloads
-    /// report their byte buffer length (the dominant cost); precompute
-    /// payloads forward to the accumulator's own `approx_memory_bytes()`.
+    /// report their byte buffer length (the dominant cost);
+    /// exact-aggregation payloads forward to the accumulator's own
+    /// `approx_memory_bytes()`.
     pub fn approx_bytes(&self) -> usize {
         match self {
             AggPayload::Sketch(s) => {
                 s.bytes.len() + std::mem::size_of::<SketchSampleState>()
             }
-            AggPayload::Precompute(p) => p.approx_memory_bytes(),
+            AggPayload::ExactAgg(p) => p.approx_memory_bytes(),
         }
     }
 }
