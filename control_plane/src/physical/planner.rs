@@ -463,7 +463,10 @@ fn plan_node(
 ///
 /// Uses `StageBudget::fits(SketchCapability)` to check each stage in order:
 /// Agent → BackendCollector → QueryEngine.
-fn decide_sketch_placement(resolved: &PhysicalAggOp, config: &PhysicalPlannerConfig) -> Placement {
+pub(crate) fn decide_sketch_placement(
+    resolved: &PhysicalAggOp,
+    config: &PhysicalPlannerConfig,
+) -> Placement {
     use crate::optimizer::engine::sketch_capability;
 
     let cap = sketch_capability(&resolved.sketch_type);
