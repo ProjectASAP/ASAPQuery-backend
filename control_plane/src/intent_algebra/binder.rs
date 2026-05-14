@@ -50,7 +50,7 @@
 //! legacy IR is retired it moves into the `core::lower` L1→L2→L3 passes
 //! proper (the `lower_*(ast, schema)` signatures in design.md §6).
 
-use crate::intent_algebra::legacy_expr::{ColumnRef, QueryExpr as LQueryExpr};
+use crate::intent_algebra::legacy_expr::QueryExpr as LQueryExpr;
 use crate::intent_algebra::schema::{Column, DataType, Schema};
 
 /// The DB / source-schema metadata source from design.md §6 "three
@@ -166,19 +166,17 @@ fn default_leaf_columns() -> Vec<Column> {
     ]
 }
 
-/// Walk the legacy tree and collect every distinct column / group-key
-/// name the legacy → canonical converter resolves positionally:
-/// `SketchAgg.col` / `WindowedAgg.col` (when `Named`), `Aggregate.keys`,
+/// Walk the legacy tree and collect every distinct group-key name the
+/// legacy → canonical converter resolves positionally: `Aggregate.keys`,
 /// `TopK.by`, and `Partition.keys`. Sorted + de-duplicated for a stable,
 /// deterministic column order.
+///
+/// `AggItem.col` (the statistic's *input* column) is deliberately not
+/// collected — the converter never resolves it positionally; it only
+/// ever resolves group-by keys.
 fn collect_referenced_columns(tree: &LQueryExpr) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     tree.walk(&mut |node| match node {
-        LQueryExpr::SketchAgg { col, .. } | LQueryExpr::WindowedAgg { col, .. } => {
-            if let ColumnRef::Named(name) = col {
-                out.push(name.clone());
-            }
-        }
         LQueryExpr::Aggregate { keys, .. } => out.extend(keys.iter().cloned()),
         LQueryExpr::TopK { by, .. } => out.extend(by.iter().cloned()),
         LQueryExpr::Partition { keys, .. } => out.extend(keys.keys().iter().cloned()),
@@ -194,7 +192,6 @@ fn collect_referenced_columns(tree: &LQueryExpr) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::agg_intent::AggIntent;
     use crate::intent_algebra::legacy_expr::{
         AggFunc, AggItem, ColumnRef as LColumnRef, PartitionKeys, QueryExpr as LQueryExpr,
         SourceSpec,
@@ -211,22 +208,6 @@ mod tests {
         assert_eq!(schema.columns[0].name, "ts");
         assert_eq!(schema.columns[1].name, "value");
         assert_eq!(schema.time_index, Some(0));
-    }
-
-    #[test]
-    fn sketch_agg_named_col_lands_in_schema() {
-        // SketchAgg { col: Named("price") } over Source — "price" must be
-        // resolvable, i.e. present in the bound schema.
-        let tree = LQueryExpr::SketchAgg {
-            op: AggIntent::Sum,
-            col: LColumnRef::Named("price".into()),
-            input: Box::new(src("trades")),
-        };
-        let schema = Binder::new().bind(&tree);
-        assert!(schema.column_id("price").is_some(), "price should be bound: {schema:?}");
-        // floor still there.
-        assert!(schema.column_id("ts").is_some());
-        assert!(schema.column_id("value").is_some());
     }
 
     #[test]
@@ -309,11 +290,7 @@ mod tests {
                 }
             }
         }
-        let tree = LQueryExpr::SketchAgg {
-            op: AggIntent::Sum,
-            col: LColumnRef::Named("datacenter".into()),
-            input: Box::new(src("known_metric")),
-        };
+        let tree = src("known_metric");
         let schema = Binder::with_catalog(FixedCatalog).bind(&tree);
         // `datacenter` came from the catalog, not usage-synthesis — and it
         // is non-nullable, unlike a usage-derived column.
