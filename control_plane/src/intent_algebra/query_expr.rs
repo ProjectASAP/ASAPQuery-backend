@@ -15,10 +15,11 @@
 //! `LetBinding`, `Ref`. Batch 2 of the legacy_expr migration adds the ten
 //! "A-classified" structurally-canonical variants from `design.md` §6:
 //! `Filter`, `Project`, `Partition`, `Distinct`, `Merge`, `Join`,
-//! `SetOp`, `Sort`, `Limit`, `BinaryOp`. The remaining design.md nodes
-//! (`Subquery`, `WindowFunc`) are deferred to follow-up phases as the
-//! planner grows consumers for them. The shape defined here is forward-
-//! compatible — adding more variants is purely additive.
+//! `SetOp`, `Sort`, `Limit`, `BinaryOp`. Step γ7 adds `Subquery` (the
+//! canonical counterpart of `legacy_expr::PromQLSubquery`). `WindowFunc`
+//! remains deferred until the planner grows a consumer for it. The shape
+//! defined here is forward-compatible — adding more variants is purely
+//! additive.
 //!
 //! Single-input variants here use `child:` (matching the existing
 //! `Window`, `Aggregate`, `LetBinding` shape). Legacy `input:` survives in
@@ -490,6 +491,19 @@ pub enum QueryExpr {
         #[serde(default)]
         vector_match: Option<VectorMatch>,
     },
+
+    /// PromQL sub-query (`<expr>[range:resolution]`) — re-evaluates `child`
+    /// at `resolution`-spaced steps across the trailing `range` window,
+    /// producing a range-vector the enclosing function consumes. The
+    /// canonical counterpart of `legacy_expr::QueryExpr::PromQLSubquery`.
+    /// Logical pass-through for schema flow — the range/resolution are a
+    /// sampling hint the L5 precompute stage reads, not a schema transform.
+    Subquery {
+        range: Duration,
+        #[serde(default)]
+        resolution: Option<Duration>,
+        child: Box<QueryExpr>,
+    },
 }
 
 impl QueryExpr {
@@ -578,12 +592,13 @@ impl QueryExpr {
                 .ok_or_else(|| QueryExprError::UnresolvedRef(name.as_str().into())),
 
             // ── A-variants — schema-flow per design.md §6 ────────────────
-            // Filter / Partition / Sort / Limit pass the child's schema
-            // through unchanged.
+            // Filter / Partition / Sort / Limit / Subquery pass the child's
+            // schema through unchanged.
             QueryExpr::Filter { child, .. }
             | QueryExpr::Partition { child, .. }
             | QueryExpr::Sort { child, .. }
-            | QueryExpr::Limit { child, .. } => child.output_schema_in(scope),
+            | QueryExpr::Limit { child, .. }
+            | QueryExpr::Subquery { child, .. } => child.output_schema_in(scope),
 
             // Project: schema-flow says "the input schema projected to
             // `cols`". Phase-B placeholder — return the child schema until

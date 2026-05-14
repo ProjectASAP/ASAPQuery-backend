@@ -248,7 +248,8 @@ impl ThreeStageWalker {
             | QE::Partition { .. }
             | QE::Distinct { .. }
             | QE::Sort { .. }
-            | QE::Limit { .. } => Ok(StageId::Edge),
+            | QE::Limit { .. }
+            | QE::Subquery { .. } => Ok(StageId::Edge),
             QE::Merge { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
                 Ok(StageId::Backend)
             }
