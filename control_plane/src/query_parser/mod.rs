@@ -39,7 +39,10 @@ pub use language::{Language, LanguageAst, ParseError, PromQLLanguage, SqlLanguag
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::intent_algebra::legacy_expr::{AggIntent, QueryExpr};
+use crate::intent_algebra::agg_intent::AggIntent;
+use crate::intent_algebra::query_expr::{
+    BinaryOpKind, ColumnRef, LiteralValue, Predicate, QueryExpr, Source,
+};
 use crate::types::AggType;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
@@ -92,12 +95,21 @@ pub enum QueryHint {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Parse a raw query string (PromQL or SQL) into the general [`QueryExpr`] IR.
+/// Parse a raw query string (PromQL or SQL) into the **legacy** L3
+/// [`legacy_expr::QueryExpr`](crate::intent_algebra::legacy_expr::QueryExpr) IR.
 ///
 /// Both parsers emit Layer 2 relational operators (`Aggregate { AggFunc }`).
 /// The shared lowering pass converts `Aggregate` → `SketchAgg { AggIntent }`
 /// where applicable.
-pub fn parse_query_expr(query: &str) -> anyhow::Result<QueryExpr> {
+///
+/// Step γ7: this still returns the *legacy* IR — it remains the internal
+/// L2→L3 path that the producers (`sql.rs` / `promql.rs` / `legacy_lower`)
+/// and `language_logical_plan` build on. New consumers use
+/// [`parse_query_expr_canonical`]; the legacy path is removed once every
+/// consumer migrates.
+pub fn parse_query_expr(
+    query: &str,
+) -> anyhow::Result<crate::intent_algebra::legacy_expr::QueryExpr> {
     let q = query.trim();
     let upper = q.to_ascii_uppercase();
     let layer2 = if upper.starts_with("SELECT") || upper.starts_with("WITH") {
@@ -136,28 +148,60 @@ pub fn parse_query_expr_canonical(
 /// Parse a raw query string (PromQL or SQL) into a [`ParsedQuery`].
 ///
 /// This is the backward-compatible entry point for the existing
-/// [`crate::analyzer::Analyzer`].  Internally it parses via [`parse_query_expr`]
-/// and extracts the flat summary by walking the [`QueryExpr`] tree.
+/// [`crate::analyzer::Analyzer`].  Internally it parses via
+/// [`parse_query_expr_canonical`] and extracts the flat summary by walking
+/// the canonical [`QueryExpr`] tree.
 pub fn parse_query(query: &str) -> anyhow::Result<ParsedQuery> {
-    let qe = parse_query_expr(query)?;
+    let qe = parse_query_expr_canonical(query)?;
     Ok(qe_to_parsed_query(&qe))
 }
 
-/// Extract a flat [`ParsedQuery`] by walking a [`QueryExpr`] tree.
+/// Extract a flat [`ParsedQuery`] by walking a canonical [`QueryExpr`] tree.
 ///
-/// Step β: the root-level [`crate::intent_algebra::Schema`] is derived
-/// from the outermost `Source` leaf (via
-/// [`crate::intent_algebra::infer_schema_for_root`]) and threaded through
-/// the [`QeCollector::visit`] walk. The collector is schema-agnostic
-/// today (it reads metric / aggregate / label names from the legacy
-/// `ColumnRef::Named(_)` shape directly); Step γ migrates the column-name
-/// reads onto positional `ColumnId` lookups via
-/// [`crate::intent_algebra::resolve_column_ref`].
+/// Step γ7: the collector walks the canonical IR. `Aggregate` carries
+/// `Vec<AggIntent>` directly (the legacy `AggFunc` is gone), so the
+/// `collect_agg_func*` helpers are replaced by per-intent [`collect_op`]
+/// calls. Canonical `Scan` also carries `label_filters` inline, so they
+/// are picked up at the scan leaf as well as from any `Filter` predicate.
 fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
-    let schema = crate::intent_algebra::infer_schema_for_root(qe);
+    // The Binder-built `Scan.schema` is the complete, self-contained
+    // column universe every `ColumnId` in the tree indexes into. We grab
+    // it up-front so the `Aggregate` walk can recover group-by *names*
+    // from positional `by` ids.
+    let schema = root_scan_schema(qe);
     let mut c = QeCollector::default();
-    c.visit(qe, &schema);
+    c.visit(qe, schema);
     c.build()
+}
+
+/// Find the schema carried by the tree's first `Scan` leaf. Every `Scan`
+/// in a converted tree carries the same Binder schema, so the first one
+/// found is representative.
+fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
+    match qe {
+        QueryExpr::Scan { schema, .. } => Some(schema),
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Window { child, .. }
+        | QueryExpr::Aggregate { child, .. }
+        | QueryExpr::Partition { child, .. }
+        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::Subquery { child, .. } => root_scan_schema(child),
+        QueryExpr::Merge { children } => children.iter().find_map(root_scan_schema),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => root_scan_schema(left).or_else(|| root_scan_schema(right)),
+        QueryExpr::LetBinding { expr, child, .. } => {
+            root_scan_schema(expr).or_else(|| root_scan_schema(child))
+        }
+        QueryExpr::Ref { .. } => None,
+    }
 }
 
 #[derive(Default)]
@@ -170,164 +214,101 @@ struct QeCollector {
     exact_required:  bool,
     quantiles:       Vec<f64>,
     topk:            Option<u64>,
-    /// True when currently visiting inside a TopK node (affects Count handling).
-    inside_topk:     bool,
 }
 
 impl QeCollector {
-    /// Step β: `parent_schema` is the [`crate::intent_algebra::Schema`] in
-    /// scope at this node. Collectors that need to convert a
-    /// `ColumnRef::Named` to a `ColumnId` (Step γ migration) call
-    /// [`crate::intent_algebra::resolve_column_ref`] with it.
-    fn visit(&mut self, expr: &QueryExpr, parent_schema: &crate::intent_algebra::Schema) {
-        use crate::intent_algebra::legacy_expr::{FilterOp, FilterVal, LiteralValue, ScalarExpr};
+    /// `schema` is the Binder-built `Scan.schema` — the complete column
+    /// universe `Aggregate.by` positional ids index into. Threaded
+    /// unchanged through the walk; only the `Aggregate` arm reads it.
+    fn visit(&mut self, expr: &QueryExpr, schema: Option<&crate::intent_algebra::Schema>) {
         match expr {
-            QueryExpr::Source(s) => {
+            QueryExpr::Scan {
+                source,
+                label_filters,
+                ..
+            } => {
                 if self.metric_name.is_none() {
-                    self.metric_name = Some(s.name.clone());
+                    self.metric_name = Some(match source {
+                        Source::TimeSeries { metric } => metric.clone(),
+                        Source::Table { table_ref } => table_ref.clone(),
+                    });
+                }
+                // Canonical `Scan` carries equality label filters inline.
+                for lf in label_filters {
+                    self.label_filters
+                        .entry(lf.label.clone())
+                        .or_insert_with(|| lf.equals.clone());
                 }
             }
-            QueryExpr::Filter { pred, input } => {
+            QueryExpr::Filter { pred, child } => {
                 // Extract equality label filters from the predicate tree.
                 collect_filters_from_scalar(pred, &mut self.label_filters);
-                self.visit(input, parent_schema);
+                self.visit(child, schema);
             }
-            QueryExpr::Window { duration, input, .. } => {
+            QueryExpr::Window { size, child, .. } => {
                 if self.time_window.is_none() {
-                    self.time_window = Some(*duration);
+                    self.time_window = Some(*size);
                 }
-                self.visit(input, parent_schema);
+                self.visit(child, schema);
             }
-            QueryExpr::Partition { keys, input } => {
+            QueryExpr::Partition { keys, child } => {
                 for k in keys.keys() {
                     if !self.group_by_labels.contains(k) {
                         self.group_by_labels.push(k.clone());
                     }
                 }
-                self.visit(input, parent_schema);
+                self.visit(child, schema);
             }
-            QueryExpr::SketchAgg { op, input, .. } => {
-                self.collect_op(op);
-                self.visit(input, parent_schema);
-            }
-            QueryExpr::WindowedAgg { agg, window, input, .. } => {
-                if self.time_window.is_none() {
-                    if let crate::intent_algebra::legacy_expr::WindowKind::Tumbling { size } = &window.kind {
-                        self.time_window = Some(*size);
+            QueryExpr::Aggregate { by, aggs, child, .. } => {
+                // The canonical IR folds legacy SketchAgg / WindowedAgg-inner
+                // / TopK / Aggregate into one variant carrying `AggIntent`s.
+                // `by` is positional — recover the group-by label *names*
+                // from the Binder schema (the legacy `Aggregate.keys` were
+                // names; multi-agg aggregates reach here with a non-empty
+                // `by` after the Binder resolves them).
+                if let Some(s) = schema {
+                    for &id in by {
+                        if let Some(col) = s.columns.get(id) {
+                            if !self.group_by_labels.contains(&col.name) {
+                                self.group_by_labels.push(col.name.clone());
+                            }
+                        }
                     }
                 }
-                self.collect_op(agg);
-                self.visit(input, parent_schema);
-            }
-            QueryExpr::TopK { k, input, .. } => {
-                self.topk = Some(*k);
-                let prev = self.inside_topk;
-                self.inside_topk = true;
-                self.visit(input, parent_schema);
-                self.inside_topk = prev;
-            }
-            QueryExpr::Distinct { input, .. } => self.visit(input, parent_schema),
-            QueryExpr::Merge { inputs } => {
-                for i in inputs { self.visit(i, parent_schema); }
-            }
-            QueryExpr::Aggregate { keys, aggs, input, .. } => {
-                for k in keys {
-                    if !self.group_by_labels.contains(k) {
-                        self.group_by_labels.push(k.clone());
+                for intent in aggs {
+                    if let AggIntent::TopK { k, .. } = intent {
+                        self.topk = Some(*k as u64);
+                    } else {
+                        self.collect_op(intent);
                     }
                 }
-                let has_group_by = !keys.is_empty();
-                for agg in aggs {
-                    self.collect_agg_func_with_group(&agg.func, has_group_by);
-                }
-                self.visit(input, parent_schema);
+                self.visit(child, schema);
             }
-            QueryExpr::Project { input, .. }
-            | QueryExpr::Sort { input, .. }
-            | QueryExpr::Limit { input, .. }
-            | QueryExpr::PromQLSubquery { input, .. } => self.visit(input, parent_schema),
+            QueryExpr::Distinct { child, .. } => self.visit(child, schema),
+            QueryExpr::Merge { children } => {
+                for c in children {
+                    self.visit(c, schema);
+                }
+            }
+            QueryExpr::Project { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. }
+            | QueryExpr::Subquery { child, .. } => self.visit(child, schema),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
-            | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
-                self.visit(left, parent_schema);
-                self.visit(right, parent_schema);
+            | QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                self.visit(left, schema);
+                self.visit(right, schema);
             }
-            QueryExpr::LetBinding { expr, body, .. } => {
-                self.visit(expr, parent_schema);
-                self.visit(body, parent_schema);
+            QueryExpr::LetBinding { expr, child, .. } => {
+                self.visit(expr, schema);
+                self.visit(child, schema);
             }
-            QueryExpr::Ref(_) => {}
-        }
-    }
-
-    fn collect_agg_func_with_group(&mut self, func: &crate::intent_algebra::legacy_expr::AggFunc, has_group_by: bool) {
-        use crate::intent_algebra::legacy_expr::AggFunc;
-        // COUNT(*) without GROUP BY → exact (no sketch benefit), unless inside topk
-        // where Count means frequency counting.
-        if matches!(func, AggFunc::Count) && !has_group_by && !self.inside_topk {
-            self.exact_required = true;
-            return;
-        }
-        self.collect_agg_func(func);
-    }
-
-    fn collect_agg_func(&mut self, func: &crate::intent_algebra::legacy_expr::AggFunc) {
-        use crate::intent_algebra::legacy_expr::AggFunc;
-        match func {
-            AggFunc::CountDistinct => {
-                if !self.agg_types.contains(&AggType::Cardinality) {
-                    self.agg_types.push(AggType::Cardinality);
-                }
-            }
-            AggFunc::Count => {
-                if !self.agg_types.contains(&AggType::Frequency) {
-                    self.agg_types.push(AggType::Frequency);
-                }
-            }
-            AggFunc::HeavyHitters { .. } => {
-                if !self.agg_types.contains(&AggType::Frequency) {
-                    self.agg_types.push(AggType::Frequency);
-                }
-            }
-            AggFunc::Quantile(phi) => {
-                if !self.agg_types.contains(&AggType::Quantile) {
-                    self.agg_types.push(AggType::Quantile);
-                }
-                if !self.quantiles.contains(phi) {
-                    self.quantiles.push(*phi);
-                }
-            }
-            AggFunc::Avg => {
-                if !self.agg_types.contains(&AggType::Quantile) {
-                    self.agg_types.push(AggType::Quantile);
-                }
-                // AVG maps to p50 (median) sketch
-                if !self.quantiles.contains(&0.5) { self.quantiles.push(0.5); }
-            }
-            AggFunc::Min => {
-                if !self.agg_types.contains(&AggType::Quantile) {
-                    self.agg_types.push(AggType::Quantile);
-                }
-                if !self.quantiles.contains(&0.0) { self.quantiles.push(0.0); }
-            }
-            AggFunc::Max => {
-                if !self.agg_types.contains(&AggType::Quantile) {
-                    self.agg_types.push(AggType::Quantile);
-                }
-                if !self.quantiles.contains(&1.0) { self.quantiles.push(1.0); }
-            }
-            AggFunc::StdDev { .. } | AggFunc::Variance { .. } => {
-                if !self.agg_types.contains(&AggType::Quantile) {
-                    self.agg_types.push(AggType::Quantile);
-                }
-                // StdDev/Variance use IQR proxy via p25/p75.
-                if !self.quantiles.contains(&0.25) { self.quantiles.push(0.25); }
-                if !self.quantiles.contains(&0.75) { self.quantiles.push(0.75); }
-            }
-            AggFunc::Sum | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta
-            | AggFunc::Custom(_) => {
-                self.exact_required = true;
-            }
+            QueryExpr::Ref { .. } => {}
         }
     }
 
@@ -399,20 +380,26 @@ impl QeCollector {
     }
 }
 
-fn collect_filters_from_scalar(
-    pred: &crate::intent_algebra::legacy_expr::ScalarExpr,
-    out:  &mut HashMap<String, String>,
-) {
-    use crate::intent_algebra::legacy_expr::{BinaryOpKind, LiteralValue, ScalarExpr};
+fn collect_filters_from_scalar(pred: &Predicate, out: &mut HashMap<String, String>) {
     match pred {
-        ScalarExpr::BinaryOp { op: BinaryOpKind::Eq, lhs, rhs } => {
-            if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v))) =
-                (lhs.as_ref(), rhs.as_ref())
+        Predicate::BinaryOp {
+            op: BinaryOpKind::Eq,
+            lhs,
+            rhs,
+        } => {
+            if let (
+                Predicate::Column(ColumnRef::Named(col)),
+                Predicate::Literal(LiteralValue::Str(v)),
+            ) = (lhs.as_ref(), rhs.as_ref())
             {
                 out.insert(col.clone(), v.clone());
             }
         }
-        ScalarExpr::BinaryOp { op: BinaryOpKind::And, lhs, rhs } => {
+        Predicate::BinaryOp {
+            op: BinaryOpKind::And,
+            lhs,
+            rhs,
+        } => {
             collect_filters_from_scalar(lhs, out);
             collect_filters_from_scalar(rhs, out);
         }
@@ -547,13 +534,19 @@ mod tests {
         ).unwrap();
         // `WindowedAgg` exists only on the legacy IR — the canonical IR
         // splits it into `Window { Aggregate }`.
-        assert!(matches!(legacy, QueryExpr::WindowedAgg { .. }));
+        assert!(matches!(
+            legacy,
+            crate::intent_algebra::legacy_expr::QueryExpr::WindowedAgg { .. }
+        ));
     }
 }
 
 #[cfg(test)]
 mod doc_verify_all {
-    use super::*;
+    // These tests pin the *legacy* L2→L3 parse path (`parse_query_expr`),
+    // so `QueryExpr` here is the legacy IR — not the canonical one that
+    // `super::*` would bring in.
+    use super::parse_query_expr;
     use crate::intent_algebra::legacy_expr::*;
 
     #[test]
