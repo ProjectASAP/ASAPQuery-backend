@@ -276,7 +276,8 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
         | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
-        | QueryExpr::Limit { child, .. } => collect_agg_intents(child, out),
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::Subquery { child, .. } => collect_agg_intents(child, out),
         QueryExpr::Merge { children } => {
             for c in children {
                 collect_agg_intents(c, out);

@@ -616,7 +616,8 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
         | QE::Partition { child, .. }
         | QE::Distinct { child, .. }
         | QE::Sort { child, .. }
-        | QE::Limit { child, .. } => extract_edge_facts(child, edge),
+        | QE::Limit { child, .. }
+        | QE::Subquery { child, .. } => extract_edge_facts(child, edge),
         QE::Merge { children } => {
             for c in children {
                 extract_edge_facts(c, edge);
