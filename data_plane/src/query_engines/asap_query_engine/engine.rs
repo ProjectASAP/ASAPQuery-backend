@@ -3524,21 +3524,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             let policy_registry = streaming_snap.policy_registry();
 
             for candidate in &analysis.candidates {
-                // Fast path (PRs #203 + #204 + #205): find matching
-                // policies in the content-addressed registry, then
-                // resolve each policy_fp → {sids} via the reverse
-                // index. Both hops are O(1)-amortized.
-                //
-                // Slow-path fallback: when the fast path yields no
-                // sids — either because no policy matches (control
-                // plane hasn't published one yet) or because the
-                // candidate's sids were registered with
-                // `PolicyFingerprint::UNSET` (legacy paths that
-                // didn't carry an `AggregationConfig` at ingest) —
-                // fall back to the metadata walk
-                // `instances_matching(metric, gbk)`. The per-sid
-                // capability filter below catches mismatches the
-                // fast path would have rejected at policy-match time.
+                // Content-addressed sid lookup: find matching policies
+                // in the registry → resolve each policy_fp → {sids}
+                // via the reverse index. Both hops are O(1)-amortized.
+                // The legacy `instances_matching(metric, gbk)`
+                // fallback was retired in this PR — every production
+                // sid registration path now populates `policy_fp`,
+                // and sids that don't are intentionally unreachable
+                // (raw mode, etc. — they map to capability misses).
                 let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
                     &policy_registry,
                     candidate,
@@ -3548,16 +3541,12 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     sids.extend(idx.sids_for_policy(*fp));
                 }
                 if sids.is_empty() {
-                    sids = idx
-                        .instances_matching(&candidate.metric_name, &candidate.group_by_keys);
-                }
-                if sids.is_empty() {
                     return Err(crate::query_engines::EngineError::capability_miss(
                         asap_types::StorageBackend::SketchStore.data_source_id(),
                         format!(
-                            "SketchStore has no instance for metric `{}` \
-                             with group_by_keys ⊇ {:?} (analyzer required \
-                             {:?}) — failing over to archive",
+                            "SketchStore has no policy for metric `{}` \
+                             with group_by_keys ⊇ {:?} satisfying capability \
+                             {:?} — failing over to archive",
                             candidate.metric_name,
                             candidate.group_by_keys,
                             candidate.required_capability,
@@ -5974,31 +5963,28 @@ mod asap_tier_classify_tests {
 
     #[tokio::test]
     async fn execute_returns_capability_miss_when_classify_is_ghost() {
-        // Register instance metadata but never call append_sample → the
-        // sid classifies as Ghost. The Phase-9 controller-unified
-        // adapter expects a call-shaped query (the analyzer rejects
-        // bare selectors with NoCallNodeFound BEFORE any sid lookup);
-        // use `quantile_over_time(...)` so the analyzer accepts the
-        // shape and the per-candidate sid classification surfaces
-        // the ghost miss.
+        // Register instance metadata but never call append_sample. With
+        // `dd_meta`'s `PolicyFingerprint::UNSET`, the engine's policy-fp
+        // lookup misses entirely — there's no policy in the (empty)
+        // registry to bind the sid to. Prior to the legacy-fallback
+        // removal, the engine would walk `instances_matching` and find
+        // the registered sid, classify it as Ghost (no sample state),
+        // and produce a "ghost/unknown" detail. After removal, the
+        // ghost lookup short-circuits at the policy-resolution step.
+        // The CapabilityMiss outcome is preserved; we just don't
+        // pin the detail string.
         let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(1, "http_latency_ms", &["zone"]));
         let engine = build_engine_with_index(idx);
         let err = engine
             .execute("quantile_over_time(0.99, http_latency_ms{zone=\"z0\"}[5m])")
             .await
-            .expect_err("ghost classification must yield CapabilityMiss");
+            .expect_err("ghost sid registration must yield CapabilityMiss");
         match err {
-            EngineError::CapabilityMiss { engine_id, detail } => {
+            EngineError::CapabilityMiss { engine_id, .. } => {
                 assert_eq!(
                     engine_id,
                     asap_types::StorageBackend::SketchStore.data_source_id()
-                );
-                assert!(
-                    detail.contains("ghost")
-                        || detail.contains("Ghost")
-                        || detail.contains("unknown"),
-                    "detail mentions ghost/unknown: {detail}"
                 );
             }
             other => panic!("expected CapabilityMiss, got {other:?}")}

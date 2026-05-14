@@ -386,8 +386,28 @@ pub fn spatial_filter_compatible(config_filter: &str, req_filter: &str) -> bool 
 
 /// Aggregation priority comparator: prefer larger `window_size` (descending).
 /// This is a separate function so callers can swap the policy without touching matching logic.
+///
+/// Sort keys (each `then_with`s the previous when equal):
+/// 1. **Larger `window_size` wins.** Coarser windows can answer
+///    finer-grained queries by re-aggregation.
+/// 2. **Single-population variants beat multi-population.** Multi-pop
+///    types (`CountMinSketch`, `MultipleSum`, etc.) require a paired
+///    key-aggregation lookup downstream; single-pop types
+///    (`Sum`, `Increase`, `MinMax`, …) don't. Preferring single-pop
+///    avoids the key-aggregation hunt when both shapes serve the
+///    statistic — which is the common case for `Statistic::Sum`
+///    matching both `Sum` and `CountMinSketch`.
+/// 3. **Tie-break on `aggregation_id()` (the policy fingerprint).**
+///    Deterministic across runs and hosts; fixes the
+///    HashMap-iteration-order flake on `avg_finds_sum_and_count`.
 pub fn aggregation_priority(a: &AggregationConfig, b: &AggregationConfig) -> Ordering {
-    b.window_size.cmp(&a.window_size)
+    let a_multi = is_multi_population_value_type(a.aggregation_type);
+    let b_multi = is_multi_population_value_type(b.aggregation_type);
+    b.window_size
+        .cmp(&a.window_size)
+        // `false < true` in Rust's bool Ord → single-pop sorts FIRST.
+        .then_with(|| a_multi.cmp(&b_multi))
+        .then_with(|| a.aggregation_id().cmp(&b.aggregation_id()))
 }
 
 // ---------------------------------------------------------------------------
