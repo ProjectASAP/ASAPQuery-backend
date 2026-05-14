@@ -715,8 +715,19 @@ async fn handle_plan(
                 let budgets = StageResourceBudgets::from_workload_chars(&wc_for_algebra);
                 let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
                 let (opt_qe, _iters) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(opt_qe);
-                Some(plan_node.summarise(raw_bps))
+                // Step γ7: the allocator is canonical-IR now (PR 7); the
+                // optimizer still emits the legacy IR (flips in PR 9).
+                // `convert_root` bridges the boundary until then.
+                match control_plane::intent_algebra::convert_root(&opt_qe) {
+                    Ok(canonical) => {
+                        let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(canonical);
+                        Some(plan_node.summarise(raw_bps))
+                    }
+                    Err(e) => {
+                        warn!(query = qs, error = %e, "legacy→canonical conversion failed; skipping plan_summary");
+                        None
+                    }
+                }
             }
         }
     });

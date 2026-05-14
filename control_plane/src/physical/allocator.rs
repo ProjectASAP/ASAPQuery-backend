@@ -15,26 +15,34 @@
 //!
 //! | Node type | Default stage | Condition |
 //! |-----------|---------------|-----------|
-//! | Source, Filter, Window, Partition, Distinct | Agent | Always |
-//! | SketchAgg (sketachable op, mergeable) | Agent | budget OK |
-//! | SketchAgg (sketchable, mergeable) | Backend | agent budget exceeded |
-//! | SketchAgg (sketchable, not mergeable: Avg) | Db | always |
-//! | SketchAgg (exact: Sum/Count/Min/Max) | Backend | mergeable |
-//! | TopK | Precompute | always |
+//! | Scan, Ref, Filter, Window, Partition, Distinct | Agent | Always |
+//! | Aggregate (single sketch intent, mergeable) | Agent | budget OK |
+//! | Aggregate (single sketch intent, mergeable) | Backend | agent budget exceeded |
+//! | Aggregate (single intent: Avg) | Db | always (not mergeable) |
+//! | Aggregate (single exact intent: Sum/Count/Min/Max) | Backend | mergeable |
+//! | Aggregate (single TopK intent) | Precompute | always |
+//! | Aggregate (multi-intent or HAVING) | Db | always (general exact) |
 //! | Merge | Backend | always |
-//! | Aggregate, Project, Sort, Limit | Db | always |
-//! | PromQLSubquery, BinaryOp | Precompute | has sketch children |
-//!
-//! `histogram_quantile(φ, …)` is substituted at the parser level into a plain
-//! `Aggregate{Quantile(φ)}` (Step γ5) — no dedicated allocator arm.
+//! | Project, Sort, Limit, Join, SetOp | Db | always |
+//! | Subquery, BinaryOp | Precompute | has sketch children |
 //! | LetBinding | same as body | propagated |
+//!
+//! Step γ7: the canonical IR folds the legacy `SketchAgg` / `WindowedAgg`
+//! / `TopK` variants all into `Aggregate`, so the single `Aggregate` arm
+//! dispatches on shape. `histogram_quantile(φ, …)` was already
+//! substituted at the parser level into a plain `Aggregate{Quantile(φ)}`
+//! (Step γ5). A `Window` over a single-intent `Aggregate` is the
+//! canonical fold of the legacy `WindowedAgg`; for *stage* allocation
+//! the window is informational (the `Window` arm is a passthrough and
+//! the inner `Aggregate` arm does the sketch placement). The
+//! window-defines-sketch-lifecycle fusion that *does* matter is a
+//! `physical::planner` concern — see `physical::window_fusion`.
 
-use crate::intent_algebra::legacy_expr::QueryExpr;
-use super::plan::{
-    CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode,
-};
-use crate::intent_algebra::legacy_expr::{agg_is_exact, AggIntent};
-use crate::intent_algebra::{infer_schema_for_root, Schema};
+use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
+use crate::intent_algebra::agg_intent::AggIntent;
+use crate::intent_algebra::legacy_expr::agg_is_exact;
+use crate::intent_algebra::schema::ColumnId;
+use crate::intent_algebra::QueryExpr;
 use crate::types::{SketchType, StageResourceBudgets};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
@@ -79,10 +87,10 @@ impl BudgetState {
 
 // ── Public allocator ──────────────────────────────────────────────────────────
 
-/// Converts a (pre-optimised) [`QueryExpr`] tree into an annotated
-/// [`PlanNode`] tree.
+/// Converts a (pre-optimised) canonical [`QueryExpr`] tree into an
+/// annotated [`PlanNode`] tree.
 pub struct SketchAllocator {
-    budgets:         StageResourceBudgets,
+    budgets:           StageResourceBudgets,
     raw_bytes_per_sec: f64,
 }
 
@@ -93,46 +101,40 @@ impl SketchAllocator {
     /// * `raw_bytes_per_sec` — baseline bandwidth of the raw OTLP stream,
     ///   used to estimate compression ratios.
     pub fn new(budgets: StageResourceBudgets, raw_bytes_per_sec: f64) -> Self {
-        Self { budgets, raw_bytes_per_sec }
+        Self {
+            budgets,
+            raw_bytes_per_sec,
+        }
     }
 
     /// Allocate stages for the entire expression tree.
     ///
-    /// Step β: derives the root-level [`Schema`] from the outermost
-    /// `Source` leaf (via [`infer_schema_for_root`]) and threads it
-    /// through every recursive [`Self::alloc_node`] call. The allocator's
-    /// stage-assignment logic is purely structural today, but the schema
-    /// parameter is in place for Step γ when sketch-placement heuristics
-    /// start consulting column types.
+    /// The canonical `Aggregate.by` is already positional (`Vec<ColumnId>`),
+    /// so — unlike the legacy allocator — no inherited `Schema` needs to be
+    /// threaded for column resolution; stage assignment is purely structural.
     pub fn allocate(&self, expr: QueryExpr) -> PlanNode {
-        let schema = infer_schema_for_root(&expr);
         let mut budget = BudgetState::from_budgets(&self.budgets);
-        self.alloc_node(expr, &mut budget, &schema)
+        self.alloc_node(expr, &mut budget)
     }
 
     // ── Recursive allocation ──────────────────────────────────────────────────
 
-    fn alloc_node(
-        &self,
-        expr: QueryExpr,
-        budget: &mut BudgetState,
-        parent_schema: &Schema,
-    ) -> PlanNode {
+    fn alloc_node(&self, expr: QueryExpr, budget: &mut BudgetState) -> PlanNode {
         match expr {
             // ── Leaves ───────────────────────────────────────────────────────
-            QueryExpr::Source(_) | QueryExpr::Ref(_) => PlanNode::leaf(
-                expr,
-                PipelineStage::Agent,
-                ExecutionMode::Passthrough,
-            ),
+            QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {
+                PlanNode::leaf(expr, PipelineStage::Agent, ExecutionMode::Passthrough)
+            }
 
             // ── Structural / filter nodes — always Agent ──────────────────
-            QueryExpr::Filter { pred, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
-                let stage = PipelineStage::Agent;
+            QueryExpr::Filter { pred, child } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
-                    expr: QueryExpr::Filter { pred, input: Box::new(child.expr.clone()) },
-                    stage,
+                    expr: QueryExpr::Filter {
+                        pred,
+                        child: Box::new(child.expr.clone()),
+                    },
+                    stage: PipelineStage::Agent,
                     mode: ExecutionMode::Passthrough,
                     cost: CostEstimate {
                         bytes_per_sec: self.raw_bytes_per_sec * 0.5,
@@ -146,16 +148,27 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Window { duration, slide, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            // A `Window` over a single-intent `Aggregate` is the canonical
+            // fold of the legacy `WindowedAgg`; for *stage* allocation the
+            // window is informational — this arm is a passthrough and the
+            // inner `Aggregate` arm does the sketch placement.
+            QueryExpr::Window {
+                kind,
+                size,
+                slide,
+                child,
+            } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Window {
-                        duration, slide,
-                        input: Box::new(child.expr.clone()),
+                        kind,
+                        size,
+                        slide,
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
-                    mode:  ExecutionMode::Passthrough,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Passthrough,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Time window computed at Agent".into(),
                         ..Default::default()
@@ -164,16 +177,16 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Partition { keys, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            QueryExpr::Partition { keys, child } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Partition {
                         keys,
-                        input: Box::new(child.expr.clone()),
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
-                    mode:  ExecutionMode::Passthrough,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Passthrough,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Partition for GROUP BY at Agent".into(),
                         ..Default::default()
@@ -182,16 +195,16 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Distinct { cols, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            QueryExpr::Distinct { cols, child } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Distinct {
                         cols,
-                        input: Box::new(child.expr.clone()),
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
-                    mode:  ExecutionMode::Passthrough,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Passthrough,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Distinct at Agent before sketch build".into(),
                         ..Default::default()
@@ -200,113 +213,70 @@ impl SketchAllocator {
                 }
             }
 
-            // ── Sketch aggregation — core allocation logic ────────────────
-            QueryExpr::SketchAgg { op, col, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
-                self.alloc_sketch_agg(op, col, child, budget, parent_schema)
-            }
-
-            // ── WindowedAgg — treat as SketchAgg (window is informational) ──
-            //
-            // Step γ3 demonstration: bridge the legacy WindowedAgg to
-            // canonical-shape data (Window over Aggregate) and enrich
-            // the child PlanNode's annotation rationale with the
-            // canonical window kind + intent kind. The legacy emit
-            // shape is unchanged — `alloc_sketch_agg` still receives
-            // the legacy `agg` / `col` and emits a `QueryExpr::SketchAgg`
-            // (approach (c) per the migration spec). The bridge fails
-            // gracefully on Wildcard cols / Unbounded / Landmark
-            // windows; we keep the un-enriched fallback rationale in
-            // that case.
-            QueryExpr::WindowedAgg { agg, window, col, input } => {
-                let bridge_annotation: Option<String> =
-                    crate::intent_algebra::bridge_windowed_agg_to_canonical(
-                        &agg, &window, &col, parent_schema,
-                    )
-                    .ok()
-                    .map(|b| {
-                        let kind_str = match b.window_kind {
-                            crate::intent_algebra::WindowKind::Tumbling => "tumbling",
-                            crate::intent_algebra::WindowKind::Sliding => "sliding",
-                            crate::intent_algebra::WindowKind::Session => "session",
+            // ── Aggregate — the canonical IR folds legacy SketchAgg /
+            // WindowedAgg / TopK all into Aggregate, so dispatch on shape:
+            //   * single TopK intent, no HAVING → heavy-hitter at Precompute
+            //   * single other intent, no HAVING → budget-driven sketch
+            //   * multi-intent or HAVING → general exact Aggregate at Db
+            QueryExpr::Aggregate {
+                by,
+                aggs,
+                having,
+                child,
+            } => {
+                if aggs.len() == 1 && having.is_none() {
+                    if let AggIntent::TopK { k, .. } = &aggs[0] {
+                        let k = *k;
+                        let child = self.alloc_node(*child, budget);
+                        return PlanNode {
+                            expr: QueryExpr::Aggregate {
+                                by,
+                                aggs,
+                                having,
+                                child: Box::new(child.expr.clone()),
+                            },
+                            stage: PipelineStage::Precompute,
+                            mode: ExecutionMode::Sketch,
+                            cost: CostEstimate {
+                                bytes_per_sec: self.raw_bytes_per_sec * 0.05,
+                                memory_bytes: (k as f64) * 64.0,
+                                ..Default::default()
+                            },
+                            annotation: NodeAnnotation {
+                                sketch_type: Some(SketchType::CountSketch),
+                                rationale: format!(
+                                    "TopK(k={k}) assigned to Precompute engine (CountSketch)"
+                                ),
+                                ..Default::default()
+                            },
+                            children: vec![child],
                         };
-                        let intent_str = b
-                            .inner
-                            .aggs
-                            .first()
-                            .map(canonical_intent_kind_str)
-                            .unwrap_or("<none>");
-                        format!(
-                            "canonical view: Window(kind={kind_str}, \
-                             size={:?}, slide={:?}) over Aggregate(by_len={}, \
-                             intent={intent_str})",
-                            b.window_size,
-                            b.window_slide,
-                            b.inner.by.len(),
-                        )
-                    });
-                let child = self.alloc_node(*input, budget, parent_schema);
-                let mut node = self.alloc_sketch_agg(agg, col, child, budget, parent_schema);
-                if let Some(extra) = bridge_annotation {
-                    if node.annotation.rationale.is_empty() {
-                        node.annotation.rationale = extra;
-                    } else {
-                        node.annotation.rationale =
-                            format!("{}; {extra}", node.annotation.rationale);
                     }
+                    // Single non-TopK intent → budget-driven sketch agg.
+                    let child = self.alloc_node(*child, budget);
+                    return self.alloc_sketch_agg(by, aggs, child, budget);
                 }
-                node
-            }
-
-            // ── TopK — Precompute engine ──────────────────────────────────
-            QueryExpr::TopK { k, by, input } => {
-                // Step γ4 demonstration: bridge the legacy TopK to its
-                // canonical-shape data (one of `HeavyHitter` vs
-                // `SortLimit`) and enrich the annotation rationale with
-                // the canonical intent kind. The legacy emit shape is
-                // unchanged — `expr` still carries the legacy variant
-                // (approach (c) per the migration spec). The bridge fails
-                // gracefully when `by` columns don't resolve; the legacy
-                // annotation text is used as the fallback in that case.
-                let by_refs: Vec<crate::intent_algebra::query_expr::ColumnRef> = by
-                    .iter()
-                    .map(|name| {
-                        crate::intent_algebra::query_expr::ColumnRef::Named(name.clone())
-                    })
-                    .collect();
-                let bridge_annotation: String =
-                    match crate::intent_algebra::bridge_topk(k as usize, &by_refs, parent_schema) {
-                        Ok(crate::intent_algebra::BridgedTopK::HeavyHitter { k: kb, by: by_ids, .. }) => format!(
-                            "TopK assigned to Precompute engine (CountSketch); \
-                             canonical intent: HeavyHitter {{ k: {}, by_cols: {} }}",
-                            kb,
-                            by_ids.len(),
-                        ),
-                        Ok(crate::intent_algebra::BridgedTopK::SortLimit { k: kb, by: by_ids }) => format!(
-                            "TopK assigned to Precompute engine (CountSketch); \
-                             canonical intent: SortLimit {{ k: {}, by_cols: {} }}",
-                            kb,
-                            by_ids.len(),
-                        ),
-                        Err(_e) => "TopK assigned to Precompute engine (CountSketch)".into(),
-                    };
-
-                let child = self.alloc_node(*input, budget, parent_schema);
+                // General multi-intent / HAVING aggregate → Db (exact).
+                let child = self.alloc_node(*child, budget);
+                let kinds: Vec<&'static str> =
+                    aggs.iter().map(canonical_intent_kind_str).collect();
                 PlanNode {
-                    expr: QueryExpr::TopK {
-                        k, by,
-                        input: Box::new(child.expr.clone()),
+                    expr: QueryExpr::Aggregate {
+                        by,
+                        aggs,
+                        having,
+                        child: Box::new(child.expr.clone()),
                     },
-                    stage: PipelineStage::Precompute,
-                    mode:  ExecutionMode::Sketch,
-                    cost:  CostEstimate {
-                        bytes_per_sec:  self.raw_bytes_per_sec * 0.05,
-                        memory_bytes:   (k as f64) * 64.0,
+                    stage: PipelineStage::Db,
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate {
+                        bytes_per_sec: self.raw_bytes_per_sec,
                         ..Default::default()
                     },
                     annotation: NodeAnnotation {
-                        sketch_type: Some(SketchType::CountSketch),
-                        rationale:   bridge_annotation,
+                        rationale: format!(
+                            "General Aggregate at Db (exact); intents: {kinds:?}"
+                        ),
                         ..Default::default()
                     },
                     children: vec![child],
@@ -314,21 +284,21 @@ impl SketchAllocator {
             }
 
             // ── Merge — Backend ───────────────────────────────────────────
-            QueryExpr::Merge { inputs } => {
+            QueryExpr::Merge { children: inputs } => {
                 let children: Vec<PlanNode> = inputs
                     .into_iter()
-                    .map(|inp| self.alloc_node(inp, budget, parent_schema))
+                    .map(|inp| self.alloc_node(inp, budget))
                     .collect();
                 let mem: f64 = children.iter().map(|c| c.cost.memory_bytes).sum();
                 PlanNode {
                     expr: QueryExpr::Merge {
-                        inputs: children.iter().map(|c| c.expr.clone()).collect(),
+                        children: children.iter().map(|c| c.expr.clone()).collect(),
                     },
                     stage: PipelineStage::Backend,
-                    mode:  ExecutionMode::Passthrough,
-                    cost:  CostEstimate {
+                    mode: ExecutionMode::Passthrough,
+                    cost: CostEstimate {
                         bytes_per_sec: self.raw_bytes_per_sec * 0.1,
-                        memory_bytes:  mem,
+                        memory_bytes: mem,
                         ..Default::default()
                     },
                     annotation: NodeAnnotation {
@@ -340,63 +310,16 @@ impl SketchAllocator {
             }
 
             // ── Exact / relational — Db ───────────────────────────────────
-            QueryExpr::Aggregate { keys, aggs, having, input } => {
-                // Step γ1 demonstration: bridge the legacy Aggregate to
-                // canonical-shape data and enrich the annotation rationale
-                // with the canonical intent kind(s). The legacy emit shape
-                // is unchanged — `expr` still carries the legacy variant
-                // (approach (c) per the migration spec). The bridge fails
-                // gracefully when keys don't resolve or HAVING uses an
-                // E-deferred ScalarExpr variant; the legacy annotation
-                // text is used as the fallback in that case.
-                let bridge_annotation: String = match
-                    crate::intent_algebra::bridge_aggregate_to_canonical(
-                        &keys, &aggs, &having, parent_schema,
-                    )
-                {
-                    Ok(b) => {
-                        let kinds: Vec<&'static str> = b.aggs.iter()
-                            .map(canonical_intent_kind_str)
-                            .collect();
-                        format!(
-                            "General Aggregate at Db (exact); canonical \
-                             intents: {:?}, group_by_cols: {}",
-                            kinds, b.by.len()
-                        )
-                    }
-                    Err(_e) => "General Aggregate at Db (exact)".into(),
-                };
-
-                let child = self.alloc_node(*input, budget, parent_schema);
-                PlanNode {
-                    expr: QueryExpr::Aggregate {
-                        keys, aggs, having,
-                        input: Box::new(child.expr.clone()),
-                    },
-                    stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate {
-                        bytes_per_sec: self.raw_bytes_per_sec,
-                        ..Default::default()
-                    },
-                    annotation: NodeAnnotation {
-                        rationale: bridge_annotation,
-                        ..Default::default()
-                    },
-                    children: vec![child],
-                }
-            }
-
-            QueryExpr::Project { cols, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            QueryExpr::Project { cols, child } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Project {
                         cols,
-                        input: Box::new(child.expr.clone()),
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Project at Db".into(),
                         ..Default::default()
@@ -405,16 +328,16 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Sort { keys, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            QueryExpr::Sort { keys, child } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Sort {
                         keys,
-                        input: Box::new(child.expr.clone()),
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Sort at Db".into(),
                         ..Default::default()
@@ -423,16 +346,21 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Limit { n, offset, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            QueryExpr::Limit {
+                n,
+                offset,
+                child,
+            } => {
+                let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Limit {
-                        n, offset,
-                        input: Box::new(child.expr.clone()),
+                        n,
+                        offset,
+                        child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "Limit at Db".into(),
                         ..Default::default()
@@ -441,18 +369,24 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Join { kind, pred, left, right } => {
-                let left_node  = self.alloc_node(*left, budget, parent_schema);
-                let right_node = self.alloc_node(*right, budget, parent_schema);
+            QueryExpr::Join {
+                kind,
+                pred,
+                left,
+                right,
+            } => {
+                let left_node = self.alloc_node(*left, budget);
+                let right_node = self.alloc_node(*right, budget);
                 PlanNode {
                     expr: QueryExpr::Join {
-                        kind, pred,
-                        left:  Box::new(left_node.expr.clone()),
+                        kind,
+                        pred,
+                        left: Box::new(left_node.expr.clone()),
                         right: Box::new(right_node.expr.clone()),
                     },
                     stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate {
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate {
                         bytes_per_sec: self.raw_bytes_per_sec,
                         ..Default::default()
                     },
@@ -464,18 +398,24 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::SetOp { kind, all, left, right } => {
-                let left_node  = self.alloc_node(*left, budget, parent_schema);
-                let right_node = self.alloc_node(*right, budget, parent_schema);
+            QueryExpr::SetOp {
+                kind,
+                all,
+                left,
+                right,
+            } => {
+                let left_node = self.alloc_node(*left, budget);
+                let right_node = self.alloc_node(*right, budget);
                 PlanNode {
                     expr: QueryExpr::SetOp {
-                        kind, all,
-                        left:  Box::new(left_node.expr.clone()),
+                        kind,
+                        all,
+                        left: Box::new(left_node.expr.clone()),
                         right: Box::new(right_node.expr.clone()),
                     },
                     stage: PipelineStage::Db,
-                    mode:  ExecutionMode::Exact,
-                    cost:  CostEstimate::default(),
+                    mode: ExecutionMode::Exact,
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "SetOp at Db".into(),
                         ..Default::default()
@@ -484,13 +424,13 @@ impl SketchAllocator {
                 }
             }
 
-            // ── PromQL-specific ───────────────────────────────────────────
-            // (histogram_quantile is substituted at the parser level into a
-            // plain Aggregate{Quantile(φ)}; see Step γ5. The Aggregate arm
-            // above handles the resulting Quantile intent.)
-
-            QueryExpr::PromQLSubquery { range, resolution, input } => {
-                let child = self.alloc_node(*input, budget, parent_schema);
+            // ── PromQL sub-query ──────────────────────────────────────────
+            QueryExpr::Subquery {
+                range,
+                resolution,
+                child,
+            } => {
+                let child = self.alloc_node(*child, budget);
                 let stage = if child.mode == ExecutionMode::Sketch {
                     PipelineStage::Precompute
                 } else {
@@ -498,9 +438,10 @@ impl SketchAllocator {
                 };
                 let rationale = format!("PromQL subquery at {stage}");
                 PlanNode {
-                    expr: QueryExpr::PromQLSubquery {
-                        range, resolution,
-                        input: Box::new(child.expr.clone()),
+                    expr: QueryExpr::Subquery {
+                        range,
+                        resolution,
+                        child: Box::new(child.expr.clone()),
                     },
                     stage,
                     mode: child.mode.clone(),
@@ -513,9 +454,14 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::BinaryOp { op, lhs, rhs, vector_match } => {
-                let left_node  = self.alloc_node(*lhs, budget, parent_schema);
-                let right_node = self.alloc_node(*rhs, budget, parent_schema);
+            QueryExpr::BinaryOp {
+                op,
+                lhs,
+                rhs,
+                vector_match,
+            } => {
+                let left_node = self.alloc_node(*lhs, budget);
+                let right_node = self.alloc_node(*rhs, budget);
                 let has_sketch = left_node.mode == ExecutionMode::Sketch
                     || right_node.mode == ExecutionMode::Sketch;
                 let stage = if has_sketch {
@@ -526,12 +472,17 @@ impl SketchAllocator {
                 let rationale = format!("BinaryOp at {stage}");
                 PlanNode {
                     expr: QueryExpr::BinaryOp {
-                        op, vector_match,
+                        op,
+                        vector_match,
                         lhs: Box::new(left_node.expr.clone()),
                         rhs: Box::new(right_node.expr.clone()),
                     },
                     stage,
-                    mode: if has_sketch { ExecutionMode::Sketch } else { ExecutionMode::Exact },
+                    mode: if has_sketch {
+                        ExecutionMode::Sketch
+                    } else {
+                        ExecutionMode::Exact
+                    },
                     cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale,
@@ -542,20 +493,20 @@ impl SketchAllocator {
             }
 
             // ── Scoping constructs — propagate body's stage ───────────────
-            QueryExpr::LetBinding { name, expr, body } => {
-                let expr_node = self.alloc_node(*expr, budget, parent_schema);
-                let body_node = self.alloc_node(*body, budget, parent_schema);
+            QueryExpr::LetBinding { name, expr, child } => {
+                let expr_node = self.alloc_node(*expr, budget);
+                let body_node = self.alloc_node(*child, budget);
                 let stage = body_node.stage.clone();
-                let mode  = body_node.mode.clone();
+                let mode = body_node.mode.clone();
                 PlanNode {
                     expr: QueryExpr::LetBinding {
                         name,
                         expr: Box::new(expr_node.expr.clone()),
-                        body: Box::new(body_node.expr.clone()),
+                        child: Box::new(body_node.expr.clone()),
                     },
                     stage,
                     mode,
-                    cost:       CostEstimate::default(),
+                    cost: CostEstimate::default(),
                     annotation: NodeAnnotation {
                         rationale: "LetBinding: stage = body stage".into(),
                         ..Default::default()
@@ -566,63 +517,38 @@ impl SketchAllocator {
         }
     }
 
-    // ── SketchAgg allocation (budget-driven demotion) ─────────────────────────
+    // ── Single-intent Aggregate allocation (budget-driven demotion) ───────────
 
+    /// Allocate a single-intent, no-HAVING `Aggregate` — the canonical
+    /// shape the legacy `SketchAgg` / `WindowedAgg`-inner-agg folded into.
+    /// The caller (the `Aggregate` arm of [`Self::alloc_node`]) guarantees
+    /// `aggs.len() == 1` and that the single intent is not `TopK`.
     fn alloc_sketch_agg(
         &self,
-        op:     AggIntent,
-        col:    crate::intent_algebra::legacy_expr::ColumnRef,
-        child:  PlanNode,
+        by: Vec<ColumnId>,
+        aggs: Vec<AggIntent>,
+        child: PlanNode,
         budget: &mut BudgetState,
-        // Step β: schema in scope at this SketchAgg node. Step γ2 wires
-        // this schema through the SketchAgg bridge so the annotation
-        // rationale can carry canonical-shape info; future Step γ wiring
-        // (sketch-placement rules that consult column types, e.g. KLL vs
-        // DDSketch for `value: Float64`) will read it directly.
-        parent_schema: &Schema,
     ) -> PlanNode {
-        // Step γ2 demonstration: bridge the legacy SketchAgg to canonical-
-        // shape data and capture a suffix describing the canonical intent
-        // kind + group-by column count. The legacy emit shape is unchanged
-        // — `expr` still carries the legacy SketchAgg variant (approach (c)
-        // per the migration spec). The bridge fails gracefully when `col`
-        // is a Named/SampleValue that doesn't resolve against the inherited
-        // schema; the legacy annotation text stands alone in that case.
-        let canonical_suffix: String = match
-            crate::intent_algebra::bridge_sketch_agg_to_canonical(
-                &op, &col, parent_schema,
-            )
-        {
-            Ok(b) => {
-                let kinds: Vec<&'static str> = b.aggs.iter()
-                    .map(canonical_intent_kind_str)
-                    .collect();
-                format!(
-                    " [canonical: intents={:?}, group_by_cols={}]",
-                    kinds, b.by.len()
-                )
-            }
-            Err(_e) => String::new(),
-        };
+        let intent = aggs[0].clone();
 
         // Exact non-mergeable (Avg) → always Db.
-        if matches!(&op, AggIntent::Avg) {
+        if matches!(intent, AggIntent::Avg) {
             return PlanNode {
-                expr: QueryExpr::SketchAgg {
-                    op,
-                    col,
-                    input: Box::new(child.expr.clone()),
+                expr: QueryExpr::Aggregate {
+                    by,
+                    aggs,
+                    having: None,
+                    child: Box::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Db,
-                mode:  ExecutionMode::Exact,
-                cost:  CostEstimate {
+                mode: ExecutionMode::Exact,
+                cost: CostEstimate {
                     bytes_per_sec: self.raw_bytes_per_sec,
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    rationale: format!(
-                        "Avg is not mergeable — must run at Db{canonical_suffix}"
-                    ),
+                    rationale: "Avg is not mergeable — must run at Db".into(),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -630,56 +556,55 @@ impl SketchAllocator {
         }
 
         // Exact mergeable (Sum, Count, Min, Max) → Backend.
-        if agg_is_exact(&op) {
+        if agg_is_exact(&intent) {
             return PlanNode {
-                expr: QueryExpr::SketchAgg {
-                    op,
-                    col,
-                    input: Box::new(child.expr.clone()),
+                expr: QueryExpr::Aggregate {
+                    by,
+                    aggs,
+                    having: None,
+                    child: Box::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Backend,
-                mode:  ExecutionMode::Exact,
-                cost:  CostEstimate {
+                mode: ExecutionMode::Exact,
+                cost: CostEstimate {
                     bytes_per_sec: self.raw_bytes_per_sec * 0.8,
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    rationale: format!(
-                        "Exact(Sum/Count/Min/Max) merged at Backend{canonical_suffix}"
-                    ),
+                    rationale: "Exact(Sum/Count/Min/Max) merged at Backend".into(),
                     ..Default::default()
                 },
                 children: vec![child],
             };
         }
 
-        // Sketch operators: resolve to physical, then try Agent → Backend → Precompute.
-        let physical = super::planner::resolve(&op);
-        let mem = estimated_sketch_memory(&op);
+        // Sketch operators: resolve to physical, then try
+        // Agent → Backend → Precompute.
+        let physical = super::planner::resolve(&intent);
+        let mem = estimated_sketch_memory(&intent);
         let (sketch_type, params) = (physical.sketch_type, physical.sketch_params);
 
         if budget.fits_agent(mem) {
             budget.consume_agent(mem);
             return PlanNode {
-                expr: QueryExpr::SketchAgg {
-                    op,
-                    col,
-                    input: Box::new(child.expr.clone()),
+                expr: QueryExpr::Aggregate {
+                    by,
+                    aggs,
+                    having: None,
+                    child: Box::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Agent,
-                mode:  ExecutionMode::Sketch,
-                cost:  CostEstimate {
-                    bytes_per_sec:  self.raw_bytes_per_sec * 0.05,
-                    memory_bytes:   mem,
+                mode: ExecutionMode::Sketch,
+                cost: CostEstimate {
+                    bytes_per_sec: self.raw_bytes_per_sec * 0.05,
+                    memory_bytes: mem,
                     compression_ratio: 20.0,
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
                     sketch_type: Some(sketch_type),
                     sketch_params: Some(params),
-                    rationale: format!(
-                        "Sketch at Agent (within budget){canonical_suffix}"
-                    ),
+                    rationale: "Sketch at Agent (within budget)".into(),
                     ..Default::default()
                 },
                 children: vec![child],
@@ -689,25 +614,24 @@ impl SketchAllocator {
         if budget.fits_backend(mem) {
             budget.consume_backend(mem);
             return PlanNode {
-                expr: QueryExpr::SketchAgg {
-                    op,
-                    col,
-                    input: Box::new(child.expr.clone()),
+                expr: QueryExpr::Aggregate {
+                    by,
+                    aggs,
+                    having: None,
+                    child: Box::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Backend,
-                mode:  ExecutionMode::Sketch,
-                cost:  CostEstimate {
-                    bytes_per_sec:  self.raw_bytes_per_sec * 0.1,
-                    memory_bytes:   mem,
+                mode: ExecutionMode::Sketch,
+                cost: CostEstimate {
+                    bytes_per_sec: self.raw_bytes_per_sec * 0.1,
+                    memory_bytes: mem,
                     compression_ratio: 10.0,
                     ..Default::default()
                 },
                 annotation: NodeAnnotation {
-                    sketch_type:     Some(sketch_type),
-                    sketch_params:   Some(params),
-                    rationale:       format!(
-                        "Sketch demoted to Backend (Agent budget exceeded){canonical_suffix}"
-                    ),
+                    sketch_type: Some(sketch_type),
+                    sketch_params: Some(params),
+                    rationale: "Sketch demoted to Backend (Agent budget exceeded)".into(),
                     budget_demotion: true,
                     ..Default::default()
                 },
@@ -717,25 +641,25 @@ impl SketchAllocator {
 
         // Both Agent and Backend budgets exceeded → Precompute.
         PlanNode {
-            expr: QueryExpr::SketchAgg {
-                op,
-                col,
-                input: Box::new(child.expr.clone()),
+            expr: QueryExpr::Aggregate {
+                by,
+                aggs,
+                having: None,
+                child: Box::new(child.expr.clone()),
             },
             stage: PipelineStage::Precompute,
-            mode:  ExecutionMode::Sketch,
-            cost:  CostEstimate {
-                bytes_per_sec:  self.raw_bytes_per_sec * 0.2,
-                memory_bytes:   mem,
+            mode: ExecutionMode::Sketch,
+            cost: CostEstimate {
+                bytes_per_sec: self.raw_bytes_per_sec * 0.2,
+                memory_bytes: mem,
                 compression_ratio: 5.0,
                 ..Default::default()
             },
             annotation: NodeAnnotation {
-                sketch_type:     Some(sketch_type),
-                sketch_params:   Some(params),
-                rationale:       format!(
-                    "Sketch demoted to Precompute (Agent+Backend budgets exceeded){canonical_suffix}"
-                ),
+                sketch_type: Some(sketch_type),
+                sketch_params: Some(params),
+                rationale: "Sketch demoted to Precompute (Agent+Backend budgets exceeded)"
+                    .into(),
                 budget_demotion: true,
                 ..Default::default()
             },
@@ -752,9 +676,7 @@ fn estimated_sketch_memory(op: &AggIntent) -> f64 {
 }
 
 /// Map a canonical [`AggIntent`] to a short stable kind string for
-/// annotation rationale text. Step γ1: used by the legacy
-/// `QueryExpr::Aggregate` arm to enrich the rationale with the canonical
-/// intent kinds reachable via `bridge_aggregate_to_canonical`.
+/// annotation rationale text.
 fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
     match intent {
         AggIntent::Count { .. } => "count",
@@ -781,24 +703,42 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
     }
 }
 
-// sketch_type_for_op delegated to algebra::directory::sketch_type_and_params.
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::QueryExpr;
-    use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::intent_algebra::legacy_expr::{
-        default_cardinality, default_frequency, default_quantile, AggIntent, ColumnRef,
-        PartitionKeys, SourceSpec,
+        default_cardinality, default_frequency, default_quantile,
     };
+    use crate::intent_algebra::{
+        JoinKind, LiteralValue, Predicate, QueryExpr, Schema, Source,
+    };
+    use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
-    use std::time::Duration;
+    use crate::types_v2::AccuracyTarget;
 
-    fn src(name: &str) -> QueryExpr {
-        QueryExpr::Source(SourceSpec { name: name.into() })
+    /// Canonical `Scan` leaf — the L3 counterpart of the legacy
+    /// `QueryExpr::Source(SourceSpec { .. })`.
+    fn scan(name: &str) -> QueryExpr {
+        QueryExpr::Scan {
+            source: Source::TimeSeries {
+                metric: name.into(),
+            },
+            label_filters: vec![],
+            schema: Schema::default(),
+        }
+    }
+
+    /// Single-intent, global (`by: []`), no-HAVING `Aggregate` over a
+    /// `Scan` — the canonical shape the legacy `SketchAgg` folded into.
+    fn agg(intent: AggIntent) -> QueryExpr {
+        QueryExpr::Aggregate {
+            by: vec![],
+            aggs: vec![intent],
+            having: None,
+            child: Box::new(scan("m")),
+        }
     }
 
     fn alloc(budgets: StageResourceBudgets, expr: QueryExpr) -> PlanNode {
@@ -811,36 +751,35 @@ mod tests {
 
     fn tight_agent() -> StageResourceBudgets {
         StageResourceBudgets {
-            agent_memory_bytes: Some(1),   // 1 byte — too small for any sketch
+            agent_memory_bytes: Some(1), // 1 byte — too small for any sketch
             ..Default::default()
         }
     }
 
     fn tight_all() -> StageResourceBudgets {
         StageResourceBudgets {
-            agent_memory_bytes:   Some(1),
+            agent_memory_bytes: Some(1),
             backend_memory_bytes: Some(1),
             ..Default::default()
         }
     }
 
-    // ── Source / leaf ─────────────────────────────────────────────────────────
+    // ── Scan / leaf ───────────────────────────────────────────────────────────
 
     #[test]
-    fn source_goes_to_agent() {
-        let node = alloc(unlimited(), src("cpu"));
+    fn scan_goes_to_agent() {
+        let node = alloc(unlimited(), scan("cpu"));
         assert_eq!(node.stage, PipelineStage::Agent);
-        assert_eq!(node.mode,  ExecutionMode::Passthrough);
+        assert_eq!(node.mode, ExecutionMode::Passthrough);
     }
 
     // ── Filter ────────────────────────────────────────────────────────────────
 
     #[test]
     fn filter_at_agent() {
-        use crate::intent_algebra::legacy_expr::{LiteralValue, ScalarExpr};
         let expr = QueryExpr::Filter {
-            pred:  ScalarExpr::Literal(LiteralValue::Bool(true)),
-            input: Box::new(src("m")),
+            pred: Predicate::Literal(LiteralValue::Bool(true)),
+            child: Box::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Agent);
@@ -850,14 +789,9 @@ mod tests {
 
     #[test]
     fn ddsketch_within_budget_goes_to_agent() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(src("latency")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(default_quantile(0.99)));
         assert_eq!(node.stage, PipelineStage::Agent);
-        assert_eq!(node.mode,  ExecutionMode::Sketch);
+        assert_eq!(node.mode, ExecutionMode::Sketch);
         assert_eq!(node.annotation.sketch_type, Some(SketchType::DDSketch));
     }
 
@@ -865,12 +799,7 @@ mod tests {
 
     #[test]
     fn ddsketch_agent_budget_exceeded_goes_to_backend() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(src("latency")),
-        };
-        let node = alloc(tight_agent(), expr);
+        let node = alloc(tight_agent(), agg(default_quantile(0.99)));
         assert_eq!(node.stage, PipelineStage::Backend);
         assert!(node.annotation.budget_demotion);
     }
@@ -879,12 +808,7 @@ mod tests {
 
     #[test]
     fn ddsketch_all_budgets_exceeded_goes_to_precompute() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(src("latency")),
-        };
-        let node = alloc(tight_all(), expr);
+        let node = alloc(tight_all(), agg(default_quantile(0.99)));
         assert_eq!(node.stage, PipelineStage::Precompute);
         assert!(node.annotation.budget_demotion);
     }
@@ -893,40 +817,31 @@ mod tests {
 
     #[test]
     fn exact_avg_goes_to_db() {
-        let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::Avg,
-            col:   ColumnRef::Named("price".into()),
-            input: Box::new(src("trades")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(AggIntent::Avg));
         assert_eq!(node.stage, PipelineStage::Db);
-        assert_eq!(node.mode,  ExecutionMode::Exact);
+        assert_eq!(node.mode, ExecutionMode::Exact);
     }
 
     // ── Exact(Sum) → Backend ──────────────────────────────────────────────────
 
     #[test]
     fn exact_sum_goes_to_backend() {
-        let expr = QueryExpr::SketchAgg {
-            op:    AggIntent::Sum,
-            col:   ColumnRef::Named("bytes".into()),
-            input: Box::new(src("network")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(AggIntent::Sum));
         assert_eq!(node.stage, PipelineStage::Backend);
-        assert_eq!(node.mode,  ExecutionMode::Exact);
+        assert_eq!(node.mode, ExecutionMode::Exact);
     }
 
     // ── TopK → Precompute ─────────────────────────────────────────────────────
 
     #[test]
     fn topk_goes_to_precompute() {
-        let expr = QueryExpr::TopK {
-            k:     10,
-            by:    vec!["symbol".into()],
-            input: Box::new(src("trades")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(
+            unlimited(),
+            agg(AggIntent::TopK {
+                k: 10,
+                accuracy: AccuracyTarget::Epsilon(0.05),
+            }),
+        );
         assert_eq!(node.stage, PipelineStage::Precompute);
         assert_eq!(node.annotation.sketch_type, Some(SketchType::CountSketch));
     }
@@ -936,7 +851,7 @@ mod tests {
     #[test]
     fn merge_goes_to_backend() {
         let expr = QueryExpr::Merge {
-            inputs: vec![src("a"), src("b")],
+            children: vec![scan("a"), scan("b")],
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Backend);
@@ -946,12 +861,7 @@ mod tests {
 
     #[test]
     fn hll_within_budget_at_agent() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_cardinality(),
-            col:   ColumnRef::Named("uid".into()),
-            input: Box::new(src("events")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(default_cardinality()));
         assert_eq!(node.stage, PipelineStage::Agent);
         assert_eq!(node.annotation.sketch_type, Some(SketchType::HLL));
     }
@@ -960,12 +870,7 @@ mod tests {
 
     #[test]
     fn frequency_within_budget_at_agent() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_frequency(),
-            col:   ColumnRef::Wildcard,
-            input: Box::new(src("requests")),
-        };
-        let node = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(default_frequency()));
         assert_eq!(node.stage, PipelineStage::Agent);
         assert_eq!(node.annotation.sketch_type, Some(SketchType::CountSketch));
     }
@@ -974,33 +879,62 @@ mod tests {
 
     #[test]
     fn join_goes_to_db() {
-        use crate::intent_algebra::legacy_expr::JoinKind;
         let expr = QueryExpr::Join {
-            kind:  JoinKind::Inner,
-            pred:  None,
-            left:  Box::new(src("orders")),
-            right: Box::new(src("items")),
+            kind: JoinKind::Inner,
+            pred: Predicate::Literal(LiteralValue::Bool(true)),
+            left: Box::new(scan("orders")),
+            right: Box::new(scan("items")),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Db);
     }
 
-    // (`histogram_quantile` is substituted at the parser level into a plain
-    // `Aggregate{Quantile(φ)}` — see Step γ5. The Aggregate → SketchAgg path
-    // is covered by other tests.)
+    // ── Multi-intent Aggregate → Db (exact) ───────────────────────────────────
+
+    #[test]
+    fn multi_intent_aggregate_goes_to_db() {
+        let expr = QueryExpr::Aggregate {
+            by: vec![],
+            aggs: vec![AggIntent::Sum, AggIntent::Min],
+            having: None,
+            child: Box::new(scan("m")),
+        };
+        let node = alloc(unlimited(), expr);
+        assert_eq!(node.stage, PipelineStage::Db);
+        assert_eq!(node.mode, ExecutionMode::Exact);
+    }
+
+    // ── Window over a single-intent Aggregate (the WindowedAgg fold) ──────────
+
+    #[test]
+    fn window_over_aggregate_window_passthrough_agg_sketches() {
+        // Canonical fold of legacy `WindowedAgg`: Window passthrough at
+        // Agent, inner Aggregate does the sketch placement.
+        let expr = QueryExpr::Window {
+            kind: crate::intent_algebra::WindowKind::Tumbling,
+            size: std::time::Duration::from_secs(300),
+            slide: None,
+            child: Box::new(agg(default_quantile(0.5))),
+        };
+        let node = alloc(unlimited(), expr);
+        assert_eq!(node.stage, PipelineStage::Agent);
+        assert_eq!(node.mode, ExecutionMode::Passthrough);
+        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children[0].stage, PipelineStage::Agent);
+        assert_eq!(node.children[0].mode, ExecutionMode::Sketch);
+    }
 
     // ── LetBinding inherits body stage ────────────────────────────────────────
 
     #[test]
     fn let_binding_inherits_body_stage() {
         let expr = QueryExpr::LetBinding {
-            name: "base".into(),
-            expr: Box::new(src("cpu")),
-            body: Box::new(QueryExpr::TopK {
-                k:     5,
-                by:    vec![],
-                input: Box::new(src("cpu")),
-            }),
+            name: crate::types_v2::BindingName::new("base"),
+            expr: Box::new(scan("cpu")),
+            child: Box::new(agg(AggIntent::TopK {
+                k: 5,
+                accuracy: AccuracyTarget::Epsilon(0.05),
+            })),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Precompute);
@@ -1016,8 +950,7 @@ mod tests {
 
     #[test]
     fn frequency_memory_estimate() {
-        let op = default_frequency();
-        let mem = estimated_sketch_memory(&op);
+        let mem = estimated_sketch_memory(&default_frequency());
         assert!(mem > 0.0);
     }
 
@@ -1025,12 +958,7 @@ mod tests {
 
     #[test]
     fn plan_summary_shows_bandwidth_saved() {
-        let expr = QueryExpr::SketchAgg {
-            op:    default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(src("latency")),
-        };
-        let node   = alloc(unlimited(), expr);
+        let node = alloc(unlimited(), agg(default_quantile(0.99)));
         let summary = node.summarise(100_000.0);
         // sketch reduces to ~5% → saved ~95 000 B/s
         assert!(summary.bandwidth_saved_bytes_per_sec > 50_000.0);
