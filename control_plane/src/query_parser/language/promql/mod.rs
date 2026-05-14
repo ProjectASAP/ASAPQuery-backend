@@ -9,7 +9,7 @@ pub mod ast;
 
 use super::language_ast::LanguageAst;
 use super::{Language, ParseError};
-use crate::query_parser::{parse_query, parse_query_expr};
+use crate::query_parser::{parse_query, parse_query_expr_canonical};
 use crate::types_v2::QueryLanguage;
 
 pub use ast::PromQLAst;
@@ -29,9 +29,10 @@ impl Language for PromQLLanguage {
     fn parse(&self, source: &str) -> Result<LanguageAst, ParseError> {
         // Delegate to the existing parser — both entry points re-parse the
         // same string today; the cost is negligible (microseconds) and we
-        // get the legacy `ParsedQuery` for free for back-compat callers.
-        let expr =
-            parse_query_expr(source).map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
+        // get the flat `ParsedQuery` for free for back-compat callers.
+        // `PromQLAst.expr` is the canonical L3 `QueryExpr`.
+        let expr = parse_query_expr_canonical(source)
+            .map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
         let summary =
             parse_query(source).map_err(|e| ParseError::backend(QueryLanguage::PromQL, e))?;
         Ok(LanguageAst::PromQL(PromQLAst::new(
