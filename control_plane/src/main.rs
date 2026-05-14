@@ -2,7 +2,6 @@ use control_plane::accuracy;
 use control_plane::backend_client;
 use control_plane::emit;
 use control_plane::intent_algebra;
-use control_plane::language_logical_plan;
 use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;

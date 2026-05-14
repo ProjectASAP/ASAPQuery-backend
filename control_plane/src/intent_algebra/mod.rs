@@ -83,9 +83,8 @@ pub mod schema;
 // pre-existing legacy L2 relational IR formerly at
 // `controller/src/algebra/expr.rs` lives here while a separate follow-up
 // unifies it with the canonical `query_expr` module above. It still
-// carries the heavy `QueryExpr` type the `query_parser` modules emit and
-// the planner / allocator / physical planner / language_logical_plan
-// modules consume today.
+// carries the `QueryExpr` type the `query_parser` modules emit and the
+// planner / allocator / physical planner modules consume today.
 pub mod column_resolution;
 pub mod legacy_expr;
 

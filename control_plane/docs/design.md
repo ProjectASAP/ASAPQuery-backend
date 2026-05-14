@@ -43,8 +43,8 @@ DataCollector/controller already documents its query→sketch translation as a 5
 
 | # | Layer | What it does | Today's locations |
 |---|-------|--------------|-------------------|
-| 1 | **Query Language** | Parse raw strings (PromQL, SQL, DataFusion, ElasticDSL, …) into a language-specific AST | DC `controller/src/query_parser/{promql,sql}.rs` + the per-language façade `controller/src/query_parser/language/{promql,sql,elastic_dsl}/`; asap-planner-rs pulls `promql-parser` + `sqlparser` directly; asap-fusion consumes a pre-built DataFusion `LogicalPlan` (its L1 happens upstream). *Refactor 2026-05 absorbed `controller/src/query_language/` into `query_parser::language/`.* |
-| 2 | **Language Logical Plan** | Per-language algebra tree (`Aggregate` / `Window` / `Filter` / `Sort` / `Limit`) preserving language semantics, **no sketch names, no sketch binding** | DC `controller/src/language_logical_plan/{lower,plan}.rs` + `controller/src/intent_algebra/legacy_expr.rs` (the legacy L2 relational IR the `query_parser` front ends emit); asap-fusion inherits DataFusion's `LogicalPlan` as its L2; asap-planner-rs has no L2 today (uses a template-pattern catalogue) — **Phase 4 builds one** |
+| 1 | **Query Language** | Parse raw strings (PromQL, SQL, DataFusion, ElasticDSL, …) into a language-specific AST | DC `controller/src/query_parser/{promql,sql}.rs` (each parses straight to the L2 relational tree below); asap-planner-rs pulls `promql-parser` + `sqlparser` directly; asap-fusion consumes a pre-built DataFusion `LogicalPlan` (its L1 happens upstream) |
+| 2 | **Language Logical Plan** | Per-language algebra tree (`Aggregate` / `Window` / `Filter` / `Sort` / `Limit`) preserving language semantics, **no sketch names, no sketch binding** | DC `controller/src/intent_algebra/legacy_expr.rs` — the L2 relational `QueryExpr` tree the `query_parser` front ends emit (one shared tree for PromQL + SQL today; a per-language split is future work); asap-fusion inherits DataFusion's `LogicalPlan` as its L2; asap-planner-rs has no L2 today (uses a template-pattern catalogue) — **Phase 4 builds one** |
 | 3 | **Intent algebra** | Language- and deployment-independent IR: `QueryExpr` + `AggIntent`. Describes **intent only** — *what* to compute, with accuracy target. **No sketch type, no sketch parameters, no sketch-bound nodes** (`SketchAgg` / `SketchJoin` / `SketchSubtract` etc. live in the L4 IR `SketchExpr`). **No language-shaped operators** (no `HistogramQuantile`, no `PromQLSubquery` — those are PromQL L2 nodes that lower to data-model-agnostic shapes here). **One canonical form per plan** — no `WindowedAgg` (use `Window` over `Aggregate`). Heavy-hitter intents are first-class (`AggIntent::TopK`) so heavy-hitter sketches bind directly on the intent rather than on a generic `Sort + Limit` shape; generic `Sort + Limit` survives in `QueryExpr` for non-heavy-hitter cases (e.g. `ORDER BY name LIMIT 10`). Every edge carries a typed `Schema`. Data-model-agnostic — `QueryExpr::Scan` wraps a `Source` sum with `TimeSeries` / `Table` / `Join` variants so the same L3 IR covers ASAPQuery's time-series queries and asap-fusion's tabular queries. | DC `controller/src/intent_algebra/{agg_intent,query_expr,schema,lower,cse}.rs` (canonical L3) + `controller/src/intent_algebra/legacy_to_canonical.rs` (the L2→L3 converter: folds the legacy `legacy_expr` relational tree straight to the canonical IR, single-statistic sketchable `Aggregate` fusion included — no intermediate fused L3 IR); asap-fusion's 3-variant `SubPopulationAnalyticsType` maps to a subset; asap-planner-rs's 9-variant `Statistic` maps to a subset — **Phase 4 splits sketch binding out of planner's current fused L3+L4**. *Refactor 2026-05 absorbed `controller/src/algebra/expr.rs` into `intent_algebra/legacy_expr.rs`.* |
 | 4 | **Sketch algebra + optimizer** | Cost-aware algebraic rewrite rules under deployment constraints. **This is where sketch binding happens** — L4 rules take intent-only L3 (`QueryExpr`) and emit the sketch-bound IR (`SketchExpr`). ~12 rules in DC; a smaller targeted subset in planner; `SketchConfigRule` + `HashModeRule` in fusion. | Core provides the **rule engine driver** + `OptimizerRule` trait + a shared rule library + the sketch-bound IR `core::sketch_algebra::SketchExpr`; deployment models **pick** which rules to enable + supply their own deployment constraints. DC `controller/src/sketch_algebra/` (IR + binding rules) + `controller/src/optimizer/{engine,trait_def,baseline,rules/,cost/}.rs` (rule engine + cost models); fusion `src/optimizer/rules/`; planner's `map_statistic_to_precompute_operator`. *Refactor 2026-05 absorbed `controller/src/algebra/optimizer.rs` (→ `optimizer/engine.rs`) and `controller/src/planner/{cost_model,delta_cost_model,online_cost_model,pareto,tco,wire_cost,rules,baseline_planner}.rs` (→ `optimizer/{cost/,rules/,baseline.rs}`).* |
 | 5 | **Physical Execution Plan** | Assign ops to pipeline stages (edge / gateway / backend / object store); produce the deployment-specific artifact (OpAMP YAML, `streaming_config.yaml`, rewritten DataFusion `LogicalPlan`). **Sketch binding is already committed by L4**; L5 is about stage allocation + emission. | Core provides the **stage allocator framework** + `PhysicalPlanner` trait + the sketch catalogue; deployment models supply their own **topology** (3-stage / 1-stage / 0-stage) + their own **emitter** for the output format. DC `controller/src/physical/{allocator,planner,plan,sketch_catalog,stage_split,topology,colored_dag/}.rs` (allocator framework + sketch catalogue + typed three-stage colouring) + `controller/src/emit/{stage_config,otap,telegraf,agent,backend,asapquery_backend,precompute,trait_def}.rs` (per-deployment-model emitters + `PlanEmitter` trait) + `controller/src/pipeline.rs` (L1→…→L5 driver, formerly `analyzer.rs`); asap-planner-rs `output/generator.rs`; asap-fusion `src/executor/`. *Refactor 2026-05 absorbed `controller/src/algebra/{physical,allocator,plan,directory}.rs` and `controller/src/planner/stage_split.rs` and the legacy `controller/src/stage_split/` framework into `physical/`; absorbed `controller/src/config/` into `emit/` + `workload.rs`; renamed `analyzer.rs` to `pipeline.rs`.* |
@@ -167,9 +167,9 @@ If something must be optional (e.g. OpAMP for deployments that don't run OTel co
 >
 > | Target §5 path | Current single-crate path |
 > |---|---|
-> | `crates/core/query_language/` | `controller/src/query_parser/language/` |
-> | `crates/core/logical_plan/` | `controller/src/language_logical_plan/` |
-> | `crates/core/intent_algebra/` | `controller/src/intent_algebra/` (with `legacy_expr` carrying the legacy L2 relational IR and `legacy_to_canonical` converting it to the canonical L3 types) |
+> | `crates/core/query_language/` | `controller/src/query_parser/{promql,sql}.rs` (L1 parsers — emit the L2 tree directly) |
+> | `crates/core/logical_plan/` | `controller/src/intent_algebra/legacy_expr.rs` (the L2 relational `QueryExpr` tree) |
+> | `crates/core/intent_algebra/` | `controller/src/intent_algebra/` (with `legacy_expr` carrying the L2 relational IR and `legacy_to_canonical` lowering it to the canonical L3 types) |
 > | `crates/core/sketch_algebra/` | `controller/src/sketch_algebra/` |
 > | `crates/core/optimizer/{engine,trait,rules,cost}/` | `controller/src/optimizer/{engine.rs,trait_def.rs,rules/,cost/,baseline.rs}` |
 > | `crates/core/physical/{planner_trait,stage_allocator,topology,executor,sketch_catalog}/` | `controller/src/physical/{planner,allocator,plan,stage_split,sketch_catalog,topology,colored_dag/}.rs` |
@@ -285,11 +285,11 @@ Core is not a trait-stubs library. It ships real L1/L2/L3 code lifted from DC's 
 >
 > | `core::*` reference in §6 | Current single-crate path |
 > |---|---|
-> | `core::query_language` | `controller/src/query_parser/language/` |
-> | `core::logical_plan` | `controller/src/language_logical_plan/` |
-> | `core::intent_algebra` | `controller/src/intent_algebra/` (canonical) + `controller/src/intent_algebra/legacy_{expr,lower}.rs` (legacy IR pending unification) |
+> | `core::query_language` | `controller/src/query_parser/{promql,sql}.rs` |
+> | `core::logical_plan` | `controller/src/intent_algebra/legacy_expr.rs` (the L2 relational `QueryExpr` tree) |
+> | `core::intent_algebra` | `controller/src/intent_algebra/` (canonical `query_expr` / `agg_intent`) + `controller/src/intent_algebra/legacy_expr.rs` (the L2 relational IR) |
 > | `core::sketch_algebra` | `controller/src/sketch_algebra/` |
-> | `core::lower` | per-layer: `controller/src/language_logical_plan/lower.rs` + `controller/src/intent_algebra/{lower,legacy_to_canonical}.rs` + `controller/src/sketch_algebra/lower.rs` |
+> | `core::lower` | per-layer: `controller/src/intent_algebra/{lower,legacy_to_canonical}.rs` + `controller/src/sketch_algebra/lower.rs` |
 > | `core::optimizer::engine` | `controller/src/optimizer/engine.rs` |
 > | `core::optimizer::trait` | `controller/src/optimizer/trait_def.rs` (placeholder) |
 > | `core::optimizer::rules` | `controller/src/optimizer/rules/` |
@@ -322,26 +322,24 @@ Per-language parsers, one module each:
 
 Each returns a language-flavored AST type. No sketch awareness.
 
-> **Implementation status (Phase D).** L1 lives in
-> `controller/src/query_language/` with a `Language` trait
-> (`fn id() -> QueryLanguage; fn parse(&str) -> Result<LanguageAst, ParseError>`)
-> + a `LanguageAst` sum type (one variant per `QueryLanguage`). The
-> PromQL backend (`query_language::promql::PromQLLanguage`) wraps the
-> existing `query_parser::{parse_query, parse_query_expr}` entry points
-> — no parsing logic was duplicated; `PromQLAst` bundles the algebra
-> tree (`QueryExpr`) and the flat `ParsedQuery` summary the legacy
-> analyzer expects. The `Sql`, `DataFusion`, and `ElasticDsl`
-> backends are stubbed: they implement `Language` but `parse` returns
-> `ParseError::Unimplemented(...)`. This keeps the type system uniform
-> for the orchestrator while the DC build ships PromQL only. L2 lives
-> in `controller/src/language_logical_plan/`: `LanguageLogicalPlan`
-> mirrors `LanguageAst` with one variant per language; PromQL's L2 IS
-> the existing `QueryExpr` tree (rebadged + paired with a flat
-> `LanguageLogicalPlanSummary` projection). `lower_to_logical_plan`
-> is the L1 → L2 pass; non-PromQL variants surface
-> `LoweringError::UnsupportedLanguage` cleanly. The legacy
-> `query_parser::parse_query` / `parse_query_expr` entry points stay
-> unchanged for back-compat.
+> **Implementation status.** L1 + L2 are realised concretely, without
+> the `Language`-trait / `LanguageAst` indirection the target design
+> sketches. L1 lives in `controller/src/query_parser/{promql,sql}.rs` —
+> each parser walks its language's AST and emits the **L2 relational
+> tree directly** (`intent_algebra::legacy_expr::QueryExpr`: `Aggregate`
+> / `Window` / `Filter` / `Join` / `Sort` / `Limit` / …). That tree
+> *is* L2. `query_parser::parse_query_expr_canonical` then lowers it to
+> the canonical L3 IR via `intent_algebra::legacy_to_canonical`
+> (sketch-fusion + the Binder folded in); `parse_query` projects the
+> flat `ParsedQuery` summary the legacy analyzer / pipeline consume.
+>
+> An earlier `Language`-trait + `LanguageAst` + `LanguageLogicalPlan`
+> scaffold (a per-language enum mirroring the target design) was built
+> ahead of its call site, never wired into the pipeline, and drifted
+> out of sync — its "L2" actually held the L3 tree. It was removed; the
+> per-language `Language`-trait extension point gets rebuilt when a
+> second real language backend (SQL beyond the current direct parser,
+> DataFusion, ElasticDSL) actually needs it.
 
 ### `core::logical_plan` — Layer 2
 
@@ -1872,7 +1870,7 @@ The pre-refactor layout grew organically as the controller absorbed three legacy
 | `controller/src/planner/stage_split.rs` | `controller/src/physical/stage_split.rs` |
 | `controller/src/analyzer.rs` | `controller/src/pipeline.rs` |
 | `controller/src/stage_split/` | `controller/src/physical/colored_dag/` |
-| `controller/src/query_language/` | `controller/src/query_parser/language/` |
+| `controller/src/query_language/` | *(deleted)* — was moved to `controller/src/query_parser/language/`, then removed as unwired scaffolding; the real L1 parsers are `query_parser/{promql,sql}.rs` |
 | `controller/src/config/workloads.rs` | `controller/src/workload.rs` |
 | `controller/src/config/{stage_config*,otap,telegraf,agent,backend,asapquery_backend,precompute}.rs` | `controller/src/emit/{stage_config,otap,telegraf,agent,backend,asapquery_backend,precompute}.rs` |
 | (new) | `controller/src/emit/trait_def.rs` — `PlanEmitter` trait placeholder |
@@ -1885,6 +1883,6 @@ The pre-refactor layout grew organically as the controller absorbed three legacy
 **TODOs left from the refactor:**
 
 - `controller/src/emit/stage_config.rs` (3,020 lines, formerly `config/stage_config.rs`) was moved whole rather than split into `emit/opamp.rs` + `emit/streaming_config.rs` + `emit/inference_config.rs` per design.md §5. The monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, storage-routing JSON emit, and shared internals; a clean split needs ownership reorganisation, not file renames. Tracked for a follow-up.
-- `controller/src/intent_algebra/legacy_expr.rs` carries the legacy **L2 relational** `QueryExpr` the `query_parser` front ends emit; `legacy_to_canonical.rs` is the single pass that converts it (sketch-fusion folded in) to the canonical `intent_algebra::{query_expr,agg_intent}` L3 types. The sketch-fused `SketchAgg` / `WindowedAgg` legacy variants and the standalone `legacy_lower` pass have been retired. Several controller modules (query_parser, language_logical_plan, physical/, optimizer/, emit/) still reference `legacy_expr` for shared leaf types; fully deleting the legacy tree is a follow-up gated on the canonical `Predicate` covering the remaining `ScalarExpr` variants.
+- `controller/src/intent_algebra/legacy_expr.rs` carries the legacy **L2 relational** `QueryExpr` the `query_parser` front ends emit; `legacy_to_canonical.rs` is the single pass that converts it (sketch-fusion folded in) to the canonical `intent_algebra::{query_expr,agg_intent}` L3 types. The sketch-fused `SketchAgg` / `WindowedAgg` legacy variants and the standalone `legacy_lower` pass have been retired. Several controller modules (query_parser, physical/, optimizer/, emit/) still reference `legacy_expr` for shared leaf types; fully deleting the legacy tree is a follow-up gated on the canonical `Predicate` covering the remaining `ScalarExpr` variants. The `legacy_*` naming is itself a misnomer — `legacy_expr` is the real, current L2 IR — and an honest rename is the planned follow-up.
 - `controller/src/optimizer/trait_def.rs` (`OptimizerRule`), `controller/src/emit/trait_def.rs` (`PlanEmitter`), `controller/src/deployment_model.rs` (`DeploymentModelRegistry`) ship as placeholders — the existing free-function emitters and concrete rule loops still drive behaviour. Migrating them onto the trait surfaces lands when the per-deployment-model crate split lands.
 

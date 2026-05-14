@@ -29,12 +29,6 @@
 
 pub mod promql;
 pub mod sql;
-pub mod language;
-
-// Re-export the L1 language façade at this module's top so call sites
-// that historically used `crate::query_language::*` (folded in by the
-// 2026-05 refactor) keep a one-level import.
-pub use language::{Language, LanguageAst, ParseError, PromQLLanguage, SqlLanguage, ElasticDslLanguage};
 
 use std::collections::HashMap;
 use std::time::Duration;
