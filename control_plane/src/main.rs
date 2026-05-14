@@ -459,10 +459,16 @@ async fn handle_plan(
 
     let mut plan = st.planner.plan(&workload, Some(&wc));
 
-    // ── SP-9: single QueryExpr pipeline — parse → optimise → stage-split ─────
+    // ── SP-9: single QueryExpr pipeline — parse → optimise → bind → stage ────
     // When query_string is present, run the full algebra pipeline and attach
     // the StagedPlan.  The SP-3 flat assignment remains the fallback when no
     // query_string is supplied.
+    //
+    // `bound_physical` carries the **L4 output** — the optimised canonical
+    // L3 tree run through `sketch_algebra::bind_query_expr` — so the typed
+    // L5 stage-split below is fed from the real parsed tree rather than
+    // from the flat `QueryWorkload` summary.
+    let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
     if let Some(ref qs) = query_string {
         match parse_query_expr_canonical(qs) {
             Err(e) => warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping staged_plan"),
@@ -473,6 +479,16 @@ async fn handle_plan(
                 // Step γ7: parser, optimizer and physical planner are all
                 // canonical-IR now (PR 6/9/8) — no `convert_root` bridge.
                 let (opt_qe, _) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
+                // L4 sketch binding: lower the optimised L3 tree to the
+                // sketch-bound `PhysicalExpr` IR. Feeds the typed L5
+                // stage-split below.
+                let accuracy = if workload.accuracy_sla >= 1.0 {
+                    control_plane::types_v2::AccuracyTarget::Exact
+                } else {
+                    control_plane::types_v2::AccuracyTarget::Epsilon(1.0 - workload.accuracy_sla)
+                };
+                bound_physical =
+                    control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
                 let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
                 plan.staged_plan = Some(staged);
             }
@@ -510,13 +526,18 @@ async fn handle_plan(
     // ── Phase B (MVP v6): typed L5 stage_split → per-stage emitter ────────────
     // Behind the `USE_TYPED_STAGE_SPLIT` env-var gate so existing
     // control plane behaviour is unchanged unless explicitly opted in.
-    // When enabled, the workload is bound to a `PhysicalExpr`, the typed
-    // L5 path produces a `HashMap<StageId, StageConfig>`, and each
-    // per-stage config is materialised into wire bytes via the emitters
-    // in `config::stage_config`. Phase C will plumb deployment-aware
-    // endpoint resolution + a real backend POST.
+    //
+    // The typed L5 stage-split is now fed by the real **L4 output**: when
+    // the spec carries a `query_string`, `bound_physical` holds the
+    // optimised L3 tree run through `sketch_algebra::bind_query_expr`.
+    // For specs that supply only explicit fields (no `query_string` to
+    // parse), there is no L3 tree to bind, so we fall back to
+    // `bind_workload_typed`, which lowers the flat `QueryWorkload`
+    // summary to a `PhysicalExpr` directly.
     if physical::stage_split::typed_stage_split_enabled() {
-        if let Some(physical_expr) = optimizer::rules::bind_workload_typed(&workload) {
+        let physical_expr =
+            bound_physical.or_else(|| optimizer::rules::bind_workload_typed(&workload));
+        if let Some(physical_expr) = physical_expr {
             if let Some(configs) = physical::stage_split::split_typed_three_stage(&physical_expr) {
                 for (stage_id, stage_cfg) in configs {
                     match stage_cfg {
