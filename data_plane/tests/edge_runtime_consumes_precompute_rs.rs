@@ -10,8 +10,18 @@
 //! shared logic actually runs in this repo, not just in agents.
 //!
 //! Sketch coverage:
-//! - **DDSketch + KLL**: round-trip + structural assertions are
-//!   live (PRs `asap_sketchlib`#40 and #41 land byte parity).
+//! - **DDSketch**: round-trip + structural assertions are live — DDSketch
+//!   is a deterministic histogram, so `snapshot → reconstruct → snapshot`
+//!   is byte-identical (`asap_sketchlib`#40).
+//! - **KLL**: the *structural* round-trip is live, but the **byte-parity**
+//!   round-trip is gated `#[ignore]`. KLL compaction is randomized and
+//!   lossy; `reconstruct_via_runtime` rebuilds the sketch by replaying the
+//!   envelope's retained items through `apply_delta`, which re-compacts
+//!   them (different RNG, double compaction) — so the re-snapshot is a
+//!   valid KLL summary but not byte-identical to the original. True byte
+//!   parity needs an `asap_sketchlib` `KLL::from_wire_state` that consumes
+//!   the on-wire `levels`/`items`/`coin` directly — tracked in
+//!   `asap_sketchlib`#41.
 //! - **HLL + CountSketch + CountMinSketch**: the byte-parity work
 //!   for these three sketches is tracked under
 //!   `ProjectASAP/ASAPCollector#243`. Tests are present and gated
@@ -163,13 +173,23 @@ fn ddsketch_backend_sketch_snapshots_to_canonical_envelope_bytes() {
 
 // --- KLL ----------------------------------------------------------
 
-/// Round-trip: KLL envelope produced by asap-precompute-rs's
-/// `KLLWrapper` is reconstructed by the backend's runtime adapter
-/// (returning a re-snapshot from the runtime), and the structural
-/// shape (recovered items count) matches what we put in.
+/// Round-trip: a KLL envelope produced by asap-precompute-rs's
+/// `KLLWrapper` is reconstructed by the backend's runtime adapter,
+/// which returns a re-snapshot from the runtime.
 ///
-/// KLL byte parity per `asap_sketchlib`#41.
+/// **Byte parity is gated `#[ignore]`** — see below. `reconstruct_via_runtime`
+/// rebuilds the KLL by replaying the envelope's retained `items` through
+/// `apply_delta` → `update()`. For an input large enough to compact
+/// (here, 400 items at k=200 → 2 levels), that re-feed re-compacts
+/// lossily and with a different RNG seed than the original, so the
+/// re-snapshot — though a valid KLL summary — is not byte-identical.
+/// True byte parity needs an `asap_sketchlib` `KLL::from_wire_state`
+/// that restores the exact compactor state (`levels`/`items`/`coin`)
+/// instead of replaying items; tracked in `asap_sketchlib`#41. The
+/// *structural* round-trip is covered live by the test below.
 #[test]
+#[ignore = "KLL byte parity needs asap_sketchlib KLL::from_wire_state (asap_sketchlib#41); \
+            reconstruct_via_runtime replays items, which re-compacts lossily"]
 fn kll_envelope_round_trip_through_backend_adapter() {
     let mut w = KLLWrapper::new(200, Some(42));
     for i in 1..=400 {
@@ -185,10 +205,6 @@ fn kll_envelope_round_trip_through_backend_adapter() {
         _ => panic!("expected KLL reconstruction"),
     };
     assert!(!snapshot_bytes.is_empty(), "non-empty re-snapshot");
-    // Round-trip byte-equality with the original snapshot — the wrapper
-    // emits a single-level `[0, history.len()]` layout, so a fresh
-    // wrapper that was fed the same items via `apply_delta` produces
-    // matching envelope bytes for the same input order.
     assert_eq!(
         snapshot_bytes, original,
         "KLL envelope round-trip via asap-precompute-rs runtime is byte-identical"
