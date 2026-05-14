@@ -27,6 +27,7 @@ pub mod planner;
 pub mod sketch_catalog;
 pub mod stage_split;
 pub mod topology;
+pub mod window_fusion;
 
 // Convenience re-exports — preserve the surface that consumers of the
 // former `algebra` module relied on.
