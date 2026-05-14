@@ -5,21 +5,21 @@
 //!
 //! | Stage | Nodes |
 //! |---|---|
-//! | Agent OTel Collector | `Source`, `Filter`, `Window`, `SketchAgg` (sketch ops) |
-//! | Backend OTel Collector | `Partition`, `Merge`, `Dedup`, `Aggregate { Exact(Sum\|Count\|Min\|Max) }` |
-//! | ASAPQuery Precompute Engine | `TopK`, `PromQLSubquery`, deferred sketch ops |
-//! | DB-side query | `Aggregate { Avg }` (non-mergeable) |
+//! | Agent OTel Collector | `Scan`, `Filter`, `Window`, single-intent sketch `Aggregate` |
+//! | Backend OTel Collector | `Partition`, `Merge`, `Distinct`, mergeable-exact `Aggregate` |
+//! | ASAPQuery Precompute Engine | `TopK`-intent `Aggregate`, `Subquery`, deferred sketch ops |
+//! | DB-side query | non-mergeable-exact `Aggregate` (`Avg`) |
 //!
-//! # ExactAgg / AggFunc deferral
+//! # Exact-op deferral
 //!
-//! Mergeability drives `Exact` op placement:
+//! Mergeability drives exact-intent placement:
 //! - `Sum`, `Count`, `Min`, `Max` — mergeable (`agg(A∪B) = merge(agg(A), agg(B))`) →
 //!   **Backend** (the backend collector can combine partial results from N agents).
-//! - `Avg`, `StdDev`, `Variance` — **not** mergeable → **DB-side** query.
+//! - `Avg` — **not** mergeable → **DB-side** query.
 //!
 //! # Budget-driven deferral chain
 //!
-//! When a `SketchAgg` node's estimated memory cost exceeds the stage cap in
+//! When a sketch intent's estimated memory cost exceeds the stage cap in
 //! [`StageResourceBudgets`], it is deferred to the next stage:
 //!
 //! `Agent → Backend → Precompute`
@@ -31,40 +31,45 @@
 //! # PromQL serialisation
 //!
 //! [`expr_to_promql`] converts a [`QueryExpr`] tree to a valid PromQL expression
-//! consumed by the ASAPQuery Precompute Engine's query engine.  Unlike the old
-//! flat-template approach, this uses a proper recursive descent so it handles
-//! `PromQLSubquery` and vector `BinaryOp` nodes natively. (`histogram_quantile`
-//! is substituted at the parser level into a plain `Aggregate{Quantile(φ)}`;
-//! see Step γ5.)
+//! consumed by the ASAPQuery Precompute Engine's query engine.  It uses a
+//! proper recursive descent so it handles `Subquery` and vector `BinaryOp`
+//! nodes natively.
+//!
+//! Step γ7: this module consumes the canonical `query_expr::QueryExpr`. The
+//! legacy `SketchAgg` / `WindowedAgg` / `TopK` variants fold into canonical
+//! `Aggregate` / `Window { Aggregate }`, so the single `Aggregate` arm
+//! dispatches on intent shape and the `Window` arm is a plain passthrough
+//! (the inner `Aggregate` carries the sketch decision).
 
 use std::time::Duration;
 
-use crate::intent_algebra::legacy_expr::{AggFunc, agg_is_exact, agg_is_mergeable, agg_quantiles, BinaryOpKind, LiteralValue, QueryExpr, ScalarExpr};
+use crate::intent_algebra::agg_intent::AggIntent;
+use crate::intent_algebra::legacy_expr::{agg_is_exact, agg_is_mergeable};
+use crate::intent_algebra::query_expr::{
+    BinaryOpKind, ColumnRef, GroupSide, LiteralValue, Predicate, QueryExpr, Source,
+    VectorMatchKind,
+};
 use crate::pipeline::format_duration;
-use crate::intent_algebra::legacy_expr::AggIntent;
-use crate::intent_algebra::{infer_schema_for_root, Schema};
 use crate::physical::sketch_catalog;
 use crate::types::{
-    AgentSubPlan, BackendSubPlan,
-    DbSubPlan, PrecomputeSubPlan, SketchParams, SketchType,
+    AgentSubPlan, BackendSubPlan, DbSubPlan, PrecomputeSubPlan, SketchParams, SketchType,
     StagedPlan, StageResourceBudgets,
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Split a [`QueryExpr`] tree across pipeline stages, respecting per-stage
-/// resource budgets and the `AggFunc` mergeability rules described above.
+/// resource budgets and the intent mergeability rules described above.
 ///
 /// The returned [`StagedPlan`] is attached to
 /// [`crate::types::CollectionPlan::staged_plan`] by the caller
 /// (`handle_plan` in `main.rs`).
 pub fn split_expr_by_stage(expr: &QueryExpr, budgets: &StageResourceBudgets) -> StagedPlan {
-    let schema = infer_schema_for_root(expr);
     let mut plan = StagedPlan::default();
-    walk(expr, &mut plan, budgets, &schema);
+    walk(expr, &mut plan, budgets);
 
     // Build the precompute query_expr from the full tree when the precompute
-    // stage is active (TopK, PromQLSubquery, or deferred ops).
+    // stage is active (TopK, Subquery, or deferred ops).
     if plan.precompute.active && plan.precompute.query_expr.is_empty() {
         plan.precompute.query_expr = expr_to_promql(expr);
     }
@@ -83,182 +88,118 @@ pub fn split_expr_by_stage(expr: &QueryExpr, budgets: &StageResourceBudgets) -> 
 /// Sketch data is already ingested from the Backend OTel Collector; the PromQL
 /// describes the aggregation to apply over it.
 ///
-/// Uses recursive descent, so it handles `PromQLSubquery` and vector
-/// `BinaryOp` nodes that the old flat-template could not represent.
-/// (`histogram_quantile` is substituted at the parser level into a plain
-/// `Aggregate{Quantile(φ)}`; see Step γ5.)
-///
-/// Step β: the root-level [`Schema`] is derived from the outermost
-/// `Source` leaf and threaded through the recursive descent. The
-/// serialiser is schema-agnostic today (it emits `ColumnRef::Named(s)`
-/// verbatim into the PromQL output); Step γ wires schema-aware column
-/// resolution at the points that need it.
+/// Uses recursive descent, so it handles `Subquery` and vector `BinaryOp`
+/// nodes.
 pub fn expr_to_promql(expr: &QueryExpr) -> String {
-    let schema = infer_schema_for_root(expr);
     let mut ctx = PromQLCtx::default();
-    promql_from_qe(expr, &mut ctx, &schema)
+    promql_from_qe(expr, &mut ctx)
 }
 
 // ── Tree walker ───────────────────────────────────────────────────────────────
 
-fn walk(
-    expr: &QueryExpr,
-    plan: &mut StagedPlan,
-    budgets: &StageResourceBudgets,
-    parent_schema: &Schema,
-) {
+fn walk(expr: &QueryExpr, plan: &mut StagedPlan, budgets: &StageResourceBudgets) {
     match expr {
-        // Source — always Agent; populate metric name.
-        QueryExpr::Source(_) => {}
+        // Scan / Ref — leaves, nothing to assign.
+        QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
 
         // Filter — push label predicates to Agent.
-        QueryExpr::Filter { pred, input } => {
+        QueryExpr::Filter { pred, child } => {
             collect_label_filters_into(pred, &mut plan.agent.label_filters);
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
         }
 
-        // Window — time window lives at Agent.
-        QueryExpr::Window { duration, input, .. } => {
-            plan.agent.window_secs = Some(duration.as_secs());
-            walk(input, plan, budgets, parent_schema);
-        }
-
-        // SketchAgg — the key sketch assignment decision.
-        QueryExpr::SketchAgg { op, input, .. } => {
-            assign_sketch_agg(op, plan, budgets);
-            walk(input, plan, budgets, parent_schema);
-        }
-
-        // WindowedAgg — bundles window + sketch agg intent.
-        QueryExpr::WindowedAgg { agg, window, input, .. } => {
-            if let crate::intent_algebra::legacy_expr::WindowKind::Tumbling { size } = &window.kind {
-                plan.agent.window_secs = Some(size.as_secs());
-            }
-            assign_sketch_agg(agg, plan, budgets);
-            walk(input, plan, budgets, parent_schema);
+        // Window — time window lives at Agent. A `Window` over a
+        // single-intent `Aggregate` is the canonical fold of the legacy
+        // `WindowedAgg`; the inner `Aggregate` arm carries the sketch
+        // decision, so this arm just records the window seconds.
+        QueryExpr::Window { size, child, .. } => {
+            plan.agent.window_secs = Some(size.as_secs());
+            walk(child, plan, budgets);
         }
 
         // Partition — GROUP BY / `by (dims)` always assigned to Backend.
-        QueryExpr::Partition { keys, input } => {
+        QueryExpr::Partition { keys, child } => {
             for k in keys.keys() {
                 if !plan.backend.group_by.contains(k) {
                     plan.backend.group_by.push(k.clone());
                 }
             }
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
         }
 
-        // Aggregate — SQL GROUP BY + agg functions.
-        // Mergeable aggs (Sum/Count/Min/Max) → Backend.
-        // Non-mergeable (Avg/StdDev/Variance) → Db.
-        // Sketchable (Quantile/CountDistinct/HeavyHitters) → treated as SketchAgg.
-        QueryExpr::Aggregate { keys, aggs, input, .. } => {
-            for k in keys {
-                if !plan.backend.group_by.contains(k) {
-                    plan.backend.group_by.push(k.clone());
+        // Aggregate — the canonical fold of legacy SketchAgg / WindowedAgg-
+        // inner / TopK / Aggregate. Each intent is assigned in turn:
+        // TopK → Precompute; everything else → sketch / exact placement.
+        QueryExpr::Aggregate { aggs, child, .. } => {
+            for intent in aggs {
+                if let AggIntent::TopK { k, .. } = intent {
+                    plan.precompute.topk = Some(*k as u64);
+                    plan.precompute.active = true;
+                } else {
+                    assign_sketch_agg(intent, plan, budgets);
                 }
             }
-            for agg in aggs {
-                assign_agg_func(&agg.func, plan, budgets);
-            }
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
         }
 
         // Distinct — absorbed at Backend (HLL dedup elimination is upstream).
-        //
-        // Step β proof-of-use: opportunistically resolve named-column
-        // dedup keys against the inherited schema and record their
-        // positional ids on the staged plan's deferral log. The legacy
-        // `BackendSubPlan` doesn't carry `ColumnId`s yet (Step γ adds
-        // them), so failed lookups are logged as TODOs rather than
-        // surfaced as errors. Wildcard / SampleValue cols are skipped —
-        // they have no positional id by construction.
-        QueryExpr::Distinct { cols, input } => {
+        QueryExpr::Distinct { child, .. } => {
             plan.backend.has_dedup = true;
-            for c in cols {
-                if let crate::intent_algebra::legacy_expr::ColumnRef::Named(_) = c {
-                    match crate::intent_algebra::resolve_column_ref(c, parent_schema) {
-                        Ok(_id) => {
-                            // Step γ TODO: thread `_id` through to a
-                            // `BackendSubPlan::distinct_cols: Vec<ColumnId>`
-                            // field once the staged plan grows one.
-                        }
-                        Err(e) => {
-                            plan.deferral_log.push(format!(
-                                "Distinct col resolution deferred to Step γ: {e}"
-                            ));
-                        }
-                    }
-                }
-            }
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
         }
 
         // Merge — Backend merges N agent sketches.
-        QueryExpr::Merge { inputs } => {
+        QueryExpr::Merge { children } => {
             plan.backend.has_merge = true;
-            for i in inputs {
-                walk(i, plan, budgets, parent_schema);
+            for c in children {
+                walk(c, plan, budgets);
             }
         }
 
-        // TopK — always at the Precompute Engine.
-        QueryExpr::TopK { k, input, .. } => {
-            plan.precompute.topk = Some(*k);
+        // Limit — maps to topk semantics at Precompute.
+        QueryExpr::Limit { n, child, .. } => {
+            plan.precompute.topk = Some(*n as u64);
             plan.precompute.active = true;
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
+        }
+        QueryExpr::Sort { child, .. } => {
+            walk(child, plan, budgets);
         }
 
-        // Sort + Limit — maps to topk semantics at Precompute.
-        QueryExpr::Limit { n, input, .. } => {
-            plan.precompute.topk = Some(*n);
+        // Subquery — precompute engine evaluates the sub-query.
+        QueryExpr::Subquery { child, .. } => {
             plan.precompute.active = true;
-            walk(input, plan, budgets, parent_schema);
-        }
-        QueryExpr::Sort { input, .. } => {
-            walk(input, plan, budgets, parent_schema);
-        }
-
-        // (histogram_quantile is substituted at the parser level into a plain
-        // Aggregate{Quantile(φ)}; see step γ5. No dedicated stage-split arm.)
-
-        // PromQLSubquery — precompute engine evaluates the sub-query.
-        QueryExpr::PromQLSubquery { input, .. } => {
-            plan.precompute.active = true;
-            walk(input, plan, budgets, parent_schema);
+            walk(child, plan, budgets);
         }
 
         // BinaryOp between two instant vectors — precompute evaluates.
         QueryExpr::BinaryOp { lhs, rhs, .. } => {
             plan.precompute.active = true;
-            walk(lhs, plan, budgets, parent_schema);
-            walk(rhs, plan, budgets, parent_schema);
+            walk(lhs, plan, budgets);
+            walk(rhs, plan, budgets);
         }
 
         // Join — Backend.
         QueryExpr::Join { left, right, .. } => {
             plan.backend.has_merge = true;
-            walk(left, plan, budgets, parent_schema);
-            walk(right, plan, budgets, parent_schema);
+            walk(left, plan, budgets);
+            walk(right, plan, budgets);
         }
 
         // SetOp — treat as Backend merge.
         QueryExpr::SetOp { left, right, .. } => {
             plan.backend.has_merge = true;
-            walk(left, plan, budgets, parent_schema);
-            walk(right, plan, budgets, parent_schema);
+            walk(left, plan, budgets);
+            walk(right, plan, budgets);
         }
 
         // Transparent / passthrough nodes — recurse into child.
-        QueryExpr::Project { input, .. } => walk(input, plan, budgets, parent_schema),
+        QueryExpr::Project { child, .. } => walk(child, plan, budgets),
 
-        QueryExpr::LetBinding { expr, body, .. } => {
-            walk(expr, plan, budgets, parent_schema);
-            walk(body, plan, budgets, parent_schema);
+        QueryExpr::LetBinding { expr, child, .. } => {
+            walk(expr, plan, budgets);
+            walk(child, plan, budgets);
         }
-
-        // Ref — nothing to assign (resolved externally).
-        QueryExpr::Ref(_) => {}
     }
 }
 
@@ -278,10 +219,15 @@ fn assign_sketch_agg(op: &AggIntent, plan: &mut StagedPlan, budgets: &StageResou
 
     // Sketch ops: resolve to physical, assign to Agent, defer if budget exceeded.
     let physical = crate::physical::planner::resolve(op);
-    let stage = resolve_sketch_stage(physical.estimated_memory_bytes, budgets, &mut plan.deferral_log, op);
+    let stage = resolve_sketch_stage(
+        physical.estimated_memory_bytes,
+        budgets,
+        &mut plan.deferral_log,
+        op,
+    );
     match stage {
         SketchStage::Agent => {
-            plan.agent.sketch_type   = Some(physical.sketch_type);
+            plan.agent.sketch_type = Some(physical.sketch_type);
             plan.agent.sketch_params = physical.sketch_params;
         }
         SketchStage::Backend => {
@@ -293,40 +239,14 @@ fn assign_sketch_agg(op: &AggIntent, plan: &mut StagedPlan, budgets: &StageResou
     }
 }
 
-fn assign_agg_func(func: &AggFunc, plan: &mut StagedPlan, budgets: &StageResourceBudgets) {
-    use crate::intent_algebra::legacy_expr::{default_cardinality, default_frequency, default_quantile};
-    match func {
-        // Sketchable → synthesise the corresponding AggIntent and use existing logic.
-        AggFunc::Quantile(phi) => {
-            let op = default_quantile(*phi);
-            assign_sketch_agg(&op, plan, budgets);
-        }
-        AggFunc::CountDistinct => {
-            assign_sketch_agg(&default_cardinality(), plan, budgets);
-        }
-        AggFunc::HeavyHitters { .. } => {
-            assign_sketch_agg(&default_frequency(), plan, budgets);
-        }
-        // Mergeable exact → Backend.
-        AggFunc::Count | AggFunc::Sum | AggFunc::Min | AggFunc::Max
-        | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
-            plan.backend.has_merge = true;
-        }
-        // Non-mergeable → Db.
-        AggFunc::Avg | AggFunc::StdDev { .. } | AggFunc::Variance { .. } => {
-            plan.db.active = true;
-        }
-        AggFunc::Custom(_) => {
-            // Unknown; conservatively route to Precompute.
-            plan.precompute.active = true;
-        }
-    }
-}
-
 // ── Budget deferral ───────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
-enum SketchStage { Agent, Backend, Precompute }
+enum SketchStage {
+    Agent,
+    Backend,
+    Precompute,
+}
 
 fn resolve_sketch_stage(
     est_mem: u64,
@@ -370,18 +290,21 @@ struct PromQLCtx {
 
 /// Recursive PromQL serialisation of a [`QueryExpr`] node.
 ///
-/// Returns the PromQL string fragment for this node.  Inner nodes (Source,
-/// Filter) return their selector string; outer nodes (SketchAgg, TopK, etc.)
+/// Returns the PromQL string fragment for this node.  Inner nodes (Scan,
+/// Filter) return their selector string; outer nodes (Aggregate, etc.)
 /// wrap it.
-fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx, parent_schema: &Schema) -> String {
+fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx) -> String {
     match expr {
         // ── Leaf ─────────────────────────────────────────────────────────────
-        QueryExpr::Source(s) => s.name.clone(),
-        QueryExpr::Ref(name) => name.clone(),
+        QueryExpr::Scan { source, .. } => match source {
+            Source::TimeSeries { metric } => metric.clone(),
+            Source::Table { table_ref } => table_ref.clone(),
+        },
+        QueryExpr::Ref { name } => name.as_str().to_string(),
 
         // ── Filter — append label matchers to the selector ───────────────────
-        QueryExpr::Filter { pred, input } => {
-            let inner = promql_from_qe(input, ctx, parent_schema);
+        QueryExpr::Filter { pred, child } => {
+            let inner = promql_from_qe(child, ctx);
             let matchers = scalar_to_label_matchers(pred);
             if matchers.is_empty() {
                 inner
@@ -391,83 +314,50 @@ fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx, parent_schema: &Schema)
         }
 
         // ── Window — store duration for use by enclosing aggregate ───────────
-        QueryExpr::Window { duration, input, .. } => {
+        QueryExpr::Window { size, child, .. } => {
             if ctx.window.is_none() {
-                ctx.window = Some(*duration);
+                ctx.window = Some(*size);
             }
-            promql_from_qe(input, ctx, parent_schema)
+            promql_from_qe(child, ctx)
         }
 
         // ── Partition — store group_by keys for enclosing aggregate ──────────
-        QueryExpr::Partition { keys, input } => {
+        QueryExpr::Partition { keys, child } => {
             for k in keys.keys() {
                 if !ctx.group_by.contains(k) {
                     ctx.group_by.push(k.clone());
                 }
             }
-            promql_from_qe(input, ctx, parent_schema)
+            promql_from_qe(child, ctx)
         }
 
-        // ── WindowedAgg — bundled window + sketch agg ────────────────────────
-        QueryExpr::WindowedAgg { agg, window, input, .. } => {
-            if ctx.window.is_none() {
-                if let crate::intent_algebra::legacy_expr::WindowKind::Tumbling { size } = &window.kind {
-                    ctx.window = Some(*size);
-                }
-            }
-            let selector = promql_from_qe(input, ctx, parent_schema);
-            let window_s = window_str(ctx.window);
-            let by       = by_clause(&ctx.group_by);
-            sketch_op_to_promql(agg, &selector, &window_s, &by)
-        }
-
-        // ── SketchAgg — the main aggregation node ────────────────────────────
-        QueryExpr::SketchAgg { op, input, .. } => {
-            let selector = promql_from_qe(input, ctx, parent_schema);
-            let window   = window_str(ctx.window);
-            let by       = by_clause(&ctx.group_by);
-            sketch_op_to_promql(op, &selector, &window, &by)
-        }
-
-        // ── Aggregate (SQL GROUP BY) ──────────────────────────────────────────
-        QueryExpr::Aggregate { keys, aggs, input, .. } => {
-            // Merge SQL GROUP BY keys into the context.
-            for k in keys {
-                if !ctx.group_by.contains(k) {
-                    ctx.group_by.push(k.clone());
-                }
-            }
-            let selector = promql_from_qe(input, ctx, parent_schema);
-            let window   = window_str(ctx.window);
-            let by       = by_clause(&ctx.group_by);
-            // Use the first aggregate function to drive the PromQL template.
-            if let Some(agg) = aggs.first() {
-                agg_func_to_promql(&agg.func, &selector, &window, &by)
-            } else {
-                selector
+        // ── Aggregate (the canonical fold of SketchAgg / WindowedAgg-inner /
+        // TopK / general Aggregate) ──────────────────────────────────────────
+        QueryExpr::Aggregate { aggs, child, .. } => {
+            let selector = promql_from_qe(child, ctx);
+            let window = window_str(ctx.window);
+            let by = by_clause(&ctx.group_by);
+            match aggs.first() {
+                Some(AggIntent::TopK { k, .. }) => format!("topk({k}, {selector})"),
+                Some(intent) => sketch_op_to_promql(intent, &selector, &window, &by),
+                None => selector,
             }
         }
 
-        // ── TopK ─────────────────────────────────────────────────────────────
-        QueryExpr::TopK { k, input, .. } => {
-            let inner = promql_from_qe(input, ctx, parent_schema);
-            format!("topk({k}, {inner})")
-        }
-
-        // ── Sort + Limit — map to topk ───────────────────────────────────────
-        QueryExpr::Limit { n, input, .. } => {
-            let inner = promql_from_qe(input, ctx, parent_schema);
+        // ── Limit — maps to topk ─────────────────────────────────────────────
+        QueryExpr::Limit { n, child, .. } => {
+            let inner = promql_from_qe(child, ctx);
             format!("topk({n}, {inner})")
         }
-        QueryExpr::Sort { input, .. } => promql_from_qe(input, ctx, parent_schema),
+        QueryExpr::Sort { child, .. } => promql_from_qe(child, ctx),
 
-        // (histogram_quantile lowered to plain Aggregate{Quantile(φ)} at the
-        // parser level; the resulting Aggregate node round-trips to PromQL
-        // via the `quantile_over_time(φ, …)` shape above.)
-
-        // ── PromQL subquery expr[range:step] ─────────────────────────────────
-        QueryExpr::PromQLSubquery { range, resolution, input } => {
-            let inner    = promql_from_qe(input, ctx, parent_schema);
+        // ── Subquery  expr[range:step] ───────────────────────────────────────
+        QueryExpr::Subquery {
+            range,
+            resolution,
+            child,
+        } => {
+            let inner = promql_from_qe(child, ctx);
             let step_str = resolution
                 .map(|r| format!(":{}", format_duration(r)))
                 .unwrap_or_default();
@@ -475,30 +365,38 @@ fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx, parent_schema: &Schema)
         }
 
         // ── Vector binary op  (lhs op rhs) ───────────────────────────────────
-        QueryExpr::BinaryOp { op, lhs, rhs, vector_match } => {
-            let lhs_str = promql_from_qe(lhs, ctx, parent_schema);
-            let rhs_str = promql_from_qe(rhs, &mut PromQLCtx::default(), parent_schema);
-            let op_str  = binop_to_promql(op);
+        QueryExpr::BinaryOp {
+            op,
+            lhs,
+            rhs,
+            vector_match,
+        } => {
+            let lhs_str = promql_from_qe(lhs, ctx);
+            let rhs_str = promql_from_qe(rhs, &mut PromQLCtx::default());
+            let op_str = binop_to_promql(op);
             let match_str = vector_match
                 .as_ref()
                 .map(|m| {
-                    use crate::intent_algebra::legacy_expr::{GroupSide, VectorMatchKind};
                     let kw = match m.kind {
-                        VectorMatchKind::On       => "on",
+                        VectorMatchKind::On => "on",
                         VectorMatchKind::Ignoring => "ignoring",
                     };
                     let labels = m.labels.join(", ");
-                    let group = m.grouping.as_ref().map(|g| {
-                        let side = match g.side {
-                            GroupSide::Left  => "group_left",
-                            GroupSide::Right => "group_right",
-                        };
-                        if g.labels.is_empty() {
-                            format!(" {side}")
-                        } else {
-                            format!(" {side}({})", g.labels.join(", "))
-                        }
-                    }).unwrap_or_default();
+                    let group = m
+                        .grouping
+                        .as_ref()
+                        .map(|g| {
+                            let side = match g.side {
+                                GroupSide::Left => "group_left",
+                                GroupSide::Right => "group_right",
+                            };
+                            if g.labels.is_empty() {
+                                format!(" {side}")
+                            } else {
+                                format!(" {side}({})", g.labels.join(", "))
+                            }
+                        })
+                        .unwrap_or_default();
                     format!(" {kw} ({labels}){group}")
                 })
                 .unwrap_or_default();
@@ -506,28 +404,29 @@ fn promql_from_qe(expr: &QueryExpr, ctx: &mut PromQLCtx, parent_schema: &Schema)
         }
 
         // ── Merge — serialise first branch (all branches same shape) ─────────
-        QueryExpr::Merge { inputs } => {
-            inputs.first()
-                .map(|first| promql_from_qe(first, ctx, parent_schema))
-                .unwrap_or_default()
-        }
+        QueryExpr::Merge { children } => children
+            .first()
+            .map(|first| promql_from_qe(first, ctx))
+            .unwrap_or_default(),
 
         // ── Passthrough nodes ─────────────────────────────────────────────────
-        QueryExpr::Distinct { input, .. }
-        | QueryExpr::Project { input, .. } => promql_from_qe(input, ctx, parent_schema),
+        QueryExpr::Distinct { child, .. } | QueryExpr::Project { child, .. } => {
+            promql_from_qe(child, ctx)
+        }
 
-        QueryExpr::LetBinding { body, .. } => promql_from_qe(body, ctx, parent_schema),
+        QueryExpr::LetBinding { child, .. } => promql_from_qe(child, ctx),
 
         // ── Join / SetOp — serialise the outer / left branch ─────────────────
-        QueryExpr::Join       { left,  .. } => promql_from_qe(left, ctx, parent_schema),
-        QueryExpr::SetOp      { left,  .. } => promql_from_qe(left, ctx, parent_schema),
+        QueryExpr::Join { left, .. } => promql_from_qe(left, ctx),
+        QueryExpr::SetOp { left, .. } => promql_from_qe(left, ctx),
     }
 }
 
 // ── PromQL fragment helpers ───────────────────────────────────────────────────
 
 fn window_str(w: Option<Duration>) -> String {
-    w.map(|d| format!("[{}]", format_duration(d))).unwrap_or_default()
+    w.map(|d| format!("[{}]", format_duration(d)))
+        .unwrap_or_default()
 }
 
 fn by_clause(keys: &[String]) -> String {
@@ -539,10 +438,6 @@ fn by_clause(keys: &[String]) -> String {
 }
 
 fn sketch_op_to_promql(op: &AggIntent, selector: &str, window: &str, by: &str) -> String {
-    // Canonical Quantile is single-φ post Step α; multi-φ fan-out happens
-    // at construction time (Merge of SketchAgg siblings) so the
-    // `quantile_over_time(qs, …)` arm collapses to one φ.
-    let _ = agg_quantiles; // imported for symmetry — unused after fan-out
     match op {
         AggIntent::Quantile { q, .. } => {
             format!("quantile_over_time({q}, {selector}{window}){by}")
@@ -554,120 +449,121 @@ fn sketch_op_to_promql(op: &AggIntent, selector: &str, window: &str, by: &str) -
             format!("count_over_time({selector}{window}){by}")
         }
         AggIntent::Count { .. } => format!("count_over_time({selector}{window}){by}"),
-        AggIntent::Sum   => format!("sum_over_time({selector}{window}){by}"),
-        AggIntent::Avg   => format!("avg_over_time({selector}{window}){by}"),
-        AggIntent::Min   => format!("min_over_time({selector}{window}){by}"),
-        AggIntent::Max   => format!("max_over_time({selector}{window}){by}"),
-        AggIntent::Rate { .. }     => format!("rate({selector}{window}){by}"),
+        AggIntent::Sum => format!("sum_over_time({selector}{window}){by}"),
+        AggIntent::Avg => format!("avg_over_time({selector}{window}){by}"),
+        AggIntent::Min => format!("min_over_time({selector}{window}){by}"),
+        AggIntent::Max => format!("max_over_time({selector}{window}){by}"),
+        AggIntent::Rate { .. } => format!("rate({selector}{window}){by}"),
         AggIntent::Increase { .. } => format!("increase({selector}{window}){by}"),
-        // TopK + archive-only intents (Phase β): Step γ routes these via
-        // canonical templates; today they reuse `count_over_time` because
-        // the legacy `Exact(_)` fall-through did effectively the same for
-        // any non-mergeable case. Documented as a Step γ TODO.
+        // TopK + archive-only intents: Step γ routes these via canonical
+        // templates; today they reuse `count_over_time` because the legacy
+        // `Exact(_)` fall-through did effectively the same for any
+        // non-mergeable case. Documented as a Step γ TODO.
         _ => format!("count_over_time({selector}{window}){by}"),
-    }
-}
-
-fn agg_func_to_promql(func: &AggFunc, selector: &str, window: &str, by: &str) -> String {
-    match func {
-        AggFunc::Quantile(phi)   => format!("quantile_over_time({phi}, {selector}{window}){by}"),
-        AggFunc::CountDistinct   => format!("count_over_time({selector}{window}){by}"),
-        AggFunc::HeavyHitters{k} => format!("topk({k}, count_over_time({selector}{window}){by})"),
-        AggFunc::Count           => format!("count_over_time({selector}{window}){by}"),
-        AggFunc::Sum             => format!("sum_over_time({selector}{window}){by}"),
-        AggFunc::Avg             => format!("avg_over_time({selector}{window}){by}"),
-        AggFunc::Min             => format!("min_over_time({selector}{window}){by}"),
-        AggFunc::Max             => format!("max_over_time({selector}{window}){by}"),
-        AggFunc::StdDev { .. }  => format!("stddev_over_time({selector}{window}){by}"),
-        AggFunc::Variance { .. } => format!("stdvar_over_time({selector}{window}){by}"),
-        AggFunc::Rate            => format!("rate({selector}{window}){by}"),
-        AggFunc::Increase        => format!("increase({selector}{window}){by}"),
-        AggFunc::Delta           => format!("delta({selector}{window}){by}"),
-        AggFunc::Custom(name)    => format!("{name}({selector}{window}){by}"),
     }
 }
 
 fn binop_to_promql(op: &BinaryOpKind) -> &'static str {
     match op {
-        BinaryOpKind::Add    => "+",
-        BinaryOpKind::Sub    => "-",
-        BinaryOpKind::Mul    => "*",
-        BinaryOpKind::Div    => "/",
-        BinaryOpKind::Mod    => "%",
-        BinaryOpKind::Pow    => "^",
-        BinaryOpKind::Eq     => "==",
-        BinaryOpKind::Ne     => "!=",
-        BinaryOpKind::Lt     => "<",
-        BinaryOpKind::Le     => "<=",
-        BinaryOpKind::Gt     => ">",
-        BinaryOpKind::Ge     => ">=",
-        BinaryOpKind::And    => "and",
-        BinaryOpKind::Or     => "or",
+        BinaryOpKind::Add => "+",
+        BinaryOpKind::Sub => "-",
+        BinaryOpKind::Mul => "*",
+        BinaryOpKind::Div => "/",
+        BinaryOpKind::Mod => "%",
+        BinaryOpKind::Pow => "^",
+        BinaryOpKind::Eq => "==",
+        BinaryOpKind::Ne => "!=",
+        BinaryOpKind::Lt => "<",
+        BinaryOpKind::Le => "<=",
+        BinaryOpKind::Gt => ">",
+        BinaryOpKind::Ge => ">=",
+        BinaryOpKind::And => "and",
+        BinaryOpKind::Or => "or",
         BinaryOpKind::Unless => "unless",
-        BinaryOpKind::Atan2  => "atan2",
-        _                    => "and", // bitwise/string ops not in PromQL
+        BinaryOpKind::Atan2 => "atan2",
+        _ => "and", // bitwise/string ops not in PromQL
     }
 }
 
-// ── Label matcher extraction from ScalarExpr ─────────────────────────────────
+// ── Label matcher extraction from Predicate ──────────────────────────────────
 
-/// Extract PromQL-compatible label matchers from a `ScalarExpr` AND-tree.
+/// Extract PromQL-compatible label matchers from a `Predicate` AND-tree.
 ///
 /// Only equality / inequality / regex comparisons between a `Column` and a
 /// string `Literal` are extractable as label matchers.  Everything else is
 /// silently ignored (it won't become a label filter in the PromQL output).
-fn scalar_to_label_matchers(pred: &ScalarExpr) -> Vec<String> {
+fn scalar_to_label_matchers(pred: &Predicate) -> Vec<String> {
     let mut out = Vec::new();
     collect_label_matchers(pred, &mut out);
     out
 }
 
-fn collect_label_matchers(pred: &ScalarExpr, out: &mut Vec<String>) {
+fn collect_label_matchers(pred: &Predicate, out: &mut Vec<String>) {
     match pred {
         // AND-tree: recurse into both sides.
-        ScalarExpr::BinaryOp { op: BinaryOpKind::And, lhs, rhs } => {
+        Predicate::BinaryOp {
+            op: BinaryOpKind::And,
+            lhs,
+            rhs,
+        } => {
             collect_label_matchers(lhs, out);
             collect_label_matchers(rhs, out);
         }
         // col = "val"
-        ScalarExpr::BinaryOp { op: BinaryOpKind::Eq, lhs, rhs } => {
-            if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v)))
-                = (lhs.as_ref(), rhs.as_ref())
+        Predicate::BinaryOp {
+            op: BinaryOpKind::Eq,
+            lhs,
+            rhs,
+        } => {
+            if let (Predicate::Column(ColumnRef::Named(col)), Predicate::Literal(LiteralValue::Str(v))) =
+                (lhs.as_ref(), rhs.as_ref())
             {
-                out.push(format!("{}=\"{}\"", col, v));
+                out.push(format!("{col}=\"{v}\""));
             }
         }
         // col != "val"
-        ScalarExpr::BinaryOp { op: BinaryOpKind::Ne, lhs, rhs } => {
-            if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v)))
-                = (lhs.as_ref(), rhs.as_ref())
+        Predicate::BinaryOp {
+            op: BinaryOpKind::Ne,
+            lhs,
+            rhs,
+        } => {
+            if let (Predicate::Column(ColumnRef::Named(col)), Predicate::Literal(LiteralValue::Str(v))) =
+                (lhs.as_ref(), rhs.as_ref())
             {
-                out.push(format!("{}!=\"{}\"", col, v));
+                out.push(format!("{col}!=\"{v}\""));
             }
         }
         // col =~ "regex"
-        ScalarExpr::BinaryOp { op: BinaryOpKind::Regex, lhs, rhs } => {
-            if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v)))
-                = (lhs.as_ref(), rhs.as_ref())
+        Predicate::BinaryOp {
+            op: BinaryOpKind::Regex,
+            lhs,
+            rhs,
+        } => {
+            if let (Predicate::Column(ColumnRef::Named(col)), Predicate::Literal(LiteralValue::Str(v))) =
+                (lhs.as_ref(), rhs.as_ref())
             {
-                out.push(format!("{}=~\"{}\"", col, v));
+                out.push(format!("{col}=~\"{v}\""));
             }
         }
         // col !~ "regex"
-        ScalarExpr::BinaryOp { op: BinaryOpKind::NotRegex, lhs, rhs } => {
-            if let (ScalarExpr::Column(col), ScalarExpr::Literal(LiteralValue::Str(v)))
-                = (lhs.as_ref(), rhs.as_ref())
+        Predicate::BinaryOp {
+            op: BinaryOpKind::NotRegex,
+            lhs,
+            rhs,
+        } => {
+            if let (Predicate::Column(ColumnRef::Named(col)), Predicate::Literal(LiteralValue::Str(v))) =
+                (lhs.as_ref(), rhs.as_ref())
             {
-                out.push(format!("{}!~\"{}\"", col, v));
+                out.push(format!("{col}!~\"{v}\""));
             }
         }
         _ => {}
     }
 }
 
-// ── Helper: push label filters from a ScalarExpr into a Vec<String> ──────────
+// ── Helper: push label filters from a Predicate into a Vec<String> ───────────
 
-fn collect_label_filters_into(pred: &ScalarExpr, out: &mut Vec<String>) {
+fn collect_label_filters_into(pred: &Predicate, out: &mut Vec<String>) {
     let matchers = scalar_to_label_matchers(pred);
     for m in matchers {
         // Store as "col=val" (without PromQL quotes) for the agent YAML.
@@ -723,11 +619,13 @@ pub fn typed_stage_split_enabled() -> bool {
 /// `Backend`. Phase C plumbs deployment-aware endpoint resolution.
 pub fn split_typed_three_stage(
     expr: &crate::sketch_algebra::PhysicalExpr,
-) -> Option<std::collections::HashMap<crate::physical::colored_dag::StageId, crate::physical::colored_dag::StageConfig>>
-{
-    use crate::physical::colored_dag::{
-        Emitter, StageAllocator, ThreeStageEmitter, Topology,
-    };
+) -> Option<
+    std::collections::HashMap<
+        crate::physical::colored_dag::StageId,
+        crate::physical::colored_dag::StageConfig,
+    >,
+> {
+    use crate::physical::colored_dag::{Emitter, StageAllocator, ThreeStageEmitter, Topology};
     let dag = StageAllocator.allocate(expr, Topology::ThreeStage).ok()?;
     ThreeStageEmitter.emit_per_stage(&dag).ok()
 }
@@ -737,23 +635,54 @@ pub fn split_typed_three_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{AggItem, AggIntent, BinaryOpKind, LiteralValue, QueryExpr, ScalarExpr};
-    use crate::intent_algebra::legacy_expr::{ColumnRef, PartitionKeys, SourceSpec};
+    use crate::intent_algebra::legacy_expr::{
+        default_cardinality, default_frequency, default_quantile,
+    };
+    use crate::intent_algebra::{PartitionKeys, Schema, Source, WindowKind};
+    use crate::types_v2::AccuracyTarget;
 
-    fn source(name: &str) -> QueryExpr {
-        QueryExpr::Source(SourceSpec { name: name.into() })
+    fn no_budget() -> StageResourceBudgets {
+        StageResourceBudgets::default()
     }
 
-    fn no_budget() -> StageResourceBudgets { StageResourceBudgets::default() }
-
-    fn eq_filter(col: &str, val: &str) -> QueryExpr {
-        QueryExpr::Filter {
-            pred: ScalarExpr::BinaryOp {
-                op:  BinaryOpKind::Eq,
-                lhs: Box::new(ScalarExpr::Column(col.into())),
-                rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(val.into()))),
+    /// Canonical `Scan` leaf.
+    fn scan(name: &str) -> QueryExpr {
+        QueryExpr::Scan {
+            source: Source::TimeSeries {
+                metric: name.into(),
             },
-            input: Box::new(source("latency")),
+            label_filters: vec![],
+            schema: Schema::default(),
+        }
+    }
+
+    /// Single-intent, global, no-HAVING `Aggregate` over a `Scan` — the
+    /// canonical fold of the legacy `SketchAgg`.
+    fn sketch_agg(intent: AggIntent, metric: &str) -> QueryExpr {
+        QueryExpr::Aggregate {
+            by: vec![],
+            aggs: vec![intent],
+            having: None,
+            child: Box::new(scan(metric)),
+        }
+    }
+
+    /// `Window { Aggregate }` — the canonical fold of the legacy
+    /// `WindowedAgg`.
+    fn windowed_agg(intent: AggIntent, size_secs: u64, metric: &str) -> QueryExpr {
+        QueryExpr::Window {
+            kind: WindowKind::Tumbling,
+            size: Duration::from_secs(size_secs),
+            slide: None,
+            child: Box::new(sketch_agg(intent, metric)),
+        }
+    }
+
+    fn eq_pred(col: &str, val: &str) -> Predicate {
+        Predicate::BinaryOp {
+            op: BinaryOpKind::Eq,
+            lhs: Box::new(Predicate::Column(ColumnRef::Named(col.into()))),
+            rhs: Box::new(Predicate::Literal(LiteralValue::Str(val.into()))),
         }
     }
 
@@ -761,15 +690,7 @@ mod tests {
 
     #[test]
     fn ddsketch_agg_goes_to_agent() {
-        let expr = QueryExpr::Window {
-            duration: Duration::from_secs(300),
-            slide: None,
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
-                col:   ColumnRef::SampleValue,
-                input: Box::new(source("latency")),
-            }),
-        };
+        let expr = windowed_agg(default_quantile(0.99), 300, "latency");
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert_eq!(plan.agent.sketch_type, Some(SketchType::DDSketch));
         assert_eq!(plan.agent.window_secs, Some(300));
@@ -779,11 +700,7 @@ mod tests {
 
     #[test]
     fn hll_stays_at_agent_by_default() {
-        let expr = QueryExpr::SketchAgg {
-            op:    crate::intent_algebra::legacy_expr::default_cardinality(),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(source("events")),
-        };
+        let expr = sketch_agg(default_cardinality(), "events");
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert_eq!(plan.agent.sketch_type, Some(SketchType::HLL));
     }
@@ -792,11 +709,7 @@ mod tests {
     fn partition_group_by_goes_to_backend() {
         let expr = QueryExpr::Partition {
             keys: PartitionKeys::By(vec!["host".into(), "region".into()]),
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
-                col:   ColumnRef::SampleValue,
-                input: Box::new(source("latency")),
-            }),
+            child: Box::new(sketch_agg(default_quantile(0.99), "latency")),
         };
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert!(plan.backend.group_by.contains(&"host".to_string()));
@@ -804,51 +717,32 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_without_group_by_avg_goes_to_db() {
-        let expr = QueryExpr::Aggregate {
-            keys:   vec![],
-            aggs:   vec![AggItem {
-                alias:    "avg_val".into(),
-                func:     AggFunc::Avg,
-                col:      ColumnRef::SampleValue,
-                distinct: false,
-            }],
-            having: None,
-            input:  Box::new(source("price")),
-        };
+    fn aggregate_avg_goes_to_db() {
+        // Single-intent Avg → non-mergeable exact → Db.
+        let expr = sketch_agg(AggIntent::Avg, "price");
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert!(plan.db.active);
     }
 
     #[test]
     fn aggregate_sum_goes_to_backend() {
-        let expr = QueryExpr::Aggregate {
-            keys:   vec!["symbol".into()],
-            aggs:   vec![AggItem {
-                alias:    "total".into(),
-                func:     AggFunc::Sum,
-                col:      ColumnRef::SampleValue,
-                distinct: false,
-            }],
-            having: None,
-            input:  Box::new(source("trades")),
-        };
+        // Single-intent Sum → mergeable exact → Backend.
+        let expr = sketch_agg(AggIntent::Sum, "trades");
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert!(plan.backend.has_merge);
-        assert!(plan.backend.group_by.contains(&"symbol".to_string()));
         assert!(!plan.db.active);
     }
 
     #[test]
     fn topk_goes_to_precompute() {
-        let expr = QueryExpr::TopK {
-            k:     10,
-            by:    vec!["symbol".into()],
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    crate::intent_algebra::legacy_expr::default_frequency(),
-                col:   ColumnRef::SampleValue,
-                input: Box::new(source("price")),
-            }),
+        let expr = QueryExpr::Aggregate {
+            by: vec![],
+            aggs: vec![AggIntent::TopK {
+                k: 10,
+                accuracy: AccuracyTarget::Epsilon(0.05),
+            }],
+            having: None,
+            child: Box::new(sketch_agg(default_frequency(), "price")),
         };
         let plan = split_expr_by_stage(&expr, &no_budget());
         assert!(plan.precompute.active);
@@ -857,12 +751,10 @@ mod tests {
 
     #[test]
     fn binary_op_activates_precompute() {
-        let lhs = source("metric_a");
-        let rhs = source("metric_b");
         let expr = QueryExpr::BinaryOp {
-            op:           BinaryOpKind::Div,
-            lhs:          Box::new(lhs),
-            rhs:          Box::new(rhs),
+            op: BinaryOpKind::Div,
+            lhs: Box::new(scan("metric_a")),
+            rhs: Box::new(scan("metric_b")),
             vector_match: None,
         };
         let plan = split_expr_by_stage(&expr, &no_budget());
@@ -874,32 +766,24 @@ mod tests {
     #[test]
     fn ddsketch_deferred_to_backend_when_agent_budget_exceeded() {
         let tiny_budget = StageResourceBudgets {
-            agent_memory_bytes: Some(1), // 1 byte — DDSketch (4 KiB) won't fit
+            agent_memory_bytes: Some(1), // 1 byte — DDSketch won't fit
             ..Default::default()
         };
-        let expr = QueryExpr::SketchAgg {
-            op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(source("latency")),
-        };
+        let expr = sketch_agg(default_quantile(0.99), "latency");
         let plan = split_expr_by_stage(&expr, &tiny_budget);
         assert_eq!(plan.agent.sketch_type, None); // not at agent
-        assert!(plan.backend.has_merge);          // deferred to backend
+        assert!(plan.backend.has_merge); // deferred to backend
         assert!(!plan.deferral_log.is_empty());
     }
 
     #[test]
     fn ddsketch_deferred_to_precompute_when_both_budgets_exceeded() {
         let tiny_budget = StageResourceBudgets {
-            agent_memory_bytes:   Some(1),
+            agent_memory_bytes: Some(1),
             backend_memory_bytes: Some(1),
             ..Default::default()
         };
-        let expr = QueryExpr::SketchAgg {
-            op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
-            col:   ColumnRef::SampleValue,
-            input: Box::new(source("latency")),
-        };
+        let expr = sketch_agg(default_quantile(0.99), "latency");
         let plan = split_expr_by_stage(&expr, &tiny_budget);
         assert!(plan.precompute.active);
         assert_eq!(plan.deferral_log.len(), 2); // two deferral steps logged
@@ -911,40 +795,41 @@ mod tests {
     fn promql_ddsketch_with_filter_and_window() {
         let expr = QueryExpr::Partition {
             keys: PartitionKeys::By(vec!["symbol".into()]),
-            input: Box::new(QueryExpr::Window {
-                duration: Duration::from_secs(300),
+            child: Box::new(QueryExpr::Window {
+                kind: WindowKind::Tumbling,
+                size: Duration::from_secs(300),
                 slide: None,
-                input: Box::new(QueryExpr::SketchAgg {
-                    op:    crate::intent_algebra::legacy_expr::default_quantile(0.99),
-                    col:   ColumnRef::SampleValue,
-                    input: Box::new(QueryExpr::Filter {
-                        pred: ScalarExpr::BinaryOp {
-                            op:  BinaryOpKind::Eq,
-                            lhs: Box::new(ScalarExpr::Column("sectype".into())),
-                            rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str("E".into()))),
-                        },
-                        input: Box::new(source("price")),
+                child: Box::new(QueryExpr::Aggregate {
+                    by: vec![],
+                    aggs: vec![default_quantile(0.99)],
+                    having: None,
+                    child: Box::new(QueryExpr::Filter {
+                        pred: eq_pred("sectype", "E"),
+                        child: Box::new(scan("price")),
                     }),
                 }),
             }),
         };
         let ql = expr_to_promql(&expr);
-        assert!(ql.contains("quantile_over_time(0.99"), "expected quantile_over_time: {ql}");
-        assert!(ql.contains("sectype=\"E\""),            "expected label filter: {ql}");
-        assert!(ql.contains("[5m]"),                     "expected window: {ql}");
-        assert!(ql.contains("by (symbol)"),              "expected group_by: {ql}");
+        assert!(
+            ql.contains("quantile_over_time(0.99"),
+            "expected quantile_over_time: {ql}"
+        );
+        assert!(ql.contains("sectype=\"E\""), "expected label filter: {ql}");
+        assert!(ql.contains("[5m]"), "expected window: {ql}");
+        assert!(ql.contains("by (symbol)"), "expected group_by: {ql}");
     }
 
     #[test]
     fn promql_topk_wraps_inner() {
-        let expr = QueryExpr::TopK {
-            k:     10,
-            by:    vec![],
-            input: Box::new(QueryExpr::SketchAgg {
-                op:    crate::intent_algebra::legacy_expr::default_frequency(),
-                col:   ColumnRef::SampleValue,
-                input: Box::new(source("events")),
-            }),
+        let expr = QueryExpr::Aggregate {
+            by: vec![],
+            aggs: vec![AggIntent::TopK {
+                k: 10,
+                accuracy: AccuracyTarget::Epsilon(0.05),
+            }],
+            having: None,
+            child: Box::new(sketch_agg(default_frequency(), "events")),
         };
         let ql = expr_to_promql(&expr);
         assert!(ql.starts_with("topk(10,"), "expected topk prefix: {ql}");
@@ -953,41 +838,40 @@ mod tests {
     #[test]
     fn promql_binary_op_renders_operator() {
         let expr = QueryExpr::BinaryOp {
-            op:           BinaryOpKind::Div,
-            lhs:          Box::new(source("http_errors")),
-            rhs:          Box::new(source("http_requests")),
+            op: BinaryOpKind::Div,
+            lhs: Box::new(scan("http_errors")),
+            rhs: Box::new(scan("http_requests")),
             vector_match: None,
         };
         let ql = expr_to_promql(&expr);
         assert!(ql.contains('/'), "expected / operator: {ql}");
-        assert!(ql.contains("http_errors"),   "got: {ql}");
+        assert!(ql.contains("http_errors"), "got: {ql}");
         assert!(ql.contains("http_requests"), "got: {ql}");
     }
 
     #[test]
     fn promql_subquery_renders_range() {
-        let expr = QueryExpr::PromQLSubquery {
-            range:      Duration::from_secs(3600),
+        let expr = QueryExpr::Subquery {
+            range: Duration::from_secs(3600),
             resolution: Some(Duration::from_secs(60)),
-            input:      Box::new(source("metric")),
+            child: Box::new(scan("metric")),
         };
         let ql = expr_to_promql(&expr);
-        assert!(ql.contains("[1h:1m]") || ql.contains("[3600s:60s]"), "got: {ql}");
+        assert!(
+            ql.contains("[1h:1m]") || ql.contains("[3600s:60s]"),
+            "got: {ql}"
+        );
     }
 
     #[test]
     fn label_matchers_and_tree() {
-        let pred = ScalarExpr::BinaryOp {
+        let pred = Predicate::BinaryOp {
             op: BinaryOpKind::And,
-            lhs: Box::new(ScalarExpr::BinaryOp {
-                op:  BinaryOpKind::Eq,
-                lhs: Box::new(ScalarExpr::Column("job".into())),
-                rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str("api".into()))),
-            }),
-            rhs: Box::new(ScalarExpr::BinaryOp {
-                op:  BinaryOpKind::Ne,
-                lhs: Box::new(ScalarExpr::Column("env".into())),
-                rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str("dev".into()))),
+            lhs: Box::new(eq_pred("job", "api")),
+            rhs: Box::new(Predicate::BinaryOp {
+                op: BinaryOpKind::Ne,
+                lhs: Box::new(Predicate::Column(ColumnRef::Named("env".into()))),
+                rhs: Box::new(Predicate::Literal(LiteralValue::Str("dev".into()))),
             }),
         };
         let matchers = scalar_to_label_matchers(&pred);
@@ -1003,9 +887,9 @@ mod tests {
         use crate::intent_algebra::{
             LabelFilter, QueryExpr as L3QE, Schema, Source as L3Source, WindowKind,
         };
+        use crate::physical::colored_dag::StageId;
         use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams as L4Params};
         use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
-        use crate::physical::colored_dag::StageId;
         let scan = L3QE::Scan {
             source: L3Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),

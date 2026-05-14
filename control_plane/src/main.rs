@@ -472,8 +472,20 @@ async fn handle_plan(
                 let budgets = StageResourceBudgets::from_workload_chars(&wc);
                 let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
                 let (opt_qe, _) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
-                plan.staged_plan = Some(staged);
+                // Step γ7: the physical planner is canonical-IR now (PR 8);
+                // the optimizer still emits the legacy IR (flips in PR 9).
+                // `convert_root` bridges the boundary until then.
+                match control_plane::intent_algebra::convert_root(&opt_qe) {
+                    Ok(canonical) => {
+                        let (staged, _physical_tree) =
+                            physical_plan_to_staged(&canonical, &budgets);
+                        plan.staged_plan = Some(staged);
+                    }
+                    Err(e) => warn!(
+                        query = %qs, error = %e,
+                        "legacy→canonical conversion failed; skipping staged_plan"
+                    ),
+                }
             }
         }
     }

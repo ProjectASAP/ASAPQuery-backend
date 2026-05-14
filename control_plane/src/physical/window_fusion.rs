@@ -236,52 +236,53 @@ mod tests {
         }
     }
 
-    /// The core equivalence assertion: for a legacy `WindowedAgg`, the
-    /// canonical recognizer + `fused_sketch_decision` reconstruct the
-    /// same `OtelSketchBuild` op (sketch type + window) and the same
-    /// placement that the legacy `plan_node` `WindowedAgg` arm produces.
+    /// End-to-end fusion assertion: a legacy `WindowedAgg`, converted to
+    /// the canonical `Window { Aggregate }` shape and run through the
+    /// canonical planner, produces a *fused* `OtelSketchBuild` carrying a
+    /// resolved (non-`None`) physical window. This is the
+    /// window-defines-sketch-lifecycle invariant — now a planner peephole
+    /// (`recognize_windowed_sketch` + `fused_sketch_decision`, both wired
+    /// onto the hot path by PR 8) rather than an IR-shape property.
+    ///
+    /// Before PR 8 this harness compared the recognizer against the live
+    /// legacy `WindowedAgg` planner arm; that arm is now gone (the planner
+    /// is canonical), so the assertion is the canonical end-to-end result.
     fn assert_equivalent(agg: AggIntent, window: WindowSpec) {
         let cfg = config();
         let legacy = legacy_windowed_agg(agg, window);
-
-        // Legacy side: the live source of truth.
-        let legacy_node = plan(&legacy, &cfg);
-        let PhysicalOp::OtelSketchBuild {
-            sketch_type: legacy_sketch,
-            window: legacy_window,
-            ..
-        } = &legacy_node.op
-        else {
-            panic!("legacy WindowedAgg did not plan to OtelSketchBuild: {:?}", legacy_node.op);
-        };
-
-        // Canonical side: convert → recognize → reconstruct.
         let canonical = convert_root(&legacy).expect("convert");
+
+        // The recognizer matches the converted `Window { Aggregate }` fold.
         let fused = recognize_windowed_sketch(&canonical)
             .expect("canonical Window{Aggregate} should be recognized as a fused sketch");
-        let (canon_op, canon_placement) = fused_sketch_decision(&fused, &cfg);
+        let (decided_op, _placement) = fused_sketch_decision(&fused, &cfg);
         let PhysicalOp::OtelSketchBuild {
-            sketch_type: canon_sketch,
-            window: canon_window,
+            window: decided_window,
             ..
-        } = &canon_op
+        } = &decided_op
         else {
-            panic!("fused_sketch_decision did not produce OtelSketchBuild: {canon_op:?}");
+            panic!("fused_sketch_decision did not produce OtelSketchBuild: {decided_op:?}");
         };
+        assert!(
+            !matches!(decided_window, PhysicalWindow::None),
+            "fused windowed sketch must carry a resolved physical window, got None"
+        );
 
-        assert_eq!(
-            *legacy_sketch, *canon_sketch,
-            "sketch type diverged between legacy and canonical paths"
-        );
-        assert_eq!(
-            legacy_node.placement, canon_placement,
-            "placement diverged between legacy and canonical paths"
-        );
+        // End-to-end: the canonical planner produces the same fused
+        // `OtelSketchBuild` — `recognize_windowed_sketch` is on its hot path.
+        let node = plan(&canonical, &cfg);
+        let PhysicalOp::OtelSketchBuild {
+            window: planned_window,
+            ..
+        } = &node.op
+        else {
+            panic!("canonical planner did not fuse Window{{Aggregate}}: {:?}", node.op);
+        };
         // PhysicalWindow has no PartialEq — compare its Debug form.
         assert_eq!(
-            format!("{legacy_window:?}"),
-            format!("{canon_window:?}"),
-            "physical window diverged between legacy and canonical paths"
+            format!("{decided_window:?}"),
+            format!("{planned_window:?}"),
+            "planner's fused window diverged from fused_sketch_decision"
         );
     }
 
