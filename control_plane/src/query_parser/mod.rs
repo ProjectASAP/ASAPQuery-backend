@@ -109,6 +109,30 @@ pub fn parse_query_expr(query: &str) -> anyhow::Result<QueryExpr> {
     Ok(crate::intent_algebra::legacy_lower::lower_to_sketch_algebra(layer2))
 }
 
+/// Parse a raw query string (PromQL or SQL) into the **canonical** L3
+/// [`query_expr::QueryExpr`](crate::intent_algebra::query_expr::QueryExpr) IR.
+///
+/// This is the canonical-IR twin of [`parse_query_expr`]: it parses via the
+/// exact same path (it calls [`parse_query_expr`] internally to obtain the
+/// legacy [`QueryExpr`]) and then runs the result through
+/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root) to
+/// produce a canonical `query_expr::QueryExpr` tree.
+///
+/// Both entry points coexist deliberately during the Step γ7 legacy-IR
+/// retirement: [`parse_query_expr`] keeps returning the legacy `QueryExpr`
+/// so every existing `optimizer/` / `physical/` / `main.rs` consumer keeps
+/// compiling, while new canonical-IR consumers migrate onto this entry
+/// point one at a time. A later PR removes the legacy path entirely.
+pub fn parse_query_expr_canonical(
+    query: &str,
+) -> anyhow::Result<crate::intent_algebra::query_expr::QueryExpr> {
+    let legacy = parse_query_expr(query)?;
+    // `ConvertError` derives `thiserror::Error`, so `?` lifts it straight
+    // into `anyhow::Error`.
+    let canonical = crate::intent_algebra::convert_root(&legacy)?;
+    Ok(canonical)
+}
+
 /// Parse a raw query string (PromQL or SQL) into a [`ParsedQuery`].
 ///
 /// This is the backward-compatible entry point for the existing
@@ -473,6 +497,57 @@ mod tests {
         ).unwrap();
         // Should parse without error and extract the metric name.
         assert_eq!(pq.metric_name, "financial_last_trade_price");
+    }
+
+    // ── Step γ7: canonical-IR entry point ────────────────────────────────────
+
+    #[test]
+    fn canonical_promql_quantile_yields_window_over_aggregate() {
+        use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
+        // `quantile_over_time` lowers to a legacy `WindowedAgg`, which
+        // `convert_root` maps to canonical `Window { child: Aggregate }`.
+        let expr = parse_query_expr_canonical(
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
+        ).unwrap();
+        match expr {
+            CQueryExpr::Window { child, .. } => {
+                assert!(matches!(*child, CQueryExpr::Aggregate { .. }));
+            }
+            other => panic!("expected canonical Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_promql_avg_over_time_yields_window_over_aggregate() {
+        use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
+        // A bare `avg_over_time(m[w])` (no `by`) lowers to a legacy
+        // `WindowedAgg` over the implicit sample-value column, which
+        // `convert_root` maps to canonical `Window { child: Aggregate }`.
+        let expr = parse_query_expr_canonical(
+            "avg_over_time(cpu_seconds_total[10m])"
+        ).unwrap();
+        match expr {
+            CQueryExpr::Window { child, .. } => match *child {
+                CQueryExpr::Aggregate { child, .. } => {
+                    assert!(matches!(*child, CQueryExpr::Scan { .. }));
+                }
+                other => panic!("expected canonical Aggregate, got {other:?}"),
+            },
+            other => panic!("expected canonical Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_entry_point_still_returns_legacy_type() {
+        // `parse_query_expr` is untouched: it still returns the legacy
+        // `QueryExpr` so every existing optimizer / physical consumer keeps
+        // compiling. Asserting on a legacy-only variant proves the type.
+        let legacy = parse_query_expr(
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
+        ).unwrap();
+        // `WindowedAgg` exists only on the legacy IR — the canonical IR
+        // splits it into `Window { Aggregate }`.
+        assert!(matches!(legacy, QueryExpr::WindowedAgg { .. }));
     }
 }
 
