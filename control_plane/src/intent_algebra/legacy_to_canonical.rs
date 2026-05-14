@@ -63,9 +63,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 use crate::intent_algebra::agg_intent::AggIntent;
+use crate::intent_algebra::binder::Binder;
 use crate::intent_algebra::column_resolution::{
-    infer_schema_for_root, infer_source_schema, resolve_column_ref, resolve_named_keys,
-    ResolveError,
+    resolve_column_ref, resolve_named_keys, ResolveError,
 };
 use crate::intent_algebra::legacy_expr::{
     ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
@@ -107,10 +107,17 @@ pub enum ConvertError {
     Scalar(QueryExprError),
 }
 
-/// Convert a legacy `QueryExpr` tree to canonical, deriving the inherited
-/// schema from the tree's outermost `Source` leaf.
+/// Convert a legacy `QueryExpr` tree to canonical.
+///
+/// The inherited schema comes from the [`Binder`] — the explicit L3
+/// name-resolution pass — which builds the complete, self-contained
+/// schema every `ColumnId` indexes into. Because the Binder guarantees
+/// every referenced name is in scope, the per-arm positional resolution
+/// below (`resolve_column_ref` / `resolve_named_keys`) is **total**: it
+/// cannot raise `ConvertError::Resolve` on a well-formed legacy tree.
 pub fn convert_root(legacy: &LQueryExpr) -> Result<CQueryExpr, ConvertError> {
-    convert(legacy, &infer_schema_for_root(legacy))
+    let schema = Binder::new().bind(legacy);
+    convert(legacy, &schema)
 }
 
 /// Convert a legacy `QueryExpr` tree to canonical against an explicit
@@ -123,7 +130,9 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                 metric: spec.name.clone(),
             },
             label_filters: Vec::new(),
-            schema: infer_source_schema(&spec.name),
+            // Carry the Binder's complete schema — the same self-contained
+            // scope every `ColumnId` in this tree resolves against.
+            schema: schema.clone(),
         },
 
         LQueryExpr::Ref(name) => CQueryExpr::Ref {
