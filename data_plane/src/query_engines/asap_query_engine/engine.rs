@@ -5991,17 +5991,17 @@ mod asap_tier_classify_tests {
     }
 
     #[tokio::test]
-    async fn execute_rejects_bare_selector_via_analyzer() {
-        // Phase-9 controller-unified behavior: a bare vector selector
-        // (no call node) is rejected by
-        // `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`
-        // with `UnsupportedReason::NoCallNodeFound` BEFORE the sid
-        // index is even consulted. The archive engine answers raw
-        // selectors directly, so this is the right place for the
-        // routing decision. Replaces the legacy
-        // `execute_proceeds_to_handle_query_when_all_sids_hit` test —
-        // the new behavior is "bare selectors short-circuit on shape
-        // rejection, regardless of index state".
+    async fn execute_bare_selector_falls_over_to_archive() {
+        // A bare vector selector lowers (via
+        // `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`)
+        // to an `ExactAgg(Sum)` candidate — the control plane no longer
+        // rejects it outright with `NoCallNodeFound`. But the
+        // `SketchStore` here holds only a DDSketch (quantile) policy, so
+        // the candidate's `ExactAgg(Sum)` capability finds no matching
+        // policy and the query still fails over to the archive engine
+        // via `CapabilityMiss` — just with a capability-mismatch detail
+        // rather than an analyzer-shape rejection. Either way the
+        // routing outcome (→ archive) is unchanged.
         let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
@@ -6018,11 +6018,11 @@ mod asap_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    detail.contains("NoCallNodeFound") || detail.contains("analyzer rejected"),
-                    "expected NoCallNodeFound analyzer rejection: {detail}"
+                    detail.contains("ExactAgg(Sum)") || detail.contains("no policy"),
+                    "expected a capability-miss fall-over to archive: {detail}"
                 );
             }
-            other => panic!("expected analyzer-rejected CapabilityMiss, got {other:?}")}
+            other => panic!("expected CapabilityMiss fall-over to archive, got {other:?}")}
     }
 }
 
@@ -6319,22 +6319,22 @@ mod analyzer_parity_tests {
     ctrl   OK [metric=m gbk=[] cap=QuantileApprox(Any) fn=quantile_over_time args=[0.99] range_s=7200]
     engine OK pattern=only_temporal stats=[quantile] metric=m fn=quantile_over_time agg_op= range_s=7200 range_ms=Some(7200000) spatial=\"\" grouping=[]
 ─── q04: sum by (zone) (http_requests_total)
-    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    ctrl   OK [metric=http_requests_total gbk=[\"zone\"] cap=ExactAgg(Sum) fn=sum args=[] range_s=0]
     engine OK pattern=only_spatial stats=[sum] metric=http_requests_total fn= agg_op=sum range_s=- range_ms=None spatial=\"\" grouping=[\"zone\"]
 ─── q05: sum by (zone, region) (http_requests_total)
-    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    ctrl   OK [metric=http_requests_total gbk=[\"region\", \"zone\"] cap=ExactAgg(Sum) fn=sum args=[] range_s=0]
     engine OK pattern=only_spatial stats=[sum] metric=http_requests_total fn= agg_op=sum range_s=- range_ms=None spatial=\"\" grouping=[\"region\", \"zone\"]
 ─── q06: topk(5, http_requests_total)
-    ctrl   MISS(UnsupportedAggIntent(\"topk\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=FrequencyTopk(CmsWithHeap) fn=topk args=[5.0] range_s=0 | metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=topk args=[5.0] range_s=0]
     engine OK pattern=only_spatial stats=[topk] metric=http_requests_total fn= agg_op=topk range_s=- range_ms=None spatial=\"\" grouping=[]
 ─── q07: topk(10, sum by (svc) (m))
-    ctrl   MISS(UnsupportedAggIntent(\"topk\"))
+    ctrl   OK [metric=m gbk=[\"svc\"] cap=FrequencyTopk(CmsWithHeap) fn=topk args=[10.0] range_s=0 | metric=m gbk=[\"svc\"] cap=ExactAgg(Sum) fn=topk args=[10.0] range_s=0]
     engine MISS(NoPattern)
 ─── q08: count_over_time(http_requests_total[5m])
-    ctrl   MISS(UnsupportedAggIntent(\"count_over_time\"))
+    ctrl   MISS(UnsupportedAggIntent(\"count\"))
     engine OK pattern=only_temporal stats=[count] metric=http_requests_total fn=count_over_time agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
 ─── q09: count by (zone) (count_over_time(http_requests_total[5m]))
-    ctrl   OK [metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300]
+    ctrl   OK [metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300 | metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300]
     engine OK pattern=one_temporal_one_spatial stats=[count] metric=http_requests_total fn=count_over_time agg_op=count range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[\"zone\"]
 ─── q10: histogram_quantile(0.99, sum by (le) (rate(http_latency_bucket[5m])))
     ctrl   MISS(UnparseableMetricsql(\"expected MatrixSelector, got Discriminant(0)\"))
@@ -6343,22 +6343,22 @@ mod analyzer_parity_tests {
     ctrl   MISS(UnparseableMetricsql(\"expected MatrixSelector, got Discriminant(7)\"))
     engine MISS(NoPattern)
 ─── q12: http_requests_total
-    ctrl   MISS(NoCallNodeFound)
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn= args=[] range_s=0]
     engine MISS(NoPattern)
 ─── q13: http_requests_total{zone=\"z0\"}
-    ctrl   MISS(NoCallNodeFound)
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn= args=[] range_s=0]
     engine MISS(NoPattern)
 ─── q14: rate(http_requests_total[5m])
-    ctrl   MISS(UnsupportedAggIntent(\"rate\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=rate args=[] range_s=300]
     engine OK pattern=only_temporal stats=[rate] metric=http_requests_total fn=rate agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
 ─── q15: irate(http_requests_total[5m])
-    ctrl   MISS(UnsupportedAggIntent(\"irate\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=irate args=[] range_s=300]
     engine MISS(NoPattern)
 ─── q16: increase(http_requests_total[5m])
-    ctrl   MISS(UnsupportedAggIntent(\"increase\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=increase args=[] range_s=300]
     engine OK pattern=only_temporal stats=[increase] metric=http_requests_total fn=increase agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
 ─── q17: sum(rate(http_requests_total[5m]))
-    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=sum args=[] range_s=300]
     engine OK pattern=one_temporal_one_spatial stats=[rate] metric=http_requests_total fn=rate agg_op=sum range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
 ─── q18: @@@ not promql @@@
     ctrl   MISS(UnparseableMetricsql(\"PromQL parse error: invalid promql query\"))
