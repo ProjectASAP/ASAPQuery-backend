@@ -6127,3 +6127,259 @@ mod hybrid_stitch_tests {
         assert_eq!(b.samples.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod analyzer_parity_tests {
+    //! PR-α parity tests — capture both PromQL → asap-tier analyzers
+    //! side by side and pin the output.
+    //!
+    //! Two analyzers exist today and the analyzer-unification chain
+    //! (α→β→γ→δ→ε) is going to collapse them. To make that collapse
+    //! verifiable, α (this test) freezes how each analyzer answers
+    //! every shape in an 18-query corpus. γ rewrites the engine path
+    //! as a shim over the control plane path; δ deletes the engine
+    //! analyzer. Both stages must preserve the *engine column* of
+    //! this table — that's the parity contract.
+    //!
+    //! The two analyzers:
+    //!
+    //! 1. **Control plane** —
+    //!    `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`.
+    //!    Pipeline: `query_parser::parse_query` →
+    //!    `intent_algebra::lower::lower_parsed_query` →
+    //!    `capability_for(&AggIntent)`. Output:
+    //!    `ASAPTierAnalysis { candidates, unsupported }` — speaks
+    //!    `Capability` + `AggIntent` (L3).
+    //!
+    //! 2. **Engine** — `ASAPQueryEngine::parse_and_match_promql` +
+    //!    `build_query_requirements_promql`. Pipeline:
+    //!    `promql_parser::parser::parse` → match against
+    //!    `controller_patterns: HashMap<QueryPatternType, Vec<PromQLPattern>>`
+    //!    built at `new_with_hot_reload`. Output:
+    //!    `(QueryPatternType, PromQLMatchResult)` + `QueryRequirements`
+    //!    — speaks `Statistic` + `QueryPatternType` (physical
+    //!    sketch-storage table).
+    //!
+    //! Known divergences pinned by this corpus (see
+    //! `control_plane/docs/analyzer-parity-matrix.md` for the
+    //! per-query explanation):
+    //!
+    //! - `count_over_time(m[r])` without an outer `count by`:
+    //!   control plane → `MISS(UnsupportedAggIntent("count"))`,
+    //!   engine → `OK pattern=only_temporal stats=[count]`.
+    //! - `histogram_quantile(phi, m[…])`: control plane substitutes to
+    //!   `Quantile` at the parser site (γ5 / PR #144); engine has no
+    //!   `histogram_quantile` pattern and falls through to `MISS`.
+    //! - `irate(m[r])`: engine pattern list omits `irate` so it
+    //!   misses; control plane rejects it as `UnsupportedAggIntent("rate")`.
+    //! - `topk(k, sum_by(…))` (topk wrapping a spatial agg, no
+    //!   metric leaf at the call site): engine's `topk` pattern only
+    //!   accepts a bare metric; control plane accepts via the topk
+    //!   bridge.
+    //! - Bare selectors (`m`, `m{l=v}`): control plane → `NoCallNodeFound`;
+    //!   engine → `MISS(NoPattern)` (no aggregation / function node).
+
+    use super::*;
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+
+    /// Build a parity-test `ASAPQueryEngine`. The engine analyzer's
+    /// `parse_and_match_promql` depends only on `self.controller_patterns`
+    /// (built inside `new_with_hot_reload` from a static table), so an
+    /// empty `StreamingConfig` is sufficient. `build_query_requirements_promql`
+    /// calls `resolve_metric_labels(&metric)` which returns `None` against
+    /// an empty config and falls back to `KeyByLabelNames::empty()` — we
+    /// want exactly that fallback so the parity output is deterministic
+    /// and independent of any schema registry state.
+    fn make_engine() -> ASAPQueryEngine {
+        let sc = Arc::new(StreamingConfig::new(HashMap::new()));
+        let hr = HotReloadStreamingConfig::from_arc(sc);
+        ASAPQueryEngine::new_with_hot_reload(hr, 60)
+    }
+
+    /// The 18-query parity corpus. Each row is `(id, promql)`. The id
+    /// is the row anchor in `control_plane/docs/analyzer-parity-matrix.md`;
+    /// keep them aligned when adding queries.
+    const CORPUS: &[(&str, &str)] = &[
+        ("q01", "quantile_over_time(0.99, http_latency_ms[5m])"),
+        ("q02", "quantile_over_time(0.5, m[30s])"),
+        ("q03", "quantile_over_time(0.99, m[2h])"),
+        ("q04", "sum by (zone) (http_requests_total)"),
+        ("q05", "sum by (zone, region) (http_requests_total)"),
+        ("q06", "topk(5, http_requests_total)"),
+        ("q07", "topk(10, sum by (svc) (m))"),
+        ("q08", "count_over_time(http_requests_total[5m])"),
+        ("q09", "count by (zone) (count_over_time(http_requests_total[5m]))"),
+        ("q10", "histogram_quantile(0.99, sum by (le) (rate(http_latency_bucket[5m])))"),
+        ("q11", "histogram_quantile(0.99, http_latency_bucket)"),
+        ("q12", "http_requests_total"),
+        ("q13", "http_requests_total{zone=\"z0\"}"),
+        ("q14", "rate(http_requests_total[5m])"),
+        ("q15", "irate(http_requests_total[5m])"),
+        ("q16", "increase(http_requests_total[5m])"),
+        ("q17", "sum(rate(http_requests_total[5m]))"),
+        ("q18", "@@@ not promql @@@"),
+    ];
+
+    /// One-line stable summary of `ASAPTierAnalysis`. `MISS(reason)` on
+    /// the unsupported path; `OK [cand, ...]` on the supported path
+    /// with the full candidate shape so γ can be checked against this
+    /// without ambiguity.
+    fn summarize_controller(q: &str) -> String {
+        let a = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(q);
+        if let Some(reason) = &a.unsupported {
+            return format!("MISS({:?})", reason);
+        }
+        if a.candidates.is_empty() {
+            return "MISS(NoCandidates)".to_string();
+        }
+        let cands: Vec<String> = a
+            .candidates
+            .iter()
+            .map(|c| {
+                let gbk: Vec<&str> = c.group_by_keys.iter().map(|s| s.as_str()).collect();
+                format!(
+                    "metric={} gbk={:?} cap={:?} fn={} args={:?} range_s={}",
+                    c.metric_name,
+                    gbk,
+                    c.required_capability,
+                    c.function,
+                    c.function_args,
+                    c.range_seconds,
+                )
+            })
+            .collect();
+        format!("OK [{}]", cands.join(" | "))
+    }
+
+    /// One-line stable summary of the engine analyzer's
+    /// `(QueryPatternType, PromQLMatchResult)` + `QueryRequirements`.
+    /// `MISS(NoPattern)` when no pattern in `controller_patterns`
+    /// matches the AST; `OK pattern=… stats=[…] …` otherwise.
+    fn summarize_engine(eng: &ASAPQueryEngine, q: &str) -> String {
+        match eng.parse_and_match_promql(q) {
+            None => "MISS(NoPattern)".to_string(),
+            Some((pt, mr)) => {
+                let req = eng.build_query_requirements_promql(&mr, pt);
+                let stats: Vec<String> =
+                    req.statistics.iter().map(|s| s.to_string()).collect();
+                let fn_name = mr.get_function_name().unwrap_or_default();
+                let agg_op = mr.get_aggregation_op().unwrap_or_default();
+                let range_s = mr
+                    .get_range_duration()
+                    .map(|d| d.num_seconds().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                format!(
+                    "OK pattern={pattern} stats=[{stats}] metric={metric} fn={fn_name} \
+                     agg_op={agg_op} range_s={range_s} range_ms={range_ms:?} \
+                     spatial={spatial:?} grouping={grouping:?}",
+                    pattern = pt,
+                    stats = stats.join(","),
+                    metric = req.metric,
+                    fn_name = fn_name,
+                    agg_op = agg_op,
+                    range_s = range_s,
+                    range_ms = req.data_range_ms,
+                    spatial = req.spatial_filter_normalized,
+                    grouping = req.grouping_labels.labels,
+                )
+            }
+        }
+    }
+
+    fn build_parity_table() -> String {
+        let eng = make_engine();
+        let mut out = String::new();
+        for (id, q) in CORPUS {
+            out.push_str(&format!("─── {id}: {q}\n"));
+            out.push_str(&format!("    ctrl   {}\n", summarize_controller(q)));
+            out.push_str(&format!("    engine {}\n", summarize_engine(&eng, q)));
+        }
+        out
+    }
+
+    /// Embedded golden master — captured against `origin/main` at
+    /// commit `6557fb8` (post-PR #187), re-verified byte-for-byte on
+    /// the rebase onto `origin/main` post-PR #211. Replace whenever an
+    /// analyzer output changes intentionally: re-run the test, copy the
+    /// printed `=== ACTUAL ===` block, and update
+    /// `control_plane/docs/analyzer-parity-matrix.md` in the same PR.
+    ///
+    /// Each row records what the analyzer **today** answers. β/γ MUST
+    /// preserve every `engine ...` row (the parity contract); δ MAY
+    /// change them only if the matching `ctrl ...` row already matches
+    /// the new behavior. The two paths must converge, not drift apart.
+    const GOLDEN: &str = "\
+─── q01: quantile_over_time(0.99, http_latency_ms[5m])
+    ctrl   OK [metric=http_latency_ms gbk=[] cap=QuantileApprox(Any) fn=quantile_over_time args=[0.99] range_s=300]
+    engine OK pattern=only_temporal stats=[quantile] metric=http_latency_ms fn=quantile_over_time agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
+─── q02: quantile_over_time(0.5, m[30s])
+    ctrl   OK [metric=m gbk=[] cap=QuantileApprox(Any) fn=quantile_over_time args=[0.5] range_s=30]
+    engine OK pattern=only_temporal stats=[quantile] metric=m fn=quantile_over_time agg_op= range_s=30 range_ms=Some(30000) spatial=\"\" grouping=[]
+─── q03: quantile_over_time(0.99, m[2h])
+    ctrl   OK [metric=m gbk=[] cap=QuantileApprox(Any) fn=quantile_over_time args=[0.99] range_s=7200]
+    engine OK pattern=only_temporal stats=[quantile] metric=m fn=quantile_over_time agg_op= range_s=7200 range_ms=Some(7200000) spatial=\"\" grouping=[]
+─── q04: sum by (zone) (http_requests_total)
+    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    engine OK pattern=only_spatial stats=[sum] metric=http_requests_total fn= agg_op=sum range_s=- range_ms=None spatial=\"\" grouping=[\"zone\"]
+─── q05: sum by (zone, region) (http_requests_total)
+    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    engine OK pattern=only_spatial stats=[sum] metric=http_requests_total fn= agg_op=sum range_s=- range_ms=None spatial=\"\" grouping=[\"region\", \"zone\"]
+─── q06: topk(5, http_requests_total)
+    ctrl   MISS(UnsupportedAggIntent(\"topk\"))
+    engine OK pattern=only_spatial stats=[topk] metric=http_requests_total fn= agg_op=topk range_s=- range_ms=None spatial=\"\" grouping=[]
+─── q07: topk(10, sum by (svc) (m))
+    ctrl   MISS(UnsupportedAggIntent(\"topk\"))
+    engine MISS(NoPattern)
+─── q08: count_over_time(http_requests_total[5m])
+    ctrl   MISS(UnsupportedAggIntent(\"count_over_time\"))
+    engine OK pattern=only_temporal stats=[count] metric=http_requests_total fn=count_over_time agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
+─── q09: count by (zone) (count_over_time(http_requests_total[5m]))
+    ctrl   OK [metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300]
+    engine OK pattern=one_temporal_one_spatial stats=[count] metric=http_requests_total fn=count_over_time agg_op=count range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[\"zone\"]
+─── q10: histogram_quantile(0.99, sum by (le) (rate(http_latency_bucket[5m])))
+    ctrl   MISS(UnparseableMetricsql(\"expected MatrixSelector, got Discriminant(0)\"))
+    engine MISS(NoPattern)
+─── q11: histogram_quantile(0.99, http_latency_bucket)
+    ctrl   MISS(UnparseableMetricsql(\"expected MatrixSelector, got Discriminant(7)\"))
+    engine MISS(NoPattern)
+─── q12: http_requests_total
+    ctrl   MISS(NoCallNodeFound)
+    engine MISS(NoPattern)
+─── q13: http_requests_total{zone=\"z0\"}
+    ctrl   MISS(NoCallNodeFound)
+    engine MISS(NoPattern)
+─── q14: rate(http_requests_total[5m])
+    ctrl   MISS(UnsupportedAggIntent(\"rate\"))
+    engine OK pattern=only_temporal stats=[rate] metric=http_requests_total fn=rate agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
+─── q15: irate(http_requests_total[5m])
+    ctrl   MISS(UnsupportedAggIntent(\"irate\"))
+    engine MISS(NoPattern)
+─── q16: increase(http_requests_total[5m])
+    ctrl   MISS(UnsupportedAggIntent(\"increase\"))
+    engine OK pattern=only_temporal stats=[increase] metric=http_requests_total fn=increase agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
+─── q17: sum(rate(http_requests_total[5m]))
+    ctrl   MISS(UnsupportedAggIntent(\"sum\"))
+    engine OK pattern=one_temporal_one_spatial stats=[rate] metric=http_requests_total fn=rate agg_op=sum range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
+─── q18: @@@ not promql @@@
+    ctrl   MISS(UnparseableMetricsql(\"PromQL parse error: invalid promql query\"))
+    engine MISS(NoPattern)
+";
+
+    /// Run all 18 queries through both analyzers, format as a parity
+    /// table, and pin against the embedded golden. A mismatch here is
+    /// the parity-violation signal β/γ must not trip — and is what
+    /// PR #144 (`histogram_quantile` parser substitution) regression-
+    /// guards against.
+    #[test]
+    fn analyzer_parity_18_query_corpus() {
+        let actual = build_parity_table();
+        if actual != GOLDEN {
+            eprintln!("=== ACTUAL ===\n{actual}=== END ACTUAL ===");
+        }
+        assert_eq!(
+            actual, GOLDEN,
+            "analyzer parity drifted — update control_plane/docs/analyzer-parity-matrix.md \
+             and replace GOLDEN with the new ACTUAL block above"
+        );
+    }
+}
