@@ -435,6 +435,78 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
     }
 }
 
+/// Look up the policy whose contents match a freshly-ingested
+/// sketch's shape. Used by the OTel sketch-ingest path
+/// (`drivers/ingest/otel.rs`) to populate
+/// `SketchInstanceMetadata.policy_fp` at registration time. Without
+/// this lookup, sketch-backed sids carry `PolicyFingerprint::UNSET`
+/// and are reachable only through the legacy
+/// `instances_matching(metric, gbk)` walk; with it, they participate
+/// in the `policy_fp → [sid]` reverse index (#203).
+///
+/// Match shape — all must hold:
+/// 1. `policy.metric == metric`
+/// 2. `policy.aggregation_type == agg_type`
+/// 3. `policy.grouping_labels.labels` (as a set) == `group_by_keys`
+/// 4. Every key in `expected_params` is present in `policy.parameters`
+///    with an equal value (deep `serde_json::Value` equality).
+///    Extra keys on the policy that aren't in `expected_params` are
+///    tolerated — the OTLP DP may not surface every param the
+///    control plane authored, and policy-side defaults shouldn't
+///    cause a mismatch.
+/// 5. `policy.spatial_filter_normalized.is_empty()` — OTLP sketches
+///    don't carry a filter context, so only unfiltered policies are
+///    matchable from this path.
+///
+/// Returns `Some(fp)` on a unique match, `None` when zero or multiple
+/// policies match. Ambiguous (multiple-match) callers stay on the
+/// UNSET sentinel — better than picking one arbitrarily. If multiple
+/// distinct windows of the same `(metric, agg_type, params, group_by)`
+/// shape exist, the control plane shouldn't have pushed them: they'd
+/// collide on sid identity. The skip with `None` surfaces that bug.
+pub fn find_policy_by_content(
+    registry: &asap_types::PolicyRegistry,
+    metric: &str,
+    group_by_keys: &BTreeSet<String>,
+    agg_type: promql_utilities::query_logics::enums::AggregationType,
+    expected_params: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<asap_types::PolicyFingerprint> {
+    let mut hit: Option<asap_types::PolicyFingerprint> = None;
+    for (fp, cfg) in registry.iter() {
+        if cfg.metric != metric {
+            continue;
+        }
+        if cfg.aggregation_type != agg_type {
+            continue;
+        }
+        let policy_keys: BTreeSet<String> =
+            cfg.grouping_labels.labels.iter().cloned().collect();
+        if &policy_keys != group_by_keys {
+            continue;
+        }
+        if !cfg.spatial_filter_normalized.is_empty() {
+            continue;
+        }
+        // Param subset match — every key the caller named must appear
+        // in policy.parameters with an equal value. We don't require
+        // the reverse direction (policy may have extra params the DP
+        // didn't surface).
+        let params_ok = expected_params
+            .iter()
+            .all(|(k, v)| cfg.parameters.get(k).is_some_and(|pv| pv == v));
+        if !params_ok {
+            continue;
+        }
+        // Track unique-match invariant.
+        if hit.is_some() {
+            // Ambiguous — multiple policies match the same shape. Skip.
+            return None;
+        }
+        hit = Some(*fp);
+    }
+    hit
+}
+
 /// Find every policy in `registry` whose contents satisfy `candidate`.
 /// The result is empty when no policy fits — caller routes the query
 /// to the archive engine (cold tier) in that case. Multiple matches
