@@ -369,11 +369,10 @@ impl Worker {
                         let mut updater = create_accumulator_updater(&state.config);
                         apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
                         let key = build_group_key_label_values(group_key);
-                        let output = PrecomputedOutput::new_with_policy_fp(
+                        let output = PrecomputedOutput::new(
                             window_start as u64,
                             window_end as u64,
                             Some(key),
-                            agg_id,
                             PolicyFingerprint::from_config(&state.config),
                         );
                         emit_batch.push((output, updater.take_accumulator()));
@@ -412,11 +411,10 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new_with_policy_fp(
+                let output = PrecomputedOutput::new(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
-                    agg_id,
                     PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
@@ -504,11 +502,10 @@ impl Worker {
                     let window_start = pane_start;
                     let window_end = pane_start + state.window_manager.window_size_ms();
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new_with_policy_fp(
+                    let output = PrecomputedOutput::new(
                         window_start as u64,
                         window_end as u64,
                         Some(key),
-                        agg_id,
                         PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, incoming));
@@ -556,11 +553,10 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new_with_policy_fp(
+                let output = PrecomputedOutput::new(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
-                    agg_id,
                     PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
@@ -571,11 +567,10 @@ impl Worker {
                 merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new_with_policy_fp(
+                let output = PrecomputedOutput::new(
                     *window_start as u64,
                     window_end as u64,
                     Some(key),
-                    agg_id,
                     PolicyFingerprint::from_config(&state.config),
                 );
                 emit_batch.push((output, accumulator));
@@ -610,13 +605,21 @@ impl Worker {
 
         for (ts, val) in samples {
             // Raw-mode path does not carry an `AggregationConfig` for
-            // the source aggregation (it's an aggregation-config-less
-            // pass-through with a synthetic agg_id), so we leave
-            // `policy_fp` as the `PolicyFingerprint::UNSET` sentinel.
-            // The sink falls back to `aggregation_id` lookup — the
-            // dual-keyed transition this PR is structured around.
-            let output =
-                PrecomputedOutput::new(ts as u64, ts as u64, None, self.raw_mode_aggregation_id);
+            // the source aggregation (synthetic agg_id, no source
+            // config). After the PR-6 follow-up retired
+            // `PrecomputedOutput.aggregation_id`, the sink's fallback
+            // branch is gone — outputs carrying `PolicyFingerprint::UNSET`
+            // are dropped at the sink with a warn. Raw-mode is
+            // dev/test-only today (default `raw_mode_aggregation_id=0`),
+            // so this path effectively writes nothing in production;
+            // wiring raw mode to a real policy is a separate concern.
+            let output = PrecomputedOutput::new(
+                ts as u64,
+                ts as u64,
+                None,
+                PolicyFingerprint::UNSET,
+            );
+            let _ = self.raw_mode_aggregation_id;
             let accumulator = SumAccumulator::with_sum(val);
             emit_batch.push((output, Box::new(accumulator)));
         }
@@ -748,11 +751,10 @@ impl Worker {
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new_with_policy_fp(
+                    let output = PrecomputedOutput::new(
                         *window_start as u64,
                         window_end as u64,
                         Some(key),
-                        *agg_id,
                         PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, accumulator));
@@ -762,11 +764,10 @@ impl Worker {
                     merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new_with_policy_fp(
+                    let output = PrecomputedOutput::new(
                         *window_start as u64,
                         window_end as u64,
                         Some(key),
-                        *agg_id,
                         PolicyFingerprint::from_config(&state.config),
                     );
                     emit_batch.push((output, accumulator));
@@ -1207,7 +1208,11 @@ mod tests {
         for ((ts, val), (output, acc)) in samples.iter().zip(captured.iter()) {
             assert_eq!(output.start_timestamp as i64, *ts);
             assert_eq!(output.end_timestamp as i64, *ts);
-            assert_eq!(output.aggregation_id, 99);
+            // Raw mode emits PolicyFingerprint::UNSET (no source
+            // AggregationConfig in the raw-mode fast path). The sink
+            // drops UNSET outputs with a warn — verified separately
+            // via integration tests.
+            assert!(output.policy_fp.is_unset());
             let sum_acc = acc
                 .as_any()
                 .downcast_ref::<SumAccumulator>()
@@ -1263,7 +1268,10 @@ mod tests {
         assert_eq!(captured.len(), 1, "exactly one window should close");
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 1);
+        // PR-6 follow-up: `aggregation_id` field is gone; the worker
+        // now emits the config's policy fingerprint. Non-UNSET asserts
+        // the emit path threaded the source config through.
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 10_000);
 
@@ -1324,7 +1332,10 @@ mod tests {
         assert_eq!(captured.len(), 1, "one output per group per window");
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 1);
+        // PR-6 follow-up: `aggregation_id` field is gone; the worker
+        // now emits the config's policy fingerprint. Non-UNSET asserts
+        // the emit path threaded the source config through.
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 10_000);
 
@@ -1471,7 +1482,10 @@ mod tests {
         assert_eq!(captured.len(), 1, "one KLL output for the whole group");
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 1);
+        // PR-6 follow-up: `aggregation_id` field is gone; the worker
+        // now emits the config's policy fingerprint. Non-UNSET asserts
+        // the emit path threaded the source config through.
+        assert!(!output.policy_fp.is_unset());
         let kll = acc
             .as_any()
             .downcast_ref::<DatasketchesKLLAccumulator>()
@@ -1722,7 +1736,7 @@ mod tests {
         assert_eq!(captured.len(), 1, "ForwardToStore should emit");
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 5);
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 10_000);
 
@@ -1795,7 +1809,8 @@ aggregations:
         assert_eq!(captured.len(), 1);
 
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, agg_id);
+        let _ = agg_id;
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 10_000);
 
@@ -2137,7 +2152,10 @@ aggregations:
         // The emitted output's window must be [60_000, 90_000) — the
         // 30s tumbling window that contained the first batch.
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 1);
+        // PR-6 follow-up: `aggregation_id` field is gone; the worker
+        // now emits the config's policy fingerprint. Non-UNSET asserts
+        // the emit path threaded the source config through.
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 60_000);
         assert_eq!(output.end_timestamp, 90_000);
         assert_eq!(
@@ -2372,7 +2390,10 @@ aggregations:
         // — the tumbling 30s window containing all the frozen-time
         // sketches.
         let (output, acc) = &captured[0];
-        assert_eq!(output.aggregation_id, 1);
+        // PR-6 follow-up: `aggregation_id` field is gone; the worker
+        // now emits the config's policy fingerprint. Non-UNSET asserts
+        // the emit path threaded the source config through.
+        assert!(!output.policy_fp.is_unset());
         assert_eq!(output.start_timestamp, 0);
         assert_eq!(output.end_timestamp, 30_000);
         assert_eq!(

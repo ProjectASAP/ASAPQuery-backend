@@ -57,52 +57,38 @@ impl SketchStoreSink {
     /// practice because the control plane will re-emit the agg_config
     /// on its next reconcile pass.
     ///
-    /// PR 4 (sid identity chain): resolves the source `AggregationConfig`
-    /// via [`PolicyFingerprint`] first when the output carries a
-    /// non-sentinel `policy_fp`; falls back to the legacy
-    /// `aggregation_id` lookup when the field is the
-    /// `PolicyFingerprint::UNSET` sentinel (set by call sites still on
-    /// the legacy `PrecomputedOutput::new` constructor). Both paths
-    /// resolve to the same `AggregationConfig` while
-    /// `StreamingConfig::aggregation_configs` is the source of truth.
+    /// PR-6 follow-up: resolves the source `AggregationConfig` via
+    /// `PolicyRegistry::get(output.policy_fp)`. The legacy
+    /// `aggregation_id` fallback branch (PR 4) is gone — `policy_fp`
+    /// is the only identity handle on `PrecomputedOutput`. Outputs
+    /// emitted with the `PolicyFingerprint::UNSET` sentinel (e.g.
+    /// raw-mode fast-path that has no source config) are skipped
+    /// rather than routed by a parallel id.
     fn append_to_index(
         &self,
         output: &PrecomputedOutput,
         accumulator: &dyn AggregateCore,
     ) -> bool {
+        if output.policy_fp.is_unset() {
+            warn!(
+                "SketchStoreSink: PrecomputedOutput carries PolicyFingerprint::UNSET; \
+                 skipping write (sink requires a content-addressed handle)"
+            );
+            return false;
+        }
         let cfg = self.hot_reload.snapshot();
-        let agg_cfg_owned;
-        let agg_cfg: &asap_types::aggregation_config::AggregationConfig =
-            if !output.policy_fp.is_unset() {
-                let registry = cfg.policy_registry();
-                match registry.get(output.policy_fp) {
-                    Some(c) => {
-                        // Clone out so the borrow on the snapshot
-                        // doesn't outlive this scope; the existing
-                        // legacy branch ALSO borrows from the snapshot,
-                        // so this is structurally equivalent.
-                        agg_cfg_owned = c.clone();
-                        &agg_cfg_owned
-                    }
-                    None => {
-                        warn!(
-                            policy_fp = %output.policy_fp,
-                            agg_id = output.aggregation_id,
-                            "SketchStoreSink: policy_fp missing from registry; skipping write"
-                        );
-                        return false;
-                    }
-                }
-            } else {
-                let Some(c) = cfg.get_aggregation_config(output.aggregation_id) else {
-                    warn!(
-                        agg_id = output.aggregation_id,
-                        "SketchStoreSink: agg_config missing from streaming snapshot; skipping write"
-                    );
-                    return false;
-                };
-                c
-            };
+        let registry = cfg.policy_registry();
+        let agg_cfg = match registry.get(output.policy_fp) {
+            Some(c) => c.clone(),
+            None => {
+                warn!(
+                    policy_fp = %output.policy_fp,
+                    "SketchStoreSink: policy_fp missing from registry; skipping write"
+                );
+                return false;
+            }
+        };
+        let agg_cfg = &agg_cfg;
         let resolver = self.series_resolver.clone();
         self.sketch_index
             .ingest_precompute_for_agg_config(
@@ -257,7 +243,7 @@ mod tests {
         );
 
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
-        let output = PrecomputedOutput::new(1000, 2000, Some(key), agg_id);
+        let output = PrecomputedOutput::new(1000, 2000, Some(key), asap_types::PolicyFingerprint(agg_id));
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
 
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
@@ -308,7 +294,7 @@ mod tests {
             Arc::new(SeriesIdResolver::new()),
         );
 
-        let output = PrecomputedOutput::new(1000, 2000, None, 99);
+        let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(99));
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
         assert_eq!(sketch_index.instance_count(), 0);
