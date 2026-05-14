@@ -334,6 +334,77 @@ fn quantile_suffix(q: f64) -> String {
     s.replace('.', "_")
 }
 
+// ── AggIntent helpers ────────────────────────────────────────────────────────
+//
+// Step γ7: relocated from `legacy_expr.rs` (where they were free fns
+// operating on the canonical re-exported `AggIntent`). `legacy_expr`
+// re-exports them during the legacy-IR retirement; consumers migrate to
+// `intent_algebra::*` paths and the re-exports drop with `legacy_expr`.
+
+/// Two instances of this aggregation can be merged
+/// (`agg(A ∪ B) = combine(agg(A), agg(B))`). `Avg` is the only
+/// non-mergeable case (needs `(sum, count)`, not a single value).
+pub fn agg_is_mergeable(op: &AggIntent) -> bool {
+    !matches!(op, AggIntent::Avg)
+}
+
+/// Whether this op implies `exact_required` — no sketch benefit. The
+/// exact intents are `Sum / Count / Avg / Min / Max`.
+pub fn agg_is_exact(op: &AggIntent) -> bool {
+    matches!(
+        op,
+        AggIntent::Sum
+            | AggIntent::Count { .. }
+            | AggIntent::Avg
+            | AggIntent::Min
+            | AggIntent::Max
+    )
+}
+
+/// Accuracy parameter as a fractional ε (`0.0` for exact ops), unpacked
+/// from the typed `AccuracyTarget` on Quantile / Cardinality / Frequency
+/// / Count / TopK.
+pub fn agg_accuracy(op: &AggIntent) -> f64 {
+    match op {
+        AggIntent::Quantile { accuracy, .. }
+        | AggIntent::Cardinality { accuracy }
+        | AggIntent::Frequency { accuracy }
+        | AggIntent::Count { accuracy }
+        | AggIntent::TopK { accuracy, .. } => accuracy_target_to_f64(accuracy),
+        _ => 0.0,
+    }
+}
+
+fn accuracy_target_to_f64(t: &AccuracyTarget) -> f64 {
+    match t {
+        AccuracyTarget::Exact => 0.0,
+        AccuracyTarget::Epsilon(eps) | AccuracyTarget::EpsilonDelta { eps, .. } => *eps,
+    }
+}
+
+/// Default `Frequency` intent — `accuracy = e / 2000`.
+pub fn default_frequency() -> AggIntent {
+    AggIntent::Frequency {
+        accuracy: AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0),
+    }
+}
+
+/// Default `Cardinality` intent — `accuracy = hll_accuracy(14)`.
+pub fn default_cardinality() -> AggIntent {
+    AggIntent::Cardinality {
+        accuracy: AccuracyTarget::Epsilon(crate::sketch_algebra::capability::hll_accuracy(14)),
+    }
+}
+
+/// Default `Quantile` intent at φ = `q`, `accuracy = ε 0.01`. Canonical
+/// `Quantile` is single-φ; multi-φ callers invoke this once per φ.
+pub fn default_quantile(q: f64) -> AggIntent {
+    AggIntent::Quantile {
+        q,
+        accuracy: AccuracyTarget::Epsilon(0.01),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
