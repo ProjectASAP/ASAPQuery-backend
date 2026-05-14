@@ -27,6 +27,7 @@ pub mod bind_archive_only;
 pub mod bind_cms_count;
 pub mod bind_cms_topk;
 pub mod bind_ddsketch_quantile;
+pub mod bind_exact_agg;
 pub mod bind_hll_cardinality;
 pub mod bind_kll_quantile;
 
@@ -64,6 +65,12 @@ pub fn dispatch(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalE
         Box::new(bind_cms_count::BindCmsOnCount),
         Box::new(bind_cms_topk::BindCountSketchOnTopK),
         Box::new(bind_hll_cardinality::BindHllOnCardinality),
+        // PR-6 follow-up: ExactAgg routing for Sum / Rate / Increase /
+        // Count{Exact}. Priority 2 — above archive-only, below sketch
+        // families. When this matches alongside `bind_archive_only`
+        // (Sum without an explicit accuracy override etc.), ExactAgg
+        // wins; matches `capability_for`'s analyzer-side direction.
+        Box::new(bind_exact_agg::BindExactAgg),
         // Phase β: archive-only catch-all. Lowest priority — fires only
         // when no warm-tier rule matches AND the intent is archive-only.
         Box::new(bind_archive_only::BindArchiveOnly),

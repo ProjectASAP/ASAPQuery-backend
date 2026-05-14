@@ -632,6 +632,9 @@ mod tests {
             PhysicalExpr::Logical(_) | PhysicalExpr::Ref { .. } => None,
             PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
             PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
+            // ExactAgg has no sketch family — it produces an exact
+            // aggregation accumulator, not a sketch state.
+            PhysicalExpr::ExactAgg { .. } => None,
         }
     }
 

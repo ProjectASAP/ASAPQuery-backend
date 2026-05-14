@@ -180,6 +180,18 @@ impl ThreeStageWalker {
             // Prometheus's native OTLP receiver. The agent pipeline picks
             // this up via `asap.mode=prometheus_archive` routing.
             PhysicalExpr::RawAtEdgePrometheusArchive { .. } => StageId::Edge,
+
+            // ── ExactAgg (PR-6 follow-up): same shape as SketchAgg —
+            // produces typed state at the edge. The accumulator runs on
+            // the edge precompute pipeline; the backend's
+            // `SketchStoreSink::append_to_index` writes the final
+            // (sid, window, accumulator) tuples it ships. Coloured
+            // Edge to match the sketch path's locality.
+            PhysicalExpr::ExactAgg { child, .. } => {
+                let (cid, _) = self.visit(child)?;
+                self.dag.edges.push((id, cid));
+                StageId::Edge
+            }
         };
 
         // Patch in the resolved stage now that children have been visited.
