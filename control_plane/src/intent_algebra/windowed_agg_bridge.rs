@@ -78,13 +78,10 @@
 //! | `Tumbling { size }`           | `Tumbling`             | `size`    | `None`      |
 //! | `Sliding { size, slide }`     | `Sliding`              | `size`    | `Some(slide)` |
 //! | `Session { gap }`             | `Session`              | `gap`     | `None`      |
-//! | `Unbounded`                   | bridge defers          | —         | —           |
-//! | `Landmark`                    | bridge defers          | —         | —           |
 //!
-//! `Unbounded` and `Landmark` have no canonical equivalent today (the
-//! canonical `WindowKind` enum is `Tumbling / Sliding / Session`) so the
-//! bridge surfaces them as [`BridgeError::UnsupportedWindowKind`] — the
-//! caller keeps the legacy `WindowedAgg` at that site.
+//! The mapping is total — every legacy `WindowKind` variant has a
+//! canonical equivalent (the catalogue-less `Unbounded` / `Landmark`
+//! were retired in PR 12: no producer ever constructed them).
 
 use std::time::Duration;
 
@@ -106,9 +103,8 @@ use crate::intent_algebra::schema::{Column, ColumnId, DataType, Schema};
 /// `input` directly, mirroring the γ1 bridge convention).
 #[derive(Debug, Clone)]
 pub struct BridgedWindowedAgg {
-    /// Outer `Window`'s kind, mapped from the legacy `WindowSpec.kind`.
-    /// `Tumbling` / `Sliding` / `Session` only — see module doc on the
-    /// `Unbounded` / `Landmark` deferral.
+    /// Outer `Window`'s kind, mapped from the legacy `WindowSpec.kind`
+    /// (`Tumbling` / `Sliding` / `Session`).
     pub window_kind: CanonicalWindowKind,
     /// Outer `Window`'s `size: Duration` — taken from `Tumbling.size` /
     /// `Sliding.size` / `Session.gap`.
@@ -136,11 +132,6 @@ pub enum BridgeError {
     /// legacy `WindowedAgg` at this site and log the deferral.
     #[error("WindowedAgg col resolution failed: {0}")]
     Col(#[from] ResolveError),
-    /// The legacy `WindowSpec.kind` was `Unbounded` or `Landmark` —
-    /// neither has a canonical `WindowKind` equivalent today. Callers
-    /// keep the legacy `WindowedAgg` at this site.
-    #[error("WindowedAgg uses non-canonical WindowKind variant: {kind_dbg}")]
-    UnsupportedWindowKind { kind_dbg: String },
 }
 
 /// Translate the canonical-shape fields of a legacy
@@ -184,11 +175,6 @@ pub fn bridge_windowed_agg_to_canonical(
         }
         LegacyWindowKind::Session { gap } => {
             (CanonicalWindowKind::Session, *gap, None)
-        }
-        other @ (LegacyWindowKind::Unbounded | LegacyWindowKind::Landmark) => {
-            return Err(BridgeError::UnsupportedWindowKind {
-                kind_dbg: format!("{other:?}"),
-            });
         }
     };
 
@@ -408,36 +394,6 @@ mod tests {
         assert_eq!(b.window_kind, CanonicalWindowKind::Session);
         assert_eq!(b.window_size, Duration::from_secs(30));
         assert_eq!(b.window_slide, None);
-    }
-
-    #[test]
-    fn bridge_unbounded_window_defers() {
-        // Unbounded has no canonical equivalent today — the bridge
-        // surfaces UnsupportedWindowKind so callers keep the legacy
-        // WindowedAgg at this site.
-        let s = infer_source_schema("m");
-        let agg = AggIntent::Sum;
-        let window = WindowSpec {
-            kind: LegacyWindowKind::Unbounded,
-            time_col: None,
-        };
-        let col = LegacyColumnRef::SampleValue;
-        let err = bridge_windowed_agg_to_canonical(&agg, &window, &col, &s).unwrap_err();
-        assert!(matches!(err, BridgeError::UnsupportedWindowKind { .. }));
-    }
-
-    #[test]
-    fn bridge_landmark_window_defers() {
-        // Same deferral path as Unbounded.
-        let s = infer_source_schema("m");
-        let agg = AggIntent::Sum;
-        let window = WindowSpec {
-            kind: LegacyWindowKind::Landmark,
-            time_col: None,
-        };
-        let col = LegacyColumnRef::SampleValue;
-        let err = bridge_windowed_agg_to_canonical(&agg, &window, &col, &s).unwrap_err();
-        assert!(matches!(err, BridgeError::UnsupportedWindowKind { .. }));
     }
 
     #[test]
