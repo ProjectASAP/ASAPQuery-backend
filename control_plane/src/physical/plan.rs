@@ -1,6 +1,6 @@
 //! Annotated plan nodes — the output of the [`super::allocator::SketchAllocator`].
 //!
-//! After the optimizer rewrites a [`QueryExpr`](crate::intent_algebra::legacy_expr::QueryExpr) tree,
+//! After the optimizer rewrites a [`QueryExpr`](crate::intent_algebra::QueryExpr) tree,
 //! the allocator wraps every node in a [`PlanNode`] that carries:
 //!
 //! * **`stage`** — which pipeline component executes this operator.
@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::intent_algebra::legacy_expr::QueryExpr;
+use crate::intent_algebra::QueryExpr;
 
 // ── Pipeline stages ───────────────────────────────────────────────────────────
 
@@ -277,15 +277,22 @@ impl PlanNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::QueryExpr;
-    use crate::intent_algebra::legacy_expr::SourceSpec;
+    use crate::intent_algebra::{QueryExpr, Schema, Source};
+
+    /// Canonical `Scan` leaf — the L3 counterpart of the legacy
+    /// `QueryExpr::Source(SourceSpec { .. })`.
+    fn scan(name: &str) -> QueryExpr {
+        QueryExpr::Scan {
+            source: Source::TimeSeries {
+                metric: name.into(),
+            },
+            label_filters: vec![],
+            schema: Schema::default(),
+        }
+    }
 
     fn source_node(name: &str, stage: PipelineStage) -> PlanNode {
-        PlanNode::leaf(
-            QueryExpr::Source(SourceSpec { name: name.into() }),
-            stage,
-            ExecutionMode::Passthrough,
-        )
+        PlanNode::leaf(scan(name), stage, ExecutionMode::Passthrough)
     }
 
     // ── PipelineStage ordering ────────────────────────────────────────────────
@@ -303,9 +310,7 @@ mod tests {
     #[test]
     fn nodes_at_stage_collects_correctly() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec {
-                name: "root".into(),
-            }),
+            expr: scan("root"),
             stage: PipelineStage::Agent,
             mode: ExecutionMode::Sketch,
             cost: CostEstimate {
@@ -329,23 +334,19 @@ mod tests {
     #[test]
     fn sketch_nodes_only_returns_sketch_mode() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            expr: scan("r"),
             stage: PipelineStage::Agent,
             mode: ExecutionMode::Sketch,
             cost: CostEstimate::default(),
             annotation: NodeAnnotation::default(),
             children: vec![
                 PlanNode::leaf(
-                    QueryExpr::Source(SourceSpec {
-                        name: "exact_child".into(),
-                    }),
+                    scan("exact_child"),
                     PipelineStage::Db,
                     ExecutionMode::Exact,
                 ),
                 PlanNode::leaf(
-                    QueryExpr::Source(SourceSpec {
-                        name: "sketch_child".into(),
-                    }),
+                    scan("sketch_child"),
                     PipelineStage::Backend,
                     ExecutionMode::Sketch,
                 ),
@@ -360,7 +361,7 @@ mod tests {
     #[test]
     fn stage_bandwidth_sums_nodes_at_stage() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            expr: scan("r"),
             stage: PipelineStage::Agent,
             mode: ExecutionMode::Sketch,
             cost: CostEstimate {
@@ -369,7 +370,7 @@ mod tests {
             },
             annotation: NodeAnnotation::default(),
             children: vec![PlanNode {
-                expr: QueryExpr::Source(SourceSpec { name: "c".into() }),
+                expr: scan("c"),
                 stage: PipelineStage::Agent,
                 mode: ExecutionMode::Passthrough,
                 cost: CostEstimate {
@@ -396,7 +397,7 @@ mod tests {
     #[test]
     fn flatten_depth_increments_per_level() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            expr: scan("r"),
             stage: PipelineStage::Agent,
             mode: ExecutionMode::Passthrough,
             cost: CostEstimate::default(),
@@ -413,7 +414,7 @@ mod tests {
     #[test]
     fn summarise_reports_bandwidth_saved() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            expr: scan("r"),
             stage: PipelineStage::Agent,
             mode: ExecutionMode::Sketch,
             cost: CostEstimate {
@@ -434,7 +435,7 @@ mod tests {
     #[test]
     fn summarise_detects_budget_demotion() {
         let root = PlanNode {
-            expr: QueryExpr::Source(SourceSpec { name: "r".into() }),
+            expr: scan("r"),
             stage: PipelineStage::Backend,
             mode: ExecutionMode::Sketch,
             cost: CostEstimate::default(),
