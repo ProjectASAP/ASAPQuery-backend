@@ -91,6 +91,12 @@ pub mod column_resolution;
 pub mod legacy_expr;
 pub mod legacy_lower;
 
+// Step γ7 keystone: the composable legacy → canonical full-tree
+// converter. Producers route their output through `convert_root`; the
+// consumer-flip PRs then become pure canonical pattern-match rewrites.
+pub mod legacy_to_canonical;
+pub use legacy_to_canonical::{convert as convert_legacy, convert_root, ConvertError};
+
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
 pub use agg_intent::AggIntent;
