@@ -114,6 +114,7 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -133,6 +134,7 @@ fn kll_meta(sid: u64, k: u32) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -152,6 +154,7 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -478,6 +481,7 @@ fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -497,6 +501,7 @@ fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 

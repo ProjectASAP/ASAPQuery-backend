@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use asap_types::PolicyFingerprint;
 use dashmap::DashMap;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
@@ -91,6 +92,16 @@ pub struct SketchInstanceMetadata {
     /// `retired_at_ms + retention_ms`. Mirrors
     /// `AggSchema::expires_at_ms`.
     pub expires_at_ms: Option<u64>,
+    /// Content-addressed back-reference to the policy that minted this
+    /// sid. Together with [`SketchStore::policy_to_sids`] this gives
+    /// the query path a direct `policy_fp → [sid]` index without
+    /// walking the metadata map. `PolicyFingerprint::UNSET` is reserved
+    /// for the legacy registration path that doesn't carry a source
+    /// `AggregationConfig` (test fixtures + the early-Phase-5 sketch
+    /// ingest path that didn't thread the config through); the index
+    /// skips those entries — they're reachable through the legacy
+    /// `instances_matching(metric, gbk)` walk if a query needs them.
+    pub policy_fp: PolicyFingerprint,
 }
 
 impl SketchInstanceMetadata {
@@ -171,6 +182,15 @@ pub struct SketchStore {
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
     series: DashMap<u64, SidStore>,
+    /// Reverse index: `policy_fp → {sids}`. Lets the query path resolve
+    /// "which sids belong to this policy?" in O(1) without walking
+    /// `instances`. Maintained by [`Self::register`] /
+    /// [`Self::remove_instance`] / [`Self::remove_instances_for_agg_config`].
+    /// Entries with `PolicyFingerprint::UNSET` are NOT recorded (the
+    /// sentinel means "no source config"); legacy callers that mint
+    /// sids without a fingerprint reach those sids through
+    /// `instances_matching(metric, gbk)`.
+    policy_to_sids: RwLock<HashMap<PolicyFingerprint, BTreeSet<u64>>>,
 }
 
 /// Three possible outcomes of looking up a sid in the SketchStore.
@@ -212,9 +232,46 @@ impl SketchStore {
         }
     }
 
-    /// Insert metadata for a freshly-resolved sid.
+    /// Insert metadata for a freshly-resolved sid. Also records the
+    /// sid in the `policy_fp → {sids}` reverse index when the metadata
+    /// carries a non-UNSET fingerprint.
     pub fn register(&self, meta: SketchInstanceMetadata) {
-        self.instances.write().unwrap().insert(meta.sid, meta);
+        let sid = meta.sid;
+        let policy_fp = meta.policy_fp;
+        self.instances.write().unwrap().insert(sid, meta);
+        if !policy_fp.is_unset() {
+            self.policy_to_sids
+                .write()
+                .unwrap()
+                .entry(policy_fp)
+                .or_default()
+                .insert(sid);
+        }
+    }
+
+    /// Resolve a policy fingerprint to the set of sids it has minted.
+    /// Returns an empty vector when no sid is bound to the fingerprint
+    /// (e.g. fresh policy with no ingest activity yet) or when the
+    /// caller passes [`PolicyFingerprint::UNSET`]. The order of the
+    /// returned slice is sorted (the underlying index is a `BTreeSet`)
+    /// so callers can hash / compare it deterministically.
+    pub fn sids_for_policy(&self, policy_fp: PolicyFingerprint) -> Vec<u64> {
+        if policy_fp.is_unset() {
+            return Vec::new();
+        }
+        self.policy_to_sids
+            .read()
+            .unwrap()
+            .get(&policy_fp)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Live policy count — number of distinct fingerprints with at
+    /// least one sid. Useful for telemetry / `/runtime` introspection
+    /// (mirrors the legacy "active aggregation count" metric).
+    pub fn policy_count(&self) -> usize {
+        self.policy_to_sids.read().unwrap().len()
     }
 
     /// Look up the metadata for a sid (cloned because callers usually
@@ -546,14 +603,23 @@ impl SketchStore {
         Some(meta.clone())
     }
 
-    /// Drop a sid's metadata + its series state. Mirrors
-    /// `SchemaRegistry::remove_schema` for the eviction path's
-    /// post-data-drop cleanup. Returns the removed metadata, or
+    /// Drop a sid's metadata + its series state + the reverse-index
+    /// entry. Mirrors `SchemaRegistry::remove_schema` for the eviction
+    /// path's post-data-drop cleanup. Returns the removed metadata, or
     /// `None` if the sid was absent.
     pub fn remove_instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
         let removed = self.instances.write().ok()?.remove(&sid);
-        if removed.is_some() {
+        if let Some(meta) = &removed {
             self.series.remove(&sid);
+            if !meta.policy_fp.is_unset() {
+                let mut idx = self.policy_to_sids.write().unwrap();
+                if let Some(set) = idx.get_mut(&meta.policy_fp) {
+                    set.remove(&sid);
+                    if set.is_empty() {
+                        idx.remove(&meta.policy_fp);
+                    }
+                }
+            }
         }
         removed
     }
@@ -654,6 +720,12 @@ impl SketchStore {
                     first_seen_unix_ms: output.start_timestamp as i64,
                     retired_at_ms: None,
                     expires_at_ms: None,
+                    // Trust the caller's output — it carries the
+                    // policy fingerprint computed at emit time
+                    // (precompute worker / backfill processor).
+                    // Falling back to `from_config(&agg_cfg)` here
+                    // would also be correct but redundant.
+                    policy_fp: output.policy_fp,
                 });
             }
             Some(existing) if !existing.is_writable() => {
@@ -930,6 +1002,10 @@ mod tests {
     use super::*;
 
     fn meta(sid: u64) -> SketchInstanceMetadata {
+        meta_with_policy(sid, asap_types::PolicyFingerprint::UNSET)
+    }
+
+    fn meta_with_policy(sid: u64, policy_fp: asap_types::PolicyFingerprint) -> SketchInstanceMetadata {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
@@ -947,6 +1023,7 @@ mod tests {
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
+            policy_fp,
         }
     }
 
@@ -1382,6 +1459,85 @@ mod tests {
     // outer wrapper is now gone. The remaining `compute_sid_*` tests
     // exercise the encoding properties that PR-4 will lean on when it
     // migrates the precompute path to the resolver.
+
+    // ── policy_fp reverse-index tests ────────────────────────────────
+
+    #[test]
+    fn sids_for_policy_returns_empty_for_unset_or_missing() {
+        let idx = SketchStore::new();
+        // Empty store → nothing for any fp.
+        assert!(idx
+            .sids_for_policy(asap_types::PolicyFingerprint(42))
+            .is_empty());
+        // The UNSET sentinel always returns empty regardless of state.
+        idx.register(meta_with_policy(1, asap_types::PolicyFingerprint::UNSET));
+        assert!(idx
+            .sids_for_policy(asap_types::PolicyFingerprint::UNSET)
+            .is_empty());
+    }
+
+    #[test]
+    fn register_indexes_one_sid_under_its_policy() {
+        let idx = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(7);
+        idx.register(meta_with_policy(1, fp));
+        assert_eq!(idx.sids_for_policy(fp), vec![1]);
+        assert_eq!(idx.policy_count(), 1);
+    }
+
+    #[test]
+    fn register_groups_multiple_sids_under_one_policy() {
+        let idx = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(7);
+        idx.register(meta_with_policy(1, fp));
+        idx.register(meta_with_policy(2, fp));
+        idx.register(meta_with_policy(3, fp));
+        let mut sids = idx.sids_for_policy(fp);
+        sids.sort();
+        assert_eq!(sids, vec![1, 2, 3]);
+        assert_eq!(idx.policy_count(), 1);
+    }
+
+    #[test]
+    fn register_separates_distinct_policies() {
+        let idx = SketchStore::new();
+        let fp_a = asap_types::PolicyFingerprint(7);
+        let fp_b = asap_types::PolicyFingerprint(8);
+        idx.register(meta_with_policy(1, fp_a));
+        idx.register(meta_with_policy(2, fp_b));
+        idx.register(meta_with_policy(3, fp_a));
+        assert_eq!(idx.sids_for_policy(fp_a), vec![1, 3]);
+        assert_eq!(idx.sids_for_policy(fp_b), vec![2]);
+        assert_eq!(idx.policy_count(), 2);
+    }
+
+    #[test]
+    fn unset_policy_sids_are_not_in_reverse_index() {
+        let idx = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(7);
+        idx.register(meta_with_policy(1, fp));
+        // sid 2 has UNSET — should NOT show up under any fp.
+        idx.register(meta_with_policy(2, asap_types::PolicyFingerprint::UNSET));
+        assert_eq!(idx.sids_for_policy(fp), vec![1]);
+        assert_eq!(idx.policy_count(), 1);
+        // But it IS still in the main `instances` map.
+        assert!(idx.instance(2).is_some());
+    }
+
+    #[test]
+    fn remove_instance_drops_reverse_index_entry() {
+        let idx = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(7);
+        idx.register(meta_with_policy(1, fp));
+        idx.register(meta_with_policy(2, fp));
+        idx.remove_instance(1);
+        assert_eq!(idx.sids_for_policy(fp), vec![2]);
+        assert_eq!(idx.policy_count(), 1);
+        idx.remove_instance(2);
+        assert!(idx.sids_for_policy(fp).is_empty());
+        // Empty entry collapses — policy_count drops to 0.
+        assert_eq!(idx.policy_count(), 0);
+    }
 }
 
 // 2026-05 reorg: generic epoch-partitioned columnar storage lives
