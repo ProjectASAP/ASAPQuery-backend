@@ -324,6 +324,7 @@ mod tests {
             first_seen_unix_ms: first_seen,
             retired_at_ms: retired,
             expires_at_ms: expires,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
         }
     }
 

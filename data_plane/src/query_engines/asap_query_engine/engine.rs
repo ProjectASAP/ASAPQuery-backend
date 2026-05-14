@@ -5916,6 +5916,7 @@ mod warm_tier_classify_tests {
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
         }
     }
 

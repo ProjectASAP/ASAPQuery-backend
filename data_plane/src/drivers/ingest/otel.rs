@@ -1066,6 +1066,14 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 first_seen_unix_ms: ts_ms,
                                 retired_at_ms: None,
                                 expires_at_ms: None,
+                                // OTel sketch ingest path doesn't have a
+                                // source `AggregationConfig` here — sketches
+                                // arrive with their shape (kind + config)
+                                // embedded in the OTLP DP, not a policy
+                                // reference. Leave UNSET; the reverse
+                                // index skips these. Sketch sids stay
+                                // reachable via `instances_matching`.
+                                policy_fp: asap_types::PolicyFingerprint::UNSET,
                             });
                         }
 
