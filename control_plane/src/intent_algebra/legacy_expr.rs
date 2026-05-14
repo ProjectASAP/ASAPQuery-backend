@@ -277,13 +277,15 @@ pub enum WindowKind {
     Tumbling { size: Duration },
     /// Fixed-size, overlapping (each sample belongs to ceil(size/slide) windows).
     Sliding { size: Duration, slide: Duration },
-    /// Aggregate all samples (no time dimension).
-    Unbounded,
-    /// From epoch to current time.
-    Landmark,
     /// Gap-based: window closes after inactivity.
     Session { gap: Duration },
 }
+// Step γ7: the `Unbounded` / `Landmark` variants were removed — no
+// producer ever constructed them (`legacy_lower` only builds
+// `Tumbling` / `Sliding`; the parsers never emit a `WindowSpec` with
+// either). They had no canonical `query_expr::WindowKind` equivalent,
+// so dropping them retires dead code and makes the legacy → canonical
+// `WindowKind` mapping total.
 
 /// A single filter predicate pushed down to the collector.
 #[derive(Debug, Clone)]

@@ -96,10 +96,6 @@ pub enum ConvertError {
     /// `AggFunc::Custom(_)` triggers this today.
     #[error("AggItem `{alias}` uses non-canonical func ({func_dbg}) — no AggIntent equivalent")]
     NoCanonicalIntent { alias: String, func_dbg: String },
-    /// A `WindowedAgg` used the legacy `WindowKind::Unbounded` /
-    /// `Landmark` — neither has a canonical `WindowKind` equivalent.
-    #[error("WindowedAgg uses non-canonical WindowKind variant: {kind_dbg}")]
-    UnsupportedWindowKind { kind_dbg: String },
     /// A legacy `ScalarExpr` leaf failed to translate. Unreachable in
     /// practice — `convert_scalar` handles every variant — but kept as a
     /// typed boundary around [`from_legacy_scalar`].
@@ -240,7 +236,7 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             col: _,
             input,
         } => {
-            let (kind, size, slide) = map_window_kind(window)?;
+            let (kind, size, slide) = map_window_kind(window);
             // As with `SketchAgg`: `col` is the sketch input column, not
             // a GROUP BY key — the inner canonical `Aggregate.by` is empty.
             CQueryExpr::Window {
@@ -424,21 +420,15 @@ pub fn convert_scalar(se: &LScalarExpr, schema: &Schema) -> Result<Predicate, Co
 }
 
 /// Map a legacy `WindowSpec` to canonical `(WindowKind, size, slide)`.
-/// `Unbounded` / `Landmark` have no canonical equivalent — see PR 12.
-fn map_window_kind(
-    window: &WindowSpec,
-) -> Result<(CWindowKind, Duration, Option<Duration>), ConvertError> {
+/// Total — every legacy `WindowKind` variant has a canonical equivalent
+/// (the catalogue-less `Unbounded` / `Landmark` were retired in PR 12).
+fn map_window_kind(window: &WindowSpec) -> (CWindowKind, Duration, Option<Duration>) {
     match &window.kind {
-        LWindowKind::Tumbling { size } => Ok((CWindowKind::Tumbling, *size, None)),
+        LWindowKind::Tumbling { size } => (CWindowKind::Tumbling, *size, None),
         LWindowKind::Sliding { size, slide } => {
-            Ok((CWindowKind::Sliding, *size, Some(*slide)))
+            (CWindowKind::Sliding, *size, Some(*slide))
         }
-        LWindowKind::Session { gap } => Ok((CWindowKind::Session, *gap, None)),
-        other @ (LWindowKind::Unbounded | LWindowKind::Landmark) => {
-            Err(ConvertError::UnsupportedWindowKind {
-                kind_dbg: format!("{other:?}"),
-            })
-        }
+        LWindowKind::Session { gap } => (CWindowKind::Session, *gap, None),
     }
 }
 
@@ -614,23 +604,6 @@ mod tests {
             }
             other => panic!("expected Window, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn windowed_agg_unbounded_kind_errors() {
-        let legacy = LQueryExpr::WindowedAgg {
-            agg: AggIntent::Sum,
-            window: WindowSpec {
-                kind: LWindowKind::Unbounded,
-                time_col: None,
-            },
-            col: LColumnRef::SampleValue,
-            input: Box::new(src("m")),
-        };
-        assert!(matches!(
-            convert_root(&legacy).unwrap_err(),
-            ConvertError::UnsupportedWindowKind { .. }
-        ));
     }
 
     #[test]

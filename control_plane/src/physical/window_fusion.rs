@@ -103,11 +103,11 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
 /// Resolve a canonical `(WindowKind, size, slide)` to a
 /// [`PhysicalWindow`] for a given placement.
 ///
-/// The canonical-IR twin of `planner::resolve_window` (which takes a
-/// legacy `WindowSpec`). The two must stay in lockstep — the
-/// `#[cfg(test)]` equivalence harness pins that. The legacy
-/// `Unbounded` / `Landmark` arms have no canonical counterpart
-/// (`legacy_to_canonical` errors on them), so they are absent here.
+/// The canonical-IR twin of the legacy `WindowSpec`-based window
+/// resolution. Every canonical `WindowKind` variant maps — the legacy
+/// `WindowKind` is now `Tumbling` / `Sliding` / `Session` only (the
+/// catalogue-less `Unbounded` / `Landmark` were retired in PR 12), so
+/// the legacy → canonical `WindowKind` mapping is total.
 pub fn resolve_window_canonical(
     kind: &WindowKind,
     size: Duration,
