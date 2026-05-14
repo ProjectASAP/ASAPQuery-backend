@@ -57,12 +57,11 @@ use crate::types_v2::AccuracyTarget;
 //                                          to `Aggregate { by, aggs }` is
 //                                          Step γ's job.)
 //
-// `SketchAgg.op` / `WindowedAgg.agg` carry canonical `AggIntent` directly;
 // PerPartition semantics ride on `PerPartitionWrap` (a thin legacy-only
-// wrapper consumed by the four sites that still build it). Free helpers
-// (`agg_to_legacy_agg_type`, `agg_is_mergeable`, etc.) mirror what the old
-// `AggIntent::method()` API used to provide so the migration is a typed
-// search-and-replace rather than a semantic rewrite.
+// wrapper consumed by the `physical::sketch_catalog` per-partition sizing
+// helpers). Free helpers (`agg_is_mergeable`, `agg_is_exact`, etc.) mirror
+// what the old `AggIntent::method()` API used to provide so the migration
+// is a typed search-and-replace rather than a semantic rewrite.
 
 /// Canonical L3 aggregation intent. Re-exported here so existing
 /// `legacy_expr::AggIntent` references keep working — the type is now the
@@ -71,10 +70,9 @@ pub use crate::intent_algebra::agg_intent::AggIntent;
 
 /// Per-partition wrapper that historically lived on the legacy `AggIntent`
 /// enum as a `PerPartition { inner, keys }` variant. Canonical L3 represents
-/// this shape via `QueryExpr::Aggregate { by: keys, aggs: [inner] }`, but
-/// the legacy carriers (`SketchAgg` / `WindowedAgg`) still need an inline
-/// place for `keys` until Step γ collapses them. This wrapper sits exactly
-/// where the variant used to.
+/// this shape via `QueryExpr::Aggregate { by: keys, aggs: [inner] }`; this
+/// wrapper survives only as the input type for the
+/// `physical::sketch_catalog` per-partition sizing helpers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerPartitionWrap {
     pub inner: AggIntent,
@@ -157,28 +155,11 @@ pub use crate::intent_algebra::agg_intent::{
 
 pub use crate::sketch_algebra::capability::{countmin_accuracy, hll_accuracy};
 
-/// Unified window specification — captures all language-level window semantics.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WindowSpec {
-    pub kind: WindowKind,
-    pub time_col: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum WindowKind {
-    /// Fixed-size, non-overlapping.
-    Tumbling { size: Duration },
-    /// Fixed-size, overlapping (each sample belongs to ceil(size/slide) windows).
-    Sliding { size: Duration, slide: Duration },
-    /// Gap-based: window closes after inactivity.
-    Session { gap: Duration },
-}
-// Step γ7: the `Unbounded` / `Landmark` variants were removed — no
-// producer ever constructed them (`legacy_lower` only builds
-// `Tumbling` / `Sliding`; the parsers never emit a `WindowSpec` with
-// either). They had no canonical `query_expr::WindowKind` equivalent,
-// so dropping them retires dead code and makes the legacy → canonical
-// `WindowKind` mapping total.
+// The legacy `WindowSpec` / `WindowKind` types were removed alongside the
+// `WindowedAgg` variant they fed. Layer-2 windows are carried by
+// `QueryExpr::Window { duration, slide }` directly; window *kind*
+// (Tumbling / Sliding / Session) is a canonical L3 concern —
+// `query_expr::WindowKind`.
 
 /// A single filter predicate pushed down to the collector.
 #[derive(Debug, Clone)]
@@ -216,36 +197,30 @@ pub enum FilterVal {
 
 // ── Relational algebra ────────────────────────────────────────────────────────
 
-/// Full relational + sketch algebra — the sole query IR.
+/// The legacy **Layer-2 relational** query IR.
 ///
-/// Every variant is a *node* in the logical query plan tree.  Leaves are
-/// [`QueryExpr::Source`] or [`QueryExpr::Ref`].  Interior nodes combine their
-/// `input` child(ren) through the operator they implement.
+/// Every variant is a *node* in the per-language logical query plan tree
+/// the `query_parser` front ends (`promql.rs` / `sql.rs`) emit. Leaves
+/// are [`QueryExpr::Source`] or [`QueryExpr::Ref`]; interior nodes combine
+/// their `input` child(ren) through the operator they implement.
 ///
-/// # Migration status (legacy_expr migration, Batch 2)
+/// # Relationship to the canonical L3 IR
 ///
-/// The ten "A-classified" variants — `Filter`, `Project`, `Partition`,
-/// `Distinct`, `Merge`, `Join`, `SetOp`, `Sort`, `Limit`, `BinaryOp` —
-/// have canonical structural twins in
-/// [`crate::intent_algebra::query_expr::QueryExpr`]. The canonical spelling
-/// uses `child:` where these legacy variants use `input:`; the typed
-/// [`crate::intent_algebra::Predicate`] replaces [`ScalarExpr`] in `Filter`
-/// / `Join` / `Aggregate::having` (translation via
-/// [`crate::intent_algebra::from_legacy_scalar`] for the four supported
-/// scalar shapes).
+/// Most variants have canonical structural twins in
+/// [`crate::intent_algebra::query_expr::QueryExpr`]. The canonical
+/// spelling uses `child:` where these legacy variants use `input:`; the
+/// typed [`crate::intent_algebra::Predicate`] replaces [`ScalarExpr`] in
+/// `Filter` / `Join` / `Aggregate::having` (translation via
+/// [`crate::intent_algebra::from_legacy_scalar`]).
 ///
-/// These legacy variants stay here for now because:
-///   1. [`legacy_lower`] (Batch 13's target) reshape paths still construct
-///      them internally.
-///   2. The legacy [`ScalarExpr`] retains four E-deferred variants
-///      (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) that the
-///      canonical `Predicate` doesn't cover yet — deleting the legacy
-///      `Filter` would lose `ScalarExpr` expressiveness from consumers
-///      that haven't migrated.
-///
-/// Consumer-side redirect (legacy → canonical, with `input:` → `child:` and
-/// `ScalarExpr` → `Predicate`) lands in subsequent batches once Batch 2's
-/// additive lift is in place.
+/// This is purely a Layer-2 *relational* IR — the sketch-fused
+/// `SketchAgg` / `WindowedAgg` variants were removed once the
+/// `legacy_to_canonical` converter learned to fold the single-statistic
+/// sketchable `Aggregate` straight into canonical shapes. The remaining
+/// reason the tree is not yet *deleted* outright is that the legacy
+/// [`ScalarExpr`] still carries four variants (`FunctionCall`,
+/// `ScalarSubquery`, `InList`, `Between`) the canonical `Predicate`
+/// doesn't cover, and the parsers build `ScalarExpr` directly.
 #[derive(Debug, Clone)]
 pub enum QueryExpr {
     // ── Base relations ────────────────────────────────────────────────────
@@ -293,25 +268,11 @@ pub enum QueryExpr {
         input:    Box<QueryExpr>,
     },
 
-    /// γ+α specialisation for sketch aggregations (single sketch per node).
-    ///
-    /// Kept separate from [`Self::Aggregate`] so the allocator can reason
-    /// about which sketch type to use without parsing `AggFunc` variants.
-    SketchAgg {
-        op:    AggIntent,
-        col:   ColumnRef,
-        input: Box<QueryExpr>,
-    },
-
-    /// Core sketch algebra operator: windowed aggregation intent.
-    /// Bundles the window and the aggregation because in sketch systems
-    /// the window defines the sketch lifecycle (when to flush/reset).
-    WindowedAgg {
-        agg:    AggIntent,
-        window: WindowSpec,
-        col:    ColumnRef,
-        input:  Box<QueryExpr>,
-    },
+    // The sketch-fused `SketchAgg` / `WindowedAgg` variants were removed:
+    // they were never parser output — only an intermediate the old
+    // `legacy_lower` pass produced — and the legacy → canonical converter
+    // now folds the single-statistic sketchable `Aggregate` straight into
+    // canonical shapes (`Aggregate { by: [] }` / `Window { Aggregate }`).
 
     // ── Distributed / multi-stage operators ──────────────────────────────
 
@@ -589,8 +550,6 @@ impl QueryExpr {
             QueryExpr::Filter { input, .. }
             | QueryExpr::Project { input, .. }
             | QueryExpr::Window { input, .. }
-            | QueryExpr::SketchAgg { input, .. }
-            | QueryExpr::WindowedAgg { input, .. }
             | QueryExpr::Partition { input, .. }
             | QueryExpr::Distinct { input, .. }
             | QueryExpr::TopK { input, .. }
@@ -616,12 +575,16 @@ impl QueryExpr {
         }
     }
 
-    /// Returns `true` when the sub-tree contains at least one [`QueryExpr::SketchAgg`]
-    /// or [`QueryExpr::TopK`] node (i.e. sketch work is present).
+    /// Returns `true` when the sub-tree contains at least one
+    /// [`QueryExpr::TopK`] node — the only Layer-2 variant that names a
+    /// heavy-hitter sketch directly. (Single-statistic sketchable
+    /// `Aggregate`s are recognised as sketch work only once the converter
+    /// folds them; at Layer 2 they are indistinguishable from exact
+    /// aggregates.)
     pub fn has_sketch_work(&self) -> bool {
         let mut found = false;
         self.walk(&mut |n| {
-            if matches!(n, QueryExpr::SketchAgg { .. } | QueryExpr::WindowedAgg { .. } | QueryExpr::TopK { .. }) {
+            if matches!(n, QueryExpr::TopK { .. }) {
                 found = true;
             }
         });
@@ -635,8 +598,6 @@ impl QueryExpr {
             QueryExpr::Filter { input, .. }
             | QueryExpr::Project { input, .. }
             | QueryExpr::Window { input, .. }
-            | QueryExpr::SketchAgg { input, .. }
-            | QueryExpr::WindowedAgg { input, .. }
             | QueryExpr::Partition { input, .. }
             | QueryExpr::Distinct { input, .. }
             | QueryExpr::TopK { input, .. }
@@ -744,10 +705,10 @@ mod tests {
     // ── has_sketch_work ───────────────────────────────────────────────────────
 
     #[test]
-    fn has_sketch_work_true_when_ddsketch_present() {
-        let qe = QueryExpr::SketchAgg {
-            op:    default_quantile(0.5),
-            col:   ColumnRef::SampleValue,
+    fn has_sketch_work_true_when_topk_present() {
+        let qe = QueryExpr::TopK {
+            k: 10,
+            by: vec![],
             input: Box::new(src("m")),
         };
         assert!(qe.has_sketch_work());
@@ -847,7 +808,7 @@ mod tests {
 
     #[test]
     fn complex_nested_tree() {
-        // TopK(10, Partition(symbol, Window(5m, SketchAgg(CountSketch, Source(price)))))
+        // TopK(10, Partition(symbol, Window(5m, Aggregate(Count, Source(price)))))
         let qe = QueryExpr::TopK {
             k: 10,
             by: vec![],
@@ -856,10 +817,16 @@ mod tests {
                 input: Box::new(QueryExpr::Window {
                     duration: Duration::from_secs(300),
                     slide:    None,
-                    input:    Box::new(QueryExpr::SketchAgg {
-                        op:    default_frequency(),
-                        col:   ColumnRef::Wildcard,
-                        input: Box::new(src("price")),
+                    input:    Box::new(QueryExpr::Aggregate {
+                        keys:   vec![],
+                        aggs:   vec![AggItem {
+                            alias:    "c".into(),
+                            func:     AggFunc::Count,
+                            col:      ColumnRef::Wildcard,
+                            distinct: false,
+                        }],
+                        having: None,
+                        input:  Box::new(src("price")),
                     }),
                 }),
             }),

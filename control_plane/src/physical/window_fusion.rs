@@ -1,29 +1,26 @@
-//! Step γ7 safety net: the `Window { child: Aggregate }` fusion
-//! recognizer.
+//! The `Window { child: Aggregate }` fusion recognizer.
 //!
 //! ## The invariant this protects
 //!
-//! The legacy IR fuses the window and the sketch aggregation into a
-//! single `legacy_expr::QueryExpr::WindowedAgg` node, because in sketch
-//! systems the window defines the sketch's lifecycle (when to flush /
-//! reset). The legacy `physical::planner::plan_node` `WindowedAgg` arm
-//! relies on that fused shape: it resolves the window into the *same*
-//! `PhysicalOp::OtelSketchBuild { window }` node as the sketch build.
+//! In sketch systems the window defines the sketch's lifecycle (when to
+//! flush / reset), so a windowed sketch aggregation must be planned as a
+//! *single* fused physical node — `PhysicalOp::OtelSketchBuild { window }`
+//! — where the window and the sketch build are resolved together.
 //!
-//! The canonical L3 IR has no `WindowedAgg` — `legacy_to_canonical`
-//! folds it into the stacked `Window { child: Aggregate { .. } }` shape
-//! (design.md §6: "one canonical form per plan"). That moves the
-//! window-defines-sketch-lifecycle invariant out of the *IR shape* and
-//! into a planner-side **peephole recognizer** — this module.
+//! The canonical L3 IR keeps "one canonical form per plan" (design.md
+//! §6): it has no fused windowed-aggregate variant — a windowed sketch is
+//! the stacked `Window { child: Aggregate { aggs: [one], .. } }` shape.
+//! `legacy_to_canonical` produces exactly that shape when it folds a
+//! single-statistic sketchable `Aggregate` sitting over a `Window`. This
+//! module is the planner-side **peephole recognizer** that puts the
+//! window-defines-sketch-lifecycle invariant back: it matches the stacked
+//! shape and reconstructs the fused physical node.
 //!
 //! [`recognize_windowed_sketch`] matches the stacked canonical shape and
 //! returns a [`FusedWindowSketch`] view; [`fused_sketch_decision`]
-//! reconstructs the exact `(PhysicalOp, Placement)` the legacy
-//! `WindowedAgg` arm produces. Nothing here is on the hot path yet — PR
-//! 8 wires it into the canonical `plan_node`. The `#[cfg(test)]`
-//! equivalence harness below pins the reconstruction against the live
-//! legacy `WindowedAgg` arm *while that arm is still the source of
-//! truth*, so the invariant is proven before any consumer flips.
+//! reconstructs the `(PhysicalOp, Placement)` for the fused sketch build.
+//! It is on the canonical planner's hot path; the `#[cfg(test)]`
+//! equivalence harness below pins it end-to-end against `plan`.
 
 #![allow(dead_code)]
 
@@ -170,22 +167,23 @@ pub fn fused_sketch_decision(
     (op, placement)
 }
 
+
 // ── Equivalence harness ──────────────────────────────────────────────────────
 //
 // Pins `recognize_windowed_sketch` + `fused_sketch_decision` against the
-// live legacy `WindowedAgg` arm of `physical::planner::plan_node`. While
-// the legacy arm is still the source of truth (it is, until PR 8), this
-// harness proves the canonical recognizer reconstructs exactly the same
-// physical decision — the window-defines-sketch-lifecycle invariant
-// survives the un-fused canonical IR shape.
+// canonical planner: a `Window { Aggregate }` fused sketch — the shape
+// `legacy_to_canonical` folds a single-statistic sketchable `Aggregate`
+// over a `Window` into — produces a resolved (non-`None`) physical window,
+// and the planner's own decision matches `fused_sketch_decision`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::convert_root;
     use crate::intent_algebra::legacy_expr::{
-        default_cardinality, default_frequency, default_quantile, ColumnRef as LColumnRef,
-        QueryExpr as LQueryExpr, SourceSpec, WindowKind as LWindowKind, WindowSpec,
+        AggFunc, AggItem, ColumnRef as LColumnRef, QueryExpr as LQueryExpr, SourceSpec,
+    };
+    use crate::intent_algebra::{
+        convert_root, default_cardinality, default_frequency, default_quantile,
     };
     use crate::optimizer::engine::DeploymentConstraints;
     use crate::physical::planner::{plan, PhysicalOp};
@@ -198,61 +196,51 @@ mod tests {
         }
     }
 
-    /// Build a legacy `WindowedAgg { agg, window, SampleValue, Source }`.
-    fn legacy_windowed_agg(agg: AggIntent, window: WindowSpec) -> LQueryExpr {
-        LQueryExpr::WindowedAgg {
-            agg,
-            window,
-            col: LColumnRef::SampleValue,
-            input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+    /// A canonical `Scan` leaf — built through `convert_root` so it carries
+    /// the same Binder-built schema a real converted tree would.
+    fn canonical_scan(metric: &str) -> QueryExpr {
+        convert_root(&LQueryExpr::Source(SourceSpec {
+            name: metric.into(),
+        }))
+        .expect("convert source")
+    }
+
+    /// The canonical `Window { Aggregate { by: [], aggs: [agg] } }` shape —
+    /// the fold `legacy_to_canonical` produces for a windowed single-sketch
+    /// aggregate.
+    fn windowed_sketch(
+        agg: AggIntent,
+        kind: WindowKind,
+        size: Duration,
+        slide: Option<Duration>,
+    ) -> QueryExpr {
+        QueryExpr::Window {
+            kind,
+            size,
+            slide,
+            child: Box::new(QueryExpr::Aggregate {
+                by: Vec::new(),
+                aggs: vec![agg],
+                having: None,
+                child: Box::new(canonical_scan("m")),
+            }),
         }
     }
 
-    fn tumbling(secs: u64) -> WindowSpec {
-        WindowSpec {
-            kind: LWindowKind::Tumbling {
-                size: Duration::from_secs(secs),
-            },
-            time_col: None,
-        }
-    }
-
-    fn sliding(size_secs: u64, slide_secs: u64) -> WindowSpec {
-        WindowSpec {
-            kind: LWindowKind::Sliding {
-                size: Duration::from_secs(size_secs),
-                slide: Duration::from_secs(slide_secs),
-            },
-            time_col: None,
-        }
-    }
-
-    fn session(gap_secs: u64) -> WindowSpec {
-        WindowSpec {
-            kind: LWindowKind::Session {
-                gap: Duration::from_secs(gap_secs),
-            },
-            time_col: None,
-        }
-    }
-
-    /// End-to-end fusion assertion: a legacy `WindowedAgg`, converted to
-    /// the canonical `Window { Aggregate }` shape and run through the
-    /// canonical planner, produces a *fused* `OtelSketchBuild` carrying a
-    /// resolved (non-`None`) physical window. This is the
-    /// window-defines-sketch-lifecycle invariant — now a planner peephole
-    /// (`recognize_windowed_sketch` + `fused_sketch_decision`, both wired
-    /// onto the hot path by PR 8) rather than an IR-shape property.
-    ///
-    /// Before PR 8 this harness compared the recognizer against the live
-    /// legacy `WindowedAgg` planner arm; that arm is now gone (the planner
-    /// is canonical), so the assertion is the canonical end-to-end result.
-    fn assert_equivalent(agg: AggIntent, window: WindowSpec) {
+    /// End-to-end fusion assertion: the canonical `Window { Aggregate }`
+    /// shape, run through the recognizer + `fused_sketch_decision` and
+    /// through the canonical planner, produces a *fused* `OtelSketchBuild`
+    /// carrying a resolved (non-`None`) physical window — the
+    /// window-defines-sketch-lifecycle invariant as a planner peephole.
+    fn assert_equivalent(
+        agg: AggIntent,
+        kind: WindowKind,
+        size: Duration,
+        slide: Option<Duration>,
+    ) {
         let cfg = config();
-        let legacy = legacy_windowed_agg(agg, window);
-        let canonical = convert_root(&legacy).expect("convert");
+        let canonical = windowed_sketch(agg, kind, size, slide);
 
-        // The recognizer matches the converted `Window { Aggregate }` fold.
         let fused = recognize_windowed_sketch(&canonical)
             .expect("canonical Window{Aggregate} should be recognized as a fused sketch");
         let (decided_op, _placement) = fused_sketch_decision(&fused, &cfg);
@@ -288,50 +276,80 @@ mod tests {
 
     #[test]
     fn equivalence_tumbling_quantile() {
-        assert_equivalent(default_quantile(0.99), tumbling(300));
+        assert_equivalent(
+            default_quantile(0.99),
+            WindowKind::Tumbling,
+            Duration::from_secs(300),
+            None,
+        );
     }
 
     #[test]
     fn equivalence_sliding_quantile() {
-        assert_equivalent(default_quantile(0.5), sliding(600, 60));
+        assert_equivalent(
+            default_quantile(0.5),
+            WindowKind::Sliding,
+            Duration::from_secs(600),
+            Some(Duration::from_secs(60)),
+        );
     }
 
     #[test]
     fn equivalence_session_quantile() {
-        assert_equivalent(default_quantile(0.95), session(30));
+        assert_equivalent(
+            default_quantile(0.95),
+            WindowKind::Session,
+            Duration::from_secs(30),
+            None,
+        );
     }
 
     #[test]
     fn equivalence_tumbling_cardinality() {
-        assert_equivalent(default_cardinality(), tumbling(60));
+        assert_equivalent(
+            default_cardinality(),
+            WindowKind::Tumbling,
+            Duration::from_secs(60),
+            None,
+        );
     }
 
     #[test]
     fn equivalence_tumbling_frequency() {
-        assert_equivalent(default_frequency(), tumbling(120));
+        assert_equivalent(
+            default_frequency(),
+            WindowKind::Tumbling,
+            Duration::from_secs(120),
+            None,
+        );
     }
 
     #[test]
     fn equivalence_sum_intent() {
-        assert_equivalent(AggIntent::Sum, tumbling(300));
+        assert_equivalent(
+            AggIntent::Sum,
+            WindowKind::Tumbling,
+            Duration::from_secs(300),
+            None,
+        );
     }
 
     #[test]
     fn recognizer_rejects_bare_aggregate() {
-        // A canonical Aggregate with no enclosing Window is the unfused
-        // SketchAgg case — not a windowed sketch.
-        let legacy = LQueryExpr::SketchAgg {
-            op: AggIntent::Sum,
-            col: LColumnRef::SampleValue,
-            input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+        // A canonical `Aggregate` with no enclosing `Window` is the unfused
+        // sketch case — not a windowed sketch.
+        let canonical = QueryExpr::Aggregate {
+            by: Vec::new(),
+            aggs: vec![AggIntent::Sum],
+            having: None,
+            child: Box::new(canonical_scan("m")),
         };
-        let canonical = convert_root(&legacy).expect("convert");
         assert!(recognize_windowed_sketch(&canonical).is_none());
     }
 
     #[test]
     fn recognizer_rejects_window_over_non_aggregate() {
-        // Window directly over a Scan — no inner Aggregate to fuse.
+        // `Window` directly over a `Scan` — no inner `Aggregate` to fuse.
         let legacy = LQueryExpr::Window {
             duration: Duration::from_secs(60),
             slide: None,
@@ -343,9 +361,24 @@ mod tests {
 
     #[test]
     fn recognizer_accepts_converted_windowed_agg() {
-        // Sanity: the shape legacy_to_canonical folds a WindowedAgg into
-        // is exactly what the recognizer matches.
-        let legacy = legacy_windowed_agg(default_quantile(0.99), tumbling(300));
+        // The L2 `Aggregate { Quantile } over Window` shape the parsers
+        // emit converts to canonical `Window { Aggregate }` — exactly the
+        // shape the recognizer matches.
+        let legacy = LQueryExpr::Aggregate {
+            keys: vec![],
+            aggs: vec![AggItem {
+                alias: "q".into(),
+                func: AggFunc::Quantile(0.99),
+                col: LColumnRef::SampleValue,
+                distinct: false,
+            }],
+            having: None,
+            input: Box::new(LQueryExpr::Window {
+                duration: Duration::from_secs(300),
+                slide: None,
+                input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+            }),
+        };
         let canonical = convert_root(&legacy).expect("convert");
         let fused = recognize_windowed_sketch(&canonical).expect("should recognize");
         assert_eq!(fused.window_kind, WindowKind::Tumbling);
