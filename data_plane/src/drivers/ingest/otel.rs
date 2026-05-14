@@ -1052,6 +1052,27 @@ async fn route_modified_otlp_sketches_to_precompute(
                             let group_by_keys: BTreeSet<String> =
                                 dp.attrs.keys().cloned().collect();
                             let cfg = dp.container_config.clone();
+                            // Derive the policy fingerprint by content-
+                            // matching the OTLP DP's shape against the
+                            // streaming-config registry. Sketches arrive
+                            // with `(kind, config)` embedded but no policy
+                            // reference; we find the policy whose contents
+                            // produce the same shape. Lookup returns
+                            // `Some(fp)` on a unique match, `None`
+                            // when zero policies match (sketch ingested
+                            // before the streaming-config caught up) or
+                            // when multiple policies match the same shape
+                            // (would have been a sid-collision bug —
+                            // surfaces as an UNSET registration so the
+                            // legacy `instances_matching` walk still
+                            // covers it).
+                            let policy_fp = derive_sketch_policy_fp(
+                                ingest_state,
+                                &metric.name,
+                                kind,
+                                &cfg,
+                                &group_by_keys,
+                            );
                             ingest_state.sketch_index.register(SketchInstanceMetadata {
                                 sid,
                                 metric_name: metric.name.clone(),
@@ -1066,14 +1087,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 first_seen_unix_ms: ts_ms,
                                 retired_at_ms: None,
                                 expires_at_ms: None,
-                                // OTel sketch ingest path doesn't have a
-                                // source `AggregationConfig` here — sketches
-                                // arrive with their shape (kind + config)
-                                // embedded in the OTLP DP, not a policy
-                                // reference. Leave UNSET; the reverse
-                                // index skips these. Sketch sids stay
-                                // reachable via `instances_matching`.
-                                policy_fp: asap_types::PolicyFingerprint::UNSET,
+                                policy_fp,
                             });
                         }
 
@@ -1235,6 +1249,111 @@ async fn route_modified_otlp_sketches_to_precompute(
         unknown_series_ids: unknown_sids,
         series_assignments: new_assignments,
     }
+}
+
+/// Map `SketchKindHandle` to the corresponding wire-format
+/// `AggregationType`. Inverse direction is in
+/// `sketch_kind_handle_for` above. Used by
+/// [`derive_sketch_policy_fp`] to find the policy whose
+/// `AggregationConfig.aggregation_type` matches a freshly-ingested
+/// sketch.
+///
+/// `Any` is a control-plane analysis-time wildcard — it doesn't
+/// appear on the ingest path. Returns `None` so the policy lookup
+/// fails the (rare) defensive path explicitly.
+fn aggregation_type_for_sketch_handle(
+    handle: crate::storage_engines::sketch_db::index::SketchKindHandle,
+) -> Option<promql_utilities::query_logics::enums::AggregationType> {
+    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+    use promql_utilities::query_logics::enums::AggregationType;
+    match handle {
+        SketchKindHandle::DDSketch => Some(AggregationType::DDSketch),
+        SketchKindHandle::Kll => Some(AggregationType::DatasketchesKLL),
+        SketchKindHandle::Hll => Some(AggregationType::HLL),
+        SketchKindHandle::CountSketch => Some(AggregationType::CountSketch),
+        SketchKindHandle::CountSketchWithHeap => Some(AggregationType::CountSketch),
+        SketchKindHandle::CountMin => Some(AggregationType::CountMinSketch),
+        SketchKindHandle::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
+        SketchKindHandle::Any => None,
+    }
+}
+
+/// Render a `SketchConfig` into the param map the streaming-config
+/// stores. The control plane authors these as
+/// `parameters: {<name>: <value>}` JSON; the data plane has the
+/// parameters typed in `SketchConfig`. This function converts.
+///
+/// Keys MUST match what the control plane emits (see
+/// `crates/asap_types/src/aggregation_config.rs::from_yaml_data` for
+/// the canonical names). Drift here surfaces as policy lookups that
+/// silently miss.
+fn sketch_config_to_params(
+    cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
+) -> std::collections::HashMap<String, serde_json::Value> {
+    use crate::storage_engines::sketch_db::data::SketchConfig;
+    let mut params = std::collections::HashMap::new();
+    match cfg {
+        SketchConfig::DDSketch { relative_accuracy } => {
+            params.insert(
+                "relative_accuracy".to_string(),
+                serde_json::json!(*relative_accuracy),
+            );
+        }
+        SketchConfig::Kll { k } => {
+            params.insert("k".to_string(), serde_json::json!(*k));
+        }
+        SketchConfig::Hll { precision } => {
+            params.insert("precision".to_string(), serde_json::json!(*precision));
+        }
+        SketchConfig::CountSketch { rows, cols }
+        | SketchConfig::CountMin { rows, cols } => {
+            params.insert("rows".to_string(), serde_json::json!(*rows));
+            params.insert("cols".to_string(), serde_json::json!(*cols));
+        }
+    }
+    params
+}
+
+/// Look up the policy fingerprint for a freshly-ingested OTLP sketch
+/// by content-matching against the streaming-config registry.
+///
+/// Sketches arrive with `(metric, attrs, sketch_kind, sketch_config)`
+/// embedded in the DP but no policy reference. The matching pass:
+/// snapshots the current streaming config, derives a
+/// `PolicyRegistry`, and asks `find_policy_by_content` for the
+/// fingerprint of a policy whose contents match. Returns
+/// `PolicyFingerprint::UNSET` when:
+///   1. The `SketchKindHandle::Any` wildcard reached this path
+///      (defensive — shouldn't happen).
+///   2. No policy in the registry matches.
+///   3. Multiple policies match (would-have-been-a-bug case;
+///      `find_policy_by_content` returns `None` on ambiguity).
+///
+/// Callers register the sid with the returned fp regardless of
+/// success — UNSET sids are simply absent from the policy_fp →
+/// {sids} reverse index, and remain reachable via the legacy
+/// `instances_matching(metric, gbk)` walk.
+fn derive_sketch_policy_fp(
+    ingest_state: &IngestState,
+    metric: &str,
+    kind: crate::storage_engines::sketch_db::index::SketchKindHandle,
+    cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
+    group_by_keys: &std::collections::BTreeSet<String>,
+) -> asap_types::PolicyFingerprint {
+    let Some(agg_type) = aggregation_type_for_sketch_handle(kind) else {
+        return asap_types::PolicyFingerprint::UNSET;
+    };
+    let params = sketch_config_to_params(cfg);
+    let snap = ingest_state.config_snapshot();
+    let registry = snap.policy_registry();
+    control_plane::warm_tier_analysis::find_policy_by_content(
+        &registry,
+        metric,
+        group_by_keys,
+        agg_type,
+        &params,
+    )
+    .unwrap_or(asap_types::PolicyFingerprint::UNSET)
 }
 
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
@@ -1896,6 +2015,82 @@ fn attributes_to_map(
         }
     }
     m
+}
+
+#[cfg(test)]
+mod policy_fp_lookup_tests {
+    use super::*;
+    use crate::storage_engines::sketch_db::data::SketchConfig;
+    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+    use promql_utilities::query_logics::enums::AggregationType;
+
+    #[test]
+    fn handle_to_agg_type_round_trips_canonical_kinds() {
+        // Locks in the data-plane → control-plane name mapping.
+        // Drift surfaces as policy lookups that silently miss because
+        // the handle resolves to an `AggregationType` no policy uses.
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::DDSketch),
+            Some(AggregationType::DDSketch)
+        );
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::Kll),
+            Some(AggregationType::DatasketchesKLL)
+        );
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::Hll),
+            Some(AggregationType::HLL)
+        );
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::CountMin),
+            Some(AggregationType::CountMinSketch)
+        );
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::CmsWithHeap),
+            Some(AggregationType::CountMinSketchWithHeap)
+        );
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::CountSketch),
+            Some(AggregationType::CountSketch)
+        );
+        // `Any` is a control-plane wildcard, not a real DP shape.
+        assert_eq!(
+            aggregation_type_for_sketch_handle(SketchKindHandle::Any),
+            None
+        );
+    }
+
+    #[test]
+    fn sketch_config_to_params_uses_canonical_keys() {
+        // The param-name vocabulary must match what the control plane
+        // writes in streaming-config YAML (see
+        // `asap_types::aggregation_config::AggregationConfig::from_yaml_data`).
+        // Drift surfaces as `find_policy_by_content` missing matches.
+        let dd = sketch_config_to_params(&SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        });
+        assert_eq!(dd.get("relative_accuracy"), Some(&serde_json::json!(0.01)));
+
+        let kll = sketch_config_to_params(&SketchConfig::Kll { k: 200 });
+        assert_eq!(kll.get("k"), Some(&serde_json::json!(200)));
+
+        let hll = sketch_config_to_params(&SketchConfig::Hll { precision: 14 });
+        assert_eq!(hll.get("precision"), Some(&serde_json::json!(14)));
+
+        let cs = sketch_config_to_params(&SketchConfig::CountSketch {
+            rows: 4,
+            cols: 256,
+        });
+        assert_eq!(cs.get("rows"), Some(&serde_json::json!(4)));
+        assert_eq!(cs.get("cols"), Some(&serde_json::json!(256)));
+
+        let cm = sketch_config_to_params(&SketchConfig::CountMin {
+            rows: 4,
+            cols: 256,
+        });
+        assert_eq!(cm.get("rows"), Some(&serde_json::json!(4)));
+        assert_eq!(cm.get("cols"), Some(&serde_json::json!(256)));
+    }
 }
 
 #[cfg(test)]
