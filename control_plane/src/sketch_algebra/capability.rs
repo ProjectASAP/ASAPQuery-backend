@@ -304,13 +304,19 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             // accuracy is non-Exact and we hand it to the cardinality
             // sketch path.
             //
-            // PR-6 follow-up: exact count = sum-of-1s, which is
-            // served by the `AggregationType::Sum` exact-precompute
-            // operator at the ASAP tier. Returning that capability
-            // lets the analyzer route `count_over_time` to a ASAP-tier
-            // ExactAgg sid instead of falling through to archive.
+            // Exact count routes to archive (`None`). The PR #200/#201
+            // follow-up flipped this to `ExactAgg(Sum)` on the theory
+            // "count = sum-of-1s" — but the data plane has no count
+            // accumulator. `SumAccumulator` only tracks `sum: f64` and
+            // its `query` returns `self.sum` for BOTH `Statistic::Sum`
+            // and `Statistic::Count`, so a `count_over_time` query
+            // matched against a `Sum` policy returns the sum of the
+            // sample VALUES, not the count of samples. Reverted here
+            // until a real `SumCountAccumulator` lands (the
+            // temporal/spatial-split work) — archive counts correctly
+            // in the meantime.
             if is_exact(accuracy) {
-                Some(Capability::ExactAgg(AggregationType::Sum))
+                None
             } else {
                 Some(Capability::CardinalityApprox)
             }
@@ -691,18 +697,18 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_exact_routes_to_exact_agg_sum() {
-        // PR-6 follow-up: `count_over_time` lowers to
-        // `Count{accuracy:Exact}`; count = sum-of-1s, so the ASAP-tier
-        // ExactAgg path uses `AggregationType::Sum`. Pre-follow-up
-        // this returned `None` and the analyzer routed to archive.
+    fn capability_for_count_exact_routes_to_archive() {
+        // `count_over_time` lowers to `Count{accuracy:Exact}`. The
+        // PR #200/#201 follow-up briefly routed this to
+        // `ExactAgg(Sum)`, but the data plane has no count
+        // accumulator — `SumAccumulator` returns its `sum` for both
+        // `Statistic::Sum` and `Statistic::Count`, so the result was
+        // sum-of-values, not sample-count. Reverted to `None` (archive
+        // routing) until a real `SumCountAccumulator` lands.
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Exact,
         };
-        assert_eq!(
-            capability_for(&intent),
-            Some(Capability::ExactAgg(AggregationType::Sum))
-        );
+        assert_eq!(capability_for(&intent), None);
     }
 
     #[test]
@@ -1026,12 +1032,10 @@ mod tests {
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
 
     #[test]
-    fn pr_6_follow_up_flipped_sum_rate_increase_count_exact() {
-        // PR 6 first landed `Capability::ExactAgg` dormant — variant
-        // wired into `is_satisfied_by` but `capability_for` still
-        // returned `None` for Sum / Rate / Increase / Count{Exact}.
-        // This test locks in the follow-up that flipped those four
-        // intents to route through ASAP-tier ExactAgg state.
+    fn exact_agg_routing_covers_sum_rate_increase_only() {
+        // `Capability::ExactAgg` routing covers the three intents the
+        // data plane has a real accumulator for: `Sum` (SumAccumulator)
+        // and `Rate` / `Increase` (IncreaseAccumulator).
         assert_eq!(
             capability_for(&AggIntent::Sum),
             Some(Capability::ExactAgg(AggregationType::Sum))
@@ -1048,14 +1052,15 @@ mod tests {
             }),
             Some(Capability::ExactAgg(AggregationType::Increase))
         );
+        // `Count{Exact}` (count_over_time) and `Avg` both need a real
+        // count accumulator that doesn't exist yet — they route to
+        // archive until `SumCountAccumulator` lands.
         assert_eq!(
             capability_for(&AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             }),
-            Some(Capability::ExactAgg(AggregationType::Sum))
+            None
         );
-        // Avg stays on archive — needs cross-policy join (Sum + Count)
-        // that the L4 binder doesn't yet emit. Tracked as follow-up.
         assert_eq!(capability_for(&AggIntent::Avg), None);
     }
 
