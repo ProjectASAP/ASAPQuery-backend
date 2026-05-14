@@ -217,7 +217,7 @@ pub enum FilterVal {
 ///
 /// This is purely a Layer-2 *relational* IR — the sketch-fused
 /// `SketchAgg` / `WindowedAgg` variants were removed once the
-/// `lower_to_canonical` converter learned to fold the single-statistic
+/// `lower` converter learned to fold the single-statistic
 /// sketchable `Aggregate` straight into canonical shapes. The remaining
 /// reason the tree is not yet *deleted* outright is that [`ScalarExpr`]
 /// still carries four variants (`FunctionCall`, `ScalarSubquery`,
@@ -272,7 +272,7 @@ pub enum QueryExpr {
 
     // The sketch-fused `SketchAgg` / `WindowedAgg` variants were removed:
     // they were never parser output — only an intermediate of an earlier
-    // sketch-lowering pass — and `lower_to_canonical` now folds the
+    // sketch-lowering pass — and `lower` now folds the
     // single-statistic sketchable `Aggregate` straight into canonical
     // shapes (`Aggregate { by: [] }` / `Window { Aggregate }`).
 
@@ -503,7 +503,7 @@ impl AggFunc {
     ///
     /// Canonical Quantile is single-φ; this helper returns one canonical
     /// intent. Callers that need multi-φ behaviour build the merge fan-out
-    /// themselves (cf. `lower_to_canonical::agg_func_to_intents`).
+    /// themselves (cf. `lower::agg_func_to_intents`).
     pub fn to_sketch_op(&self) -> Option<AggIntent> {
         match self {
             AggFunc::Quantile(phi) => Some(default_quantile(*phi)),

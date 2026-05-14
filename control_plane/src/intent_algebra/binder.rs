@@ -17,7 +17,7 @@
 //! Our canonical L3 IR (`query_expr::QueryExpr`) already commits to
 //! positional column identity — `Aggregate.by: Vec<ColumnId>` — exactly
 //! like RisingWave's `InputRef`. What was missing was the *pass* that
-//! produces it: resolution was smeared into `lower_to_canonical::convert`
+//! produces it: resolution was smeared into `lower::convert`
 //! with a hardcoded synthesized `(ts, value)` schema, so any query
 //! referencing a real label / column name (`price`, `host`, …) errored.
 //!
@@ -46,7 +46,7 @@
 //! ## Where it sits
 //!
 //! Today the Binder runs at the L2→L3 (legacy → canonical) conversion
-//! boundary — `lower_to_canonical::convert_root` calls it. Once the
+//! boundary — `lower::convert_root` calls it. Once the
 //! legacy IR is retired it moves into the `core::lower` L1→L2→L3 passes
 //! proper (the `lower_*(ast, schema)` signatures in design.md §6).
 

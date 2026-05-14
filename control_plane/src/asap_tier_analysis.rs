@@ -51,8 +51,7 @@ use promql_parser::parser::{self, Expr, VectorSelector};
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::QueryExpr;
-use crate::query_parser::parse_query;
-use crate::types_v2::AccuracyTarget;
+use crate::query_parser::{parse_query, parse_query_expr_canonical};
 
 pub use crate::sketch_algebra::capability::{capability_for, Capability, SketchKindHandle};
 
@@ -154,16 +153,15 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
     // PromQL function names.
     let trace = trace_from_promql(metricsql);
 
-    // Step 2: pick a sane default accuracy. Warm-tier analysis only
-    // cares about whether the AggIntent has a sketch binding, and the
-    // lowerer maps `parsed.exact_required = true` to `AccuracyTarget::Exact`
-    // anyway. Anything non-exact unlocks the same set of bindings, so
-    // we pick a mid-range epsilon as the analysis-time default; the
-    // real per-query accuracy bound comes from QueryWorkload further
-    // downstream.
-    let accuracy = AccuracyTarget::Epsilon(0.01);
-
-    let expr = match crate::intent_algebra::lower::lower_parsed_query(&parsed, accuracy) {
+    // Step 2: lower to the canonical L3 `QueryExpr` via the real parse
+    // path. `parse_query` (above) already ran this conversion internally
+    // to build its flat summary; we re-run it here to get the *tree*
+    // itself, which the flat `ParsedQuery` doesn't carry. The walk below
+    // only inspects `AggIntent` kinds + accuracy; the converter pins
+    // sketch-eligible intents at a non-exact epsilon, which is all
+    // warm-tier analysis needs (the real per-query accuracy bound comes
+    // from QueryWorkload further downstream).
+    let expr = match parse_query_expr_canonical(metricsql) {
         Ok(e) => e,
         Err(e) => {
             return ASAPTierAnalysis {
@@ -611,6 +609,7 @@ pub fn find_matching_policies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use promql_utilities::query_logics::enums::AggregationType;
 
     fn keys(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -699,69 +698,72 @@ mod tests {
         assert!(!a.candidates.is_empty(), "expected at least one candidate");
     }
 
-    // ── Unsupported / rejected shapes ────────────────────────────────────
+    // ── ExactAgg-routed shapes ───────────────────────────────────────────
+    //
+    // `rate` / `irate` / `increase` / `sum` and the bare selector all
+    // lower (via `lower`) to `AggIntent::Sum`, and
+    // `capability_for(&Sum)` returns `Capability::ExactAgg(Sum)` — so
+    // they are ASAP-tier-answerable from exact-precompute state. (The
+    // older `lower_parsed_query` path *dropped* these intents, masking
+    // the `ExactAgg` capability and routing everything to archive.)
 
     #[test]
-    fn reject_bare_vector_selector() {
+    fn bare_vector_selector_binds_to_exact_agg() {
+        // The PromQL parser models a bare selector as `Aggregate { Sum }`
+        // over the sample value; `Sum` carries an `ExactAgg` capability.
         let a = analyze_promql_for_asap_tier("http_requests_total{zone=\"z0\"}");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates.len(), 1);
         assert_eq!(
-            a.unsupported,
-            Some(UnsupportedReason::NoCallNodeFound),
-            "{a:?}"
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
         );
-        assert!(a.candidates.is_empty());
     }
 
     #[test]
-    fn reject_rate_function() {
-        // `rate(...)` lowers to `AggIntent::Rate{...}` and
-        // `capability_for(&Rate{..})` returns None.
+    fn rate_binds_to_exact_agg() {
         let a = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
-        match a.unsupported {
-            Some(UnsupportedReason::UnsupportedAggIntent(kind)) => assert_eq!(kind, "rate"),
-            other => panic!("expected UnsupportedAggIntent(rate), got {other:?}"),
-        }
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
+        );
     }
 
     #[test]
-    fn reject_irate_function() {
+    fn irate_binds_to_exact_agg() {
+        // `irate` shares `AggFunc::Rate` with `rate` in
+        // `query_parser::promql`; both lower to `AggIntent::Sum`.
         let a = analyze_promql_for_asap_tier("irate(http_requests_total[5m])");
-        // `irate` lowers to `AggIntent::Rate{...}` via the
-        // control plane's PromQL parser (irate / rate share an AggFunc
-        // in `query_parser::promql`). The capability bridge returns
-        // None either way.
-        match a.unsupported {
-            Some(UnsupportedReason::UnsupportedAggIntent(kind)) => {
-                assert!(
-                    kind == "rate" || kind == "irate",
-                    "unexpected intent kind: {kind}"
-                );
-            }
-            other => panic!("expected UnsupportedAggIntent, got {other:?}"),
-        }
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
+        );
     }
 
     #[test]
-    fn reject_increase_function() {
+    fn increase_binds_to_exact_agg() {
         let a = analyze_promql_for_asap_tier("increase(http_requests_total[5m])");
-        match a.unsupported {
-            Some(UnsupportedReason::UnsupportedAggIntent(kind)) => {
-                assert_eq!(kind, "increase");
-            }
-            other => panic!("expected UnsupportedAggIntent(increase), got {other:?}"),
-        }
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
+        );
     }
 
     #[test]
-    fn reject_sum_by_bare_metric() {
-        // `sum by (zone) (metric)` lowers to `AggIntent::Sum`; bridge
-        // returns None — Sum-over-CountSketch is a follow-up.
+    fn sum_by_binds_to_exact_agg() {
         let a = analyze_promql_for_asap_tier("sum by (zone) (http_requests_total)");
-        match a.unsupported {
-            Some(UnsupportedReason::UnsupportedAggIntent(kind)) => assert_eq!(kind, "sum"),
-            other => panic!("expected UnsupportedAggIntent(sum), got {other:?}"),
-        }
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
+        );
+        assert_eq!(a.candidates[0].group_by_keys, keys(&["zone"]));
     }
+
+    // ── Unsupported / rejected shapes ────────────────────────────────────
 
     #[test]
     fn unparseable_promql_surfaces_clean_error() {
@@ -804,14 +806,19 @@ mod tests {
 
     #[test]
     fn is_asap_tier_answerable_false_for_unsupported() {
-        let a = analyze_promql_for_asap_tier("rate(m[5m])");
+        // `count_over_time(...)` without an outer `count by (...)` lowers
+        // to `AggIntent::Count { accuracy: Exact }` — exact counts have
+        // no ASAP-tier sketch, so `capability_for` returns `None`.
+        let a = analyze_promql_for_asap_tier("count_over_time(m[5m])");
         assert!(!a.is_asap_tier_answerable());
     }
 
     #[test]
-    fn is_asap_tier_answerable_false_for_bare_selector() {
+    fn is_asap_tier_answerable_true_for_bare_selector() {
+        // A bare selector lowers to `Aggregate { Sum }`, which carries an
+        // `ExactAgg` capability — so it is ASAP-tier-answerable.
         let a = analyze_promql_for_asap_tier("m{zone=\"z0\"}");
-        assert!(!a.is_asap_tier_answerable());
+        assert!(a.is_asap_tier_answerable());
     }
 
     // ── Cardinality / count_over_time real-PromQL acceptance ────────────

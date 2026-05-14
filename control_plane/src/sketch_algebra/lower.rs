@@ -72,10 +72,46 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
             child: Box::new(bind_recursive(child, accuracy)),
         },
         QueryExpr::Ref { name } => PhysicalExpr::Ref { name: name.clone() },
+        // The canonical L3 IR places `Window` *above* a single-statistic
+        // sketchable `Aggregate` (`lower`'s window-swap).
+        // The `Bind*` rules match `Aggregate` with the window as its
+        // *child*, so push the window down under the aggregate and
+        // re-dispatch — the window then rides along inside the bound
+        // node's `Logical(...)` child, exactly as it did when the
+        // aggregate sat on top. A `Window` over anything else stays a
+        // logical pass-through.
+        QueryExpr::Window {
+            kind,
+            size,
+            slide,
+            child,
+        } if matches!(child.as_ref(), QueryExpr::Aggregate { .. }) => {
+            let QueryExpr::Aggregate {
+                by,
+                aggs,
+                having,
+                child: agg_child,
+            } = child.as_ref()
+            else {
+                unreachable!("guarded by the `matches!` above")
+            };
+            let pushed = QueryExpr::Aggregate {
+                by: by.clone(),
+                aggs: aggs.clone(),
+                having: having.clone(),
+                child: Box::new(QueryExpr::Window {
+                    kind: kind.clone(),
+                    size: *size,
+                    slide: *slide,
+                    child: agg_child.clone(),
+                }),
+            };
+            bind_recursive(&pushed, accuracy)
+        }
         // For `Aggregate`, the rule dispatcher already had a chance and
-        // declined. For `Scan` and `Window`, the recursive walk is a
-        // no-op (no binding rule applies to these shapes today). In all
-        // cases, wrap the L3 sub-tree as a logical pass-through.
+        // declined. For `Scan` and a `Window` over a non-`Aggregate`
+        // child, no binding rule applies — wrap the L3 sub-tree as a
+        // logical pass-through.
         QueryExpr::Aggregate { .. } | QueryExpr::Scan { .. } | QueryExpr::Window { .. } => {
             PhysicalExpr::Logical(expr.clone())
         }

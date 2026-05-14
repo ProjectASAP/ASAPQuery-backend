@@ -42,7 +42,7 @@
 //!   lookup table (Phase 4 / 5 use this to route raw-name PromQL).
 //! - `intent_algebra` — `AggIntent` + `QueryExpr` DAG (canonical L3 IR;
 //!   `relational` carries the L2 relational IR the parsers emit and
-//!   `lower_to_canonical` lowers it to the canonical L3 types).
+//!   `lower` lowers it to the canonical L3 types).
 //! - `query_parser` — front-end parsers (Layer 1): `promql.rs` / `sql.rs`
 //!   emit the L2 relational `relational::QueryExpr` tree.
 //! - `physical` — L5 framework (allocator, planner, plan, sketch_catalog,

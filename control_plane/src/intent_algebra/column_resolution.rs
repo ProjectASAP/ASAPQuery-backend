@@ -174,7 +174,7 @@ pub fn resolve_column_refs(
 /// [`resolve_column_refs`] but skips the `ColumnRef::Named` wrapping —
 /// the legacy `Aggregate.keys` field is already a `Vec<String>`.
 ///
-/// Used by `lower_to_canonical::convert` to translate a legacy
+/// Used by `lower::convert` to translate a legacy
 /// `Aggregate.keys: Vec<String>` into the canonical `by: Vec<ColumnId>`.
 pub fn resolve_named_keys(
     keys: &[String],

@@ -34,8 +34,6 @@
 //!   workload-level CSE lives one layer up in `types_v2::WorkloadPlan`.
 //! - [`Schema`] — typed schema flowing on every L3 edge. `unique_keys` is
 //!   the load-bearing field for CSE legality (`design.md` §6 line ~1284).
-//! - [`lower_parsed_query`] — `query_parser::ParsedQuery` → [`QueryExpr`]
-//!   single-query lowering.
 //!
 //! Phase F adds the CSE surface that consumes `Schema::unique_keys`:
 //!
@@ -75,7 +73,6 @@
 
 pub mod agg_intent;
 pub mod cse;
-pub mod lower;
 pub mod query_expr;
 pub mod schema;
 
@@ -91,8 +88,8 @@ pub mod relational;
 // raw `relational::QueryExpr` tree and route it through `convert_root`,
 // which lowers it (single-statistic sketchable `Aggregate` fusion folded
 // in) onto the canonical IR.
-pub mod lower_to_canonical;
-pub use lower_to_canonical::{convert, convert_root, ConvertError};
+pub mod lower;
+pub use lower::{convert, convert_root, ConvertError};
 
 // Step γ7: the L3 Binder — name resolution as an explicit pass. Produces
 // the complete self-contained `Schema` every `ColumnId` indexes into;
@@ -109,7 +106,6 @@ pub use agg_intent::{
     default_quantile, AggIntent,
 };
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
-pub use lower::{lower_parsed_query, LoweringError};
 pub use query_expr::{
     from_legacy_scalar, BinaryOpKind, BindingScope, ColumnRef, GroupSide, HavingPredicate,
     JoinKind, LabelFilter, LiteralValue, PartitionKeys, Predicate, ProjectItem, QueryExpr,

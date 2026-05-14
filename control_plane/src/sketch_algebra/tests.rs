@@ -542,16 +542,14 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
 // representative query string from the corresponding fixture YAML and
 // pins the expected (sketch_kind | archive-only) outcome.
 
-/// Helper: parse a PromQL string, lower to L3, bind to L4. Returns the
-/// produced `PhysicalExpr` for assertion. The control plane's `parse_query`
-/// returns a `ParsedQuery`; `lower_parsed_query` builds the L3 IR from
-/// it under the supplied accuracy target; `bind_query_expr` is the L3→L4
-/// bottom-up walk.
+/// Helper: parse a PromQL string to the canonical L3 `QueryExpr`, bind to
+/// L4. Returns the produced `PhysicalExpr` for assertion.
+/// `parse_query_expr_canonical` is the real parse path (L1 → L2 relational
+/// → L3 canonical via `lower`); `bind_query_expr` is the
+/// L3→L4 bottom-up walk under the supplied accuracy target.
 fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
-    let parsed =
-        crate::query_parser::parse_query(query).unwrap_or_else(|e| panic!("parse {query}: {e}"));
-    let qe = crate::intent_algebra::lower_parsed_query(&parsed, accuracy.clone())
-        .unwrap_or_else(|e| panic!("lower {query}: {e}"));
+    let qe = crate::query_parser::parse_query_expr_canonical(query)
+        .unwrap_or_else(|e| panic!("parse {query}: {e}"));
     bind_query_expr(&qe, accuracy).unwrap_or_else(|e| panic!("bind {query}: {e}"))
 }
 

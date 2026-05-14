@@ -45,7 +45,7 @@ DataCollector/controller already documents its query→sketch translation as a 5
 |---|-------|--------------|-------------------|
 | 1 | **Query Language** | Parse raw strings (PromQL, SQL, DataFusion, ElasticDSL, …) into a language-specific AST | DC `controller/src/query_parser/{promql,sql}.rs` (each parses straight to the L2 relational tree below); asap-planner-rs pulls `promql-parser` + `sqlparser` directly; asap-fusion consumes a pre-built DataFusion `LogicalPlan` (its L1 happens upstream) |
 | 2 | **Language Logical Plan** | Per-language algebra tree (`Aggregate` / `Window` / `Filter` / `Sort` / `Limit`) preserving language semantics, **no sketch names, no sketch binding** | DC `controller/src/intent_algebra/relational.rs` — the L2 relational `QueryExpr` tree the `query_parser` front ends emit (one shared tree for PromQL + SQL today; a per-language split is future work); asap-fusion inherits DataFusion's `LogicalPlan` as its L2; asap-planner-rs has no L2 today (uses a template-pattern catalogue) — **Phase 4 builds one** |
-| 3 | **Intent algebra** | Language- and deployment-independent IR: `QueryExpr` + `AggIntent`. Describes **intent only** — *what* to compute, with accuracy target. **No sketch type, no sketch parameters, no sketch-bound nodes** (`SketchAgg` / `SketchJoin` / `SketchSubtract` etc. live in the L4 IR `SketchExpr`). **No language-shaped operators** (no `HistogramQuantile`, no `PromQLSubquery` — those are PromQL L2 nodes that lower to data-model-agnostic shapes here). **One canonical form per plan** — no `WindowedAgg` (use `Window` over `Aggregate`). Heavy-hitter intents are first-class (`AggIntent::TopK`) so heavy-hitter sketches bind directly on the intent rather than on a generic `Sort + Limit` shape; generic `Sort + Limit` survives in `QueryExpr` for non-heavy-hitter cases (e.g. `ORDER BY name LIMIT 10`). Every edge carries a typed `Schema`. Data-model-agnostic — `QueryExpr::Scan` wraps a `Source` sum with `TimeSeries` / `Table` / `Join` variants so the same L3 IR covers ASAPQuery's time-series queries and asap-fusion's tabular queries. | DC `controller/src/intent_algebra/{agg_intent,query_expr,schema,lower,cse}.rs` (canonical L3) + `controller/src/intent_algebra/lower_to_canonical.rs` (the L2→L3 converter: folds the `relational` L2 tree straight to the canonical IR, single-statistic sketchable `Aggregate` fusion included — no intermediate fused L3 IR); asap-fusion's 3-variant `SubPopulationAnalyticsType` maps to a subset; asap-planner-rs's 9-variant `Statistic` maps to a subset — **Phase 4 splits sketch binding out of planner's current fused L3+L4**. *Refactor 2026-05 absorbed `controller/src/algebra/expr.rs` into `intent_algebra/relational.rs`.* |
+| 3 | **Intent algebra** | Language- and deployment-independent IR: `QueryExpr` + `AggIntent`. Describes **intent only** — *what* to compute, with accuracy target. **No sketch type, no sketch parameters, no sketch-bound nodes** (`SketchAgg` / `SketchJoin` / `SketchSubtract` etc. live in the L4 IR `SketchExpr`). **No language-shaped operators** (no `HistogramQuantile`, no `PromQLSubquery` — those are PromQL L2 nodes that lower to data-model-agnostic shapes here). **One canonical form per plan** — no `WindowedAgg` (use `Window` over `Aggregate`). Heavy-hitter intents are first-class (`AggIntent::TopK`) so heavy-hitter sketches bind directly on the intent rather than on a generic `Sort + Limit` shape; generic `Sort + Limit` survives in `QueryExpr` for non-heavy-hitter cases (e.g. `ORDER BY name LIMIT 10`). Every edge carries a typed `Schema`. Data-model-agnostic — `QueryExpr::Scan` wraps a `Source` sum with `TimeSeries` / `Table` / `Join` variants so the same L3 IR covers ASAPQuery's time-series queries and asap-fusion's tabular queries. | DC `controller/src/intent_algebra/{agg_intent,query_expr,schema,lower,cse}.rs` (canonical L3) + `controller/src/intent_algebra/lower.rs` (the L2→L3 converter: folds the `relational` L2 tree straight to the canonical IR, single-statistic sketchable `Aggregate` fusion included — no intermediate fused L3 IR); asap-fusion's 3-variant `SubPopulationAnalyticsType` maps to a subset; asap-planner-rs's 9-variant `Statistic` maps to a subset — **Phase 4 splits sketch binding out of planner's current fused L3+L4**. *Refactor 2026-05 absorbed `controller/src/algebra/expr.rs` into `intent_algebra/relational.rs`.* |
 | 4 | **Sketch algebra + optimizer** | Cost-aware algebraic rewrite rules under deployment constraints. **This is where sketch binding happens** — L4 rules take intent-only L3 (`QueryExpr`) and emit the sketch-bound IR (`SketchExpr`). ~12 rules in DC; a smaller targeted subset in planner; `SketchConfigRule` + `HashModeRule` in fusion. | Core provides the **rule engine driver** + `OptimizerRule` trait + a shared rule library + the sketch-bound IR `core::sketch_algebra::SketchExpr`; deployment models **pick** which rules to enable + supply their own deployment constraints. DC `controller/src/sketch_algebra/` (IR + binding rules) + `controller/src/optimizer/{engine,trait_def,baseline,rules/,cost/}.rs` (rule engine + cost models); fusion `src/optimizer/rules/`; planner's `map_statistic_to_precompute_operator`. *Refactor 2026-05 absorbed `controller/src/algebra/optimizer.rs` (→ `optimizer/engine.rs`) and `controller/src/planner/{cost_model,delta_cost_model,online_cost_model,pareto,tco,wire_cost,rules,baseline_planner}.rs` (→ `optimizer/{cost/,rules/,baseline.rs}`).* |
 | 5 | **Physical Execution Plan** | Assign ops to pipeline stages (edge / gateway / backend / object store); produce the deployment-specific artifact (OpAMP YAML, `streaming_config.yaml`, rewritten DataFusion `LogicalPlan`). **Sketch binding is already committed by L4**; L5 is about stage allocation + emission. | Core provides the **stage allocator framework** + `PhysicalPlanner` trait + the sketch catalogue; deployment models supply their own **topology** (3-stage / 1-stage / 0-stage) + their own **emitter** for the output format. DC `controller/src/physical/{allocator,planner,plan,sketch_catalog,stage_split,topology,colored_dag/}.rs` (allocator framework + sketch catalogue + typed three-stage colouring) + `controller/src/emit/{stage_config,otap,telegraf,agent,backend,asapquery_backend,precompute,trait_def}.rs` (per-deployment-model emitters + `PlanEmitter` trait) + `controller/src/pipeline.rs` (L1→…→L5 driver, formerly `analyzer.rs`); asap-planner-rs `output/generator.rs`; asap-fusion `src/executor/`. *Refactor 2026-05 absorbed `controller/src/algebra/{physical,allocator,plan,directory}.rs` and `controller/src/planner/stage_split.rs` and the legacy `controller/src/stage_split/` framework into `physical/`; absorbed `controller/src/config/` into `emit/` + `workload.rs`; renamed `analyzer.rs` to `pipeline.rs`.* |
 
@@ -169,7 +169,7 @@ If something must be optional (e.g. OpAMP for deployments that don't run OTel co
 > |---|---|
 > | `crates/core/query_language/` | `controller/src/query_parser/{promql,sql}.rs` (L1 parsers — emit the L2 tree directly) |
 > | `crates/core/logical_plan/` | `controller/src/intent_algebra/relational.rs` (the L2 relational `QueryExpr` tree) |
-> | `crates/core/intent_algebra/` | `controller/src/intent_algebra/` (with `relational` carrying the L2 relational IR and `lower_to_canonical` lowering it to the canonical L3 types) |
+> | `crates/core/intent_algebra/` | `controller/src/intent_algebra/` (with `relational` carrying the L2 relational IR and `lower` lowering it to the canonical L3 types) |
 > | `crates/core/sketch_algebra/` | `controller/src/sketch_algebra/` |
 > | `crates/core/optimizer/{engine,trait,rules,cost}/` | `controller/src/optimizer/{engine.rs,trait_def.rs,rules/,cost/,baseline.rs}` |
 > | `crates/core/physical/{planner_trait,stage_allocator,topology,executor,sketch_catalog}/` | `controller/src/physical/{planner,allocator,plan,stage_split,sketch_catalog,topology,colored_dag/}.rs` |
@@ -289,7 +289,7 @@ Core is not a trait-stubs library. It ships real L1/L2/L3 code lifted from DC's 
 > | `core::logical_plan` | `controller/src/intent_algebra/relational.rs` (the L2 relational `QueryExpr` tree) |
 > | `core::intent_algebra` | `controller/src/intent_algebra/` (canonical `query_expr` / `agg_intent`) + `controller/src/intent_algebra/relational.rs` (the L2 relational IR) |
 > | `core::sketch_algebra` | `controller/src/sketch_algebra/` |
-> | `core::lower` | per-layer: `controller/src/intent_algebra/{lower,lower_to_canonical}.rs` + `controller/src/sketch_algebra/lower.rs` |
+> | `core::lower` | per-layer: `controller/src/intent_algebra/{lower,lower}.rs` + `controller/src/sketch_algebra/lower.rs` |
 > | `core::optimizer::engine` | `controller/src/optimizer/engine.rs` |
 > | `core::optimizer::trait` | `controller/src/optimizer/trait_def.rs` (placeholder) |
 > | `core::optimizer::rules` | `controller/src/optimizer/rules/` |
@@ -329,7 +329,7 @@ Each returns a language-flavored AST type. No sketch awareness.
 > tree directly** (`intent_algebra::relational::QueryExpr`: `Aggregate`
 > / `Window` / `Filter` / `Join` / `Sort` / `Limit` / …). That tree
 > *is* L2. `query_parser::parse_query_expr_canonical` then lowers it to
-> the canonical L3 IR via `intent_algebra::lower_to_canonical`
+> the canonical L3 IR via `intent_algebra::lower`
 > (sketch-fusion + the Binder folded in); `parse_query` projects the
 > flat `ParsedQuery` summary the legacy analyzer / pipeline consume.
 >
@@ -598,7 +598,7 @@ The schema source is the **`SchemaCatalog`** seam:
   only the catalog impl swaps.
 
 Placement: today the Binder runs at the L2→L3 (relational → canonical)
-conversion boundary (`lower_to_canonical::convert_root` calls it).
+conversion boundary (`lower::convert_root` calls it).
 Once the `relational` L2 IR is retired it moves into the `core::lower` L1→L2→L3
 passes proper — the `lower_*(ast, schema)` signatures below already
 anticipate a schema parameter at that point.
@@ -787,7 +787,7 @@ The `schema` parameter on each pass is supplied by the **Binder** — see
 §6 "The Binder — name resolution as an explicit pass". The Binder is the
 single place symbolic names become positional `ColumnId`s; the `lower_*`
 passes consume its output and never resolve names ad-hoc. Today the
-Binder runs at the L2→L3 boundary inside `lower_to_canonical`; it folds
+Binder runs at the L2→L3 boundary inside `lower`; it folds
 into these `lower_*` signatures once the `relational` L2 IR is retired.
 
 ### `core::pipeline` — orchestration
@@ -1856,7 +1856,7 @@ The pre-refactor layout grew organically as the controller absorbed three legacy
 | Retired path | Replacement |
 |---|---|
 | `controller/src/algebra/expr.rs` | `controller/src/intent_algebra/relational.rs` |
-| `controller/src/algebra/lower.rs` | `controller/src/intent_algebra/lower_to_canonical.rs` (the L2→L3 lowering + converter) |
+| `controller/src/algebra/lower.rs` | `controller/src/intent_algebra/lower.rs` (the L2→L3 lowering + converter) |
 | `controller/src/algebra/directory.rs` | `controller/src/physical/sketch_catalog.rs` |
 | `controller/src/algebra/physical.rs` | `controller/src/physical/planner.rs` |
 | `controller/src/algebra/allocator.rs` | `controller/src/physical/allocator.rs` |
@@ -1883,6 +1883,6 @@ The pre-refactor layout grew organically as the controller absorbed three legacy
 **TODOs left from the refactor:**
 
 - `controller/src/emit/stage_config.rs` (3,020 lines, formerly `config/stage_config.rs`) was moved whole rather than split into `emit/opamp.rs` + `emit/streaming_config.rs` + `emit/inference_config.rs` per design.md §5. The monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, storage-routing JSON emit, and shared internals; a clean split needs ownership reorganisation, not file renames. Tracked for a follow-up.
-- `controller/src/intent_algebra/relational.rs` carries the **L2 relational** `QueryExpr` the `query_parser` front ends emit; `lower_to_canonical.rs` is the single pass that converts it (sketch-fusion folded in) to the canonical `intent_algebra::{query_expr,agg_intent}` L3 types. The sketch-fused `SketchAgg` / `WindowedAgg` variants and the standalone sketch-lowering pass that once produced them have been retired. Several controller modules (query_parser, physical/, optimizer/, emit/) still reference `relational` for shared leaf types; fully *deleting* the L2 tree is gated on the canonical `Predicate` covering the remaining `ScalarExpr` variants — but it is the real, current L2 IR (formerly misnamed `legacy_expr`), not removable debt.
+- `controller/src/intent_algebra/relational.rs` carries the **L2 relational** `QueryExpr` the `query_parser` front ends emit; `lower.rs` is the single pass that converts it (sketch-fusion folded in) to the canonical `intent_algebra::{query_expr,agg_intent}` L3 types. The sketch-fused `SketchAgg` / `WindowedAgg` variants and the standalone sketch-lowering pass that once produced them have been retired. Several controller modules (query_parser, physical/, optimizer/, emit/) still reference `relational` for shared leaf types; fully *deleting* the L2 tree is gated on the canonical `Predicate` covering the remaining `ScalarExpr` variants — but it is the real, current L2 IR (formerly misnamed `legacy_expr`), not removable debt.
 - `controller/src/optimizer/trait_def.rs` (`OptimizerRule`), `controller/src/emit/trait_def.rs` (`PlanEmitter`), `controller/src/deployment_model.rs` (`DeploymentModelRegistry`) ship as placeholders — the existing free-function emitters and concrete rule loops still drive behaviour. Migrating them onto the trait surfaces lands when the per-deployment-model crate split lands.
 
