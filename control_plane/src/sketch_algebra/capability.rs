@@ -175,12 +175,21 @@ impl Capability {
             (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
                 is_heap_bearing(*have) && handles_compatible(*req, *have)
             }
-            // Exact-aggregation family: the agg_type must match exactly.
-            // There is no `Any` wildcard for ExactAgg — a Sum sid does
-            // not satisfy a MinMax requirement and vice versa. If a
-            // future PR introduces a wildcard semantic (e.g. "any
-            // single-population accumulator"), extend the match here.
-            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => req == have,
+            // Exact-aggregation family: the agg_type must match
+            // exactly OR be the single-pop ⇆ multi-pop equivalent. A
+            // `MultipleSum` policy can serve a `Sum` query by
+            // re-aggregating across keys; the `find_matching_policies`
+            // group_by ⊆ policy_grouping_labels check is what
+            // ultimately decides whether the re-aggregation is
+            // semantically valid. The reverse direction (single-pop
+            // serving multi-pop) is NOT allowed — the single-pop
+            // policy has lost the key dimension and can't recover it.
+            //
+            // Cross-family ExactAgg combos (Sum vs MinMax, etc.)
+            // remain non-satisfiable: they're different operations.
+            (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
+                req == have || multi_pop_satisfies_single(*req, *have)
+            }
             _ => false,
         }
     }
@@ -220,6 +229,22 @@ fn is_frequency_family(h: SketchKindHandle) -> bool {
             | SketchKindHandle::CountSketch
             | SketchKindHandle::CmsWithHeap
             | SketchKindHandle::CountSketchWithHeap
+    )
+}
+
+/// True when `available` is the multi-population equivalent of
+/// `required`'s single-population variant — i.e. a `MultipleSum`
+/// policy can serve a `Sum` query (via re-aggregation across keys),
+/// `MultipleIncrease` can serve `Increase`, `MultipleMinMax` can
+/// serve `MinMax`. Asymmetric: this returns `false` for the reverse
+/// direction (single-pop can't recover keys that have been collapsed
+/// away).
+fn multi_pop_satisfies_single(required: AggregationType, available: AggregationType) -> bool {
+    matches!(
+        (required, available),
+        (AggregationType::Sum, AggregationType::MultipleSum)
+            | (AggregationType::Increase, AggregationType::MultipleIncrease)
+            | (AggregationType::MinMax, AggregationType::MultipleMinMax)
     )
 }
 
