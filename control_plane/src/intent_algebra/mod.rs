@@ -79,22 +79,20 @@ pub mod lower;
 pub mod query_expr;
 pub mod schema;
 
-// Refactor 2026-05 (`refactor/controller-layered-cleanup`): the
-// pre-existing legacy L2 relational IR formerly at
-// `controller/src/algebra/expr.rs` lives here while a separate follow-up
-// unifies it with the canonical `query_expr` module above. It still
-// carries the `QueryExpr` type the `query_parser` modules emit and the
-// planner / allocator / physical planner modules consume today.
+// The **Layer-2 relational IR** — the `QueryExpr` tree the `query_parser`
+// front ends emit (`promql.rs` / `sql.rs`). Formerly `legacy_expr`; it is
+// the real, current L2 IR, not legacy debt. The planner / allocator /
+// physical planner still consume it directly while their migration onto
+// the canonical L3 `query_expr` types is in progress.
 pub mod column_resolution;
-pub mod legacy_expr;
+pub mod relational;
 
-// Step γ7 keystone: the legacy → canonical full-tree converter. The
-// `query_parser` entry points emit raw Layer-2 trees and route them
-// through `convert_root`, which first folds them into the sketch-fused
-// legacy Layer-3 form (the former `legacy_lower` pass, now private to
-// this module) and then maps that onto the canonical IR.
-pub mod legacy_to_canonical;
-pub use legacy_to_canonical::{convert as convert_legacy, convert_root, ConvertError};
+// The L2 → canonical-L3 lowering. The `query_parser` entry points emit a
+// raw `relational::QueryExpr` tree and route it through `convert_root`,
+// which lowers it (single-statistic sketchable `Aggregate` fusion folded
+// in) onto the canonical IR.
+pub mod lower_to_canonical;
+pub use lower_to_canonical::{convert, convert_root, ConvertError};
 
 // Step γ7: the L3 Binder — name resolution as an explicit pass. Produces
 // the complete self-contained `Schema` every `ColumnId` indexes into;
@@ -120,22 +118,12 @@ pub use query_expr::{
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
 
-// Step β plumbing: schema-driven column resolution helpers used by the
-// legacy planning stack (`optimizer/engine.rs`, `physical/{allocator,
-// planner, stage_split}.rs`, `query_parser/*`) to carry an inherited
-// `Schema` alongside every legacy `QueryExpr` traversal. Consumers call
-// `resolve_column_ref` at the point
-// where they need a positional `ColumnId` — Step γ migrates variants
-// one at a time onto the canonical positional form.
+// Schema-driven column-resolution helpers used by the planning stack
+// (`optimizer/engine.rs`, `physical/{allocator,planner,stage_split}.rs`,
+// `query_parser/*`) to carry an inherited `Schema` alongside a
+// `relational::QueryExpr` traversal. Consumers call `resolve_column_ref`
+// at the point where they need a positional `ColumnId`.
 pub use column_resolution::{
     infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
     resolve_column_refs, resolve_named_keys, ResolveError,
 };
-
-// Step γ7 (PR 13): the four γ1–γ4 one-way "approach (c)" bridges
-// (`aggregate_bridge`, `topk_bridge`, `windowed_agg_bridge`,
-// `sketch_agg_bridge`) were deleted. They returned canonical-shape data
-// *minus the child* — useful only as a non-composable migration aid
-// while consumers still pattern-matched legacy variants. Every consumer
-// now runs on the canonical IR via the composable `legacy_to_canonical`
-// converter, so the bridges had zero remaining call sites.

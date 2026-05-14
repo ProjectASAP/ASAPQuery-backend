@@ -1,13 +1,13 @@
-//! The legacy Layer-2 → canonical L3 IR converter.
+//! The Layer-2 → canonical L3 IR converter.
 //!
-//! Recursively converts a *whole* `legacy_expr::QueryExpr` tree (the raw
+//! Recursively converts a *whole* `relational::QueryExpr` tree (the raw
 //! Layer-2 relational IR the `query_parser` front ends emit) into a
 //! *whole* canonical `query_expr::QueryExpr` tree. This is the single
 //! entry the parse path routes through — [`convert_root`].
 //!
 //! ## Variant mapping
 //!
-//! | legacy `QueryExpr`         | canonical `QueryExpr`                              |
+//! | relational `QueryExpr`     | canonical `QueryExpr`                              |
 //! |---|---|
 //! | `Source(spec)`             | `Scan { TimeSeries, label_filters: [], schema }`   |
 //! | `Ref(name)`                | `Ref { name }`                                     |
@@ -24,15 +24,14 @@
 //! | `SetOp`                    | `SetOp`                                            |
 //! | `Sort`                     | `Sort`                                             |
 //! | `Limit`                    | `Limit`                                            |
-//! | `LetBinding`               | `LetBinding` (legacy `body` → canonical `child`)   |
+//! | `LetBinding`               | `LetBinding` (relational `body` → canonical `child`)|
 //! | `PromQLSubquery`           | `Subquery`                                         |
 //! | `BinaryOp`                 | `BinaryOp`                                         |
 //!
-//! The single-statistic sketchable `Aggregate` fusion was, before the
-//! legacy-IR retirement, a separate `legacy_lower` pass that produced
-//! intermediate `SketchAgg` / `WindowedAgg` legacy Layer-3 nodes. Those
-//! variants are gone — the fusion is now done directly in canonical
-//! terms inside the [`convert`] `Aggregate` arm.
+//! The single-statistic sketchable `Aggregate` fusion (`Window`-swap,
+//! `Partition` wrap, `StdDev` / `Variance` fan-out) is done directly in
+//! canonical terms inside the [`convert`] `Aggregate` arm — there is no
+//! intermediate sketch-fused L2-or-L3 IR.
 //!
 //! ## Schema threading
 //!
@@ -41,7 +40,7 @@
 //! complete and self-contained (`(ts, value)` plus every referenced
 //! name), so threading the root schema down is correct except for the
 //! nested-schema-transform case (an `Aggregate` below another
-//! `Aggregate`), which the legacy stack also doesn't handle — proper
+//! `Aggregate`), which the L2→L3 lowering also doesn't handle — proper
 //! bottom-up schema flow lands with the canonical `output_schema_in`
 //! wiring downstream.
 
@@ -56,7 +55,7 @@ use crate::intent_algebra::binder::Binder;
 use crate::intent_algebra::column_resolution::{
     resolve_named_keys, ResolveError,
 };
-use crate::intent_algebra::legacy_expr::{
+use crate::intent_algebra::relational::{
     AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
     ScalarExpr as LScalarExpr,
 };
@@ -479,7 +478,7 @@ fn convert_column_ref(c: &LColumnRef) -> CColumnRef {
 /// `StdDev` / `Variance` fan-out (the caller wraps the pair in a `Merge`
 /// of sibling sketch aggregates).
 fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
     match func {
@@ -517,7 +516,7 @@ fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         AggFunc, AggItem, ColumnRef as LColumnRef, ProjectItem as LProjectItem, SourceSpec,
     };
 
@@ -815,7 +814,7 @@ mod tests {
                 offset: 0,
                 input: Box::new(LQueryExpr::Filter {
                     pred: LScalarExpr::Literal(
-                        crate::intent_algebra::legacy_expr::LiteralValue::Bool(true),
+                        crate::intent_algebra::relational::LiteralValue::Bool(true),
                     ),
                     input: Box::new(LQueryExpr::Window {
                         duration: Duration::from_secs(60),

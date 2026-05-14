@@ -44,7 +44,7 @@
 use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::legacy_expr::{agg_is_exact, agg_is_mergeable};
+use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::intent_algebra::query_expr::{
     BinaryOpKind, ColumnRef, GroupSide, LiteralValue, Predicate, QueryExpr, Source,
     VectorMatchKind,
@@ -635,7 +635,7 @@ pub fn split_typed_three_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
     use crate::intent_algebra::{PartitionKeys, Schema, Source, WindowKind};

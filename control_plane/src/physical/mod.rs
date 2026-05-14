@@ -12,7 +12,7 @@
 //!
 //! | File | Role |
 //! |---|---|
-//! | [`allocator`] | `SketchAllocator` — assigns physical ops to pipeline stages over the legacy [`crate::intent_algebra::legacy_expr::QueryExpr`] IR |
+//! | [`allocator`] | `SketchAllocator` — assigns physical ops to pipeline stages over the legacy [`crate::intent_algebra::relational::QueryExpr`] IR |
 //! | [`planner`] | `PhysicalPlanner` — `QueryExpr` → staged sub-plans (DC three-stage emission) |
 //! | [`plan`] | `PlanNode` / `PlanSummary` — annotated plan tree with cost estimates + stage colouring |
 //! | [`sketch_catalog`] | Candidate sketch types per `AggIntent`, default `SketchParams`, memory estimation |

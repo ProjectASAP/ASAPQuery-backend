@@ -90,7 +90,7 @@ pub enum QueryHint {
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Parse a raw query string (PromQL or SQL) into the **legacy Layer-2**
-/// [`legacy_expr::QueryExpr`](crate::intent_algebra::legacy_expr::QueryExpr) IR.
+/// [`relational::QueryExpr`](crate::intent_algebra::relational::QueryExpr) IR.
 ///
 /// Both parsers emit Layer-2 relational operators (`Aggregate { AggFunc }`,
 /// `Window`, `Filter`, `Join`, …). The Layer-2 → Layer-3 sketch lowering
@@ -102,7 +102,7 @@ pub enum QueryHint {
 /// [`parse_query_expr_canonical`], which is the public canonical-IR entry.
 pub(crate) fn parse_query_expr(
     query: &str,
-) -> anyhow::Result<crate::intent_algebra::legacy_expr::QueryExpr> {
+) -> anyhow::Result<crate::intent_algebra::relational::QueryExpr> {
     let q = query.trim();
     let upper = q.to_ascii_uppercase();
     if upper.starts_with("SELECT") || upper.starts_with("WITH") {
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn legacy_entry_point_returns_raw_layer2() {
-        use crate::intent_algebra::legacy_expr::{AggFunc, QueryExpr as LQueryExpr};
+        use crate::intent_algebra::relational::{AggFunc, QueryExpr as LQueryExpr};
         // `parse_query_expr` is the crate-internal language-dispatch front
         // door: it returns the raw legacy Layer-2 relational tree with no
         // sketch lowering applied — the L2→L3 fusion now lives inside

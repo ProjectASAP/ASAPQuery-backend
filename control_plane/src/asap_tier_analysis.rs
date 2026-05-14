@@ -268,7 +268,7 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
             collect_agg_intents(child, out);
         }
         QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
-        // A-variants lifted in Batch 2 of the legacy_expr migration. They
+        // A-variants lifted in Batch 2 of the relational migration. They
         // carry no AggIntent themselves — recurse into their children to
         // find Aggregates further down the tree.
         QueryExpr::Filter { child, .. }

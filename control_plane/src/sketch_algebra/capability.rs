@@ -605,7 +605,7 @@ pub fn load_capability_overrides(path: &str) -> HashMap<SketchKind, SketchCapabi
 // ── Sketch-family error bounds ───────────────────────────────────────────────
 //
 // These two helpers were originally defined in `controller/src/algebra/expr.rs`
-// (now `controller/src/intent_algebra/legacy_expr.rs`). The 2026-05
+// (now `controller/src/intent_algebra/relational.rs`). The 2026-05
 // layered-cleanup refactor moves them here — they are sketch-family
 // error bounds, so the capability module is their structural home.
 //

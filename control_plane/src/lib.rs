@@ -18,7 +18,7 @@
 //!
 //! | Old path | New path |
 //! |---|---|
-//! | `controller/src/algebra/expr.rs` | `controller/src/intent_algebra/legacy_expr.rs` |
+//! | `controller/src/algebra/expr.rs` | `controller/src/intent_algebra/relational.rs` |
 //! | `controller/src/algebra/lower.rs` | `controller/src/intent_algebra/legacy_lower.rs` |
 //! | `controller/src/algebra/directory.rs` | `controller/src/physical/sketch_catalog.rs` |
 //! | `controller/src/algebra/physical.rs` | `controller/src/physical/planner.rs` |
@@ -41,10 +41,10 @@
 //! - `sketch_algebra` — `Capability` enum + `capability_for(agg_intent: &AggIntent)`
 //!   lookup table (Phase 4 / 5 use this to route raw-name PromQL).
 //! - `intent_algebra` — `AggIntent` + `QueryExpr` DAG (canonical L3 IR;
-//!   `legacy_expr` carries the L2 relational IR the parsers emit and
-//!   `legacy_to_canonical` lowers it to the canonical L3 types).
+//!   `relational` carries the L2 relational IR the parsers emit and
+//!   `lower_to_canonical` lowers it to the canonical L3 types).
 //! - `query_parser` — front-end parsers (Layer 1): `promql.rs` / `sql.rs`
-//!   emit the L2 relational `legacy_expr::QueryExpr` tree.
+//!   emit the L2 relational `relational::QueryExpr` tree.
 //! - `physical` — L5 framework (allocator, planner, plan, sketch_catalog,
 //!   colored_dag, stage_split, topology).
 //! - `optimizer` — L4 rule engine + cost model traits/impls + baseline
@@ -82,7 +82,7 @@ pub mod workload;
 // `pub mod algebra { … }`, `pub use physical::colored_dag as stage_split`,
 // `pub mod planner { … }`) have been removed. `main.rs` and other
 // consumers now reference the canonical module names directly
-// (`emit`, `pipeline`, `intent_algebra::legacy_expr`, `optimizer`,
+// (`emit`, `pipeline`, `intent_algebra::relational`, `optimizer`,
 // `physical`, `physical::colored_dag`, etc.) per the layered-cleanup
 // follow-up task.
 /// PromQL → ASAP-tier candidate analyzer. Phase-9 unification of the

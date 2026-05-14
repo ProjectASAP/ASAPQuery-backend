@@ -40,7 +40,7 @@
 
 use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::legacy_expr::agg_is_exact;
+use crate::intent_algebra::relational::agg_is_exact;
 use crate::intent_algebra::schema::ColumnId;
 use crate::intent_algebra::QueryExpr;
 use crate::types::{SketchType, StageResourceBudgets};
@@ -708,7 +708,7 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
     use crate::intent_algebra::{

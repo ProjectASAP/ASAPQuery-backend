@@ -676,7 +676,7 @@ pub fn physical_plan_to_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
     use crate::intent_algebra::{Schema, Source, WindowKind};

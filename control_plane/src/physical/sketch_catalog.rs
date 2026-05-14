@@ -9,7 +9,7 @@
 //!
 //! All callers now go through this module.
 
-use crate::intent_algebra::legacy_expr::{agg_accuracy, AggIntent, PerPartitionWrap};
+use crate::intent_algebra::relational::{agg_accuracy, AggIntent, PerPartitionWrap};
 use crate::types::{
     AggType, SketchDefaults,
     SketchParams, SketchType,
@@ -267,20 +267,20 @@ mod tests {
 
     #[test]
     fn op_cardinality_yields_hll_type() {
-        let op = crate::intent_algebra::legacy_expr::default_cardinality();
+        let op = crate::intent_algebra::relational::default_cardinality();
         assert_eq!(sketch_type_for_op(&op), SketchType::HLL);
     }
 
     #[test]
     fn op_frequency_yields_countsketch() {
-        let op = crate::intent_algebra::legacy_expr::default_frequency();
+        let op = crate::intent_algebra::relational::default_frequency();
         assert_eq!(sketch_type_for_op(&op), SketchType::CountSketch);
     }
 
     #[test]
     fn per_partition_delegates_to_inner() {
         let wrap = PerPartitionWrap {
-            inner: crate::intent_algebra::legacy_expr::default_cardinality(),
+            inner: crate::intent_algebra::relational::default_cardinality(),
             keys:  vec!["k".into()],
         };
         assert_eq!(sketch_type_for_per_partition(&wrap), SketchType::HLL);
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn memory_per_partition_scales_by_keys() {
-        let inner = crate::intent_algebra::legacy_expr::default_cardinality();
+        let inner = crate::intent_algebra::relational::default_cardinality();
         let base_mem = estimated_sketch_memory_bytes(&inner);
         let wrap = PerPartitionWrap {
             inner,

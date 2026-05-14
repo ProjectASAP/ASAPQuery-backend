@@ -104,7 +104,7 @@ pub enum AggIntent {
     // captures the intent so the routing decision is layered above intent.
     //
     // Note: `histogram_quantile(φ, …)` is NOT an L3 intent — it's a PromQL
-    // /MetricsQL language-level operator. Per Step γ5 of the legacy_expr
+    // /MetricsQL language-level operator. Per Step γ5 of the relational
     // migration, the PromQL parser substitutes it directly into a plain
     // `Aggregate { Quantile(φ) }` (which lowers to
     // `AggIntent::Quantile { q, accuracy }`); bucket-aware handling is a
@@ -336,10 +336,10 @@ fn quantile_suffix(q: f64) -> String {
 
 // ── AggIntent helpers ────────────────────────────────────────────────────────
 //
-// Step γ7: relocated from `legacy_expr.rs` (where they were free fns
-// operating on the canonical re-exported `AggIntent`). `legacy_expr`
+// Step γ7: relocated from `relational.rs` (where they were free fns
+// operating on the canonical re-exported `AggIntent`). `relational`
 // re-exports them during the legacy-IR retirement; consumers migrate to
-// `intent_algebra::*` paths and the re-exports drop with `legacy_expr`.
+// `intent_algebra::*` paths and the re-exports drop with `relational`.
 
 /// Two instances of this aggregation can be merged
 /// (`agg(A ∪ B) = combine(agg(A), agg(B))`). `Avg` is the only
