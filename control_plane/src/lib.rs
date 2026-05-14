@@ -41,12 +41,10 @@
 //! - `sketch_algebra` — `Capability` enum + `capability_for(agg_intent: &AggIntent)`
 //!   lookup table (Phase 4 / 5 use this to route raw-name PromQL).
 //! - `intent_algebra` — `AggIntent` + `QueryExpr` DAG (canonical L3 IR;
-//!   `legacy_expr` / `legacy_lower` carry the older `algebra::expr`-flavored
-//!   IR pending full migration).
-//! - `language_logical_plan` — PromQL → AST → logical plan.
-//! - `query_parser` — front-end parsers (Layer 1).
-//!   The former top-level `query_language/` module was folded into
-//!   `query_parser::language` by this refactor.
+//!   `legacy_expr` carries the L2 relational IR the parsers emit and
+//!   `legacy_to_canonical` lowers it to the canonical L3 types).
+//! - `query_parser` — front-end parsers (Layer 1): `promql.rs` / `sql.rs`
+//!   emit the L2 relational `legacy_expr::QueryExpr` tree.
 //! - `physical` — L5 framework (allocator, planner, plan, sketch_catalog,
 //!   colored_dag, stage_split, topology).
 //! - `optimizer` — L4 rule engine + cost model traits/impls + baseline
@@ -64,7 +62,6 @@ pub mod backend_client;
 pub mod deployment_model;
 pub mod emit;
 pub mod intent_algebra;
-pub mod language_logical_plan;
 pub mod metrics_exposer;
 pub mod monitor;
 pub mod opamp;
