@@ -97,6 +97,14 @@ pub mod legacy_lower;
 pub mod legacy_to_canonical;
 pub use legacy_to_canonical::{convert as convert_legacy, convert_root, ConvertError};
 
+// Step γ7: the L3 Binder — name resolution as an explicit pass. Produces
+// the complete self-contained `Schema` every `ColumnId` indexes into;
+// `convert_root` runs it so positional resolution is total. The
+// `SchemaCatalog` seam (design.md §6 "three metadata sources") makes the
+// schema source pluggable — usage-derived today, registry-backed later.
+pub mod binder;
+pub use binder::{Binder, SchemaCatalog, UsageDerivedCatalog};
+
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
 pub use agg_intent::AggIntent;

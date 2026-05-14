@@ -561,10 +561,49 @@ These three are sometimes conflated and shouldn't be. Only the first two are *sc
 | Source | Where it lives | What it describes | Who reads it |
 |---|---|---|---|
 | **DAG schema** | On every edge of the L3 / L4 / L5 DAG (`Schema` above) | Columns + types flowing between operators | L4 rules (selectivity estimation, push-down legality), L5 emitter |
-| **DB / source schema** | The query target (Prometheus TSDB metric metadata, SQL `information_schema`, DataFusion catalog) | What metrics / tables / columns exist in the data plane, with their types and indexing | `core::lower::*` to resolve names during L1→L2; exposed through a `SchemaCatalog` interface |
+| **DB / source schema** | The query target (Prometheus TSDB metric metadata, SQL `information_schema`, DataFusion catalog) | What metrics / tables / columns exist in the data plane, with their types and indexing | The **Binder** (below), via the `SchemaCatalog` interface (`core::intent_algebra::binder`) |
 | **Sketch catalog** | `core::physical::sketch_catalog` (built at startup; static) | What sketches the runtime can build; what intents each one serves; mergeability, accuracy / confidence guarantees, supported aggregation keys, parameter ranges | L4 binding rules to choose a sketch for an `AggIntent`; L5 to instantiate the sketch |
 
-L1→L2 lowering reads the **DB schema** to resolve symbols. L3 onward, every edge carries a **DAG schema** that is type-checked locally. L4 binding rules consult the **sketch catalog** to map an intent to a concrete sketch under the deployment's constraints. They are three separate inputs to three distinct decisions.
+The **Binder** reads the **DB schema** to resolve symbols. L3 onward, every edge carries a **DAG schema** that is type-checked locally. L4 binding rules consult the **sketch catalog** to map an intent to a concrete sketch under the deployment's constraints. They are three separate inputs to three distinct decisions.
+
+#### The Binder — name resolution as an explicit pass
+
+Every mature query engine has exactly one explicit boundary where
+symbolic column / table *names* are resolved against a schema source,
+and everything downstream of that boundary is fully resolved:
+
+| Engine | Resolution pass | Resolved column identity |
+|---|---|---|
+| ClickHouse | `QueryAnalyzer` rewrites `IdentifierNode` → `ColumnNode` against `StorageSnapshot` | name + type + source pointer |
+| Trino | `Analyzer` → `Analysis` side-table, against catalog `Metadata` | opaque, plan-local `Symbol` |
+| RisingWave | `Binder` resolves against its `Catalog` | positional `InputRef { index, data_type }` |
+| **ASAP control plane** | **`core::intent_algebra::binder::Binder`** | positional `ColumnId` (index into `Schema`) |
+
+Our canonical L3 IR already commits to positional column identity —
+`Aggregate.by: Vec<ColumnId>`, exactly RisingWave's `InputRef`. The
+[`Binder`] is the pass that *produces* it: given a query tree, it walks
+it, collects every referenced column / group-key name, and builds the
+complete, **self-contained** [`Schema`] every `ColumnId` in the lowered
+tree indexes into — the IR's own "RelationType" (Trino) / bind scope
+(RisingWave). Resolution downstream is then **total** — it cannot fail
+on a well-formed tree.
+
+The schema source is the **`SchemaCatalog`** seam:
+
+- The default `UsageDerivedCatalog` knows nothing — every schema is
+  derived purely from what the query references. This is the honest
+  state for the observability domain: metric label sets are open-ended
+  and data-dependent, there is no closed catalog to resolve against
+  (unlike a SQL `information_schema`).
+- A registry-backed `SchemaCatalog` (a metric-schema registry) is future
+  work. Crucially, **the `Binder` pass does not change when it lands** —
+  only the catalog impl swaps.
+
+Placement: today the Binder runs at the L2→L3 (legacy → canonical)
+conversion boundary (`legacy_to_canonical::convert_root` calls it).
+Once the legacy IR is retired it moves into the `core::lower` L1→L2→L3
+passes proper — the `lower_*(ast, schema)` signatures below already
+anticipate a schema parameter at that point.
 
 #### `AggIntent` — what to compute, not how
 
@@ -745,6 +784,13 @@ pub fn lower_elasticdsl(ast: EsAst, schema: &IndexSchema) -> Result<QueryExpr>;
 ```
 
 Once a query hits L3 it's language-agnostic. All deployment models downstream see the same IR.
+
+The `schema` parameter on each pass is supplied by the **Binder** — see
+§6 "The Binder — name resolution as an explicit pass". The Binder is the
+single place symbolic names become positional `ColumnId`s; the `lower_*`
+passes consume its output and never resolve names ad-hoc. Today the
+Binder runs at the L2→L3 boundary inside `legacy_to_canonical`; it folds
+into these `lower_*` signatures once the legacy IR is retired.
 
 ### `core::pipeline` — orchestration
 
