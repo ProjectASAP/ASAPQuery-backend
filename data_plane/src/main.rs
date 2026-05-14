@@ -241,7 +241,7 @@ struct Args {
     /// Path to the per-metric backend storage routing YAML
     /// (`{metric_name: storage_backend}` map). Loaded at startup and
     /// consulted by the HTTP query handler on every PromQL request to
-    /// pick the right engine (`ASAPQueryEngine` for warm-tier sketches,
+    /// pick the right engine (`ASAPQueryEngine` for ASAP-tier sketches,
     /// `GorillaQueryEngine` for the cold archive, etc.). Without
     /// this flag the handler falls back to the streaming-config
     /// single axis (always `SketchStore`) and the EngineRouter is
@@ -305,7 +305,7 @@ async fn main() -> Result<()> {
     // (sid resolution + unknown_series_ids stamping; SketchStore
     // .append_sample on every modified-OTLP sketch DP) AND the
     // ASAPQueryEngine query path (SketchStore.classify / query_range
-    // for warm-tier reads) hold clones of these Arcs. Allocated
+    // for ASAP-tier reads) hold clones of these Arcs. Allocated
     // here before BOTH the ASAPQueryEngine and the precompute engine
     // are constructed so both can be wired with a single canonical
     // instance — even when precompute is disabled, the engine still
@@ -334,7 +334,7 @@ async fn main() -> Result<()> {
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all
     // precompute + sketch writes land (M2.3.6a), so flushing it to
-    // disk is what makes Phase 5 warm-tier state survive restarts.
+    // disk is what makes Phase 5 ASAP-tier state survive restarts.
     // The legacy `SketchStore::with_persistence_per_key` flusher
     // constructed above is now a no-op (its source has no writes) —
     // it stays in place until subsequent M2.3.6 sub-PRs delete the
@@ -401,10 +401,10 @@ async fn main() -> Result<()> {
             hot_reload_config.clone(),
             args.prometheus_scrape_interval,
         )
-        // Phase 5 wire-in (refactor 2026-05): hand the warm-tier
+        // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
         // SketchStore to the query engine so SidLookup classification
         // drives the Phase 6 archive failover via
-        // EngineError::CapabilityMiss when the warm tier is empty
+        // EngineError::CapabilityMiss when the ASAP tier is empty
         // / ghost / unknown.
         .with_sketch_index(sketch_index.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
@@ -668,7 +668,7 @@ async fn main() -> Result<()> {
             }
             Err(_) => {
                 info!(
-                        "ASAP_GORILLA_S3_* env vars not configured — router serves warm-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing, or set ASAP_THANOS_QUERY_URL to enable Path A2 thanos forwarding)",
+                        "ASAP_GORILLA_S3_* env vars not configured — router serves ASAP-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing, or set ASAP_THANOS_QUERY_URL to enable Path A2 thanos forwarding)",
                     );
             }
         },

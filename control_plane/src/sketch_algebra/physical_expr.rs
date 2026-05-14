@@ -181,7 +181,7 @@ pub enum PhysicalExpr {
     /// Exact-aggregation node — produces the exact aggregation result
     /// (Sum / Count-as-Sum / Increase / MinMax / …) directly. The L4
     /// counterpart to the data-plane `AggPayload::ExactAgg` shape:
-    /// state at the warm-tier sid is a typed accumulator (not a
+    /// state at the ASAP-tier sid is a typed accumulator (not a
     /// sketch byte buffer), and there's no separate readout step —
     /// the accumulator's value IS the answer.
     ///

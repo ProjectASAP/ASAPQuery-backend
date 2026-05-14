@@ -50,10 +50,10 @@ pub struct IngestState {
     /// exporter). Holding it on `IngestState` lets every ingest source
     /// reach the same idempotent compute-or-mint cache.
     pub series_resolver: Arc<crate::drivers::ingest::series_resolver::SeriesIdResolver>,
-    /// Phase 5 — two-level sketch warm tier (instance metadata +
+    /// Phase 5 — two-level sketch ASAP tier (instance metadata +
     /// per-sid columnar state). Populated by the OTLP ingest path on
     /// every modified-OTLP first-class sketch DataPoint; queried by
-    /// the `ASAPQueryEngine` query path (warm-tier hit / ghost / unknown
+    /// the `ASAPQueryEngine` query path (ASAP-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
     pub sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
 }

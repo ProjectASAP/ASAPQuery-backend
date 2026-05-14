@@ -11,9 +11,9 @@
 
 pub mod engine;
 
-// Phase-5 reorg: warm-tier reducer moved to `sketch_db::query`. The
+// Phase-5 reorg: ASAP-tier reducer moved to `sketch_db::query`. The
 // engine still consumes it via that canonical path.
-pub use crate::storage_engines::sketch_db::query as warm_tier;
+pub use crate::storage_engines::sketch_db::query as asap_tier;
 
 #[cfg(test)]
 pub mod tests;

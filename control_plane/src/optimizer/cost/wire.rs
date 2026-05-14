@@ -220,7 +220,7 @@ impl Default for WireWorkload {
 #[derive(Debug, Clone, PartialEq)]
 pub enum BindMode {
     /// Mode 1: sketch processor at the edge ships sketch state via OTLP
-    /// to the backend's warm tier. The default for high-sample-per-window
+    /// to the backend's ASAP tier. The default for high-sample-per-window
     /// workloads where the sketch's per-flush wire cost beats raw OTLP.
     SketchAtEdge { family: SketchKind },
 

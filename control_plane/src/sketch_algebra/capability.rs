@@ -5,7 +5,7 @@
 //! at `control_plane/sketch_capabilities.yml`, the compiled-in defaults in
 //! `algebra/optimizer.rs::sketch_capability`, the `SketchKind` enum in
 //! `sketch_algebra/params.rs`, and the per-query `Capability` /
-//! `SketchKindHandle` invented inside `warm_tier_analysis.rs` (PR #128).
+//! `SketchKindHandle` invented inside `asap_tier_analysis.rs` (PR #128).
 //! All four collapse into this module:
 //!
 //! - [`SketchCapability`] / [`SupportedIntent`] — per-sketch performance
@@ -17,11 +17,11 @@
 //!   `deletable`) — `SketchCapability` here is the perf / cost-model surface,
 //!   `SketchStateMetadata` is the L4 catalog-flag surface.
 //! - [`Capability`] / [`SketchKindHandle`] — query-side capability tag,
-//!   used by the warm-tier reducer in `asap-query-engine` to dispatch
+//!   used by the ASAP-tier reducer in `asap-query-engine` to dispatch
 //!   PromQL → per-Capability sketch evaluation.
-//! - [`capability_for`] — the **semantic** intent → warm-tier dispatch
+//! - [`capability_for`] — the **semantic** intent → ASAP-tier dispatch
 //!   bridge. PromQL → intent_algebra::lower → `AggIntent` → (this fn) →
-//!   `Capability`. The warm-tier analyzer is now a thin facade around
+//!   `Capability`. The ASAP-tier analyzer is now a thin facade around
 //!   this single function; PromQL function-name string matching lives
 //!   only inside the lowerer.
 //! - [`default_capability_table`] / [`load_capability_overrides`] —
@@ -33,7 +33,7 @@
 //!
 //! Before Step 2a, "what can a sketch do" was duplicated four times.
 //! Adding a new sketch family meant touching `params.rs`,
-//! `optimizer.rs`, the YAML, and `warm_tier_analysis.rs`. After Step 2a
+//! `optimizer.rs`, the YAML, and `asap_tier_analysis.rs`. After Step 2a
 //! every capability fact has exactly one home — `params.rs` declares
 //! the sketch families, this module declares everything else.
 
@@ -51,14 +51,14 @@ use promql_utilities::query_logics::enums::AggregationType;
 // ── Query-side capability tag ────────────────────────────────────────────────
 
 /// Warm-tier capability tag. One variant per logical query family the
-/// warm tier can answer. The inner [`SketchKindHandle`] is the
+/// ASAP tier can answer. The inner [`SketchKindHandle`] is the
 /// implementation choice (e.g. DDSketch vs KLL for `QuantileApprox`).
 /// Query routing keys on the variant, not the implementation, so two
 /// CMS instances and one CountSketch instance for the same metric-and-
 /// group-by all map to `FrequencyTopk` and the query path picks any
 /// of them.
 ///
-/// Used by both the control plane (via [`capability_for`] in the warm-tier
+/// Used by both the control plane (via [`capability_for`] in the ASAP-tier
 /// analyzer) and the `asap-query-engine` backend (re-exported as the
 /// `sketch_index::Capability` it indexes sketch instances under). One
 /// canonical definition; the backend re-exports rather than duplicating.
@@ -85,7 +85,7 @@ pub enum Capability {
     /// wire format can answer this. `Any` required matches either
     /// `CmsWithHeap` or `CountSketchWithHeap`.
     FrequencyTopk(SketchKindHandle),
-    /// Exact-aggregation warm-tier state — Sum / Count / MinMax / Avg /
+    /// Exact-aggregation ASAP-tier state — Sum / Count / MinMax / Avg /
     /// Rate / Increase / SetAggregator etc. Backed by a per-accumulator
     /// payload (`AggPayload::ExactAgg` in the data plane). One variant
     /// per [`AggregationType`] — the inner enum names the concrete
@@ -93,7 +93,7 @@ pub enum Capability {
     ///
     /// Distinct from the `*Approx` variants above: the `*Approx`
     /// capabilities serve approximate sketch-bound intents; `ExactAgg`
-    /// serves the warm-tier exact-aggregation path (the data plane's
+    /// serves the ASAP-tier exact-aggregation path (the data plane's
     /// `AggKind::ExactAgg`-backed sids). Routing an analyzer candidate
     /// at `Capability::ExactAgg(Sum)` to a sid whose `agg_kind` is
     /// `AggKind::ExactAgg { agg_type: Sum, .. }` is what closes the gap
@@ -124,7 +124,7 @@ pub enum SketchKindHandle {
     CountMin,
     /// CMS paired with a Misra-Gries / heavy-hitter heap. Distinct from
     /// `CountMin` because vanilla CMS carries no item universe — the
-    /// heap is what lets the warm-tier reducer enumerate top-k items
+    /// heap is what lets the ASAP-tier reducer enumerate top-k items
     /// without an external item list.
     CmsWithHeap,
     /// CountSketch paired with a heavy-hitter heap. Same role as
@@ -145,7 +145,7 @@ impl Capability {
     ///
     /// `self` is the **required** capability (from the analyzer);
     /// `indexed` is the **available** capability (from the sketch
-    /// index). The backend's warm-tier hook reads both and routes the
+    /// index). The backend's ASAP-tier hook reads both and routes the
     /// query to whichever sids satisfy.
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
@@ -225,13 +225,13 @@ fn is_frequency_family(h: SketchKindHandle) -> bool {
 
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
 
-/// Map a semantic [`AggIntent`] to the warm-tier [`Capability`] that can
-/// answer it. Returns `None` for intents that have no warm-tier sketch
+/// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
+/// answer it. Returns `None` for intents that have no ASAP-tier sketch
 /// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
 /// — see [`AggIntent::archive_only`]).
 ///
 /// This is the **single bridge** between the L3 intent vocabulary and
-/// the L4/Q1 sketch-capability vocabulary. Both the warm-tier analyzer
+/// the L4/Q1 sketch-capability vocabulary. Both the ASAP-tier analyzer
 /// and the optimizer's binding rules read it. PromQL function-name
 /// string matching does NOT happen here — it happens in the lowerer
 /// (`intent_algebra::lower::lower_parsed_query`), which is the single
@@ -251,7 +251,7 @@ fn is_frequency_family(h: SketchKindHandle) -> bool {
 /// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
 /// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
 /// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
-/// | `Sum` | `Some(ExactAgg(Sum))` — warm-tier exact precompute (PR-6 follow-up) |
+/// | `Sum` | `Some(ExactAgg(Sum))` — ASAP-tier exact precompute (PR-6 follow-up) |
 /// | `Rate` / `Increase` | `Some(ExactAgg(Increase))` — counter-reset-aware precompute (PR-6 follow-up) |
 /// | `Avg` | `None` — needs cross-policy join (Sum + Count); follow-up |
 /// | Every archive-only intent | `None` |
@@ -281,8 +281,8 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             //
             // PR-6 follow-up: exact count = sum-of-1s, which is
             // served by the `AggregationType::Sum` exact-precompute
-            // operator at the warm tier. Returning that capability
-            // lets the analyzer route `count_over_time` to a warm-tier
+            // operator at the ASAP tier. Returning that capability
+            // lets the analyzer route `count_over_time` to a ASAP-tier
             // ExactAgg sid instead of falling through to archive.
             if is_exact(accuracy) {
                 Some(Capability::ExactAgg(AggregationType::Sum))
@@ -292,7 +292,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         }
         AggIntent::TopK { accuracy, .. } => {
             if is_exact(accuracy) {
-                // Exact top-k must use HashAgg+Heap; no warm-tier sketch.
+                // Exact top-k must use HashAgg+Heap; no ASAP-tier sketch.
                 None
             } else {
                 // Top-k is intrinsically heavy-hitter — only heap-bearing
@@ -329,7 +329,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         // These intents previously returned `None` and routed to the
         // archive engine. Now that the data plane carries
         // `Capability::ExactAgg(agg_type)` on ExactAgg-backed sids,
-        // the analyzer can match them to warm-tier exact-precompute
+        // the analyzer can match them to ASAP-tier exact-precompute
         // state instead. `is_satisfied_by` checks `agg_type` equality
         // structurally — a sid registered as `ExactAgg(Sum)` only
         // satisfies a required `ExactAgg(Sum)`.
@@ -337,13 +337,13 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         AggIntent::Rate { .. } | AggIntent::Increase { .. } => {
             Some(Capability::ExactAgg(AggregationType::Increase))
         }
-        // ── Avg: still no warm-tier substitute ───────────────────────
+        // ── Avg: still no ASAP-tier substitute ───────────────────────
         // Avg = Sum / Count, which needs two separate ExactAgg policies
         // (one for Sum, one for Count) joined at query time. The L4
         // binder doesn't yet emit that pattern, so capability_for keeps
         // Avg on the archive path for now. Follow-up.
         AggIntent::Avg => None,
-        // Archive-only intents — never bind to a warm-tier capability;
+        // Archive-only intents — never bind to a ASAP-tier capability;
         // routed to the cold tier (Gorilla / Thanos).
         AggIntent::Absent
         | AggIntent::Present
@@ -626,7 +626,7 @@ mod tests {
             accuracy: AccuracyTarget::Exact,
         };
         // Exact quantiles must be answered by HashAgg/SortAgg — no
-        // warm-tier sketch in this case.
+        // ASAP-tier sketch in this case.
         assert_eq!(capability_for(&intent), None);
     }
 
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn capability_for_count_exact_routes_to_exact_agg_sum() {
         // PR-6 follow-up: `count_over_time` lowers to
-        // `Count{accuracy:Exact}`; count = sum-of-1s, so the warm-tier
+        // `Count{accuracy:Exact}`; count = sum-of-1s, so the ASAP-tier
         // ExactAgg path uses `AggregationType::Sum`. Pre-follow-up
         // this returned `None` and the analyzer routed to archive.
         let intent = AggIntent::Count {
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn capability_for_sum_routes_to_exact_agg_sum() {
-        // PR-6 follow-up: Sum routes to warm-tier ExactAgg(Sum) state.
+        // PR-6 follow-up: Sum routes to ASAP-tier ExactAgg(Sum) state.
         // Pre-follow-up this returned `None`.
         assert_eq!(
             capability_for(&AggIntent::Sum),
@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn capability_for_avg_returns_none() {
-        // Avg is exact at L3 — no warm-tier sketch substitutes for it
+        // Avg is exact at L3 — no ASAP-tier sketch substitutes for it
         // today (a sketch-bound `Avg` would fold onto `Quantile{q=0.5}`
         // only when the cost model allows the relaxation, which is a
         // follow-up).
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn capability_for_rate_increase_route_to_exact_agg_increase() {
-        // PR-6 follow-up: Rate and Increase route to warm-tier
+        // PR-6 follow-up: Rate and Increase route to ASAP-tier
         // ExactAgg(Increase) — the counter-reset-aware exact precompute.
         // Pre-follow-up this returned `None`.
         let exact_inc = Some(Capability::ExactAgg(AggregationType::Increase));
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn capability_for_topk_exact_returns_none() {
-        // Exact top-k must use HashAgg+Heap; no warm-tier sketch.
+        // Exact top-k must use HashAgg+Heap; no ASAP-tier sketch.
         let intent = AggIntent::TopK {
             k: 10,
             accuracy: AccuracyTarget::Exact,
@@ -1006,7 +1006,7 @@ mod tests {
         // wired into `is_satisfied_by` but `capability_for` still
         // returned `None` for Sum / Rate / Increase / Count{Exact}.
         // This test locks in the follow-up that flipped those four
-        // intents to route through warm-tier ExactAgg state.
+        // intents to route through ASAP-tier ExactAgg state.
         assert_eq!(
             capability_for(&AggIntent::Sum),
             Some(Capability::ExactAgg(AggregationType::Sum))

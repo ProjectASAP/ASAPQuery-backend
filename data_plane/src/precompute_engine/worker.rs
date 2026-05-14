@@ -720,7 +720,7 @@ impl Worker {
             // stamps every sketch with the same `time_unix_nano`
             // (e.g. window-start), `previous_watermark_ms` freezes
             // and `closed_windows(prev, prev+1)` returns empty
-            // forever — the 30s window never closes and warm-tier
+            // forever — the 30s window never closes and ASAP-tier
             // queries come back empty even though sketches keep
             // arriving (sweep blocker #2). Force `effective_wm` past
             // `pane_start + window_size_ms` for any pane older than
@@ -2066,7 +2066,7 @@ aggregations:
     }
 
     // -----------------------------------------------------------------------
-    // Sweep blocker #2: warm-tier persistence path for sketch ingest.
+    // Sweep blocker #2: ASAP-tier persistence path for sketch ingest.
     //
     // Pre-fix the OTLP sketch path produced `worker_process_accumulator`
     // log lines but never persisted into the per_key store, so PromQL
@@ -2145,7 +2145,7 @@ aggregations:
         let captured = sink.drain();
         assert!(
             !captured.is_empty(),
-            "warm-tier sketch persistence regressed: window close did not emit any output. \
+            "ASAP-tier sketch persistence regressed: window close did not emit any output. \
              pre-fix this is exactly the symptom the sweep agent saw — \
              `worker_process_accumulator` fires but per_key store stays empty."
         );
@@ -2191,7 +2191,7 @@ aggregations:
     /// If a future change changes `grouping_labels` to include
     /// `rack/node/pod`, the agent's per-tuple emit shape would land 1000
     /// outputs in the store instead of `n_zones`, blowing up cardinality
-    /// and breaking warm-tier reads.
+    /// and breaking ASAP-tier reads.
     #[test]
     fn test_grouping_labels_roll_up_per_tuple_sketches() {
         let cfg = make_agg_config(
@@ -2278,7 +2278,7 @@ aggregations:
     // `time_unix_nano`, e.g. window-start instead of flush-time), so
     // `closed_windows(prev_wm, prev_wm + 1)` in `flush_all` returns empty
     // forever, the 30s window never closes, no output ever lands in the
-    // per_key store, and warm-tier queries come back empty even though
+    // per_key store, and ASAP-tier queries come back empty even though
     // `worker_process_accumulator` keeps logging.
     //
     // The fix tracks each pane's wall-clock birth time and force-closes its

@@ -135,7 +135,7 @@ pub struct EdgeStageConfig {
     pub prometheus_archive_metrics: Vec<PrometheusArchiveMetric>,
     /// Phase 3.2.5 — archive-tier metrics that should flow through the
     /// `gorillas3` processor at the edge agent (write a Gorilla-S3
-    /// chunk + Prometheus TSDB block to MinIO so the warm-tier query
+    /// chunk + Prometheus TSDB block to MinIO so the ASAP-tier query
     /// engine and the Thanos store-gateway can both serve them).
     ///
     /// Empty list = no archive-tier metrics → no `gorillas3` processor
@@ -153,7 +153,7 @@ pub struct EdgeStageConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_tier_metrics: Vec<ArchiveTierMetric>,
     /// Phase 3.2.5 — metrics that must be carried through the
-    /// warm-tier pipeline WITHOUT the family-specific sketch processor
+    /// ASAP-tier pipeline WITHOUT the family-specific sketch processor
     /// renaming them. The freshness probes are timestamp counters by
     /// design (the wire value `unix_ts_ms_of_emission` IS the freshness
     /// signal); the DDSketch processor's `_quantile` suffix would
@@ -165,7 +165,7 @@ pub struct EdgeStageConfig {
     /// dispatches by `metric.name`: matching metrics route to a
     /// `metrics/warm_passthrough` pipeline (gorillas3 if archive is
     /// declared, then exporter — NO sketch processor); everything
-    /// else takes the existing `metrics/warm_tier` pipeline.
+    /// else takes the existing `metrics/asap_tier` pipeline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warm_passthrough_metrics: Vec<String>,
     /// MVP §46 — per-metric → sketch-family mapping populated by the
@@ -493,7 +493,7 @@ impl Emitter for ThreeStageEmitter {
                             label_proj: label_proj.clone(),
                         });
                     // Phase 3.2.5 (Bug a): Mode-3 metrics also land in
-                    // the Gorilla-S3 archive so the warm-tier
+                    // the Gorilla-S3 archive so the ASAP-tier
                     // sketch-engine and the Thanos store-gateway can
                     // both serve them. The `gorillas3` processor block
                     // is emitted by the L5 emitter when this list is

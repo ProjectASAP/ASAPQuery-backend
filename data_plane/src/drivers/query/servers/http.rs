@@ -145,12 +145,12 @@ pub struct HttpServer {
     config: HttpServerConfig,
     query_engine: Arc<ASAPQueryEngine>,
     /// Phase-5/6 capability router. Built from `query_engine` at
-    /// construction time (`ASAPQueryEngine` registered as the warm-tier
+    /// construction time (`ASAPQueryEngine` registered as the ASAP-tier
     /// `QueryEngine`) and extended via [`Self::with_query_engine`] —
     /// e.g. to plug in a `GorillaQueryEngine` for the cold archive
     /// tier. Instant-query dispatch consults this for metrics whose
     /// `StreamingConfig::storage_backend()` is anything other than
-    /// `SketchStore`; warm-tier queries still take the direct
+    /// `SketchStore`; ASAP-tier queries still take the direct
     /// `ASAPQueryEngine::handle_query` path so they keep the
     /// `KeyByLabelNames` Prometheus needs to populate the `metric`
     /// map. See `docs/design-gorilla-s3-cold-engine.md` §8.
@@ -782,7 +782,7 @@ fn first_metric_name(expr: &promql_parser::parser::Expr) -> Option<String> {
 /// Response shape mirrors `process_via_router`'s success path: a
 /// Prometheus instant vector with one element (empty labels, scalar
 /// value), a `data_source: asap_query` info-line so the wire format
-/// is consistent with the warm-tier path the routing table comment
+/// is consistent with the ASAP-tier path the routing table comment
 /// describes as the right home for the `_warm` probe.
 async fn try_answer_freshness_probe(
     state: &AppState,
@@ -885,7 +885,7 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
 
 /// Direct `ASAPQueryEngine::handle_query` dispatch — preserves the
 /// `KeyByLabelNames` the Prometheus adapter needs to fill in the
-/// `metric` map. Used for warm-tier metrics (the default) so the
+/// `metric` map. Used for ASAP-tier metrics (the default) so the
 /// response surface is byte-identical to the pre-router path. Adds a
 /// `data_source: asap_query` info-line at the JSON layer so Phase-6
 /// callers can byte-compare regardless of the dispatch path.
@@ -2914,7 +2914,7 @@ aggregations:
     // `feat/http-server-wire-engine-router` PR — every query that
     // arrives through `/api/v1/query` now consults the
     // `StreamingConfig::storage_backend()` axis and dispatches via the
-    // `EngineRouter` for non-warm-tier metrics. The wire response
+    // `EngineRouter` for non-ASAP-tier metrics. The wire response
     // carries a `data_source: <id>` info-line so dashboards / e2e
     // tests can byte-compare which engine answered.
 
@@ -3059,7 +3059,7 @@ aggregations:
     /// `503 NoEngineRegistered` test.
     async fn setup_test_server_with_empty_router(metric_storage_backend: StorageBackend) -> u16 {
         // `HttpServer::new` always registers ASAPQueryEngine for the
-        // warm tier. To force `NoEngineRegistered` we point the
+        // ASAP tier. To force `NoEngineRegistered` we point the
         // metric at a backend whose data_source_id doesn't match
         // any registered engine — since `HttpServer::new` only
         // registers ASAPQueryEngine (asap_query), routing a
@@ -3085,7 +3085,7 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_routes_warm_tier_metric_to_simple_engine() {
+    async fn http_routes_asap_tier_metric_to_simple_engine() {
         // Default (no hot-reload) → `SketchStore`. The handler
         // takes the direct `ASAPQueryEngine::handle_query` path; the
         // response's `infos` array carries `data_source: asap_query`
@@ -3101,7 +3101,7 @@ aggregations:
             .expect("Failed to send request");
         assert!(
             resp.status().is_success(),
-            "warm-tier dispatch must return 2xx; got {}",
+            "ASAP-tier dispatch must return 2xx; got {}",
             resp.status()
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -3146,11 +3146,11 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_query_with_no_storage_config_defaults_to_warm_tier() {
+    async fn http_query_with_no_storage_config_defaults_to_asap_tier() {
         // `StreamingConfig::default()` has `storage_backend =
         // SketchStore` (per the `#[serde(default)]` on the
         // field — see `streaming_config.rs`). A server set up
-        // without a hot-reload handle still infers warm-tier and
+        // without a hot-reload handle still infers ASAP-tier and
         // takes the ASAPQueryEngine direct path. Back-compat for
         // pre-Phase-5 deploys whose YAML doesn't include the new
         // `storage_backend` key.
@@ -3265,11 +3265,11 @@ aggregations:
     async fn http_router_serves_double_write_via_warm_head() {
         // Step-1 of the JSONL deprecation deleted the
         // `ColdJsonlFallback` last-resort slot; the surviving
-        // failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
+        // failover surface is ASAP-tier sketch ↔ Gorilla-S3 archive.
         // The HTTP handler dispatches with default
         // `(Statistic::Sum, AccuracyTarget::Approximate)`, so for a
         // `DoubleWrite` metric the compatibility list is
-        // `[SketchStore, GorillaObjectStore]` and the warm-tier
+        // `[SketchStore, GorillaObjectStore]` and the ASAP-tier
         // mock answers first. The archive must NOT be hit (no
         // failover needed when the head succeeds).
         let (warm_ok, warm_calls) =
@@ -3300,7 +3300,7 @@ aggregations:
         assert_eq!(
             archive_calls.load(Ordering::SeqCst),
             0,
-            "archive must not run when the warm-tier head answers cleanly",
+            "archive must not run when the ASAP-tier head answers cleanly",
         );
     }
 
@@ -3366,9 +3366,9 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_production_path_unlisted_metric_falls_back_to_warm_tier() {
+    async fn http_production_path_unlisted_metric_falls_back_to_asap_tier() {
         // The same routing table only overrides `http_requests_total`;
-        // a query against a different metric must take the warm-tier
+        // a query against a different metric must take the ASAP-tier
         // direct-dispatch path (no `EngineRouter` round-trip).
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
@@ -3392,7 +3392,7 @@ aggregations:
             .expect("Failed to send request");
         assert!(
             resp.status().is_success(),
-            "warm-tier fallback must return 2xx; got {}",
+            "ASAP-tier fallback must return 2xx; got {}",
             resp.status(),
         );
         let body: serde_json::Value = resp.json().await.unwrap();
@@ -3436,10 +3436,10 @@ aggregations:
     // applies_to_query_shape)` targets. The two tests below mirror
     // `http_production_path_routes_archive_metric_via_routing_table`
     // — same setup, but the routing table has TWO targets for
-    // `http_requests_total`: a default warm-tier slot and a
+    // `http_requests_total`: a default ASAP-tier slot and a
     // cold-archive slot scoped to `[count, topk, rate_post_hoc]`.
     // A `count(...)` query must land on the archive; a
-    // `quantile_over_time(...)` query must land on the warm tier.
+    // `quantile_over_time(...)` query must land on the ASAP tier.
 
     #[tokio::test]
     async fn http_v7_dual_routing_count_lands_on_archive() {
@@ -3488,7 +3488,7 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn http_v7_dual_routing_quantile_stays_on_warm_tier() {
+    async fn http_v7_dual_routing_quantile_stays_on_asap_tier() {
         use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
@@ -3525,7 +3525,7 @@ aggregations:
         // Warm tier path returns 2xx with `data_source: asap_query`
         // (the ASAPQueryEngine returns None for this unconfigured
         // metric, but the handler still annotates the wire response
-        // with the warm-tier source).
+        // with the ASAP-tier source).
         assert!(
             resp.status().is_success(),
             "v7 dual-routing: quantile must dispatch and return 2xx; got {}",
@@ -3642,7 +3642,7 @@ aggregations:
                 .await;
 
         let client = Client::new();
-        // No override → quantile shape routes to warm tier.
+        // No override → quantile shape routes to ASAP tier.
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
             .query(&[
@@ -4180,7 +4180,7 @@ aggregations:
     async fn http_engine_override_can_target_thanos_query_id() {
         // X-ASAP-Engine: thanos_query must reach the forwarder
         // even when the metric's storage axis would otherwise route
-        // to the warm tier. Path A2's accuracy reducer relies on
+        // to the ASAP tier. Path A2's accuracy reducer relies on
         // this for apples-to-apples comparison runs.
         use crate::query_engines::thanos_query_engine::forward::test_support::{
             spawn_mock_thanos, CANNED_VECTOR_BODY};
@@ -4195,7 +4195,7 @@ aggregations:
         let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
 
         let server_port = setup_test_server_with_named_router(
-            StorageBackend::SketchStore, // Default storage axis is warm tier.
+            StorageBackend::SketchStore, // Default storage axis is ASAP tier.
             vec![arc_engine],
         )
         .await;

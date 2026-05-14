@@ -308,7 +308,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // Pre-PR-6-follow-up: `Sum` had no `Bind*` rule and passed through
     // as `PhysicalExpr::Logical`. The L4 binder rule `BindExactAgg`
     // (added in the PR-6 follow-up) now matches and emits
-    // `PhysicalExpr::ExactAgg { agg_type: Sum, .. }` so the warm-tier
+    // `PhysicalExpr::ExactAgg { agg_type: Sum, .. }` so the ASAP-tier
     // exact-aggregation path can serve the intent.
     let expr = QueryExpr::Aggregate {
         by: vec![],
@@ -484,11 +484,11 @@ fn phase_b_pattern_temporal_and_spatial_combined() {
         child: Box::new(windowed_scan()),
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
-    // Rate has no warm-tier sketch family today — expect Logical.
+    // Rate has no ASAP-tier sketch family today — expect Logical.
     assert!(matches!(bound, PhysicalExpr::Logical(_)));
 }
 
-/// Phase β archive-only intent: any of the no-warm-tier-family entries
+/// Phase β archive-only intent: any of the no-ASAP-tier-family entries
 /// (`Absent`, `Present`, `Delta`, …) matches `BindArchiveOnly` → `Logical`
 /// pass-through, and the L5 emitter / Phase α routing reads
 /// `AggIntent::archive_only() == true` to flag the StreamingConfig entry
@@ -610,10 +610,10 @@ fn binding_is_archive(expr: &PhysicalExpr) -> bool {
         // (its own engine ID), which the L5 emitter handles via
         // emit_backend_storage_routing rather than the warm-vs-archive
         // gate this helper guards. Treat as not-archive: this helper is
-        // about cold-tier scan-vs-warm-tier-sketch decisions, not Mode 3.
+        // about cold-tier scan-vs-ASAP-tier-sketch decisions, not Mode 3.
         PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => binding_is_archive(child),
         PhysicalExpr::RawAtEdgePrometheusArchive { .. } => false,
-        // ExactAgg is a warm-tier exact-aggregation accumulator, NOT
+        // ExactAgg is a ASAP-tier exact-aggregation accumulator, NOT
         // an archive route. The L5 emitter writes the result through
         // the precompute output sink, same path as SketchAgg.
         PhysicalExpr::ExactAgg { .. } => false,
@@ -640,13 +640,13 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
     );
     assert!(
         !binding_is_archive(&bound),
-        "warm-tier quantile must not flag archive"
+        "ASAP-tier quantile must not flag archive"
     );
 }
 
 /// `sum_over_time.yaml` — the legacy planner produces an exact-sum
 /// aggregation row (no sketch). Control plane path: `Aggregate{Sum}` over
-/// `Window` → no warm-tier rule fires → `Logical` pass-through.
+/// `Window` → no ASAP-tier rule fires → `Logical` pass-through.
 /// Functional equivalence: both produce a single non-sketch row.
 #[test]
 fn phase_b_e2e_sum_over_time_falls_through_to_logical() {
@@ -668,7 +668,7 @@ fn phase_b_e2e_sum_over_time_falls_through_to_logical() {
 /// `sum_by.yaml` — `sum by (label) (sum_over_time(...))`. Spatial-and-
 /// temporal aggregation; the legacy planner emits an exact-sum row keyed
 /// on the by-label. Control plane path: `Aggregate{Sum, by=[…]}` over
-/// `Window` → no warm-tier rule fires → `Logical` pass-through. The
+/// `Window` → no ASAP-tier rule fires → `Logical` pass-through. The
 /// by-label is preserved on the L3 group-by-id list, which Phase α's
 /// routing emit reads to build the per-label rollup partition.
 #[test]
@@ -710,7 +710,7 @@ fn phase_b_e2e_rate_falls_through_to_logical() {
     assert!(collect_sketch_kinds(&bound).is_empty());
     assert!(
         !binding_is_archive(&bound),
-        "Rate is warm-tier, not archive"
+        "Rate is ASAP-tier, not archive"
     );
 }
 
@@ -762,7 +762,7 @@ fn phase_b_e2e_archive_only_e2e_binding() {
         binding_is_archive(&bound),
         "archive-only intent must surface archive flag through L4 binding"
     );
-    // No warm-tier sketch fires for archive-only intents.
+    // No ASAP-tier sketch fires for archive-only intents.
     assert!(collect_sketch_kinds(&bound).is_empty());
 }
 

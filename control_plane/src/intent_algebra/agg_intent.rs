@@ -97,7 +97,7 @@ pub enum AggIntent {
     },
 
     // ── Archive-only intents (Phase β migration) ─────────────────────────
-    // Intents below have no warm-tier sketch family today; the L4 binder
+    // Intents below have no ASAP-tier sketch family today; the L4 binder
     // emits a `PhysicalExpr::Logical` pass-through and the L5 emitter routes
     // them to the cold archive tier (Gorilla / Thanos). Adding a streaming
     // sketch family for any of these is a follow-up — the L3 vocabulary
@@ -164,7 +164,7 @@ pub enum AggIntent {
 }
 
 impl AggIntent {
-    /// True iff this intent has no warm-tier (streaming sketch) binding
+    /// True iff this intent has no ASAP-tier (streaming sketch) binding
     /// today. `false` means a `Bind*` rule may match. `true` means the
     /// L5 emitter routes the intent to the cold-store / archive tier.
     ///
@@ -451,7 +451,7 @@ mod tests {
 
     /// Every intent the legacy `asap-planner-rs::single_query::is_supported`
     /// previously refused now lifts to L3 with `archive_only() == true`.
-    /// The negative cases are the warm-tier-bound intents — they must
+    /// The negative cases are the ASAP-tier-bound intents — they must
     /// continue to return false, otherwise the L4 binder would short-circuit
     /// them to the cold tier.
     #[test]
@@ -532,7 +532,7 @@ mod tests {
         for v in warm {
             assert!(
                 !v.archive_only(),
-                "{v:?} is warm-tier and must not be archive-only"
+                "{v:?} is ASAP-tier and must not be archive-only"
             );
         }
     }

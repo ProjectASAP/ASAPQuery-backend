@@ -7,7 +7,7 @@
 //!   Fetches plan config from the control plane. Optional; today's
 //!   binary path does not consume it.
 //! * [`miss_notifier`] — outbound capability-miss notifications. The
-//!   warm-tier engine fires fire-and-forget POSTs here when a query
+//!   ASAP-tier engine fires fire-and-forget POSTs here when a query
 //!   has no compatible stored aggregation, so the control plane can
 //!   generate a new sketch plan and push it back via the streaming
 //!   config endpoint.

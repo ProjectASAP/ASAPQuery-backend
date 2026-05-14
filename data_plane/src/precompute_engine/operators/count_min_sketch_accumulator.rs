@@ -407,7 +407,7 @@ impl AggregateCore for CountMinSketchAccumulator {
         };
         match statistic {
             Statistic::Count | Statistic::Sum => Ok(total_events()),
-            // PR #111 honest-gap closure (in-the-bag for warm tier).
+            // PR #111 honest-gap closure (in-the-bag for ASAP tier).
             // CMS records insert counts but not timestamps, so per-second
             // `rate(metric[range])` requires the engine to push the
             // range duration via `query_kwargs["range_ms"]`. When

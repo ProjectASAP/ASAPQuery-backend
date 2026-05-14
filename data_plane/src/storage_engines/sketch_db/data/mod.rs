@@ -53,7 +53,7 @@
 // Step 2a consolidated all capability state into
 // `control_plane::sketch_algebra::capability`. The backend re-exports the
 // canonical types so there's exactly one definition in the codebase.
-// `is_satisfied_by` (used by the engine warm-tier hook) lives on the
+// `is_satisfied_by` (used by the engine ASAP-tier hook) lives on the
 // control-plane-side `Capability` impl.
 
 pub use control_plane::sketch_algebra::{Capability, SketchKindHandle};
@@ -254,7 +254,7 @@ pub struct AccuracyBound {
 impl AccuracyBound {
     /// Compute accuracy bound from sketch config. Variant-specific
     /// formulas; the HTTP layer can present this in
-    /// `X-ASAP-Accuracy: 0.01` so callers know the warm-tier answer's
+    /// `X-ASAP-Accuracy: 0.01` so callers know the ASAP-tier answer's
     /// error envelope.
     pub fn from_config(cfg: &SketchConfig) -> Self {
         match cfg {
@@ -361,7 +361,7 @@ impl std::fmt::Debug for AggPayload {
 
 impl AggPayload {
     /// Return the sketch payload if this is a sketch variant; `None`
-    /// otherwise. The warm-tier sketch reducer uses this to filter
+    /// otherwise. The ASAP-tier sketch reducer uses this to filter
     /// non-sketch payloads out of its `query_range` results.
     pub fn as_sketch(&self) -> Option<&SketchSampleState> {
         match self {

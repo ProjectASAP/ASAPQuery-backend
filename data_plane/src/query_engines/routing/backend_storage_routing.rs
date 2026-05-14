@@ -26,16 +26,16 @@
 //! ## v7: dual-routing per metric
 //!
 //! v6.1 surfaced an architectural gap: routing one metric to one engine
-//! forces an exclusive trade-off between criterion ④ (warm-tier
+//! forces an exclusive trade-off between criterion ④ (ASAP-tier
 //! accuracy) and criterion ⑤ (cold-fallback). Every quantile/sum-by
-//! query on `http_requests_total` had to go to either the warm tier
+//! query on `http_requests_total` had to go to either the ASAP tier
 //! (so the accuracy reducer could compute relative error) or the
 //! archive (so the `data_source: thanos_query` info-line landed on
 //! the cold-fallback probe). v7 closes this by letting one metric have
 //! multiple targets, each with an optional query-shape filter; the
 //! HTTP handler inspects the parsed PromQL and picks the matching
 //! target. Predictable / planned queries (quantile, sum_over_time)
-//! land on the warm tier; ad-hoc / post-hoc queries
+//! land on the ASAP tier; ad-hoc / post-hoc queries
 //! (count, topk, rate-post-hoc) route to the cold archive.
 //!
 //! ## Schema
@@ -113,19 +113,19 @@ use tracing::{debug, info};
 /// The shapes intentionally mirror the v7 spec's
 /// `[count, topk, rate_post_hoc]` enumeration — each is a PromQL
 /// shape the cold-archive engine answers natively, and which the
-/// warm-tier sketch path either can't serve at all (count over an
+/// ASAP-tier sketch path either can't serve at all (count over an
 /// approximate sketch is misleading) or serves with worse precision
 /// than the archive (rate post-hoc).
 ///
 /// Phase α (control-plane-emitted routing tables) adds `HistogramQuantile`
-/// / `Delta` / `Deriv` / `Absent` — these are PromQL shapes no warm-tier
+/// / `Delta` / `Deriv` / `Absent` — these are PromQL shapes no ASAP-tier
 /// sketch can serve and the control plane's emitter reliably routes them
 /// to the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryShape {
     /// `count(<metric>{...})` — series count after label predicates.
-    /// Cold archive serves exactly via postings index; warm tier has
+    /// Cold archive serves exactly via postings index; ASAP tier has
     /// no compatible aggregation (a CMS doesn't track per-series
     /// existence).
     Count,
@@ -134,7 +134,7 @@ pub enum QueryShape {
     /// tier needs a `CountMinSketchWithHeap` to answer at all.
     Topk,
     /// `rate(<metric>[<range>])` — per-second rate over a range.
-    /// Marked "post-hoc" because the warm tier's pre-computed
+    /// Marked "post-hoc" because the ASAP tier's pre-computed
     /// `Increase` aggregation answers `rate` natively for known
     /// queries, so this shape only kicks in for ad-hoc rate queries
     /// the control plane didn't pre-plan for.
@@ -148,12 +148,12 @@ pub enum QueryShape {
     /// serves via a sum-typed accumulator.
     Sum,
     /// `last_over_time(<metric>[<range>])`. Used by the v6
-    /// freshness probes — warm tier serves via a counter-typed
+    /// freshness probes — ASAP tier serves via a counter-typed
     /// accumulator (Change B), archive serves by selecting the
     /// most-recent sample in each chunk.
     LastOverTime,
     /// `histogram_quantile(φ, ...)` — Prometheus-native histogram
-    /// readout. No warm-tier sketch fits the bucket-vector input
+    /// readout. No ASAP-tier sketch fits the bucket-vector input
     /// shape; archive serves via post-hoc bucket scan.
     HistogramQuantile,
     /// `delta(<counter>[<range>])` — first-difference over a range.
@@ -164,7 +164,7 @@ pub enum QueryShape {
     Deriv,
     /// `absent(<metric>{...})` — 1 if no series match, vacuous
     /// vector otherwise. Archive answers natively from the postings
-    /// index; warm-tier sketch has no compatible aggregation.
+    /// index; ASAP-tier sketch has no compatible aggregation.
     Absent,
     /// Anything else — `min/max_over_time`, `count_over_time`,
     /// `avg_over_time`, etc. Lets the routing table register
@@ -561,7 +561,7 @@ impl BackendStorageRouting {
     /// drift forward of the backend's. Empty `targets` arrays are
     /// rejected (same contract as `from_yaml_str`).
     ///
-    /// Side fields (e.g. `warm_tier_native_shapes`) the control plane emits
+    /// Side fields (e.g. `asap_tier_native_shapes`) the control plane emits
     /// for operator inspection are ignored — the JSON parser pulls only
     /// `default_engine` and `metrics:[...]`.
     pub fn from_json_payload(value: &JsonValue) -> Result<Self> {
@@ -723,7 +723,7 @@ impl BackendStorageRouting {
     /// implementation walks the list in two passes:
     ///   1. First, prefer a target whose filter explicitly includes
     ///      `shape` — this lets a `[count, topk, rate_post_hoc]`
-    ///      target win over the default warm-tier slot for those
+    ///      target win over the default ASAP-tier slot for those
     ///      shapes.
     ///   2. If no shape-specific target matches, fall back to the
     ///      first target with `applies_to_query_shape: None`
@@ -1087,7 +1087,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_router_routes_everything_to_warm_tier() {
+    fn empty_router_routes_everything_to_asap_tier() {
         let r = BackendStorageRouting::empty();
         assert_eq!(r.lookup("anything"), StorageBackend::SketchStore);
         assert_eq!(
@@ -1154,7 +1154,7 @@ metrics:
     #[test]
     fn yaml_v7_multi_target_routes_count_to_archive_quantile_to_warm() {
         // v7 form: `routes:` list. http_requests_total has TWO
-        // targets — the default warm-tier slot and a cold-archive
+        // targets — the default ASAP-tier slot and a cold-archive
         // slot scoped to count/topk/rate_post_hoc.
         let yaml = r#"
 default: sketch_store
@@ -1383,7 +1383,7 @@ routes:
                             ]
                         }
                     ],
-                    "warm_tier_native_shapes": ["topk", "rate", "sum"]
+                    "asap_tier_native_shapes": ["topk", "rate", "sum"]
                 },
                 {
                     "name": "request_latency_seconds",

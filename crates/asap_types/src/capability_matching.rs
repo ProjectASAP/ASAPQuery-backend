@@ -24,7 +24,7 @@ pub const CANONICAL_QUERY_ENGINE_IDS: &[&str] = &[ENGINE_ID_ASAP_QUERY, ENGINE_I
 // `(metric, statistic, sub_type, window_size, grouping_labels, spatial_filter)`
 // — there is no axis for "which storage tier serves this query." The Phase-5
 // `GorillaQueryEngine` (PR #85) introduces a parallel exact tier; the planner /
-// router needs to disambiguate between warm-tier sketches and Gorilla-S3
+// router needs to disambiguate between ASAP-tier sketches and Gorilla-S3
 // chunks. See `docs/design-gorilla-s3-cold-engine.md` §8.
 // ---------------------------------------------------------------------------
 
@@ -38,7 +38,7 @@ pub const CANONICAL_QUERY_ENGINE_IDS: &[&str] = &[ENGINE_ID_ASAP_QUERY, ENGINE_I
 /// `ColdJsonlFallback` variant. The legacy local-FS JSONL leg
 /// (`LocalFsColdStore`, `parse_jsonl`, the §5.2 raw-store
 /// fallback) was deleted at the same commit; the surviving
-/// failover surface is warm-tier sketch ↔ Thanos archive.
+/// failover surface is ASAP-tier sketch ↔ Thanos archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {
@@ -53,9 +53,9 @@ pub enum StorageBackend {
     /// archive chunk format/storage detail, not a public query engine.
     GorillaObjectStore,
 
-    /// Double-write: the metric is written to both warm-tier sketches AND the
+    /// Double-write: the metric is written to both ASAP-tier sketches AND the
     /// Gorilla-S3 archive. Capability matching surfaces both options and the
-    /// cost-aware dispatcher picks per query (typically warm-tier for low-
+    /// cost-aware dispatcher picks per query (typically ASAP-tier for low-
     /// latency approximate, archive for exact).
     DoubleWrite,
 
@@ -66,7 +66,7 @@ pub enum StorageBackend {
     /// controller's `RawAtEdgePrometheusArchive` mode can route a
     /// metric's queries to Prometheus directly. Mirrors the
     /// `GorillaObjectStore` slot's "single backend, no failover"
-    /// semantics — there is no warm-tier sketch to fall back on for a
+    /// semantics — there is no ASAP-tier sketch to fall back on for a
     /// Prometheus-remote metric.
     PrometheusRemote,
 }
@@ -99,11 +99,11 @@ pub fn parse_storage_backend_engine_id(s: &str) -> Option<StorageBackend> {
 /// (`controller/docs/design.md` §6 `core::workload`). The Phase-5 capability
 /// router consults this to decide whether a metric configured for both warm-
 /// tier and Gorilla-S3 should answer from the archive (Exact) or the
-/// approximate warm-tier sketch.
+/// approximate ASAP-tier sketch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AccuracyTarget {
-    /// Caller demands an exact answer; warm-tier sketches are not eligible
+    /// Caller demands an exact answer; ASAP-tier sketches are not eligible
     /// unless they happen to be exact accumulators (Sum, MinMax, Increase).
     Exact,
     /// Caller accepts ε/δ-bounded approximate answers. Default.
@@ -143,7 +143,7 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::Sum,
             AggregationType::MultipleSum,
             AggregationType::CountMinSketch,
-            // Counters: warm-tier ingest stores counter metrics
+            // Counters: ASAP-tier ingest stores counter metrics
             // (OTel `Sum` / monotonic=true) as Increase /
             // MultipleIncrease accumulators, whose `query`
             // implementation answers `Statistic::Sum` with the
@@ -159,7 +159,7 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
         // Count-Exact uses `MultipleSum` with sub_type="count"); approximate
         // via CountMinSketch / CountMinSketchWithHeap.
         //
-        // HLL is also valid here: the warm-tier MVP demo
+        // HLL is also valid here: the ASAP-tier MVP demo
         // (ProjectASAP/ASAPCollector#46) plans `unique_users_per_min`
         // as an HLL agg and the replay client queries it with
         // `count(unique_users_per_min)`. `HllSketchAccumulator`
@@ -189,7 +189,7 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
         // DDSketch enumerated here, capability matching for an
         // out-of-YAML query like `quantile_over_time(0.99,
         // http_requests_total_latency_ms[1m])` would miss and the
-        // warm-tier engine returns `EngineError::CapabilityMiss`.
+        // ASAP-tier engine returns `EngineError::CapabilityMiss`.
         Statistic::Quantile => &[
             AggregationType::DatasketchesKLL,
             AggregationType::HydraKLL,
@@ -252,7 +252,7 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
 ///
 /// **Step-1 of the JSONL deprecation refactor**: the legacy
 /// `ColdJsonlFallback` failover slot was removed. Surviving
-/// failover surface is warm-tier sketch ↔ Gorilla-S3 archive.
+/// failover surface is ASAP-tier sketch ↔ Gorilla-S3 archive.
 ///
 /// Routing rules (mirrors `docs/design-gorilla-s3-cold-engine.md` §8):
 ///
@@ -260,9 +260,9 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
 ///   `[GorillaObjectStore]`. Exact-on-archive subsumes approximate-on-warm,
 ///   so even a `Statistic::Quantile` with an `Approximate` target still
 ///   routes to the archive when the metric is Gorilla-only — there is no
-///   warm-tier sketch to fall back to in that deploy shape.
+///   ASAP-tier sketch to fall back to in that deploy shape.
 /// * Metric configured for `SketchStore` (or unconfigured / default):
-///   `[SketchStore]`. A capability miss in the warm tier surfaces
+///   `[SketchStore]`. A capability miss in the ASAP tier surfaces
 ///   as a 404 — the previous JSONL fallback path has been deleted.
 /// * Metric configured for `DoubleWrite`: head depends on accuracy hint,
 ///   tail is the failover sequence (the cost-aware `EngineRouter` picks
@@ -292,7 +292,7 @@ pub fn compatible_storage_backends(
             ],
         },
         // Phase ε.2: Prometheus-remote metrics route only to the
-        // Prometheus forwarder. There is no warm-tier sketch to fall
+        // Prometheus forwarder. There is no ASAP-tier sketch to fall
         // back on (the metric's raw samples never landed in
         // ASAP-managed storage), so the failover sequence is the
         // single backend itself; a missing engine surfaces as a
@@ -1117,7 +1117,7 @@ mod tests {
         }
     }
 
-    /// Pin the canonical-approximator picks driving the warm-tier query path
+    /// Pin the canonical-approximator picks driving the ASAP-tier query path
     /// (the "five sketch types" CMS / KLL / HLL / DDSketch / CountSketch
     /// canonical statistic table from PROGRESS.md). HLL / DDSketch /
     /// CountSketch route via the modified-OTLP wire format and are not in the
@@ -1198,7 +1198,7 @@ mod tests {
     /// query, `find_query_config` misses and the engine falls into
     /// capability matching. Pre-fix, `compatible_agg_types(Quantile)`
     /// listed only KLL types, so the DDSketch agg was filtered out
-    /// and the warm-tier engine returned a 404 / null; post-fix,
+    /// and the ASAP-tier engine returned a 404 / null; post-fix,
     /// DDSketch is enumerated and capability matching resolves the
     /// agg cleanly.
     #[test]
@@ -1317,7 +1317,7 @@ mod tests {
             AccuracyTarget::Approximate,
             StorageBackend::SketchStore,
         );
-        // Step-1 of the JSONL deprecation: warm-tier only routes
+        // Step-1 of the JSONL deprecation: ASAP-tier only routes
         // to itself; the previous `ColdJsonlFallback` failover slot
         // has been deleted.
         assert_eq!(backends, vec![StorageBackend::SketchStore]);
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn double_write_metric_returns_both_options() {
-        // Exact: archive head, warm-tier failover.
+        // Exact: archive head, ASAP-tier failover.
         let exact = compatible_storage_backends(
             Statistic::Sum,
             AccuracyTarget::Exact,
@@ -1338,7 +1338,7 @@ mod tests {
                 StorageBackend::SketchStore,
             ]
         );
-        // Approximate: warm-tier head (cheaper for ε/δ-bounded
+        // Approximate: ASAP-tier head (cheaper for ε/δ-bounded
         // answers), archive failover.
         let approx = compatible_storage_backends(
             Statistic::Quantile,
@@ -1356,7 +1356,7 @@ mod tests {
 
     /// Exact-on-archive subsumes approximate-on-warm: a metric configured
     /// only for Gorilla-S3 still routes to the archive even when the caller
-    /// asks for an approximate answer (no warm-tier sketch exists to back-
+    /// asks for an approximate answer (no ASAP-tier sketch exists to back-
     /// fall to in that deploy shape).
     #[test]
     fn gorilla_s3_with_non_exact_accuracy_still_archives() {
@@ -1369,7 +1369,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_backend_default_is_warm_tier() {
+    fn storage_backend_default_is_asap_tier() {
         // `#[serde(default)]` on `StreamingConfig.storage_backend` (and on
         // `StorageBackend::default()`) MUST be `SketchStore` so pre-Phase-5
         // configs decode without bumping deploys onto the archive.

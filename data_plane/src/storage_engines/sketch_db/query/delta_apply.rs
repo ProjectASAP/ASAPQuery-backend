@@ -1,4 +1,4 @@
-//! Per-window delta stitching for the warm-tier sketch reducer.
+//! Per-window delta stitching for the ASAP-tier sketch reducer.
 //!
 //! The reducer walks a sid's per-window samples in time order. When a
 //! window's payload is a `Full` encoding (PROTO / MSGPACK), it

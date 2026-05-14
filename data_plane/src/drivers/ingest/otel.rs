@@ -1201,10 +1201,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
                         // DEPRECATED: aggregation_id-keyed write — remove
-                        // after warm-tier validation. The Phase 5
+                        // after ASAP-tier validation. The Phase 5
                         // SketchStore above is the new write path; this
                         // legacy router push stays in tandem until the
-                        // query path's warm-tier reducer is wired
+                        // query path's ASAP-tier reducer is wired
                         // end-to-end and the streaming-config /
                         // SketchStore call sites can be deleted.
                         messages.push(WorkerMessage::AccumulatorInput {
@@ -1346,7 +1346,7 @@ fn derive_sketch_policy_fp(
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
     let registry = snap.policy_registry();
-    control_plane::warm_tier_analysis::find_policy_by_content(
+    control_plane::asap_tier_analysis::find_policy_by_content(
         &registry,
         metric,
         group_by_keys,
@@ -1367,7 +1367,7 @@ fn derive_sketch_policy_fp(
 /// payload (an outer `{sketch, topk_heap, heap_size}` wrapper). When
 /// the encoding is MSGPACK and the bytes round-trip via
 /// `CountMinSketchWithHeap::deserialize_msgpack`, we classify the sid
-/// as `CmsWithHeap` so the warm-tier reducer can later read the heap
+/// as `CmsWithHeap` so the ASAP-tier reducer can later read the heap
 /// directly for `topk` / `topk_over_time` queries.
 fn sketch_kind_handle_for(
     dp: &ModifiedOtlpSketchDp,
@@ -1384,7 +1384,7 @@ fn sketch_kind_handle_for(
             // `CountMinSketchWithHeap::deserialize_msgpack`. If the
             // sketch bytes decode against that wrapper *and* the
             // resulting heap is non-empty, treat the sid as
-            // CmsWithHeap so warm-tier `topk` can read the heap.
+            // CmsWithHeap so ASAP-tier `topk` can read the heap.
             // Otherwise stay with vanilla `CountMin`.
             if dp.encoding == ENCODING_MSGPACK {
                 use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;

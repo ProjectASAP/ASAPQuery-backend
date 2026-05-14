@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_dispatches_to_warm_tier_for_sketch_metrics() {
+    async fn router_dispatches_to_asap_tier_for_sketch_metrics() {
         let mut router = EngineRouter::new();
         let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
         let (archive, archive_calls) =
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(
             archive_calls.load(Ordering::SeqCst),
             0,
-            "archive must not run for a warm-tier-only metric (Step-1 deleted the JSONL fallback slot)",
+            "archive must not run for a ASAP-tier-only metric (Step-1 deleted the JSONL fallback slot)",
         );
     }
 
@@ -348,14 +348,14 @@ mod tests {
         assert_eq!(
             warm_calls.load(Ordering::SeqCst),
             0,
-            "warm-tier must not run for an archive-only metric",
+            "ASAP-tier must not run for an archive-only metric",
         );
     }
 
     #[tokio::test]
     async fn router_falls_back_to_warm_when_archive_fails_on_double_write() {
         // Double-write deploy with `Exact` head: archive head fails,
-        // router falls through to the warm-tier sketch (the only
+        // router falls through to the ASAP-tier sketch (the only
         // remaining failover after Step-1 deleted JSONL).
         let mut router = EngineRouter::new();
         let (gorilla, gorilla_calls) =
@@ -374,7 +374,7 @@ mod tests {
             .await;
         assert!(
             result.is_ok(),
-            "router must reach warm-tier when the archive head fails",
+            "router must reach ASAP-tier when the archive head fails",
         );
         assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
         assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
@@ -405,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn router_returns_all_failed_when_every_engine_errors() {
         // After Step-1 deleted JSONL, the SketchStore failover
-        // sequence is just `[SketchStore]`. A failing warm-tier
+        // sequence is just `[SketchStore]`. A failing ASAP-tier
         // engine is the only error path on this metric.
         let mut router = EngineRouter::new();
         let (warm, _) = StubEngine::new(StorageBackend::SketchStore, Outcome::Backend);
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(
             warm_calls.load(Ordering::SeqCst),
             0,
-            "warm-tier must not run for a Mode 3 metric — Prometheus owns the storage",
+            "ASAP-tier must not run for a Mode 3 metric — Prometheus owns the storage",
         );
     }
 

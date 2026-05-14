@@ -13,7 +13,7 @@
 //! Ghost sids (registered but never carrying state) are valid — they
 //! exist when an agent registers a pre-merge identity that the gateway
 //! folds into a different (post-merge) identity before backend ever sees
-//! the sketch payload. Query path treats ghost sids as warm-tier MISS
+//! the sketch payload. Query path treats ghost sids as ASAP-tier MISS
 //! and falls through to Thanos archive (Phase 6).
 //!
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
@@ -138,7 +138,7 @@ impl SketchInstanceMetadata {
     /// Sketch-handle accessor for the legacy sketch path. Returns
     /// `Some(handle)` iff this sid is sketch-backed; `None` for
     /// exact-aggregation-backed sids. Consumers that only meaningfully
-    /// run on sketches (e.g. the warm-tier reducer) `.expect` it.
+    /// run on sketches (e.g. the ASAP-tier reducer) `.expect` it.
     pub fn sketch_kind(&self) -> Option<SketchKindHandle> {
         match &self.agg_kind {
             AggKind::Sketch { kind, .. } => Some(*kind),
@@ -195,7 +195,7 @@ pub struct SketchStore {
 
 /// Three possible outcomes of looking up a sid in the SketchStore.
 /// Query path uses this enum to drive routing decisions:
-/// - `Hit`: warm-tier sketch has data — evaluate.
+/// - `Hit`: ASAP-tier sketch has data — evaluate.
 /// - `Ghost`: backend knows the identity (metadata is present) but no
 ///   sketch state ever arrived under this sid — fall through to Thanos
 ///   for raw archive. See design doc §5.4 ("Ghost sids").
@@ -327,7 +327,7 @@ impl SketchStore {
         guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
     }
 
-    /// Range-query the warm-tier state for one sid. Window-end-keyed
+    /// Range-query the ASAP-tier state for one sid. Window-end-keyed
     /// time series result, one entry per distinct group-by VALUES
     /// vector. `(start, end)` is the inclusive query window; entries
     /// whose `(window_start, window_end)` lies fully within the query
@@ -503,7 +503,7 @@ impl SketchStore {
     /// Find every registered sid whose instance matches `metric_name` and
     /// whose `group_by_keys` is a superset of (or equal to) the user's
     /// requested label-key set. Phase 5 query path uses this to pick
-    /// candidate sids for warm-tier dispatch — a sid whose group-by KEYS
+    /// candidate sids for ASAP-tier dispatch — a sid whose group-by KEYS
     /// don't cover the user's PromQL label matchers can't answer the
     /// query and must fall through to archive.
     ///
@@ -704,10 +704,10 @@ impl SketchStore {
                 let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
                 // PR 6 follow-up: ExactAgg-backed sids carry an
                 // `ExactAgg(agg_type)` capability so the analyzer can
-                // route warm-tier-answerable exact intents (Sum / Rate /
+                // route ASAP-tier-answerable exact intents (Sum / Rate /
                 // Increase / Count{Exact}) to this sid instead of falling
                 // through to the archive engine. Pre-PR-6 this field was
-                // unconditionally `None`, which meant warm-tier ExactAgg
+                // unconditionally `None`, which meant ASAP-tier ExactAgg
                 // state was reachable only through the legacy precompute
                 // query path; capability-matching couldn't see it.
                 self.register(SketchInstanceMetadata {
@@ -789,7 +789,7 @@ impl SketchStore {
 /// Persistence harness for `SketchStore` — Phase 5 M2.3.6c.
 ///
 /// Owns the manifest + flusher thread + part cache that back the
-/// sid-keyed warm tier. Constructed via [`SketchStore::start_persistence`];
+/// sid-keyed ASAP tier. Constructed via [`SketchStore::start_persistence`];
 /// the flusher reads sealed epochs through the
 /// [`EpochSource`](crate::storage_engines::sketch_db::index::persistence::EpochSource)
 /// impl on `SketchStore` and writes parts under `disk_path/parts/`.

@@ -154,7 +154,7 @@ mod tests {
     /// `storage_backend` field; deserialize must default to `SketchStore`
     /// so the router keeps dispatching to `ASAPQueryEngine` unchanged.
     #[test]
-    fn deserialize_legacy_yaml_defaults_to_warm_tier() {
+    fn deserialize_legacy_yaml_defaults_to_asap_tier() {
         let yaml = "{\"aggregation_configs\":{}}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("legacy decode");
         assert_eq!(cfg.storage_backend(), StorageBackend::SketchStore);

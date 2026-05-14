@@ -659,7 +659,7 @@ mod tests {
             .expect("typed emit should succeed for a quantile workload");
 
         // gorillas3 — archive-tier write to MinIO. Without this the
-        // warm-tier query engine has nothing to read for criterion ⑥.
+        // ASAP-tier query engine has nothing to read for criterion ⑥.
         assert!(
             yaml.contains("gorillas3"),
             "typed emit must include the gorillas3 processor block:\n{yaml}"

@@ -11,7 +11,7 @@
 //!
 //! Engines + the shared error envelope:
 //!
-//! * [`asap_query_engine::ASAPQueryEngine`] — warm-tier sketch query
+//! * [`asap_query_engine::ASAPQueryEngine`] — ASAP-tier sketch query
 //!   engine.
 //! * [`thanos_query_engine::ThanosQueryEngine`] — archive-tier query
 //!   engine.
@@ -24,7 +24,7 @@ pub mod query_result;
 pub mod routing;
 pub mod thanos_query_engine;
 
-// Post-M2.3 reorg: timeline_dispatch + window_merger are warm-tier driver
+// Post-M2.3 reorg: timeline_dispatch + window_merger are ASAP-tier driver
 // primitives (they reason about reconfigure boundaries that only exist
 // inside a SketchStore). They moved into `sketch_db::query`. The
 // orchestration layer consumes them through the canonical path; these
@@ -67,7 +67,7 @@ pub enum EngineError {
     /// `ASAPQueryEngine::handle_query` returning `None`. The router treats
     /// this as a "hard miss" and falls through to the next backend in
     /// the `compatible_storage_backends` list. After Step-1 of the
-    /// JSONL deprecation, the surviving failovers are warm-tier
+    /// JSONL deprecation, the surviving failovers are ASAP-tier
     /// sketch ↔ Gorilla-S3 archive only (the cold JSONL leg was
     /// deleted).
     #[error("no compatible aggregation in {engine_id}: {detail}")]

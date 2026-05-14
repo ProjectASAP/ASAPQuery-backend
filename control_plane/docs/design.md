@@ -1794,13 +1794,13 @@ Before PR #129 there were **four** overlapping capability tables in the controll
 | YAML at `controller/sketch_capabilities.yml` | filesystem | per-sketch perf profile, runtime-loaded |
 | Compiled-in defaults | `algebra/optimizer.rs::sketch_capability` | per-sketch perf profile, hard-coded |
 | `SketchKind` enum | `sketch_algebra/params.rs` | sketch type tag |
-| `Capability` / `SketchKindHandle` | `warm_tier_analysis.rs` (PR #128) | query-side dispatch tag invented per-query |
+| `Capability` / `SketchKindHandle` | `asap_tier_analysis.rs` (PR #128) | query-side dispatch tag invented per-query |
 
 All four collapsed into one module: `controller/src/sketch_algebra/capability.rs`. The four-way map is now:
 
 - `SketchCapability` + `SupportedIntent` — per-sketch perf profile, read by L4 cost model + L5 physical planner (formerly the YAML + compiled-in copies).
-- `Capability` + `SketchKindHandle` — query-side capability tag, used by `asap-query-engine`'s warm-tier reducer (formerly the per-query invention in PR #128).
-- `capability_for(intent: &AggIntent) -> Option<Capability>` — the **semantic** intent → warm-tier dispatch bridge. The new signature replaces the older `capability_for(query_func: &str)` string-keyed lookup. PromQL → `intent_algebra::lower` → `AggIntent` → (this fn) → `Capability`. The warm-tier analyzer at `controller/src/warm_tier_analysis.rs` is now a thin facade around this single function.
+- `Capability` + `SketchKindHandle` — query-side capability tag, used by `asap-query-engine`'s ASAP-tier reducer (formerly the per-query invention in PR #128).
+- `capability_for(intent: &AggIntent) -> Option<Capability>` — the **semantic** intent → ASAP-tier dispatch bridge. The new signature replaces the older `capability_for(query_func: &str)` string-keyed lookup. PromQL → `intent_algebra::lower` → `AggIntent` → (this fn) → `Capability`. The ASAP-tier analyzer at `controller/src/asap_tier_analysis.rs` is now a thin facade around this single function.
 - `default_capability_table()` / `load_capability_overrides()` — compiled-in defaults + YAML override loader.
 
 The four-table fragmentation reflected partial consolidations that never finished; once `Capability` was the canonical query-side tag (PR #128) the perf-profile + override-loader story had a natural home next to it (PR #129).

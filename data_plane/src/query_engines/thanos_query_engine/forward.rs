@@ -274,7 +274,7 @@ impl QueryEngine for ThanosQueryEngine {
             Err(ThanosQueryError::Unreachable(reason)) => {
                 // Surface fail-loud as a backend error so the
                 // router's failover sequence can fall through to
-                // the warm-tier sketch on a `DoubleWrite` deploy.
+                // the ASAP-tier sketch on a `DoubleWrite` deploy.
                 // The wrapped result also carries the quirk infos
                 // for direct (non-router) callers — see the test
                 // `unreachable_returns_quirk_infos_in_wrapped_result`.
@@ -750,7 +750,7 @@ mod tests {
         }
 
         // The trait surface folds it into a `Backend` error so the
-        // router falls through to the warm-tier sketch on a
+        // router falls through to the ASAP-tier sketch on a
         // `DoubleWrite` deploy. The HTTP handler turns this into a
         // 503 with the `thanos_unreachable` quirk infos.
         let trait_path = QueryEngine::execute(&engine, "up").await;

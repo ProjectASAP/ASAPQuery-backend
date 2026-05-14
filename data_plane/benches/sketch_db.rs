@@ -1,4 +1,4 @@
-//! Criterion benchmarks for `SketchStore` — the warm-tier sketch DB.
+//! Criterion benchmarks for `SketchStore` — the ASAP-tier sketch DB.
 //!
 //! Run with: `cargo bench -p data_plane --bench sketch_db`
 //!

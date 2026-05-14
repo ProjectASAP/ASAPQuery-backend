@@ -16,7 +16,7 @@ plan and the query's shape:
 - **Archive tier** — Prometheus `promql.Engine` (via Thanos
   store-gateway and thanos-query) over Gorilla-XOR-compressed raw
   chunks on object storage. Exact PromQL surface for ad-hoc and
-  post-hoc queries the warm tier cannot answer.
+  post-hoc queries the ASAP tier cannot answer.
 
 ```
                     PromQL HTTP request
@@ -34,7 +34,7 @@ plan and the query's shape:
             │                               │
             ▼                               ▼
    ┌─────────────────┐             ┌────────────────────┐
-   │   warm tier     │             │   archive tier     │
+   │   ASAP tier     │             │   archive tier     │
    │   SimpleEngine  │             │   thanos-query     │
    │   (sketch state │             │   (Prometheus      │
    │   in RAM)       │             │    promql.Engine   │
@@ -78,7 +78,7 @@ ASAPQuery-backend/
 │       ├── bin/                 # auxiliary binaries (offline tests,
 │       │                        # logical-plan dumper)
 │       ├── query-engines/
-│       │   ├── simple/                # warm tier — SimpleEngine
+│       │   ├── simple/                # ASAP tier — SimpleEngine
 │       │   │                          # (33 PromQL pattern matchers)
 │       │   └── gorilla/               # archive tier
 │       │       ├── engine.rs            # in-process curated-subset
@@ -261,7 +261,7 @@ that produced the current architecture:
 
 - **Phase δ — backend pure executor**: drop the in-process
   curated-subset `GorillaQueryEngine` once Path A2 (Thanos) is
-  verified at scale. The backend then becomes a thin warm-tier
+  verified at scale. The backend then becomes a thin ASAP-tier
   evaluator + HTTP forwarder.
 - **Per-tenant routing**: `BackendStorageRouting` is global today;
   multi-tenant deployments will need per-tenant routing tables.

@@ -158,12 +158,12 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
     // for), the agent's pipeline MUST run the `gorillas3` processor so
     // the metric's samples land in MinIO. Without this, freshness probes
     // (and any other archive-bound metric) never reach the cold tier and
-    // the warm-tier engine's `last_over_time(...)` returns empty.
+    // the ASAP-tier engine's `last_over_time(...)` returns empty.
     //
     // Config matches `deploy/configs/asap-otel-agent-b6-asap-single-sketch.yaml`
     // — `block_format: prometheus_tsdb` so the Thanos store-gateway can
     // read the emitted blocks; `drop_original: false` so the metric also
-    // flows downstream to the warm-tier sketch / OTLP exporter; the
+    // flows downstream to the ASAP-tier sketch / OTLP exporter; the
     // `window_interval` is the smallest `window_secs` declared on any
     // archive-tier metric (defaults to 60s).
     let has_archive_tier = !cfg.archive_tier_metrics.is_empty();
@@ -197,11 +197,11 @@ tsdb_block_duration: {window_secs}s\n",
         processors.insert("gorillas3".to_string(), gorillas3);
     }
 
-    // Pipeline-processor list for the warm-tier path. Order matches
+    // Pipeline-processor list for the ASAP-tier path. Order matches
     // `asap-otel-agent-b6-asap-single-sketch.yaml`: gorillas3 runs FIRST
     // so the cold-tier write happens on the raw sample BEFORE the sketch
     // processor mutates / suffix-renames the metric stream.
-    let warm_tier_processors: Vec<String> = {
+    let asap_tier_processors: Vec<String> = {
         let mut v = Vec::new();
         if has_archive_tier {
             v.push("gorillas3".to_string());
@@ -269,7 +269,7 @@ tsdb_block_duration: {window_secs}s\n",
         // ── Phase 3.2.5 Bug (b): warm-passthrough routing ───────────────────
         // The freshness probes are timestamp counters by design — the
         // wire value `unix_ts_ms_of_emission` IS the freshness signal,
-        // so they MUST flow through the warm tier with their original
+        // so they MUST flow through the ASAP tier with their original
         // metric name preserved. The DDSketch processor's `_quantile`
         // suffix would rename `http_freshness_probe_warm` to
         // `http_freshness_probe_warm_quantile` and break the replay
@@ -279,7 +279,7 @@ tsdb_block_duration: {window_secs}s\n",
         // The fix: a `routing` processor with OTTL `route()` statements
         // dispatches by metric name. Listed metrics route to
         // `metrics/warm_passthrough` (gorillas3 → exporter, NO sketch);
-        // everything else takes the regular `metrics/warm_tier` path
+        // everything else takes the regular `metrics/asap_tier` path
         // (gorillas3 → sketches → exporter). Phase ε.1's Mode-3 entry
         // (matching `attributes["asap.mode"]`) is folded into the same
         // table when prometheus_archive is also configured.
@@ -295,7 +295,7 @@ tsdb_block_duration: {window_secs}s\n",
             );
         }
         let routing_yaml = format!(
-            "default_pipelines: [metrics/warm_tier]\ntable:\n{}\n",
+            "default_pipelines: [metrics/asap_tier]\ntable:\n{}\n",
             table_entries.join("\n"),
         );
         let routing: Value = serde_yaml::from_str(&routing_yaml)
@@ -303,10 +303,10 @@ tsdb_block_duration: {window_secs}s\n",
         processors.insert("routing".to_string(), routing);
 
         pipelines.insert(
-            "metrics/warm_tier".to_string(),
+            "metrics/asap_tier".to_string(),
             Pipeline {
                 receivers: vec!["otlp".into()],
-                processors: warm_tier_processors.clone(),
+                processors: asap_tier_processors.clone(),
                 exporters: vec![exporter_key.clone()],
             },
         );
@@ -344,20 +344,20 @@ tsdb_block_duration: {window_secs}s\n",
         // Legacy Phase ε.1 routing — `from_attribute: asap.mode`.
         // Preserved as-is so the wire shape stays stable for the
         // (warm_passthrough_metrics empty) cases that already exist.
-        let routing_yaml = "from_attribute: asap.mode\ndefault_pipelines: [metrics/warm_tier]\ntable:\n  - value: prometheus_archive\n    pipelines: [metrics/prometheus_archive]\n";
+        let routing_yaml = "from_attribute: asap.mode\ndefault_pipelines: [metrics/asap_tier]\ntable:\n  - value: prometheus_archive\n    pipelines: [metrics/prometheus_archive]\n";
         let routing: Value =
             serde_yaml::from_str(routing_yaml).context("parse routing processor block")?;
         processors.insert("routing".to_string(), routing);
 
         // Two named pipelines:
-        //   `metrics/warm_tier`        — gorillas3 (if archive) +
+        //   `metrics/asap_tier`        — gorillas3 (if archive) +
         //                                 sketch processors → otlp/backend
         //   `metrics/prometheus_archive` — passthrough → otlphttp/prometheus
         pipelines.insert(
-            "metrics/warm_tier".to_string(),
+            "metrics/asap_tier".to_string(),
             Pipeline {
                 receivers: vec!["otlp".into()],
-                processors: warm_tier_processors.clone(),
+                processors: asap_tier_processors.clone(),
                 exporters: vec![exporter_key.clone()],
             },
         );
@@ -382,14 +382,14 @@ tsdb_block_duration: {window_secs}s\n",
             },
         );
     } else {
-        // No routing — single pipeline with the warm-tier processor
+        // No routing — single pipeline with the ASAP-tier processor
         // chain (gorillas3 if archive_tier_metrics non-empty, then
         // sketches).
         pipelines.insert(
             "metrics".to_string(),
             Pipeline {
                 receivers: vec!["otlp".into()],
-                processors: warm_tier_processors,
+                processors: asap_tier_processors,
                 exporters: vec![exporter_key],
             },
         );
@@ -558,25 +558,25 @@ pub fn emit_backend_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
 /// For each `(metric, BackendStageConfig)` we derive a target list by
 /// inspecting the L4 sketch families landed at the backend:
 ///
-/// * **DDSketch / KLL** present → warm-tier serves `quantile` shape;
-///   warm-tier is the default for everything the archive doesn't claim.
-/// * **HLL** present → warm-tier serves `count` shape (cardinality
+/// * **DDSketch / KLL** present → ASAP-tier serves `quantile` shape;
+///   ASAP-tier is the default for everything the archive doesn't claim.
+/// * **HLL** present → ASAP-tier serves `count` shape (cardinality
 ///   readout). NOTE: with HLL planned, `count` does NOT route to archive
-///   — the warm-tier sketch is lossier-but-cheaper than archive scan and
+///   — the ASAP-tier sketch is lossier-but-cheaper than archive scan and
 ///   the controller already chose to spend the bandwidth on it.
-/// * **Count-Sketch** present → warm-tier serves `topk` shape (the
+/// * **Count-Sketch** present → ASAP-tier serves `topk` shape (the
 ///   sketch's whole purpose).
-/// * **CountMinSketch** present → warm-tier serves `point_count` /
+/// * **CountMinSketch** present → ASAP-tier serves `point_count` /
 ///   `count` shape (the CMS's `Estimate` readout).
 ///
 /// The `thanos_query` target is always added with the **archive-eligible
-/// shape list** — those PromQL shapes that no warm-tier sketch can
+/// shape list** — those PromQL shapes that no ASAP-tier sketch can
 /// answer at all (`histogram_quantile`, `delta`, `deriv`, `absent`,
 /// post-hoc / un-planned ranges). When a sketch-eligible shape is also
 /// in the archive's claim list (e.g. `count` when no HLL was planned)
 /// it is added so the archive picks it up as a fallback.
 ///
-/// Phase α is conservative: we always emit BOTH a warm-tier default
+/// Phase α is conservative: we always emit BOTH a ASAP-tier default
 /// slot AND a thanos archive slot for every planned metric, so v7
 /// dual-routing semantics are preserved by construction. Future phases
 /// (β / γ) may prune the archive slot for metrics the cost model
@@ -702,7 +702,7 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
         .map(|a| a.sketch_kind.clone())
         .collect();
 
-    // Sketch-eligible shapes — the warm tier serves these natively
+    // Sketch-eligible shapes — the ASAP tier serves these natively
     // because we planned a sketch for them.
     let mut warm_shapes: Vec<&'static str> = Vec::new();
     let has_quantile_sketch = kinds
@@ -731,7 +731,7 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
     }
     // Sketch-planned `rate / sum / avg / min / max` over the planned
     // ranges — every sketch family the planner emits also tracks the
-    // range aggregation needed to answer these from the warm tier
+    // range aggregation needed to answer these from the ASAP tier
     // (the gateway merge processor produces a windowed accumulator).
     if !kinds.is_empty() {
         warm_shapes.push("rate");
@@ -742,12 +742,12 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
     }
 
     // Archive-eligible shapes — Thanos / cold archive answers these
-    // because no warm-tier sketch can.
+    // because no ASAP-tier sketch can.
     //
     // Classification rule (surprised-me bullet for the report): `topk`
     // and `count` route to archive only when NO matching sketch was
-    // planned. With Count-Sketch the warm tier answers `topk` via the
-    // CountSketch's heap-augmented Estimate; with HLL the warm tier
+    // planned. With Count-Sketch the ASAP tier answers `topk` via the
+    // CountSketch's heap-augmented Estimate; with HLL the ASAP tier
     // answers `count` via the cardinality estimate. Pruning the
     // archive's claim list is what makes Phase α a planner-driven
     // routing table rather than a static "everything goes to archive"
@@ -765,7 +765,7 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
         archive_shapes.push("count");
     }
 
-    // Emit the warm-tier default slot first (no filter — catches every
+    // Emit the ASAP-tier default slot first (no filter — catches every
     // shape the archive doesn't claim), then the archive slot with the
     // explicit-shape claim list. Ordering matches the existing
     // `deploy/configs/backend-storage-routing.yaml` convention. The
@@ -794,14 +794,14 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
 
     // The warm-shape list is informational — surface it on a side
     // field for operators / tests to spot-check what the controller
-    // decided the warm tier serves natively. The backend ignores
+    // decided the ASAP tier serves natively. The backend ignores
     // unknown fields (`#[serde(default)]` on the parser side).
     let mut entry = json!({
         "name": metric_name,
         "targets": targets,
     });
     if !warm_shapes.is_empty() {
-        entry["warm_tier_native_shapes"] = json!(warm_shapes);
+        entry["asap_tier_native_shapes"] = json!(warm_shapes);
     }
     entry
 }
@@ -1897,7 +1897,7 @@ mod tests {
         let metric = &v["metrics"][0];
         let targets = metric["targets"].as_array().expect("targets array");
 
-        // Default slot — warm tier, no filter.
+        // Default slot — ASAP tier, no filter.
         assert_eq!(targets[0]["engine"], "asap_query");
         assert!(
             targets[0].get("applies_to_query_shape").is_none(),
@@ -1916,13 +1916,13 @@ mod tests {
         assert!(archive_shapes.contains(&"delta".to_string()));
         assert!(archive_shapes.contains(&"absent".to_string()));
         assert!(archive_shapes.contains(&"rate_post_hoc".to_string()));
-        // DDSketch planned → `topk` and `count` not warm-tier-eligible
+        // DDSketch planned → `topk` and `count` not ASAP-tier-eligible
         // (only quantile is). Both stay in archive's claim list.
         assert!(archive_shapes.contains(&"topk".to_string()));
         assert!(archive_shapes.contains(&"count".to_string()));
 
         // Warm-tier native shapes surfaced for spot-check.
-        let warm_native: Vec<String> = metric["warm_tier_native_shapes"]
+        let warm_native: Vec<String> = metric["asap_tier_native_shapes"]
             .as_array()
             .unwrap()
             .iter()
@@ -1942,7 +1942,7 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap().to_string())
             .collect();
-        // Count-Sketch planned → warm tier serves `topk`, archive
+        // Count-Sketch planned → ASAP tier serves `topk`, archive
         // claim list must NOT include topk.
         assert!(
             !archive_shapes.contains(&"topk".to_string()),
@@ -1962,7 +1962,7 @@ mod tests {
             .iter()
             .map(|s| s.as_str().unwrap().to_string())
             .collect();
-        // HLL planned → warm tier serves `count` (cardinality);
+        // HLL planned → ASAP tier serves `count` (cardinality);
         // archive claim list must NOT include count. `topk` still
         // routes to archive (no Count-Sketch).
         assert!(
@@ -2000,6 +2000,14 @@ mod tests {
   "default_engine": "asap_query",
   "metrics": [
     {
+      "asap_tier_native_shapes": [
+        "topk",
+        "rate",
+        "sum",
+        "avg",
+        "min",
+        "max"
+      ],
       "name": "http_requests_total",
       "targets": [
         {
@@ -2016,17 +2024,17 @@ mod tests {
           ],
           "engine": "thanos_query"
         }
-      ],
-      "warm_tier_native_shapes": [
-        "topk",
+      ]
+    },
+    {
+      "asap_tier_native_shapes": [
+        "count",
         "rate",
         "sum",
         "avg",
         "min",
         "max"
-      ]
-    },
-    {
+      ],
       "name": "active_users",
       "targets": [
         {
@@ -2043,17 +2051,18 @@ mod tests {
           ],
           "engine": "thanos_query"
         }
-      ],
-      "warm_tier_native_shapes": [
-        "count",
+      ]
+    },
+    {
+      "asap_tier_native_shapes": [
+        "quantile",
+        "quantile_over_time",
         "rate",
         "sum",
         "avg",
         "min",
         "max"
-      ]
-    },
-    {
+      ],
       "name": "request_latency_seconds",
       "targets": [
         {
@@ -2071,15 +2080,6 @@ mod tests {
           ],
           "engine": "thanos_query"
         }
-      ],
-      "warm_tier_native_shapes": [
-        "quantile",
-        "quantile_over_time",
-        "rate",
-        "sum",
-        "avg",
-        "min",
-        "max"
       ]
     }
   ],
@@ -2099,8 +2099,8 @@ mod tests {
     fn storage_routing_empty_aggregations_still_emits_archive_default() {
         // A plan with no aggregations (degenerate; should not happen
         // in practice but we don't want to panic). The metric still
-        // lands in the table as archive-only — no warm-tier-native
-        // shapes, no warm-tier annotation field.
+        // lands in the table as archive-only — no ASAP-tier-native
+        // shapes, no ASAP-tier annotation field.
         let cfg = BackendStageConfig {
             aggregations: vec![],
             readouts: vec![],
@@ -2108,9 +2108,9 @@ mod tests {
         let v = emit_backend_storage_routing(&[("orphan".into(), &cfg)]).expect("emit ok");
         let metric = &v["metrics"][0];
         assert_eq!(metric["name"], "orphan");
-        // No warm_tier_native_shapes side field.
-        assert!(metric.get("warm_tier_native_shapes").is_none());
-        // Targets: warm-tier default + archive default-shape list.
+        // No asap_tier_native_shapes side field.
+        assert!(metric.get("asap_tier_native_shapes").is_none());
+        // Targets: ASAP-tier default + archive default-shape list.
         let targets = metric["targets"].as_array().unwrap();
         assert_eq!(targets[0]["engine"], "asap_query");
         assert_eq!(targets[1]["engine"], "thanos_query");
@@ -2120,7 +2120,7 @@ mod tests {
     //
     // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
     // bind to `PhysicalExpr::Logical` rather than producing a `BackendAggregation`,
-    // so they correctly stay OUT of the warm-tier StreamingConfig the
+    // so they correctly stay OUT of the ASAP-tier StreamingConfig the
     // backend's ASAPQueryEngine receives. Phase α wires the archive routing
     // entry separately. This snapshot pins that contract.
 
@@ -2128,7 +2128,7 @@ mod tests {
     /// `{"aggregations": [], "readouts": []}` shape — what the backend
     /// receives when every intent in the workload is archive-only.
     #[test]
-    fn phase_b_empty_warm_tier_snapshot_for_all_archive_only_workload() {
+    fn phase_b_empty_asap_tier_snapshot_for_all_archive_only_workload() {
         let cfg = BackendStageConfig {
             aggregations: vec![],
             readouts: vec![],
@@ -2138,7 +2138,7 @@ mod tests {
         assert_eq!(s, r#"{"aggregations":[],"readouts":[]}"#);
     }
 
-    /// Snapshot: every Phase β warm-tier-bound intent (KLL/DDSketch
+    /// Snapshot: every Phase β ASAP-tier-bound intent (KLL/DDSketch
     /// quantile, HLL cardinality, CMS frequency, CountSketch topk) maps to
     /// a stable `aggregationType` string the backend's `AggregationType::
     /// FromStr` recognises. This is the contract the L4 → L5 → backend
@@ -2252,11 +2252,11 @@ mod tests {
         // No shape filter — Prometheus serves every PromQL shape.
         assert!(targets[0].get("applies_to_query_shape").is_none());
         // `asap_mode` annotation surfaces so operators can see why a
-        // metric routes off warm tier.
+        // metric routes off ASAP tier.
         assert_eq!(metrics[0]["asap_mode"], "prometheus_archive");
     }
 
-    /// Mode 1 + Mode 3 mixed in one cycle — warm-tier metric AND
+    /// Mode 1 + Mode 3 mixed in one cycle — ASAP-tier metric AND
     /// Prometheus-archive metric coexist in one routing JSON.
     #[test]
     fn phase_eps1_mixed_mode1_and_mode3_share_one_routing_table() {
@@ -2296,7 +2296,7 @@ mod tests {
             }],
             // RawAtEdgePrometheusArchive auto-populates the archive
             // tier list as well (Phase 3.2.5): the Mode-3 metric also
-            // lands in the Gorilla-S3 archive so the warm-tier engine
+            // lands in the Gorilla-S3 archive so the ASAP-tier engine
             // can serve last_over_time(...) queries.
             archive_tier_metrics: vec![ArchiveTierMetric {
                 metric: "http_requests_total".to_string(),
@@ -2347,8 +2347,8 @@ mod tests {
             "missing metrics/prometheus_archive pipeline\n{yaml}"
         );
         assert!(
-            yaml.contains("metrics/warm_tier:"),
-            "missing metrics/warm_tier pipeline\n{yaml}"
+            yaml.contains("metrics/asap_tier:"),
+            "missing metrics/asap_tier pipeline\n{yaml}"
         );
     }
 
@@ -2369,7 +2369,7 @@ mod tests {
             "no Mode 3 → no archive pipeline\n{yaml}"
         );
         assert!(
-            !yaml.contains("metrics/warm_tier"),
+            !yaml.contains("metrics/asap_tier"),
             "no Mode 3 → main pipeline keeps the legacy `metrics:` name\n{yaml}"
         );
         // Phase 3.2.5 — without archive_tier_metrics no gorillas3 block.
@@ -2383,9 +2383,9 @@ mod tests {
 
     /// Bug (a): when at least one archive-tier metric is configured the
     /// emitted YAML MUST include the `gorillas3` processor block + the
-    /// processor MUST be in the warm-tier pipeline. Without this freshness
+    /// processor MUST be in the ASAP-tier pipeline. Without this freshness
     /// probes (and any other archive-bound metric) never reach MinIO so
-    /// the warm-tier engine's `last_over_time(...)` returns empty.
+    /// the ASAP-tier engine's `last_over_time(...)` returns empty.
     #[test]
     fn phase_3_2_5_bug_a_archive_tier_metrics_emit_gorillas3_processor() {
         let mut cfg = ddsketch_edge_cfg();
@@ -2415,16 +2415,16 @@ mod tests {
             "endpoint should be env-overridable for the deploy team\n{yaml}"
         );
         // `drop_original: false` so the metric ALSO flows downstream
-        // through the warm-tier sketch / OTLP exporter (without this
-        // the warm tier never sees the metric).
+        // through the ASAP-tier sketch / OTLP exporter (without this
+        // the ASAP tier never sees the metric).
         assert!(
             yaml.contains("drop_original: false"),
-            "drop_original must be false so warm-tier sketches still see the metric\n{yaml}"
+            "drop_original must be false so ASAP-tier sketches still see the metric\n{yaml}"
         );
         // Processor name in the pipeline list.
         assert!(
             yaml.contains("- gorillas3"),
-            "gorillas3 must appear in the warm-tier pipeline processors\n{yaml}"
+            "gorillas3 must appear in the ASAP-tier pipeline processors\n{yaml}"
         );
         // window_interval picked up from the smallest declared
         // window_secs — 5 here, matching the freshness-probe spec.
@@ -2435,7 +2435,7 @@ mod tests {
     }
 
     /// Bug (a) corollary: gorillas3 runs BEFORE the sketch processor in
-    /// the warm-tier pipeline so the cold-tier write happens on raw
+    /// the ASAP-tier pipeline so the cold-tier write happens on raw
     /// samples — mirrors `asap-otel-agent-b6-asap-single-sketch.yaml`'s
     /// canonical `[gorillas3, ddsketch, batch]` ordering.
     #[test]
@@ -2465,14 +2465,14 @@ mod tests {
         );
     }
 
-    // ── Phase 3.2.5 Bug (b) — warm-tier passthrough routing ─────────────────
+    // ── Phase 3.2.5 Bug (b) — ASAP-tier passthrough routing ─────────────────
 
     /// Bug (b): freshness probes (and other counters whose value IS
     /// the signal) must bypass the family-specific sketch processor so
     /// the metric name is preserved end-to-end. The L5 emitter adds a
     /// `routing` processor with OTTL `route()` statements that dispatch
     /// listed metrics to a `metrics/warm_passthrough` pipeline; everything
-    /// else takes `metrics/warm_tier` as before.
+    /// else takes `metrics/asap_tier` as before.
     #[test]
     fn phase_3_2_5_bug_b_warm_passthrough_routes_around_sketch() {
         let mut cfg = ddsketch_edge_cfg();
@@ -2499,8 +2499,8 @@ mod tests {
 
         // Both pipelines exist.
         assert!(
-            yaml.contains("metrics/warm_tier:"),
-            "missing metrics/warm_tier pipeline\n{yaml}"
+            yaml.contains("metrics/asap_tier:"),
+            "missing metrics/asap_tier pipeline\n{yaml}"
         );
         assert!(
             yaml.contains("metrics/warm_passthrough:"),
@@ -2572,8 +2572,8 @@ mod tests {
             "warm_passthrough pipeline still emitted\n{yaml}"
         );
         assert!(
-            yaml.contains("metrics/warm_tier:"),
-            "warm_tier (default) pipeline still emitted\n{yaml}"
+            yaml.contains("metrics/asap_tier:"),
+            "asap_tier (default) pipeline still emitted\n{yaml}"
         );
     }
 

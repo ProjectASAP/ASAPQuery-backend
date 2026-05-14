@@ -184,7 +184,7 @@ pub struct RangeVectorElement {
     /// Optional per-element label-key override. When `Some`, the
     /// HTTP serializer uses these keys for the PromQL response's
     /// `"metric"` object instead of the query-scoped
-    /// `KeyByLabelNames` argument. Used by warm-tier `topk` (whose
+    /// `KeyByLabelNames` argument. Used by ASAP-tier `topk` (whose
     /// reducer synthesizes an `"item"` key not present in the
     /// query's group-by clause) and other adapters that materialize
     /// labels the caller doesn't know about. `None` for everyone
