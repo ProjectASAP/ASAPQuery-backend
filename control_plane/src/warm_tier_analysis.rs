@@ -375,6 +375,120 @@ fn duration_to_seconds(d: Duration) -> u64 {
     d.as_secs()
 }
 
+// ── Candidate → Policy matching ─────────────────────────────────────────────
+//
+// Closes the analyzer → policy registry lookup half of the merged-sid-identity
+// query path. Together with `SketchStore::sids_for_policy` (PR #203) this
+// gives the query engine an O(1) `Candidate → policy_fp → [sid]` index that
+// avoids walking the per-sid metadata map.
+
+/// Translate an [`asap_types::AggregationConfig`] into the warm-tier
+/// [`Capability`] its sids serve. Mirrors the inverse direction
+/// `capability_for(&AggIntent)`: where that function says "this intent
+/// wants *this* capability", this function says "this stored policy
+/// *provides* this capability". Returns `None` for `AggregationType`
+/// variants that don't have a corresponding warm-tier capability
+/// (multi-pop keyed variants without an L4 binder, legacy config
+/// wrappers, etc.) — callers MUST treat `None` as "policy doesn't
+/// serve any warm-tier candidate" and skip.
+pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capability> {
+    use crate::sketch_algebra::capability::SketchKindHandle;
+    use promql_utilities::query_logics::enums::AggregationType;
+    match cfg.aggregation_type {
+        // Exact-aggregation families — the warm-tier ExactAgg path.
+        AggregationType::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggregationType::Increase => Some(Capability::ExactAgg(AggregationType::Increase)),
+        AggregationType::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
+        // Quantile families — DDSketch and KLL answer quantile + min/max.
+        AggregationType::DDSketch => {
+            Some(Capability::QuantileApprox(SketchKindHandle::DDSketch))
+        }
+        AggregationType::DatasketchesKLL => {
+            Some(Capability::QuantileApprox(SketchKindHandle::Kll))
+        }
+        // Cardinality.
+        AggregationType::HLL => Some(Capability::CardinalityApprox),
+        // Frequency families.
+        AggregationType::CountMinSketch => {
+            Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin))
+        }
+        AggregationType::CountSketch => {
+            Some(Capability::FrequencyEstimate(SketchKindHandle::CountSketch))
+        }
+        AggregationType::CountMinSketchWithHeap => {
+            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
+        }
+        // Keyed-multi-population variants and legacy wrappers — no
+        // standalone warm-tier capability today. The L4 binder doesn't
+        // yet emit `PhysicalExpr::ExactAgg` for keyed `MultipleSum` /
+        // `MultipleIncrease` shapes (the matching capability doesn't
+        // exist either). When the keyed-ExactAgg follow-up lands, this
+        // function gets the corresponding arms.
+        AggregationType::MultipleSum
+        | AggregationType::MultipleIncrease
+        | AggregationType::MultipleMinMax
+        | AggregationType::HydraKLL
+        | AggregationType::SetAggregator
+        | AggregationType::DeltaSetAggregator
+        | AggregationType::SingleSubpopulation
+        | AggregationType::MultipleSubpopulation => None,
+    }
+}
+
+/// Find every policy in `registry` whose contents satisfy `candidate`.
+/// The result is empty when no policy fits — caller routes the query
+/// to the archive engine (cold tier) in that case. Multiple matches
+/// are valid (different windows / different sketch families all
+/// serving the same intent); the caller can pick the cheapest via the
+/// cost model or fan out to all of them and combine.
+///
+/// Matching predicate:
+/// 1. `policy.metric == candidate.metric_name`
+/// 2. `candidate.group_by_keys ⊆ policy.grouping_labels.labels` —
+///    the policy's group-by must cover every key the candidate names
+///    (extra group-by keys on the policy are fine; the query can
+///    re-aggregate down to its required projection).
+/// 3. `policy_capability(policy)` is `Some(c)` and
+///    `candidate.required_capability.is_satisfied_by(&c)`.
+/// 4. `policy.window_size ≤ candidate.range_seconds` — finer windows
+///    can answer coarser queries by merging; the reverse isn't true.
+///    When `candidate.range_seconds == 0` (instant-vector query),
+///    any policy window passes.
+/// 5. `policy.spatial_filter_normalized.is_empty()` — only unfiltered
+///    policies for now. Filtered-policy match has to compare the
+///    canonical predicate against the candidate's filter shape, and
+///    the candidate doesn't carry one today. Future enhancement.
+pub fn find_matching_policies(
+    registry: &asap_types::PolicyRegistry,
+    candidate: &WarmTierCandidate,
+) -> Vec<asap_types::PolicyFingerprint> {
+    let mut out = Vec::new();
+    for (fp, cfg) in registry.iter() {
+        if cfg.metric != candidate.metric_name {
+            continue;
+        }
+        let policy_keys: BTreeSet<String> =
+            cfg.grouping_labels.labels.iter().cloned().collect();
+        if !candidate.group_by_keys.is_subset(&policy_keys) {
+            continue;
+        }
+        let Some(provided) = policy_capability(cfg) else {
+            continue;
+        };
+        if !candidate.required_capability.is_satisfied_by(&provided) {
+            continue;
+        }
+        if candidate.range_seconds > 0 && cfg.window_size > candidate.range_seconds {
+            continue;
+        }
+        if !cfg.spatial_filter_normalized.is_empty() {
+            continue;
+        }
+        out.push(*fp);
+    }
+    out
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -626,5 +740,284 @@ mod tests {
             a.candidates[0].required_capability,
             Capability::CardinalityApprox,
         );
+    }
+
+    // ── policy_capability + find_matching_policies tests ─────────────────
+
+    mod matching {
+        use super::super::*;
+        use asap_types::{AggregationConfig, PolicyFingerprint, PolicyRegistry};
+        use promql_utilities::data_model::KeyByLabelNames;
+        use promql_utilities::query_logics::enums::AggregationType;
+        use std::collections::HashMap;
+
+        fn cfg(
+            metric: &str,
+            agg_type: AggregationType,
+            group_by: Vec<&str>,
+            window_size: u64,
+            spatial_filter: &str,
+        ) -> AggregationConfig {
+            AggregationConfig::new(
+                agg_type,
+                String::new(),
+                HashMap::new(),
+                KeyByLabelNames::new(group_by.into_iter().map(|s| s.to_string()).collect()),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                String::new(),
+                window_size,
+                window_size,
+                asap_types::enums::WindowType::Tumbling,
+                spatial_filter.to_string(),
+                metric.to_string(),
+                None,
+                None,
+                None,
+            )
+        }
+
+        fn candidate(
+            metric: &str,
+            group_by: &[&str],
+            cap: Capability,
+            range_seconds: u64,
+        ) -> WarmTierCandidate {
+            WarmTierCandidate {
+                metric_name: metric.to_string(),
+                group_by_keys: group_by.iter().map(|s| s.to_string()).collect(),
+                required_capability: cap,
+                function: String::new(),
+                function_args: Vec::new(),
+                range_seconds,
+            }
+        }
+
+        #[test]
+        fn policy_capability_maps_sum_to_exact_agg() {
+            let c = cfg("m", AggregationType::Sum, vec![], 60, "");
+            assert_eq!(
+                policy_capability(&c),
+                Some(Capability::ExactAgg(AggregationType::Sum))
+            );
+        }
+
+        #[test]
+        fn policy_capability_maps_ddsketch_to_quantile_approx() {
+            use crate::sketch_algebra::capability::SketchKindHandle;
+            let c = cfg("m", AggregationType::DDSketch, vec![], 60, "");
+            assert_eq!(
+                policy_capability(&c),
+                Some(Capability::QuantileApprox(SketchKindHandle::DDSketch))
+            );
+        }
+
+        #[test]
+        fn policy_capability_returns_none_for_multi_pop_variants() {
+            let c = cfg("m", AggregationType::MultipleSum, vec!["zone"], 60, "");
+            assert!(policy_capability(&c).is_none());
+        }
+
+        #[test]
+        fn matches_exact_metric_and_capability() {
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            let m = find_matching_policies(&registry, &cand);
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0], registry.fingerprints().next().unwrap());
+        }
+
+        #[test]
+        fn does_not_match_different_metric() {
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "cpu_pct",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn does_not_match_incompatible_capability() {
+            // Policy is Sum (ExactAgg); candidate asks for QuantileApprox.
+            use crate::sketch_algebra::capability::SketchKindHandle;
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::QuantileApprox(SketchKindHandle::Any),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn matches_when_policy_group_by_covers_candidate() {
+            // Policy keeps {zone, service}; candidate asks for just {zone}.
+            // That's covered — the query can re-aggregate down.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::Sum,
+                vec!["zone", "service"],
+                60,
+                "",
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &["zone"],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn does_not_match_when_candidate_needs_keys_policy_lacks() {
+            // Policy keeps {zone}; candidate asks for {zone, service}.
+            // That's NOT covered — policy already projected service away.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::Sum,
+                vec!["zone"],
+                60,
+                "",
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &["zone", "service"],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn finer_window_matches_coarser_query_range() {
+            // Policy emits 60s windows; candidate wants 300s range.
+            // Finer can answer coarser via merge.
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                300,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn coarser_window_does_not_match_finer_query_range() {
+            // Policy emits 300s windows; candidate wants 60s range.
+            // Can't downsample 300s into 60s.
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 300, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn zero_range_query_accepts_any_window() {
+            // Instant-vector queries (range_seconds=0) match any policy.
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 300, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                0,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn filtered_policy_does_not_match_today() {
+            // Until candidate carries a spatial-filter shape, filtered
+            // policies are skipped. Locks in the documented limitation.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::Sum,
+                vec![],
+                60,
+                r#"status="200""#,
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn multiple_matches_return_all_fingerprints() {
+            // Two policies serve the same intent at different windows
+            // — both match (cost model picks one later).
+            let policies = vec![
+                cfg("http_lat", AggregationType::Sum, vec![], 60, ""),
+                cfg("http_lat", AggregationType::Sum, vec![], 30, ""),
+            ];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                300,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 2);
+        }
+
+        #[test]
+        fn ignores_multi_pop_policies() {
+            // Multi-population policies have `policy_capability == None`;
+            // matching skips them even when other fields would line up.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::MultipleSum,
+                vec!["zone"],
+                60,
+                "",
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &["zone"],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn empty_registry_yields_empty_matches() {
+            let registry = PolicyRegistry::from_configs(Vec::<AggregationConfig>::new());
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+            let _ = PolicyFingerprint::UNSET; // silence unused import warning
+        }
     }
 }
