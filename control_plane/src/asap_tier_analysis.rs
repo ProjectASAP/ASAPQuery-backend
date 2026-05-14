@@ -447,16 +447,29 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
         AggregationType::CountMinSketchWithHeap => {
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
         }
-        // Keyed-multi-population variants and legacy wrappers — no
-        // standalone ASAP-tier capability today. The L4 binder doesn't
-        // yet emit `PhysicalExpr::ExactAgg` for keyed `MultipleSum` /
-        // `MultipleIncrease` shapes (the matching capability doesn't
-        // exist either). When the keyed-ExactAgg follow-up lands, this
-        // function gets the corresponding arms.
-        AggregationType::MultipleSum
-        | AggregationType::MultipleIncrease
-        | AggregationType::MultipleMinMax
-        | AggregationType::HydraKLL
+        // Keyed-multi-population variants. The capability the policy
+        // *provides* is the multi-pop variant itself; the matching
+        // predicate (`Capability::is_satisfied_by`) recognises that
+        // a multi-pop indexed capability satisfies a single-pop
+        // required capability through `multi_pop_satisfies_single`.
+        // So a candidate's `ExactAgg(Sum)` matches a policy whose
+        // `policy_capability` returns `ExactAgg(MultipleSum)`.
+        AggregationType::MultipleSum => Some(Capability::ExactAgg(AggregationType::MultipleSum)),
+        AggregationType::MultipleIncrease => {
+            Some(Capability::ExactAgg(AggregationType::MultipleIncrease))
+        }
+        AggregationType::MultipleMinMax => {
+            Some(Capability::ExactAgg(AggregationType::MultipleMinMax))
+        }
+        // No ASAP-tier capability today. HydraKLL is a keyed-quantile
+        // family that needs its own QuantileApprox arm (with a
+        // multi-pop equivalent rule) — separate follow-up. SetAggregator
+        // and DeltaSetAggregator are exact-set-membership primitives;
+        // they serve `count(distinct ...)` queries through a different
+        // routing path (not via candidate capability matching).
+        // `Single/MultipleSubpopulation` are legacy enum wrappers from
+        // the pre-refactor config schema and have no semantic shape.
+        AggregationType::HydraKLL
         | AggregationType::SetAggregator
         | AggregationType::DeltaSetAggregator
         | AggregationType::SingleSubpopulation
@@ -927,9 +940,73 @@ mod tests {
         }
 
         #[test]
-        fn policy_capability_returns_none_for_multi_pop_variants() {
+        fn policy_capability_maps_multiple_sum_to_exact_agg_multiple_sum() {
             let c = cfg("m", AggregationType::MultipleSum, vec!["zone"], 60, "");
-            assert!(policy_capability(&c).is_none());
+            assert_eq!(
+                policy_capability(&c),
+                Some(Capability::ExactAgg(AggregationType::MultipleSum))
+            );
+        }
+
+        #[test]
+        fn multiple_sum_policy_satisfies_unkeyed_sum_query() {
+            // MultipleSum policy keeps per-zone state; an unkeyed Sum
+            // query can re-aggregate across zones. The is_satisfied_by
+            // multi-pop-satisfies-single rule + the group_by ⊆ policy
+            // grouping check let it through.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::MultipleSum,
+                vec!["zone"],
+                60,
+                "",
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn multiple_increase_policy_satisfies_keyed_increase_query() {
+            let policies = vec![cfg(
+                "http_requests_total",
+                AggregationType::MultipleIncrease,
+                vec!["zone", "service"],
+                60,
+                "",
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            // Query asks for per-zone increase; policy keeps {zone,
+            // service} (superset).
+            let cand = candidate(
+                "http_requests_total",
+                &["zone"],
+                Capability::ExactAgg(AggregationType::Increase),
+                60,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn single_pop_policy_does_not_satisfy_keyed_query() {
+            // Unkeyed Sum policy can't answer per-zone Sum — keys
+            // already collapsed. Group_by ⊆ policy_grouping_labels
+            // check rejects this even though capabilities would
+            // structurally satisfy.
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate(
+                "http_lat",
+                &["zone"],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
         }
 
         #[test]
@@ -1156,12 +1233,13 @@ mod tests {
         }
 
         #[test]
-        fn ignores_multi_pop_policies() {
-            // Multi-population policies have `policy_capability == None`;
-            // matching skips them even when other fields would line up.
+        fn ignores_unsupported_multi_pop_variants() {
+            // `HydraKLL`, `SetAggregator`, etc. have
+            // `policy_capability == None` because no Capability variant
+            // covers their shape today. Matching skips them.
             let policies = vec![cfg(
                 "http_lat",
-                AggregationType::MultipleSum,
+                AggregationType::SetAggregator,
                 vec!["zone"],
                 60,
                 "",

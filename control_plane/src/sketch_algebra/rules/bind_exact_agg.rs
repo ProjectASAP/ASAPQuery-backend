@@ -77,15 +77,25 @@ impl Rule for BindExactAgg {
     }
 
     fn apply(&self, expr: &QueryExpr, _accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
-        let (intent, child) = match expr {
+        let (intent, child, keyed) = match expr {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
-            } if aggs.len() == 1 && by.is_empty() => (&aggs[0], child),
+            } if aggs.len() == 1 => (&aggs[0], child, !by.is_empty()),
             _ => return None,
         };
 
+        // Keyed aggregations (non-empty `by`) lower to the multi-pop
+        // accumulator variant; the data plane stores per-key state so
+        // the query can fan results out over the surviving labels.
+        // Unkeyed aggregations stay on the single-pop variant.
         let agg_type = match intent {
-            AggIntent::Sum => AggregationType::Sum,
+            AggIntent::Sum => {
+                if keyed {
+                    AggregationType::MultipleSum
+                } else {
+                    AggregationType::Sum
+                }
+            }
             AggIntent::Rate { window } | AggIntent::Increase { window } => {
                 // The window is informational here — the data plane keys
                 // the policy on (metric, attrs, agg_kind, filter) plus
@@ -95,11 +105,24 @@ impl Rule for BindExactAgg {
                 if *window == Duration::ZERO {
                     return None;
                 }
-                AggregationType::Increase
+                if keyed {
+                    AggregationType::MultipleIncrease
+                } else {
+                    AggregationType::Increase
+                }
             }
             AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
-            } => AggregationType::Sum,
+            } => {
+                // count_over_time = sum-of-1s, so it lowers through the
+                // Sum/MultipleSum accumulator family — same as
+                // `AggIntent::Sum` above.
+                if keyed {
+                    AggregationType::MultipleSum
+                } else {
+                    AggregationType::Sum
+                }
+            }
             _ => return None,
         };
 
@@ -213,20 +236,66 @@ mod tests {
         assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 
-    #[test]
-    fn does_not_bind_when_by_clause_present() {
-        // Group-by-bearing intents are L3-canonical-form-only here;
-        // this rule mirrors the existing bind_ddsketch_quantile shape
-        // and rejects `by`-bearing inputs. A keyed ExactAgg follow-up
-        // would emit `MultipleSum` / `MultipleIncrease` instead — see
-        // the AggregationType enum.
-        let expr = QueryExpr::Aggregate {
-            aggs: vec![AggIntent::Sum],
-            child: Box::new(scan("test_metric")),
-            by: vec![0],
+    fn agg_over_with_by(intent: AggIntent, metric: &str, by: Vec<usize>) -> QueryExpr {
+        QueryExpr::Aggregate {
+            aggs: vec![intent],
+            child: Box::new(scan(metric)),
+            by,
             having: None,
-        };
-        assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
+        }
+    }
+
+    fn check_keyed_binds(intent: AggIntent, expected: AggregationType) {
+        let expr = agg_over_with_by(intent, "test_metric", vec![0]);
+        let bound = BindExactAgg
+            .apply(&expr, &AccuracyTarget::Exact)
+            .unwrap_or_else(|| panic!("rule didn't fire on keyed {expected:?}"));
+        match bound {
+            PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(agg_type, expected),
+            other => panic!("expected ExactAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyed_sum_binds_to_multiple_sum() {
+        check_keyed_binds(AggIntent::Sum, AggregationType::MultipleSum);
+    }
+
+    #[test]
+    fn keyed_rate_binds_to_multiple_increase() {
+        check_keyed_binds(
+            AggIntent::Rate {
+                window: Duration::from_secs(60),
+            },
+            AggregationType::MultipleIncrease,
+        );
+    }
+
+    #[test]
+    fn keyed_increase_binds_to_multiple_increase() {
+        check_keyed_binds(
+            AggIntent::Increase {
+                window: Duration::from_secs(300),
+            },
+            AggregationType::MultipleIncrease,
+        );
+    }
+
+    #[test]
+    fn keyed_count_exact_binds_to_multiple_sum() {
+        check_keyed_binds(
+            AggIntent::Count {
+                accuracy: AccuracyTarget::Exact,
+            },
+            AggregationType::MultipleSum,
+        );
+    }
+
+    #[test]
+    fn unkeyed_sum_still_binds_to_single_pop_sum() {
+        // Regression guard: the keyed/unkeyed branch must still
+        // dispatch correctly on `by.is_empty()`.
+        check_binds(AggIntent::Sum, AggregationType::Sum);
     }
 
     #[test]

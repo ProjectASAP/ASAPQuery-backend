@@ -449,11 +449,13 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 }
 
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
-/// Control plane path: `Aggregate{Sum, by=[host]}` over a bare `Scan` (no
-/// `Window`). Sum is exact → Logical pass-through. The point of the test
-/// is the by-clause survives binding intact.
+/// Control plane path: `Aggregate{Sum, by=[host]}` over a bare `Scan`.
+/// Post keyed-ExactAgg follow-up, `BindExactAgg` lowers this to
+/// `PhysicalExpr::ExactAgg { agg_type: MultipleSum, .. }` — the
+/// multi-pop accumulator family the data plane uses for keyed
+/// per-group sums.
 #[test]
-fn phase_b_pattern_only_spatial_aggregate_preserves_by_clause() {
+fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
         by: vec![1], // service column
         aggs: vec![AggIntent::Sum],
@@ -462,19 +464,19 @@ fn phase_b_pattern_only_spatial_aggregate_preserves_by_clause() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Logical(QueryExpr::Aggregate { by, .. }) => {
-            assert_eq!(by, vec![1]);
-        }
-        other => panic!("expected Logical(Aggregate), got {other:?}"),
+        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
+            agg_type,
+            promql_utilities::query_logics::enums::AggregationType::MultipleSum,
+        ),
+        other => panic!("expected ExactAgg(MultipleSum), got {other:?}"),
     }
 }
 
 /// `ONE_TEMPORAL_ONE_SPATIAL` — `sum by (host) (rate(m[5m]))`.
-/// Control plane path: combined `Aggregate{Sum, by=[host]}` over `Window` —
-/// the L3 algebra captures both axes natively without needing the legacy
-/// pattern's `One*One*` enum.
+/// Post keyed-ExactAgg follow-up: `Rate` keyed by `host` lowers to
+/// `MultipleIncrease`.
 #[test]
-fn phase_b_pattern_temporal_and_spatial_combined() {
+fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
         by: vec![1],
         aggs: vec![AggIntent::Rate {
@@ -484,8 +486,13 @@ fn phase_b_pattern_temporal_and_spatial_combined() {
         child: Box::new(windowed_scan()),
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
-    // Rate has no ASAP-tier sketch family today — expect Logical.
-    assert!(matches!(bound, PhysicalExpr::Logical(_)));
+    match bound {
+        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
+            agg_type,
+            promql_utilities::query_logics::enums::AggregationType::MultipleIncrease,
+        ),
+        other => panic!("expected ExactAgg(MultipleIncrease), got {other:?}"),
+    }
 }
 
 /// Phase β archive-only intent: any of the no-ASAP-tier-family entries
