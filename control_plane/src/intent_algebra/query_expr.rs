@@ -57,8 +57,8 @@ pub enum QueryExprError {
     #[error("Merge requires at least one child")]
     EmptyMerge,
     /// A legacy `ScalarExpr` variant has no canonical `Predicate` counterpart
-    /// yet. Surfaces from [`from_legacy_scalar`] for the deferred E-variants
-    /// (`FunctionCall` / `ScalarSubquery` / `InList` / `Between`).
+    /// yet. Surfaces from [`from_legacy_scalar`] for `ScalarSubquery` only —
+    /// it carries a legacy `QueryExpr` sub-tree that needs the tree converter.
     #[error("legacy ScalarExpr variant `{0}` is not yet representable in canonical Predicate")]
     UnsupportedLegacyScalar(&'static str),
 }
@@ -288,13 +288,13 @@ pub struct ProjectItem {
 
 // ── Typed Predicate ──────────────────────────────────────────────────────────
 
-/// Minimal typed scalar predicate. Covers the four
-/// `legacy_expr::ScalarExpr` variants that have a structurally clean canonical
-/// shape: column / literal / binary-op / is-null. The deferred E-variants
-/// (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) remain in
-/// `legacy_expr::ScalarExpr` until their own migration batch — they require
-/// either a typed scalar function catalog (FunctionCall) or recursive
-/// `QueryExpr` (ScalarSubquery) which is out of scope for Batch 2.
+/// Typed scalar predicate — the canonical counterpart of
+/// `legacy_expr::ScalarExpr`. Covers all eight legacy scalar shapes:
+/// column / literal / binary-op / is-null (the structurally clean four)
+/// plus `FunctionCall` / `InList` / `Between` / `ScalarSubquery` (the
+/// E-variants). `ScalarSubquery` carries a canonical [`QueryExpr`] —
+/// translating a legacy `ScalarSubquery` requires the legacy→canonical
+/// tree converter, so [`from_legacy_scalar`] still defers that one arm.
 ///
 /// See [`from_legacy_scalar`] for the migration helper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -313,6 +313,26 @@ pub enum Predicate {
     /// IS NULL / IS NOT NULL.
     IsNull {
         expr: Box<Predicate>,
+        negated: bool,
+    },
+    /// Named scalar function call (`ABS(x)`, `DATE_TRUNC('hour', ts)`).
+    FunctionCall {
+        name: String,
+        args: Vec<Predicate>,
+    },
+    /// Scalar sub-query (`SELECT MAX(price) FROM orders`).
+    ScalarSubquery(Box<QueryExpr>),
+    /// `expr IN (v1, v2, …)` / `NOT IN (…)`.
+    InList {
+        expr: Box<Predicate>,
+        list: Vec<Predicate>,
+        negated: bool,
+    },
+    /// `expr BETWEEN low AND high` / `NOT BETWEEN …`.
+    Between {
+        expr: Box<Predicate>,
+        low: Box<Predicate>,
+        high: Box<Predicate>,
         negated: bool,
     },
 }
@@ -616,10 +636,10 @@ impl BindingScope {
 // ── legacy_expr::ScalarExpr → canonical Predicate translation ────────────────
 
 /// Translate a [`legacy_expr::ScalarExpr`](crate::intent_algebra::legacy_expr::ScalarExpr)
-/// into the canonical typed [`Predicate`]. Returns
-/// [`QueryExprError::UnsupportedLegacyScalar`] for the deferred E-variants
-/// (`FunctionCall`, `ScalarSubquery`, `InList`, `Between`) — those keep
-/// living in `legacy_expr::ScalarExpr` until their own migration batch.
+/// into the canonical typed [`Predicate`]. All scalar shapes translate
+/// except `ScalarSubquery`, which carries a legacy `QueryExpr` sub-tree:
+/// that arm still returns [`QueryExprError::UnsupportedLegacyScalar`] until
+/// the legacy→canonical tree converter lands and can recurse into it.
 ///
 /// `LiteralValue::Duration` is folded into a `Predicate::Literal(Int)`
 /// carrying the nanosecond count, because the canonical [`LiteralValue`]
@@ -641,14 +661,41 @@ pub fn from_legacy_scalar(
             expr: Box::new(from_legacy_scalar(expr)?),
             negated: *negated,
         }),
-        l::ScalarExpr::FunctionCall { .. } => {
-            Err(QueryExprError::UnsupportedLegacyScalar("FunctionCall"))
-        }
+        l::ScalarExpr::FunctionCall { name, args } => Ok(Predicate::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(from_legacy_scalar)
+                .collect::<Result<Vec<_>, _>>()?,
+        }),
+        l::ScalarExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Predicate::InList {
+            expr: Box::new(from_legacy_scalar(expr)?),
+            list: list
+                .iter()
+                .map(from_legacy_scalar)
+                .collect::<Result<Vec<_>, _>>()?,
+            negated: *negated,
+        }),
+        l::ScalarExpr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => Ok(Predicate::Between {
+            expr: Box::new(from_legacy_scalar(expr)?),
+            low: Box::new(from_legacy_scalar(low)?),
+            high: Box::new(from_legacy_scalar(high)?),
+            negated: *negated,
+        }),
+        // `ScalarSubquery` carries a legacy `QueryExpr` sub-tree — needs the
+        // legacy→canonical tree converter to recurse. Deferred to that PR.
         l::ScalarExpr::ScalarSubquery(_) => {
             Err(QueryExprError::UnsupportedLegacyScalar("ScalarSubquery"))
         }
-        l::ScalarExpr::InList { .. } => Err(QueryExprError::UnsupportedLegacyScalar("InList")),
-        l::ScalarExpr::Between { .. } => Err(QueryExprError::UnsupportedLegacyScalar("Between")),
     }
 }
 
@@ -1053,36 +1100,58 @@ mod tests {
     }
 
     #[test]
-    fn from_legacy_scalar_unsupported_variants_error() {
+    fn from_legacy_scalar_e_variants_translate() {
         use crate::intent_algebra::legacy_expr as l;
+
         let f = l::ScalarExpr::FunctionCall {
             name: "abs".into(),
             args: vec![l::ScalarExpr::Column("x".into())],
         };
-        assert!(matches!(
-            from_legacy_scalar(&f).unwrap_err(),
-            QueryExprError::UnsupportedLegacyScalar("FunctionCall")
-        ));
+        match from_legacy_scalar(&f).unwrap() {
+            Predicate::FunctionCall { name, args } => {
+                assert_eq!(name, "abs");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(&args[0], Predicate::Column(ColumnRef::Named(n)) if n == "x"));
+            }
+            other => panic!("expected FunctionCall, got {other:?}"),
+        }
 
         let il = l::ScalarExpr::InList {
             expr: Box::new(l::ScalarExpr::Column("x".into())),
             list: vec![l::ScalarExpr::Literal(l::LiteralValue::Int(1))],
             negated: false,
         };
-        assert!(matches!(
-            from_legacy_scalar(&il).unwrap_err(),
-            QueryExprError::UnsupportedLegacyScalar("InList")
-        ));
+        match from_legacy_scalar(&il).unwrap() {
+            Predicate::InList {
+                list, negated, ..
+            } => {
+                assert_eq!(list.len(), 1);
+                assert!(!negated);
+            }
+            other => panic!("expected InList, got {other:?}"),
+        }
 
         let bt = l::ScalarExpr::Between {
             expr: Box::new(l::ScalarExpr::Column("x".into())),
             low: Box::new(l::ScalarExpr::Literal(l::LiteralValue::Int(0))),
             high: Box::new(l::ScalarExpr::Literal(l::LiteralValue::Int(10))),
-            negated: false,
+            negated: true,
         };
         assert!(matches!(
-            from_legacy_scalar(&bt).unwrap_err(),
-            QueryExprError::UnsupportedLegacyScalar("Between")
+            from_legacy_scalar(&bt).unwrap(),
+            Predicate::Between { negated: true, .. }
+        ));
+    }
+
+    #[test]
+    fn from_legacy_scalar_subquery_still_deferred() {
+        use crate::intent_algebra::legacy_expr as l;
+        // `ScalarSubquery` carries a legacy `QueryExpr` sub-tree — needs the
+        // legacy→canonical tree converter, so it still errors for now.
+        let sq = l::ScalarExpr::ScalarSubquery(Box::new(l::QueryExpr::Ref("cte".into())));
+        assert!(matches!(
+            from_legacy_scalar(&sq).unwrap_err(),
+            QueryExprError::UnsupportedLegacyScalar("ScalarSubquery")
         ));
     }
 }

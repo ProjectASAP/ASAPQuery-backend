@@ -199,7 +199,8 @@ mod tests {
     };
     use crate::intent_algebra::legacy_expr::{
         AggFunc, BinaryOpKind as LegacyBinaryOpKind, ColumnRef as LegacyColumnRef,
-        LiteralValue as LegacyLiteralValue, ScalarExpr as LegacyScalarExpr,
+        LiteralValue as LegacyLiteralValue, QueryExpr as LegacyQueryExpr,
+        ScalarExpr as LegacyScalarExpr,
     };
     use crate::intent_algebra::schema::{Column, DataType};
 
@@ -292,13 +293,13 @@ mod tests {
 
     #[test]
     fn bridge_having_deferred_e_variant_surfaces_error() {
-        // HAVING uses FunctionCall — an E-classified ScalarExpr variant
-        // that from_legacy_scalar doesn't translate.
+        // HAVING uses ScalarSubquery — the one ScalarExpr variant
+        // from_legacy_scalar still defers (it carries a legacy QueryExpr
+        // sub-tree that needs the tree converter to recurse).
         let s = infer_source_schema("m");
-        let having = Some(LegacyScalarExpr::FunctionCall {
-            name: "now".into(),
-            args: vec![],
-        });
+        let having = Some(LegacyScalarExpr::ScalarSubquery(Box::new(
+            LegacyQueryExpr::Ref("cte".into()),
+        )));
         let aggs = vec![agg_item("s", AggFunc::Sum)];
         let err = bridge_aggregate_to_canonical(&[], &aggs, &having, &s).unwrap_err();
         assert!(matches!(err, BridgeError::HavingDeferred(_)));
