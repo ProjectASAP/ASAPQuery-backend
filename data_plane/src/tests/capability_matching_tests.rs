@@ -71,7 +71,7 @@ fn engine_no_query_configs(
     let ts = 1_000_000_u64;
     for c in &agg_configs {
         let window_ms = c.window_size * 1000;
-        let output = PrecomputedOutput::new(ts - window_ms, ts, None, c.aggregation_id());
+        let output = PrecomputedOutput::new(ts - window_ms, ts, None, asap_types::PolicyFingerprint(c.aggregation_id()));
         let acc: Box<dyn crate::AggregateCore> = match c.aggregation_type.as_str() {
             "DatasketchesKLL" => {
                 let mut kll = DatasketchesKLLAccumulator::new(200);
@@ -116,7 +116,7 @@ fn engine_with_query_config(
 
     let ts = 1_000_000_u64;
     let window_ms = agg_config.window_size * 1000;
-    let output = PrecomputedOutput::new(ts - window_ms, ts, None, agg_id);
+    let output = PrecomputedOutput::new(ts - window_ms, ts, None, asap_types::PolicyFingerprint(agg_id));
     let acc = SumAccumulator::with_sum(99.0);
     let resolver = Arc::new(SeriesIdResolver::new());
     sketch_index.ingest_precompute_for_agg_config(

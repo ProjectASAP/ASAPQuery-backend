@@ -123,7 +123,7 @@ pub fn create_engine_single_pop_with_aggregated(
     let timestamp = 1_000_000_u64;
     for (label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp, timestamp, key, agg_id);
+        let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(agg_id));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
 
@@ -224,12 +224,12 @@ pub fn create_engine_dual_input(
     let timestamp = 1_000_000_u64;
     for (label_values_opt, acc) in value_data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp, timestamp, key, value_id);
+        let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(value_id));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in keys_data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp, timestamp, key, keys_id);
+        let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(keys_id));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
 
@@ -310,12 +310,12 @@ pub fn create_engine_two_metrics(
     let timestamp = 1_000_000_u64;
     for (label_values_opt, acc) in data_a {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp, timestamp, key, id_a);
+        let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(id_a));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_1, &output, acc.as_ref());
     }
     for (label_values_opt, acc) in data_b {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp, timestamp, key, id_b);
+        let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(id_b));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
     let _ = (query_a, query_b);
@@ -394,7 +394,7 @@ pub fn create_engine_three_metrics(
         let agg_id = ids[idx];
         for (label_values_opt, acc) in data {
             let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-            let output = PrecomputedOutput::new(timestamp, timestamp, key, agg_id);
+            let output = PrecomputedOutput::new(timestamp, timestamp, key, asap_types::PolicyFingerprint(agg_id));
             ingest_with_fresh_resolver(&sketch_index, &resolver, agg_cfg, &output, acc.as_ref());
         }
     }
@@ -445,7 +445,7 @@ pub fn create_engine_multi_timestamp(
     let agg_cfg = streaming_config.get_aggregation_config(agg_id).cloned().expect("agg");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, agg_id);
+        let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, asap_types::PolicyFingerprint(agg_id));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
@@ -499,7 +499,7 @@ pub fn create_engine_multi_timestamp_with_window(
     let agg_cfg = streaming_config.get_aggregation_config(agg_id).cloned().expect("agg");
     for (timestamp, label_values_opt, acc) in data {
         let key = label_values_opt.map(|labels| KeyByLabelValues { labels });
-        let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, agg_id);
+        let output = PrecomputedOutput::new(timestamp - 1000, timestamp, key, asap_types::PolicyFingerprint(agg_id));
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
     ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)

@@ -90,7 +90,7 @@ fn seed_sum_at(
         labels: vec![host.to_string()]});
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use std::sync::Arc as StdArc;
-    let output = PrecomputedOutput::new(ts, ts, key, agg_id);
+    let output = PrecomputedOutput::new(ts, ts, key, asap_types::PolicyFingerprint(agg_id));
     let acc = SumAccumulator::with_sum(sum);
     if let Some(agg_cfg) = streaming_config.get_aggregation_config(agg_id) {
         thread_local! {
