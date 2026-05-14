@@ -582,22 +582,25 @@ fn collect_label_filters_into(pred: &Predicate, out: &mut Vec<String>) {
 /// flow runs unchanged. Mirror of `ENV_USE_TYPED_SKETCH_ALGEBRA` from
 /// Phase C.
 ///
-/// Set `USE_TYPED_STAGE_SPLIT=1` to opt in.
+/// The typed L5 path is on by default; set `USE_TYPED_STAGE_SPLIT=0` to
+/// opt out (legacy `StagedPlan`-only fallback).
 #[allow(dead_code)]
 pub const ENV_USE_TYPED_STAGE_SPLIT: &str = "USE_TYPED_STAGE_SPLIT";
 
 /// Whether the typed L5 stage_split path is enabled for this process.
-/// Reads the env var once per call (cheap; called per `plan()`
-/// invocation at most). Phase E is additive — both code paths produce
-/// per-stage descriptions, but the typed path's structural output is
-/// `crate::physical::colored_dag::StageConfig` (sketched against design.md §6),
-/// while the legacy path is the existing `StagedPlan` shape.
 ///
-/// Phase B (MVP v6) wires `main::handle_plan` to consult this gate.
+/// **Default ON.** The typed path — `sketch_algebra::PhysicalExpr` (L4)
+/// → `split_typed_three_stage` → per-stage `StageConfig` emit — is now
+/// the primary L5. Set `USE_TYPED_STAGE_SPLIT=0` (or `false` / `no`) to
+/// fall back to the legacy `StagedPlan`-only path while the redundant
+/// L5 is being retired (see PR C of the L1→L5 wiring arc).
+///
+/// Reads the env var once per call (cheap; called per `plan()`
+/// invocation at most).
 pub fn typed_stage_split_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var(ENV_USE_TYPED_STAGE_SPLIT).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
+        Ok("0") | Ok("false") | Ok("no")
     )
 }
 
