@@ -50,7 +50,7 @@ use optimizer::cost::online as online_cost_model;
 use physical::stage_split::split_expr_by_stage;
 use optimizer::cost::tco;
 use physical::planner::physical_plan_to_staged;
-use query_parser::parse_query_expr;
+use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use physical::colored_dag::emitter::BackendStageConfig;
 use store::{PlanStore, WorkloadStore};
@@ -465,27 +465,17 @@ async fn handle_plan(
     // the StagedPlan.  The SP-3 flat assignment remains the fallback when no
     // query_string is supplied.
     if let Some(ref qs) = query_string {
-        match parse_query_expr(qs) {
-            Err(e) => warn!(query = %qs, error = %e, "parse_query_expr failed; skipping staged_plan"),
+        match parse_query_expr_canonical(qs) {
+            Err(e) => warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping staged_plan"),
             Ok(qe) => {
                 let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
                 let budgets = StageResourceBudgets::from_workload_chars(&wc);
                 let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
+                // Step γ7: parser, optimizer and physical planner are all
+                // canonical-IR now (PR 6/9/8) — no `convert_root` bridge.
                 let (opt_qe, _) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                // Step γ7: the physical planner is canonical-IR now (PR 8);
-                // the optimizer still emits the legacy IR (flips in PR 9).
-                // `convert_root` bridges the boundary until then.
-                match control_plane::intent_algebra::convert_root(&opt_qe) {
-                    Ok(canonical) => {
-                        let (staged, _physical_tree) =
-                            physical_plan_to_staged(&canonical, &budgets);
-                        plan.staged_plan = Some(staged);
-                    }
-                    Err(e) => warn!(
-                        query = %qs, error = %e,
-                        "legacy→canonical conversion failed; skipping staged_plan"
-                    ),
-                }
+                let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
+                plan.staged_plan = Some(staged);
             }
         }
     }
@@ -718,28 +708,19 @@ async fn handle_plan(
     // ── Algebra pipeline: parse → optimise → allocate ─────────────────────────
     let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
     let plan_summary = query_string.as_deref().and_then(|qs| {
-        match parse_query_expr(qs) {
+        match parse_query_expr_canonical(qs) {
             Err(e) => {
-                warn!(query = qs, error = %e, "parse_query_expr failed; skipping plan_summary");
+                warn!(query = qs, error = %e, "parse_query_expr_canonical failed; skipping plan_summary");
                 None
             }
             Ok(qe) => {
                 let budgets = StageResourceBudgets::from_workload_chars(&wc_for_algebra);
                 let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
+                // Step γ7: parser, optimizer and allocator are all
+                // canonical-IR now (PR 6/9/7) — no `convert_root` bridge.
                 let (opt_qe, _iters) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                // Step γ7: the allocator is canonical-IR now (PR 7); the
-                // optimizer still emits the legacy IR (flips in PR 9).
-                // `convert_root` bridges the boundary until then.
-                match control_plane::intent_algebra::convert_root(&opt_qe) {
-                    Ok(canonical) => {
-                        let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(canonical);
-                        Some(plan_node.summarise(raw_bps))
-                    }
-                    Err(e) => {
-                        warn!(query = qs, error = %e, "legacy→canonical conversion failed; skipping plan_summary");
-                        None
-                    }
-                }
+                let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(opt_qe);
+                Some(plan_node.summarise(raw_bps))
             }
         }
     });
