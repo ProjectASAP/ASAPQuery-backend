@@ -1,7 +1,7 @@
 //! Tests for L2 lowering (`language_logical_plan`).
 
 use super::*;
-use crate::intent_algebra::legacy_expr::{AggIntent, QueryExpr};
+use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::query_parser::language::{Language, LanguageAst, PromQLLanguage};
 use crate::types::AggType;
 use crate::types_v2::QueryLanguage;
@@ -36,18 +36,20 @@ fn lower_promql_quantile_preserves_summary() {
 
 #[test]
 fn lower_promql_keeps_algebra_tree_for_l3() {
-    // The PromQL L2 tree IS the existing `QueryExpr`; assert that the
-    // tree shape matches what `parse_query_expr` would have produced.
+    // The PromQL L2 tree is the canonical `QueryExpr`. `quantile_over_time`
+    // lowers (via the legacy `WindowedAgg`) into the canonical
+    // `Window { child: Aggregate { aggs: [Quantile] } }` fold.
     let ast = parse_promql("quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])");
     let plan = lower_to_logical_plan(&ast).unwrap();
     let tree = plan.as_promql_tree().expect("PromQL plan");
-    assert!(matches!(
-        tree,
-        QueryExpr::WindowedAgg {
-            agg: AggIntent::Quantile { .. },
-            ..
-        }
-    ));
+    match tree {
+        QueryExpr::Window { child, .. } => assert!(matches!(
+            child.as_ref(),
+            QueryExpr::Aggregate { aggs, .. }
+                if matches!(aggs.as_slice(), [AggIntent::Quantile { .. }])
+        )),
+        other => panic!("expected canonical Window{{Aggregate}}, got {other:?}"),
+    }
 }
 
 #[test]

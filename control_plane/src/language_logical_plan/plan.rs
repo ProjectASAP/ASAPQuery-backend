@@ -6,27 +6,21 @@
 //! Elastic buckets) — `Aggregate { AggFunc }`, `Window`, `Filter`,
 //! `Sort`, `Limit`. **No sketch names yet**.
 //!
-//! In DC's existing tree the equivalent representation is the
-//! [`crate::intent_algebra::legacy_expr::QueryExpr`] tree produced by
-//! `query_parser::parse_query_expr`. To stay consistent with the
-//! design.md L2 contract while not duplicating the algebra:
+//! The PromQL variant carries the canonical
+//! [`crate::intent_algebra::QueryExpr`] tree (produced by
+//! `query_parser::parse_query_expr_canonical` and stashed inside
+//! `PromQLAst`) plus the flat `ParsedQuery` summary downstream
+//! analyzer / planner consumers want.
 //!
-//! - The `PromQL` variant of [`LanguageLogicalPlan`] carries the
-//!   already-built `QueryExpr` tree (which is the L2 representation
-//!   for the PromQL language) **plus** the flat `ParsedQuery`
-//!   summary needed by downstream analyzer/planner.
-//! - Other languages get their own variants when implemented.
-//!
-//! The `intent_algebra` (L3) layer (Phase B, separate worktree) is
-//! responsible for normalising this language-specific tree into the
-//! language-orthogonal `QueryExpr` shape (e.g. dropping `PromQLSubquery`).
-//! `histogram_quantile(...)` is no longer a legacy variant — Step γ5
-//! substitutes it at the parser level into a plain `Aggregate{Quantile(φ)}`.
+//! Step γ7: this used to carry the legacy `legacy_expr::QueryExpr`; now
+//! that the producers route through the L3 Binder + canonical converter,
+//! L2 carries the canonical IR directly. Other languages get their own
+//! variants when implemented.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::intent_algebra::legacy_expr::QueryExpr;
+use crate::intent_algebra::QueryExpr;
 use crate::query_parser::{ParsedQuery, QueryHint};
 use crate::types::AggType;
 use crate::types_v2::QueryLanguage;
@@ -41,7 +35,8 @@ use crate::types_v2::QueryLanguage;
 ///   without walking the tree themselves.
 #[derive(Debug, Clone)]
 pub enum LanguageLogicalPlan {
-    /// PromQL L2. Tree = `QueryExpr` from `query_parser::parse_query_expr`.
+    /// PromQL L2. Tree = canonical `QueryExpr` from
+    /// `query_parser::parse_query_expr_canonical`.
     PromQL {
         /// Original PromQL source.
         source: String,
