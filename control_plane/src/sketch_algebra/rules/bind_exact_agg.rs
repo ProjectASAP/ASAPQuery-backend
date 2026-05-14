@@ -1,5 +1,5 @@
-//! `BindExactAgg` — emits `PhysicalExpr::ExactAgg` for the four exact-aggregation
-//! intents that the PR 6 follow-up flipped to ASAP-tier routing.
+//! `BindExactAgg` — emits `PhysicalExpr::ExactAgg` for the exact-aggregation
+//! intents the ASAP tier can serve from a precompute accumulator.
 //!
 //! ## Coverage
 //!
@@ -8,7 +8,6 @@
 //! | `Sum`                                | `agg_type: AggregationType::Sum`       |
 //! | `Rate { .. }`                        | `agg_type: AggregationType::Increase`  |
 //! | `Increase { .. }`                    | `agg_type: AggregationType::Increase`  |
-//! | `Count { accuracy: Exact }`          | `agg_type: AggregationType::Sum`       |
 //!
 //! `Rate` and `Increase` share the `Increase` accumulator because rate is
 //! computed as `increase / window_seconds` — a scalar division on the
@@ -16,16 +15,18 @@
 //! division (when needed) is the L5 emitter's responsibility, not the
 //! L4 binder's.
 //!
-//! `Count{accuracy:Exact}` maps to `Sum` because `count_over_time` is
-//! exactly the sum of presence indicators (each sample contributes 1).
-//! There's no dedicated `Count` `AggregationType` variant; `Sum`
-//! covers the shape.
-//!
 //! ## What this rule does NOT bind
 //!
-//! - `AggIntent::Avg` — needs cross-policy join (Sum / Count), no single
-//!   `AggregationType` covers it. Stays on archive until the L4 binder
-//!   gains a join rule.
+//! - `AggIntent::Count { accuracy: Exact }` — `count_over_time`. The
+//!   PR #200/#201 follow-up bound this to `AggregationType::Sum` on the
+//!   "count = sum-of-1s" theory, but the data plane has no count
+//!   accumulator: `SumAccumulator` only tracks `sum: f64` and returns
+//!   it for both `Statistic::Sum` and `Statistic::Count`, so the result
+//!   is the sum of sample VALUES, not the sample count. Reverted —
+//!   `count_over_time` routes to archive (which counts correctly)
+//!   until a real `SumCountAccumulator` lands.
+//! - `AggIntent::Avg` — needs a `(sum, count)` accumulator, same
+//!   missing piece. Stays on archive until `SumCountAccumulator` lands.
 //! - `AggIntent::Quantile { Exact }` / `Cardinality { Exact }` /
 //!   `TopK { Exact }` / `Frequency { Exact }` — the exact-accuracy
 //!   variants of approximate-by-default intents. No exact-precompute
@@ -111,18 +112,10 @@ impl Rule for BindExactAgg {
                     AggregationType::Increase
                 }
             }
-            AggIntent::Count {
-                accuracy: AccuracyTarget::Exact,
-            } => {
-                // count_over_time = sum-of-1s, so it lowers through the
-                // Sum/MultipleSum accumulator family — same as
-                // `AggIntent::Sum` above.
-                if keyed {
-                    AggregationType::MultipleSum
-                } else {
-                    AggregationType::Sum
-                }
-            }
+            // `AggIntent::Count{Exact}` (count_over_time) is intentionally
+            // NOT bound here — see the module doc. It needs a real
+            // count accumulator, which doesn't exist yet; binding it to
+            // `Sum` returns sum-of-values instead of sample-count.
             _ => return None,
         };
 
@@ -197,13 +190,17 @@ mod tests {
     }
 
     #[test]
-    fn binds_count_exact_to_exact_agg_sum() {
-        check_binds(
+    fn does_not_bind_count_exact() {
+        // `count_over_time` (Count{Exact}) is NOT bound — the data
+        // plane has no count accumulator. Routes to archive instead.
+        // See the module doc.
+        let expr = agg_over(
             AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             },
-            AggregationType::Sum,
+            "test_metric",
         );
+        assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 
     #[test]
@@ -282,13 +279,17 @@ mod tests {
     }
 
     #[test]
-    fn keyed_count_exact_binds_to_multiple_sum() {
-        check_keyed_binds(
+    fn keyed_count_exact_does_not_bind() {
+        // `count by (...) (count_over_time(...))` — Count{Exact} is
+        // unbound regardless of keying; no count accumulator exists.
+        let expr = agg_over_with_by(
             AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             },
-            AggregationType::MultipleSum,
+            "test_metric",
+            vec![0],
         );
+        assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 
     #[test]
