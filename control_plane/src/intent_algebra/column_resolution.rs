@@ -1,9 +1,9 @@
 //! Schema-driven column resolution for the legacy `QueryExpr` IR
-//! (Step β of the legacy_expr migration).
+//! (Step β of the relational migration).
 //!
 //! Step α (PR #138) replaced the legacy `AggIntent` enum with the canonical
 //! [`crate::intent_algebra::agg_intent::AggIntent`]. The legacy IR still
-//! uses [`crate::intent_algebra::legacy_expr::ColumnRef::Named(String)`] for
+//! uses [`crate::intent_algebra::relational::ColumnRef::Named(String)`] for
 //! column references; the canonical IR uses positional
 //! [`crate::intent_algebra::schema::ColumnId`] resolved against a per-node
 //! [`crate::intent_algebra::schema::Schema`].
@@ -29,7 +29,7 @@
 //!
 //! ## Why a synthesized default
 //!
-//! The legacy_expr migration plan's "Synthesise from metric name:
+//! The relational migration plan's "Synthesise from metric name:
 //! `(ts, value, *labels)`" decision applies here. There is no
 //! `SchemaCatalog` in the controller today, so the source leaf has to
 //! produce a schema purely from the metric / table name. This module
@@ -41,7 +41,7 @@
 use thiserror::Error;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::legacy_expr::{ColumnRef, QueryExpr, SourceSpec};
+use crate::intent_algebra::relational::{ColumnRef, QueryExpr, SourceSpec};
 use crate::intent_algebra::schema::{Column, ColumnId, DataType, Schema};
 
 /// Errors returned by [`resolve_column_ref`] / [`resolve_column_refs`].
@@ -81,7 +81,7 @@ pub enum ResolveError {
 /// representation for "any number of label columns whose names are
 /// data-dependent." That's tracked as a Step γ TODO at the module level.
 ///
-/// Per the legacy_expr migration plan's "Synthesise from metric name:
+/// Per the relational migration plan's "Synthesise from metric name:
 /// `(ts, value, *labels)`" decision — minus the `*labels` part the
 /// canonical schema model can't express today.
 pub fn infer_source_schema(_metric_or_table_name: &str) -> Schema {
@@ -170,11 +170,11 @@ pub fn resolve_column_refs(
 
 /// Slice-flavoured variant of [`resolve_column_ref`] over a list of
 /// `Vec<String>` GROUP BY keys (the shape carried by
-/// `legacy_expr::QueryExpr::Aggregate.keys`). Mirrors
+/// `relational::QueryExpr::Aggregate.keys`). Mirrors
 /// [`resolve_column_refs`] but skips the `ColumnRef::Named` wrapping —
 /// the legacy `Aggregate.keys` field is already a `Vec<String>`.
 ///
-/// Used by `legacy_to_canonical::convert` to translate a legacy
+/// Used by `lower_to_canonical::convert` to translate a legacy
 /// `Aggregate.keys: Vec<String>` into the canonical `by: Vec<ColumnId>`.
 pub fn resolve_named_keys(
     keys: &[String],
@@ -295,7 +295,7 @@ pub fn output_schema_for_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::SourceSpec;
+    use crate::intent_algebra::relational::SourceSpec;
 
     fn src(name: &str) -> QueryExpr {
         QueryExpr::Source(SourceSpec { name: name.into() })
@@ -315,8 +315,8 @@ mod tests {
     #[test]
     fn root_schema_via_walk() {
         let expr = QueryExpr::Filter {
-            pred: crate::intent_algebra::legacy_expr::ScalarExpr::Literal(
-                crate::intent_algebra::legacy_expr::LiteralValue::Bool(true),
+            pred: crate::intent_algebra::relational::ScalarExpr::Literal(
+                crate::intent_algebra::relational::LiteralValue::Bool(true),
             ),
             input: Box::new(src("cpu_usage")),
         };

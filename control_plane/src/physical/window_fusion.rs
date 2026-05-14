@@ -10,7 +10,7 @@
 //! The canonical L3 IR keeps "one canonical form per plan" (design.md
 //! §6): it has no fused windowed-aggregate variant — a windowed sketch is
 //! the stacked `Window { child: Aggregate { aggs: [one], .. } }` shape.
-//! `legacy_to_canonical` produces exactly that shape when it folds a
+//! `lower_to_canonical` produces exactly that shape when it folds a
 //! single-statistic sketchable `Aggregate` sitting over a `Window`. This
 //! module is the planner-side **peephole recognizer** that puts the
 //! window-defines-sketch-lifecycle invariant back: it matches the stacked
@@ -53,7 +53,7 @@ pub struct FusedWindowSketch<'a> {
 }
 
 /// Recognize the canonical `Window { child: Aggregate { aggs: [one],
-/// having: None, .. } }` shape — the stacked form `legacy_to_canonical`
+/// having: None, .. } }` shape — the stacked form `lower_to_canonical`
 /// folds a legacy `WindowedAgg` into — and return a [`FusedWindowSketch`]
 /// view of it. Returns `None` for any other shape (a multi-intent
 /// `Aggregate`, an `Aggregate` with a `having` clause, a `Window` over a
@@ -172,14 +172,14 @@ pub fn fused_sketch_decision(
 //
 // Pins `recognize_windowed_sketch` + `fused_sketch_decision` against the
 // canonical planner: a `Window { Aggregate }` fused sketch — the shape
-// `legacy_to_canonical` folds a single-statistic sketchable `Aggregate`
+// `lower_to_canonical` folds a single-statistic sketchable `Aggregate`
 // over a `Window` into — produces a resolved (non-`None`) physical window,
 // and the planner's own decision matches `fused_sketch_decision`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{
+    use crate::intent_algebra::relational::{
         AggFunc, AggItem, ColumnRef as LColumnRef, QueryExpr as LQueryExpr, SourceSpec,
     };
     use crate::intent_algebra::{
@@ -206,7 +206,7 @@ mod tests {
     }
 
     /// The canonical `Window { Aggregate { by: [], aggs: [agg] } }` shape —
-    /// the fold `legacy_to_canonical` produces for a windowed single-sketch
+    /// the fold `lower_to_canonical` produces for a windowed single-sketch
     /// aggregate.
     fn windowed_sketch(
         agg: AggIntent,

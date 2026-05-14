@@ -2,7 +2,7 @@
 //!
 //! Per `control_plane/docs/design.md` §3/§5/§6 `core::optimizer`: this is
 //! the rule engine driver + cost-model trait + rule library that takes
-//! L3 [`crate::intent_algebra::legacy_expr::QueryExpr`] / canonical
+//! L3 [`crate::intent_algebra::relational::QueryExpr`] / canonical
 //! [`crate::intent_algebra::QueryExpr`] inputs and produces L4
 //! sketch-bound output (in the legacy path: an annotated `QueryExpr`
 //! with `SketchAgg` nodes; in the canonical path: a

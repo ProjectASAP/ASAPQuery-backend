@@ -514,11 +514,11 @@ fn subtree_cost_bundled(
             let child_cost = subtree_cost_bundled(child, &extended, &extended_scope)?;
             Ok(bind_cost + child_cost)
         }
-        // A-variants lifted in Batch 2 of the legacy_expr migration — no
+        // A-variants lifted in Batch 2 of the relational migration — no
         // canonical-cost consumer exercises them yet. Fall through to a
         // child-walk-only contribution (0 cost added at this node) until
         // the per-node cost primitives land alongside their consumers.
-        // TODO(legacy_expr-migration): add proper node_cost_* helpers for
+        // TODO(relational-migration): add proper node_cost_* helpers for
         // Filter/Project/Partition/Distinct/Merge/Join/SetOp/Sort/Limit/BinaryOp.
         _ => walk_children_zero_cost_bundled(expr, binding_costs, schema_scope),
     }

@@ -1,4 +1,6 @@
-//! General query algebra — the full IR for SQL and PromQL queries.
+//! The **Layer-2 relational IR** — the per-language query algebra the
+//! `query_parser` front ends emit, before lowering to the canonical L3
+//! `intent_algebra::query_expr` types.
 //!
 //! This module defines two mutually recursive expression types:
 //!
@@ -27,9 +29,9 @@ use std::time::Duration;
 
 use crate::types_v2::AccuracyTarget;
 
-// ── AggIntent harmonization (Step α of legacy_expr migration) ────────────────
+// ── AggIntent harmonization ──────────────────────────────────────────────────
 //
-// The legacy `AggIntent` / `ExactAgg` enums that historically lived here have
+// The `AggIntent` / `ExactAgg` enums that historically lived here have
 // been deleted in favor of the canonical `intent_algebra::agg_intent::AggIntent`
 // vocabulary. The translation table is documented in the migration spec; in
 // short:
@@ -64,7 +66,7 @@ use crate::types_v2::AccuracyTarget;
 // is a typed search-and-replace rather than a semantic rewrite.
 
 /// Canonical L3 aggregation intent. Re-exported here so existing
-/// `legacy_expr::AggIntent` references keep working — the type is now the
+/// `relational::AggIntent` references keep working — the type is now the
 /// single canonical [`crate::intent_algebra::agg_intent::AggIntent`].
 pub use crate::intent_algebra::agg_intent::AggIntent;
 
@@ -131,8 +133,8 @@ pub enum ColumnRef {
 // ── AggIntent helpers ────────────────────────────────────────────────────────
 //
 // Step γ7 (PR 13.5): the `AggIntent` helper free fns relocated to their
-// canonical home, `intent_algebra::agg_intent`. `legacy_expr` re-exports
-// the live ones so existing `legacy_expr::*` call sites keep compiling
+// canonical home, `intent_algebra::agg_intent`. `relational` re-exports
+// the live ones so existing `relational::*` call sites keep compiling
 // during the retirement; PR 13 sweeps the consumer imports to the
 // canonical path and drops these re-exports with the file. The dead
 // helpers (`agg_to_legacy_agg_type`, `agg_quantiles`,
@@ -147,8 +149,8 @@ pub use crate::intent_algebra::agg_intent::{
 //
 // The 2026-05 layered-cleanup refactor moved these helpers to
 // `sketch_algebra::capability` (their structural home — sketch-family
-// error bounds). The thin re-exports below keep `legacy_expr::hll_accuracy` /
-// `legacy_expr::countmin_accuracy` available so the in-file
+// error bounds). The thin re-exports below keep `relational::hll_accuracy` /
+// `relational::countmin_accuracy` available so the in-file
 // `default_cardinality` call site (and any external `algebra::expr::hll_accuracy`
 // reference resolved via the back-compat `algebra` alias in `lib.rs`) keep
 // compiling.
@@ -197,7 +199,7 @@ pub enum FilterVal {
 
 // ── Relational algebra ────────────────────────────────────────────────────────
 
-/// The legacy **Layer-2 relational** query IR.
+/// The **Layer-2 relational** query IR.
 ///
 /// Every variant is a *node* in the per-language logical query plan tree
 /// the `query_parser` front ends (`promql.rs` / `sql.rs`) emit. Leaves
@@ -208,19 +210,19 @@ pub enum FilterVal {
 ///
 /// Most variants have canonical structural twins in
 /// [`crate::intent_algebra::query_expr::QueryExpr`]. The canonical
-/// spelling uses `child:` where these legacy variants use `input:`; the
+/// spelling uses `child:` where these L2 variants use `input:`; the
 /// typed [`crate::intent_algebra::Predicate`] replaces [`ScalarExpr`] in
 /// `Filter` / `Join` / `Aggregate::having` (translation via
 /// [`crate::intent_algebra::from_legacy_scalar`]).
 ///
 /// This is purely a Layer-2 *relational* IR — the sketch-fused
 /// `SketchAgg` / `WindowedAgg` variants were removed once the
-/// `legacy_to_canonical` converter learned to fold the single-statistic
+/// `lower_to_canonical` converter learned to fold the single-statistic
 /// sketchable `Aggregate` straight into canonical shapes. The remaining
-/// reason the tree is not yet *deleted* outright is that the legacy
-/// [`ScalarExpr`] still carries four variants (`FunctionCall`,
-/// `ScalarSubquery`, `InList`, `Between`) the canonical `Predicate`
-/// doesn't cover, and the parsers build `ScalarExpr` directly.
+/// reason the tree is not yet *deleted* outright is that [`ScalarExpr`]
+/// still carries four variants (`FunctionCall`, `ScalarSubquery`,
+/// `InList`, `Between`) the canonical `Predicate` doesn't cover, and the
+/// parsers build `ScalarExpr` directly.
 #[derive(Debug, Clone)]
 pub enum QueryExpr {
     // ── Base relations ────────────────────────────────────────────────────
@@ -269,10 +271,10 @@ pub enum QueryExpr {
     },
 
     // The sketch-fused `SketchAgg` / `WindowedAgg` variants were removed:
-    // they were never parser output — only an intermediate the old
-    // `legacy_lower` pass produced — and the legacy → canonical converter
-    // now folds the single-statistic sketchable `Aggregate` straight into
-    // canonical shapes (`Aggregate { by: [] }` / `Window { Aggregate }`).
+    // they were never parser output — only an intermediate of an earlier
+    // sketch-lowering pass — and `lower_to_canonical` now folds the
+    // single-statistic sketchable `Aggregate` straight into canonical
+    // shapes (`Aggregate { by: [] }` / `Window { Aggregate }`).
 
     // ── Distributed / multi-stage operators ──────────────────────────────
 
@@ -349,8 +351,8 @@ pub enum QueryExpr {
     // ── PromQL-specific operators ─────────────────────────────────────────
 
     // Note: `histogram_quantile(φ, <buckets>)` is no longer a `QueryExpr`
-    // variant. Per Step γ5 of the legacy_expr migration, the PromQL parser
-    // substitutes the call with a plain `Aggregate { Quantile(φ) }` so
+    // variant. The PromQL parser substitutes the call with a plain
+    // `Aggregate { Quantile(φ) }` so
     // downstream code (lowerer, optimizer, physical planner) sees a single
     // canonical Quantile intent.
 
@@ -499,10 +501,9 @@ impl AggFunc {
 
     /// Suggest the appropriate [`AggIntent`] for this function, if any.
     ///
-    /// Canonical Quantile is single-φ post Step α; this helper returns one
-    /// canonical intent. Callers that need multi-φ behaviour build the
-    /// merge fan-out themselves (cf. the construction sites in
-    /// `legacy_lower::agg_func_to_intent`).
+    /// Canonical Quantile is single-φ; this helper returns one canonical
+    /// intent. Callers that need multi-φ behaviour build the merge fan-out
+    /// themselves (cf. `lower_to_canonical::agg_func_to_intents`).
     pub fn to_sketch_op(&self) -> Option<AggIntent> {
         match self {
             AggFunc::Quantile(phi) => Some(default_quantile(*phi)),
@@ -520,10 +521,10 @@ impl AggFunc {
 
 // Leaf algebra types — `BinaryOpKind`, `JoinKind`, `SetOpKind`,
 // `VectorMatch` / `VectorMatchKind` / `VectorGrouping` / `GroupSide`,
-// `SortKey` — are owned by the canonical `query_expr` module. The legacy
+// `SortKey` — are owned by the canonical `query_expr` module. The L2
 // definitions were byte-identical (modulo extra `Hash` / `serde` derives
-// on the canonical side), so `legacy_expr` now re-exports them: every
-// `legacy_expr::BinaryOpKind` reference resolves to the single canonical
+// on the canonical side), so `relational` now re-exports them: every
+// `relational::BinaryOpKind` reference resolves to the single canonical
 // type. `impl Display for BinaryOpKind` moved alongside the type.
 pub use crate::intent_algebra::query_expr::{
     BinaryOpKind, GroupSide, JoinKind, SetOpKind, SortKey, VectorGrouping, VectorMatch,
@@ -617,7 +618,7 @@ impl QueryExpr {
 
 // ── Predicate → ScalarExpr conversion ────────────────────────────────────────
 
-/// Convert a slice of legacy [`Predicate`]s (AND-list) into a single
+/// Convert a slice of [`Predicate`]s (AND-list) into a single
 /// [`ScalarExpr`] tree.  An empty slice becomes `Literal(true)`.
 fn scalar_from_predicates(preds: &[Predicate]) -> ScalarExpr {
     if preds.is_empty() {

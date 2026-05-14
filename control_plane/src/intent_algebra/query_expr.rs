@@ -12,18 +12,18 @@
 //! [`QueryExpr::LetBinding`] + [`QueryExpr::Ref`].
 //!
 //! Variant set. Phase B shipped `Scan`, `Window`, `Aggregate`,
-//! `LetBinding`, `Ref`. Batch 2 of the legacy_expr migration adds the ten
+//! `LetBinding`, `Ref`. Batch 2 of the relational migration adds the ten
 //! "A-classified" structurally-canonical variants from `design.md` §6:
 //! `Filter`, `Project`, `Partition`, `Distinct`, `Merge`, `Join`,
 //! `SetOp`, `Sort`, `Limit`, `BinaryOp`. Step γ7 adds `Subquery` (the
-//! canonical counterpart of `legacy_expr::PromQLSubquery`). `WindowFunc`
+//! canonical counterpart of `relational::PromQLSubquery`). `WindowFunc`
 //! remains deferred until the planner grows a consumer for it. The shape
 //! defined here is forward-compatible — adding more variants is purely
 //! additive.
 //!
 //! Single-input variants here use `child:` (matching the existing
 //! `Window`, `Aggregate`, `LetBinding` shape). Legacy `input:` survives in
-//! `legacy_expr::QueryExpr` until its consumers redirect through here.
+//! `relational::QueryExpr` until its consumers redirect through here.
 
 #![allow(dead_code)]
 
@@ -113,11 +113,11 @@ pub struct LabelFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HavingPredicate(pub String);
 
-// ── Supporting types lifted from legacy_expr ─────────────────────────────────
+// ── Supporting types lifted from relational ─────────────────────────────────
 //
-// Per Batch 2 of the legacy_expr migration: these are structural copies of
+// Per Batch 2 of the relational migration: these are structural copies of
 // the legacy supporting enums so the canonical [`QueryExpr`] variants below
-// can reference them without rooting the canonical IR in `legacy_expr`.
+// can reference them without rooting the canonical IR in `relational`.
 // Field shapes mirror `design.md` §6.
 
 /// Which column / field a sketch / projection / DISTINCT operation targets.
@@ -283,7 +283,7 @@ pub enum GroupSide {
 
 /// Scalar literal value. Subset of values used by the canonical
 /// [`Predicate`] — extended literal kinds (durations, intervals) stay in
-/// `legacy_expr::LiteralValue` until the E-variants migrate.
+/// `relational::LiteralValue` until the E-variants migrate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiteralValue {
@@ -303,7 +303,7 @@ pub struct ProjectItem {
     /// Projected expression. Modeled as a [`Predicate`] for the four
     /// covered scalar shapes (column / literal / binary op / is-null);
     /// the legacy E-variants (`FunctionCall`, `ScalarSubquery`, `InList`,
-    /// `Between`) stay in `legacy_expr::ScalarExpr` and live in
+    /// `Between`) stay in `relational::ScalarExpr` and live in
     /// [`ProjectItem::raw_expr`] until they migrate.
     pub expr: Predicate,
 }
@@ -311,7 +311,7 @@ pub struct ProjectItem {
 // ── Typed Predicate ──────────────────────────────────────────────────────────
 
 /// Typed scalar predicate — the canonical counterpart of
-/// `legacy_expr::ScalarExpr`. Covers all eight legacy scalar shapes:
+/// `relational::ScalarExpr`. Covers all eight legacy scalar shapes:
 /// column / literal / binary-op / is-null (the structurally clean four)
 /// plus `FunctionCall` / `InList` / `Between` / `ScalarSubquery` (the
 /// E-variants). `ScalarSubquery` carries a canonical [`QueryExpr`] —
@@ -405,19 +405,19 @@ pub enum QueryExpr {
         name: BindingName,
     },
 
-    // ── A-classified variants lifted in Batch 2 of the legacy_expr migration ──
+    // ── A-classified variants lifted in Batch 2 of the relational migration ──
     //
     // Each is a structural copy of the legacy variant of the same name in
-    // `legacy_expr::QueryExpr`. Single-input variants here use `child:` to
+    // `relational::QueryExpr`. Single-input variants here use `child:` to
     // match the existing canonical `Window`/`Aggregate`/`LetBinding` shape,
     // whereas legacy spells them `input:`. Consumers that haven't migrated
-    // yet keep using `legacy_expr::QueryExpr::*` — the legacy variants stay
+    // yet keep using `relational::QueryExpr::*` — the legacy variants stay
     // in place until the consumer-side redirect lands in subsequent batches.
 
     /// σ — row-level filter (WHERE / PromQL label matchers). Uses the new
     /// typed [`Predicate`] (only Column / Literal / BinaryOp / IsNull at L3
     /// for now; `FunctionCall` / `ScalarSubquery` / `InList` / `Between`
-    /// stay in `legacy_expr::ScalarExpr` until their own batch).
+    /// stay in `relational::ScalarExpr` until their own batch).
     Filter {
         pred: Predicate,
         child: Box<QueryExpr>,
@@ -495,7 +495,7 @@ pub enum QueryExpr {
     /// PromQL sub-query (`<expr>[range:resolution]`) — re-evaluates `child`
     /// at `resolution`-spaced steps across the trailing `range` window,
     /// producing a range-vector the enclosing function consumes. The
-    /// canonical counterpart of `legacy_expr::QueryExpr::PromQLSubquery`.
+    /// canonical counterpart of `relational::QueryExpr::PromQLSubquery`.
     /// Logical pass-through for schema flow — the range/resolution are a
     /// sampling hint the L5 precompute stage reads, not a schema transform.
     Subquery {
@@ -669,9 +669,9 @@ impl BindingScope {
     }
 }
 
-// ── legacy_expr::ScalarExpr → canonical Predicate translation ────────────────
+// ── relational::ScalarExpr → canonical Predicate translation ────────────────
 
-/// Translate a [`legacy_expr::ScalarExpr`](crate::intent_algebra::legacy_expr::ScalarExpr)
+/// Translate a [`relational::ScalarExpr`](crate::intent_algebra::relational::ScalarExpr)
 /// into the canonical typed [`Predicate`]. All scalar shapes translate
 /// except `ScalarSubquery`, which carries a legacy `QueryExpr` sub-tree:
 /// that arm still returns [`QueryExprError::UnsupportedLegacyScalar`] until
@@ -682,9 +682,9 @@ impl BindingScope {
 /// is deliberately narrower than the legacy spelling (no `Duration` literal
 /// at this layer — see design.md §6 schema-flow `DataType` list).
 pub fn from_legacy_scalar(
-    se: &crate::intent_algebra::legacy_expr::ScalarExpr,
+    se: &crate::intent_algebra::relational::ScalarExpr,
 ) -> Result<Predicate, QueryExprError> {
-    use crate::intent_algebra::legacy_expr as l;
+    use crate::intent_algebra::relational as l;
     match se {
         l::ScalarExpr::Column(name) => Ok(Predicate::Column(ColumnRef::Named(name.clone()))),
         l::ScalarExpr::Literal(lit) => Ok(Predicate::Literal(literal_from_legacy(lit))),
@@ -735,8 +735,8 @@ pub fn from_legacy_scalar(
     }
 }
 
-fn literal_from_legacy(lit: &crate::intent_algebra::legacy_expr::LiteralValue) -> LiteralValue {
-    use crate::intent_algebra::legacy_expr as l;
+fn literal_from_legacy(lit: &crate::intent_algebra::relational::LiteralValue) -> LiteralValue {
+    use crate::intent_algebra::relational as l;
     match lit {
         l::LiteralValue::Null => LiteralValue::Null,
         l::LiteralValue::Bool(b) => LiteralValue::Bool(*b),
@@ -749,8 +749,8 @@ fn literal_from_legacy(lit: &crate::intent_algebra::legacy_expr::LiteralValue) -
     }
 }
 
-fn binary_op_from_legacy(op: &crate::intent_algebra::legacy_expr::BinaryOpKind) -> BinaryOpKind {
-    use crate::intent_algebra::legacy_expr as l;
+fn binary_op_from_legacy(op: &crate::intent_algebra::relational::BinaryOpKind) -> BinaryOpKind {
+    use crate::intent_algebra::relational as l;
     match op {
         l::BinaryOpKind::Add => BinaryOpKind::Add,
         l::BinaryOpKind::Sub => BinaryOpKind::Sub,
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn from_legacy_scalar_column() {
-        use crate::intent_algebra::legacy_expr as l;
+        use crate::intent_algebra::relational as l;
         let s = l::ScalarExpr::Column("foo".into());
         let p = from_legacy_scalar(&s).unwrap();
         assert!(matches!(
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn from_legacy_scalar_literal_bool() {
-        use crate::intent_algebra::legacy_expr as l;
+        use crate::intent_algebra::relational as l;
         let s = l::ScalarExpr::Literal(l::LiteralValue::Bool(true));
         let p = from_legacy_scalar(&s).unwrap();
         assert!(matches!(p, Predicate::Literal(LiteralValue::Bool(true))));
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn from_legacy_scalar_binary_op_and_is_null() {
-        use crate::intent_algebra::legacy_expr as l;
+        use crate::intent_algebra::relational as l;
         let s = l::ScalarExpr::BinaryOp {
             op: l::BinaryOpKind::Eq,
             lhs: Box::new(l::ScalarExpr::Column("a".into())),
@@ -1137,7 +1137,7 @@ mod tests {
 
     #[test]
     fn from_legacy_scalar_e_variants_translate() {
-        use crate::intent_algebra::legacy_expr as l;
+        use crate::intent_algebra::relational as l;
 
         let f = l::ScalarExpr::FunctionCall {
             name: "abs".into(),
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn from_legacy_scalar_subquery_still_deferred() {
-        use crate::intent_algebra::legacy_expr as l;
+        use crate::intent_algebra::relational as l;
         // `ScalarSubquery` carries a legacy `QueryExpr` sub-tree — needs the
         // legacy→canonical tree converter, so it still errors for now.
         let sq = l::ScalarExpr::ScalarSubquery(Box::new(l::QueryExpr::Ref("cte".into())));

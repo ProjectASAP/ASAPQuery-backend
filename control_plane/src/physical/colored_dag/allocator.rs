@@ -236,7 +236,7 @@ impl ThreeStageWalker {
                 .get(name.as_str())
                 .copied()
                 .ok_or_else(|| AllocateError::UnresolvedRef(name.as_str().to_string())),
-            // A-variants lifted in Batch 2 of the legacy_expr migration.
+            // A-variants lifted in Batch 2 of the relational migration.
             // No colored-DAG consumer constructs them today; conservatively
             // route to the Edge stage (matches the per-row Scan/Window
             // policy) so the build is total. The proper stage-placement

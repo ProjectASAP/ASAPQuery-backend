@@ -35,7 +35,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, MatrixSelector, VectorSelector};
 
-use crate::intent_algebra::legacy_expr::{FilterOp, FilterVal, PartitionKeys, Predicate};
+use crate::intent_algebra::relational::{FilterOp, FilterVal, PartitionKeys, Predicate};
 
 // ── Walk context ──────────────────────────────────────────────────────────────
 
@@ -153,7 +153,7 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 // | `m[5m:1m]` subquery      | PromQLSubquery { 5m, Some(1m) }      |
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
-use crate::intent_algebra::legacy_expr::{
+use crate::intent_algebra::relational::{
     AggFunc, AggItem,
     BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
     PartitionKeys as QePartitionKeys, QueryExpr,
@@ -165,7 +165,7 @@ use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality
 ///
 /// This preserves `PromQLSubquery` and `BinaryOp` nodes natively;
 /// `histogram_quantile(φ, …)` is substituted into a plain
-/// `Aggregate { Quantile(φ) }` per Step γ5 of the legacy_expr migration.
+/// `Aggregate { Quantile(φ) }` per Step γ5 of the relational migration.
 pub fn parse_promql_expr(query: &str) -> anyhow::Result<QueryExpr> {
     let expr = parser::parse(query)
         .map_err(|e| anyhow!("PromQL parse error: {e}"))?;
@@ -311,7 +311,7 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     match name {
         // histogram_quantile(φ, bucket_metric) → plain Aggregate { Quantile(φ) }.
         //
-        // Per Step γ5 of the legacy_expr migration: at the PromQL parser level
+        // Per Step γ5 of the relational migration: at the PromQL parser level
         // we substitute `histogram_quantile(φ, bucket_metric)` with the same
         // shape that `quantile_over_time(φ, m[w])` produces — an `Aggregate`
         // carrying a single `AggFunc::Quantile(φ)`. Downstream code (the
@@ -494,7 +494,7 @@ fn apply_qe_filters(
     if filters.is_empty() {
         input
     } else {
-        use crate::intent_algebra::legacy_expr::{BinaryOpKind, LiteralValue, ScalarExpr};
+        use crate::intent_algebra::relational::{BinaryOpKind, LiteralValue, ScalarExpr};
         let pred = filters.iter().fold(
             ScalarExpr::Literal(LiteralValue::Bool(true)),
             |acc, p| {
@@ -599,7 +599,7 @@ mod tests {
     /// multi-quantile machinery.
     #[test]
     fn histogram_quantile_lowers_to_plain_aggregate_quantile() {
-        use crate::intent_algebra::legacy_expr::{AggFunc, ColumnRef, QueryExpr};
+        use crate::intent_algebra::relational::{AggFunc, ColumnRef, QueryExpr};
 
         let qe = super::parse_promql_expr(
             r#"histogram_quantile(0.99, rate(http_requests_bucket{le="0.5"}[5m]))"#,

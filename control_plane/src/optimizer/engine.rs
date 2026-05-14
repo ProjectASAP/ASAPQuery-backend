@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::legacy_expr::{agg_is_exact, agg_is_mergeable};
+use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::intent_algebra::query_expr::{ColumnRef, Predicate, QueryExpr, SetOpKind, Source};
 use crate::sketch_algebra::capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
@@ -537,7 +537,7 @@ impl RewriteRule for TopKFusion {
 
 // ── R6 (retired): HistogramQuantileFusion ─────────────────────────────────────
 //
-// Per Step γ5 of the legacy_expr migration, `histogram_quantile(φ, …)` is
+// Per Step γ5 of the relational migration, `histogram_quantile(φ, …)` is
 // substituted at the PromQL parser level into a plain
 // `Aggregate{Quantile(φ)}`. The fusion rule that used to merge a
 // `HistogramQuantile` wrapper with an inner DDSketch is no longer needed.
@@ -1212,7 +1212,7 @@ impl OptimizerRule for CommonSubexprElim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::legacy_expr::{default_cardinality, default_quantile};
+    use crate::intent_algebra::relational::{default_cardinality, default_quantile};
     use crate::intent_algebra::{
         BinaryOpKind, LiteralValue, PartitionKeys, Schema, SortKey, Source, WindowKind,
     };
