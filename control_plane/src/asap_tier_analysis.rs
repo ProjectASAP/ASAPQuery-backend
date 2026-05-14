@@ -1,4 +1,4 @@
-//! PromQL → warm-tier candidate analyzer (Step 2a thin-facade rewrite).
+//! PromQL → ASAP-tier candidate analyzer (Step 2a thin-facade rewrite).
 //!
 //! Before Step 2a this module was an 868-line second-PromQL-walker that
 //! pattern-matched on raw function-name strings — duplicating the
@@ -17,7 +17,7 @@
 //!   ↓  intent_algebra::lower::lower_parsed_query
 //! QueryExpr (intent_algebra) — Scan / Window / Aggregate{ aggs: Vec<AggIntent> }
 //!   ↓  walk and call capability_for(&AggIntent)
-//! Vec<WarmTierCandidate>
+//! Vec<ASAPTierCandidate>
 //! ```
 //!
 //! The lowerer is the **single owner** of "what does this PromQL function
@@ -26,8 +26,8 @@
 //!
 //! ## What's still here
 //!
-//! - The `WarmTierCandidate` / `WarmTierAnalysis` / `UnsupportedReason`
-//!   public types — the warm-tier reducer and the engine router consume
+//! - The `ASAPTierCandidate` / `ASAPTierAnalysis` / `UnsupportedReason`
+//!   public types — the ASAP-tier reducer and the engine router consume
 //!   them.
 //! - The PromQL `[5m]` range-selector → `range_seconds` extraction
 //!   helper. Reached by walking the [`ParsedQuery`] / re-parsing the
@@ -59,11 +59,11 @@ pub use crate::sketch_algebra::capability::{capability_for, Capability, SketchKi
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// One sub-expression of the input PromQL that CAN be served from the
-/// warm tier. The reducer resolves each candidate to a vector of sids
+/// ASAP tier. The reducer resolves each candidate to a vector of sids
 /// via `SketchIndex::instances_matching(metric_name, group_by_keys)`
 /// and verifies each sid carries the required capability.
 #[derive(Debug, Clone, PartialEq)]
-pub struct WarmTierCandidate {
+pub struct ASAPTierCandidate {
     pub metric_name: String,
     pub group_by_keys: BTreeSet<String>,
     pub required_capability: Capability,
@@ -81,20 +81,20 @@ pub struct WarmTierCandidate {
 
 /// Whole-query analysis result.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct WarmTierAnalysis {
-    pub candidates: Vec<WarmTierCandidate>,
+pub struct ASAPTierAnalysis {
+    pub candidates: Vec<ASAPTierCandidate>,
     pub unsupported: Option<UnsupportedReason>,
 }
 
-impl WarmTierAnalysis {
-    /// True iff the analysis is fully warm-tier-answerable —
+impl ASAPTierAnalysis {
+    /// True iff the analysis is fully ASAP-tier-answerable —
     /// `unsupported.is_none()` AND at least one candidate.
-    pub fn is_warm_tier_answerable(&self) -> bool {
+    pub fn is_asap_tier_answerable(&self) -> bool {
         self.unsupported.is_none() && !self.candidates.is_empty()
     }
 }
 
-/// Distinct reasons a PromQL query is NOT warm-tier-answerable. The
+/// Distinct reasons a PromQL query is NOT ASAP-tier-answerable. The
 /// distinction matters for logging / future precompute hints; the
 /// routing layer maps every variant to the cold tier today.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +105,7 @@ pub enum UnsupportedReason {
     /// `Count`. The carried string is the variant kind for logging.
     UnsupportedAggIntent(String),
     /// The query is a bare vector / matrix selector with no call —
-    /// the warm tier doesn't materialize raw counter values.
+    /// the ASAP tier doesn't materialize raw counter values.
     NoCallNodeFound,
     /// `query_parser::parse_query` rejected the input. Carries the
     /// parser error message for diagnostics.
@@ -116,22 +116,22 @@ pub enum UnsupportedReason {
 
 /// Parse PromQL via the control plane's existing pipeline, lower to L3
 /// `intent_algebra::QueryExpr`, walk it, and build a
-/// [`WarmTierAnalysis`].
+/// [`ASAPTierAnalysis`].
 ///
-/// Single owner of warm-tier shape recognition: this function does
+/// Single owner of ASAP-tier shape recognition: this function does
 /// **no** direct PromQL function-name matching. The lowerer
 /// (`intent_algebra::lower::lower_parsed_query`) is the only place
 /// that knows what `quantile_over_time` / `count_over_time` / etc.
 /// mean; this function just consumes the lowered `AggIntent`s and
 /// dispatches via [`capability_for`].
-pub fn analyze_promql_for_warm_tier(metricsql: &str) -> WarmTierAnalysis {
+pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
     // Step 1: parse via the control plane's existing PromQL → ParsedQuery
     // chain. `parse_query` already understands the full PromQL surface
     // we care about.
     let parsed = match parse_query(metricsql) {
         Ok(p) => p,
         Err(e) => {
-            return WarmTierAnalysis {
+            return ASAPTierAnalysis {
                 candidates: Vec::new(),
                 unsupported: Some(UnsupportedReason::UnparseableMetricsql(e.to_string())),
             };
@@ -158,7 +158,7 @@ pub fn analyze_promql_for_warm_tier(metricsql: &str) -> WarmTierAnalysis {
     let expr = match crate::intent_algebra::lower::lower_parsed_query(&parsed, accuracy) {
         Ok(e) => e,
         Err(e) => {
-            return WarmTierAnalysis {
+            return ASAPTierAnalysis {
                 candidates: Vec::new(),
                 unsupported: Some(UnsupportedReason::UnparseableMetricsql(e.to_string())),
             };
@@ -167,7 +167,7 @@ pub fn analyze_promql_for_warm_tier(metricsql: &str) -> WarmTierAnalysis {
 
     // Step 3: walk the lowered tree, looking for `Aggregate` nodes.
     // If there's no Aggregate the query is either:
-    //   - a bare metric selector → `NoCallNodeFound` (warm-tier
+    //   - a bare metric selector → `NoCallNodeFound` (ASAP-tier
     //     doesn't materialize raw counter values)
     //   - a window-bound exact-aggregation (`rate`, `irate`,
     //     `increase`, `sum_over_time`, `count_over_time` without
@@ -186,7 +186,7 @@ pub fn analyze_promql_for_warm_tier(metricsql: &str) -> WarmTierAnalysis {
         } else {
             UnsupportedReason::NoCallNodeFound
         };
-        return WarmTierAnalysis {
+        return ASAPTierAnalysis {
             candidates: Vec::new(),
             unsupported: Some(reason),
         };
@@ -198,11 +198,11 @@ pub fn analyze_promql_for_warm_tier(metricsql: &str) -> WarmTierAnalysis {
     let metric_name = parsed.metric_name.clone();
     let group_by_keys: BTreeSet<String> = parsed.group_by_labels.iter().cloned().collect();
 
-    let mut out = WarmTierAnalysis::default();
+    let mut out = ASAPTierAnalysis::default();
     for intent in &intents {
         match capability_for(intent) {
             Some(cap) => {
-                out.candidates.push(WarmTierCandidate {
+                out.candidates.push(ASAPTierCandidate {
                     metric_name: metric_name.clone(),
                     group_by_keys: group_by_keys.clone(),
                     required_capability: cap,
@@ -299,7 +299,7 @@ fn intent_kind_label(intent: &AggIntent) -> &'static str {
 /// outer function name, leading scalar args, and the matrix selector's
 /// `[r]` range in seconds. None of this drives capability dispatch —
 /// dispatch is `capability_for(&AggIntent)`. This walker exists ONLY
-/// so the `WarmTierCandidate.function` / `.function_args` / `.range_seconds`
+/// so the `ASAPTierCandidate.function` / `.function_args` / `.range_seconds`
 /// fields populate for downstream logging and the reducer's range hint.
 #[derive(Debug, Default)]
 struct PromqlTrace {
@@ -382,20 +382,20 @@ fn duration_to_seconds(d: Duration) -> u64 {
 // gives the query engine an O(1) `Candidate → policy_fp → [sid]` index that
 // avoids walking the per-sid metadata map.
 
-/// Translate an [`asap_types::AggregationConfig`] into the warm-tier
+/// Translate an [`asap_types::AggregationConfig`] into the ASAP-tier
 /// [`Capability`] its sids serve. Mirrors the inverse direction
 /// `capability_for(&AggIntent)`: where that function says "this intent
 /// wants *this* capability", this function says "this stored policy
 /// *provides* this capability". Returns `None` for `AggregationType`
-/// variants that don't have a corresponding warm-tier capability
+/// variants that don't have a corresponding ASAP-tier capability
 /// (multi-pop keyed variants without an L4 binder, legacy config
 /// wrappers, etc.) — callers MUST treat `None` as "policy doesn't
-/// serve any warm-tier candidate" and skip.
+/// serve any ASAP-tier candidate" and skip.
 pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capability> {
     use crate::sketch_algebra::capability::SketchKindHandle;
     use promql_utilities::query_logics::enums::AggregationType;
     match cfg.aggregation_type {
-        // Exact-aggregation families — the warm-tier ExactAgg path.
+        // Exact-aggregation families — the ASAP-tier ExactAgg path.
         AggregationType::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
         AggregationType::Increase => Some(Capability::ExactAgg(AggregationType::Increase)),
         AggregationType::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
@@ -419,7 +419,7 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
         }
         // Keyed-multi-population variants and legacy wrappers — no
-        // standalone warm-tier capability today. The L4 binder doesn't
+        // standalone ASAP-tier capability today. The L4 binder doesn't
         // yet emit `PhysicalExpr::ExactAgg` for keyed `MultipleSum` /
         // `MultipleIncrease` shapes (the matching capability doesn't
         // exist either). When the keyed-ExactAgg follow-up lands, this
@@ -532,7 +532,7 @@ pub fn find_policy_by_content(
 ///    the candidate doesn't carry one today. Future enhancement.
 pub fn find_matching_policies(
     registry: &asap_types::PolicyRegistry,
-    candidate: &WarmTierCandidate,
+    candidate: &ASAPTierCandidate,
 ) -> Vec<asap_types::PolicyFingerprint> {
     let mut out = Vec::new();
     for (fp, cfg) in registry.iter() {
@@ -575,7 +575,7 @@ mod tests {
 
     #[test]
     fn analyze_quantile_over_time() {
-        let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, http_latency_ms[5m])");
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, http_latency_ms[5m])");
         assert!(
             a.unsupported.is_none(),
             "expected no unsupported reason: {a:?}"
@@ -594,7 +594,7 @@ mod tests {
 
     #[test]
     fn analyze_quantile_over_time_with_label_matchers() {
-        let a = analyze_promql_for_warm_tier(
+        let a = analyze_promql_for_asap_tier(
             "quantile_over_time(0.5, http_latency_ms{zone=\"z0\", region=\"us\"}[30s])",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
@@ -613,7 +613,7 @@ mod tests {
     fn analyze_quantile_over_time_with_sum_by_group_keys() {
         // PromQL `sum by (host) (quantile_over_time(...))` populates
         // group_by_keys with `host`.
-        let a = analyze_promql_for_warm_tier(
+        let a = analyze_promql_for_asap_tier(
             "sum by (host) (quantile_over_time(0.99, http_latency_ms[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
@@ -630,8 +630,8 @@ mod tests {
         // shape requires a `rate(bucket[r])` which the analyzer rejects as
         // an exact-counter intent, so the analyzer returns SOME unsupported
         // reason; the bucket-aware physical reduction is not yet wired into
-        // the warm-tier path.
-        let a = analyze_promql_for_warm_tier(
+        // the ASAP-tier path.
+        let a = analyze_promql_for_asap_tier(
             "histogram_quantile(0.99, sum(rate(http_latency_bucket[5m])) by (le))",
         );
         assert!(a.unsupported.is_some(), "{a:?}");
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn analyze_topk_aggregate() {
-        let a = analyze_promql_for_warm_tier(
+        let a = analyze_promql_for_asap_tier(
             "topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn reject_bare_vector_selector() {
-        let a = analyze_promql_for_warm_tier("http_requests_total{zone=\"z0\"}");
+        let a = analyze_promql_for_asap_tier("http_requests_total{zone=\"z0\"}");
         assert_eq!(
             a.unsupported,
             Some(UnsupportedReason::NoCallNodeFound),
@@ -671,7 +671,7 @@ mod tests {
     fn reject_rate_function() {
         // `rate(...)` lowers to `AggIntent::Rate{...}` and
         // `capability_for(&Rate{..})` returns None.
-        let a = analyze_promql_for_warm_tier("rate(http_requests_total[5m])");
+        let a = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
         match a.unsupported {
             Some(UnsupportedReason::UnsupportedAggIntent(kind)) => assert_eq!(kind, "rate"),
             other => panic!("expected UnsupportedAggIntent(rate), got {other:?}"),
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn reject_irate_function() {
-        let a = analyze_promql_for_warm_tier("irate(http_requests_total[5m])");
+        let a = analyze_promql_for_asap_tier("irate(http_requests_total[5m])");
         // `irate` lowers to `AggIntent::Rate{...}` via the
         // control plane's PromQL parser (irate / rate share an AggFunc
         // in `query_parser::promql`). The capability bridge returns
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn reject_increase_function() {
-        let a = analyze_promql_for_warm_tier("increase(http_requests_total[5m])");
+        let a = analyze_promql_for_asap_tier("increase(http_requests_total[5m])");
         match a.unsupported {
             Some(UnsupportedReason::UnsupportedAggIntent(kind)) => {
                 assert_eq!(kind, "increase");
@@ -711,7 +711,7 @@ mod tests {
     fn reject_sum_by_bare_metric() {
         // `sum by (zone) (metric)` lowers to `AggIntent::Sum`; bridge
         // returns None — Sum-over-CountSketch is a follow-up.
-        let a = analyze_promql_for_warm_tier("sum by (zone) (http_requests_total)");
+        let a = analyze_promql_for_asap_tier("sum by (zone) (http_requests_total)");
         match a.unsupported {
             Some(UnsupportedReason::UnsupportedAggIntent(kind)) => assert_eq!(kind, "sum"),
             other => panic!("expected UnsupportedAggIntent(sum), got {other:?}"),
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn unparseable_promql_surfaces_clean_error() {
-        let a = analyze_promql_for_warm_tier("@@@ this is not promql @@@");
+        let a = analyze_promql_for_asap_tier("@@@ this is not promql @@@");
         match a.unsupported {
             Some(UnsupportedReason::UnparseableMetricsql(msg)) => {
                 assert!(!msg.is_empty(), "parser error message should be non-empty");
@@ -733,47 +733,47 @@ mod tests {
 
     #[test]
     fn range_seconds_parses_seconds() {
-        let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, m[30s])");
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, m[30s])");
         assert_eq!(a.candidates[0].range_seconds, 30);
     }
 
     #[test]
     fn range_seconds_parses_minutes() {
-        let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, m[5m])");
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, m[5m])");
         assert_eq!(a.candidates[0].range_seconds, 300);
     }
 
     #[test]
     fn range_seconds_parses_hours() {
-        let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, m[2h])");
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, m[2h])");
         assert_eq!(a.candidates[0].range_seconds, 7200);
     }
 
-    // ── is_warm_tier_answerable ──────────────────────────────────────────
+    // ── is_asap_tier_answerable ──────────────────────────────────────────
 
     #[test]
-    fn is_warm_tier_answerable_true_for_supported() {
-        let a = analyze_promql_for_warm_tier("quantile_over_time(0.99, m[5m])");
-        assert!(a.is_warm_tier_answerable());
+    fn is_asap_tier_answerable_true_for_supported() {
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, m[5m])");
+        assert!(a.is_asap_tier_answerable());
     }
 
     #[test]
-    fn is_warm_tier_answerable_false_for_unsupported() {
-        let a = analyze_promql_for_warm_tier("rate(m[5m])");
-        assert!(!a.is_warm_tier_answerable());
+    fn is_asap_tier_answerable_false_for_unsupported() {
+        let a = analyze_promql_for_asap_tier("rate(m[5m])");
+        assert!(!a.is_asap_tier_answerable());
     }
 
     #[test]
-    fn is_warm_tier_answerable_false_for_bare_selector() {
-        let a = analyze_promql_for_warm_tier("m{zone=\"z0\"}");
-        assert!(!a.is_warm_tier_answerable());
+    fn is_asap_tier_answerable_false_for_bare_selector() {
+        let a = analyze_promql_for_asap_tier("m{zone=\"z0\"}");
+        assert!(!a.is_asap_tier_answerable());
     }
 
     // ── Cardinality / count_over_time real-PromQL acceptance ────────────
 
     /// `count_over_time(...)` is real PromQL and lowers to
     /// `AggIntent::Count{accuracy:Exact}` per `intent_algebra::lower`.
-    /// Exact-accuracy Count has no warm-tier binding, so the analyzer
+    /// Exact-accuracy Count has no ASAP-tier binding, so the analyzer
     /// surfaces this as `UnsupportedAggIntent("count")` — the routing
     /// layer then sends it to archive, which is the right behavior
     /// because `count_over_time` counts samples (not distinct values).
@@ -784,7 +784,7 @@ mod tests {
         // The lowerer doesn't emit an AggIntent for it (no entry in
         // `AggType`), so the analyzer surfaces the raw function name
         // from the AST trace as the `UnsupportedAggIntent` label.
-        let a = analyze_promql_for_warm_tier("count_over_time(http_requests_total[5m])");
+        let a = analyze_promql_for_asap_tier("count_over_time(http_requests_total[5m])");
         match a.unsupported {
             Some(UnsupportedReason::UnsupportedAggIntent(kind)) => {
                 assert!(
@@ -803,7 +803,7 @@ mod tests {
     /// maps to `Capability::CardinalityApprox`.
     #[test]
     fn count_by_count_over_time_is_cardinality() {
-        let a = analyze_promql_for_warm_tier(
+        let a = analyze_promql_for_asap_tier(
             "count by (symbol) (count_over_time(financial_last_trade_price[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
@@ -854,8 +854,8 @@ mod tests {
             group_by: &[&str],
             cap: Capability,
             range_seconds: u64,
-        ) -> WarmTierCandidate {
-            WarmTierCandidate {
+        ) -> ASAPTierCandidate {
+            ASAPTierCandidate {
                 metric_name: metric.to_string(),
                 group_by_keys: group_by.iter().map(|s| s.to_string()).collect(),
                 required_capability: cap,

@@ -7,12 +7,12 @@
 //! / CMS-with-heap decoders mirror
 //! `precompute_operators::{count_min_sketch, count_sketch,
 //! count_min_sketch_with_heap}_accumulator.rs` bit-for-bit so the
-//! warm-tier reducer's output matches what the precompute (ingest-side)
+//! ASAP-tier reducer's output matches what the precompute (ingest-side)
 //! accumulator would have produced from the same bytes.
 //!
 //! Each entry point returns the typed sketchlib struct on success or a
 //! plain `String` error; the reducer wraps the error into a
-//! `WarmTierError::DeserializeFailure` so the engine router falls over
+//! `ASAPTierError::DeserializeFailure` so the engine router falls over
 //! to archive cleanly.
 
 use asap_sketchlib::sketches::countminsketch::CountMinSketch;

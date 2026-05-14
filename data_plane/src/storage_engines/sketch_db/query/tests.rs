@@ -1,4 +1,4 @@
-//! Unit tests for the warm-tier sketch reducer.
+//! Unit tests for the ASAP-tier sketch reducer.
 //!
 //! Each test:
 //! 1. Builds an in-memory `SketchStore` with one synthetic sid.
@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use asap_sketchlib::sketches::ddsketch::DdSketch;
 use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
 
-use crate::storage_engines::sketch_db::query::{SketchReducer, WarmTierError};
+use crate::storage_engines::sketch_db::query::{SketchReducer, ASAPTierError};
 use crate::storage_engines::sketch_db::index::{
     AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchStore, SketchInstanceMetadata,
     SketchKindHandle, SketchSampleState,
@@ -335,7 +335,7 @@ fn capability_mismatch_quantile_vs_topk() {
         .evaluate(&[sid], "topk", &[5.0], 100, 110)
         .expect_err("topk against QuantileApprox must fail");
     match err {
-        WarmTierError::UnsupportedCapability { function, .. } => {
+        ASAPTierError::UnsupportedCapability { function, .. } => {
             assert_eq!(function, "topk");
         }
         other => panic!("expected UnsupportedCapability, got {other:?}"),
@@ -347,7 +347,7 @@ fn capability_mismatch_quantile_vs_topk() {
 // would return Ghost (so the engine wouldn't even call the reducer
 // today). We test the defensive behavior — evaluate over a sid with
 // no data should return `NoData` rather than an empty
-// `WarmTierResult` so the engine can surface CapabilityMiss
+// `ASAPTierResult` so the engine can surface CapabilityMiss
 // truthfully and let archive answer.
 // ---------------------------------------------------------------------------
 
@@ -369,7 +369,7 @@ fn empty_returns_no_data_error() {
         .evaluate(&[sid], "quantile_over_time", &[0.99], 5000, 6000)
         .expect_err("no samples in window must yield NoData");
     match err {
-        WarmTierError::NoData { metric_name } => {
+        ASAPTierError::NoData { metric_name } => {
             assert_eq!(metric_name, "http_latency_ms");
         }
         other => panic!("expected NoData, got {other:?}"),
@@ -390,9 +390,9 @@ fn unsupported_function_rejects() {
     let reducer = SketchReducer::new(&idx);
     let err = reducer
         .evaluate(&[sid], "rate", &[], 0, 100)
-        .expect_err("`rate` is not warm-tier-answerable");
+        .expect_err("`rate` is not ASAP-tier-answerable");
     match err {
-        WarmTierError::UnsupportedFunction(name) => {
+        ASAPTierError::UnsupportedFunction(name) => {
             assert_eq!(name, "rate");
         }
         other => panic!("expected UnsupportedFunction, got {other:?}"),
@@ -421,7 +421,7 @@ fn decode_failure_surfaces_deserialize_error() {
         .evaluate(&[sid], "quantile_over_time", &[0.99], 1000, 1010)
         .expect_err("garbage bytes must yield DeserializeFailure");
     match err {
-        WarmTierError::DeserializeFailure { sid: s, .. } => {
+        ASAPTierError::DeserializeFailure { sid: s, .. } => {
             assert_eq!(s, sid);
         }
         other => panic!("expected DeserializeFailure, got {other:?}"),
@@ -430,7 +430,7 @@ fn decode_failure_surfaces_deserialize_error() {
 
 // ---------------------------------------------------------------------------
 // Multi-series: two distinct group-by VALUES vectors under the same
-// sid (e.g. `host=a` and `host=b`) → expect two `WarmTierResult`
+// sid (e.g. `host=a` and `host=b`) → expect two `ASAPTierResult`
 // entries.
 // ---------------------------------------------------------------------------
 
@@ -584,7 +584,7 @@ fn cms_without_heap_returns_missing_heap() {
         .evaluate(&[sid], "topk", &[5.0], 1000, 1010)
         .expect_err("topk against CountMin (no heap) must surface MissingHeap");
     match err {
-        WarmTierError::MissingHeap {
+        ASAPTierError::MissingHeap {
             sid: s,
             sketch_kind,
         } => {
@@ -688,7 +688,7 @@ fn hll_cumulative_full_plus_one_delta() {
     let bytes1 = encode_hll(&sk1);
     idx.append_sample(sid, BTreeMap::new(), (1000, 1010), proto_full(bytes1));
 
-    // Window 2: Msgpack-delta — the warm-tier reducer treats
+    // Window 2: Msgpack-delta — the ASAP-tier reducer treats
     // MsgpackDelta for HLL as a serialized HllSketch fragment that's
     // mergeable via `HllSketch::merge`. We mock that here by
     // serializing a second HLL with 500 additional distinct items.
@@ -724,7 +724,7 @@ fn hll_cumulative_full_plus_one_delta() {
 }
 
 // ---------------------------------------------------------------------------
-// TODO-3 tests — hybrid warm + archive stitch via `WarmTierResult.coverage`.
+// TODO-3 tests — hybrid warm + archive stitch via `ASAPTierResult.coverage`.
 //
 // We don't drive the full ASAPQueryEngine here (that would require
 // constructing the whole streaming-config plumbing). Instead we exercise

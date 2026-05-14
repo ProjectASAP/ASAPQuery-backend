@@ -72,7 +72,7 @@ pub fn dispatch(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Option<PhysicalE
         // wins; matches `capability_for`'s analyzer-side direction.
         Box::new(bind_exact_agg::BindExactAgg),
         // Phase β: archive-only catch-all. Lowest priority — fires only
-        // when no warm-tier rule matches AND the intent is archive-only.
+        // when no ASAP-tier rule matches AND the intent is archive-only.
         Box::new(bind_archive_only::BindArchiveOnly),
     ];
 

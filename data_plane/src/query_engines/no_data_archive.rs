@@ -3,7 +3,7 @@
 //!
 //! ## Why this exists
 //!
-//! When a deploy is configured with the warm-tier sketch path only and
+//! When a deploy is configured with the ASAP-tier sketch path only and
 //! has neither `ASAP_THANOS_QUERY_URL` nor `ASAP_GORILLA_S3_*` env
 //! vars set, no archive engine is registered on the
 //! [`crate::query_engines::routing::EngineRouter`]. Cold queries (queries the

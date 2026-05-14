@@ -315,7 +315,7 @@ enum Capability {
     CardinalityApprox,             // single sketch family: HLL
     FrequencyTopk(SketchKind),     // SketchKind ∈ {CountMin, CountSketch}
     // SumOverTime, RateOverTime — answered from raw counter via Thanos,
-    // not via warm-tier sketches; no Capability variant needed.
+    // not via ASAP-tier sketches; no Capability variant needed.
 }
 ```
 
@@ -659,7 +659,7 @@ fn query(&self, sid: u64, ...) -> QueryResult {
 ```
 
 Three query outcomes per sid lookup:
-- metadata + series have state    → warm-tier hit, evaluate sketch
+- metadata + series have state    → ASAP-tier hit, evaluate sketch
 - metadata only (ghost)           → Thanos fallthrough on the registered identity
 - no metadata (unknown sid)       → response.unknown_series_ids; sender re-registers; fall through with original attrs if available
 

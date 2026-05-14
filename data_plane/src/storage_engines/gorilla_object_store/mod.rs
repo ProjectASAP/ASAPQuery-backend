@@ -322,7 +322,7 @@ impl ExecutionOutcome {
 // shape; router should fall through). Store / timeout / buffer-budget
 // failures fold into `EngineError::Backend` (the engine could have served
 // the query but its backend transiently failed; router should also fall
-// through, typically to the warm-tier sketch path on `DoubleWrite`).
+// through, typically to the ASAP-tier sketch path on `DoubleWrite`).
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]

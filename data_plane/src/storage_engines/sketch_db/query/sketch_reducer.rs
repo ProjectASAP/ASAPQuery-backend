@@ -1,4 +1,4 @@
-//! Per-Capability sketch reducer (warm-tier query evaluator).
+//! Per-Capability sketch reducer (ASAP-tier query evaluator).
 //!
 //! Caller has already classified all candidate sids as `Hit`
 //! against the [`SketchStore`] (see PR #122's classify hook in
@@ -18,10 +18,10 @@
 //!      (`from_sketchlib_proto_bytes` for `ProtoFull`,
 //!      `from_msgpack_bytes` for `MsgpackFull`; `*Delta` encodings
 //!      surface as `DeserializeFailure` because applying a delta
-//!      requires the prior base, which the warm-tier query path
+//!      requires the prior base, which the ASAP-tier query path
 //!      doesn't carry today).
 //!    - Run the canonical sketch query (`quantile`, `estimate`).
-//! 5. Return per-series, per-window scalars in [`WarmTierResult`].
+//! 5. Return per-series, per-window scalars in [`ASAPTierResult`].
 //!
 //! The deserialize + query primitives are the **same** library
 //! calls that `precompute_operators::*_accumulator.rs` uses — so
@@ -34,13 +34,13 @@
 //!   `quantile_over_time` returns one quantile per
 //!   `window_end_unix_ms` rather than merging windows in the
 //!   request range and returning a single quantile. This matches
-//!   how the warm-tier columnar store carries one sketch per
+//!   how the ASAP-tier columnar store carries one sketch per
 //!   `(start, end)` window; the request-range merge can be added
 //!   as a post-process when the simple engine's range-query
 //!   pipeline is wired to call this reducer.
 //! - **Hybrid stitch** (`[t0..t1']` from warm + `[t1'..t1]` from
 //!   archive) — `QueryResult` doesn't carry timestamp-coverage
-//!   metadata yet, so we materialize the full warm-tier answer
+//!   metadata yet, so we materialize the full ASAP-tier answer
 //!   and let the engine router decide.
 //! - **Top-k items**: top-k requires CMS-with-heap (the heap
 //!   structure carries the actual heavy hitters); the
@@ -76,9 +76,9 @@ pub struct SketchReducer<'a> {
 
 /// Distinct failure modes the engine maps onto the routing layer.
 ///
-/// `UnsupportedFunction` / `UnsupportedCapability` → "the warm tier
+/// `UnsupportedFunction` / `UnsupportedCapability` → "the ASAP tier
 /// can't answer this; archive can". `DeserializeFailure` → "the
-/// warm-tier state didn't decode; defensive fallback". `NoData` →
+/// ASAP-tier state didn't decode; defensive fallback". `NoData` →
 /// "the sketch index has no samples in `[t0, t1]`; archive may have
 /// older history". `MissingHeap` → "the sid is FrequencyTopk-classed
 /// but the underlying sketch family carries no heap (vanilla
@@ -86,7 +86,7 @@ pub struct SketchReducer<'a> {
 /// reducer can't materialize top-k items without an external item
 /// universe".
 #[derive(Debug)]
-pub enum WarmTierError {
+pub enum ASAPTierError {
     UnsupportedFunction(String),
     UnsupportedCapability {
         function: String,
@@ -111,44 +111,44 @@ pub enum WarmTierError {
     },
 }
 
-impl std::fmt::Display for WarmTierError {
+impl std::fmt::Display for ASAPTierError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WarmTierError::UnsupportedFunction(name) => {
-                write!(f, "warm-tier reducer does not support function `{name}`")
+            ASAPTierError::UnsupportedFunction(name) => {
+                write!(f, "ASAP-tier reducer does not support function `{name}`")
             }
-            WarmTierError::UnsupportedCapability {
+            ASAPTierError::UnsupportedCapability {
                 function,
                 capability,
             } => write!(
                 f,
-                "warm-tier reducer cannot answer `{function}` against capability {capability:?}"
+                "ASAP-tier reducer cannot answer `{function}` against capability {capability:?}"
             ),
-            WarmTierError::MissingHeap { sid, sketch_kind } => write!(
+            ASAPTierError::MissingHeap { sid, sketch_kind } => write!(
                 f,
-                "warm-tier reducer cannot enumerate top-k for sid {sid}: \
+                "ASAP-tier reducer cannot enumerate top-k for sid {sid}: \
                  sketch kind {sketch_kind:?} carries no top-k heap \
                  (CountMin / CountSketch only support point-frequency queries; \
                  use CmsWithHeap for top-k)"
             ),
-            WarmTierError::DeserializeFailure {
+            ASAPTierError::DeserializeFailure {
                 sid,
                 encoding,
                 reason,
             } => write!(
                 f,
-                "warm-tier sketch decode failure for sid {sid} \
+                "ASAP-tier sketch decode failure for sid {sid} \
                  (encoding={encoding:?}): {reason}"
             ),
-            WarmTierError::NoData { metric_name } => write!(
+            ASAPTierError::NoData { metric_name } => write!(
                 f,
-                "warm-tier index has no samples for metric `{metric_name}` in window"
+                "ASAP-tier index has no samples for metric `{metric_name}` in window"
             ),
         }
     }
 }
 
-impl std::error::Error for WarmTierError {}
+impl std::error::Error for ASAPTierError {}
 
 /// Per-series, per-window scalar results.
 ///
@@ -158,9 +158,9 @@ impl std::error::Error for WarmTierError {}
 /// compares `coverage` against the requested `[t0, t1]` and, on a
 /// partial hit (`cov_lo > t0 || cov_hi < t1`), falls over to archive
 /// for the missing range and stitches the two answers. See TODO 3 in
-/// the warm-tier follow-up PR.
+/// the ASAP-tier follow-up PR.
 #[derive(Debug, Clone, Default)]
-pub struct WarmTierResult {
+pub struct ASAPTierResult {
     /// `(label_values, samples)` where `samples` is
     /// `(window_end_unix_ms, value)`.
     pub series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
@@ -170,7 +170,7 @@ pub struct WarmTierResult {
     pub coverage: Option<(u64, u64)>,
 }
 
-impl WarmTierResult {
+impl ASAPTierResult {
     pub fn is_empty(&self) -> bool {
         self.series.iter().all(|(_, s)| s.is_empty())
     }
@@ -196,7 +196,7 @@ impl<'a> SketchReducer<'a> {
         Self { index }
     }
 
-    /// Map a PromQL function name to the warm-tier query family it
+    /// Map a PromQL function name to the ASAP-tier query family it
     /// addresses. After the Step 2a refactor the canonical dispatch is
     /// off the analyzer's `Capability` (see [`capability_to_family`]);
     /// this string-based fallback exists ONLY for the
@@ -204,7 +204,7 @@ impl<'a> SketchReducer<'a> {
     /// API surface, which is preserved for the existing call sites.
     /// Unrecognised names route to the canonical family via the
     /// downstream `require_capability` check.
-    fn function_to_family(function_name: &str) -> Result<QueryFamily, WarmTierError> {
+    fn function_to_family(function_name: &str) -> Result<QueryFamily, ASAPTierError> {
         match function_name {
             "quantile_over_time" | "histogram_quantile" | "quantile" => Ok(QueryFamily::Quantile),
             // `distinct_over_time` (MetricsQL) is the canonical
@@ -225,17 +225,17 @@ impl<'a> SketchReducer<'a> {
             // canonical name; `count_over_time` is accepted as an alias
             // for back-compat with PromQL counter-style point queries.
             "frequency" | "frequency_estimate" => Ok(QueryFamily::FrequencyEstimate),
-            other => Err(WarmTierError::UnsupportedFunction(other.to_string())),
+            other => Err(ASAPTierError::UnsupportedFunction(other.to_string())),
         }
     }
 
     /// Map a [`Capability`] to a [`QueryFamily`]. This is the canonical
     /// dispatch path after Step 2a: the control plane's analyzer hands
-    /// each `WarmTierCandidate` a `required_capability`, and the
+    /// each `ASAPTierCandidate` a `required_capability`, and the
     /// reducer picks a family without ever matching on the PromQL
     /// function-name string.
     ///
-    /// Returns `None` for `Capability::ExactAgg(_)` — the warm-tier
+    /// Returns `None` for `Capability::ExactAgg(_)` — the ASAP-tier
     /// sketch reducer only handles sketch-backed sids. Exact-aggregation
     /// state is read through `SketchStore::query_precomputes_by_agg`
     /// (a parallel code path), so an ExactAgg capability has no
@@ -261,14 +261,14 @@ impl<'a> SketchReducer<'a> {
         function_name: &str,
         family: QueryFamily,
         meta: &SketchInstanceMetadata,
-    ) -> Result<Capability, WarmTierError> {
-        // The warm-tier reducer only ever runs on sketch-backed sids
+    ) -> Result<Capability, ASAPTierError> {
+        // The ASAP-tier reducer only ever runs on sketch-backed sids
         // (the analyzer's `instances_matching` filters on `Capability`,
         // which is `None` for precompute-backed sids). A `None` here
         // means upstream classification broke — surface as a missing
         // capability rather than panicking the request path.
         let Some(cap) = meta.capability.as_ref() else {
-            return Err(WarmTierError::UnsupportedCapability {
+            return Err(ASAPTierError::UnsupportedCapability {
                 function: function_name.to_string(),
                 capability: Capability::CardinalityApprox,
             });
@@ -285,14 +285,14 @@ impl<'a> SketchReducer<'a> {
             | (QueryFamily::FrequencyEstimate, Capability::FrequencyTopk(_)) => {
                 Ok(cap.clone())
             }
-            (_, other) => Err(WarmTierError::UnsupportedCapability {
+            (_, other) => Err(ASAPTierError::UnsupportedCapability {
                 function: function_name.to_string(),
                 capability: other.clone(),
             }),
         }
     }
 
-    /// Evaluate a PromQL query against the warm tier.
+    /// Evaluate a PromQL query against the ASAP tier.
     ///
     /// Caller invariant: every sid in `sids` has already been
     /// verified to classify as `Hit` against `self.index`. We
@@ -325,7 +325,7 @@ impl<'a> SketchReducer<'a> {
         function_args: &[f64],
         t0_ms: u64,
         t1_ms: u64,
-    ) -> Result<WarmTierResult, WarmTierError> {
+    ) -> Result<ASAPTierResult, ASAPTierError> {
         let family = Self::function_to_family(function_name)?;
         let is_cumulative = matches!(
             function_name,
@@ -376,7 +376,7 @@ impl<'a> SketchReducer<'a> {
                         if w > cov_hi {
                             cov_hi = w;
                         }
-                        let total = decode_frequency_total(sid, meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids"), state)?;
+                        let total = decode_frequency_total(sid, meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids"), state)?;
                         samples_out.push((*w_end, total));
                     }
                     out_series.push((ts.series_label_values, samples_out));
@@ -409,7 +409,7 @@ impl<'a> SketchReducer<'a> {
                     if w_end_u64 > cov_hi {
                         cov_hi = w_end_u64;
                     }
-                    let cms_heap = match meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids") {
+                    let cms_heap = match meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids") {
                         SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
                             // Both heap-bearing variants serialize the
                             // outer `CountMinSketchWithHeap` envelope via
@@ -417,7 +417,7 @@ impl<'a> SketchReducer<'a> {
                             // same wire shape since the heap is the
                             // distinguishing payload).
                             decode_cms_with_heap_from_msgpack(&state.bytes).map_err(|e| {
-                                WarmTierError::DeserializeFailure {
+                                ASAPTierError::DeserializeFailure {
                                     sid,
                                     encoding: state.encoding,
                                     reason: e,
@@ -428,13 +428,13 @@ impl<'a> SketchReducer<'a> {
                             // Heap-LESS variants can't enumerate top-k —
                             // they support point-frequency only (which
                             // routes through QueryFamily::FrequencyEstimate).
-                            return Err(WarmTierError::MissingHeap {
+                            return Err(ASAPTierError::MissingHeap {
                                 sid,
-                                sketch_kind: meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids"),
+                                sketch_kind: meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids"),
                             });
                         }
                         other => {
-                            return Err(WarmTierError::UnsupportedCapability {
+                            return Err(ASAPTierError::UnsupportedCapability {
                                 function: function_name.to_string(),
                                 capability: Capability::FrequencyTopk(other),
                             });
@@ -457,12 +457,12 @@ impl<'a> SketchReducer<'a> {
             }
 
             // Quantile / Cardinality with delta stitching.
-            let delta_kind = match (family, meta.sketch_kind().expect("warm-tier reducer only handles sketch-backed sids")) {
+            let delta_kind = match (family, meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids")) {
                 (QueryFamily::Quantile, SketchKindHandle::DDSketch) => DeltaSketchKind::DDSketch,
                 (QueryFamily::Quantile, SketchKindHandle::Kll) => DeltaSketchKind::Kll,
                 (QueryFamily::Cardinality, SketchKindHandle::Hll) => DeltaSketchKind::Hll,
                 _ => {
-                    return Err(WarmTierError::UnsupportedCapability {
+                    return Err(ASAPTierError::UnsupportedCapability {
                         function: function_name.to_string(),
                         capability: meta
                             .capability
@@ -504,7 +504,7 @@ impl<'a> SketchReducer<'a> {
 
                 let samples_out: Vec<(i64, f64)> = if is_cumulative {
                     let (one, _skipped) = cumulative_evaluate(&samples_vec, delta_kind, &evaluator)
-                        .map_err(|e| WarmTierError::DeserializeFailure {
+                        .map_err(|e| ASAPTierError::DeserializeFailure {
                             sid,
                             encoding: SketchEncoding::ProtoFull,
                             reason: e,
@@ -516,7 +516,7 @@ impl<'a> SketchReducer<'a> {
                 } else {
                     let (per_win, _skipped) =
                         per_window_evaluate(&samples_vec, delta_kind, &evaluator).map_err(|e| {
-                            WarmTierError::DeserializeFailure {
+                            ASAPTierError::DeserializeFailure {
                                 sid,
                                 encoding: SketchEncoding::ProtoFull,
                                 reason: e,
@@ -529,7 +529,7 @@ impl<'a> SketchReducer<'a> {
         }
 
         if !any_window {
-            return Err(WarmTierError::NoData {
+            return Err(ASAPTierError::NoData {
                 metric_name: metric_name_for_err,
             });
         }
@@ -539,7 +539,7 @@ impl<'a> SketchReducer<'a> {
         } else {
             None
         };
-        Ok(WarmTierResult {
+        Ok(ASAPTierResult {
             series: out_series,
             coverage,
         })
@@ -552,7 +552,7 @@ impl<'a> SketchReducer<'a> {
     /// follow-up moved the per-window decode-then-evaluate flow into
     /// [`super::delta_apply`]. Callers that want a one-shot evaluate
     /// without delta-state plumbing can still reach this entry point;
-    /// the warm-tier reducer's main loop now goes through
+    /// the ASAP-tier reducer's main loop now goes through
     /// [`per_window_evaluate`] / [`cumulative_evaluate`].
     #[allow(dead_code)]
     fn evaluate_one_state(
@@ -562,7 +562,7 @@ impl<'a> SketchReducer<'a> {
         sketch_kind: SketchKindHandle,
         function_args: &[f64],
         state: &SketchSampleState,
-    ) -> Result<f64, WarmTierError> {
+    ) -> Result<f64, ASAPTierError> {
         match family {
             QueryFamily::Quantile => {
                 let q = function_args
@@ -579,7 +579,7 @@ impl<'a> SketchReducer<'a> {
                 // this legacy one-shot entry never participates in the
                 // top-k path. Surface as `UnsupportedCapability` so a
                 // stray caller falls over to archive.
-                Err(WarmTierError::UnsupportedCapability {
+                Err(ASAPTierError::UnsupportedCapability {
                     function: "topk".to_string(),
                     capability: Capability::FrequencyTopk(sketch_kind),
                 })
@@ -591,7 +591,7 @@ impl<'a> SketchReducer<'a> {
                 // FrequencyEstimate path; surface as a defensive
                 // `UnsupportedCapability` so a stray caller falls over
                 // to archive rather than silently misroutes.
-                Err(WarmTierError::UnsupportedCapability {
+                Err(ASAPTierError::UnsupportedCapability {
                     function: "frequency".to_string(),
                     capability: Capability::FrequencyEstimate(sketch_kind),
                 })
@@ -606,7 +606,7 @@ impl<'a> SketchReducer<'a> {
         sketch_kind: SketchKindHandle,
         q: f64,
         state: &SketchSampleState,
-    ) -> Result<f64, WarmTierError> {
+    ) -> Result<f64, ASAPTierError> {
         match sketch_kind {
             SketchKindHandle::DDSketch => {
                 let sk = decode_ddsketch(sid, state)?;
@@ -616,7 +616,7 @@ impl<'a> SketchReducer<'a> {
                 let sk = decode_kll(sid, state)?;
                 Ok(sk.quantile(q))
             }
-            other => Err(WarmTierError::UnsupportedCapability {
+            other => Err(ASAPTierError::UnsupportedCapability {
                 function: "quantile".to_string(),
                 capability: Capability::QuantileApprox(other),
             }),
@@ -629,13 +629,13 @@ impl<'a> SketchReducer<'a> {
         sid: u64,
         sketch_kind: SketchKindHandle,
         state: &SketchSampleState,
-    ) -> Result<f64, WarmTierError> {
+    ) -> Result<f64, ASAPTierError> {
         match sketch_kind {
             SketchKindHandle::Hll => {
                 let sk = decode_hll(sid, state)?;
                 Ok(sk.estimate())
             }
-            other => Err(WarmTierError::UnsupportedCapability {
+            other => Err(ASAPTierError::UnsupportedCapability {
                 function: "cardinality".to_string(),
                 capability: Capability::QuantileApprox(other),
             }),
@@ -651,11 +651,11 @@ impl<'a> SketchReducer<'a> {
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, WarmTierError> {
+fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, ASAPTierError> {
     match state.encoding {
         SketchEncoding::ProtoFull => {
             DdSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                WarmTierError::DeserializeFailure {
+                ASAPTierError::DeserializeFailure {
                     sid,
                     encoding: state.encoding,
                     reason: e.to_string(),
@@ -663,18 +663,18 @@ fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, Warm
             })
         }
         SketchEncoding::MsgpackFull => DdSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
+            ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
                 reason: e.to_string(),
             }
         }),
         SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(WarmTierError::DeserializeFailure {
+            Err(ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
                 reason: "delta encodings require base sketch state \
-                         (warm-tier reducer doesn't yet stitch delta + base \
+                         (ASAP-tier reducer doesn't yet stitch delta + base \
                          within query_range)"
                     .to_string(),
             })
@@ -683,11 +683,11 @@ fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, Warm
 }
 
 #[allow(dead_code)]
-fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, WarmTierError> {
+fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, ASAPTierError> {
     match state.encoding {
         SketchEncoding::ProtoFull => {
             KllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                WarmTierError::DeserializeFailure {
+                ASAPTierError::DeserializeFailure {
                     sid,
                     encoding: state.encoding,
                     reason: e.to_string(),
@@ -695,28 +695,28 @@ fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, WarmTier
             })
         }
         SketchEncoding::MsgpackFull => KllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
+            ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
                 reason: e.to_string(),
             }
         }),
         SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(WarmTierError::DeserializeFailure {
+            Err(ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
-                reason: "KLL delta encodings not implemented in warm-tier reducer".to_string(),
+                reason: "KLL delta encodings not implemented in ASAP-tier reducer".to_string(),
             })
         }
     }
 }
 
 #[allow(dead_code)]
-fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, WarmTierError> {
+fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, ASAPTierError> {
     match state.encoding {
         SketchEncoding::ProtoFull => {
             HllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                WarmTierError::DeserializeFailure {
+                ASAPTierError::DeserializeFailure {
                     sid,
                     encoding: state.encoding,
                     reason: e.to_string(),
@@ -724,17 +724,17 @@ fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, WarmTier
             })
         }
         SketchEncoding::MsgpackFull => HllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
-            WarmTierError::DeserializeFailure {
+            ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
                 reason: e.to_string(),
             }
         }),
         SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(WarmTierError::DeserializeFailure {
+            Err(ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
-                reason: "HLL delta encodings not implemented in warm-tier reducer".to_string(),
+                reason: "HLL delta encodings not implemented in ASAP-tier reducer".to_string(),
             })
         }
     }
@@ -881,7 +881,7 @@ fn _unused_count_sketch_kept_for_future_topk(buffer: &[u8]) -> Option<CountSketc
 /// Heap-bearing variants (`CmsWithHeap` / `CountSketchWithHeap`) are
 /// decoded via the same wrapper and the underlying CMS matrix is used.
 ///
-/// Returns `WarmTierError::DeserializeFailure` if the bytes don't decode
+/// Returns `ASAPTierError::DeserializeFailure` if the bytes don't decode
 /// against the sid's declared sketch kind. Heap-less CMS / CountSketch
 /// are NOT a `MissingHeap` error here — bare frequency is exactly what
 /// heap-less variants are designed to answer.
@@ -889,8 +889,8 @@ fn decode_frequency_total(
     sid: u64,
     sketch_kind: SketchKindHandle,
     state: &SketchSampleState,
-) -> Result<f64, WarmTierError> {
-    let to_err = |e: String, encoding: SketchEncoding| WarmTierError::DeserializeFailure {
+) -> Result<f64, ASAPTierError> {
+    let to_err = |e: String, encoding: SketchEncoding| ASAPTierError::DeserializeFailure {
         sid,
         encoding,
         reason: e,
@@ -905,7 +905,7 @@ fn decode_frequency_total(
                         .map_err(|e| to_err(e, state.encoding))?,
                     SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
                         return Err(to_err(
-                            "CMS delta encodings not implemented in warm-tier reducer".to_string(),
+                            "CMS delta encodings not implemented in ASAP-tier reducer".to_string(),
                             state.encoding,
                         ));
                     }
@@ -922,7 +922,7 @@ fn decode_frequency_total(
                 }
                 SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
                     return Err(to_err(
-                        "CountSketch delta encodings not implemented in warm-tier reducer"
+                        "CountSketch delta encodings not implemented in ASAP-tier reducer"
                             .to_string(),
                         state.encoding,
                     ));
@@ -940,7 +940,7 @@ fn decode_frequency_total(
         }
         // Quantile / cardinality handles can't answer frequency — caller
         // should have rejected at `require_capability`. Defensive arm.
-        other => Err(WarmTierError::UnsupportedCapability {
+        other => Err(ASAPTierError::UnsupportedCapability {
             function: "frequency".to_string(),
             capability: Capability::FrequencyEstimate(other),
         }),

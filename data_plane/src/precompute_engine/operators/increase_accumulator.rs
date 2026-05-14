@@ -301,7 +301,7 @@ impl SingleSubpopulationAggregate for IncreaseAccumulator {
             // `by` labels and adds the per-series totals across keys.
             //
             // See PR #108 audit conclusion (commit 4359e10) and issue
-            // ProjectASAP/ASAPCollector#46: pre-fix the warm tier ingested
+            // ProjectASAP/ASAPCollector#46: pre-fix the ASAP tier ingested
             // counters as IncreaseAccumulator and bare `sum by (...) (<counter>)`
             // capability-missed because this trait did not answer Sum.
             Statistic::Sum => Ok(self.last_seen_measurement.value),

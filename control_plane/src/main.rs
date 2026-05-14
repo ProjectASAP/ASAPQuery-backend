@@ -95,7 +95,7 @@ struct AppState {
     /// `handle_plan` call, so when N metrics replan in sequence only
     /// the last metric's entry survives in the backend's routing table.
     /// That defaults the other N-1 metrics to `sketch_store`, which
-    /// has no warm-tier sketch state for archive-shape queries
+    /// has no ASAP-tier sketch state for archive-shape queries
     /// (`count`, `topk`, `rate_post_hoc`, `histogram_quantile`,
     /// `delta`, `deriv`, `absent`) → the backend returns empty / 404 →
     /// the demo's accuracy reducer logs `archive_miss` for those metrics
@@ -2500,7 +2500,7 @@ mod api_tests {
     // `/api/v1/plan` for each of the 5 sketched contract metrics in
     // sequence, only the LAST metric's entry survived in the backend.
     // The other 4 metrics defaulted to `sketch_store` (which has
-    // no warm-tier sketch state for archive-shape queries) → the
+    // no ASAP-tier sketch state for archive-shape queries) → the
     // demo's accuracy reducer logged `archive_miss` for those metrics
     // even though gorillas3 wrote their TSDB blocks to MinIO and
     // Thanos had them indexed.

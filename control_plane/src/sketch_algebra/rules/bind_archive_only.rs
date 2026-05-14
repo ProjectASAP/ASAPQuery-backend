@@ -18,7 +18,7 @@
 //! (an `Aggregate{Sum}` over a tabular leaf, etc.). Surfacing the
 //! archive-only cases through an explicit named rule lets the
 //! StreamingConfig emitter and Phase α routing emit distinguish "no
-//! warm-tier rule fired but the intent IS warm-eligible" from "this
+//! ASAP-tier rule fired but the intent IS warm-eligible" from "this
 //! intent is intentionally archive-only, route it cold".
 //!
 //! Reference: `control_plane/docs/design.md` §6 line ~689 ("the optimizer
@@ -42,7 +42,7 @@ impl Rule for BindArchiveOnly {
     }
 
     fn priority(&self) -> u16 {
-        // Lowest priority — every warm-tier rule should out-rank this
+        // Lowest priority — every ASAP-tier rule should out-rank this
         // one so the only path to BindArchiveOnly is "no warm rule
         // fired AND the intent is archive-only".
         1
@@ -128,7 +128,7 @@ mod tests {
         // PromQL operator that the controller's PromQL parser substitutes
         // (Step γ5) into a plain `Aggregate { Quantile(φ) }`. The
         // canonical archive-only anchor for this test is `Absent`
-        // (which has no warm-tier sketch family).
+        // (which has no ASAP-tier sketch family).
         let expr = agg_with(AggIntent::Absent);
         let out = BindArchiveOnly
             .apply(&expr, &AccuracyTarget::Epsilon(0.01))
@@ -183,9 +183,9 @@ mod tests {
     }
 
     #[test]
-    fn does_not_bind_warm_tier_intents() {
+    fn does_not_bind_asap_tier_intents() {
         // Sum / Quantile / Cardinality / TopK are NOT archive-only — they
-        // must NOT trigger BindArchiveOnly (the warm-tier rules own them).
+        // must NOT trigger BindArchiveOnly (the ASAP-tier rules own them).
         for intent in [
             AggIntent::Sum,
             AggIntent::Quantile {
@@ -214,7 +214,7 @@ mod tests {
                 BindArchiveOnly
                     .apply(&expr, &AccuracyTarget::Epsilon(0.01))
                     .is_none(),
-                "BindArchiveOnly must not bind warm-tier intent {intent:?}"
+                "BindArchiveOnly must not bind ASAP-tier intent {intent:?}"
             );
         }
     }

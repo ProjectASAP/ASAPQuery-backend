@@ -176,7 +176,7 @@ Coordinated release with ASAPCollector. After this lands,
 
 `Arc<dyn AggregateCore>` payloads are no longer the path-of-record;
 they only exist in the legacy `store/{global,per_key}.rs` code, which
-either deletes (warm-tier sketch state now lives in
+either deletes (ASAP-tier sketch state now lives in
 `SketchIndex.series.windows`) or becomes a thin adapter shim. The
 `store/common.rs::MutableEpoch` duplication disappears with its only
 caller.

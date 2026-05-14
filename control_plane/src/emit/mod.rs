@@ -131,7 +131,7 @@ pub fn emit_for_runtime(
 /// 10s flush window for the freshness probes — see the comment in
 /// `emit_bootstrap_typed` (and the original PR #333) for the rationale.
 /// Smallest window that produces well-formed Prometheus-TSDB blocks
-/// while keeping criterion ⑥'s warm-tier p50 ≤ 30s budget.
+/// while keeping criterion ⑥'s ASAP-tier p50 ≤ 30s budget.
 pub const FRESHNESS_PROBE_WINDOW_SECS: u64 = 10;
 
 /// 60s window for non-probe workload-registry metrics added to the

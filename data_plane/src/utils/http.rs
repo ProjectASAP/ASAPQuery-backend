@@ -178,7 +178,7 @@ pub fn convert_range_result_to_prometheus(
                     // Build metric labels object. Per-element override
                     // (`element.label_keys_override`) wins when the
                     // adapter knows the keys at materialization time —
-                    // e.g. warm-tier `topk` synthesizes an `"item"` key
+                    // e.g. ASAP-tier `topk` synthesizes an `"item"` key
                     // that's not in the query's group-by clause, so the
                     // outer `label_names` doesn't carry it. Falls back
                     // to the query-scoped key list for everyone else.

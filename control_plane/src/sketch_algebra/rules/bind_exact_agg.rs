@@ -1,5 +1,5 @@
 //! `BindExactAgg` — emits `PhysicalExpr::ExactAgg` for the four exact-aggregation
-//! intents that the PR 6 follow-up flipped to warm-tier routing.
+//! intents that the PR 6 follow-up flipped to ASAP-tier routing.
 //!
 //! ## Coverage
 //!
@@ -31,7 +31,7 @@
 //!   variants of approximate-by-default intents. No exact-precompute
 //!   shape exists in `AggregationType` for these; they need
 //!   `HashAgg` / `SortAgg` / `SortMerge` from the deployment's
-//!   exact-physical-operator family (none of which run at the warm tier
+//!   exact-physical-operator family (none of which run at the ASAP tier
 //!   today).
 //! - `AggIntent::Min` / `AggIntent::Max` — `MinMax` is already covered
 //!   by the quantile-sketch path (`quantile(0)` / `quantile(1)` via

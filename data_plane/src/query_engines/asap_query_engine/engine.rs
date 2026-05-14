@@ -75,25 +75,25 @@ fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> Stri
 }
 
 /// Phase 5 helper — extract `(metric_name, label_matcher_key_set)` from a
-/// PromQL query for warm-tier candidate selection. Walks the AST to find
+/// PromQL query for ASAP-tier candidate selection. Walks the AST to find
 /// the first `VectorSelector` / `MatrixSelector`, returns its metric name
 /// (drawn either from `vs.name` or from a `__name__=...` matcher) and
 /// the user-specified label-matcher KEYS (excluding the synthetic
 /// `__name__`). Returns `None` for queries that don't reference a
 /// concrete metric.
 ///
-/// Intentionally lightweight: callers use the result to filter warm-tier
+/// Intentionally lightweight: callers use the result to filter ASAP-tier
 /// candidates via `SketchStore::instances_matching`. Any over-approximation
 /// is tolerable — the candidates are subsequently classified, and on
 /// `Ghost` / `Unknown` outcomes the query falls through to the archive
 /// engine via the EngineRouter's `CapabilityMiss` failover.
 /// Legacy `(metric_name, group_by_keys)` extractor — superseded by
-/// `control_plane::warm_tier_analysis::analyze_promql_for_warm_tier`,
-/// which returns the full `WarmTierAnalysis` (capability, function
+/// `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`,
+/// which returns the full `ASAPTierAnalysis` (capability, function
 /// name + args, range). Kept around as `#[allow(dead_code)]` because
 /// downstream code (range-query pipeline, range-step planner) still
 /// uses bare `(metric, keys)` projections for sid candidate filtering;
-/// once those callers also migrate to `WarmTierAnalysis`, this can be
+/// once those callers also migrate to `ASAPTierAnalysis`, this can be
 /// deleted in a follow-up.
 #[allow(dead_code)]
 fn extract_metric_and_label_keys(
@@ -260,17 +260,17 @@ pub struct ASAPQueryEngine {
     /// misses fall through to the §5.2 fallback silently, matching
     /// pre-PR-G behavior. Set via `with_control_plane_client`.
     control_plane_client: Option<Arc<dyn crate::drivers::control_plane_client::ControlPlaneClient>>,
-    /// Phase 5 — warm-tier sketch index. When `Some`, the trait's
+    /// Phase 5 — ASAP-tier sketch index. When `Some`, the trait's
     /// `execute` adapter classifies the query's metric/group-by against
     /// the index and short-circuits to `EngineError::CapabilityMiss` when
-    /// no warm-tier identity covers the request — driving the
+    /// no ASAP-tier identity covers the request — driving the
     /// EngineRouter's archive failover (Phase 6). When `None`, the
     /// engine behaves as it did before Phase 5 wire-in (every query
     /// goes through `handle_query`'s legacy path).
     sketch_index: Option<Arc<crate::storage_engines::sketch_db::index::SketchStore>>,
     /// Phase-5 hybrid-stitch hook — set by `with_archive_engine` from
-    /// `main.rs`'s engine builder. When the warm-tier reducer reports a
-    /// `WarmTierResult.coverage` narrower than the requested
+    /// `main.rs`'s engine builder. When the ASAP-tier reducer reports a
+    /// `ASAPTierResult.coverage` narrower than the requested
     /// `[t0, t1]`, the engine calls into this archive engine to fetch
     /// the missing prefix / suffix and stitches the two answers by
     /// `(label_values, timestamp)`. Warm-tier values win on overlap.
@@ -446,9 +446,9 @@ impl ASAPQueryEngine {
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
-    /// `QueryEngine` trait adapter will dispatch to when the warm-tier
+    /// `QueryEngine` trait adapter will dispatch to when the ASAP-tier
     /// reducer reports a coverage narrower than the requested range.
-    /// When `None`, the engine returns whatever the warm tier covers.
+    /// When `None`, the engine returns whatever the ASAP tier covers.
     pub fn with_archive_engine(
         mut self,
         archive: Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>,
@@ -552,7 +552,7 @@ impl ASAPQueryEngine {
     ///
     /// The user-facing `inference_config.schema` is the source of truth
     /// for "what labels does this metric carry" — but the production
-    /// warm-tier deploy launches with `--streaming-config` only and no
+    /// ASAP-tier deploy launches with `--streaming-config` only and no
     /// `--config`, so the schema is empty. Pre-fix every query lookup
     /// in `build_promql_execution_context_tail` and
     /// `build_query_requirements_promql` returned `None` /
@@ -622,7 +622,7 @@ impl ASAPQueryEngine {
     /// Resolve agent-side INGEST renames (`_quantile`, `_hll`,
     /// `_count_unique`) so a user PromQL query that names the
     /// conceptual unsuffixed metric still finds the suffixed series
-    /// the warm tier actually holds.
+    /// the ASAP tier actually holds.
     ///
     /// The agent's per-family sketch processors rename the raw input
     /// metric on egress:
@@ -644,7 +644,7 @@ impl ASAPQueryEngine {
     ///     never gets an `_hll` redirect by accident), AND
     ///   * the bare metric is NOT in the streaming config / schema
     ///     but the suffixed variant IS — guaranteeing the redirect
-    ///     points at a series the warm tier can actually answer.
+    ///     points at a series the ASAP tier can actually answer.
     ///
     /// Substitution is byte-level identifier replacement
     /// (`replace_metric_token`); the rewritten string is re-parsed
@@ -1352,7 +1352,7 @@ impl ASAPQueryEngine {
 
         // Resolve the metric's "all labels" set. Falls back to a
         // streaming-config-derived label union when the schema is
-        // empty for this metric — the production warm-tier deploy
+        // empty for this metric — the production ASAP-tier deploy
         // launches with `--streaming-config` only and an empty
         // schema, and pre-fix every query for a streaming-config-
         // registered metric blew up here on the schema lookup. See
@@ -1997,7 +1997,7 @@ impl ASAPQueryEngine {
 
         // Resolve agent-side INGEST-time metric renames so the
         // user's bare-metric PromQL still finds the suffixed series
-        // the warm tier actually holds. Today: DDSketch / KLL
+        // the ASAP tier actually holds. Today: DDSketch / KLL
         // (`_quantile` for `quantile_over_time` / `quantile`) and
         // HLL (`_hll` for `count(...)` cardinality). See
         // `resolve_sketch_metric_alias` for the full shape→suffix
@@ -2011,7 +2011,7 @@ impl ASAPQueryEngine {
 
         // Binary arithmetic dispatch was previously handled here via a
         // DataFusion-based plan combiner. That path was removed alongside
-        // the datafusion crate; binary arithmetic on warm-tier sketches
+        // the datafusion crate; binary arithmetic on ASAP-tier sketches
         // will be reintroduced as part of the PromQL-evaluator-on-Gorilla
         // follow-up. For now binary expressions fall through to the
         // normal dispatch path (which will not match and trigger the
@@ -3314,7 +3314,7 @@ impl ASAPQueryEngine {
 // to the next compatible backend.
 // ---------------------------------------------------------------------------
 
-/// Adapt a [`crate::storage_engines::sketch_db::query::WarmTierResult`] to the engine's
+/// Adapt a [`crate::storage_engines::sketch_db::query::ASAPTierResult`] to the engine's
 /// existing `QueryResult` shape. The reducer hands back per-series
 /// time-stamped scalars; we materialize them as a
 /// `QueryResult::Matrix` whose [`crate::query_engines::query_result::RangeVectorElement`]s
@@ -3323,14 +3323,14 @@ impl ASAPQueryEngine {
 /// `now_ms` is unused for the matrix variant (each sample carries its
 /// own window-end timestamp); it's plumbed for future extension to
 /// the instant-vector case (latest-pane projection).
-/// Merge a warm-tier `QueryResult::Matrix` with an archive
+/// Merge a ASAP-tier `QueryResult::Matrix` with an archive
 /// `QueryResult::Matrix` by `(label_values, timestamp)`. Samples whose
 /// timestamps fall inside the warm coverage `(cov_lo, cov_hi)` keep
 /// the warm value (warm is approximate but more recent); samples
 /// outside that window come from the archive answer. For
 /// labels-not-present-in-warm series the archive series is taken in
 /// full. Used by `ASAPQueryEngine`'s hybrid-stitch path when the
-/// warm-tier reducer reports `coverage` narrower than the request.
+/// ASAP-tier reducer reports `coverage` narrower than the request.
 fn stitch_warm_and_archive(
     warm: crate::query_engines::query_result::QueryResult,
     archive: crate::query_engines::query_result::QueryResult,
@@ -3385,8 +3385,8 @@ fn stitch_warm_and_archive(
     QueryResult::matrix(elements)
 }
 
-fn warm_tier_result_to_query_result(
-    result: crate::storage_engines::sketch_db::query::WarmTierResult,
+fn asap_tier_result_to_query_result(
+    result: crate::storage_engines::sketch_db::query::ASAPTierResult,
     _now_ms: u64,
 ) -> crate::query_engines::query_result::QueryResult {
     use crate::storage_engines::types::KeyByLabelValues;
@@ -3398,7 +3398,7 @@ fn warm_tier_result_to_query_result(
         // the serializer pairs them with KEYS from a query-scoped
         // `KeyByLabelNames`. For most queries the keys ARE the
         // query's group-by clause, so the default path works. But
-        // warm-tier `topk` synthesizes an `"item"` key (the top-k
+        // ASAP-tier `topk` synthesizes an `"item"` key (the top-k
         // entry name) that the original query's group-by doesn't
         // carry — without an override the serializer drops it and
         // the response shows `"metric": {}`. Project the BTreeMap's
@@ -3431,14 +3431,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         &self,
         query: &str,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError> {
-        // Phase 9 controller-unification (2026-05) — the warm-tier
+        // Phase 9 controller-unification (2026-05) — the ASAP-tier
         // hook is now a thin driver around the control plane's
-        // `analyze_promql_for_warm_tier`. The analyzer is the single
-        // owner of "is this PromQL warm-tier-answerable" knowledge.
+        // `analyze_promql_for_asap_tier`. The analyzer is the single
+        // owner of "is this PromQL ASAP-tier-answerable" knowledge.
         // We drop into one of three branches:
         //
-        // 1. `WarmTierAnalysis::unsupported` is `Some(_)` — the
-        //    PromQL shape isn't warm-tier-servable. Surface as
+        // 1. `ASAPTierAnalysis::unsupported` is `Some(_)` — the
+        //    PromQL shape isn't ASAP-tier-servable. Surface as
         //    `EngineError::CapabilityMiss(SketchStore, …)` with the
         //    structured `UnsupportedReason` in the detail string. The
         //    EngineRouter fails over to the archive engine. This
@@ -3453,7 +3453,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //        (archive's parser may be more permissive, or it'll
         //        also reject and the user sees the error)
         //
-        // 2. `WarmTierAnalysis::candidates` is populated, but ANY
+        // 2. `ASAPTierAnalysis::candidates` is populated, but ANY
         //    candidate's `instances_matching` returns empty OR a
         //    sid that classifies as `Ghost`/`Unknown` — surface
         //    as CapabilityMiss. The EngineRouter falls over.
@@ -3464,7 +3464,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //    over to archive (no per-candidate hybrid stitch yet —
         //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
-            let analysis = control_plane::warm_tier_analysis::analyze_promql_for_warm_tier(query);
+            let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
             // Branch 1 — the control plane analyzer rejects the shape.
             if let Some(reason) = &analysis.unsupported {
@@ -3477,14 +3477,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 ));
             }
             if analysis.candidates.is_empty() {
-                // Defensive — `is_warm_tier_answerable` would have
+                // Defensive — `is_asap_tier_answerable` would have
                 // caught this; analyzer guarantees `unsupported.is_some()`
                 // when `candidates.is_empty()` but we keep the
                 // belt-and-braces miss-path for safety.
                 return Err(crate::query_engines::EngineError::capability_miss(
                     asap_types::StorageBackend::SketchStore.data_source_id(),
                     format!(
-                        "SketchStore analyzer produced no warm-tier candidates for \
+                        "SketchStore analyzer produced no ASAP-tier candidates for \
                          `{query}` — failing over to archive"
                     ),
                 ));
@@ -3512,8 +3512,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // CapabilityMiss; on Ok we keep the result for the
             // hybrid-stitch path below. (When more than one
             // candidate is supported, a follow-up will fold
-            // per-candidate WarmTierResults.)
-            let mut combined_result: Option<crate::storage_engines::sketch_db::query::WarmTierResult> =
+            // per-candidate ASAPTierResults.)
+            let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
                 None;
             let mut combined_t0: u64 = u64::MAX;
 
@@ -3539,7 +3539,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `instances_matching(metric, gbk)`. The per-sid
                 // capability filter below catches mismatches the
                 // fast path would have rejected at policy-match time.
-                let policy_fps = control_plane::warm_tier_analysis::find_matching_policies(
+                let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
                     &policy_registry,
                     candidate,
                 );
@@ -3630,7 +3630,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 ) {
                     Ok(r) => r,
                     Err(
-                        crate::storage_engines::sketch_db::query::WarmTierError::UnsupportedFunction(
+                        crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedFunction(
                             name,
                         ),
                     ) => {
@@ -3642,7 +3642,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::storage_engines::sketch_db::query::WarmTierError::UnsupportedCapability {
+                    Err(crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedCapability {
                         function,
                         capability}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
@@ -3653,7 +3653,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::storage_engines::sketch_db::query::WarmTierError::DeserializeFailure {
+                    Err(crate::storage_engines::sketch_db::query::ASAPTierError::DeserializeFailure {
                         sid,
                         encoding,
                         reason}) => {
@@ -3666,7 +3666,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::storage_engines::sketch_db::query::WarmTierError::NoData {
+                    Err(crate::storage_engines::sketch_db::query::ASAPTierError::NoData {
                         metric_name: m}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
                             asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -3676,7 +3676,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                    Err(crate::storage_engines::sketch_db::query::WarmTierError::MissingHeap {
+                    Err(crate::storage_engines::sketch_db::query::ASAPTierError::MissingHeap {
                         sid,
                         sketch_kind}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
@@ -3696,7 +3696,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // QueryResult and run the hybrid-stitch path if archive
             // is wired and warm coverage is narrower than request.
             if let Some(result) = combined_result {
-                let warm_qr = warm_tier_result_to_query_result(result.clone(), now_ms);
+                let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms);
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
                 {
@@ -5519,7 +5519,7 @@ mod forced_agg_id_tests {
 // The agent's per-family sketch processors rename raw input metrics on
 // egress (DDSketch / KLL → `_quantile`, HLL → `_hll`). The user's
 // PromQL still references the conceptual unsuffixed name, so the
-// engine has to rewrite to whatever the warm-tier sketch store
+// engine has to rewrite to whatever the ASAP-tier sketch store
 // actually holds. These tests pin the contract:
 //
 //   * Quantile-shape queries redirect bare `M` → `M_quantile` when only
@@ -5563,7 +5563,7 @@ mod sketch_alias_resolver_tests {
 
     /// Build a ASAPQueryEngine whose streaming-config holds the supplied
     /// (metric, agg_type) pairs and whose schema is empty (matches the
-    /// production warm-tier deploy where the control plane drives the
+    /// production ASAP-tier deploy where the control plane drives the
     /// label set).
     fn engine_with(metrics: &[(&str, AggregationType)]) -> ASAPQueryEngine {
         let mut configs = HashMap::new();
@@ -5783,7 +5783,7 @@ mod hll_count_query_tests {
         let data = vec![(None, Box::new(acc) as Box<dyn AggregateCore>)];
         // No `by (...)` modifier on the query → empty grouping. The
         // engine factory's HLL agg is registered with empty grouping
-        // labels; this matches the warm-tier production shape.
+        // labels; this matches the ASAP-tier production shape.
         let engine = create_engine_single_pop(
             "unique_users_per_min_hll",
             AggregationType::HLL,
@@ -5904,7 +5904,7 @@ mod cms_rate_capability_tests {
     }
 }
 
-/// Phase 5 — `QueryEngine::execute` warm-tier classification tests.
+/// Phase 5 — `QueryEngine::execute` ASAP-tier classification tests.
 /// Pre-Phase-5 the trait adapter unconditionally delegated to
 /// `handle_query`. After Phase 5 wire-in, when a `SketchStore` is
 /// attached, the adapter classifies first and surfaces
@@ -5912,7 +5912,7 @@ mod cms_rate_capability_tests {
 /// / no-instance outcomes so the EngineRouter (Phase 6) can fall
 /// through to the archive engine.
 #[cfg(test)]
-mod warm_tier_classify_tests {
+mod asap_tier_classify_tests {
     use super::*;
     use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
     use crate::query_engines::EngineError;
@@ -5961,7 +5961,7 @@ mod warm_tier_classify_tests {
         let err = engine
             .execute("unknown_metric{zone=\"z0\"}")
             .await
-            .expect_err("warm-tier with no matching instance must yield CapabilityMiss");
+            .expect_err("ASAP-tier with no matching instance must yield CapabilityMiss");
         match err {
             EngineError::CapabilityMiss { engine_id, .. } => {
                 assert_eq!(
@@ -6008,7 +6008,7 @@ mod warm_tier_classify_tests {
     async fn execute_rejects_bare_selector_via_analyzer() {
         // Phase-9 controller-unified behavior: a bare vector selector
         // (no call node) is rejected by
-        // `control_plane::warm_tier_analysis::analyze_promql_for_warm_tier`
+        // `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`
         // with `UnsupportedReason::NoCallNodeFound` BEFORE the sid
         // index is even consulted. The archive engine answers raw
         // selectors directly, so this is the right place for the
@@ -6041,7 +6041,7 @@ mod warm_tier_classify_tests {
 }
 
 // ===========================================================================
-// Hybrid warm + archive stitch tests (TODO 3 of the warm-tier follow-ups).
+// Hybrid warm + archive stitch tests (TODO 3 of the ASAP-tier follow-ups).
 // Exercise `stitch_warm_and_archive` directly with synthetic
 // `QueryResult::Matrix` payloads and assert the merged result honors
 // the "warm wins on overlap; archive fills gaps" contract.

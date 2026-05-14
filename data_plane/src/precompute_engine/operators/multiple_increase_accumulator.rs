@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn test_multiple_increase_accumulator_sum_per_key() {
         // `sum by (zone) (counter)` reaches MultipleIncreaseAccumulator
-        // only when the warm-tier ingest groups multiple series under
+        // only when the ASAP-tier ingest groups multiple series under
         // a single accumulator (the `Multiple*` variant). In that case
         // each per-key Sum should be the series' latest cumulative
         // value; the engine's outer `by` aggregation does the cross-key

@@ -84,7 +84,7 @@ produce different strings.
                                                     • mints sid via resolver, writes to SketchStore
 
                                                   query_engines/asap_query_engine/engine.rs
-                                                    • ASAPQueryEngine (warm-tier reads)
+                                                    • ASAPQueryEngine (ASAP-tier reads)
                                                     • discovers sids via
                                                       SketchStore::instances_matching(metric, gbk)
 ```
@@ -147,9 +147,9 @@ mirrored in
                                                              │ └──────────────┬───────────────────────┘   │
                                                              │                │ query                     │
                                                              │ ┌──────────────▼───────────────────────┐   │
-                                                             │ │ ASAPQueryEngine  (warm tier)         │   │
+                                                             │ │ ASAPQueryEngine  (ASAP tier)         │   │
                                                              │ │  analyze_promql →                    │   │
-                                                             │ │  WarmTierCandidate(metric, gbk, cap) │   │
+                                                             │ │  ASAPTierCandidate(metric, gbk, cap) │   │
                                                              │ │  → instances_matching → [sids]       │   │
                                                              │ │  → SketchReducer.evaluate            │   │
                                                              │ └──────────────────────────────────────┘   │
@@ -365,7 +365,7 @@ section sketches the extension; **none of it is implemented today**.
 ```
 
 The sharding key is `(tenant, metric)`, not `(tenant, metric, attrs)`.
-A single metric's series live on one shard, so warm-tier queries that
+A single metric's series live on one shard, so ASAP-tier queries that
 need to merge sketches across attribute values stay local to one
 backend. Cross-shard queries (e.g. spanning multiple metrics) need
 the coordinator to fan out.
@@ -414,7 +414,7 @@ Properties:
 Inside the query coordinator:
 
 1. Parse PromQL via the existing control plane analyzer (single
-   authority — see `control_plane/src/warm_tier_analysis.rs`).
+   authority — see `control_plane/src/asap_tier_analysis.rs`).
 2. Extract the candidate's `metric`. Compute `shard_set =
    sharder(tenant, metric)`. For most queries this is exactly one
    shard.
