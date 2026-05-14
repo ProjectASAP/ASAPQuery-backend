@@ -65,10 +65,10 @@ use thiserror::Error;
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::binder::Binder;
 use crate::intent_algebra::column_resolution::{
-    resolve_column_ref, resolve_named_keys, ResolveError,
+    resolve_named_keys, ResolveError,
 };
 use crate::intent_algebra::legacy_expr::{
-    ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
+    AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
     ScalarExpr as LScalarExpr, WindowKind as LWindowKind, WindowSpec,
 };
 use crate::intent_algebra::legacy_lower::agg_func_to_intents;
@@ -169,6 +169,20 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             let by = resolve_named_keys(keys, schema)?;
             let mut intents: Vec<AggIntent> = Vec::with_capacity(aggs.len());
             for item in aggs {
+                // Faithful mapping for un-grouped `COUNT(*)`: `legacy_lower`
+                // deliberately leaves it un-lowered (no GROUP BY → exact
+                // row count, no sketch benefit). `agg_func_to_intents` is
+                // the *lowering* map and would pick the `Frequency` sketch
+                // — that loses the "this is exact" decision. Map it to
+                // `Count { Exact }` so downstream (`capability_for`, the
+                // `QeCollector`) sees it as exact, matching the legacy
+                // `Aggregate { AggItem { Count }, keys: [] }` semantics.
+                if matches!(item.func, AggFunc::Count) && keys.is_empty() {
+                    intents.push(AggIntent::Count {
+                        accuracy: AccuracyTarget::Exact,
+                    });
+                    continue;
+                }
                 let mapped = agg_func_to_intents(&item.func);
                 if mapped.is_empty() {
                     return Err(ConvertError::NoCanonicalIntent {
@@ -205,15 +219,15 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             child: Box::new(convert(input, schema)?),
         },
 
-        LQueryExpr::SketchAgg { op, col, input } => {
-            // Wildcard → global aggregate (empty `by`); otherwise resolve
-            // the single sketch-target column positionally.
-            let by = match col {
-                LColumnRef::Wildcard => Vec::new(),
-                _ => vec![resolve_column_ref(col, schema)?],
-            };
+        LQueryExpr::SketchAgg { op, col: _, input } => {
+            // `SketchAgg.col` is the sketch's *input* column, not a
+            // GROUP BY key — canonical `Aggregate.by` is the group-by
+            // tuple, which for a `SketchAgg` is always empty (grouping
+            // rides on the wrapping `Partition` node). The sketch input
+            // is the canonical implicit `value` column, so `col` carries
+            // no information the canonical IR needs.
             CQueryExpr::Aggregate {
-                by,
+                by: Vec::new(),
                 aggs: vec![op.clone()],
                 having: None,
                 child: Box::new(convert(input, schema)?),
@@ -223,17 +237,18 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
         LQueryExpr::WindowedAgg {
             agg,
             window,
-            col,
+            col: _,
             input,
         } => {
             let (kind, size, slide) = map_window_kind(window)?;
-            let by = vec![resolve_column_ref(col, schema)?];
+            // As with `SketchAgg`: `col` is the sketch input column, not
+            // a GROUP BY key — the inner canonical `Aggregate.by` is empty.
             CQueryExpr::Window {
                 kind,
                 size,
                 slide,
                 child: Box::new(CQueryExpr::Aggregate {
-                    by,
+                    by: Vec::new(),
                     aggs: vec![agg.clone()],
                     having: None,
                     child: Box::new(convert(input, schema)?),
@@ -541,7 +556,9 @@ mod tests {
 
     #[test]
     fn sketch_agg_folds_into_aggregate() {
-        // SketchAgg { Sum, SampleValue, Source } → Aggregate { by: [1], [Sum] }
+        // SketchAgg { Sum, SampleValue, Source } → Aggregate { by: [], [Sum] }.
+        // `col` is the sketch *input*, not a GROUP BY key — `by` is empty
+        // (grouping rides on a wrapping `Partition`, not the SketchAgg).
         let legacy = LQueryExpr::SketchAgg {
             op: AggIntent::Sum,
             col: LColumnRef::SampleValue,
@@ -549,7 +566,7 @@ mod tests {
         };
         match convert_root(&legacy).unwrap() {
             CQueryExpr::Aggregate { by, aggs, .. } => {
-                assert_eq!(by, vec![1usize]); // "value" column
+                assert!(by.is_empty(), "SketchAgg.col is not a group-by key: {by:?}");
                 assert!(matches!(aggs.as_slice(), [AggIntent::Sum]));
             }
             other => panic!("expected Aggregate, got {other:?}"),
@@ -557,11 +574,12 @@ mod tests {
     }
 
     #[test]
-    fn sketch_agg_wildcard_is_global() {
+    fn sketch_agg_named_col_still_has_empty_by() {
+        // Even a `Named` sketch-target column is not a group-by key.
         let legacy = LQueryExpr::SketchAgg {
             op: AggIntent::Sum,
-            col: LColumnRef::Wildcard,
-            input: Box::new(src("m")),
+            col: LColumnRef::Named("price".into()),
+            input: Box::new(src("trades")),
         };
         match convert_root(&legacy).unwrap() {
             CQueryExpr::Aggregate { by, .. } => assert!(by.is_empty()),
