@@ -662,99 +662,17 @@ impl AggFunc {
     }
 }
 
-/// Binary operator kinds — used in both [`ScalarExpr::BinaryOp`] and
-/// [`QueryExpr::BinaryOp`] (PromQL instant-vector arithmetic).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BinaryOpKind {
-    // Arithmetic
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-    // Comparison
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    // Logical
-    And,
-    Or,
-    // Bitwise
-    BitAnd,
-    BitOr,
-    BitXor,
-    // String / pattern
-    Concat,
-    Like,
-    NotLike,
-    Regex,
-    NotRegex,
-    // PromQL-specific
-    Unless,
-    Atan2,
-}
-
-/// JOIN variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JoinKind {
-    Inner,
-    LeftOuter,
-    RightOuter,
-    FullOuter,
-    Cross,
-    /// Semi-join: return only left rows that have a match (WHERE EXISTS).
-    Semi,
-    /// Anti-join: return only left rows that have no match (WHERE NOT EXISTS).
-    AntiSemi,
-}
-
-/// Set-operation variant.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SetOpKind {
-    Union,
-    Intersect,
-    Except,
-}
-
-/// PromQL vector matching semantics (`on (…)` / `ignoring (…)` plus
-/// `group_left` / `group_right`).
-#[derive(Debug, Clone)]
-pub struct VectorMatch {
-    pub kind:     VectorMatchKind,
-    pub labels:   Vec<String>,
-    pub grouping: Option<VectorGrouping>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VectorMatchKind {
-    On,
-    Ignoring,
-}
-
-#[derive(Debug, Clone)]
-pub struct VectorGrouping {
-    pub side:   GroupSide,
-    pub labels: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GroupSide {
-    Left,
-    Right,
-}
-
-/// ORDER BY sort key.
-#[derive(Debug, Clone)]
-pub struct SortKey {
-    pub col:  String,
-    pub desc: bool,
-    /// NULLS FIRST / NULLS LAST (None → database default).
-    pub nulls_first: Option<bool>,
-}
+// Leaf algebra types — `BinaryOpKind`, `JoinKind`, `SetOpKind`,
+// `VectorMatch` / `VectorMatchKind` / `VectorGrouping` / `GroupSide`,
+// `SortKey` — are owned by the canonical `query_expr` module. The legacy
+// definitions were byte-identical (modulo extra `Hash` / `serde` derives
+// on the canonical side), so `legacy_expr` now re-exports them: every
+// `legacy_expr::BinaryOpKind` reference resolves to the single canonical
+// type. `impl Display for BinaryOpKind` moved alongside the type.
+pub use crate::intent_algebra::query_expr::{
+    BinaryOpKind, GroupSide, JoinKind, SetOpKind, SortKey, VectorGrouping, VectorMatch,
+    VectorMatchKind,
+};
 
 /// Scalar literal.
 #[derive(Debug, Clone, PartialEq)]
@@ -895,27 +813,6 @@ fn bin(op: BinaryOpKind, lhs: ScalarExpr, rhs: ScalarExpr) -> ScalarExpr {
 }
 
 // ── Display helpers ───────────────────────────────────────────────────────────
-
-impl std::fmt::Display for BinaryOpKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            BinaryOpKind::Add => "+", BinaryOpKind::Sub => "-",
-            BinaryOpKind::Mul => "*", BinaryOpKind::Div => "/",
-            BinaryOpKind::Mod => "%", BinaryOpKind::Pow => "^",
-            BinaryOpKind::Eq  => "=", BinaryOpKind::Ne  => "!=",
-            BinaryOpKind::Lt  => "<", BinaryOpKind::Le  => "<=",
-            BinaryOpKind::Gt  => ">", BinaryOpKind::Ge  => ">=",
-            BinaryOpKind::And => "AND", BinaryOpKind::Or => "OR",
-            BinaryOpKind::BitAnd => "&", BinaryOpKind::BitOr => "|",
-            BinaryOpKind::BitXor => "XOR",
-            BinaryOpKind::Concat => "||",
-            BinaryOpKind::Like    => "LIKE",    BinaryOpKind::NotLike => "NOT LIKE",
-            BinaryOpKind::Regex   => "=~",      BinaryOpKind::NotRegex => "!~",
-            BinaryOpKind::Unless  => "unless",  BinaryOpKind::Atan2 => "atan2",
-        };
-        write!(f, "{s}")
-    }
-}
 
 impl std::fmt::Display for AggFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
