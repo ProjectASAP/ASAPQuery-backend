@@ -884,56 +884,76 @@ mod tests {
 
     // ── TUMBLE / HOP windows ────────────────────────────────────────────────
 
-    /// Helper that runs the full pipeline (parse + lower), not just Layer 2.
-    fn parse_full(sql: &str) -> QueryExpr {
-        super::super::parse_query_expr(sql)
-            .unwrap_or_else(|e| panic!("parse_query_expr failed: {e}\nSQL: {sql}"))
+    /// Helper that runs the full canonical pipeline (parse + lower +
+    /// convert), not just the raw Layer-2 parse.
+    fn parse_full_canonical(sql: &str) -> crate::intent_algebra::query_expr::QueryExpr {
+        super::super::parse_query_expr_canonical(sql)
+            .unwrap_or_else(|e| panic!("parse_query_expr_canonical failed: {e}\nSQL: {sql}"))
     }
 
-    fn has_windowed_agg(e: &QueryExpr) -> bool {
+    /// True if the tree contains the canonical fold of a legacy
+    /// `WindowedAgg` — a `Window` directly over an `Aggregate`.
+    fn has_windowed_agg(e: &crate::intent_algebra::query_expr::QueryExpr) -> bool {
+        use crate::intent_algebra::query_expr::QueryExpr as CQ;
         match e {
-            QueryExpr::WindowedAgg { .. } => true,
-            QueryExpr::Partition { input, .. }
-            | QueryExpr::TopK { input, .. }
-            | QueryExpr::Sort { input, .. }
-            | QueryExpr::Limit { input, .. } => has_windowed_agg(input),
-            _ => false,
+            CQ::Window { child, .. } if matches!(child.as_ref(), CQ::Aggregate { .. }) => true,
+            CQ::Window { child, .. }
+            | CQ::Partition { child, .. }
+            | CQ::Aggregate { child, .. }
+            | CQ::Filter { child, .. }
+            | CQ::Sort { child, .. }
+            | CQ::Limit { child, .. }
+            | CQ::Distinct { child, .. }
+            | CQ::Project { child, .. }
+            | CQ::Subquery { child, .. } => has_windowed_agg(child),
+            CQ::Merge { children } => children.iter().any(has_windowed_agg),
+            CQ::Join { left, right, .. }
+            | CQ::SetOp { left, right, .. }
+            | CQ::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => has_windowed_agg(left) || has_windowed_agg(right),
+            CQ::LetBinding { expr, child, .. } => {
+                has_windowed_agg(expr) || has_windowed_agg(child)
+            }
+            CQ::Scan { .. } | CQ::Ref { .. } => false,
         }
     }
 
     #[test]
     fn tumble_in_group_by_produces_windowed_agg() {
-        let expr = parse_full(
+        let expr = parse_full_canonical(
             "SELECT symbol, AVG(price) FROM trades \
              GROUP BY symbol, TUMBLE(ts, INTERVAL '5' MINUTE)",
         );
         assert!(
             has_windowed_agg(&expr),
-            "expected WindowedAgg in tree, got {expr:?}"
+            "expected canonical Window{{Aggregate}} in tree, got {expr:?}"
         );
     }
 
     #[test]
     fn hop_in_group_by_produces_windowed_agg() {
-        let expr = parse_full(
+        let expr = parse_full_canonical(
             "SELECT symbol, COUNT(*) FROM trades \
              GROUP BY symbol, HOP(ts, INTERVAL '1' MINUTE, INTERVAL '5' MINUTE)",
         );
         assert!(
             has_windowed_agg(&expr),
-            "expected WindowedAgg in tree, got {expr:?}"
+            "expected canonical Window{{Aggregate}} in tree, got {expr:?}"
         );
     }
 
     #[test]
     fn time_bucket_in_group_by_produces_windowed_agg() {
-        let expr = parse_full(
+        let expr = parse_full_canonical(
             "SELECT symbol, AVG(price) FROM trades \
              GROUP BY symbol, time_bucket('5 minutes', ts)",
         );
         assert!(
             has_windowed_agg(&expr),
-            "expected WindowedAgg in tree, got {expr:?}"
+            "expected canonical Window{{Aggregate}} in tree, got {expr:?}"
         );
     }
 

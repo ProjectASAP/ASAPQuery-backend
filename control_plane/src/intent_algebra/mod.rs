@@ -80,20 +80,20 @@ pub mod query_expr;
 pub mod schema;
 
 // Refactor 2026-05 (`refactor/controller-layered-cleanup`): the
-// pre-existing legacy L3+ IR formerly at `controller/src/algebra/expr.rs`
-// + `controller/src/algebra/lower.rs` lives here while a separate
-// follow-up unifies it with the canonical `query_expr` / `lower`
-// modules above. These two `legacy_*` modules carry the heavy
-// `QueryExpr` / `AggIntent` types used by the planner, allocator,
-// physical planner, query_parser, and language_logical_plan modules
-// today.
+// pre-existing legacy L2 relational IR formerly at
+// `controller/src/algebra/expr.rs` lives here while a separate follow-up
+// unifies it with the canonical `query_expr` module above. It still
+// carries the heavy `QueryExpr` type the `query_parser` modules emit and
+// the planner / allocator / physical planner / language_logical_plan
+// modules consume today.
 pub mod column_resolution;
 pub mod legacy_expr;
-pub mod legacy_lower;
 
-// Step γ7 keystone: the composable legacy → canonical full-tree
-// converter. Producers route their output through `convert_root`; the
-// consumer-flip PRs then become pure canonical pattern-match rewrites.
+// Step γ7 keystone: the legacy → canonical full-tree converter. The
+// `query_parser` entry points emit raw Layer-2 trees and route them
+// through `convert_root`, which first folds them into the sketch-fused
+// legacy Layer-3 form (the former `legacy_lower` pass, now private to
+// this module) and then maps that onto the canonical IR.
 pub mod legacy_to_canonical;
 pub use legacy_to_canonical::{convert as convert_legacy, convert_root, ConvertError};
 
@@ -123,9 +123,9 @@ pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schem
 
 // Step β plumbing: schema-driven column resolution helpers used by the
 // legacy planning stack (`optimizer/engine.rs`, `physical/{allocator,
-// planner, stage_split}.rs`, `query_parser/*`, `intent_algebra::
-// legacy_lower`) to carry an inherited `Schema` alongside every legacy
-// `QueryExpr` traversal. Consumers call `resolve_column_ref` at the point
+// planner, stage_split}.rs`, `query_parser/*`) to carry an inherited
+// `Schema` alongside every legacy `QueryExpr` traversal. Consumers call
+// `resolve_column_ref` at the point
 // where they need a positional `ColumnId` — Step γ migrates variants
 // one at a time onto the canonical positional form.
 pub use column_resolution::{
@@ -133,45 +133,10 @@ pub use column_resolution::{
     resolve_column_refs, resolve_named_keys, ResolveError,
 };
 
-// Step γ1 bridge: one-way `legacy_expr::QueryExpr::Aggregate` →
-// canonical `query_expr::QueryExpr::Aggregate` helper. Consumers that
-// need canonical-shape pattern-matching (`by: Vec<ColumnId>`, `aggs:
-// Vec<AggIntent>`) call this on an inherited Schema; the legacy variant
-// remains in `legacy_expr.rs` until every consumer entry point migrates
-// (Step γ7 or later).
-pub mod aggregate_bridge;
-pub use aggregate_bridge::{
-    bridge_aggregate_to_canonical, BridgeError, BridgedAggregate,
-};
-
-// Step γ4 bridge: one-way `legacy_expr::QueryExpr::TopK` → one of two
-// canonical shapes (heavy-hitter `AggIntent::TopK` vs generic
-// `Sort + Limit`) per design.md §6 "What was removed" row 1. Consumers
-// call this on an inherited Schema; the legacy variant remains in
-// `legacy_expr.rs` until every consumer entry point migrates (Step γ7
-// or later).
-pub mod topk_bridge;
-pub use topk_bridge::{bridge_topk, BridgeError as TopKBridgeError, BridgedTopK};
-
-// Step γ3 bridge: one-way `legacy_expr::QueryExpr::WindowedAgg` →
-// canonical `Window { child: Aggregate { .. } }` helper. Sidesteps the
-// 20+ consumers that depend on the fused `WindowedAgg`'s window-sketch
-// lifecycle invariant — they continue matching the legacy variant; only
-// consumers that want the canonical stacked view call this bridge. The
-// legacy variant remains in `legacy_expr.rs` until Step γ7 retires it.
-pub mod windowed_agg_bridge;
-pub use windowed_agg_bridge::{
-    bridge_windowed_agg_to_canonical, output_schema_for_windowed_agg,
-    BridgeError as WindowedAggBridgeError, BridgedWindowedAgg,
-};
-
-// Step γ2 bridge: one-way `legacy_expr::QueryExpr::SketchAgg` →
-// canonical-shape `BridgedAggregate` helper. Companion to the γ1
-// Aggregate bridge — SketchAgg's single-intent / single-column shape
-// maps onto the same `BridgedAggregate` carrier (with `having: None`)
-// so consumers can match on `by` / `aggs` regardless of which legacy
-// variant the data came from.
-pub mod sketch_agg_bridge;
-pub use sketch_agg_bridge::{
-    bridge_sketch_agg_to_canonical, output_schema_for_sketch_agg,
-};
+// Step γ7 (PR 13): the four γ1–γ4 one-way "approach (c)" bridges
+// (`aggregate_bridge`, `topk_bridge`, `windowed_agg_bridge`,
+// `sketch_agg_bridge`) were deleted. They returned canonical-shape data
+// *minus the child* — useful only as a non-composable migration aid
+// while consumers still pattern-matched legacy variants. Every consumer
+// now runs on the canonical IR via the composable `legacy_to_canonical`
+// converter, so the bridges had zero remaining call sites.
