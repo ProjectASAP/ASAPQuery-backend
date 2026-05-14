@@ -636,11 +636,19 @@ impl SketchStore {
         match self.instance(sid) {
             None => {
                 let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
+                // PR 6 follow-up: ExactAgg-backed sids carry an
+                // `ExactAgg(agg_type)` capability so the analyzer can
+                // route warm-tier-answerable exact intents (Sum / Rate /
+                // Increase / Count{Exact}) to this sid instead of falling
+                // through to the archive engine. Pre-PR-6 this field was
+                // unconditionally `None`, which meant warm-tier ExactAgg
+                // state was reachable only through the legacy precompute
+                // query path; capability-matching couldn't see it.
                 self.register(SketchInstanceMetadata {
                     sid,
                     metric_name: agg_cfg.metric.clone(),
                     group_by_keys,
-                    capability: None,
+                    capability: Some(Capability::ExactAgg(agg_cfg.aggregation_type)),
                     agg_kind: agg_kind.clone(),
                     accuracy: None,
                     first_seen_unix_ms: output.start_timestamp as i64,

@@ -246,11 +246,14 @@ fn is_frequency_family(h: SketchKindHandle) -> bool {
 /// | `Min` / `Max` | `Some(QuantileApprox(Any))` — quantile sketches answer min = q(0), max = q(1) |
 /// | `Cardinality { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
 /// | `Cardinality { accuracy: Exact }` | `None` |
-/// | `Count { accuracy }` (same logic as Cardinality) | `Some(CardinalityApprox)` / `None` |
+/// | `Count { accuracy: Exact }` | `Some(ExactAgg(Sum))` — count_over_time = sum-of-1s (PR-6 follow-up) |
+/// | `Count { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
 /// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
 /// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
 /// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
-/// | `Sum` / `Avg` / `Rate` / `Increase` | `None` |
+/// | `Sum` | `Some(ExactAgg(Sum))` — warm-tier exact precompute (PR-6 follow-up) |
+/// | `Rate` / `Increase` | `Some(ExactAgg(Increase))` — counter-reset-aware precompute (PR-6 follow-up) |
+/// | `Avg` | `None` — needs cross-policy join (Sum + Count); follow-up |
 /// | Every archive-only intent | `None` |
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     match intent {
@@ -275,8 +278,14 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             // (`distinct_over_time` / SQL `COUNT(DISTINCT)`), the
             // accuracy is non-Exact and we hand it to the cardinality
             // sketch path.
+            //
+            // PR-6 follow-up: exact count = sum-of-1s, which is
+            // served by the `AggregationType::Sum` exact-precompute
+            // operator at the warm tier. Returning that capability
+            // lets the analyzer route `count_over_time` to a warm-tier
+            // ExactAgg sid instead of falling through to archive.
             if is_exact(accuracy) {
-                None
+                Some(Capability::ExactAgg(AggregationType::Sum))
             } else {
                 Some(Capability::CardinalityApprox)
             }
@@ -316,11 +325,24 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         AggIntent::Min | AggIntent::Max => {
             Some(Capability::QuantileApprox(SketchKindHandle::Any))
         }
-        // ── No warm-tier sketch ──────────────────────────────────────
-        AggIntent::Sum
-        | AggIntent::Avg
-        | AggIntent::Rate { .. }
-        | AggIntent::Increase { .. } => None,
+        // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
+        // These intents previously returned `None` and routed to the
+        // archive engine. Now that the data plane carries
+        // `Capability::ExactAgg(agg_type)` on ExactAgg-backed sids,
+        // the analyzer can match them to warm-tier exact-precompute
+        // state instead. `is_satisfied_by` checks `agg_type` equality
+        // structurally — a sid registered as `ExactAgg(Sum)` only
+        // satisfies a required `ExactAgg(Sum)`.
+        AggIntent::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Rate { .. } | AggIntent::Increase { .. } => {
+            Some(Capability::ExactAgg(AggregationType::Increase))
+        }
+        // ── Avg: still no warm-tier substitute ───────────────────────
+        // Avg = Sum / Count, which needs two separate ExactAgg policies
+        // (one for Sum, one for Count) joined at query time. The L4
+        // binder doesn't yet emit that pattern, so capability_for keeps
+        // Avg on the archive path for now. Follow-up.
+        AggIntent::Avg => None,
         // Archive-only intents — never bind to a warm-tier capability;
         // routed to the cold tier (Gorilla / Thanos).
         AggIntent::Absent
@@ -644,20 +666,28 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_exact_returns_none() {
-        // `count_over_time` lowers to `Count{accuracy:Exact}` per
-        // intent_algebra::lower. `capability_for` returning `None`
-        // here is the contract that drives the analyzer to mark the
-        // query as warm-tier-unsupported (it'll route to archive).
+    fn capability_for_count_exact_routes_to_exact_agg_sum() {
+        // PR-6 follow-up: `count_over_time` lowers to
+        // `Count{accuracy:Exact}`; count = sum-of-1s, so the warm-tier
+        // ExactAgg path uses `AggregationType::Sum`. Pre-follow-up
+        // this returned `None` and the analyzer routed to archive.
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Exact,
         };
-        assert_eq!(capability_for(&intent), None);
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::ExactAgg(AggregationType::Sum))
+        );
     }
 
     #[test]
-    fn capability_for_sum_returns_none() {
-        assert_eq!(capability_for(&AggIntent::Sum), None);
+    fn capability_for_sum_routes_to_exact_agg_sum() {
+        // PR-6 follow-up: Sum routes to warm-tier ExactAgg(Sum) state.
+        // Pre-follow-up this returned `None`.
+        assert_eq!(
+            capability_for(&AggIntent::Sum),
+            Some(Capability::ExactAgg(AggregationType::Sum))
+        );
     }
 
     #[test]
@@ -688,18 +718,22 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_rate_increase_return_none() {
+    fn capability_for_rate_increase_route_to_exact_agg_increase() {
+        // PR-6 follow-up: Rate and Increase route to warm-tier
+        // ExactAgg(Increase) — the counter-reset-aware exact precompute.
+        // Pre-follow-up this returned `None`.
+        let exact_inc = Some(Capability::ExactAgg(AggregationType::Increase));
         assert_eq!(
             capability_for(&AggIntent::Rate {
                 window: Duration::from_secs(60)
             }),
-            None
+            exact_inc
         );
         assert_eq!(
             capability_for(&AggIntent::Increase {
                 window: Duration::from_secs(60)
             }),
-            None
+            exact_inc
         );
     }
 
@@ -967,20 +1001,37 @@ mod tests {
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
 
     #[test]
-    fn capability_for_sum_still_returns_none_after_exact_agg_landing() {
-        // PR 6 explicitly does NOT change `capability_for` for the
-        // intents that today return `None` (Sum / Min / Max / Avg /
-        // Rate / Increase / archive-only). The `Capability::ExactAgg`
-        // variant is wired into `is_satisfied_by` but the analyzer's
-        // intent → capability bridge stays as it was — re-routing
-        // those intents to warm-tier ExactAgg is a follow-up that
-        // requires populating `SketchInstanceMetadata.capability` with
-        // `Some(Capability::ExactAgg(_))` for the ExactAgg-backed sids
-        // first.
-        assert_eq!(capability_for(&AggIntent::Sum), None);
-        // Min / Max are intentionally NOT in this dormancy list — they
-        // already route to QuantileApprox (DDSketch / KLL answer them
-        // via quantile(0) / quantile(1)) and that path is unchanged.
+    fn pr_6_follow_up_flipped_sum_rate_increase_count_exact() {
+        // PR 6 first landed `Capability::ExactAgg` dormant — variant
+        // wired into `is_satisfied_by` but `capability_for` still
+        // returned `None` for Sum / Rate / Increase / Count{Exact}.
+        // This test locks in the follow-up that flipped those four
+        // intents to route through warm-tier ExactAgg state.
+        assert_eq!(
+            capability_for(&AggIntent::Sum),
+            Some(Capability::ExactAgg(AggregationType::Sum))
+        );
+        assert_eq!(
+            capability_for(&AggIntent::Rate {
+                window: Duration::from_secs(60)
+            }),
+            Some(Capability::ExactAgg(AggregationType::Increase))
+        );
+        assert_eq!(
+            capability_for(&AggIntent::Increase {
+                window: Duration::from_secs(60)
+            }),
+            Some(Capability::ExactAgg(AggregationType::Increase))
+        );
+        assert_eq!(
+            capability_for(&AggIntent::Count {
+                accuracy: AccuracyTarget::Exact,
+            }),
+            Some(Capability::ExactAgg(AggregationType::Sum))
+        );
+        // Avg stays on archive — needs cross-policy join (Sum + Count)
+        // that the L4 binder doesn't yet emit. Tracked as follow-up.
+        assert_eq!(capability_for(&AggIntent::Avg), None);
     }
 
     #[test]

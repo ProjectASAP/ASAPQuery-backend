@@ -283,9 +283,15 @@ mod tests {
             ),
             "sid metadata should be ExactAgg(Sum)"
         );
-        assert!(
-            meta.capability.is_none(),
-            "exact aggregations have no warm-tier sketch capability"
+        // PR 6 follow-up: ExactAgg-backed sids now carry an
+        // `ExactAgg(agg_type)` capability so the analyzer can match
+        // them. Previously this field was unconditionally `None`.
+        assert_eq!(
+            meta.capability,
+            Some(crate::storage_engines::sketch_db::data::Capability::ExactAgg(
+                AggregationType::Sum
+            )),
+            "ExactAgg sids carry an ExactAgg capability"
         );
     }
 
