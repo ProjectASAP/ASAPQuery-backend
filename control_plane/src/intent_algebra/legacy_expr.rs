@@ -25,7 +25,6 @@
 
 use std::time::Duration;
 
-use crate::types::AggType;
 use crate::types_v2::AccuracyTarget;
 
 // ── AggIntent harmonization (Step α of legacy_expr migration) ────────────────
@@ -133,124 +132,18 @@ pub enum ColumnRef {
 
 // ── AggIntent helpers ────────────────────────────────────────────────────────
 //
-// These free functions replace the legacy `AggIntent::method()` API. They
-// operate on the canonical re-exported `AggIntent` and preserve the old
-// semantics one-to-one. After Step γ moves consumers onto the canonical
-// surface they can switch to canonical `impl AggIntent` methods or new
-// L4-bound accessors; for now this is the minimal-churn shim.
-
-/// Map a canonical [`AggIntent`] to the coarse [`AggType`] used by the
-/// legacy planner. Preserves the old `AggIntent::to_agg_type()` semantics:
-/// quantile / extrema / exact all collapse onto `AggType::Quantile`,
-/// `Cardinality` → `AggType::Cardinality`, `Frequency` → `AggType::Frequency`.
-pub fn agg_to_legacy_agg_type(op: &AggIntent) -> AggType {
-    match op {
-        AggIntent::Cardinality { .. } => AggType::Cardinality,
-        AggIntent::Frequency { .. } => AggType::Frequency,
-        // Quantile / Min / Max / Sum / Count / Avg / TopK / Rate / Increase
-        // all rode the legacy "Quantile" bucket in the AggType taxonomy.
-        _ => AggType::Quantile,
-    }
-}
-
-/// Two instances of this sketch can be merged
-/// (`sketch(A ∪ B) = merge(sketch(A), sketch(B))`). Preserves the old
-/// `AggIntent::is_mergeable()` rule: Avg is the only non-mergeable case.
-pub fn agg_is_mergeable(op: &AggIntent) -> bool {
-    !matches!(op, AggIntent::Avg)
-}
-
-/// Quantile φ values carried by a `Quantile` intent (empty for non-quantile).
-/// Canonical `AggIntent::Quantile` is single-φ post Step α (fan-out happens
-/// at construction time); this returns a single-element vec.
-pub fn agg_quantiles(op: &AggIntent) -> Vec<f64> {
-    match op {
-        AggIntent::Quantile { q, .. } => vec![*q],
-        _ => vec![],
-    }
-}
-
-/// Whether this op implies `exact_required` (no sketch benefit). Preserves
-/// the legacy `AggIntent::is_exact()` rule: the legacy `Exact(_)` and
-/// `Extrema { .. }` cases now map to canonical `Sum / Count / Avg / Min /
-/// Max` — those are the cases that flip this flag.
-pub fn agg_is_exact(op: &AggIntent) -> bool {
-    matches!(
-        op,
-        AggIntent::Sum
-            | AggIntent::Count { .. }
-            | AggIntent::Avg
-            | AggIntent::Min
-            | AggIntent::Max
-    )
-}
-
-/// Accuracy parameter as a fractional ε (0.0 for exact ops). Preserves the
-/// legacy `AggIntent::accuracy() -> f64` accessor by unpacking the typed
-/// `AccuracyTarget` carried on canonical Quantile / Cardinality / Frequency
-/// / Count / TopK.
-pub fn agg_accuracy(op: &AggIntent) -> f64 {
-    match op {
-        AggIntent::Quantile { accuracy, .. }
-        | AggIntent::Cardinality { accuracy }
-        | AggIntent::Frequency { accuracy }
-        | AggIntent::Count { accuracy }
-        | AggIntent::TopK { accuracy, .. } => accuracy_target_to_f64(accuracy),
-        _ => 0.0,
-    }
-}
-
-fn accuracy_target_to_f64(t: &AccuracyTarget) -> f64 {
-    match t {
-        AccuracyTarget::Exact => 0.0,
-        AccuracyTarget::Epsilon(eps) | AccuracyTarget::EpsilonDelta { eps, .. } => *eps,
-    }
-}
-
-/// Translate a legacy `accuracy: f64` field into the typed
-/// `AccuracyTarget`. `0.0` round-trips to `Exact` (matching the old "0.0
-/// → exact" sentinel); anything else becomes `Epsilon(eps)`.
-pub fn accuracy_target_from_legacy(accuracy: f64) -> AccuracyTarget {
-    if accuracy == 0.0 {
-        AccuracyTarget::Exact
-    } else {
-        AccuracyTarget::Epsilon(accuracy)
-    }
-}
-
-// ── Default constructors (backward compat) ───────────────────────────────────
-//
-// These mirror the old `AggIntent::default_*` constructors. After Step γ
-// the call sites that still need defaults migrate to canonical L4-aware
-// builders (sketch_algebra::params + AccuracyTarget on the L3 intent).
-
-/// Default Frequency intent — `accuracy = e / 2000`, matching the legacy
-/// `AggIntent::default_frequency` constant.
-pub fn default_frequency() -> AggIntent {
-    AggIntent::Frequency {
-        accuracy: AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0),
-    }
-}
-
-/// Default Cardinality intent — `accuracy = hll_accuracy(14)`, matching the
-/// legacy `AggIntent::default_cardinality` constant.
-pub fn default_cardinality() -> AggIntent {
-    AggIntent::Cardinality {
-        accuracy: AccuracyTarget::Epsilon(hll_accuracy(14)),
-    }
-}
-
-/// Default Quantile intent. Canonical Quantile is single-φ; callers that
-/// historically passed `vec![0.5, 0.99]` to `AggIntent::default_quantile`
-/// now invoke this helper once per φ and wrap the results in a
-/// `QueryExpr::Merge` of `SketchAgg` siblings (F1 fan-out per the Step α
-/// translation spec).
-pub fn default_quantile(q: f64) -> AggIntent {
-    AggIntent::Quantile {
-        q,
-        accuracy: AccuracyTarget::Epsilon(0.01),
-    }
-}
+// Step γ7 (PR 13.5): the `AggIntent` helper free fns relocated to their
+// canonical home, `intent_algebra::agg_intent`. `legacy_expr` re-exports
+// the live ones so existing `legacy_expr::*` call sites keep compiling
+// during the retirement; PR 13 sweeps the consumer imports to the
+// canonical path and drops these re-exports with the file. The dead
+// helpers (`agg_to_legacy_agg_type`, `agg_quantiles`,
+// `accuracy_target_from_legacy` — zero non-test consumers) were deleted
+// outright rather than relocated.
+pub use crate::intent_algebra::agg_intent::{
+    agg_accuracy, agg_is_exact, agg_is_mergeable, default_cardinality, default_frequency,
+    default_quantile,
+};
 
 // ── Accuracy helpers ─────────────────────────────────────────────────────────
 //
@@ -1033,14 +926,6 @@ mod tests {
         let keys = PartitionKeys::Without(vec!["instance".into()]);
         assert_eq!(keys.keys(), &["instance".to_string()]);
         assert!(!keys.is_empty());
-    }
-
-    #[test]
-    fn agg_intent_to_legacy_agg_type() {
-        use crate::types::AggType;
-        assert_eq!(agg_to_legacy_agg_type(&default_cardinality()), AggType::Cardinality);
-        assert_eq!(agg_to_legacy_agg_type(&default_frequency()),   AggType::Frequency);
-        assert_eq!(agg_to_legacy_agg_type(&default_quantile(0.5)), AggType::Quantile);
     }
 
     #[test]

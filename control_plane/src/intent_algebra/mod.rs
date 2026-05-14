@@ -107,7 +107,10 @@ pub use binder::{Binder, SchemaCatalog, UsageDerivedCatalog};
 
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
-pub use agg_intent::AggIntent;
+pub use agg_intent::{
+    agg_accuracy, agg_is_exact, agg_is_mergeable, default_cardinality, default_frequency,
+    default_quantile, AggIntent,
+};
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use lower::{lower_parsed_query, LoweringError};
 pub use query_expr::{
