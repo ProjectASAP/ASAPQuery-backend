@@ -459,29 +459,30 @@ async fn handle_plan(
 
     let mut plan = st.planner.plan(&workload, Some(&wc));
 
-    // ── SP-9: single QueryExpr pipeline — parse → optimise → bind → stage ────
-    // When query_string is present, run the full algebra pipeline and attach
-    // the StagedPlan.  The SP-3 flat assignment remains the fallback when no
-    // query_string is supplied.
-    //
-    // `bound_physical` carries the **L4 output** — the optimised canonical
-    // L3 tree run through `sketch_algebra::bind_query_expr` — so the typed
-    // L5 stage-split below is fed from the real parsed tree rather than
-    // from the flat `QueryWorkload` summary.
+    // ── L1→L5: parse → optimise → bind → stage. One algebra pipeline. ───────
+    // When the spec carries a `query_string`, this is the single place the
+    // algebra runs: parse to canonical L3, optimise, bind to the L4
+    // `PhysicalExpr`, and derive *every* L5 artefact from that one tree —
+    //   * `bound_physical`  → the typed L5 stage-split (below);
+    //   * `plan.staged_plan` → the legacy `StagedPlan` (JSON response +
+    //     `generate_backend_config_staged`);
+    //   * `plan_summary`    → the cost summary in the JSON response.
+    // Previously the parse + optimise ran twice (here and again in a
+    // separate `plan_summary` block); it now runs once. The SP-3 flat
+    // assignment in `plan` remains the fallback when there is no
+    // `query_string`.
+    let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
+    let budgets = StageResourceBudgets::from_workload_chars(&wc);
     let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
+    let mut plan_summary = None;
     if let Some(ref qs) = query_string {
         match parse_query_expr_canonical(qs) {
-            Err(e) => warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping staged_plan"),
+            Err(e) => warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline"),
             Ok(qe) => {
-                let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
-                let budgets = StageResourceBudgets::from_workload_chars(&wc);
                 let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
-                // Step γ7: parser, optimizer and physical planner are all
-                // canonical-IR now (PR 6/9/8) — no `convert_root` bridge.
                 let (opt_qe, _) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
                 // L4 sketch binding: lower the optimised L3 tree to the
-                // sketch-bound `PhysicalExpr` IR. Feeds the typed L5
-                // stage-split below.
+                // sketch-bound `PhysicalExpr` IR — the typed L5's input.
                 let accuracy = if workload.accuracy_sla >= 1.0 {
                     control_plane::types_v2::AccuracyTarget::Exact
                 } else {
@@ -489,8 +490,13 @@ async fn handle_plan(
                 };
                 bound_physical =
                     control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
+                // Legacy L5 `StagedPlan` — still feeds the JSON response's
+                // `staged_plan` field and `generate_backend_config_staged`.
                 let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
                 plan.staged_plan = Some(staged);
+                // Cost summary for the JSON response.
+                let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(opt_qe);
+                plan_summary = Some(plan_node.summarise(raw_bps));
             }
         }
     }
@@ -498,7 +504,6 @@ async fn handle_plan(
     plan.precompute = build_precompute_jobs(&workload, &plan, "backend:4317");
     st.store.set(&workload.metric_name, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
-    let wc_for_algebra = wc.clone();
     st.workload_store.set(&workload.metric_name, workload.clone(), wc);
 
     // ── Push agent config to agent-role collectors ────────────────────────────
@@ -725,25 +730,7 @@ async fn handle_plan(
         st.replanner.register_agent(&agent_id, &workload.metric_name).await;
     }
 
-    // ── Algebra pipeline: parse → optimise → allocate ─────────────────────────
-    let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
-    let plan_summary = query_string.as_deref().and_then(|qs| {
-        match parse_query_expr_canonical(qs) {
-            Err(e) => {
-                warn!(query = qs, error = %e, "parse_query_expr_canonical failed; skipping plan_summary");
-                None
-            }
-            Ok(qe) => {
-                let budgets = StageResourceBudgets::from_workload_chars(&wc_for_algebra);
-                let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
-                // Step γ7: parser, optimizer and allocator are all
-                // canonical-IR now (PR 6/9/7) — no `convert_root` bridge.
-                let (opt_qe, _iters) = QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                let plan_node = SketchAllocator::new(budgets, raw_bps).allocate(opt_qe);
-                Some(plan_node.summarise(raw_bps))
-            }
-        }
-    });
+    // `plan_summary` was computed in the single algebra pipeline above.
 
     let agents = st.opamp.connected_agents().await;
     let cost = &plan.transmission_cost_summary;
