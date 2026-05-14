@@ -77,6 +77,14 @@ pub struct ASAPTierCandidate {
     /// Time range from the matrix-vector selector (e.g. `[5m]` → 300).
     /// `0` when the query is instant-vector-shaped.
     pub range_seconds: u64,
+    /// Canonical form of the equality label filters from the PromQL
+    /// selector (e.g. `{status="200",zone="us-east"}`). Empty when
+    /// the query has no label filters. Produced by
+    /// `asap_types::utils::normalize_spatial_filter` so it matches the
+    /// canonical form stored on `AggregationConfig.spatial_filter_normalized`
+    /// byte-for-byte. Drives the candidate → policy filter match in
+    /// `find_matching_policies`.
+    pub spatial_filter_canonical: String,
 }
 
 /// Whole-query analysis result.
@@ -197,6 +205,7 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
     // tier can't answer this query (the router falls over to archive).
     let metric_name = parsed.metric_name.clone();
     let group_by_keys: BTreeSet<String> = parsed.group_by_labels.iter().cloned().collect();
+    let spatial_filter_canonical = render_spatial_filter(&parsed.label_filters);
 
     let mut out = ASAPTierAnalysis::default();
     for intent in &intents {
@@ -209,6 +218,7 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
                     function: trace.function.clone(),
                     function_args: trace.function_args.clone(),
                     range_seconds: trace.range_seconds,
+                    spatial_filter_canonical: spatial_filter_canonical.clone(),
                 });
             }
             None => {
@@ -220,6 +230,25 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
         }
     }
     out
+}
+
+/// Render the equality label filters from a `ParsedQuery` into the
+/// canonical spatial-filter form used by
+/// `AggregationConfig.spatial_filter_normalized`. Empty map → empty
+/// string. Multiple entries get sorted+joined via
+/// [`asap_types::utils::normalize_spatial_filter`] so the result is
+/// byte-identical to what the control plane writes.
+fn render_spatial_filter(label_filters: &std::collections::HashMap<String, String>) -> String {
+    if label_filters.is_empty() {
+        return String::new();
+    }
+    // Render `key="value",key="value",…` then normalize. The renderer
+    // doesn't need to sort — normalize_spatial_filter sorts matchers.
+    let joined: Vec<String> = label_filters
+        .iter()
+        .map(|(k, v)| format!("{k}=\"{v}\""))
+        .collect();
+    asap_types::utils::normalize_spatial_filter(&joined.join(","))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -526,10 +555,12 @@ pub fn find_policy_by_content(
 ///    can answer coarser queries by merging; the reverse isn't true.
 ///    When `candidate.range_seconds == 0` (instant-vector query),
 ///    any policy window passes.
-/// 5. `policy.spatial_filter_normalized.is_empty()` — only unfiltered
-///    policies for now. Filtered-policy match has to compare the
-///    canonical predicate against the candidate's filter shape, and
-///    the candidate doesn't carry one today. Future enhancement.
+/// 5. `policy.spatial_filter_normalized == candidate.spatial_filter_canonical`
+///    — exact match on the canonical filter form. Empty matches empty
+///    (the unfiltered case); non-empty must be byte-identical (both
+///    sides come from `asap_types::utils::normalize_spatial_filter`,
+///    which sorts matchers, so the comparison is independent of the
+///    user's source ordering).
 pub fn find_matching_policies(
     registry: &asap_types::PolicyRegistry,
     candidate: &ASAPTierCandidate,
@@ -553,7 +584,7 @@ pub fn find_matching_policies(
         if candidate.range_seconds > 0 && cfg.window_size > candidate.range_seconds {
             continue;
         }
-        if !cfg.spatial_filter_normalized.is_empty() {
+        if cfg.spatial_filter_normalized != candidate.spatial_filter_canonical {
             continue;
         }
         out.push(*fp);
@@ -855,6 +886,16 @@ mod tests {
             cap: Capability,
             range_seconds: u64,
         ) -> ASAPTierCandidate {
+            candidate_with_filter(metric, group_by, cap, range_seconds, "")
+        }
+
+        fn candidate_with_filter(
+            metric: &str,
+            group_by: &[&str],
+            cap: Capability,
+            range_seconds: u64,
+            spatial_filter_canonical: &str,
+        ) -> ASAPTierCandidate {
             ASAPTierCandidate {
                 metric_name: metric.to_string(),
                 group_by_keys: group_by.iter().map(|s| s.to_string()).collect(),
@@ -862,6 +903,7 @@ mod tests {
                 function: String::new(),
                 function_args: Vec::new(),
                 range_seconds,
+                spatial_filter_canonical: spatial_filter_canonical.to_string(),
             }
         }
 
@@ -1020,9 +1062,30 @@ mod tests {
         }
 
         #[test]
-        fn filtered_policy_does_not_match_today() {
-            // Until candidate carries a spatial-filter shape, filtered
-            // policies are skipped. Locks in the documented limitation.
+        fn filtered_policy_matches_when_candidate_has_matching_filter() {
+            // Both sides carry the canonical form
+            // `{status="200"}` (normalize_spatial_filter sorts +
+            // brace-wraps single-matcher inputs). Match should succeed.
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::Sum,
+                vec![],
+                60,
+                r#"status="200""#,
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate_with_filter(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+                r#"{status="200"}"#,
+            );
+            assert_eq!(find_matching_policies(&registry, &cand).len(), 1);
+        }
+
+        #[test]
+        fn filtered_policy_does_not_match_unfiltered_candidate() {
             let policies = vec![cfg(
                 "http_lat",
                 AggregationType::Sum,
@@ -1036,6 +1099,40 @@ mod tests {
                 &[],
                 Capability::ExactAgg(AggregationType::Sum),
                 60,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn unfiltered_policy_does_not_match_filtered_candidate() {
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate_with_filter(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+                r#"{status="200"}"#,
+            );
+            assert!(find_matching_policies(&registry, &cand).is_empty());
+        }
+
+        #[test]
+        fn different_filter_values_do_not_match() {
+            let policies = vec![cfg(
+                "http_lat",
+                AggregationType::Sum,
+                vec![],
+                60,
+                r#"status="200""#,
+            )];
+            let registry = PolicyRegistry::from_configs(policies);
+            let cand = candidate_with_filter(
+                "http_lat",
+                &[],
+                Capability::ExactAgg(AggregationType::Sum),
+                60,
+                r#"{status="500"}"#,
             );
             assert!(find_matching_policies(&registry, &cand).is_empty());
         }
