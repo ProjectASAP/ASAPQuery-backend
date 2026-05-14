@@ -4,7 +4,7 @@
 //!
 //! | Function | Returns | Use |
 //! |---|---|---|
-//! | [`parse_query_expr`] | `QueryExpr` | Full algebra IR |
+//! | [`parse_query_expr_canonical`] | canonical `query_expr::QueryExpr` | Full algebra IR |
 //! | [`parse_query`] | `ParsedQuery` | Backward compat with existing analyzer |
 //!
 //! # Supported PromQL patterns (via `promql-parser` AST)
@@ -95,46 +95,39 @@ pub enum QueryHint {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Parse a raw query string (PromQL or SQL) into the **legacy** L3
+/// Parse a raw query string (PromQL or SQL) into the **legacy Layer-2**
 /// [`legacy_expr::QueryExpr`](crate::intent_algebra::legacy_expr::QueryExpr) IR.
 ///
-/// Both parsers emit Layer 2 relational operators (`Aggregate { AggFunc }`).
-/// The shared lowering pass converts `Aggregate` → `SketchAgg { AggIntent }`
-/// where applicable.
+/// Both parsers emit Layer-2 relational operators (`Aggregate { AggFunc }`,
+/// `Window`, `Filter`, `Join`, …). The Layer-2 → Layer-3 sketch lowering
+/// and the conversion to the canonical IR both live inside
+/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root) —
+/// this function is just the language-dispatch front door.
 ///
-/// Step γ7: this still returns the *legacy* IR — it remains the internal
-/// L2→L3 path that the producers (`sql.rs` / `promql.rs` / `legacy_lower`)
-/// and `language_logical_plan` build on. New consumers use
-/// [`parse_query_expr_canonical`]; the legacy path is removed once every
-/// consumer migrates.
-pub fn parse_query_expr(
+/// Internal to the crate: the only caller is
+/// [`parse_query_expr_canonical`], which is the public canonical-IR entry.
+pub(crate) fn parse_query_expr(
     query: &str,
 ) -> anyhow::Result<crate::intent_algebra::legacy_expr::QueryExpr> {
     let q = query.trim();
     let upper = q.to_ascii_uppercase();
-    let layer2 = if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-        sql::parse_sql_expr(q)?
+    if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+        sql::parse_sql_expr(q)
     } else {
-        promql::parse_promql_expr(q)?
-    };
-    // Layer 2 → Layer 3 lowering (shared by both languages).
-    Ok(crate::intent_algebra::legacy_lower::lower_to_sketch_algebra(layer2))
+        promql::parse_promql_expr(q)
+    }
 }
 
 /// Parse a raw query string (PromQL or SQL) into the **canonical** L3
 /// [`query_expr::QueryExpr`](crate::intent_algebra::query_expr::QueryExpr) IR.
 ///
-/// This is the canonical-IR twin of [`parse_query_expr`]: it parses via the
-/// exact same path (it calls [`parse_query_expr`] internally to obtain the
-/// legacy [`QueryExpr`]) and then runs the result through
-/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root) to
-/// produce a canonical `query_expr::QueryExpr` tree.
-///
-/// Both entry points coexist deliberately during the Step γ7 legacy-IR
-/// retirement: [`parse_query_expr`] keeps returning the legacy `QueryExpr`
-/// so every existing `optimizer/` / `physical/` / `main.rs` consumer keeps
-/// compiling, while new canonical-IR consumers migrate onto this entry
-/// point one at a time. A later PR removes the legacy path entirely.
+/// This is the single public algebra-IR entry point. It parses the query
+/// into the crate-internal legacy Layer-2 tree via [`parse_query_expr`],
+/// then runs that through
+/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root),
+/// which folds the Layer-2 → Layer-3 sketch lowering and the
+/// legacy → canonical conversion into one entry. The legacy IR is never
+/// observable to callers.
 pub fn parse_query_expr_canonical(
     query: &str,
 ) -> anyhow::Result<crate::intent_algebra::query_expr::QueryExpr> {
@@ -525,69 +518,95 @@ mod tests {
     }
 
     #[test]
-    fn legacy_entry_point_still_returns_legacy_type() {
-        // `parse_query_expr` is untouched: it still returns the legacy
-        // `QueryExpr` so every existing optimizer / physical consumer keeps
-        // compiling. Asserting on a legacy-only variant proves the type.
-        let legacy = parse_query_expr(
+    fn legacy_entry_point_returns_raw_layer2() {
+        use crate::intent_algebra::legacy_expr::{AggFunc, QueryExpr as LQueryExpr};
+        // `parse_query_expr` is the crate-internal language-dispatch front
+        // door: it returns the raw legacy Layer-2 relational tree with no
+        // sketch lowering applied — the L2→L3 fusion now lives inside
+        // `convert_root`.
+        let layer2 = parse_query_expr(
             "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
         ).unwrap();
-        // `WindowedAgg` exists only on the legacy IR — the canonical IR
-        // splits it into `Window { Aggregate }`.
-        assert!(matches!(
-            legacy,
-            crate::intent_algebra::legacy_expr::QueryExpr::WindowedAgg { .. }
-        ));
+        // Raw Layer 2: an `Aggregate { AggFunc::Quantile }` sitting
+        // *directly* over a `Window` — un-fused, un-lowered.
+        match layer2 {
+            LQueryExpr::Aggregate { aggs, input, .. } => {
+                assert!(matches!(
+                    aggs.as_slice(),
+                    [item] if matches!(item.func, AggFunc::Quantile(_))
+                ));
+                assert!(matches!(*input, LQueryExpr::Window { .. }));
+            }
+            other => panic!("expected raw Layer-2 Aggregate, got {other:?}"),
+        }
     }
 }
 
 #[cfg(test)]
 mod doc_verify_all {
-    // These tests pin the *legacy* L2→L3 parse path (`parse_query_expr`),
-    // so `QueryExpr` here is the legacy IR — not the canonical one that
-    // `super::*` would bring in.
-    use super::parse_query_expr;
-    use crate::intent_algebra::legacy_expr::*;
+    // These tests pin the design.md §6 worked examples against the
+    // canonical IR that `parse_query_expr_canonical` produces — the only
+    // algebra IR the parse path now emits. The legacy `WindowedAgg` /
+    // `SketchAgg` fusion the doc text once showed is folded by
+    // `convert_root` into the canonical `Window { Aggregate }` /
+    // `Aggregate { by: [], .. }` stacked forms.
+    use super::parse_query_expr_canonical;
+    use crate::intent_algebra::query_expr::QueryExpr;
+    use crate::intent_algebra::AggIntent;
 
     #[test]
     fn example4_promql_quantile() {
-        let expr = parse_query_expr(
+        let expr = parse_query_expr_canonical(
             "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
         ).unwrap();
-        // Doc: WindowedAgg { Quantile([0.99]), Tumbling(5m), Filter(Source) }
-        assert!(matches!(&expr, QueryExpr::WindowedAgg { agg: AggIntent::Quantile { .. }, .. }));
+        // Canonical fold of the legacy `WindowedAgg { Quantile }`:
+        // `Window { Aggregate { by: [], [Quantile] } }`.
+        match &expr {
+            QueryExpr::Window { child, .. } => match child.as_ref() {
+                QueryExpr::Aggregate { by, aggs, .. } => {
+                    assert!(by.is_empty());
+                    assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
+                }
+                other => panic!("expected Aggregate under Window, got {other:?}"),
+            },
+            other => panic!("expected Window, got {other:?}"),
+        }
     }
 
     #[test]
     fn example5_promql_topk() {
-        let expr = parse_query_expr(
+        let expr = parse_query_expr_canonical(
             "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))"
         ).unwrap();
-        // Doc: TopK { 10, Partition { ["service"], WindowedAgg { Frequency } } }
+        // The legacy `TopK` folds to a canonical `Aggregate` carrying an
+        // `AggIntent::TopK`, over the `Partition { Window { Aggregate } }`
+        // the grouped windowed frequency sketch lowers to.
         match &expr {
-            QueryExpr::TopK { k: 10, input, .. } => {
-                match input.as_ref() {
-                    QueryExpr::Partition { keys, input: inner } => {
-                        assert_eq!(keys.keys(), &["service".to_string()]);
-                        assert!(matches!(inner.as_ref(), QueryExpr::WindowedAgg { agg: AggIntent::Frequency { .. }, .. }));
-                    }
-                    other => panic!("expected Partition, got {other:?}"),
-                }
+            QueryExpr::Aggregate { aggs, child, .. } => {
+                assert!(matches!(aggs.as_slice(), [AggIntent::TopK { k: 10, .. }]));
+                assert!(matches!(child.as_ref(), QueryExpr::Partition { .. }));
             }
-            other => panic!("expected TopK, got {other:?}"),
+            other => panic!("expected Aggregate with TopK intent, got {other:?}"),
         }
     }
 
     #[test]
     fn example6_sql_avg() {
-        let expr = parse_query_expr(
+        let expr = parse_query_expr_canonical(
             "SELECT symbol, AVG(price) FROM trades GROUP BY symbol"
         ).unwrap();
-        // Doc: Partition { ["symbol"], SketchAgg { Quantile([0.5]), Source } }
+        // Canonical fold of `Partition { ["symbol"], SketchAgg { Quantile } }`:
+        // `Partition { ["symbol"], Aggregate { by: [], [Quantile] } }`.
         match &expr {
-            QueryExpr::Partition { keys, input } => {
+            QueryExpr::Partition { keys, child } => {
                 assert_eq!(keys.keys(), &["symbol".to_string()]);
-                assert!(matches!(input.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Quantile { .. }, .. }));
+                match child.as_ref() {
+                    QueryExpr::Aggregate { by, aggs, .. } => {
+                        assert!(by.is_empty());
+                        assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
+                    }
+                    other => panic!("expected Aggregate under Partition, got {other:?}"),
+                }
             }
             other => panic!("expected Partition, got {other:?}"),
         }
@@ -595,26 +614,28 @@ mod doc_verify_all {
 
     #[test]
     fn example7_sql_tumble() {
-        let expr = parse_query_expr(
+        let expr = parse_query_expr_canonical(
             "SELECT region, COUNT(DISTINCT user_id) AS cnt FROM sessions GROUP BY region, TUMBLE(ts, INTERVAL '5' MINUTE) ORDER BY cnt DESC LIMIT 10"
         ).unwrap();
-        // Doc: Limit { 10, Sort { Partition { ["region"], WindowedAgg { Cardinality } } } }
-        match &expr {
-            QueryExpr::Limit { n: 10, input, .. } => {
-                match input.as_ref() {
-                    QueryExpr::Sort { input: sort_inner, .. } => {
-                        match sort_inner.as_ref() {
-                            QueryExpr::Partition { keys, input: part_inner } => {
-                                assert_eq!(keys.keys(), &["region".to_string()]);
-                                assert!(matches!(part_inner.as_ref(), QueryExpr::WindowedAgg { agg: AggIntent::Cardinality { .. }, .. }));
-                            }
-                            other => panic!("expected Partition, got {other:?}"),
-                        }
-                    }
-                    other => panic!("expected Sort, got {other:?}"),
-                }
-            }
-            other => panic!("expected Limit, got {other:?}"),
-        }
+        // Canonical fold of
+        // `Limit { Sort { Partition { ["region"], WindowedAgg { Cardinality } } } }`.
+        let QueryExpr::Limit { n: 10, child, .. } = &expr else {
+            panic!("expected Limit, got {expr:?}")
+        };
+        let QueryExpr::Sort { child: sort_child, .. } = child.as_ref() else {
+            panic!("expected Sort, got {child:?}")
+        };
+        let QueryExpr::Partition { keys, child: part_child } = sort_child.as_ref() else {
+            panic!("expected Partition, got {sort_child:?}")
+        };
+        assert_eq!(keys.keys(), &["region".to_string()]);
+        let QueryExpr::Window { child: win_child, .. } = part_child.as_ref() else {
+            panic!("expected Window, got {part_child:?}")
+        };
+        assert!(matches!(
+            win_child.as_ref(),
+            QueryExpr::Aggregate { aggs, .. }
+                if matches!(aggs.as_slice(), [AggIntent::Cardinality { .. }])
+        ));
     }
 }

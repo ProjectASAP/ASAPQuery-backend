@@ -174,10 +174,8 @@ pub fn resolve_column_refs(
 /// [`resolve_column_refs`] but skips the `ColumnRef::Named` wrapping —
 /// the legacy `Aggregate.keys` field is already a `Vec<String>`.
 ///
-/// Step γ1: used by the legacy→canonical `Aggregate` bridge
-/// ([`crate::intent_algebra::aggregate_bridge::bridge_aggregate_to_canonical`])
-/// to translate the legacy `keys: Vec<String>` into the canonical
-/// `by: Vec<ColumnId>` form.
+/// Used by `legacy_to_canonical::convert` to translate a legacy
+/// `Aggregate.keys: Vec<String>` into the canonical `by: Vec<ColumnId>`.
 pub fn resolve_named_keys(
     keys: &[String],
     schema: &Schema,

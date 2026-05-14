@@ -48,8 +48,8 @@
 //!
 //! [`convert`] takes a `&Schema` — the schema in scope at the node — and
 //! threads it unchanged to every child, matching the established
-//! `legacy_lower` / `column_resolution::infer_schema_for_root`
-//! convention. The synthesized source schema is `(ts, value)` and almost
+//! `column_resolution::infer_schema_for_root` convention. The
+//! synthesized source schema is `(ts, value)` and almost
 //! every legacy operator is schema-pass-through, so threading the root
 //! schema down is correct except for the nested-schema-transform case
 //! (an `Aggregate` below another `Aggregate`), which the legacy stack
@@ -68,10 +68,9 @@ use crate::intent_algebra::column_resolution::{
     resolve_named_keys, ResolveError,
 };
 use crate::intent_algebra::legacy_expr::{
-    AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
-    ScalarExpr as LScalarExpr, WindowKind as LWindowKind, WindowSpec,
+    AggFunc, AggItem, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys,
+    QueryExpr as LQueryExpr, ScalarExpr as LScalarExpr, WindowKind as LWindowKind, WindowSpec,
 };
-use crate::intent_algebra::legacy_lower::agg_func_to_intents;
 use crate::intent_algebra::query_expr::{
     from_legacy_scalar, ColumnRef as CColumnRef, HavingPredicate, LiteralValue,
     PartitionKeys as CPartitionKeys, Predicate, ProjectItem as CProjectItem,
@@ -103,7 +102,20 @@ pub enum ConvertError {
     Scalar(QueryExprError),
 }
 
-/// Convert a legacy `QueryExpr` tree to canonical.
+/// Lower a legacy `QueryExpr` tree all the way to canonical.
+///
+/// Two internal walks, one public entry:
+///
+/// 1. [`lower_to_sketch_algebra`] folds Layer-2 relational `Aggregate
+///    { AggFunc }` shapes into the sketch-fused legacy Layer-3 form
+///    (`SketchAgg` / `WindowedAgg` / `Partition`). This is idempotent on
+///    input that is already Layer 3 — the `SketchAgg` / `WindowedAgg`
+///    arms are pass-through — so callers may hand `convert_root` either
+///    level.
+/// 2. [`convert`] maps that legacy Layer-3 tree onto the canonical IR.
+///
+/// The legacy Layer-3 fused IR never escapes this module: it is purely
+/// the intermediate between these two walks.
 ///
 /// The inherited schema comes from the [`Binder`] — the explicit L3
 /// name-resolution pass — which builds the complete, self-contained
@@ -112,8 +124,9 @@ pub enum ConvertError {
 /// below (`resolve_column_ref` / `resolve_named_keys`) is **total**: it
 /// cannot raise `ConvertError::Resolve` on a well-formed legacy tree.
 pub fn convert_root(legacy: &LQueryExpr) -> Result<CQueryExpr, ConvertError> {
-    let schema = Binder::new().bind(legacy);
-    convert(legacy, &schema)
+    let lowered = lower_to_sketch_algebra(legacy.clone());
+    let schema = Binder::new().bind(&lowered);
+    convert(&lowered, &schema)
 }
 
 /// Convert a legacy `QueryExpr` tree to canonical against an explicit
@@ -442,6 +455,315 @@ fn convert_column_ref(c: &LColumnRef) -> CColumnRef {
     }
 }
 
+// ── Layer 2 → Layer 3 sketch lowering ────────────────────────────────────────
+//
+// Formerly `intent_algebra::legacy_lower`. Folded in here because its sole
+// caller is `convert_root` above (the `query_parser` entry points emit raw
+// Layer-2 trees and route them straight through `convert_root`). Keeping it
+// private to this module means the sketch-fused legacy Layer-3 IR
+// (`SketchAgg` / `WindowedAgg`) is no longer a surface anything outside the
+// converter can construct or observe.
+
+/// Lower a Layer-2 legacy `QueryExpr` (relational operators only) to the
+/// Layer-3 sketch algebra: `Aggregate { AggFunc }` nodes whose function
+/// maps to a sketch intent become `SketchAgg { AggIntent }` (or, fused
+/// under a `Window`, `WindowedAgg`). Multi-agg `Aggregate`s, those with
+/// `HAVING`, and non-sketchable functions pass through unchanged.
+///
+/// Idempotent on input that is already Layer 3: the `SketchAgg` /
+/// `WindowedAgg` arms simply recurse.
+fn lower_to_sketch_algebra(expr: LQueryExpr) -> LQueryExpr {
+    match expr {
+        LQueryExpr::Aggregate {
+            keys,
+            aggs,
+            having,
+            input,
+        } => {
+            let input = lower_to_sketch_algebra(*input);
+            lower_aggregate(keys, aggs, having, Box::new(input))
+        }
+
+        // ── Single-input nodes: recurse ──────────────────────────────────
+        LQueryExpr::Filter { pred, input } => LQueryExpr::Filter {
+            pred,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Project { cols, input } => LQueryExpr::Project {
+            cols,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Window {
+            duration,
+            slide,
+            input,
+        } => {
+            let lowered_input = lower_to_sketch_algebra(*input);
+            // Fuse Window + SketchAgg → WindowedAgg (the window defines the
+            // sketch lifecycle).
+            if let LQueryExpr::SketchAgg {
+                op,
+                col,
+                input: sketch_input,
+            } = lowered_input
+            {
+                let window = WindowSpec {
+                    kind: match slide {
+                        Some(s) => LWindowKind::Sliding {
+                            size: duration,
+                            slide: s,
+                        },
+                        None => LWindowKind::Tumbling { size: duration },
+                    },
+                    time_col: None,
+                };
+                LQueryExpr::WindowedAgg {
+                    agg: op,
+                    window,
+                    col,
+                    input: sketch_input,
+                }
+            } else {
+                LQueryExpr::Window {
+                    duration,
+                    slide,
+                    input: Box::new(lowered_input),
+                }
+            }
+        }
+        LQueryExpr::SketchAgg { op, col, input } => LQueryExpr::SketchAgg {
+            op,
+            col,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::WindowedAgg {
+            agg,
+            window,
+            col,
+            input,
+        } => LQueryExpr::WindowedAgg {
+            agg,
+            window,
+            col,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Partition { keys, input } => LQueryExpr::Partition {
+            keys,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Distinct { cols, input } => LQueryExpr::Distinct {
+            cols,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::TopK { k, by, input } => LQueryExpr::TopK {
+            k,
+            by,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Sort { keys, input } => LQueryExpr::Sort {
+            keys,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::Limit { n, offset, input } => LQueryExpr::Limit {
+            n,
+            offset,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+        LQueryExpr::PromQLSubquery {
+            range,
+            resolution,
+            input,
+        } => LQueryExpr::PromQLSubquery {
+            range,
+            resolution,
+            input: Box::new(lower_to_sketch_algebra(*input)),
+        },
+
+        // ── Two-input nodes: recurse into both ──────────────────────────
+        LQueryExpr::BinaryOp {
+            op,
+            lhs,
+            rhs,
+            vector_match,
+        } => LQueryExpr::BinaryOp {
+            op,
+            lhs: Box::new(lower_to_sketch_algebra(*lhs)),
+            rhs: Box::new(lower_to_sketch_algebra(*rhs)),
+            vector_match,
+        },
+        LQueryExpr::Join {
+            kind,
+            pred,
+            left,
+            right,
+        } => LQueryExpr::Join {
+            kind,
+            pred,
+            left: Box::new(lower_to_sketch_algebra(*left)),
+            right: Box::new(lower_to_sketch_algebra(*right)),
+        },
+        LQueryExpr::SetOp {
+            kind,
+            all,
+            left,
+            right,
+        } => LQueryExpr::SetOp {
+            kind,
+            all,
+            left: Box::new(lower_to_sketch_algebra(*left)),
+            right: Box::new(lower_to_sketch_algebra(*right)),
+        },
+
+        // ── Multi-input / container nodes ───────────────────────────────
+        LQueryExpr::Merge { inputs } => LQueryExpr::Merge {
+            inputs: inputs.into_iter().map(lower_to_sketch_algebra).collect(),
+        },
+        LQueryExpr::LetBinding { name, expr, body } => LQueryExpr::LetBinding {
+            name,
+            expr: Box::new(lower_to_sketch_algebra(*expr)),
+            body: Box::new(lower_to_sketch_algebra(*body)),
+        },
+
+        // ── Leaf nodes: pass through ────────────────────────────────────
+        LQueryExpr::Source(_) | LQueryExpr::Ref(_) => expr,
+    }
+}
+
+/// Lower a single `Aggregate` node to `SketchAgg` / `WindowedAgg` where the
+/// aggregation benefits from a sketch.
+///
+/// Single-statistic functions produce one sketch node; `StdDev` / `Variance`
+/// fan out into two sibling quantile sketches wrapped in a `Merge` (Step α
+/// F1 strategy). `GROUP BY` keys become a wrapping `Partition`. Multi-agg,
+/// `HAVING`-bearing, and non-sketchable (`Custom`) aggregates pass through
+/// as a relational `Aggregate`.
+fn lower_aggregate(
+    keys: Vec<String>,
+    aggs: Vec<AggItem>,
+    having: Option<LScalarExpr>,
+    input: Box<LQueryExpr>,
+) -> LQueryExpr {
+    // Only lower single-agg Aggregates without HAVING.
+    if aggs.len() == 1 && having.is_none() {
+        let agg = &aggs[0];
+
+        // COUNT(*) without GROUP BY is a simple row count — no sketch benefit.
+        if matches!(agg.func, AggFunc::Count) && keys.is_empty() {
+            return LQueryExpr::Aggregate {
+                keys,
+                aggs,
+                having,
+                input,
+            };
+        }
+
+        let intents = agg_func_to_intents(&agg.func);
+        if !intents.is_empty() {
+            let col = agg.col.clone();
+            let sketch_nodes: Vec<LQueryExpr> = match *input {
+                LQueryExpr::Window {
+                    duration,
+                    slide,
+                    input: ref win_input,
+                } => {
+                    let window = WindowSpec {
+                        kind: match slide {
+                            Some(s) => LWindowKind::Sliding {
+                                size: duration,
+                                slide: s,
+                            },
+                            None => LWindowKind::Tumbling { size: duration },
+                        },
+                        time_col: None,
+                    };
+                    intents
+                        .into_iter()
+                        .map(|intent| LQueryExpr::WindowedAgg {
+                            agg: intent,
+                            window: window.clone(),
+                            col: col.clone(),
+                            input: win_input.clone(),
+                        })
+                        .collect()
+                }
+                ref other => {
+                    let inp_boxed: Box<LQueryExpr> = Box::new(other.clone());
+                    intents
+                        .into_iter()
+                        .map(|intent| LQueryExpr::SketchAgg {
+                            op: intent,
+                            col: col.clone(),
+                            input: inp_boxed.clone(),
+                        })
+                        .collect()
+                }
+            };
+            let sketch = if sketch_nodes.len() == 1 {
+                sketch_nodes.into_iter().next().unwrap()
+            } else {
+                LQueryExpr::Merge {
+                    inputs: sketch_nodes,
+                }
+            };
+
+            return if keys.is_empty() {
+                sketch
+            } else {
+                LQueryExpr::Partition {
+                    keys: LPartitionKeys::By(keys),
+                    input: Box::new(sketch),
+                }
+            };
+        }
+    }
+
+    // Multi-agg or non-sketchable: keep as relational Aggregate.
+    LQueryExpr::Aggregate {
+        keys,
+        aggs,
+        having,
+        input,
+    }
+}
+
+/// Map an [`AggFunc`] to the canonical [`AggIntent`]s needed for sketch
+/// execution. Empty for non-sketchable functions (`Custom`); one intent
+/// for single-statistic functions; two for the `StdDev` / `Variance`
+/// fan-out (the caller wraps the pair in a `Merge` of sibling sketches).
+fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
+    use crate::intent_algebra::legacy_expr::{
+        default_cardinality, default_frequency, default_quantile,
+    };
+    match func {
+        AggFunc::Quantile(phi) => vec![default_quantile(*phi)],
+        AggFunc::CountDistinct => vec![default_cardinality()],
+        AggFunc::HeavyHitters { .. } => vec![default_frequency()],
+        AggFunc::Count => vec![default_frequency()],
+        AggFunc::Avg => vec![AggIntent::Quantile {
+            q: 0.5,
+            accuracy: AccuracyTarget::Epsilon(0.01),
+        }],
+        AggFunc::Min => vec![AggIntent::Min],
+        AggFunc::Max => vec![AggIntent::Max],
+        // StdDev / Variance: legacy carried two quantiles in a single
+        // Quantile intent; Step α F1 fans them out into two siblings.
+        AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![
+            AggIntent::Quantile {
+                q: 0.25,
+                accuracy: AccuracyTarget::Epsilon(0.01),
+            },
+            AggIntent::Quantile {
+                q: 0.75,
+                accuracy: AccuracyTarget::Epsilon(0.01),
+            },
+        ],
+        AggFunc::Sum | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
+            vec![AggIntent::Sum]
+        }
+        AggFunc::Custom(_) => vec![],
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -763,5 +1085,258 @@ mod tests {
             panic!("expected Window")
         };
         assert!(matches!(*child, CQueryExpr::Scan { .. }));
+    }
+}
+
+#[cfg(test)]
+mod lower_tests {
+    //! Ported from the former `intent_algebra::legacy_lower` module —
+    //! exercises the private Layer-2 → Layer-3 `lower_to_sketch_algebra`
+    //! sketch-fusion pass that `convert_root` now runs internally.
+    use super::lower_to_sketch_algebra;
+    use crate::intent_algebra::legacy_expr::*;
+    use std::time::Duration;
+
+    fn src(name: &str) -> QueryExpr {
+        QueryExpr::Source(SourceSpec { name: name.into() })
+    }
+
+    fn make_agg(func: AggFunc, input: QueryExpr) -> QueryExpr {
+        QueryExpr::Aggregate {
+            keys: vec![],
+            aggs: vec![AggItem {
+                alias: "v".into(),
+                func,
+                col: ColumnRef::SampleValue,
+                distinct: false,
+            }],
+            having: None,
+            input: Box::new(input),
+        }
+    }
+
+    fn make_agg_with_keys(func: AggFunc, keys: Vec<String>, input: QueryExpr) -> QueryExpr {
+        QueryExpr::Aggregate {
+            keys,
+            aggs: vec![AggItem {
+                alias: "v".into(),
+                func,
+                col: ColumnRef::SampleValue,
+                distinct: false,
+            }],
+            having: None,
+            input: Box::new(input),
+        }
+    }
+
+    #[test]
+    fn quantile_lowered_to_sketch_agg() {
+        let expr = make_agg(AggFunc::Quantile(0.99), src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Quantile { .. }, .. }));
+    }
+
+    #[test]
+    fn count_distinct_lowered_to_cardinality() {
+        let expr = make_agg(AggFunc::CountDistinct, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Cardinality { .. }, .. }));
+    }
+
+    #[test]
+    fn count_without_group_by_stays_aggregate() {
+        let expr = make_agg(AggFunc::Count, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::Aggregate { .. }));
+    }
+
+    #[test]
+    fn count_with_group_by_lowered_to_frequency() {
+        let expr = make_agg_with_keys(AggFunc::Count, vec!["region".into()], src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::Partition { input, .. } => {
+                assert!(matches!(input.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Frequency { .. }, .. }));
+            }
+            other => panic!("expected Partition(SketchAgg), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_lowered_to_sum() {
+        let expr = make_agg(AggFunc::Sum, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
+    }
+
+    #[test]
+    fn avg_lowered_to_quantile_p50() {
+        let expr = make_agg(AggFunc::Avg, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => {
+                assert!((*q - 0.5).abs() < 1e-9);
+            }
+            other => panic!("expected SketchAgg(Quantile), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_lowered_to_min() {
+        let expr = make_agg(AggFunc::Min, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Min, .. }));
+    }
+
+    #[test]
+    fn max_lowered_to_max() {
+        let expr = make_agg(AggFunc::Max, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Max, .. }));
+    }
+
+    #[test]
+    fn stddev_fans_out_to_merge_of_quantile_siblings() {
+        let expr = make_agg(AggFunc::StdDev { population: false }, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::Merge { inputs } => {
+                assert_eq!(inputs.len(), 2);
+                let mut qs: Vec<f64> = inputs.iter().filter_map(|node| match node {
+                    QueryExpr::SketchAgg { op: AggIntent::Quantile { q, .. }, .. } => Some(*q),
+                    _ => None,
+                }).collect();
+                qs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                assert_eq!(qs, vec![0.25, 0.75]);
+            }
+            other => panic!("expected Merge of two SketchAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_func_not_lowered() {
+        let expr = make_agg(AggFunc::Custom("my_udf".into()), src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::Aggregate { .. }));
+    }
+
+    #[test]
+    fn group_by_wraps_with_partition() {
+        let expr = make_agg_with_keys(AggFunc::Quantile(0.5), vec!["host".into()], src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::Partition { keys, input } => {
+                assert_eq!(keys.keys(), &["host".to_string()]);
+                assert!(matches!(input.as_ref(), QueryExpr::SketchAgg { .. }));
+            }
+            other => panic!("expected Partition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_agg_not_lowered() {
+        let expr = QueryExpr::Aggregate {
+            keys: vec![],
+            aggs: vec![
+                AggItem { alias: "c".into(), func: AggFunc::Count, col: ColumnRef::Wildcard, distinct: false },
+                AggItem { alias: "s".into(), func: AggFunc::Sum, col: ColumnRef::Named("x".into()), distinct: false },
+            ],
+            having: None,
+            input: Box::new(src("m")),
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::Aggregate { .. }));
+    }
+
+    #[test]
+    fn window_wrapping_aggregate_fuses_to_windowed_agg() {
+        let expr = QueryExpr::Window {
+            duration: Duration::from_secs(300),
+            slide: None,
+            input: Box::new(make_agg(AggFunc::Quantile(0.99), src("m"))),
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::WindowedAgg { agg, window, .. } => {
+                assert!(matches!(agg, AggIntent::Quantile { .. }));
+                assert!(matches!(window.kind, WindowKind::Tumbling { .. }));
+            }
+            other => panic!("expected WindowedAgg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sliding_window_fuses_to_windowed_agg_sliding() {
+        let expr = QueryExpr::Window {
+            duration: Duration::from_secs(300),
+            slide: Some(Duration::from_secs(60)),
+            input: Box::new(make_agg(AggFunc::Quantile(0.5), src("m"))),
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::WindowedAgg { window, .. } => {
+                assert!(matches!(window.kind, WindowKind::Sliding { .. }));
+            }
+            other => panic!("expected WindowedAgg(Sliding), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_wrapping_non_sketchable_stays_separate() {
+        let expr = QueryExpr::Window {
+            duration: Duration::from_secs(300),
+            slide: None,
+            input: Box::new(make_agg(AggFunc::Custom("my_udf".into()), src("m"))),
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::Window { .. }));
+    }
+
+    #[test]
+    fn lowering_recurses_into_binary_op() {
+        let expr = QueryExpr::BinaryOp {
+            op: BinaryOpKind::Add,
+            lhs: Box::new(make_agg(AggFunc::Sum, src("a"))),
+            rhs: Box::new(make_agg(AggFunc::CountDistinct, src("b"))),
+            vector_match: None,
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::BinaryOp { lhs, rhs, .. } => {
+                assert!(matches!(lhs.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
+                assert!(matches!(rhs.as_ref(), QueryExpr::SketchAgg { op: AggIntent::Cardinality { .. }, .. }));
+            }
+            other => panic!("expected BinaryOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowering_recurses_into_topk() {
+        let expr = QueryExpr::TopK {
+            k: 10,
+            by: vec!["symbol".into()],
+            input: Box::new(make_agg_with_keys(AggFunc::Count, vec!["symbol".into()], src("m"))),
+        };
+        let lowered = lower_to_sketch_algebra(expr);
+        match &lowered {
+            QueryExpr::TopK { input, .. } => {
+                assert!(matches!(input.as_ref(), QueryExpr::Partition { .. }));
+            }
+            other => panic!("expected TopK, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_lowered_to_sum() {
+        let expr = make_agg(AggFunc::Rate, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
+    }
+
+    #[test]
+    fn delta_lowered_to_sum() {
+        let expr = make_agg(AggFunc::Delta, src("m"));
+        let lowered = lower_to_sketch_algebra(expr);
+        assert!(matches!(lowered, QueryExpr::SketchAgg { op: AggIntent::Sum, .. }));
     }
 }
