@@ -3517,8 +3517,40 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 None;
             let mut combined_t0: u64 = u64::MAX;
 
+            // Snapshot the streaming config once for this query's
+            // policy lookups. Hot-reload swaps the underlying Arc; the
+            // snapshot pins one revision for the duration.
+            let streaming_snap = self.streaming_config_snapshot();
+            let policy_registry = streaming_snap.policy_registry();
+
             for candidate in &analysis.candidates {
-                let sids = idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys);
+                // Fast path (PRs #203 + #204 + #205): find matching
+                // policies in the content-addressed registry, then
+                // resolve each policy_fp → {sids} via the reverse
+                // index. Both hops are O(1)-amortized.
+                //
+                // Slow-path fallback: when the fast path yields no
+                // sids — either because no policy matches (control
+                // plane hasn't published one yet) or because the
+                // candidate's sids were registered with
+                // `PolicyFingerprint::UNSET` (legacy paths that
+                // didn't carry an `AggregationConfig` at ingest) —
+                // fall back to the metadata walk
+                // `instances_matching(metric, gbk)`. The per-sid
+                // capability filter below catches mismatches the
+                // fast path would have rejected at policy-match time.
+                let policy_fps = control_plane::warm_tier_analysis::find_matching_policies(
+                    &policy_registry,
+                    candidate,
+                );
+                let mut sids: Vec<u64> = Vec::new();
+                for fp in &policy_fps {
+                    sids.extend(idx.sids_for_policy(*fp));
+                }
+                if sids.is_empty() {
+                    sids = idx
+                        .instances_matching(&candidate.metric_name, &candidate.group_by_keys);
+                }
                 if sids.is_empty() {
                     return Err(crate::query_engines::EngineError::capability_miss(
                         asap_types::StorageBackend::SketchStore.data_source_id(),
