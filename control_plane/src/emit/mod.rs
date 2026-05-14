@@ -257,7 +257,13 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
         }
         PhysicalExpr::Logical(_)
         | PhysicalExpr::Ref { .. }
-        | PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
+        | PhysicalExpr::RawAtEdgePrometheusArchive { .. }
+        // ExactAgg has no sketch family — it produces an exact
+        // aggregation accumulator, not a sketch state. The
+        // routing emitter routes these to the
+        // `metrics/raw_passthrough` / exact-precompute pipeline
+        // alongside Logical pass-throughs.
+        | PhysicalExpr::ExactAgg { .. } => None,
     }
 }
 

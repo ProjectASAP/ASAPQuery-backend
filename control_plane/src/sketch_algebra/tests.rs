@@ -304,9 +304,12 @@ fn bind_hll_cardinality_basic() {
 }
 
 #[test]
-fn bind_no_match_passes_through_logical() {
-    // Sum is exact at L3 — no `Bind*` rule covers it. Should pass
-    // through unchanged in `PhysicalExpr::Logical`.
+fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
+    // Pre-PR-6-follow-up: `Sum` had no `Bind*` rule and passed through
+    // as `PhysicalExpr::Logical`. The L4 binder rule `BindExactAgg`
+    // (added in the PR-6 follow-up) now matches and emits
+    // `PhysicalExpr::ExactAgg { agg_type: Sum, .. }` so the warm-tier
+    // exact-aggregation path can serve the intent.
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Sum],
@@ -314,10 +317,14 @@ fn bind_no_match_passes_through_logical() {
         child: Box::new(windowed_scan()),
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
-    assert!(
-        matches!(bound, PhysicalExpr::Logical(QueryExpr::Aggregate { .. })),
-        "Sum should pass through as Logical(Aggregate{{Sum}})"
-    );
+    match bound {
+        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
+            agg_type,
+            promql_utilities::query_logics::enums::AggregationType::Sum,
+            "Sum should bind to ExactAgg(Sum)"
+        ),
+        other => panic!("expected ExactAgg, got {other:?}"),
+    }
 }
 
 #[test]
@@ -418,12 +425,13 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 
 /// `ONLY_TEMPORAL` — `sum_over_time(m[5m])` (and the count/avg/min/max
 /// variants that legacy `single_query.rs` accepts).
-/// Control plane path: `Aggregate{Sum}` over `Window` → no warm-tier rule
-/// fires (no streaming sum sketch); falls through to `Logical`. The
-/// existing `algebra::directory` / `algebra::physical` engine handles the
-/// exact aggregate.
+///
+/// Control plane path (post PR-6 follow-up): `Aggregate{Sum}` over
+/// `Window` → `BindExactAgg` fires → `PhysicalExpr::ExactAgg{Sum}`.
+/// Pre-follow-up this fell through to `Logical` because no rule
+/// matched Sum; the L5 emitter routed it to the archive engine.
 #[test]
-fn phase_b_pattern_only_temporal_sum_falls_through_to_logical() {
+fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Sum],
@@ -431,8 +439,13 @@ fn phase_b_pattern_only_temporal_sum_falls_through_to_logical() {
         child: Box::new(windowed_scan()),
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
-    // Sum is exact → no SketchAgg, just a Logical pass-through.
-    assert!(matches!(bound, PhysicalExpr::Logical(_)));
+    match bound {
+        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
+            agg_type,
+            promql_utilities::query_logics::enums::AggregationType::Sum,
+        ),
+        other => panic!("expected ExactAgg(Sum), got {other:?}"),
+    }
 }
 
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
@@ -567,6 +580,9 @@ fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SketchKind> {
                 walk(child, out);
             }
             PhysicalExpr::RawAtEdgePrometheusArchive { .. } => {}
+            // ExactAgg has no SketchKind to collect; its child may
+            // carry one transitively (rare but possible if nested).
+            PhysicalExpr::ExactAgg { child, .. } => walk(child, out),
         }
     }
     walk(expr, &mut out);
@@ -597,6 +613,10 @@ fn binding_is_archive(expr: &PhysicalExpr) -> bool {
         // about cold-tier scan-vs-warm-tier-sketch decisions, not Mode 3.
         PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => binding_is_archive(child),
         PhysicalExpr::RawAtEdgePrometheusArchive { .. } => false,
+        // ExactAgg is a warm-tier exact-aggregation accumulator, NOT
+        // an archive route. The L5 emitter writes the result through
+        // the precompute output sink, same path as SketchAgg.
+        PhysicalExpr::ExactAgg { .. } => false,
     }
 }
 

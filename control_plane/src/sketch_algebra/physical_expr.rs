@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::intent_algebra::QueryExpr;
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
 use crate::types_v2::BindingName;
+use promql_utilities::query_logics::enums::AggregationType;
 
 /// Readout operation extracted from a built sketch state. Inverse of
 /// `SketchAgg`. Mirrors design.md §6 line ~607 — `SketchEstimate` plus
@@ -176,6 +177,36 @@ pub enum PhysicalExpr {
         /// — see `deploy/configs/prometheus-otlp-receiver.yml`.
         label_proj: Vec<String>,
     },
+
+    /// Exact-aggregation node — produces the exact aggregation result
+    /// (Sum / Count-as-Sum / Increase / MinMax / …) directly. The L4
+    /// counterpart to the data-plane `AggPayload::ExactAgg` shape:
+    /// state at the warm-tier sid is a typed accumulator (not a
+    /// sketch byte buffer), and there's no separate readout step —
+    /// the accumulator's value IS the answer.
+    ///
+    /// Distinct from `SketchAgg` + `SketchEstimate` in two ways:
+    /// 1. No `EstimateOp` wrapper. ExactAgg is its own answer.
+    /// 2. No `SketchParams`. The `AggregationType` enum captures the
+    ///    parameterization (DDSketch's α etc. don't apply — exact
+    ///    aggregations are parameter-free up to the accumulator
+    ///    family choice).
+    ///
+    /// Emitted by `bind_exact_agg` for `AggIntent::Sum` /
+    /// `AggIntent::Rate` / `AggIntent::Increase` /
+    /// `AggIntent::Count{Exact}` once the analyzer flips them (PR 6
+    /// follow-up). Until that PR, the variant existed dormant in the
+    /// data plane's `AggKind::ExactAgg`; this brings the L4 algebra
+    /// in line.
+    ExactAgg {
+        /// Which exact-aggregation family (Sum / Increase / MinMax /
+        /// SetAggregator / DeltaSetAggregator / HLL — the same enum
+        /// the data plane keys on at `AggKind::ExactAgg.agg_type`).
+        agg_type: AggregationType,
+        /// Input sub-tree — typically `Logical(Window{...})` or
+        /// `Logical(Scan{...})`. Same shape as `SketchAgg::child`.
+        child: Box<PhysicalExpr>,
+    },
 }
 
 impl PhysicalExpr {
@@ -195,6 +226,16 @@ impl PhysicalExpr {
                 params,
                 child: Box::new(PhysicalExpr::Logical(logical)),
             }),
+        }
+    }
+
+    /// Convenience constructor for `ExactAgg{Logical(qe)}` — the exact
+    /// counterpart to [`Self::estimate_over_agg`]. No estimate wrapper
+    /// because ExactAgg produces the answer directly.
+    pub fn exact_agg_over_logical(agg_type: AggregationType, logical: QueryExpr) -> Self {
+        PhysicalExpr::ExactAgg {
+            agg_type,
+            child: Box::new(PhysicalExpr::Logical(logical)),
         }
     }
 }
