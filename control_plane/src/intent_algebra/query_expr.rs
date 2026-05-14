@@ -194,6 +194,27 @@ pub enum BinaryOpKind {
     Atan2,
 }
 
+impl std::fmt::Display for BinaryOpKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            BinaryOpKind::Add => "+", BinaryOpKind::Sub => "-",
+            BinaryOpKind::Mul => "*", BinaryOpKind::Div => "/",
+            BinaryOpKind::Mod => "%", BinaryOpKind::Pow => "^",
+            BinaryOpKind::Eq  => "=", BinaryOpKind::Ne  => "!=",
+            BinaryOpKind::Lt  => "<", BinaryOpKind::Le  => "<=",
+            BinaryOpKind::Gt  => ">", BinaryOpKind::Ge  => ">=",
+            BinaryOpKind::And => "AND", BinaryOpKind::Or => "OR",
+            BinaryOpKind::BitAnd => "&", BinaryOpKind::BitOr => "|",
+            BinaryOpKind::BitXor => "XOR",
+            BinaryOpKind::Concat => "||",
+            BinaryOpKind::Like    => "LIKE",    BinaryOpKind::NotLike => "NOT LIKE",
+            BinaryOpKind::Regex   => "=~",      BinaryOpKind::NotRegex => "!~",
+            BinaryOpKind::Unless  => "unless",  BinaryOpKind::Atan2 => "atan2",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// JOIN variant. design.md §6 lists Inner / LeftOuter / RightOuter /
 /// FullOuter / Cross / Semi / AntiSemi.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
