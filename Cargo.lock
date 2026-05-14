@@ -851,6 +851,7 @@ name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asap_types",
  "axum",
  "bytes",
  "chrono",

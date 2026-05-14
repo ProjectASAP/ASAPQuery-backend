@@ -34,6 +34,7 @@ prometheus     = { version = "0.13", default-features = false, features = ["proc
 tonic          = { version = "0.12", features = ["gzip"] }
 tokio-stream   = { version = "0.1", features = ["net"] }
 promql_utilities.workspace = true
+asap_types.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
