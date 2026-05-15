@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use optimizer::engine::QueryOptimizer;
 use physical::allocator::SketchAllocator;
 use pipeline::{Analyzer, QuerySpec};
-use emit::{generate_agent_collector_config, generate_backend_collector_config, build_precompute_engine_jobs};
+use emit::{generate_agent_collector_config, build_precompute_engine_jobs};
 use workload::WorkloadRegistry;
 use emit::{AgentRuntime, emit_for_runtime};
 use types::AgentCollectorConfig;
@@ -430,7 +430,6 @@ async fn main() {
         .route("/api/v1/agents",                  get(handle_agents))
         .route("/api/v1/config/:metric",          get(handle_get_config))
         .route("/api/v1/collector-config/agent",  get(handle_bootstrap_agent_config))
-        .route("/api/v1/collector-config/backend", get(handle_bootstrap_backend_config))
         .route("/api/v1/cost-model",              get(handle_cost_model))
         .route("/api/v1/tco",                     post(handle_tco))
         .with_state(state)
@@ -501,20 +500,6 @@ async fn handle_plan(
         st.opamp.push_to_role(
             AgentRole::Agent,
             RemoteConfig { config_hash: hash, yaml: agent_yaml },
-        ).await;
-    }
-
-    // ── Push backend config to backend-role collectors ────────────────────────
-    // The typed L5 (`split_typed_three_stage`, below) owns the rich
-    // per-stage backend config now; this legacy push emits the flat
-    // backend YAML from the SP-3 `plan.backend_config`.
-    if let Ok(backend_yaml) = generate_backend_collector_config(
-        &plan.backend_config, &st.opamp_endpoint,
-    ) {
-        let hash = short_hash(&backend_yaml);
-        st.opamp.push_to_role(
-            AgentRole::Backend,
-            RemoteConfig { config_hash: hash, yaml: backend_yaml },
         ).await;
     }
 
@@ -822,11 +807,6 @@ async fn handle_rollback(
                     config_hash: short_hash(&yaml), yaml,
                 }).await;
             }
-            if let Ok(yaml) = generate_backend_collector_config(&plan.backend_config, &st.opamp_endpoint) {
-                st.opamp.push_to_role(AgentRole::Backend, RemoteConfig {
-                    config_hash: short_hash(&yaml), yaml,
-                }).await;
-            }
             (StatusCode::OK, Json(json!({ "metric": metric, "rolled_back": true }))).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
@@ -1113,24 +1093,6 @@ async fn emit_bootstrap_typed(
 
     emit_for_runtime(runtime, &edge_cfg, &st.opamp_endpoint, None)
         .with_context(|| format!("emit_for_runtime failed for `{metric}`"))
-}
-
-/// Bootstrap YAML config for backend (merge) collectors.
-async fn handle_bootstrap_backend_config(
-    State(st): State<AppState>,
-) -> impl IntoResponse {
-    let cfg = types::BackendCollectorConfig {
-        merge_sketch_type: types::SketchType::DDSketch,
-        group_by:          vec![],
-    };
-    match generate_backend_collector_config(&cfg, &st.opamp_endpoint) {
-        Ok(yaml) => (
-            StatusCode::OK,
-            [("content-type", "application/yaml")],
-            yaml,
-        ).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 /// Returns the diff between the current and previous plan for `metric`.

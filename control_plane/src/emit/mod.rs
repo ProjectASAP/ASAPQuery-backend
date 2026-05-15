@@ -7,7 +7,7 @@
 //! | Old path | New path |
 //! |---|---|
 //! | `config/agent.rs` | [`agent`] |
-//! | `config/backend.rs` | [`backend`] |
+//! | `config/backend.rs` | *retired — emitted YAML for a "backend-role" OTel merge collector tier that was never deployed; superseded by the typed L5's [`stage_config::emit_backend_streaming_config_json`] which posts to asapquery-backend's precompute engine over HTTP* |
 //! | `config/asapquery_backend.rs` | [`asapquery_backend`] |
 //! | `config/precompute.rs` | [`precompute`] |
 //! | `config/stage_config.rs` | [`stage_config`] (TODO: split into `opamp` + `streaming_config` + `inference_config` per design.md §5; deferred from refactor 2026-05 because the 3,020-line monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, and shared internals — clean split needs ownership reorganisation, not file renames) |
@@ -17,7 +17,6 @@
 
 pub mod agent;
 pub mod asapquery_backend;
-pub mod backend;
 pub mod otap;
 pub mod precompute;
 pub mod stage_config;
@@ -26,7 +25,6 @@ pub mod trait_def;
 
 pub use agent::generate_agent_collector_config;
 pub use asapquery_backend::generate_streaming_config_yaml;
-pub use backend::generate_backend_collector_config;
 pub use otap::emit_otap_dag_yaml;
 pub use precompute::{build_precompute_engine_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{

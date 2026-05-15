@@ -22,10 +22,12 @@
 //! These four functions are deliberately **stage-shaped**, not
 //! plan-shaped: the typed L5 emitter has already split the PhysicalExpr
 //! across edge / gateway / backend, so each function only sees the slice
-//! that's relevant to its executor. The legacy emitters in
-//! [`crate::config::agent`] / [`crate::config::backend`] still operate
-//! on the legacy `AgentCollectorConfig` / `BackendCollectorConfig` —
-//! Phase C will gate-flip the demo overlay onto these typed emitters.
+//! that's relevant to its executor. The legacy `agent.rs` emitter still
+//! operates on the flat `AgentCollectorConfig`; the legacy backend
+//! emitter targeted a "backend-role" OTel merge collector tier that was
+//! never deployed and has been retired — typed L5 routes `StageId::Backend`
+//! directly to asapquery-backend's precompute engine over HTTP via
+//! `emit_backend_streaming_config_json`.
 //!
 //! All three are pure transformations: no I/O, no env lookup. The
 //! `opamp_endpoint` parameter is the controller's WebSocket URL the
