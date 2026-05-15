@@ -479,9 +479,14 @@ impl HttpServer {
         Ok(())
     }
 
-    /// Start server for testing on a random available port
-    /// Returns the actual port number used
-    #[cfg(test)]
+    /// Start server for testing on a random available port. Returns the
+    /// actual port number used.
+    ///
+    /// Intentionally not gated behind `#[cfg(test)]` — integration tests
+    /// under `data_plane/tests/` are compiled separately from the lib's
+    /// own unit tests and need this entry point. The name + doc-comment
+    /// make the testing intent explicit; production callers should use
+    /// the regular `start()` method.
     pub async fn start_test_server(&self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         // Create adapter using factory
         let adapter = create_http_adapter(self.config.adapter_config.clone());

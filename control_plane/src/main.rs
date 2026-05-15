@@ -559,22 +559,33 @@ async fn handle_plan(
                             }
                         }
                         crate::physical::colored_dag::StageConfig::Backend(mut be) => {
-                            // Patch grouping label names from the
-                            // workload spec. The typed L5 emitter
-                            // produces `BackendAggregation` with
-                            // `grouping: vec![]` because the canonical
-                            // L3 `QueryExpr::Aggregate.by` is
-                            // positional `ColumnId`s against a
-                            // synthesized schema that has no label
-                            // columns (open-set label naming is a
-                            // Step γ TODO in
-                            // `intent_algebra::column_resolution`).
-                            // `QueryWorkload.group_by_labels` carries
-                            // the names unambiguously, so we patch
-                            // them in here — every aggregation under
-                            // the same workload shares the same
-                            // grouping today.
+                            // Patch metric_name + grouping from the
+                            // workload spec. The typed L5 emitter:
+                            //   * sets `metric_name` from
+                            //     `edge.source_metric`, which is
+                            //     populated by `extract_edge_facts`
+                            //     walking the `Logical(Scan{...})`
+                            //     chain. The path-recovery isn't
+                            //     guaranteed across every binder
+                            //     output shape, so we belt-and-brace
+                            //     it with `workload.metric_name`.
+                            //   * leaves `grouping` empty because the
+                            //     canonical L3 `QueryExpr::Aggregate.by`
+                            //     is positional `ColumnId`s against a
+                            //     synthesized schema with no label
+                            //     columns (open-set label naming is
+                            //     a Step γ TODO in
+                            //     `intent_algebra::column_resolution`).
+                            // `QueryWorkload` carries both unambiguously,
+                            // and every aggregation under one workload
+                            // shares them — so the patch is uniform.
                             for agg in &mut be.aggregations {
+                                if agg.metric_name.is_empty() {
+                                    agg.metric_name = workload.metric_name.clone();
+                                }
+                                if agg.window_secs == 0 {
+                                    agg.window_secs = workload.time_window.as_secs();
+                                }
                                 agg.grouping = workload.group_by_labels.clone();
                             }
                             // Phase C: post the typed L5 streaming-config
