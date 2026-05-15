@@ -532,14 +532,11 @@ pub struct PrecomputeJob {
     pub store_path: String,
 }
 
-// ── SP-9: per-stage resource budgets ─────────────────────────────────────────
+// ── Per-stage resource budgets ────────────────────────────────────────────────
 
-/// Per-stage resource caps used by `split_expr_by_stage()` (SP-9).
-///
-/// When a node's estimated memory cost exceeds the cap at its natural stage,
-/// it is deferred to the next stage in the pipeline:
-///
-/// `Agent OTel Collector → Backend OTel Collector → Precompute Engine`
+/// Per-stage resource caps. The agent cap feeds the physical planner's
+/// placement decision (sketch build deferred off the agent when it would
+/// exceed the cap).
 ///
 /// `None` means unbounded (no cap enforced).  Typically sourced from
 /// [`WorkloadCharacteristics::memory_budget_bytes`] for the agent stage and
@@ -567,87 +564,6 @@ impl StageResourceBudgets {
     }
 }
 
-// ── SP-9: per-stage sub-plans ─────────────────────────────────────────────────
-
-/// Sub-plan for the **Agent OTel Collector** stage.
-///
-/// Covers `QueryExpr` nodes: `Source`, `Filter`, `Window`, `Agg` (sketch ops).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AgentSubPlan {
-    /// Concrete sketch type resolved from the `Agg` node (absent when no Agg
-    /// node was assigned to this stage, e.g. all deferred to Backend).
-    pub sketch_type: Option<SketchType>,
-    pub sketch_params: SketchParams,
-    /// Time window in seconds (from the `Window` node).
-    pub window_secs: Option<u64>,
-    /// Partition / group-by dimensions if a `Partition` node was pushed down
-    /// to the agent stage.
-    pub aggregate_by: Vec<String>,
-    /// Label-filter predicates as `"key=value"` strings (from `Filter` nodes).
-    pub label_filters: Vec<String>,
-    /// True when a `Dedup` node was assigned to this stage.
-    pub has_dedup: bool,
-}
-
-/// Sub-plan for the **Backend OTel Collector** stage.
-///
-/// Covers `QueryExpr` nodes: `Partition`, `Merge`, `Dedup`, and
-/// `Agg { Exact(Sum|Count|Min|Max) }` (mergeable exact ops).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BackendSubPlan {
-    /// GROUP BY dimensions from the `Partition` node.
-    pub group_by: Vec<String>,
-    /// True when a `Dedup` node was assigned here.
-    pub has_dedup: bool,
-    /// True when a `Merge` node is at this stage (expected for all
-    /// multi-agent deployments).
-    pub has_merge: bool,
-}
-
-/// Sub-plan for the **ASAPQuery Precompute Engine** stage.
-///
-/// Covers `QueryExpr` nodes: `TopK`, and sketch `Agg` ops deferred from
-/// the Agent stage due to memory budget overflow.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PrecomputeSubPlan {
-    /// Top-K value when a `TopK` node was assigned to this stage.
-    pub topk: Option<u64>,
-    /// PromQL/SQL expression representing the upper sub-tree assigned here.
-    /// Empty string when no precompute operations are present.
-    pub query_expr: String,
-    /// True when at least one operation was assigned to this stage.
-    pub active: bool,
-}
-
-/// Sub-plan for **DB-side exact computation** (ClickHouse / TSDB).
-///
-/// Covers `Agg { Exact(Avg) }` — non-mergeable; cannot be precomputed across
-/// distributed agents without collecting all raw data first.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DbSubPlan {
-    /// PromQL/SQL expression for the exact DB-side query.
-    pub query_expr: String,
-    /// True when at least one operation was assigned to this stage.
-    pub active: bool,
-}
-
-/// Result of SP-9 AST-aware stage split.
-///
-/// Produced by `planner::stage_split::split_expr_by_stage()`.  Attached to
-/// [`CollectionPlan::staged_plan`] when the workload was supplied via
-/// `query_string` (giving access to the full `QueryExpr` tree).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct StagedPlan {
-    pub agent: AgentSubPlan,
-    pub backend: BackendSubPlan,
-    pub precompute: PrecomputeSubPlan,
-    pub db: DbSubPlan,
-    /// Human-readable log of deferral decisions made during the split
-    /// (e.g. a sketch op moved from Agent to Backend due to a memory cap).
-    /// Populated for observability / debugging.
-    pub deferral_log: Vec<String>,
-}
-
 // ── Collection plan ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -661,10 +577,4 @@ pub struct CollectionPlan {
     pub delta_decision: DeltaDecision,
     /// Bandwidth and overhead estimates for all three transmission strategies.
     pub transmission_cost_summary: TransmissionCostSummary,
-    /// SP-9: AST-aware per-stage sub-plans.
-    ///
-    /// `Some` when the workload was supplied via `query_string` (full
-    /// `QueryExpr` tree available).  `None` when built from explicit
-    /// aggregation fields — the SP-3 flat assignment is used as fallback.
-    pub staged_plan: Option<StagedPlan>,
 }

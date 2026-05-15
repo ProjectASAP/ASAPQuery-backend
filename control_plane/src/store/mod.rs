@@ -185,7 +185,6 @@ mod tests {
             valid_until,
             delta_decision: DeltaDecision::default(),
             transmission_cost_summary: TransmissionCostSummary::default(),
-            staged_plan: None,
         }
     }
 

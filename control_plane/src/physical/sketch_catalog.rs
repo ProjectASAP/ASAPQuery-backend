@@ -145,8 +145,8 @@ pub fn sketch_type_and_params(op: &AggIntent) -> (SketchType, SketchParams) {
 
 /// Estimated sketch memory footprint per series (bytes).
 ///
-/// Used by `split_expr_by_stage` to decide whether to defer an operation
-/// to a later pipeline stage when the budget is exceeded.
+/// Used by the physical planner's placement decision to defer a sketch
+/// build off a stage when its budget would be exceeded.
 pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
     match op {
         AggIntent::Quantile { .. } => 4_096,
