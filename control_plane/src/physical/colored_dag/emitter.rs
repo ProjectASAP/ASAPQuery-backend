@@ -371,12 +371,17 @@ impl Emitter for ThreeStageEmitter {
         }
 
         // ── Edge config ────────────────────────────────────────────────
+        // Default exporter target is the asapquery-backend stage: the
+        // backend's precompute engine merges cross-agent sketches via
+        // its accumulators, so no middle-tier gateway processor sits in
+        // the default data path. Callers wanting a gateway in the path
+        // can re-write `exporter_target` post-emit.
         let mut edge = EdgeStageConfig {
             source_metric: None,
             label_filters: Vec::new(),
             window_secs: None,
             sketch_processors: Vec::new(),
-            exporter_target: ExportTarget::Stage(StageId::Gateway),
+            exporter_target: ExportTarget::Stage(StageId::Backend),
             prometheus_archive_metrics: Vec::new(),
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),

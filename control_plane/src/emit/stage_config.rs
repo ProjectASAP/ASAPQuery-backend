@@ -225,10 +225,13 @@ tsdb_block_duration: {window_secs}s\n",
     };
 
     // ── Exporters ─────────────────────────────────────────────────────────────
-    // Edge always exports to the gateway. ExportTarget gets resolved to
-    // a concrete endpoint here (Phase B): symbolic stages map to
-    // documented hostnames the demo overlay (Phase C) will provision.
-    let (exporter_key, exporter_val) = build_otlp_exporter("gateway", &cfg.exporter_target);
+    // Edge exports directly to asapquery-backend's OTLP ingest. The
+    // backend's precompute engine merges per-aggregation_id accumulators
+    // server-side, so no middle-tier gateway merge processor is needed.
+    // (The gateway typed L5 stage + emit_gateway_yaml machinery stays in
+    // source for topologies that re-introduce a middle tier, but is not
+    // exercised in the default deployment.)
+    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
 
     let mut exporters: HashMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
     let mut pipelines: HashMap<String, Pipeline> = HashMap::new();
@@ -963,7 +966,9 @@ tsdb_block_duration: {window_secs}s\n",
     processors.insert("memory_limiter".to_string(), memory_limiter_block);
 
     // ── Exporters ──────────────────────────────────────────────────────────
-    let (exporter_key, exporter_val) = build_otlp_exporter("gateway", &cfg.exporter_target);
+    // Edge → asapquery-backend OTLP ingest (see emit_edge_yaml for the
+    // gateway-less rationale).
+    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
     let mut exporters: HashMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
 
     let has_prometheus_archive = !cfg.prometheus_archive_metrics.is_empty();
@@ -1194,9 +1199,10 @@ fn build_default_edge_processor_block(
 }
 
 /// Resolve an `ExportTarget` to a concrete `endpoint:port` string. Phase
-/// B uses documented placeholder hostnames (`gateway:4317`,
-/// `backend:4317`) for symbolic stages — Phase C plumbs a real
-/// `DeploymentConstraints::executors()` resolver.
+/// B uses documented placeholder hostnames (`backend:4317` for the
+/// edge→backend default; `gateway:4317` is reachable when a caller
+/// explicitly opts in via `default_host`) for symbolic stages — Phase C
+/// plumbs a real `DeploymentConstraints::executors()` resolver.
 fn resolve_export_endpoint(default_host: &str, target: &ExportTarget) -> String {
     match target {
         ExportTarget::Endpoint(s) => s.clone(),
@@ -1505,11 +1511,11 @@ mod tests {
             "edge processor config must not emit planning-only fields rejected by OTel configs\n{yaml}"
         );
 
-        // Exporter — gateway.
+        // Exporter — asapquery-backend OTLP ingest.
         assert!(yaml.contains("otlp/backend:"), "missing exporter\n{yaml}");
         assert!(
-            yaml.contains("gateway:4317"),
-            "exporter should target gateway\n{yaml}"
+            yaml.contains("backend:4317"),
+            "exporter should target asapquery-backend\n{yaml}"
         );
 
         // OpAMP extension carries the controller endpoint.

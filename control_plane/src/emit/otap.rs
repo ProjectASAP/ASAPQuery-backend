@@ -188,7 +188,7 @@ pub fn emit_otap_dag_yaml(
             });
             prev = name;
         }
-        let endpoint = resolve_export_endpoint("gateway", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
         nodes.insert(
             "exporter".to_string(),
             NodeDef {
@@ -202,7 +202,7 @@ pub fn emit_otap_dag_yaml(
         });
     } else {
         // Mode 2 — raw at edge → sketch at backend. Passthrough DAG.
-        let endpoint = resolve_export_endpoint("gateway", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
         nodes.insert(
             "exporter".to_string(),
             NodeDef {
@@ -427,7 +427,7 @@ mod tests {
     }
 
     /// Mode 1 snapshot — sketch at edge: receiver → asap_sketches →
-    /// otlp_grpc exporter to gateway.
+    /// otlp_grpc exporter to asapquery-backend.
     #[test]
     fn otap_dag_mode1_sketch_at_edge_shape() {
         let yaml = emit_otap_dag_yaml(&ddsketch_edge_cfg_mode1(), "ws://ctrl/v1/opamp", None)
@@ -458,10 +458,10 @@ mod tests {
         assert_eq!(pipe.connections[0].to, "sketch_0");
         assert_eq!(pipe.connections[1].from, "sketch_0");
         assert_eq!(pipe.connections[1].to, "exporter");
-        // Endpoint contains gateway:4317.
+        // Endpoint contains backend:4317.
         assert!(
-            yaml.contains("gateway:4317"),
-            "missing gateway endpoint\n{yaml}"
+            yaml.contains("backend:4317"),
+            "missing backend endpoint\n{yaml}"
         );
     }
 
