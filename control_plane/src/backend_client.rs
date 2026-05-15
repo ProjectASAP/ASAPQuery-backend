@@ -256,7 +256,7 @@ mod tests {
         let url = start_mock_backend(sink.clone(), axum::http::StatusCode::OK).await;
 
         let client = BackendClient::new(url);
-        let yaml = "aggregations:\n  - aggregationId: 42\n    metric: cpu\n".to_string();
+        let yaml = "aggregations:\n  - metric: cpu\n".to_string();
         client
             .push_streaming_config(yaml.clone())
             .await
@@ -297,7 +297,7 @@ mod tests {
         let url = start_mock_backend(sink.clone(), axum::http::StatusCode::OK).await;
 
         let client = BackendClient::new(url);
-        let json = r#"{"aggregations":[{"aggregationId":7,"metric":"latency"}]}"#.to_string();
+        let json = r#"{"aggregations":[{"metric":"latency"}]}"#.to_string();
         client
             .post_streaming_config_json(json.clone())
             .await

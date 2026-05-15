@@ -499,7 +499,10 @@ pub fn emit_gateway_yaml(cfg: &GatewayStageConfig, opamp_endpoint: &str) -> Resu
 /// Output shape mirrors the YAML shape produced by
 /// [`crate::config::asapquery_backend::generate_streaming_config_yaml`]:
 /// a top-level `aggregations` array of
-/// `{ aggregationId, aggregationType, metric, parameters, ... }` rows.
+/// `{ aggregationType, aggregationSubType, metric, labels, parameters,
+/// windowSize, windowType, spatialFilter, aggregationInput }` rows.
+/// `aggregationId` is **not** emitted — identity is content-addressed in
+/// the backend via `PolicyFingerprint(u64)`.
 /// We additionally surface a parallel `readouts` array so the backend's
 /// query engine can prepare per-readout dispatch entries up-front (the
 /// existing YAML form has no readouts list because the legacy planner
@@ -1357,21 +1360,49 @@ fn build_gateway_merge_block(mp: &GatewayMergeProcessor) -> Value {
 }
 
 /// Build one aggregation row in the backend streaming-config JSON.
+///
+/// Wire shape is aligned to what `asap_types::AggregationConfig::from_yaml_data`
+/// requires:
+///
+/// * `aggregationType` — sketch family.
+/// * `aggregationSubType` — always empty; reserved for future
+///   sub-family distinctions.
+/// * `metric` — source metric the aggregation runs over.
+/// * `labels.{grouping,rollup,aggregated}` — three label lists the
+///   backend's `KeyByLabelNames` parser keys on. Today the typed L5
+///   only surfaces an empty grouping; future work threads
+///   `QueryExpr::Aggregate.by` through `BackendAggregation` so grouping
+///   propagates faithfully.
+/// * `parameters` — sketch-family-specific params (alpha, K, precision…).
+/// * `windowSize` / `windowType` — tumbling window in seconds.
+/// * `spatialFilter` — comma-joined `k=v` pairs from the edge's label
+///   filters.
+/// * `aggregationInput` — Phase ε.1 Mode 1/2 marker (sketch_envelope vs
+///   raw); preserved so Phase ε.2's raw-input ingest path stays plumbed.
+///
+/// `aggregation_id` is **intentionally omitted** from the wire — PR 5
+/// retired the controller-allocated id; identity is content-addressed
+/// in the backend via `PolicyFingerprint(u64)` derived from the fields
+/// above.
 fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
     let parameters = sketch_params_to_json(&agg.sketch_params);
-    // Phase ε.1 — surface `aggregation_input` so the backend's
-    // `StreamingConfig` consumer knows whether the wire payload is a
-    // pre-built sketch envelope (Mode 1) or raw OTLP samples the backend
-    // builds the sketch from at ingest (Mode 2). Phase ε.2 adds the
-    // raw-input ingest path; Phase ε.1 only commits the wire shape.
     let aggregation_input = match agg.aggregation_input {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",
     };
     json!({
-        "aggregationId": agg.aggregation_id,
         "aggregationType": sketch_kind_to_backend_type(&agg.sketch_kind),
+        "aggregationSubType": "",
+        "metric": agg.metric_name,
+        "labels": {
+            "grouping": Vec::<String>::new(),
+            "rollup": Vec::<String>::new(),
+            "aggregated": Vec::<String>::new(),
+        },
         "parameters": parameters,
+        "windowSize": agg.window_secs,
+        "windowType": "tumbling",
+        "spatialFilter": agg.spatial_filter,
         "aggregationInput": aggregation_input,
     })
 }
@@ -1708,14 +1739,20 @@ mod tests {
             aggregations: vec![
                 BackendAggregation {
                     aggregation_id: "agg0".into(),
+                    metric_name: "http_latency_ms".into(),
                     sketch_kind: SketchKind::DDSketch,
                     sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                    window_secs: 60,
+                    spatial_filter: String::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
                 BackendAggregation {
                     aggregation_id: "agg1".into(),
+                    metric_name: "http_requests_total".into(),
                     sketch_kind: SketchKind::Hll,
                     sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
+                    window_secs: 60,
+                    spatial_filter: String::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
             ],
@@ -1734,10 +1771,19 @@ mod tests {
 
         let aggs = v["aggregations"].as_array().expect("aggregations array");
         assert_eq!(aggs.len(), 2, "{v}");
-        assert_eq!(aggs[0]["aggregationId"], "agg0");
+        // PR 5: `aggregationId` is no longer on the wire — identity is
+        // content-addressed in the backend via `PolicyFingerprint(u64)`.
+        assert!(
+            aggs[0].get("aggregationId").is_none(),
+            "controller must not emit aggregationId\n{v}"
+        );
         assert_eq!(aggs[0]["aggregationType"], "DDSketch");
+        assert_eq!(aggs[0]["metric"], "http_latency_ms");
+        assert_eq!(aggs[0]["windowSize"], 60);
+        assert_eq!(aggs[0]["windowType"], "tumbling");
         assert_eq!(aggs[0]["parameters"]["alpha"], 0.01);
         assert_eq!(aggs[1]["aggregationType"], "HLL");
+        assert_eq!(aggs[1]["metric"], "http_requests_total");
         assert_eq!(aggs[1]["parameters"]["precision"], 14);
 
         let reads = v["readouts"].as_array().expect("readouts array");
@@ -1753,18 +1799,24 @@ mod tests {
             aggregations: vec![
                 BackendAggregation {
                     aggregation_id: "agg0".into(),
+                    metric_name: "endpoint_count".into(),
                     sketch_kind: SketchKind::CountSketch,
                     sketch_params: SketchParams::CountSketch(CountSketchParams {
                         w: 2048,
                         d: 5,
                         with_heap: true,
                     }),
+                    window_secs: 60,
+                    spatial_filter: String::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
                 BackendAggregation {
                     aggregation_id: "agg1".into(),
+                    metric_name: "endpoint_hits".into(),
                     sketch_kind: SketchKind::Cms,
                     sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+                    window_secs: 60,
+                    spatial_filter: String::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
             ],
@@ -1823,8 +1875,11 @@ mod tests {
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: "agg0".into(),
+                metric_name: "test_metric".into(),
                 sketch_kind: kind.clone(),
                 sketch_params: params,
+                window_secs: 60,
+                spatial_filter: String::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![BackendReadout {
@@ -2182,8 +2237,11 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: "phase_b_agg0".into(),
+                metric_name: "phase_b_metric".into(),
                 sketch_kind: SketchKind::Kll,
                 sketch_params: SketchParams::Kll(KllParams { k: 200 }),
+                window_secs: 60,
+                spatial_filter: String::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![BackendReadout {
@@ -2192,9 +2250,18 @@ mod tests {
             }],
         };
         let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
-        // The id surfaces on both the agg and the readout, with the same
-        // key name — the backend looks the readout up by `aggregationId`.
-        assert_eq!(v["aggregations"][0]["aggregationId"], "phase_b_agg0");
+        // PR 5: `aggregationId` is no longer on the aggregation side — the
+        // backend derives identity from content (`PolicyFingerprint(u64)`
+        // over metric, sketch_kind, params, grouping, spatial_filter).
+        // Readouts still surface `aggregationId` because the backend's
+        // readout consumption path is unchanged (cleanup deferred — the
+        // current backend's `StreamingConfig::from_yaml_data` ignores the
+        // readouts list entirely, so this string is informational only).
+        assert!(
+            v["aggregations"][0].get("aggregationId").is_none(),
+            "controller must not emit aggregationId on aggregations\n{v}"
+        );
+        assert_eq!(v["aggregations"][0]["metric"], "phase_b_metric");
         assert_eq!(v["readouts"][0]["aggregationId"], "phase_b_agg0");
         assert_eq!(v["aggregations"][0]["aggregationType"], "DatasketchesKLL");
         assert_eq!(v["aggregations"][0]["parameters"]["k"], 200);
@@ -2212,8 +2279,11 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: "agg0".into(),
+                metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs: 60,
+                spatial_filter: String::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![],
@@ -2231,8 +2301,11 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: "agg0".into(),
+                metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs: 60,
+                spatial_filter: String::new(),
                 aggregation_input: AggregationInput::Raw,
             }],
             readouts: vec![],
