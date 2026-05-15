@@ -38,7 +38,6 @@ use emit::{generate_agent_config, generate_backend_config, build_precompute_jobs
 use workload::WorkloadRegistry;
 use emit::{AgentRuntime, emit_for_runtime};
 use types::AgentCollectorConfig;
-use emit::generate_backend_config_staged;
 use monitor::{Endpoint, Scraper, ScrapedData, Thresholds, Violation};
 use opamp::{AgentRole, OpampServer, RemoteConfig};
 use optimizer::cost::CostModelPlanner;
@@ -48,7 +47,6 @@ use optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStor
 use optimizer::cost::online as online_cost_model;
 use physical::stage_split::split_expr_by_stage;
 use optimizer::cost::tco;
-use physical::planner::physical_plan_to_staged;
 use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
 use physical::colored_dag::emitter::BackendStageConfig;
@@ -462,15 +460,11 @@ async fn handle_plan(
     // ── L1→L5: parse → optimise → bind → stage. One algebra pipeline. ───────
     // When the spec carries a `query_string`, this is the single place the
     // algebra runs: parse to canonical L3, optimise, bind to the L4
-    // `PhysicalExpr`, and derive *every* L5 artefact from that one tree —
-    //   * `bound_physical`  → the typed L5 stage-split (below);
-    //   * `plan.staged_plan` → the legacy `StagedPlan` (JSON response +
-    //     `generate_backend_config_staged`);
-    //   * `plan_summary`    → the cost summary in the JSON response.
-    // Previously the parse + optimise ran twice (here and again in a
-    // separate `plan_summary` block); it now runs once. The SP-3 flat
-    // assignment in `plan` remains the fallback when there is no
-    // `query_string`.
+    // `PhysicalExpr`, and derive the L5 artifacts from that one tree —
+    //   * `bound_physical` → the typed L5 stage-split (below) — the L5;
+    //   * `plan_summary`   → the cost summary in the JSON response.
+    // The SP-3 flat assignment in `plan` remains the fallback when there
+    // is no `query_string`.
     let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
     let budgets = StageResourceBudgets::from_workload_chars(&wc);
     let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
@@ -490,10 +484,6 @@ async fn handle_plan(
                 };
                 bound_physical =
                     control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
-                // Legacy L5 `StagedPlan` — still feeds the JSON response's
-                // `staged_plan` field and `generate_backend_config_staged`.
-                let (staged, _physical_tree) = physical_plan_to_staged(&opt_qe, &budgets);
-                plan.staged_plan = Some(staged);
                 // Cost summary for the JSON response.
                 let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(opt_qe);
                 plan_summary = Some(plan_node.summarise(raw_bps));
@@ -501,7 +491,7 @@ async fn handle_plan(
         }
     }
 
-    plan.precompute = build_precompute_jobs(&workload, &plan, "backend:4317");
+    plan.precompute = build_precompute_jobs(&workload, "backend:4317");
     st.store.set(&workload.metric_name, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
     st.workload_store.set(&workload.metric_name, workload.clone(), wc);
@@ -516,10 +506,11 @@ async fn handle_plan(
     }
 
     // ── Push backend config to backend-role collectors ────────────────────────
-    // SP-9: pass the BackendSubPlan so the YAML gains a dedup processor when needed.
-    let backend_staged = plan.staged_plan.as_ref().map(|sp| &sp.backend);
-    if let Ok(backend_yaml) = generate_backend_config_staged(
-        &plan.backend_config, backend_staged, &st.opamp_endpoint,
+    // The typed L5 (`split_typed_three_stage`, below) owns the rich
+    // per-stage backend config now; this legacy push emits the flat
+    // backend YAML from the SP-3 `plan.backend_config`.
+    if let Ok(backend_yaml) = generate_backend_config(
+        &plan.backend_config, &st.opamp_endpoint,
     ) {
         let hash = short_hash(&backend_yaml);
         st.opamp.push_to_role(
