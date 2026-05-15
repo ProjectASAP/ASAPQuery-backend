@@ -27,7 +27,7 @@ pub fn should_precompute(w: &QueryWorkload) -> bool {
 /// path took `query_expr` from `StagedPlan.precompute.query_expr` instead —
 /// but that field was never populated, so the template was always the
 /// effective output; the dead path was dropped with the legacy L5.)
-pub fn build_precompute_jobs(
+pub fn build_precompute_engine_jobs(
     w: &QueryWorkload,
     backend_addr: &str,
 ) -> Vec<PrecomputeJob> {
@@ -207,7 +207,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].sketch_source, "backend:4317");
         assert_eq!(jobs[0].granularity, Duration::from_secs(60));
@@ -220,7 +220,7 @@ mod tests {
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(60)),
         );
-        let jobs = build_precompute_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
         assert!(jobs.is_empty());
     }
 
@@ -230,7 +230,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
         assert!(jobs[0].store_path.contains("latency"));
         assert!(jobs[0].store_path.contains("5m"));
     }
@@ -242,7 +242,7 @@ mod tests {
             Some(Duration::from_secs(600)),
         );
         workload.aggregations = vec![AggType::Cardinality];
-        let jobs = build_precompute_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
         assert!(
             jobs[0].query_expr.contains("count_distinct_over_time"),
             "got: {}",

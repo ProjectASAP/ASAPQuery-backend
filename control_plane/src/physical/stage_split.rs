@@ -618,7 +618,7 @@ pub fn typed_stage_split_enabled() -> bool {
 /// emitters in [`crate::config::stage_config`] —
 /// [`crate::config::stage_config::emit_edge_yaml`] for `Edge`,
 /// [`crate::config::stage_config::emit_gateway_yaml`] for `Gateway`,
-/// [`crate::config::stage_config::emit_backend_config_json`] for
+/// [`crate::config::stage_config::emit_backend_streaming_config_json`] for
 /// `Backend`. Phase C plumbs deployment-aware endpoint resolution.
 pub fn split_typed_three_stage(
     expr: &crate::sketch_algebra::PhysicalExpr,

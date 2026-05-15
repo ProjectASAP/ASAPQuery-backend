@@ -38,7 +38,7 @@ struct Pipeline {
 /// the collector should connect to for receiving runtime config updates from the
 /// control plane.  An `extensions.opamp` section is included in the generated YAML
 /// so the collector can receive pushed configs without a restart.
-pub fn generate_agent_config(
+pub fn generate_agent_collector_config(
     cfg: &AgentCollectorConfig,
     opamp_endpoint: &str,
 ) -> anyhow::Result<String> {
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn contains_processor_key() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("ddsketch:"),
             "YAML should contain 'ddsketch:'\n{yaml}"
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn contains_opamp_extension() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("opamp"),
             "YAML should include the opamp extension\n{yaml}"
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn contains_window_duration() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("5m"),
             "YAML should contain window_duration\n{yaml}"
@@ -314,7 +314,7 @@ mod tests {
         let mut cfg = ddsketch_cfg();
         cfg.mode = ProcessorMode::Batch;
         cfg.window_duration = None;
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             !yaml.contains("window_duration"),
             "batch mode should not have window_duration\n{yaml}"
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn contains_aggregate_by() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("host.name"),
             "YAML should contain aggregate_by labels\n{yaml}"
@@ -349,7 +349,7 @@ mod tests {
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("HLL:"),
             "YAML should contain HLL processor key\n{yaml}"
@@ -387,7 +387,7 @@ mod tests {
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("countmin:"),
             "YAML should use countmin component id (factory type)\n{yaml}"
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn contains_otlp_receiver() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("receivers:"),
             "YAML should have receivers section\n{yaml}"
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn contains_prometheus_exporter() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("exporters:"),
             "YAML should have exporters section\n{yaml}"
@@ -428,7 +428,7 @@ mod tests {
 
     #[test]
     fn pipeline_has_receivers_and_exporters() {
-        let yaml = generate_agent_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         // Ensure the pipeline block references both receiver and exporter keys.
         assert!(
             yaml.contains("- otlp"),
@@ -445,7 +445,7 @@ mod tests {
         let mut cfg = ddsketch_cfg();
         cfg.delta_transmission = true;
         cfg.delta_threshold = 1.0;
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("delta_transmission: true"),
             "YAML should contain delta_transmission: true\n{yaml}"
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn delta_fields_absent_when_disabled() {
         let cfg = ddsketch_cfg(); // delta_transmission: false by default
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             !yaml.contains("delta_transmission"),
             "YAML must not contain delta_transmission when disabled\n{yaml}"
@@ -492,7 +492,7 @@ mod tests {
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(yaml.contains("KLL:"), "YAML should contain 'KLL:'\n{yaml}");
         assert!(
             yaml.contains("k:"),
@@ -526,7 +526,7 @@ mod tests {
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
         };
-        let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("countsketch:"),
             "YAML should contain 'countsketch:'\n{yaml}"
@@ -598,7 +598,7 @@ mod tests {
                 series_id_ttl_secs: 0,
                 data_sink: AgentDataSink::default(),
             };
-            let yaml = generate_agent_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+            let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
 
             // Processor section key present.
             assert!(

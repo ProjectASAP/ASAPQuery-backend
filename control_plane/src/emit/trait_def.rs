@@ -94,7 +94,7 @@ impl PlanEmitter for OpampGatewayEmitter {
 }
 
 /// Backend `StreamingConfig` JSON emitter — wraps
-/// [`super::stage_config::emit_backend_config_json`]. The output is the
+/// [`super::stage_config::emit_backend_streaming_config_json`]. The output is the
 /// JSON document the ASAPQuery-backend's
 /// `POST /api/v1/streaming-config` endpoint accepts (aggregations +
 /// readouts array).
@@ -108,7 +108,7 @@ impl PlanEmitter for StreamingConfigEmitter {
     fn name(&self) -> &'static str { "streaming_config_json" }
 
     fn emit(&self, input: &BackendStageConfig) -> Result<serde_json::Value> {
-        super::stage_config::emit_backend_config_json(input)
+        super::stage_config::emit_backend_streaming_config_json(input)
     }
 }
 
@@ -267,7 +267,7 @@ mod tests {
         let cfg = empty_backend_cfg();
         let emitter = StreamingConfigEmitter::default();
         let trait_out = emitter.emit(&cfg).expect("trait emit");
-        let direct = super::super::stage_config::emit_backend_config_json(&cfg)
+        let direct = super::super::stage_config::emit_backend_streaming_config_json(&cfg)
             .expect("direct emit");
         assert_eq!(trait_out, direct);
         assert_eq!(emitter.name(), "streaming_config_json");

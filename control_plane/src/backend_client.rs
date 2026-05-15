@@ -98,7 +98,7 @@ impl BackendClient {
 
     /// Phase C (MVP v6) variant of [`Self::push_streaming_config`]
     /// that POSTs `application/json`. The typed L5
-    /// `emit_backend_config_json` emitter produces a `serde_json::Value`
+    /// `emit_backend_streaming_config_json` emitter produces a `serde_json::Value`
     /// rather than a YAML document, and the ASAPQuery-backend's
     /// `/api/v1/streaming-config` endpoint accepts both content types
     /// (PR #297 / Phase B documents the JSON shape). Same 2xx-or-error

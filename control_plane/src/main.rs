@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use optimizer::engine::QueryOptimizer;
 use physical::allocator::SketchAllocator;
 use pipeline::{Analyzer, QuerySpec};
-use emit::{generate_agent_config, generate_backend_config, build_precompute_jobs};
+use emit::{generate_agent_collector_config, generate_backend_collector_config, build_precompute_engine_jobs};
 use workload::WorkloadRegistry;
 use emit::{AgentRuntime, emit_for_runtime};
 use types::AgentCollectorConfig;
@@ -302,7 +302,7 @@ async fn main() {
     // Built once at startup; shared between Replanner (existing path —
     // pushes the StreamingConfig YAML on every successful replan) and
     // AppState (Phase C — pushes the typed L5 backend JSON emitted by
-    // `emit_backend_config_json` from `handle_plan`). `None` when
+    // `emit_backend_streaming_config_json` from `handle_plan`). `None` when
     // `CONTROLLER_BACKEND_ENDPOINT` is unset preserves the
     // fire-and-forget "skip silently" contract from Phase B.
     let backend_client_shared: Option<Arc<backend_client::BackendClient>> =
@@ -491,13 +491,13 @@ async fn handle_plan(
         }
     }
 
-    plan.precompute = build_precompute_jobs(&workload, "backend:4317");
+    plan.precompute = build_precompute_engine_jobs(&workload, "backend:4317");
     st.store.set(&workload.metric_name, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
     st.workload_store.set(&workload.metric_name, workload.clone(), wc);
 
     // ── Push agent config to agent-role collectors ────────────────────────────
-    if let Ok(agent_yaml) = generate_agent_config(&plan.agent_config, &st.opamp_endpoint) {
+    if let Ok(agent_yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
         let hash = short_hash(&agent_yaml);
         st.opamp.push_to_role(
             AgentRole::Agent,
@@ -509,7 +509,7 @@ async fn handle_plan(
     // The typed L5 (`split_typed_three_stage`, below) owns the rich
     // per-stage backend config now; this legacy push emits the flat
     // backend YAML from the SP-3 `plan.backend_config`.
-    if let Ok(backend_yaml) = generate_backend_config(
+    if let Ok(backend_yaml) = generate_backend_collector_config(
         &plan.backend_config, &st.opamp_endpoint,
     ) {
         let hash = short_hash(&backend_yaml);
@@ -581,7 +581,7 @@ async fn handle_plan(
                             // configured endpoint this still no-ops
                             // silently — same fire-and-forget contract
                             // as the existing Replanner path.
-                            match emit::emit_backend_config_json(&be) {
+                            match emit::emit_backend_streaming_config_json(&be) {
                                 Ok(json_doc) => {
                                     info!(
                                         stage = "backend",
@@ -613,7 +613,7 @@ async fn handle_plan(
                                         );
                                     }
                                 }
-                                Err(e) => warn!(error = %e, "emit_backend_config_json failed"),
+                                Err(e) => warn!(error = %e, "emit_backend_streaming_config_json failed"),
                             }
 
                             // Phase α (MVP): emit per-metric storage
@@ -819,12 +819,12 @@ async fn handle_rollback(
     st.planner.reset(&metric);
     match st.store.rollback(&metric) {
         Ok(plan) => {
-            if let Ok(yaml) = generate_agent_config(&plan.agent_config, &st.opamp_endpoint) {
+            if let Ok(yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
                 st.opamp.push_to_role(AgentRole::Agent, RemoteConfig {
                     config_hash: short_hash(&yaml), yaml,
                 }).await;
             }
-            if let Ok(yaml) = generate_backend_config(&plan.backend_config, &st.opamp_endpoint) {
+            if let Ok(yaml) = generate_backend_collector_config(&plan.backend_config, &st.opamp_endpoint) {
                 st.opamp.push_to_role(AgentRole::Backend, RemoteConfig {
                     config_hash: short_hash(&yaml), yaml,
                 }).await;
@@ -847,7 +847,7 @@ async fn handle_get_config(
     Path(metric): Path<String>,
 ) -> impl IntoResponse {
     match st.store.get(&metric) {
-        Ok(plan) => match generate_agent_config(&plan.agent_config, &st.opamp_endpoint) {
+        Ok(plan) => match generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
             Ok(yaml) => (
                 StatusCode::OK,
                 [("content-type", "application/yaml")],
@@ -868,7 +868,7 @@ async fn handle_get_config(
 ///
 /// | `USE_TYPED_STAGE_SPLIT` | path |
 /// | --- | --- |
-/// | unset / `0` | **legacy** — emit a default-DDSketch [`AgentCollectorConfig`] via [`generate_agent_config`]. Backwards-compat with deployments that haven't migrated to the typed L5 emitters. |
+/// | unset / `0` | **legacy** — emit a default-DDSketch [`AgentCollectorConfig`] via [`generate_agent_collector_config`]. Backwards-compat with deployments that haven't migrated to the typed L5 emitters. |
 /// | `1` / `true` / `yes` | **typed** — pick the agent's pinned workload (when `X-Agent-ID` is supplied and the replanner has a prior assignment), or fall back to the first agent-role entry in [`WorkloadRegistry`]. Run the typed L5 pipeline (`bind_workload_typed` → `split_typed_three_stage`) and emit the Edge stage config via [`emit_for_runtime`] — dispatched by the `X-Agent-Runtime` header (defaults to `AsapOtel`). When the typed path errors out (no workload, unsupported topology, no Edge stage in the per-stage map) it falls back to the legacy emitter so the bootstrap never returns a 500 just because the typed path has a gap. |
 ///
 /// ## Why this matters
@@ -920,7 +920,7 @@ async fn handle_bootstrap_agent_config(
                 warn!(
                     runtime = ?runtime, error = %e,
                     "[USE_TYPED_STAGE_SPLIT] typed bootstrap path failed; \
-                     falling back to legacy generate_agent_config"
+                     falling back to legacy generate_agent_collector_config"
                 );
                 // Fall through to legacy path below.
             }
@@ -948,7 +948,7 @@ async fn handle_bootstrap_agent_config(
         series_id_ttl_secs:   300,
         data_sink:            types::AgentDataSink::default(),
     };
-    match generate_agent_config(&cfg, &st.opamp_endpoint) {
+    match generate_agent_collector_config(&cfg, &st.opamp_endpoint) {
         Ok(yaml) => (
             StatusCode::OK,
             [("content-type", "application/yaml")],
@@ -1125,7 +1125,7 @@ async fn handle_bootstrap_backend_config(
         merge_sketch_type: types::SketchType::DDSketch,
         group_by:          vec![],
     };
-    match generate_backend_config(&cfg, &st.opamp_endpoint) {
+    match generate_backend_collector_config(&cfg, &st.opamp_endpoint) {
         Ok(yaml) => (
             StatusCode::OK,
             [("content-type", "application/yaml")],
@@ -1836,7 +1836,7 @@ mod api_tests {
                 endpoint: "0.0.0.0:8889".to_string(),
             },
         };
-        let yaml = generate_agent_config(&cfg, endpoint).unwrap();
+        let yaml = generate_agent_collector_config(&cfg, endpoint).unwrap();
 
         // Parse the YAML to verify structure, not just substring matches.
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
@@ -1909,7 +1909,7 @@ mod api_tests {
     // ── Phase ε.1.5+ — handle_bootstrap_agent_config typed path ────────────────
     //
     // These tests verify the deep fix that ports the bootstrap handler
-    // off `generate_agent_config` and onto the typed-stage-split emit
+    // off `generate_agent_collector_config` and onto the typed-stage-split emit
     // pipeline that `handle_plan` already uses. See the handler's
     // doc-comment for the legacy ↔ typed behaviour matrix.
 
@@ -2020,7 +2020,7 @@ mod api_tests {
     }
 
     /// Backwards-compat — when `USE_TYPED_STAGE_SPLIT` is unset the
-    /// handler must keep its legacy `generate_agent_config` shape
+    /// handler must keep its legacy `generate_agent_collector_config` shape
     /// (default DDSketch, `processors.ddsketch`, `processors.batch`)
     /// so deployments that haven't migrated keep working.
     #[tokio::test]
@@ -2119,7 +2119,7 @@ mod api_tests {
 
     /// `USE_TYPED_STAGE_SPLIT=1` but the registry is empty → typed
     /// path fails to resolve a workload and the handler falls back
-    /// to the legacy `generate_agent_config` emit. Bootstrap MUST
+    /// to the legacy `generate_agent_collector_config` emit. Bootstrap MUST
     /// NOT 500 just because the typed path hit a gap.
     #[tokio::test]
     async fn bootstrap_typed_path_falls_back_to_legacy_when_no_workload() {
