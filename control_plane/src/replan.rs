@@ -22,8 +22,8 @@ use tracing::{info, warn};
 
 use crate::backend_client::{push_or_log, BackendClient};
 use crate::emit::{
-    build_precompute_jobs, collect_metric_to_family, emit_for_runtime,
-    extend_edge_with_demo_plumbing, generate_agent_config, generate_backend_config,
+    build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
+    extend_edge_with_demo_plumbing, generate_agent_collector_config, generate_backend_collector_config,
     generate_streaming_config_yaml, AgentRuntime, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
@@ -234,7 +234,7 @@ impl Replanner {
     ///
     /// | `USE_TYPED_STAGE_SPLIT` | path |
     /// | --- | --- |
-    /// | unset / `0` | **legacy** — emit a single-pipeline DDSketch YAML via [`generate_agent_config`]. No routing, no `gorillas3`, no warm-passthrough. Backwards-compat for deployments that haven't migrated. |
+    /// | unset / `0` | **legacy** — emit a single-pipeline DDSketch YAML via [`generate_agent_collector_config`]. No routing, no `gorillas3`, no warm-passthrough. Backwards-compat for deployments that haven't migrated. |
     /// | `1` / `true` / `yes` | **typed** — run [`try_emit_typed_edge_yaml`] (mirror of `main::emit_bootstrap_typed`). On error, fall back to the legacy emitter so the push never silently drops. |
     ///
     /// Together with the bootstrap GET path (PR #333) this finishes
@@ -261,9 +261,9 @@ impl Replanner {
                     warn!(
                         agent = agent_id, metric = %metric,
                         "[USE_TYPED_STAGE_SPLIT] typed emit failed on connect; \
-                         falling back to legacy generate_agent_config"
+                         falling back to legacy generate_agent_collector_config"
                     );
-                    match generate_agent_config(&plan.agent_config, &self.opamp_endpoint) {
+                    match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint) {
                         Ok(y) => y,
                         Err(_) => {
                             warn!(agent = agent_id, metric = %metric, "failed to generate agent config on connect");
@@ -273,7 +273,7 @@ impl Replanner {
                 }
             }
         } else {
-            match generate_agent_config(&plan.agent_config, &self.opamp_endpoint) {
+            match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint) {
                 Ok(y) => y,
                 Err(_) => {
                     warn!(agent = agent_id, metric = %metric, "failed to generate agent config on connect");
@@ -312,7 +312,7 @@ impl Replanner {
         // re-optimise with current EMA data.
         self.planner.reset(metric);
         let mut plan = self.planner.plan(&workload, Some(&wc));
-        plan.precompute = build_precompute_jobs(&workload, "backend:4317");
+        plan.precompute = build_precompute_engine_jobs(&workload, "backend:4317");
         self.plan_store.set(metric, plan.clone());
 
         // Push agent config only to agents registered for this specific metric,
@@ -333,13 +333,13 @@ impl Replanner {
                     warn!(
                         metric,
                         "[USE_TYPED_STAGE_SPLIT] re-plan typed emit failed; \
-                         falling back to legacy generate_agent_config"
+                         falling back to legacy generate_agent_collector_config"
                     );
-                    generate_agent_config(&plan.agent_config, &self.opamp_endpoint).ok()
+                    generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint).ok()
                 }
             }
         } else {
-            generate_agent_config(&plan.agent_config, &self.opamp_endpoint).ok()
+            generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint).ok()
         };
         if let Some(yaml) = agent_yaml {
             let cfg = RemoteConfig {
@@ -357,7 +357,7 @@ impl Replanner {
                 self.opamp.push(&agent_id, cfg.clone()).await;
             }
         }
-        if let Ok(yaml) = generate_backend_config(&plan.backend_config, &self.opamp_endpoint) {
+        if let Ok(yaml) = generate_backend_collector_config(&plan.backend_config, &self.opamp_endpoint) {
             self.opamp
                 .push_to_role(
                     AgentRole::Backend,
@@ -643,7 +643,7 @@ mod tests {
     /// `gorillas3`, `routing`, and `metrics/warm_passthrough`.
     ///
     /// Proves freshness-probe routing reaches OpAMP-pushed agents —
-    /// the legacy `generate_agent_config` path emits NONE of these
+    /// the legacy `generate_agent_collector_config` path emits NONE of these
     /// (it builds a single-pipeline DDSketch YAML with no routing).
     #[tokio::test]
     async fn typed_replan_emit_includes_freshness_probe_routing() {
@@ -712,7 +712,7 @@ mod tests {
         // Drive the legacy emitter directly — same code
         // `push_config_to_agent` runs when the gate is off.
         let plan = r.plan_store.get("latency").unwrap();
-        let yaml = generate_agent_config(&plan.agent_config, &r.opamp_endpoint)
+        let yaml = generate_agent_collector_config(&plan.agent_config, &r.opamp_endpoint)
             .expect("legacy emit should succeed");
 
         // Legacy single-pipeline DDSketch output has NONE of the

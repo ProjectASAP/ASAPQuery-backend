@@ -507,7 +507,7 @@ impl Emitter for ThreeStageEmitter {
                 // Edge-side: no sketch processor. Backend-side: a
                 // BackendAggregation with the family the backend will
                 // build at ingest. The aggregation_input=raw flag is
-                // emitted by `emit_backend_config_json`.
+                // emitted by `emit_backend_streaming_config_json`.
                 (PhysicalExpr::RawAtEdgeSketchAtBackend { family, params, .. }, StageId::Edge) => {
                     let aid = format!("agg{next_agg_index}");
                     next_agg_index += 1;

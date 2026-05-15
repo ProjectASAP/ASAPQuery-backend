@@ -24,13 +24,13 @@ pub mod stage_config;
 pub mod telegraf;
 pub mod trait_def;
 
-pub use agent::generate_agent_config;
+pub use agent::generate_agent_collector_config;
 pub use asapquery_backend::generate_streaming_config_yaml;
-pub use backend::{generate_backend_config, generate_backend_config_staged};
+pub use backend::generate_backend_collector_config;
 pub use otap::emit_otap_dag_yaml;
-pub use precompute::{build_precompute_jobs, should_precompute, PrecomputeClient};
+pub use precompute::{build_precompute_engine_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{
-    emit_backend_config_json, emit_backend_storage_routing,
+    emit_backend_streaming_config_json, emit_backend_storage_routing,
     emit_backend_storage_routing_for_tenant, emit_backend_storage_routing_with_prometheus,
     emit_backend_storage_routing_with_prometheus_for_tenant, emit_edge_yaml, emit_gateway_yaml,
     DEFAULT_TENANT,

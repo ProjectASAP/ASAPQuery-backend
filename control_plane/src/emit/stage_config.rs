@@ -7,7 +7,7 @@
 //! - [`emit_gateway_yaml`] → OTel-collector YAML for the gateway
 //!   aggregator (OTLP receiver → per-family `*merge` processor(s) → OTLP
 //!   exporter to backend).
-//! - [`emit_backend_config_json`] → JSON document matching the
+//! - [`emit_backend_streaming_config_json`] → JSON document matching the
 //!   ASAPQuery-backend `POST /api/v1/streaming-config` API surface — same
 //!   shape that [`crate::config::asapquery_backend::generate_streaming_config_yaml`]
 //!   builds today, just from the typed [`BackendStageConfig`] instead of
@@ -502,7 +502,7 @@ pub fn emit_gateway_yaml(cfg: &GatewayStageConfig, opamp_endpoint: &str) -> Resu
 /// PromQL query at execution time; Phase B's typed `BackendStageConfig`
 /// carries the readouts explicitly, so we ship them too — backends that
 /// don't recognise the field will ignore it without erroring).
-pub fn emit_backend_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
+pub fn emit_backend_streaming_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
     let aggregations: Vec<JsonValue> = cfg
         .aggregations
         .iter()
@@ -1722,7 +1722,7 @@ mod tests {
                 },
             ],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
 
         let aggs = v["aggregations"].as_array().expect("aggregations array");
         assert_eq!(aggs.len(), 2, "{v}");
@@ -1773,7 +1773,7 @@ mod tests {
                 },
             ],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
         let reads = v["readouts"].as_array().unwrap();
         assert_eq!(reads[0]["op"], "topk");
         assert_eq!(reads[0]["k"], 10);
@@ -2116,7 +2116,7 @@ mod tests {
         assert_eq!(targets[1]["engine"], "thanos_query");
     }
 
-    // ── Phase β: emit_backend_config_json snapshot for new pattern coverage ──
+    // ── Phase β: emit_backend_streaming_config_json snapshot for new pattern coverage ──
     //
     // The archive-only L3 intents (Absent, Present, Delta, Deriv, …)
     // bind to `PhysicalExpr::Logical` rather than producing a `BackendAggregation`,
@@ -2133,7 +2133,7 @@ mod tests {
             aggregations: vec![],
             readouts: vec![],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
         let s = serde_json::to_string(&v).unwrap();
         assert_eq!(s, r#"{"aggregations":[],"readouts":[]}"#);
     }
@@ -2183,7 +2183,7 @@ mod tests {
                 op: EstimateOp::Quantile { q: 0.99 },
             }],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
         // The id surfaces on both the agg and the readout, with the same
         // key name — the backend looks the readout up by `aggregationId`.
         assert_eq!(v["aggregations"][0]["aggregationId"], "phase_b_agg0");
@@ -2210,7 +2210,7 @@ mod tests {
             }],
             readouts: vec![],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
         assert_eq!(v["aggregations"][0]["aggregationInput"], "sketch_envelope");
     }
 
@@ -2229,7 +2229,7 @@ mod tests {
             }],
             readouts: vec![],
         };
-        let v = emit_backend_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
         assert_eq!(v["aggregations"][0]["aggregationInput"], "raw");
     }
 
