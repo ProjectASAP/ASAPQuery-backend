@@ -1036,6 +1036,43 @@ impl ASAPQueryEngine {
         // Tests that don't attach a SketchStore now get `Ok(empty)`
         // here. Anything deeper than smoke-test coverage was already
         // setting one (M2.3.5b made it mandatory in production).
+        //
+        // ── KNOWN GAP — sketch-backed aggs return empty here ─────────
+        //
+        // `query_precomputes_by_agg` (called below) filters its
+        // candidate-sid scan with `matches!(&m.agg_kind,
+        // AggKind::ExactAgg { agg_type: t, .. } if *t == agg_type)`.
+        // It NEVER matches `AggKind::Sketch` — so for any sketch-
+        // backed aggregation (DDSketch / KLL / HLL / CountSketch /
+        // CountMinSketch arriving via OTLP and registered by
+        // `route_modified_otlp_sketches_to_precompute` with
+        // `AggKind::Sketch { kind, config, .. }`), this lookup
+        // returns an empty map. We then bubble up "No precomputed
+        // outputs found for metric: X, aggregation_id: Y" and
+        // `handle_query` returns `None`, which the HTTP layer
+        // renders as `errorType: bad_data` / `error: "No result
+        // for query"`.
+        //
+        // Diagnosed in the e2e test arc (#247 → #248 → #249 →
+        // #250 → engine-path debug session 2026-05). Sketches DO
+        // reach `SketchStore` — `runtime_info.earliest_timestamp_per_sid`
+        // shows them — but they're only readable via the sid-keyed
+        // `SketchStore::query_range(sid, ...)` path (sketch payloads
+        // filtered by `payload.as_sketch()`), not via the agg-keyed
+        // precomputes path consumed here.
+        //
+        // **The fix** is to dispatch by the agg's capability:
+        //  * sketch-typed aggs route to a sketch-side query (a
+        //    counterpart to `query_precomputes_by_agg` that scans
+        //    `AggKind::Sketch` sids and assembles per-sketch results
+        //    into the engine's expected `Box<dyn AggregateCore>`
+        //    shape) — non-trivial since the existing pipeline expects
+        //    precompute payload shapes.
+        //  * OR route the legacy `handle_query` path through the
+        //    newer `ASAPQueryEngine::execute(&str)` trait path
+        //    (around line 3430), which already does
+        //    `idx.sids_for_policy(fp)` + reducer dispatch and
+        //    handles sketches natively via `SketchReducer::evaluate`.
         let Some(idx) = self.sketch_index.as_ref() else {
             return Ok(TimestampedBucketsMap::new());
         };
