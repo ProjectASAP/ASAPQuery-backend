@@ -130,10 +130,11 @@ async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
     use data_plane::storage_engines::types::StreamingConfig;
 
     let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
-    let query_engine = Arc::new(ASAPQueryEngine::new_with_hot_reload(
-        hot_reload.clone(),
-        15_000,
-    ));
+    let sketch_index = Arc::new(SketchStore::new());
+    let query_engine = Arc::new(
+        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
+            .with_sketch_index(sketch_index.clone()),
+    );
 
     let adapter_config = AdapterConfig::prometheus_promql(
         "http://127.0.0.1:9999".to_string(), // unused — no forwarding in this test
@@ -145,7 +146,6 @@ async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
         adapter_config,
     };
 
-    let sketch_index = Arc::new(SketchStore::new());
     let server = HttpServer::new(http_config, query_engine, sketch_index)
         .with_hot_reload_config(hot_reload.clone());
 
@@ -283,10 +283,16 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
         handle_http_requests: true,
         adapter_config,
     };
-    let query_engine = Arc::new(ASAPQueryEngine::new_with_hot_reload(
-        hot_reload.clone(),
-        15_000,
-    ));
+    let query_engine = Arc::new(
+        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
+            // CRITICAL: without this the engine's `sketch_index` is
+            // None and every fast path that reads sid → SketchInstance
+            // metadata is silently skipped. Sketches DO land in
+            // `sketch_index` via OTLP ingest (the engine's
+            // `precompute_engine` shares the Arc), but the query
+            // path can't see them without this binding.
+            .with_sketch_index(sketch_index.clone()),
+    );
     let server = HttpServer::new(http_config, query_engine, sketch_index)
         .with_hot_reload_config(hot_reload.clone());
     let backend_port = server
@@ -702,6 +708,15 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     assert!(
         response.get("status").is_some(),
         "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "PromQL query did not succeed after the modern-execute() fallback in \
+         process_via_simple_engine. The legacy handle_query path can't read \
+         sketch-backed sids (#252), but the fallback should now reach them via \
+         the trait-dispatch path. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
