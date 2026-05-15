@@ -423,6 +423,32 @@ impl SketchStore {
         // the engine's query-side filtering (label matchers) handles
         // that. Returning the superset is correct; over-returning is
         // just a perf cost the engine already absorbs.
+        //
+        // ── KNOWN GAP — sketch-backed aggs return empty here ────────
+        // The `matches!` predicate below ONLY matches
+        // `AggKind::ExactAgg`. Sketch-backed sids
+        // (`AggKind::Sketch { kind, config, .. }`, registered by
+        // `route_modified_otlp_sketches_to_precompute` for every
+        // OTLP DDSketch/KLL/HLL/CountSketch/CountMinSketch DP) are
+        // NEVER picked up — and the agg-keyed precompute query
+        // unconditionally returns an empty map for them. The
+        // legacy `ASAPQueryEngine::handle_query` path
+        // (`query_engines/asap_query_engine/engine.rs::execute_store_query`)
+        // falls through to "No precomputed outputs found" → the
+        // HTTP layer renders `errorType: bad_data` / `error: "No
+        // result for query"`. Sketches ARE in `SketchStore` and
+        // are readable via the sid-keyed `query_range(sid, ...)`
+        // path — they just aren't reachable via this agg-keyed
+        // precompute lookup. Closing the gap means either teaching
+        // this function to also collect sketch payloads (assemble
+        // `Box<dyn AggregateCore>` from `payload.as_sketch()`),
+        // OR routing `handle_query` through the newer
+        // `ASAPQueryEngine::execute(&str)` trait path which uses
+        // `idx.sids_for_policy(fp)` + reducer dispatch and
+        // already handles sketches natively.
+        //
+        // Diagnosed in the e2e test arc (#247 → #248 → #249 →
+        // #250 → engine-path debug session 2026-05).
         let candidate_sids: Vec<u64> = {
             let g = self.instances.read().unwrap();
             g.iter()
