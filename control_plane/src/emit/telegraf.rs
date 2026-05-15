@@ -155,7 +155,12 @@ fn emit_processors_allsketches(
     if let Some(w) = window_secs {
         out.push_str(&format!("  window_duration = \"{w}s\"\n"));
     }
-    out.push_str(&format!("  aggregation_id = \"{}\"\n", sp.aggregation_id));
+    // PR 5 alignment (mirroring #244 / #246 / #250's wire cleanups):
+    // `aggregation_id` was the controller-allocated string the
+    // patched asap-otel processors don't consume — sid identity is
+    // content-addressed server-side via `(metric, attrs_fingerprint,
+    // agg_kind_canonical)`. Field stays on `EdgeSketchProcessor` as
+    // internal emit plumbing; it just doesn't reach the wire here.
     out.push_str(&format!(
         "  sketch_kind = \"{}\"\n",
         sketch_kind_tag(&sp.sketch_kind)

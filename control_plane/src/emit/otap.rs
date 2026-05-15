@@ -284,10 +284,13 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
     } else {
         m.insert("mode".into(), Value::String("batch".to_string()));
     }
-    m.insert(
-        "aggregation_id".into(),
-        Value::String(sp.aggregation_id.clone()),
-    );
+    // PR 5 alignment (mirroring #244 / #246 / #250's wire cleanups):
+    // `aggregation_id` was the controller-allocated string IDs the
+    // patched asap-otel processors don't consume — sid identity is
+    // content-addressed at the backend via `(metric, attrs_fingerprint,
+    // agg_kind_canonical)`. The field stays on `EdgeSketchProcessor`
+    // as internal emitter plumbing for cross-stage references during
+    // the DAG walk; it just doesn't reach the wire here.
     m.insert(
         "sketch_kind".into(),
         Value::String(sketch_kind_tag(&sp.sketch_kind).into()),
