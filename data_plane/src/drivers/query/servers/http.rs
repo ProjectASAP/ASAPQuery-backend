@@ -945,6 +945,64 @@ async fn process_via_simple_engine(
                 Err(status) => status.into_response()}
         }
         None => {
+            // Legacy `handle_query` returned None — likely the
+            // sketch-vs-precompute query gap pinned in #252:
+            // `query_precomputes_by_agg` only picks up
+            // `AggKind::ExactAgg` sids, never `AggKind::Sketch`. Try
+            // the modern `ASAPQueryEngine::execute(&str)` trait path
+            // before falling through to the unsupported-query branch
+            // — `execute` uses
+            // `idx.sids_for_policy(fp)` + `SketchReducer::evaluate`
+            // and handles sketches natively.
+            //
+            // Trait dispatch loses `KeyByLabelNames` (the trait
+            // returns just `QueryResult`); we surface an empty
+            // `KeyByLabelNames`, identical to how `process_via_router`
+            // handles the same trait surface — the Prometheus
+            // adapter renders an empty `metric: {}` object, a valid
+            // shape that PromQL clients accept.
+            use crate::query_engines::routing::query_engine_routing::QueryEngine;
+            let modern_result = state
+                .query_engine
+                .execute(&parsed_request.query)
+                .await;
+            if let Ok(query_result) = modern_result {
+                debug!(
+                    "Modern execute() handled what legacy handle_query missed \
+                     (query='{}')",
+                    parsed_request.query
+                );
+                use crate::drivers::query::adapters::QueryExecutionResult;
+                let execution_result = QueryExecutionResult {
+                    query_output_labels: promql_utilities::data_model::KeyByLabelNames::default(),
+                    query_result,
+                };
+                let total_duration = start_time.elapsed();
+                debug!(
+                    "Total request processing took (modern fallback): {:.2}ms",
+                    total_duration.as_secs_f64() * 1000.0
+                );
+                return match state
+                    .adapter
+                    .format_success_response(&execution_result)
+                    .await
+                {
+                    Ok(response) => {
+                        annotate_data_source(
+                            response,
+                            StorageBackend::SketchStore.data_source_id(),
+                        )
+                        .await
+                    }
+                    Err(status) => status.into_response(),
+                };
+            }
+            debug!(
+                "Both legacy handle_query AND modern execute() returned None/Err for \
+                 query='{}', falling through to fallback / unsupported",
+                parsed_request.query
+            );
+
             let total_duration = start_time.elapsed();
             debug!("=== QUERY ENGINE RETURNED NONE ===");
             debug!(
