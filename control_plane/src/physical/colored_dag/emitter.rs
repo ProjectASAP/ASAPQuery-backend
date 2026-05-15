@@ -311,6 +311,20 @@ pub struct BackendAggregation {
     /// `label_filters`). Empty string when no filter applies.
     #[serde(default)]
     pub spatial_filter: String,
+    /// Group-by label names — keys in `labels.grouping` on the backend
+    /// side, where the precompute engine's accumulator pipeline keys
+    /// its per-aggregation state by the projected attribute set.
+    ///
+    /// The L5 emitter populates this empty (`vec![]`); the caller
+    /// (`handle_plan`) patches it from `workload.group_by_labels`
+    /// before posting the streaming-config JSON. The canonical L3
+    /// `QueryExpr::Aggregate.by` carries the keys as positional
+    /// `ColumnId`s against a synthesized schema that has no label
+    /// columns (open-set label naming is a Step γ TODO in
+    /// `intent_algebra::column_resolution`), so the workload-spec
+    /// strings are the only reliable source of the names today.
+    #[serde(default)]
+    pub grouping: Vec<String>,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
@@ -467,6 +481,10 @@ impl Emitter for ThreeStageEmitter {
                         sketch_params: params.clone(),
                         window_secs: edge.window_secs.unwrap_or(0),
                         spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
+                        // Populated post-emit by the caller (handle_plan)
+                        // from workload.group_by_labels — see the
+                        // struct doc-comment for the rationale.
+                        grouping: Vec::new(),
                         // Mode 1 — sketch built at edge, ships envelope.
                         aggregation_input: AggregationInput::SketchEnvelope,
                     });
@@ -544,6 +562,7 @@ impl Emitter for ThreeStageEmitter {
                         sketch_params: params.clone(),
                         window_secs: edge.window_secs.unwrap_or(0),
                         spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
+                        grouping: Vec::new(),
                         // Mode 2 — backend builds sketch from raw OTLP.
                         aggregation_input: AggregationInput::Raw,
                     });

@@ -223,6 +223,7 @@ mod tests {
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
                 window_secs: 60,
                 spatial_filter: String::new(),
+                grouping: Vec::new(),
                 aggregation_input:
                     crate::physical::colored_dag::emitter::AggregationInput::SketchEnvelope,
             }],
