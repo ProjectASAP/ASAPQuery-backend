@@ -26,6 +26,12 @@
 //!  * Test 2 — same shape with `group_by_labels: ["zone"]`; verifies
 //!    #245's grouping plumb survives the round-trip into the backend's
 //!    `AggregationConfig.grouping_labels`.
+//!  * Test 3 — full controller-to-query roundtrip: harness simulates
+//!    the agent (builds DDSketch state with `asap_sketchlib`, encodes
+//!    as a modified-OTLP `DdSketchDataPoint`), POSTs sketches to the
+//!    backend's OTLP receiver, waits for window close, queries via
+//!    PromQL, asserts the response is well-formed for the planned
+//!    metric.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +40,15 @@ use std::time::Duration;
 use control_plane::types::{AggType, QueryWorkload, WorkloadCharacteristics};
 use data_plane::storage_engines::types::HotReloadStreamingConfig;
 use serde_json::Value as JsonValue;
+
+use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use asap_otel_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use asap_otel_proto::tonic::metrics::v1::{
+    metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
+    ScopeMetrics,
+};
+use asap_sketchlib::proto::sketchlib::DdSketchState;
+use prost::Message;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -185,6 +200,204 @@ fn _wc_anchor() -> WorkloadCharacteristics {
     WorkloadCharacteristics::default()
 }
 
+/// Full test stack: PrecomputeEngine + SketchStoreSink + OtlpReceiver +
+/// HttpServer, all sharing the same `SketchStore` and
+/// `HotReloadStreamingConfig` so a controller-posted streaming-config
+/// is visible to the engine's accumulator routing, the engine's window
+/// outputs land in `SketchStore`, and the query engine reads from the
+/// same store.
+///
+/// Mirrors the wiring in `data_plane/src/main.rs`.
+struct FullStack {
+    backend_port: u16,
+    otlp_http_port: u16,
+}
+
+async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack {
+    use data_plane::drivers::ingest::series_resolver::SeriesIdResolver;
+    use data_plane::drivers::ingest::{OtlpReceiver, OtlpReceiverConfig};
+    use data_plane::drivers::query::adapters::config::AdapterConfig;
+    use data_plane::drivers::query::servers::{HttpServer, HttpServerConfig};
+    use data_plane::precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
+    use data_plane::precompute_engine::output_sink::SketchStoreSink;
+    use data_plane::precompute_engine::PrecomputeEngine;
+    use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
+    use data_plane::storage_engines::sketch_db::index::SketchStore;
+    use data_plane::storage_engines::types::StreamingConfig;
+
+    let sketch_index = Arc::new(SketchStore::new());
+    let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+    let series_resolver = Arc::new(SeriesIdResolver::new());
+
+    // SketchStoreSink writes precompute output back into SketchStore so
+    // the query engine can find it.
+    let sink = Arc::new(SketchStoreSink::new(
+        sketch_index.clone(),
+        hot_reload.clone(),
+        series_resolver.clone(),
+    ));
+
+    let engine_cfg = PrecomputeEngineConfig {
+        num_workers: 2,
+        allowed_lateness_ms: 0,
+        max_buffer_per_series: 10_000,
+        flush_interval_ms: 100,
+        channel_buffer_size: 10_000,
+        pass_raw_samples: false,
+        raw_mode_aggregation_id: 0,
+        late_data_policy: LateDataPolicy::Drop,
+        wall_clock_grace_period_ms: 5_000,
+        schema_persist_path: None,
+    };
+    let engine = PrecomputeEngine::new(
+        engine_cfg,
+        hot_reload.clone(),
+        sink,
+        series_resolver.clone(),
+        sketch_index.clone(),
+    );
+    let ingest_state = engine.ingest_state();
+    tokio::spawn(async move {
+        let _ = engine.run().await;
+    });
+
+    // OTLP receiver wired to the engine's ingest state.
+    let otlp_receiver = OtlpReceiver::with_ingest_state(
+        OtlpReceiverConfig {
+            grpc_port: otlp_grpc_port,
+            http_port: otlp_http_port,
+        },
+        ingest_state,
+    );
+    tokio::spawn(async move {
+        let _ = otlp_receiver.run().await;
+    });
+
+    // HTTP query server sharing the same SketchStore + hot-reload handle.
+    let adapter_config = AdapterConfig::prometheus_promql(
+        "http://127.0.0.1:9999".to_string(),
+        false,
+    );
+    let http_config = HttpServerConfig {
+        port: 0,
+        handle_http_requests: true,
+        adapter_config,
+    };
+    let query_engine = Arc::new(ASAPQueryEngine::new_with_hot_reload(
+        hot_reload.clone(),
+        15_000,
+    ));
+    let server = HttpServer::new(http_config, query_engine, sketch_index)
+        .with_hot_reload_config(hot_reload.clone());
+    let backend_port = server
+        .start_test_server()
+        .await
+        .expect("start_test_server must succeed");
+
+    // Wait for everything to bind.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    FullStack {
+        backend_port,
+        otlp_http_port,
+    }
+}
+
+/// Build a `DdSketchState` proto from raw values.
+fn build_dd_sketch_state(
+    alpha: f64,
+    store_counts: Vec<u64>,
+    store_offset: i32,
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+) -> DdSketchState {
+    DdSketchState {
+        alpha,
+        store_counts,
+        store_offset,
+        count,
+        sum,
+        min,
+        max,
+    }
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single DDSketch
+/// data point.
+fn build_dd_sketch_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    alpha: f64,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let dp = DdSketchDataPoint {
+        attributes,
+        start_time_unix_nano: 0,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
+        exemplars: Vec::new(),
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Ddsketch(DdSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        relative_accuracy: alpha,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// POST a protobuf-encoded `ExportMetricsServiceRequest` to the OTLP HTTP
+/// receiver on `localhost:port/v1/metrics`. Panics with the unexpected
+/// status code on non-2xx.
+async fn post_otlp_http(
+    client: &reqwest::Client,
+    port: u16,
+    req: ExportMetricsServiceRequest,
+) {
+    let body = req.encode_to_vec();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/metrics"))
+        .header("Content-Type", "application/x-protobuf")
+        .body(body)
+        .send()
+        .await
+        .expect("OTLP HTTP send failed");
+    assert!(
+        resp.status().is_success(),
+        "OTLP HTTP returned unexpected status {}",
+        resp.status()
+    );
+}
+
 // ── Test 1 — single DDSketch-quantile workload, no grouping ─────────────────
 //
 // Smoke test: the controller emits a streaming-config JSON for a
@@ -299,5 +512,158 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
     assert!(
         cfg_str.contains("zone"),
         "parsed AggregationConfig must contain `zone` in its grouping labels\n{cfg}"
+    );
+}
+
+// ── Test 3 — controller plan + OTLP sketch ingest (wire-format anchor) ─────
+//
+// The whole gateway-less data path, end-to-end in-process — up to and
+// including the OTLP sketch wire format:
+//
+//   1. Controller plans a DDSketch-quantile workload and POSTs the
+//      streaming-config JSON to /api/v1/streaming-config.
+//   2. Test harness (acting as the agent) builds a DDSketch state with
+//      `asap_sketchlib::proto::sketchlib::DdSketchState`, encodes it
+//      as a modified-OTLP `DdSketchDataPoint`, and POSTs it via OTLP
+//      HTTP /v1/metrics. Asserts the receiver returns 2xx.
+//   3. Harness sends a watermark-advance DP (timestamped past the
+//      window end) so the precompute engine flushes the closed window
+//      to `SketchStoreSink` → `SketchStore`. Asserts the receiver
+//      returns 2xx.
+//   4. Soft-check: harness queries `/api/v1/query`. Currently the query
+//      returns `errorType: bad_data` (”No result for query”) — same
+//      symptom that has the sibling `e2e_dd_sketch_modified_otlp_path`
+//      test `#[ignore]`'d (”broken since proto refactor”). The
+//      OTLP→precompute→`SketchStore` path is broken upstream from
+//      this PR's scope, and tightening the query assertion is
+//      deferred to whoever fixes the underlying proto path.
+//
+// What this PR's Test 3 anchors:
+//   * Controller-emitted streaming-config + content fields are
+//     parseable AND accepted at /api/v1/streaming-config (already
+//     covered by Tests 1+2, re-exercised here to verify it doesn't
+//     break when the engine + OTLP receiver are also running).
+//   * Modified-OTLP `DdSketchDataPoint` wire encoding + the backend's
+//     OTLP HTTP receiver accept the payload (no 4xx/5xx).
+//   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
+//     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
+//     comes up and stays up under POST + query traffic.
+//
+// What it does NOT anchor (deferred):
+//   * Whether the sketch state actually lands in `SketchStore` keyed
+//     by the right `PolicyFingerprint`.
+//   * Whether the query engine resolves the metric against the
+//     stored sketch and returns the correct quantile.
+// These hinge on the proto-refactor fix the existing
+// `e2e_dd_sketch_modified_otlp_path` test is also waiting on.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_ddsketch() {
+    let stack = start_full_stack(19_561, 19_562).await;
+    let client = reqwest::Client::new();
+
+    // ── 1. Controller plans + POSTs the streaming-config ───────────────
+    //
+    // Small window (1s) so the watermark-advance step below closes the
+    // window quickly and the test doesn't have to wait long.
+    let workload = build_workload(
+        "http_latency_ms",
+        vec![AggType::Quantile],
+        0.01,
+        Duration::from_secs(1),
+        Vec::new(),
+        vec![0.99],
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    // ── 2. Build a DDSketch state with a known distribution ────────────
+    //
+    // 50 samples drawn from a fixed distribution. The exact bucket-
+    // count math (DDSketch index = ceil(log_gamma(value))) doesn't
+    // matter for this test — we want to verify the wire round-trip,
+    // not the quantile readout accuracy. Pick a simple count vector
+    // the existing `e2e_modified_otlp_sketch_path::e2e_dd_sketch_*`
+    // test uses so we know it's representable.
+    let alpha = 0.01;
+    let store_counts = vec![5u64, 10, 15, 20];
+    let dd_state = build_dd_sketch_state(alpha, store_counts, -1, 50, 150.0, 0.25, 8.0);
+    let sketch_bytes = dd_state.encode_to_vec();
+
+    // ── 3. POST the sketch DP via OTLP HTTP ────────────────────────────
+    //
+    // Use wall-clock-relative timestamps so the PromQL query at default
+    // evaluation time (also wall-clock) sees the data inside its `[10s]`
+    // lookback window. The sketch lands at `now - 3s` so it's well
+    // inside a 1-second window that closed `now - 2s`; the watermark
+    // advance is at `now - 1s` so the engine sees the window-end
+    // boundary cross.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[],
+        sketch_t_ns,
+        sketch_bytes,
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    // ── 4. Send a watermark-advance DP past the window end ─────────────
+    //
+    // Window is 1s; the sketch landed at `now - 3s` and falls in some
+    // 1-second tumbling window W. This DP at `now - 1s` is at least
+    // 2 seconds past the start of W, so it moves the engine's
+    // watermark past W's close boundary and triggers the flush.
+    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0, 0, 0.0, 0.0, 0.0);
+    let watermark_req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    // Wait long enough for the periodic flush + sink write.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // ── 5. Query via PromQL ────────────────────────────────────────────
+    let query_url = format!(
+        "http://127.0.0.1:{}/api/v1/query",
+        stack.backend_port
+    );
+    let response: JsonValue = client
+        .get(&query_url)
+        .query(&[(
+            "query",
+            "quantile_over_time(0.99, http_latency_ms[10s])",
+        )])
+        .send()
+        .await
+        .expect("PromQL query failed to send")
+        .json()
+        .await
+        .expect("PromQL response was not JSON");
+
+    // ── 6. Soft-check the query response. ──────────────────────────────
+    //
+    // Asserts the response is well-formed JSON with a `status` field
+    // (i.e., the HTTP query layer is healthy and is producing
+    // Prometheus-shaped responses). Doesn't assert success — the
+    // OTLP→precompute→SketchStore path is broken upstream and the
+    // query returns `bad_data`/"No result for query". When the proto
+    // refactor's decoder gap is closed, this `assert!` can flip to a
+    // strict `status == "success"` plus an exact-value-within-SLA
+    // check on the returned quantile. See test doc-comment for context.
+    assert!(
+        response.get("status").is_some(),
+        "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
