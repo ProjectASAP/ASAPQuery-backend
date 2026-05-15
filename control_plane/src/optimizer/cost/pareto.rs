@@ -116,7 +116,6 @@ pub fn pareto_frontier(
         plan.agent_config.sketch_params = params;
         plan.agent_config.mode = mode;
         plan.agent_config.window_duration = window_duration;
-        plan.backend_config.merge_sketch_type = st.clone();
 
         // Apply delta decision using the cost table.
         apply_delta(st.clone(), &mut plan, workload, wc, &table);

@@ -206,16 +206,15 @@ impl MetricsRegistry {
             // a label value, doesn't need to be cryptographic.
             let mut hasher = DefaultHasher::new();
             // Cover the fields the planner actually changes per
-            // re-plan: agent sketch+mode+delta, backend merge+group_by,
-            // and valid_until (to catch refresh-only re-plans).
+            // re-plan: agent sketch+mode+delta+grouping, and valid_until
+            // (to catch refresh-only re-plans).
             format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
                 plan.agent_config.sketch_type,
                 plan.agent_config.mode,
                 plan.agent_config.delta_transmission,
                 plan.agent_config.window_duration,
-                plan.backend_config.merge_sketch_type,
-                plan.backend_config.group_by,
+                plan.agent_config.aggregate_by,
                 plan.valid_until,
             )
             .hash(&mut hasher);
@@ -451,10 +450,6 @@ mod tests {
                     data_sink: AgentDataSink::default(),
                 },
                 gateway_config: GatewayCollectorConfig { passthrough: true },
-                backend_config: BackendCollectorConfig {
-                    merge_sketch_type: sketch,
-                    group_by: vec![],
-                },
                 precompute: vec![],
                 valid_until: Utc::now() + chrono::Duration::seconds(valid_secs),
                 delta_decision: Default::default(),

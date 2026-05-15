@@ -509,10 +509,6 @@ mod tests {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            backend_config: BackendCollectorConfig {
-                merge_sketch_type: SketchType::DDSketch,
-                group_by: vec![],
-            },
             precompute: vec![],
             valid_until: Utc::now() + chrono::Duration::seconds(3600),
             delta_decision: DeltaDecision::default(),

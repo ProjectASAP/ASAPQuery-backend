@@ -248,7 +248,6 @@ impl CostModelPlanner {
             plan.agent_config.sketch_params = params;
             plan.agent_config.mode = mode;
             plan.agent_config.window_duration = window_duration;
-            plan.backend_config.merge_sketch_type = st.clone();
             apply_delta_decision_with(&mut plan, w, wc, &table);
             return plan;
         }
@@ -269,7 +268,6 @@ impl CostModelPlanner {
             trial.agent_config.sketch_params = params;
             trial.agent_config.mode = mode;
             trial.agent_config.window_duration = window_duration;
-            trial.backend_config.merge_sketch_type = st;
 
             let s = score_with(&trial, w, &table);
             if !s.meets_sla {
@@ -1041,10 +1039,6 @@ mod tests {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            backend_config: BackendCollectorConfig {
-                merge_sketch_type: st,
-                group_by: vec![],
-            },
             precompute: vec![],
             valid_until: Utc::now(),
             delta_decision: DeltaDecision::default(),

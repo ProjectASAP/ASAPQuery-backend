@@ -344,9 +344,6 @@ impl RulesPlanner {
             .collect();
         label_matchers.sort();
 
-        let backend_sketch = sketch_type.clone();
-        let group_by = aggregate_by.clone();
-
         let valid_until = Utc::now() + chrono::Duration::seconds(self.valid_for.as_secs() as i64);
 
         CollectionPlan {
@@ -371,10 +368,6 @@ impl RulesPlanner {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            backend_config: BackendCollectorConfig {
-                merge_sketch_type: backend_sketch,
-                group_by,
-            },
             precompute: vec![],
             valid_until,
             delta_decision: DeltaDecision::default(),
@@ -414,10 +407,6 @@ impl RulesPlanner {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            backend_config: BackendCollectorConfig {
-                merge_sketch_type: SketchType::DDSketch,
-                group_by: vec![],
-            },
             precompute: vec![],
             valid_until,
             delta_decision: DeltaDecision::default(),
@@ -580,15 +569,6 @@ mod tests {
         assert!(
             plan.valid_until > Utc::now(),
             "valid_until should be in the future"
-        );
-    }
-
-    #[test]
-    fn backend_config_matches_sketch_type() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Quantile]));
-        assert_eq!(
-            plan.backend_config.merge_sketch_type,
-            plan.agent_config.sketch_type
         );
     }
 
