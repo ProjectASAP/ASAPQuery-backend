@@ -1395,7 +1395,7 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
         "aggregationSubType": "",
         "metric": agg.metric_name,
         "labels": {
-            "grouping": Vec::<String>::new(),
+            "grouping": agg.grouping,
             "rollup": Vec::<String>::new(),
             "aggregated": Vec::<String>::new(),
         },
@@ -1744,6 +1744,7 @@ mod tests {
                     sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
                     window_secs: 60,
                     spatial_filter: String::new(),
+                    grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
                 BackendAggregation {
@@ -1753,6 +1754,7 @@ mod tests {
                     sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
                     window_secs: 60,
                     spatial_filter: String::new(),
+                    grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
             ],
@@ -1808,6 +1810,7 @@ mod tests {
                     }),
                     window_secs: 60,
                     spatial_filter: String::new(),
+                    grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
                 BackendAggregation {
@@ -1817,6 +1820,7 @@ mod tests {
                     sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
                     window_secs: 60,
                     spatial_filter: String::new(),
+                    grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
                 },
             ],
@@ -1880,6 +1884,7 @@ mod tests {
                 sketch_params: params,
                 window_secs: 60,
                 spatial_filter: String::new(),
+                grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![BackendReadout {
@@ -2225,6 +2230,48 @@ mod tests {
         }
     }
 
+    /// Grouping labels surface under `labels.grouping` in the emitted
+    /// JSON. The L5 emitter itself leaves the list empty; `handle_plan`
+    /// patches it from `workload.group_by_labels` before posting, so
+    /// here we simulate that by setting `grouping` on the
+    /// `BackendAggregation` directly and assert the JSON round-trips.
+    #[test]
+    fn backend_json_emits_grouping_under_labels() {
+        let cfg = BackendStageConfig {
+            aggregations: vec![BackendAggregation {
+                aggregation_id: "agg0".into(),
+                metric_name: "http_latency_ms".into(),
+                sketch_kind: SketchKind::DDSketch,
+                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs: 30,
+                spatial_filter: String::new(),
+                grouping: vec!["zone".into(), "service".into()],
+                aggregation_input: AggregationInput::SketchEnvelope,
+            }],
+            readouts: vec![],
+        };
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let grouping = v["aggregations"][0]["labels"]["grouping"]
+            .as_array()
+            .expect("grouping array");
+        let names: Vec<&str> = grouping.iter().filter_map(|s| s.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["zone", "service"],
+            "labels.grouping must surface BackendAggregation.grouping verbatim\n{v}"
+        );
+        // The other label lists stay empty — the L5 controller doesn't
+        // yet emit rollup / aggregated.
+        assert!(v["aggregations"][0]["labels"]["rollup"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(v["aggregations"][0]["labels"]["aggregated"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
     /// Snapshot: aggregations + readouts together exhibit the
     /// id-aliasing the backend uses to wire readouts back to their
     /// producing aggregation. Pins the sort order + key names. Phase β
@@ -2242,6 +2289,7 @@ mod tests {
                 sketch_params: SketchParams::Kll(KllParams { k: 200 }),
                 window_secs: 60,
                 spatial_filter: String::new(),
+                grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![BackendReadout {
@@ -2284,6 +2332,7 @@ mod tests {
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
                 window_secs: 60,
                 spatial_filter: String::new(),
+                grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
             }],
             readouts: vec![],
@@ -2306,6 +2355,7 @@ mod tests {
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
                 window_secs: 60,
                 spatial_filter: String::new(),
+                grouping: Vec::new(),
                 aggregation_input: AggregationInput::Raw,
             }],
             readouts: vec![],

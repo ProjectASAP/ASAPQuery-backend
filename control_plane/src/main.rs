@@ -558,7 +558,25 @@ async fn handle_plan(
                                 Err(e) => warn!(error = %e, "emit_gateway_yaml failed"),
                             }
                         }
-                        crate::physical::colored_dag::StageConfig::Backend(be) => {
+                        crate::physical::colored_dag::StageConfig::Backend(mut be) => {
+                            // Patch grouping label names from the
+                            // workload spec. The typed L5 emitter
+                            // produces `BackendAggregation` with
+                            // `grouping: vec![]` because the canonical
+                            // L3 `QueryExpr::Aggregate.by` is
+                            // positional `ColumnId`s against a
+                            // synthesized schema that has no label
+                            // columns (open-set label naming is a
+                            // Step γ TODO in
+                            // `intent_algebra::column_resolution`).
+                            // `QueryWorkload.group_by_labels` carries
+                            // the names unambiguously, so we patch
+                            // them in here — every aggregation under
+                            // the same workload shares the same
+                            // grouping today.
+                            for agg in &mut be.aggregations {
+                                agg.grouping = workload.group_by_labels.clone();
+                            }
                             // Phase C: post the typed L5 streaming-config
                             // JSON to ASAPQuery-backend via the shared
                             // BackendClient when configured. Without a
