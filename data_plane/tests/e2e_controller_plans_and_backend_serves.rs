@@ -566,12 +566,21 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     //
     // Small window (1s) so the watermark-advance step below closes the
     // window quickly and the test doesn't have to wait long.
+    //
+    // `group_by_labels: ["service"]` is critical: the OTLP DP we send
+    // below carries `service` as an attribute (required to avoid the
+    // receiver's "invalid wire shape" drop). The backend's
+    // `derive_sketch_policy_fp` matches policies on
+    // `(metric, sketch_kind, config, group_by_keys)` — so the
+    // streaming-config's grouping MUST include "service" or the
+    // fingerprint won't match and the registered sid stays orphaned
+    // from any policy.
     let workload = build_workload(
         "http_latency_ms",
         vec![AggType::Quantile],
         0.01,
         Duration::from_secs(1),
-        Vec::new(),
+        vec!["service".to_string()],
         vec![0.99],
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
@@ -605,9 +614,15 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
+    // The OTLP DP MUST carry at least one attribute (or a known sid).
+    // With both empty/zero, the receiver hits the "invalid wire shape"
+    // branch in `route_modified_otlp_sketches_to_precompute` (per the
+    // comment block at otel.rs:926 — `(sid=0, no attrs)` is dropped).
+    // The agent normally tags DPs with the workload's `aggregate_by`
+    // values; mirror that here with a `service` attribute.
     let req = build_dd_sketch_export(
         "http_latency_ms",
-        &[],
+        &[("service", "e2e-test")],
         sketch_t_ns,
         sketch_bytes,
         alpha,
@@ -623,7 +638,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0, 0, 0.0, 0.0, 0.0);
     let watermark_req = build_dd_sketch_export(
         "http_latency_ms",
-        &[],
+        &[("service", "e2e-test")],
         watermark_t_ns,
         watermark_state.encode_to_vec(),
         alpha,
@@ -653,14 +668,37 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
 
     // ── 6. Soft-check the query response. ──────────────────────────────
     //
-    // Asserts the response is well-formed JSON with a `status` field
-    // (i.e., the HTTP query layer is healthy and is producing
-    // Prometheus-shaped responses). Doesn't assert success — the
-    // OTLP→precompute→SketchStore path is broken upstream and the
-    // query returns `bad_data`/"No result for query". When the proto
-    // refactor's decoder gap is closed, this `assert!` can flip to a
-    // strict `status == "success"` plus an exact-value-within-SLA
-    // check on the returned quantile. See test doc-comment for context.
+    // Status field must exist (HTTP layer is healthy). Strict
+    // `status == "success"` is still deferred. Investigation done in
+    // the wake of #249's L5-walk fix surfaced a deeper gap further
+    // along the query path:
+    //
+    //   * The OTLP DP MUST carry at least one attribute (or known
+    //     sid). With both empty, the receiver hits the
+    //     "invalid wire shape" drop in
+    //     `route_modified_otlp_sketches_to_precompute` (otel.rs:926
+    //     comment block — `(sid=0, no attrs)` is dropped). Test now
+    //     attaches `service="e2e-test"` to the DP.
+    //
+    //   * The sketch's group_by_keys (derived from `dp.attrs.keys()`)
+    //     MUST exactly match the streaming-config policy's
+    //     `grouping_labels` for `find_policy_by_content` to bind
+    //     `policy_fp`. The match is **strict** at ingest
+    //     (asap_tier_analysis.rs:525) but **subset** at query time
+    //     (asap_tier_analysis.rs:587) — that asymmetry is intentional
+    //     (ingest needs uniqueness; queries can re-aggregate down).
+    //     Test now uses `group_by_labels: ["service"]` to align.
+    //
+    //   * After both fixes, sketches DO reach `SketchStore` (the
+    //     runtime-info `earliest_timestamp_per_sid` map is populated)
+    //     but the query still returns `bad_data`/"No result for
+    //     query". The remaining gap is between
+    //     `SketchStore::instances_matching` and the engine's reducer
+    //     dispatch — likely an asymmetry between the engine's
+    //     candidate.required_capability and the policy_capability
+    //     lookup, OR a sid-by-policy_fp reverse-index lookup failure.
+    //     Untangling that requires deeper engine-path tracing not
+    //     covered by this PR.
     assert!(
         response.get("status").is_some(),
         "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
