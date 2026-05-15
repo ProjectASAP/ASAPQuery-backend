@@ -434,6 +434,31 @@ impl Emitter for ThreeStageEmitter {
         // through.
         let mut sketch_agg_ids: HashMap<usize, String> = HashMap::new();
 
+        // Pass 0 — populate edge facts (source_metric, window_secs,
+        // label_filters) from every `Logical(qe) @ Edge` node before
+        // anything else reads them. Necessary because the DAG's
+        // depth-first node order puts SketchAgg BEFORE its
+        // `Logical(Window{Scan})` child, but the SketchAgg arm of
+        // Pass 2 captures `edge.source_metric` / `edge.window_secs` /
+        // `edge.label_filters` *at push time* when building
+        // `BackendAggregation` (and `EdgeSketchProcessor`'s
+        // `spatial_filter` etc.). Without this pre-pass, those fields
+        // see `None` because the child Logical hasn't been visited
+        // yet — and the resulting `BackendAggregation` ships with an
+        // empty `metric_name` / `window_secs: 0` / `spatial_filter:
+        // ""`, which the backend's `AggregationConfig::from_yaml_data`
+        // rejects on `Missing metric` / `Missing windowSize`.
+        //
+        // `extract_edge_facts` is idempotent on `source_metric` and
+        // `window_secs` (only sets if `None`) and dedupes
+        // `label_filters` — so the Pass 2 arm that also calls it
+        // remains correct (no double-counting).
+        for node in &dag.nodes {
+            if let (PhysicalExpr::Logical(qe), StageId::Edge) = (&node.expr, node.stage) {
+                extract_edge_facts(qe, &mut edge);
+            }
+        }
+
         // Pass 1 — assign deterministic aggregation_ids to every
         // SketchAgg up-front so SketchMerge / SketchEstimate emission
         // (pass 2) can resolve them regardless of node-table order.

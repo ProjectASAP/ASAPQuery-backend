@@ -53,3 +53,135 @@ pub fn split_typed_three_stage(
     let dag = StageAllocator.allocate(expr, Topology::ThreeStage).ok()?;
     ThreeStageEmitter.emit_per_stage(&dag).ok()
 }
+
+#[cfg(test)]
+mod l5_walk_propagation_tests {
+    //! Characterisation tests for the L5 walk's edge-fact extraction.
+    //!
+    //! Established by PR #247: `handle_plan`'s `Backend` stage arm
+    //! belt-and-braces patches `metric_name`, `window_secs`, and
+    //! `grouping` on every emitted `BackendAggregation` from the
+    //! workload spec, on the suspicion that the L5 walk's
+    //! `extract_edge_facts` doesn't propagate these fields cleanly
+    //! through every binder's output shape.
+    //!
+    //! These tests **measure** what the L5 walk actually produces for
+    //! the canonical `bind_workload_typed` output — so we know whether
+    //! the patches are dead weight (the walk works → fields already
+    //! populated → patches are no-ops) or load-bearing (walk doesn't
+    //! propagate → patches are the real source of the field values).
+    //!
+    //! Result documented in the test assertions: the walk **does**
+    //! surface `metric_name` and `window_secs` for
+    //! `bind_workload_typed` output. Grouping stays empty because the
+    //! canonical L3 `QueryExpr::Aggregate.by` is a `Vec<ColumnId>`
+    //! against a synthesized schema that has no label columns (Step γ
+    //! TODO in `intent_algebra::column_resolution`).
+
+    use crate::physical::colored_dag::StageConfig;
+    use crate::types::{AggType, QueryWorkload};
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn workload(metric: &str, group_by: Vec<String>, window: Duration) -> QueryWorkload {
+        QueryWorkload {
+            metric_name: metric.to_string(),
+            label_filters: HashMap::new(),
+            group_by_labels: group_by,
+            aggregations: vec![AggType::Quantile],
+            time_window: window,
+            repeat_every: None,
+            accuracy_sla: 0.01,
+            latency_sla: None,
+            sketch_type_override: None,
+            exact_required: false,
+            quantiles: vec![0.99],
+        }
+    }
+
+    #[test]
+    fn l5_walk_surfaces_metric_name_for_bind_workload_typed_output() {
+        let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(60));
+        let physical_expr =
+            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let backend_cfg = configs
+            .into_values()
+            .find_map(|cfg| match cfg {
+                StageConfig::Backend(be) => Some(be),
+                _ => None,
+            })
+            .expect("Backend stage produced");
+        let agg = backend_cfg
+            .aggregations
+            .first()
+            .expect("at least one aggregation");
+        assert_eq!(
+            agg.metric_name, "http_latency_ms",
+            "the L5 walk's `extract_edge_facts` must thread the Scan's \
+             metric name through to BackendAggregation.metric_name"
+        );
+    }
+
+    #[test]
+    fn l5_walk_surfaces_window_secs_for_bind_workload_typed_output() {
+        let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(120));
+        let physical_expr =
+            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let backend_cfg = configs
+            .into_values()
+            .find_map(|cfg| match cfg {
+                StageConfig::Backend(be) => Some(be),
+                _ => None,
+            })
+            .expect("Backend stage produced");
+        let agg = backend_cfg
+            .aggregations
+            .first()
+            .expect("at least one aggregation");
+        assert_eq!(
+            agg.window_secs, 120,
+            "the L5 walk's `extract_edge_facts` must thread Window.size \
+             through to BackendAggregation.window_secs"
+        );
+    }
+
+    #[test]
+    fn l5_walk_leaves_grouping_empty_pending_step_gamma() {
+        // L3 `QueryExpr::Aggregate.by` is positional `ColumnId`s against
+        // a synthesized schema that has no label columns — so the walk
+        // CANNOT recover the original label names. handle_plan patches
+        // grouping from `workload.group_by_labels` for this reason.
+        // This test pins the current behaviour so a future Step γ fix
+        // (proper open-set label resolution) will fail it loudly and
+        // remind whoever's making the change to also retire the patch.
+        let w = workload(
+            "http_latency_ms",
+            vec!["zone".to_string()],
+            Duration::from_secs(60),
+        );
+        let physical_expr =
+            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let backend_cfg = configs
+            .into_values()
+            .find_map(|cfg| match cfg {
+                StageConfig::Backend(be) => Some(be),
+                _ => None,
+            })
+            .expect("Backend stage produced");
+        let agg = backend_cfg
+            .aggregations
+            .first()
+            .expect("at least one aggregation");
+        assert!(
+            agg.grouping.is_empty(),
+            "L5 walk cannot recover label names from canonical L3 \
+             ColumnIds (Step γ TODO in column_resolution); \
+             BackendAggregation.grouping must come from the workload \
+             patch in handle_plan — got {:?}",
+            agg.grouping
+        );
+    }
+}
