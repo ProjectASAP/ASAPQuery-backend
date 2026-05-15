@@ -23,11 +23,11 @@ use tracing::{info, warn};
 use crate::backend_client::{push_or_log, BackendClient};
 use crate::emit::{
     build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
-    extend_edge_with_demo_plumbing, generate_agent_collector_config, generate_backend_collector_config,
+    extend_edge_with_demo_plumbing, generate_agent_collector_config,
     generate_streaming_config_yaml, AgentRuntime, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
-use crate::opamp::{AgentRole, OpampServer, RemoteConfig};
+use crate::opamp::{OpampServer, RemoteConfig};
 use crate::optimizer::baseline::BaselinePlanner;
 use crate::optimizer::{cost as cost_model, rules};
 use crate::physical::stage_split;
@@ -357,18 +357,6 @@ impl Replanner {
                 self.opamp.push(&agent_id, cfg.clone()).await;
             }
         }
-        if let Ok(yaml) = generate_backend_collector_config(&plan.backend_config, &self.opamp_endpoint) {
-            self.opamp
-                .push_to_role(
-                    AgentRole::Backend,
-                    RemoteConfig {
-                        config_hash: short_hash(&yaml),
-                        yaml,
-                    },
-                )
-                .await;
-        }
-
         // Push the ASAPQuery-backend StreamingConfig YAML via HTTP if a
         // backend client is configured. This is the producer side of the
         // ASAPQuery PR E hot-reload contract: the backend receives the
