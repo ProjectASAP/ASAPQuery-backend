@@ -44,23 +44,28 @@ use serde_json::Value as JsonValue;
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use asap_otel_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use asap_otel_proto::tonic::metrics::v1::{
-    metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, Metric, ResourceMetrics,
+    metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, HllSketch, HllSketchDataPoint,
+    HllSketchEncoding, KllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::DdSketchState;
+use asap_sketchlib::proto::sketchlib::{
+    DdSketchState, HllVariant as ProtoHllVariant, HyperLogLogState, KllState,
+};
+use control_plane::types::SketchType;
 use prost::Message;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Build a `QueryWorkload` with the given parameters. Mirrors the
 /// `WorkloadAnalyzer` output shape but constructed directly for tests.
-fn build_workload(
+fn build_workload_with_override(
     metric_name: &str,
     aggregations: Vec<AggType>,
     accuracy_sla: f64,
     time_window: Duration,
     group_by_labels: Vec<String>,
     quantiles: Vec<f64>,
+    sketch_type_override: Option<SketchType>,
 ) -> QueryWorkload {
     QueryWorkload {
         metric_name: metric_name.to_string(),
@@ -71,10 +76,30 @@ fn build_workload(
         repeat_every: None,
         accuracy_sla,
         latency_sla: None,
-        sketch_type_override: None,
+        sketch_type_override,
         exact_required: false,
         quantiles,
     }
+}
+
+/// Convenience wrapper — no sketch_type_override.
+fn build_workload(
+    metric_name: &str,
+    aggregations: Vec<AggType>,
+    accuracy_sla: f64,
+    time_window: Duration,
+    group_by_labels: Vec<String>,
+    quantiles: Vec<f64>,
+) -> QueryWorkload {
+    build_workload_with_override(
+        metric_name,
+        aggregations,
+        accuracy_sla,
+        time_window,
+        group_by_labels,
+        quantiles,
+        None,
+    )
 }
 
 /// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
@@ -372,6 +397,131 @@ fn build_dd_sketch_export(
                         data_points: vec![dp],
                         aggregation_temporality: 0,
                         relative_accuracy: alpha,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Build a `KllState` proto carrying the given retained items. Level
+/// metadata is not populated — the decoder replays items via `update()`
+/// regardless, per the lossy-reconstruction strategy documented on
+/// `DatasketchesKLLAccumulator::from_sketchlib_proto_bytes`.
+fn build_kll_state(k: u32, items: Vec<f64>) -> KllState {
+    KllState {
+        k,
+        m: 8,
+        num_levels: 0,
+        levels: Vec::new(),
+        items,
+        coin: None,
+    }
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single KLL DP.
+fn build_kll_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    k: u32,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let dp = KllSketchDataPoint {
+        attributes,
+        start_time_unix_nano: 0,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: KllSketchEncoding::Proto as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Kllsketch(KllSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        k,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Build a `HyperLogLogState` proto with `1 << precision` register bytes.
+fn build_hll_state(precision: u32, registers: Vec<u8>) -> HyperLogLogState {
+    HyperLogLogState {
+        variant: ProtoHllVariant::Regular as i32,
+        precision,
+        registers,
+        hip_kxq0: 0.0,
+        hip_kxq1: 0.0,
+        hip_est: 0.0,
+    }
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single HLL DP.
+fn build_hll_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    precision: u32,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let dp = HllSketchDataPoint {
+        attributes,
+        start_time_unix_nano: 0,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: HllSketchEncoding::Proto as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Hllsketch(HllSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        precision,
                     })),
                 }],
                 schema_url: String::new(),
@@ -717,6 +867,204 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
          process_via_simple_engine. The legacy handle_query path can't read \
          sketch-backed sids (#252), but the fallback should now reach them via \
          the trait-dispatch path. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
+
+// ── Test 4 — full roundtrip with KLL ────────────────────────────────────────
+//
+// Same shape as Test 3 but the workload pins KLL via
+// `sketch_type_override: Some(SketchType::KLL)`. The OTLP DP carries
+// a `KllSketchDataPoint` with `KllState`; the engine's reducer must
+// dispatch to the KLL quantile readout. Verifies the trait-dispatch
+// fallback handles the KLL family identically to DDSketch.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_kll() {
+    let stack = start_full_stack(19_563, 19_564).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "request_size_bytes",
+        vec![AggType::Quantile],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        vec![0.5],
+        Some(SketchType::KLL),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"],
+        "DatasketchesKLL",
+        "controller must emit KLL aggregationType for SketchType::KLL override\n{streaming_config_json}"
+    );
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let k = 200u32;
+    let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+    let kll_state = build_kll_state(k, items);
+    let sketch_bytes = kll_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_kll_export(
+        "request_size_bytes",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+        k,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_kll_state(k, Vec::new());
+    let watermark_req = build_kll_export(
+        "request_size_bytes",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        k,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[(
+            "query",
+            "quantile_over_time(0.5, request_size_bytes[10s])",
+        )])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "KLL quantile query did not succeed:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
+
+// ── Test 5 — full roundtrip with HLL (cardinality) ──────────────────────────
+//
+// HLL backs the cardinality readout — a fundamentally different query
+// shape from quantile_over_time. The workload pins HLL via
+// `sketch_type_override: Some(SketchType::HLL)`. The OTLP DP carries
+// a `HllSketchDataPoint` with `HyperLogLogState`.
+//
+// **Currently ignored.** The streaming-config registration succeeds and
+// the sketch state lands in `SketchStore` (verifiable via
+// `runtime_info.earliest_timestamp_per_sid`), but the PromQL query path
+// for HLL needs a query shape the analyzer recognises as
+// `Capability::CardinalityApprox`. `count(metric)` doesn't map
+// straightforwardly today — `resolve_sketch_metric_alias` only
+// rewrites `count(metric)` → `count(metric_hll)` when the bare metric
+// is ABSENT from streaming-config (a deploy-time aliasing tactic),
+// but here we register the bare metric explicitly so the alias path
+// is a no-op. The right canonical PromQL for HLL cardinality on a
+// registered bare metric is an open analyzer question — track in a
+// follow-up. Test stays here as a smoke check that the OTLP ingest
+// path accepts HLL DPs (assertable via removing the `#[ignore]` and
+// inspecting the runtime_info diagnostic).
+
+#[ignore = "HLL query path needs analyzer support for the cardinality \
+            readout on bare-registered metrics — see test doc"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_hll() {
+    let stack = start_full_stack(19_565, 19_566).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "unique_users_per_min",
+        vec![AggType::Cardinality],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::HLL),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"], "HLL",
+        "controller must emit HLL aggregationType for SketchType::HLL override\n{streaming_config_json}"
+    );
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let precision = 14u32;
+    let num_registers = 1usize << precision;
+    let mut registers = vec![0u8; num_registers];
+    // Set a few non-zero registers so the cardinality estimate is
+    // non-trivial. Indices must fit within `num_registers` (2^14 = 16384).
+    registers[0] = 5;
+    registers[100] = 7;
+    registers[1_000] = 3;
+    registers[15_000] = 4;
+    let hll_state = build_hll_state(precision, registers);
+    let sketch_bytes = hll_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_hll_export(
+        "unique_users_per_min",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+        precision,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_hll_state(precision, vec![0u8; num_registers]);
+    let watermark_req = build_hll_export(
+        "unique_users_per_min",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        precision,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // PromQL `count(metric)` over an HLL-backed agg is the cardinality
+    // readout per `resolve_sketch_metric_alias`'s `QueryShape::Count`
+    // → `_hll` mapping. We emit / register the metric with no `_hll`
+    // suffix; the analyzer / alias resolver treats the bare-present
+    // case as a no-rename (it's locally known) so the lookup hits.
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "count(unique_users_per_min)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "HLL cardinality query did not succeed:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
