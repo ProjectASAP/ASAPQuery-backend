@@ -519,12 +519,6 @@ pub struct GatewayCollectorConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct BackendCollectorConfig {
-    pub merge_sketch_type: SketchType,
-    pub group_by: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct PrecomputeJob {
     pub query_expr: String,
     pub granularity: Duration,
@@ -570,7 +564,6 @@ impl StageResourceBudgets {
 pub struct CollectionPlan {
     pub agent_config: AgentCollectorConfig,
     pub gateway_config: GatewayCollectorConfig,
-    pub backend_config: BackendCollectorConfig,
     pub precompute: Vec<PrecomputeJob>,
     pub valid_until: DateTime<Utc>,
     /// Resolved delta transmission decision and rationale.
