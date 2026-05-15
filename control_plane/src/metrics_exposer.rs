@@ -459,7 +459,6 @@ mod tests {
                 valid_until: Utc::now() + chrono::Duration::seconds(valid_secs),
                 delta_decision: Default::default(),
                 transmission_cost_summary: Default::default(),
-                staged_plan: None,
             }
         }
 

@@ -45,7 +45,6 @@ use optimizer::baseline::BaselinePlanner;
 use optimizer::cost::pareto::{ObjectiveWeights, pareto_frontier, select_best};
 use optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStore};
 use optimizer::cost::online as online_cost_model;
-use physical::stage_split::split_expr_by_stage;
 use optimizer::cost::tco;
 use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
@@ -734,7 +733,6 @@ async fn handle_plan(
         "agents_notified":     agents.len(),
         "precompute_jobs":     plan.precompute.len(),
         "delta_decision":      plan.delta_decision,
-        "staged_plan":         plan.staged_plan,
         "transmission_costs": {
             "raw_bytes_per_sec":                   cost.raw_bytes_per_sec,
             "sketch_full_bytes_per_sec":            cost.sketch_full_bytes_per_sec,
