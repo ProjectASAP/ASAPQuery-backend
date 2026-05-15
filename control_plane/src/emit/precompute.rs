@@ -19,20 +19,16 @@ pub fn should_precompute(w: &QueryWorkload) -> bool {
     }
 }
 
-/// Builds the list of precompute jobs for a plan. Returns an empty Vec if the
-/// workload does not meet the precompute eligibility criterion.
+/// Builds the list of precompute jobs for a workload. Returns an empty Vec
+/// when the workload does not meet the precompute eligibility criterion.
 ///
-/// **SP-9**: when `plan.staged_plan` is `Some` and the precompute sub-plan is
-/// active, the job's `query_expr` is taken from the AST-derived PromQL
-/// serialisation ([`PrecomputeSubPlan::query_expr`]) rather than the hardcoded
-/// `quantile_over_time(0.99, …)` template.  This allows the precompute engine
-/// to evaluate the actual upper sub-tree (e.g. `topk(10, count_over_time(…))`).
-///
-/// When no `staged_plan` is present (SP-3 flat path), the legacy
-/// `build_query_expr()` template is used as the fallback.
+/// The job's `query_expr` is the `build_query_expr()` template derived from
+/// the workload's aggregation / metric / filter fields. (An earlier SP-9
+/// path took `query_expr` from `StagedPlan.precompute.query_expr` instead —
+/// but that field was never populated, so the template was always the
+/// effective output; the dead path was dropped with the legacy L5.)
 pub fn build_precompute_jobs(
     w: &QueryWorkload,
-    plan: &CollectionPlan,
     backend_addr: &str,
 ) -> Vec<PrecomputeJob> {
     if !should_precompute(w) {
@@ -40,16 +36,8 @@ pub fn build_precompute_jobs(
     }
     let granularity = w.repeat_every.unwrap(); // safe: should_precompute checked it
 
-    // SP-9: use the staged plan's PromQL when available and non-empty.
-    let query_expr = plan
-        .staged_plan
-        .as_ref()
-        .filter(|sp| sp.precompute.active && !sp.precompute.query_expr.is_empty())
-        .map(|sp| sp.precompute.query_expr.clone())
-        .unwrap_or_else(|| build_query_expr(w));
-
     vec![PrecomputeJob {
-        query_expr,
+        query_expr: build_query_expr(w),
         granularity,
         sketch_source: backend_addr.to_string(),
         store_path: build_store_path(w),
@@ -191,38 +179,6 @@ mod tests {
         }
     }
 
-    fn dummy_plan() -> CollectionPlan {
-        CollectionPlan {
-            agent_config: AgentCollectorConfig {
-                output_mode: OutputMode::Sketch,
-                sketch_type: SketchType::DDSketch,
-                sketch_params: Default::default(),
-                aggregate_by: vec![],
-                label_matchers: vec![],
-                window_duration: None,
-                mode: ProcessorMode::Batch,
-                enable_self_monitoring: true,
-                transmit_sketch: true,
-                drop_original: true,
-                delta_transmission: false,
-                delta_threshold: 0.0,
-                enable_series_id: true,
-                series_id_ttl_secs: 0,
-                data_sink: AgentDataSink::default(),
-            },
-            gateway_config: GatewayCollectorConfig { passthrough: true },
-            backend_config: BackendCollectorConfig {
-                merge_sketch_type: SketchType::DDSketch,
-                group_by: vec![],
-            },
-            precompute: vec![],
-            valid_until: chrono::Utc::now(),
-            delta_decision: DeltaDecision::default(),
-            transmission_cost_summary: TransmissionCostSummary::default(),
-            staged_plan: None,
-        }
-    }
-
     #[test]
     fn should_precompute_true_when_repeat_lt_latency() {
         assert!(should_precompute(&w(
@@ -251,7 +207,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_jobs(&workload, &dummy_plan(), "backend:4317");
+        let jobs = build_precompute_jobs(&workload, "backend:4317");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].sketch_source, "backend:4317");
         assert_eq!(jobs[0].granularity, Duration::from_secs(60));
@@ -264,7 +220,7 @@ mod tests {
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(60)),
         );
-        let jobs = build_precompute_jobs(&workload, &dummy_plan(), "backend:4317");
+        let jobs = build_precompute_jobs(&workload, "backend:4317");
         assert!(jobs.is_empty());
     }
 
@@ -274,7 +230,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_jobs(&workload, &dummy_plan(), "backend:4317");
+        let jobs = build_precompute_jobs(&workload, "backend:4317");
         assert!(jobs[0].store_path.contains("latency"));
         assert!(jobs[0].store_path.contains("5m"));
     }
@@ -286,7 +242,7 @@ mod tests {
             Some(Duration::from_secs(600)),
         );
         workload.aggregations = vec![AggType::Cardinality];
-        let jobs = build_precompute_jobs(&workload, &dummy_plan(), "backend:4317");
+        let jobs = build_precompute_jobs(&workload, "backend:4317");
         assert!(
             jobs[0].query_expr.contains("count_distinct_over_time"),
             "got: {}",

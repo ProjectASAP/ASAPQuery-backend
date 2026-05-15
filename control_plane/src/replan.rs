@@ -312,7 +312,7 @@ impl Replanner {
         // re-optimise with current EMA data.
         self.planner.reset(metric);
         let mut plan = self.planner.plan(&workload, Some(&wc));
-        plan.precompute = build_precompute_jobs(&workload, &plan, "backend:4317");
+        plan.precompute = build_precompute_jobs(&workload, "backend:4317");
         self.plan_store.set(metric, plan.clone());
 
         // Push agent config only to agents registered for this specific metric,
