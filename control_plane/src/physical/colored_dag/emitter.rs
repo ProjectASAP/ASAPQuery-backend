@@ -283,16 +283,34 @@ pub struct BackendStageConfig {
 }
 
 /// One sketch source the backend must accept.
+///
+/// `aggregation_id` is **internal plumbing only** — used by the emitter
+/// to thread `SketchAgg` → `BackendAggregation` → `BackendReadout`
+/// during the DAG walk. It is **not** emitted on the wire (PR 5 retired
+/// the controller-allocated id; the backend content-addresses identity
+/// via `PolicyFingerprint(u64)` derived from `metric_name`,
+/// `sketch_kind`, `sketch_params`, grouping labels, and `spatial_filter`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendAggregation {
-    /// Stable id matching the upstream gateway's `aggregation_id`.
+    /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,
+    /// Source metric the aggregation runs over (e.g.
+    /// `http_requests_total_latency_ms`). Required by the backend's
+    /// `AggregationConfig` parser.
+    pub metric_name: String,
     /// Sketch family.
     pub sketch_kind: SketchKind,
     /// Sketch parameters — the backend uses these to build its
     /// per-aggregation `Sketch` instance (KLL with the right `k`,
     /// DDSketch with the right `alpha`, etc.).
     pub sketch_params: SketchParams,
+    /// Tumbling window size in seconds. Required by the backend; the
+    /// parser rejects zero-window aggregations.
+    pub window_secs: u64,
+    /// Spatial filter (comma-joined `k=v` pairs from the edge's
+    /// `label_filters`). Empty string when no filter applies.
+    #[serde(default)]
+    pub spatial_filter: String,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
@@ -444,8 +462,11 @@ impl Emitter for ThreeStageEmitter {
                     });
                     backend_aggregations.push(BackendAggregation {
                         aggregation_id,
+                        metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: sketch_type.clone(),
                         sketch_params: params.clone(),
+                        window_secs: edge.window_secs.unwrap_or(0),
+                        spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
                         // Mode 1 — sketch built at edge, ships envelope.
                         aggregation_input: AggregationInput::SketchEnvelope,
                     });
@@ -518,8 +539,11 @@ impl Emitter for ThreeStageEmitter {
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
                         aggregation_id: aid,
+                        metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: family.clone(),
                         sketch_params: params.clone(),
+                        window_secs: edge.window_secs.unwrap_or(0),
+                        spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
                         // Mode 2 — backend builds sketch from raw OTLP.
                         aggregation_input: AggregationInput::Raw,
                     });
@@ -635,6 +659,15 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
             extract_edge_facts(right, edge);
         }
     }
+}
+
+/// Join `label_filters` into the comma-separated `k=v` form the backend's
+/// `AggregationConfig` spatial-filter parser accepts. Empty list → empty
+/// string (the backend reads that as "no spatial filter").
+pub(crate) fn spatial_filter_from_label_filters(filters: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = filters.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    parts.sort();
+    parts.join(",")
 }
 
 /// Children of `parent` per the DAG's edges table. The colouring walker

@@ -218,8 +218,11 @@ mod tests {
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: "agg0".to_string(),
+                metric_name: "test_metric".to_string(),
                 sketch_kind: SketchKind::DDSketch,
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs: 60,
+                spatial_filter: String::new(),
                 aggregation_input:
                     crate::physical::colored_dag::emitter::AggregationInput::SketchEnvelope,
             }],
