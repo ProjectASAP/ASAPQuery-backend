@@ -1408,24 +1408,29 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
 }
 
 /// Build one readout row in the backend streaming-config JSON.
+///
+/// `aggregation_id` is **intentionally omitted** — PR 5's content-
+/// addressing convention applies to readouts the same way it applies
+/// to aggregations (the controller-allocated string IDs are not on
+/// the wire). The backend's current `StreamingConfig::from_yaml_data`
+/// doesn't consume the `readouts` list at all; when it eventually
+/// does, the cross-reference to its source aggregation will be
+/// content-shaped (metric / sketch_kind / params), derived from the
+/// `aggregations` list by the same `PolicyFingerprint` recipe.
 fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
     match &r.op {
         EstimateOp::Quantile { q } => json!({
-            "aggregationId": r.aggregation_id,
             "op": "quantile",
             "q": q,
         }),
         EstimateOp::Cardinality => json!({
-            "aggregationId": r.aggregation_id,
             "op": "cardinality",
         }),
         EstimateOp::PointCount { key } => json!({
-            "aggregationId": r.aggregation_id,
             "op": "point_count",
             "key": key,
         }),
         EstimateOp::TopK { k } => json!({
-            "aggregationId": r.aggregation_id,
             "op": "topk",
             "k": k,
         }),
@@ -2298,19 +2303,22 @@ mod tests {
             }],
         };
         let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
-        // PR 5: `aggregationId` is no longer on the aggregation side — the
-        // backend derives identity from content (`PolicyFingerprint(u64)`
-        // over metric, sketch_kind, params, grouping, spatial_filter).
-        // Readouts still surface `aggregationId` because the backend's
-        // readout consumption path is unchanged (cleanup deferred — the
-        // current backend's `StreamingConfig::from_yaml_data` ignores the
-        // readouts list entirely, so this string is informational only).
+        // PR 5: `aggregationId` is no longer on the wire — neither on
+        // aggregations nor readouts. Identity on the aggregation side is
+        // content-derived (`PolicyFingerprint(u64)` over metric,
+        // sketch_kind, params, grouping, spatial_filter); the readout-
+        // to-aggregation cross-reference will be content-shaped too when
+        // the backend starts consuming `readouts` (today it's silently
+        // dropped by `StreamingConfig::from_yaml_data`).
         assert!(
             v["aggregations"][0].get("aggregationId").is_none(),
             "controller must not emit aggregationId on aggregations\n{v}"
         );
+        assert!(
+            v["readouts"][0].get("aggregationId").is_none(),
+            "controller must not emit aggregationId on readouts\n{v}"
+        );
         assert_eq!(v["aggregations"][0]["metric"], "phase_b_metric");
-        assert_eq!(v["readouts"][0]["aggregationId"], "phase_b_agg0");
         assert_eq!(v["aggregations"][0]["aggregationType"], "DatasketchesKLL");
         assert_eq!(v["aggregations"][0]["parameters"]["k"], 200);
         assert_eq!(v["readouts"][0]["op"], "quantile");
