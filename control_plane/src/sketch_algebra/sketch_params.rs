@@ -141,6 +141,15 @@ pub struct CmsParams {
     pub w: u32,
     /// Number of rows (depth). Drives the failure probability (≤ 2^−d).
     pub d: u32,
+    /// Whether to pair the CMS matrix with a heavy-hitter heap (CMS-Heap
+    /// pattern from Cormode & Muthukrishnan 2005). Set by
+    /// `bind_cms_with_heap_on_topk` when the planner picks CMS for a
+    /// TopK statistic. The streaming-config emit consults this flag to
+    /// pick `CountMinSketchWithHeap` vs `CountMinSketch` for the
+    /// `aggregationType` string the backend's `policy_capability` keys
+    /// on.
+    #[serde(default)]
+    pub with_heap: bool,
 }
 
 /// Count-Sketch parameters.
@@ -236,7 +245,7 @@ mod tests {
             SketchKind::Hll
         );
         assert_eq!(
-            SketchParams::Cms(CmsParams { w: 2048, d: 5 }).kind(),
+            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }).kind(),
             SketchKind::Cms
         );
         assert_eq!(
@@ -283,7 +292,7 @@ mod tests {
             SketchParams::Kll(KllParams { k: 200 }),
             SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
             SketchParams::Hll(HllParams { precision: 14 }),
-            SketchParams::Cms(CmsParams { w: 2048, d: 5 }),
+            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
             SketchParams::CountSketch(CountSketchParams {
                 w: 2048,
                 d: 5,

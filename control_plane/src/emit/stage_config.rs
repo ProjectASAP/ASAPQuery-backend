@@ -1190,7 +1190,7 @@ fn build_default_edge_processor_block(
             d: 5,
             with_heap: true,
         }),
-        SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+        SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
     };
     let synthetic = EdgeSketchProcessor {
         processor_name: sketch_kind_to_processor_name(kind).to_string(),
@@ -1391,7 +1391,7 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
         AggregationInput::Raw => "raw",
     };
     json!({
-        "aggregationType": sketch_kind_to_backend_type(&agg.sketch_kind),
+        "aggregationType": sketch_kind_to_backend_type(&agg.sketch_kind, &agg.sketch_params),
         "aggregationSubType": "",
         "metric": agg.metric_name,
         "labels": {
@@ -1437,18 +1437,29 @@ fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
     }
 }
 
-/// Map a `SketchKind` to the backend's `AggregationType::Display` string
-/// — the same mapping
+/// Map a `(SketchKind, SketchParams)` pair to the backend's
+/// `AggregationType::Display` string — the same mapping
 /// [`crate::config::asapquery_backend::map_sketch_type_to_agg_type`] uses
 /// (the strings must match `AggregationType::FromStr` in the backend's
 /// `promql_utilities::query_logics::enums`).
-fn sketch_kind_to_backend_type(kind: &SketchKind) -> &'static str {
-    match kind {
-        SketchKind::DDSketch => "DDSketch",
-        SketchKind::Kll => "DatasketchesKLL",
-        SketchKind::Hll => "HLL",
-        SketchKind::CountSketch => "CountSketch",
-        SketchKind::Cms => "CountMinSketch",
+///
+/// The params side promotes CMS / CountSketch to their `*WithHeap`
+/// variants when the planner-set `with_heap` flag is true (see
+/// `bind_cms_with_heap_on_topk` and `BindCountSketchOnTopK`). This
+/// is what lets the backend's `policy_capability` lookup return
+/// `FrequencyTopk(*WithHeap)` for heap-bearing aggregations — required
+/// for `topk(...)` queries to bind to the right sids.
+fn sketch_kind_to_backend_type(kind: &SketchKind, params: &SketchParams) -> &'static str {
+    match (kind, params) {
+        (SketchKind::DDSketch, _) => "DDSketch",
+        (SketchKind::Kll, _) => "DatasketchesKLL",
+        (SketchKind::Hll, _) => "HLL",
+        (SketchKind::CountSketch, SketchParams::CountSketch(p)) if p.with_heap => {
+            "CountSketchWithHeap"
+        }
+        (SketchKind::CountSketch, _) => "CountSketch",
+        (SketchKind::Cms, SketchParams::Cms(p)) if p.with_heap => "CountMinSketchWithHeap",
+        (SketchKind::Cms, _) => "CountMinSketch",
     }
 }
 
@@ -1621,7 +1632,7 @@ mod tests {
             (
                 SketchKind::Cms,
                 "countmin",
-                SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
             ),
         ] {
             let mut cfg = ddsketch_edge_cfg();
@@ -1646,7 +1657,7 @@ mod tests {
         cfg.sketch_processors[0] = EdgeSketchProcessor {
             processor_name: "countmin".to_string(),
             sketch_kind: SketchKind::Cms,
-            sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+            sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
             aggregation_id: "agg-cms".to_string(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
@@ -1822,7 +1833,7 @@ mod tests {
                     aggregation_id: "agg1".into(),
                     metric_name: "endpoint_hits".into(),
                     sketch_kind: SketchKind::Cms,
-                    sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+                    sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
                     window_secs: 60,
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
@@ -1850,8 +1861,13 @@ mod tests {
         assert_eq!(reads[1]["key"], "user_42");
 
         let aggs = v["aggregations"].as_array().unwrap();
-        assert_eq!(aggs[0]["aggregationType"], "CountSketch");
+        // CountSketch with `with_heap: true` promotes to
+        // `CountSketchWithHeap` — the backend's `policy_capability`
+        // maps that to `FrequencyTopk(CountSketchWithHeap)`, the only
+        // form the analyzer's `topk(...)` candidate binds against.
+        assert_eq!(aggs[0]["aggregationType"], "CountSketchWithHeap");
         assert_eq!(aggs[0]["parameters"]["with_heap"], true);
+        // CMS with `with_heap: false` stays plain `CountMinSketch`.
         assert_eq!(aggs[1]["aggregationType"], "CountMinSketch");
         assert_eq!(aggs[1]["parameters"]["w"], 4096);
     }
@@ -1874,7 +1890,7 @@ mod tests {
             SketchKind::DDSketch => SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
             SketchKind::Kll => SketchParams::Kll(KllParams { k: 200 }),
             SketchKind::Hll => SketchParams::Hll(HllParams { precision: 14 }),
-            SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4 }),
+            SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
             SketchKind::CountSketch => SketchParams::CountSketch(CountSketchParams {
                 w: 2048,
                 d: 5,
@@ -2219,18 +2235,36 @@ mod tests {
     /// silently break the backend.
     #[test]
     fn phase_b_backend_agg_type_strings_for_every_sketch_kind() {
-        let cases = vec![
-            (SketchKind::Kll, "DatasketchesKLL"),
-            (SketchKind::DDSketch, "DDSketch"),
-            (SketchKind::Hll, "HLL"),
-            (SketchKind::Cms, "CountMinSketch"),
-            (SketchKind::CountSketch, "CountSketch"),
+        let cases: Vec<(SketchKind, SketchParams, &str)> = vec![
+            (SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }), "DatasketchesKLL"),
+            (SketchKind::DDSketch, SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }), "DDSketch"),
+            (SketchKind::Hll, SketchParams::Hll(HllParams { precision: 14 }), "HLL"),
+            (
+                SketchKind::Cms,
+                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+                "CountMinSketch",
+            ),
+            (
+                SketchKind::Cms,
+                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: true }),
+                "CountMinSketchWithHeap",
+            ),
+            (
+                SketchKind::CountSketch,
+                SketchParams::CountSketch(CountSketchParams { w: 2048, d: 5, with_heap: false }),
+                "CountSketch",
+            ),
+            (
+                SketchKind::CountSketch,
+                SketchParams::CountSketch(CountSketchParams { w: 2048, d: 5, with_heap: true }),
+                "CountSketchWithHeap",
+            ),
         ];
-        for (kind, expected) in cases {
+        for (kind, params, expected) in cases {
             assert_eq!(
-                sketch_kind_to_backend_type(&kind),
+                sketch_kind_to_backend_type(&kind, &params),
                 expected,
-                "sketch_kind_to_backend_type({kind:?}) drift — backend FromStr will reject"
+                "sketch_kind_to_backend_type({kind:?}, {params:?}) drift — backend FromStr will reject"
             );
         }
     }
