@@ -44,12 +44,14 @@ use serde_json::Value as JsonValue;
 use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use asap_otel_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use asap_otel_proto::tonic::metrics::v1::{
-    metric::Data, DdSketch, DdSketchDataPoint, DdSketchEncoding, HllSketch, HllSketchDataPoint,
-    HllSketchEncoding, KllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
-    ScopeMetrics,
+    metric::Data, CountMinSketch, CountMinSketchDataPoint, CountMinSketchEncoding, CountSketch,
+    CountSketchDataPoint, CountSketchEncoding, DdSketch, DdSketchDataPoint, DdSketchEncoding,
+    HllSketch, HllSketchDataPoint, HllSketchEncoding, KllSketch, KllSketchDataPoint,
+    KllSketchEncoding, Metric, ResourceMetrics, ScopeMetrics,
 };
 use asap_sketchlib::proto::sketchlib::{
-    DdSketchState, HllVariant as ProtoHllVariant, HyperLogLogState, KllState,
+    CountMinState, CountSketchState, CounterType, DdSketchState, HllVariant as ProtoHllVariant,
+    HyperLogLogState, KllState,
 };
 use control_plane::types::SketchType;
 use prost::Message;
@@ -528,6 +530,144 @@ fn build_hll_export(
                         data_points: vec![dp],
                         aggregation_temporality: 0,
                         precision,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Build a `CountSketchState` proto from a signed matrix in row-major order.
+fn build_count_sketch_state(rows: u32, cols: u32, counts_int: Vec<i64>) -> CountSketchState {
+    assert_eq!(
+        counts_int.len() as u32,
+        rows * cols,
+        "counts_int length must equal rows * cols"
+    );
+    CountSketchState {
+        rows,
+        cols,
+        counter_type: CounterType::Int64 as i32,
+        counts_int,
+        counts_float: Vec::new(),
+        l2: Vec::new(),
+        topk: None,
+    }
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single CountSketch DP.
+fn build_count_sketch_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
+    let dp = CountSketchDataPoint {
+        attributes,
+        start_time_unix_nano: start_t_ns,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: CountSketchEncoding::Proto as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Countsketch(CountSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        rows: 0,
+                        cols: 0,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// Build a `CountMinState` proto from a non-negative matrix in row-major order.
+fn build_count_min_state(rows: u32, cols: u32, counts_int: Vec<i64>) -> CountMinState {
+    assert_eq!(
+        counts_int.len() as u32,
+        rows * cols,
+        "counts_int length must equal rows * cols"
+    );
+    CountMinState {
+        rows,
+        cols,
+        counter_type: CounterType::Int64 as i32,
+        counts_int,
+        counts_float: Vec::new(),
+        sum_counts: Vec::new(),
+        sum2_counts: Vec::new(),
+        l1: Vec::new(),
+        l2: Vec::new(),
+    }
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single CountMinSketch DP.
+fn build_count_min_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
+    let dp = CountMinSketchDataPoint {
+        attributes,
+        start_time_unix_nano: start_t_ns,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: CountMinSketchEncoding::Proto as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Countminsketch(CountMinSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        rows: 0,
+                        cols: 0,
                     })),
                 }],
                 schema_url: String::new(),
@@ -1069,6 +1209,190 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     assert_eq!(
         status, "success",
         "HLL cardinality query did not succeed:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
+
+// ── Test 6 — wire-format roundtrip with CountSketch (frequency) ─────────────
+//
+// CountSketch backs FREQUENCY estimation — counting heavy hitters and
+// producing approximate point-frequency answers. Workload pins
+// CountSketch via `sketch_type_override: Some(SketchType::CountSketch)`.
+// The OTLP DP carries a `CountSketchDataPoint` with `CountSketchState`.
+//
+// **Soft-check on the query (status field exists, no strict success).**
+// Strict-success topk requires a heap-bearing variant
+// (`CountSketchWithHeap` / `CmsWithHeap`) — `is_satisfied_by` rejects
+// `FrequencyTopk` against `FrequencyEstimate`-only sids. Heap-bearing
+// variants need msgpack-encoded payloads (per
+// `sketch_kind_handle_for`'s detection path). Out of scope for this
+// PR; tracked as the natural next step after wire-format coverage.
+//
+// Pure-PromQL has no first-class function for `FrequencyEstimate` (the
+// reducer accepts `"frequency"` / `"frequency_estimate"` but those
+// aren't valid PromQL). MetricsQL extensions in this area would be
+// the queryable surface.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_count_sketch() {
+    let stack = start_full_stack(19_567, 19_568).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "top_endpoint_qps",
+        vec![AggType::Frequency],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::CountSketch),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketch",
+        "controller must emit CountSketch aggregationType for SketchType::CountSketch override\n{streaming_config_json}"
+    );
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let rows = 5u32;
+    let cols = 1024u32;
+    let counts: Vec<i64> = (0..(rows * cols) as i64).map(|i| i % 7).collect();
+    let cs_state = build_count_sketch_state(rows, cols, counts);
+    let sketch_bytes = cs_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_count_sketch_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_count_sketch_state(rows, cols, vec![0i64; (rows * cols) as usize]);
+    let watermark_req = build_count_sketch_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Soft-check: `topk(5, ...)` won't succeed against heap-less
+    // CountSketch (capability mismatch — see test doc), so we just
+    // assert the response is well-formed JSON with a `status` field.
+    // The real success signal is that the OTLP POSTs above returned
+    // 2xx (the wire-format ingest works) and `runtime_info` would
+    // show the sid registered.
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "topk(5, top_endpoint_qps)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+    assert!(
+        response.get("status").is_some(),
+        "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
+
+// ── Test 7 — wire-format roundtrip with CountMinSketch (frequency) ──────────
+//
+// CountMinSketch backs frequency estimation — non-negative point
+// counts with one-sided over-estimation. Workload pins CMS via
+// `sketch_type_override: Some(SketchType::CountMinSketch)`. The OTLP
+// DP carries a `CountMinSketchDataPoint` with `CountMinState`.
+//
+// **Soft-check on the query, same rationale as Test 6.** Strict-success
+// topk needs `CountMinSketchWithHeap` (with msgpack-encoded heap) —
+// out of scope for this PR.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
+    let stack = start_full_stack(19_569, 19_570).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "endpoint_request_freq",
+        vec![AggType::Frequency],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::CountMinSketch),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountMinSketch",
+        "controller must emit CountMinSketch aggregationType for SketchType::CountMinSketch override\n{streaming_config_json}"
+    );
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let rows = 5u32;
+    let cols = 2048u32;
+    let counts: Vec<i64> = (0..(rows * cols) as i64).map(|i| (i % 11).abs()).collect();
+    let cms_state = build_count_min_state(rows, cols, counts);
+    let sketch_bytes = cms_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_count_min_export(
+        "endpoint_request_freq",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_count_min_state(rows, cols, vec![0i64; (rows * cols) as usize]);
+    let watermark_req = build_count_min_export(
+        "endpoint_request_freq",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Soft-check: pure-PromQL has no `frequency_estimate` function,
+    // and `topk(...)` requires a heap-bearing CMS. Assert response
+    // shape only; ingest 2xx already confirmed wire-format coverage.
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "topk(5, endpoint_request_freq)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+    assert!(
+        response.get("status").is_some(),
+        "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
