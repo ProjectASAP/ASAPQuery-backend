@@ -650,23 +650,21 @@ fn kll_k_param(config: &AggregationConfig) -> u16 {
 
 /// Extract `(row_num, col_num)` for CMS / HydraKLL configs.
 ///
-/// Reads from the canonical `d` (depth = rows) / `w` (width = cols)
-/// keys first — these match what the control plane's
-/// `sketch_params_to_json` emits and what `sketch_config_to_params`
-/// uses for OTLP policy_fp content matching. Falls back to the
-/// legacy `row_num` / `col_num` keys so older asapcollector
-/// configs continue to work.
+/// Reads canonical `d` (depth = rows) / `w` (width = cols) keys —
+/// matches what the control plane's `sketch_params_to_json` emits
+/// and what `sketch_config_to_params` uses for OTLP policy_fp
+/// content matching. The legacy `row_num` / `col_num` form (the
+/// only pre-PR-268 reader) was retired in lock-step with the
+/// asapcollector migration to canonical keys.
 fn cms_params(config: &AggregationConfig) -> (usize, usize) {
     let row_num = config
         .parameters
         .get("d")
-        .or_else(|| config.parameters.get("row_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(4) as usize;
     let col_num = config
         .parameters
         .get("w")
-        .or_else(|| config.parameters.get("col_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1000) as usize;
     (row_num, col_num)
@@ -979,10 +977,13 @@ mod tests {
     }
 
     #[test]
-    fn cms_params_accepts_w_d_canonical_and_row_col_num_legacy() {
+    fn cms_params_reads_canonical_w_d_keys() {
         use std::collections::HashMap;
         // Canonical `w`/`d` form — what the control plane's
-        // `sketch_params_to_json` emits today.
+        // `sketch_params_to_json` emits and what asapcollector
+        // streaming-config YAMLs ship (asapcollector PR
+        // `sync-config-canonical-w-d` migrated them in lock-step
+        // with the legacy-fallback removal).
         let mut params = HashMap::new();
         params.insert("d".to_string(), serde_json::Value::from(7_u64));
         params.insert("w".to_string(), serde_json::Value::from(2048_u64));
@@ -1004,31 +1005,6 @@ mod tests {
             None,
         );
         assert_eq!(super::cms_params(&config), (7, 2048));
-
-        // Legacy `row_num`/`col_num` form — older asapcollector
-        // configs still ship these; the helper must keep accepting
-        // them so existing Docker e2e setups don't silently degrade.
-        let mut legacy = HashMap::new();
-        legacy.insert("row_num".to_string(), serde_json::Value::from(7_u64));
-        legacy.insert("col_num".to_string(), serde_json::Value::from(2048_u64));
-        let legacy_config = AggregationConfig::new(
-            AggregationType::CountMinSketch,
-            String::new(),
-            legacy,
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            String::new(),
-            60,
-            0,
-            WindowType::Tumbling,
-            "m".to_string(),
-            "m".to_string(),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(super::cms_params(&legacy_config), (7, 2048));
 
         // Empty params — defaults `(4, 1000)`.
         let empty_config = AggregationConfig::new(
