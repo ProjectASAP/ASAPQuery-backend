@@ -3172,6 +3172,149 @@ impl ASAPQueryEngine {
         ))
     }
 
+    /// Modern warm-tier path for `/api/v1/query_range` — the range-
+    /// query equivalent of the `QueryEngine::execute(&str)` trait
+    /// surface. Used by the HTTP server as a fallback when the legacy
+    /// `handle_range_query_promql` returns `None`.
+    ///
+    /// Time semantics follow Prometheus's
+    /// `/api/v1/query_range?start&end&step` spec: the result is a
+    /// `matrix` (one row per series, each row carrying multiple
+    /// (timestamp, value) samples). The warm-tier reducer naturally
+    /// produces one sample per window_close in `[start, end]`, so
+    /// the matrix is sampled at the underlying aggregation's window
+    /// boundaries — typically a finer grid than the user's `step`
+    /// when window_size < step. (The Prometheus spec says
+    /// evaluate at each step `t = start, start+step, …, end`; the
+    /// warm tier returns at native window-close granularity instead.
+    /// This is more data, not less — clients that expect exact step
+    /// timestamps can downsample, or route step-precise queries to
+    /// the cold tier via the EngineRouter.)
+    ///
+    /// `step` is currently accepted for API compatibility but unused
+    /// — see the granularity-mismatch note above.
+    pub async fn execute_range_promql_modern(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        _step_ms: u64,
+    ) -> Result<
+        crate::query_engines::query_result::QueryResult,
+        crate::query_engines::EngineError,
+    > {
+        let Some(idx) = self.sketch_index.as_ref() else {
+            return Err(crate::query_engines::EngineError::capability_miss(
+                asap_types::StorageBackend::SketchStore.data_source_id(),
+                format!("ASAPQueryEngine: no sketch index for `{query}` — failing over"),
+            ));
+        };
+
+        let analysis =
+            control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
+
+        if let Some(reason) = &analysis.unsupported {
+            return Err(crate::query_engines::EngineError::capability_miss(
+                asap_types::StorageBackend::SketchStore.data_source_id(),
+                format!(
+                    "SketchStore analyzer rejected `{query}` for range query: \
+                     {reason:?} — failing over to archive"
+                ),
+            ));
+        }
+        if analysis.candidates.is_empty() {
+            return Err(crate::query_engines::EngineError::capability_miss(
+                asap_types::StorageBackend::SketchStore.data_source_id(),
+                format!(
+                    "SketchStore analyzer produced no ASAP-tier candidates for \
+                     `{query}` — failing over to archive"
+                ),
+            ));
+        }
+
+        let streaming_snap = self.streaming_config_snapshot();
+        let policy_registry = streaming_snap.policy_registry();
+        let reducer = crate::storage_engines::sketch_db::query::SketchReducer::new(idx);
+        let mut combined_result: Option<
+            crate::storage_engines::sketch_db::query::ASAPTierResult,
+        > = None;
+
+        for candidate in &analysis.candidates {
+            let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
+                &policy_registry,
+                candidate,
+            );
+            let mut sids: Vec<u64> = Vec::new();
+            for fp in &policy_fps {
+                sids.extend(idx.sids_for_policy(*fp));
+            }
+            if sids.is_empty() {
+                return Err(crate::query_engines::EngineError::capability_miss(
+                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    format!(
+                        "SketchStore has no policy for metric `{}` satisfying \
+                         capability {:?} — failing over to archive",
+                        candidate.metric_name, candidate.required_capability,
+                    ),
+                ));
+            }
+
+            let required: crate::storage_engines::sketch_db::index::Capability =
+                candidate.required_capability.clone();
+            let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
+            for sid in &sids {
+                let meta = match idx.instance(*sid) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                if let Some(cap) = meta.capability.as_ref() {
+                    if required.is_satisfied_by(cap) {
+                        hit_sids.push(*sid);
+                    }
+                }
+            }
+            if hit_sids.is_empty() {
+                return Err(crate::query_engines::EngineError::capability_miss(
+                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    format!(
+                        "SketchStore has no sid satisfying capability {:?} for \
+                         metric `{}` — failing over to archive",
+                        candidate.required_capability, candidate.metric_name
+                    ),
+                ));
+            }
+
+            let result = reducer
+                .evaluate(
+                    &hit_sids,
+                    &candidate.function,
+                    &candidate.function_args,
+                    start_ms,
+                    end_ms,
+                )
+                .map_err(|e| {
+                    crate::query_engines::EngineError::capability_miss(
+                        asap_types::StorageBackend::SketchStore.data_source_id(),
+                        format!(
+                            "SketchStore reducer failed for `{query}` over \
+                             [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                        ),
+                    )
+                })?;
+            combined_result = Some(result);
+        }
+
+        let result = combined_result.ok_or_else(|| {
+            crate::query_engines::EngineError::capability_miss(
+                asap_types::StorageBackend::SketchStore.data_source_id(),
+                format!("SketchStore reducer produced no result for `{query}`"),
+            )
+        })?;
+
+        // Matrix shape — the range_query wire format requires it.
+        Ok(asap_tier_result_to_query_result(result, end_ms, true))
+    }
+
     /// Execute the range query pipeline
     fn execute_range_query_pipeline(
         &self,

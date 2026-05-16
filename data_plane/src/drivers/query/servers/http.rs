@@ -1698,7 +1698,65 @@ async fn process_range_query_request(
                 Err(status) => status.into_response()}
         }
         None => {
-            debug!("Range query returned None - query not supported");
+            // Legacy `handle_range_query_promql` returned None — try
+            // the modern warm-tier path. Mirrors the instant-query
+            // fallback in `process_via_simple_engine` that PR #253
+            // wired through the trait's `execute(&str)`; this site
+            // uses the range-aware sibling
+            // `execute_range_promql_modern(query, start, end, step)`
+            // which returns Matrix per the
+            // `/api/v1/query_range` wire-format requirement.
+            //
+            // Shapes that go through this fallback: anything the
+            // legacy path doesn't know (notably the modified-OTLP
+            // sketch-backed sids — count_over_time / quantile_over_time
+            // / etc. against CMS / CountSketch / KLL / DDSketch / HLL
+            // policies). Shapes still unsupported in the warm tier
+            // (topk_over_time — not standard PromQL anyway) fall
+            // through this branch too and continue to the unsupported-
+            // query response, which the EngineRouter can route to a
+            // cold-tier fallback if one is configured.
+            let start_ms = (parsed_request.start * 1000.0) as u64;
+            let end_ms = (parsed_request.end * 1000.0) as u64;
+            let step_ms = (parsed_request.step * 1000.0) as u64;
+            let modern_result = state
+                .query_engine
+                .execute_range_promql_modern(
+                    &parsed_request.query,
+                    start_ms,
+                    end_ms,
+                    step_ms,
+                )
+                .await;
+            if let Ok(query_result) = modern_result {
+                debug!(
+                    "Modern execute_range_promql_modern handled what legacy \
+                     handle_range_query_promql missed (query='{}')",
+                    parsed_request.query
+                );
+                let total_duration = start_time.elapsed();
+                debug!(
+                    "Total range query processing took (modern fallback): {:.2}ms",
+                    total_duration.as_secs_f64() * 1000.0
+                );
+                return match state
+                    .adapter
+                    .format_range_success_response(
+                        &query_result,
+                        &promql_utilities::data_model::KeyByLabelNames::default(),
+                    )
+                    .await
+                {
+                    Ok(response) => response.into_response(),
+                    Err(status) => status.into_response(),
+                };
+            }
+
+            debug!(
+                "Both legacy and modern range-query paths returned None/Err \
+                 for query='{}', falling through to unsupported",
+                parsed_request.query
+            );
             match state.adapter.format_unsupported_query_response().await {
                 Ok(json) => json.into_response(),
                 Err(status) => status.into_response()}
