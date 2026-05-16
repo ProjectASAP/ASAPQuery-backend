@@ -301,15 +301,23 @@ impl AccuracyProfile {
 // says it's OK for them to drift — this module is the single
 // authority on *accuracy*, not on *construction*.
 
+/// Reads from the canonical `d` (depth = rows) / `w` (width = cols)
+/// keys first — these match what the control plane's
+/// `sketch_params_to_json` emits and what
+/// `accumulator_factory::cms_params` reads. Falls back to the legacy
+/// `row_num` / `col_num` keys so older asapcollector configs
+/// continue to work.
 fn cms_params(config: &AggregationConfig) -> (u64, u64) {
     let rows = config
         .parameters
-        .get("row_num")
+        .get("d")
+        .or_else(|| config.parameters.get("row_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(4);
     let cols = config
         .parameters
-        .get("col_num")
+        .get("w")
+        .or_else(|| config.parameters.get("col_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1000);
     (rows, cols)
