@@ -485,6 +485,7 @@ fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
         AggFunc::Quantile(phi) => vec![default_quantile(*phi)],
         AggFunc::CountDistinct => vec![default_cardinality()],
         AggFunc::HeavyHitters { .. } => vec![default_frequency()],
+        AggFunc::Frequency => vec![default_frequency()],
         AggFunc::Count => vec![default_frequency()],
         AggFunc::Avg => vec![AggIntent::Quantile {
             q: 0.5,

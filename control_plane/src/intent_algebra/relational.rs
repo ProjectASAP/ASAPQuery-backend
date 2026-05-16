@@ -468,6 +468,14 @@ pub enum AggFunc {
     Quantile(f64),
     /// COUNT DISTINCT — maps to HLL.
     CountDistinct,
+    /// Per-series frequency estimation — maps to CMS / CountSketch.
+    /// PromQL surface: `count_over_time(metric[range])` (counts
+    /// samples per series in the window). Distinct from `Count`
+    /// because `count_over_time` is structurally per-series and
+    /// always sketchable, where `Count` carries the SQL `COUNT(*)`
+    /// exact-row-count case that the un-grouped lowering branch
+    /// pins to `AggIntent::Count{Exact}`.
+    Frequency,
     /// Top-K heavy hitters — maps to CountSketch.
     HeavyHitters { k: u64 },
     /// PromQL `rate()` — per-second increase over a window.
@@ -495,7 +503,10 @@ impl AggFunc {
     pub fn is_sketchable(&self) -> bool {
         matches!(
             self,
-            AggFunc::Quantile(_) | AggFunc::CountDistinct | AggFunc::HeavyHitters { .. }
+            AggFunc::Quantile(_)
+                | AggFunc::CountDistinct
+                | AggFunc::Frequency
+                | AggFunc::HeavyHitters { .. }
         )
     }
 
@@ -508,6 +519,7 @@ impl AggFunc {
         match self {
             AggFunc::Quantile(phi) => Some(default_quantile(*phi)),
             AggFunc::CountDistinct => Some(default_cardinality()),
+            AggFunc::Frequency => Some(default_frequency()),
             AggFunc::HeavyHitters { .. } => Some(default_frequency()),
             AggFunc::Count   => Some(AggIntent::Count { accuracy: AccuracyTarget::Exact }),
             AggFunc::Sum     => Some(AggIntent::Sum),
@@ -683,6 +695,7 @@ impl std::fmt::Display for AggFunc {
             AggFunc::Variance { .. } => write!(f, "VARIANCE"),
             AggFunc::Quantile(p)     => write!(f, "QUANTILE({p})"),
             AggFunc::CountDistinct   => write!(f, "COUNT_DISTINCT"),
+            AggFunc::Frequency       => write!(f, "FREQUENCY"),
             AggFunc::HeavyHitters { k } => write!(f, "HEAVY_HITTERS({k})"),
             AggFunc::Rate            => write!(f, "rate"),
             AggFunc::Increase        => write!(f, "increase"),

@@ -448,7 +448,25 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
         "stddev_over_time" => Ok(AggFunc::StdDev { population: false }),
         "stdvar_over_time" => Ok(AggFunc::Variance { population: false }),
         "count_over_time" => {
-            Ok(if ctx.outer_count { AggFunc::CountDistinct } else { AggFunc::Count })
+            // Three cases, in priority order:
+            //  * Inside `count by (...) (count_over_time(...))` →
+            //    `CountDistinct` (HLL distinct counting; the outer
+            //    count of inner counts is cardinality).
+            //  * Inside `topk(N, count_over_time(...))` → `Count`
+            //    (the topk wrapper expects a count-shaped inner).
+            //  * Otherwise → `Frequency` (per-series sample-count
+            //    estimation; routes to CMS / CountSketch via the
+            //    `AggFunc::Frequency → default_frequency()` lowering).
+            //    This was previously `AggFunc::Count` which the
+            //    un-grouped lowering branch pinned to
+            //    `AggIntent::Count{Exact}` → unsupported by ASAP.
+            Ok(if ctx.outer_count {
+                AggFunc::CountDistinct
+            } else if ctx.topk.is_some() {
+                AggFunc::Count
+            } else {
+                AggFunc::Frequency
+            })
         }
         "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" =>
             Ok(AggFunc::Sum),
