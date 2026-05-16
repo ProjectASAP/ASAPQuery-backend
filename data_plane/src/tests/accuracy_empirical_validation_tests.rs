@@ -73,8 +73,8 @@ fn cms_3x1000_matches_cormode_muthukrishnan_e_over_w() {
     // Cormode-Muthukrishnan 2005: ε = e/w, δ = 1/2^d.
     // For (w=1000, d=3): ε = e/1000 ≈ 2.71828e-3, δ = 0.125.
     let mut params = HashMap::new();
-    params.insert("row_num".to_string(), json!(3u64));
-    params.insert("col_num".to_string(), json!(1000u64));
+    params.insert("d".to_string(), json!(3u64));
+    params.insert("w".to_string(), json!(1000u64));
     let p = AccuracyProfile::derive(&cfg(AggregationType::CountMinSketch, params));
     assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
     assert!((p.epsilon - std::f64::consts::E / 1000.0).abs() < 1e-12);
@@ -86,8 +86,8 @@ fn count_sketch_4x10000_matches_charikar_one_over_sqrt_w() {
     // Charikar-Chen-Farach-Colton 2002: ε = 1/√w for signed
     // counter sketch.
     let mut params = HashMap::new();
-    params.insert("row_num".to_string(), json!(4u64));
-    params.insert("col_num".to_string(), json!(10_000u64));
+    params.insert("d".to_string(), json!(4u64));
+    params.insert("w".to_string(), json!(10_000u64));
     let p = AccuracyProfile::derive(&cfg(AggregationType::CountSketch, params));
     assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
     assert!((p.epsilon - 0.01).abs() < 1e-12);
@@ -123,8 +123,8 @@ fn cms_with_heap_top_k_combines_cms_and_retention_bounds() {
     // (w=1000, d=3, heap=50): CMS bound e/w ≈ 2.72e-3, heap
     // bound 1/50 = 0.02. Heap dominates → ε = 0.02.
     let mut params = HashMap::new();
-    params.insert("row_num".to_string(), json!(3u64));
-    params.insert("col_num".to_string(), json!(1000u64));
+    params.insert("d".to_string(), json!(3u64));
+    params.insert("w".to_string(), json!(1000u64));
     params.insert("heap_size".to_string(), json!(50u64));
     let p = AccuracyProfile::derive(&cfg(AggregationType::CountMinSketchWithHeap, params));
     assert_eq!(p.kind, AccuracyKind::TopK);
@@ -154,8 +154,8 @@ fn cms_epsilon_shrinks_monotonically_with_width() {
     let mut last = f64::INFINITY;
     for w in [100u64, 500, 2000, 10_000, 100_000] {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4u64));
-        params.insert("col_num".to_string(), json!(w));
+        params.insert("d".to_string(), json!(4u64));
+        params.insert("w".to_string(), json!(w));
         let eps = AccuracyProfile::derive(&cfg(AggregationType::CountMinSketch, params)).epsilon;
         assert!(eps < last, "CMS ε at w={w}: {eps} should be < {last}");
         last = eps;
@@ -167,8 +167,8 @@ fn cms_delta_shrinks_monotonically_with_depth() {
     let mut last = f64::INFINITY;
     for d in [2u64, 3, 4, 5, 6, 8] {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(d));
-        params.insert("col_num".to_string(), json!(1000u64));
+        params.insert("d".to_string(), json!(d));
+        params.insert("w".to_string(), json!(1000u64));
         let delta = AccuracyProfile::derive(&cfg(AggregationType::CountMinSketch, params)).delta;
         assert!(delta < last, "CMS δ at d={d}: {delta} should be < {last}");
         last = delta;
@@ -180,8 +180,8 @@ fn countsketch_epsilon_shrinks_monotonically_with_width() {
     let mut last = f64::INFINITY;
     for w in [100u64, 500, 2000, 10_000, 100_000] {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4u64));
-        params.insert("col_num".to_string(), json!(w));
+        params.insert("d".to_string(), json!(4u64));
+        params.insert("w".to_string(), json!(w));
         let eps = AccuracyProfile::derive(&cfg(AggregationType::CountSketch, params)).epsilon;
         assert!(
             eps < last,
@@ -229,8 +229,8 @@ fn cms_with_heap_epsilon_shrinks_monotonically_with_heap_size_when_heap_dominate
     let mut last = f64::INFINITY;
     for heap in [10u64, 100, 1000, 10_000, 100_000] {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(5u64));
-        params.insert("col_num".to_string(), json!(1_000_000u64));
+        params.insert("d".to_string(), json!(5u64));
+        params.insert("w".to_string(), json!(1_000_000u64));
         params.insert("heap_size".to_string(), json!(heap));
         let eps =
             AccuracyProfile::derive(&cfg(AggregationType::CountMinSketchWithHeap, params)).epsilon;
@@ -252,8 +252,8 @@ fn relative_ordering_of_bounds_matches_published_intuition() {
     // `countsketch_oxide_matches_cms_oxide` sanity in
     // sketch-bench.
     let mut params = HashMap::new();
-    params.insert("row_num".to_string(), json!(4u64));
-    params.insert("col_num".to_string(), json!(10_000u64));
+    params.insert("d".to_string(), json!(4u64));
+    params.insert("w".to_string(), json!(10_000u64));
     let cms = AccuracyProfile::derive(&cfg(AggregationType::CountMinSketch, params.clone()));
     let cs = AccuracyProfile::derive(&cfg(AggregationType::CountSketch, params));
     // CMS at w=10_000: e/10_000 ≈ 0.000272

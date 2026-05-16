@@ -138,11 +138,10 @@ impl AccuracyProfile {
 
             // CountMinSketch: classic Cormode-Muthukrishnan bound.
             // ε = e/w, δ = 1/2^d with w = width, d = depth. We
-            // pull w from `parameters["col_num"]` and d from
-            // `parameters["row_num"]` because that's how the
-            // existing `accumulator_factory::cms_params` names
-            // them; fall back to the factory's (rows=4, cols=1000)
-            // defaults if absent.
+            // pull w from `parameters["w"]` and d from
+            // `parameters["d"]` — the canonical keys the controller
+            // emits and `accumulator_factory::cms_params` reads.
+            // Defaults to (rows=4, cols=1000) when absent.
             AggregationType::CountMinSketch => {
                 let (rows, cols) = cms_params(config);
                 // Using natural e ≈ 2.71828 for tighter bound.
@@ -301,23 +300,19 @@ impl AccuracyProfile {
 // says it's OK for them to drift — this module is the single
 // authority on *accuracy*, not on *construction*.
 
-/// Reads from the canonical `d` (depth = rows) / `w` (width = cols)
-/// keys first — these match what the control plane's
-/// `sketch_params_to_json` emits and what
-/// `accumulator_factory::cms_params` reads. Falls back to the legacy
-/// `row_num` / `col_num` keys so older asapcollector configs
-/// continue to work.
+/// Reads canonical `d` (depth = rows) / `w` (width = cols) keys.
+/// The legacy `row_num` / `col_num` form was retired in lock-step
+/// with the asapcollector migration to canonical keys — see
+/// `accumulator_factory::cms_params` for the matching change.
 fn cms_params(config: &AggregationConfig) -> (u64, u64) {
     let rows = config
         .parameters
         .get("d")
-        .or_else(|| config.parameters.get("row_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(4);
     let cols = config
         .parameters
         .get("w")
-        .or_else(|| config.parameters.get("col_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1000);
     (rows, cols)
@@ -499,8 +494,8 @@ mod tests {
     #[test]
     fn cms_epsilon_is_e_over_w() {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(5));
-        params.insert("col_num".to_string(), json!(2718));
+        params.insert("d".to_string(), json!(5));
+        params.insert("w".to_string(), json!(2718));
         let p = AccuracyProfile::derive(&base_config(AggregationType::CountMinSketch, params));
         // e / 2718 ≈ 0.0010001 — very close to 0.001.
         assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
@@ -525,8 +520,8 @@ mod tests {
         // Large heap: 1/heap_size (= 1e-4) dominates the e/w CMS
         // bound (e/1e6 ≈ 2.72e-6). Expect ε = 1/heap.
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(5));
-        params.insert("col_num".to_string(), json!(1_000_000));
+        params.insert("d".to_string(), json!(5));
+        params.insert("w".to_string(), json!(1_000_000));
         params.insert("heap_size".to_string(), json!(10_000));
         let p = AccuracyProfile::derive(&base_config(
             AggregationType::CountMinSketchWithHeap,
@@ -542,8 +537,8 @@ mod tests {
         // Generously-sized heap (1e6) + narrow CMS (w=100) →
         // 1/heap (1e-6) ≪ e/w (2.7e-2), so the CMS bound dominates.
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4));
-        params.insert("col_num".to_string(), json!(100));
+        params.insert("d".to_string(), json!(4));
+        params.insert("w".to_string(), json!(100));
         params.insert("heap_size".to_string(), json!(1_000_000));
         let p = AccuracyProfile::derive(&base_config(
             AggregationType::CountMinSketchWithHeap,
@@ -556,8 +551,8 @@ mod tests {
     #[test]
     fn cms_with_heap_uses_default_heap_size_100() {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4));
-        params.insert("col_num".to_string(), json!(1000));
+        params.insert("d".to_string(), json!(4));
+        params.insert("w".to_string(), json!(1000));
         // heap_size absent → default 100 → 1/100 = 0.01 dominates
         // e/1000 ≈ 0.00272.
         let p = AccuracyProfile::derive(&base_config(
@@ -574,8 +569,8 @@ mod tests {
         // "heap_size" — all three should work.
         for alias in ["heap_size", "topk", "k"] {
             let mut params = HashMap::new();
-            params.insert("row_num".to_string(), json!(4));
-            params.insert("col_num".to_string(), json!(1_000_000));
+            params.insert("d".to_string(), json!(4));
+            params.insert("w".to_string(), json!(1_000_000));
             params.insert(alias.to_string(), json!(500));
             let p = AccuracyProfile::derive(&base_config(
                 AggregationType::CountMinSketchWithHeap,
@@ -592,8 +587,8 @@ mod tests {
     #[test]
     fn countsketch_epsilon_is_one_over_sqrt_w() {
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4));
-        params.insert("col_num".to_string(), json!(100));
+        params.insert("d".to_string(), json!(4));
+        params.insert("w".to_string(), json!(100));
         let p = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
         assert_eq!(p.kind, AccuracyKind::AdditiveFrequency);
         assert!((p.epsilon - 0.1).abs() < 1e-9); // 1/√100 = 0.1
@@ -691,8 +686,8 @@ mod tests {
         // i.e. CountSketch is a factor ~1.65 tighter than CMS on
         // epsilon alone. Confirms the bounds are not copy-pasted.
         let mut params = HashMap::new();
-        params.insert("row_num".to_string(), json!(4));
-        params.insert("col_num".to_string(), json!(10000));
+        params.insert("d".to_string(), json!(4));
+        params.insert("w".to_string(), json!(10000));
         let cms = AccuracyProfile::derive(&base_config(
             AggregationType::CountMinSketch,
             params.clone(),
