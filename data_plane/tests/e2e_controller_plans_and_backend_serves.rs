@@ -1903,3 +1903,121 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch_with_heap_topk() {
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
+
+// ── Test 10 — range-query warm-tier fallback (CMS + count_over_time) ────────
+//
+// `/api/v1/query_range` previously had no warm-tier fallback —
+// when the legacy `handle_range_query_promql` returned `None` (which
+// it does for sketch-backed sids), the handler immediately fell
+// through to `format_unsupported_query_response` ("No result for
+// query"). This PR adds an `execute_range_promql_modern` modern
+// path that mirrors PR #253's `process_via_simple_engine` fallback
+// for instant queries.
+//
+// Same wire setup as Test 7 (heap-less CMS, `endpoint_request_freq`
+// with `AggType::Frequency`), but the query goes through
+// `/api/v1/query_range?query=count_over_time(metric[10s])` instead
+// of the instant endpoint. The result `resultType` is `matrix`
+// (Prometheus spec for range queries).
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_range_query_count_over_time_cms() {
+    let stack = start_full_stack(19_575, 19_576).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "endpoint_request_freq",
+        vec![AggType::Frequency],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::CountMinSketch),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
+    let rows = d;
+    let cols = w;
+    let counts: Vec<i64> = (0..(rows * cols) as i64).map(|i| (i % 11).abs()).collect();
+    let cms_state = build_count_min_state(rows, cols, counts);
+    let sketch_bytes = cms_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_count_min_export(
+        "endpoint_request_freq",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+        rows as i32,
+        cols as i32,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_count_min_state(rows, cols, vec![0i64; (rows * cols) as usize]);
+    let watermark_req = build_count_min_export(
+        "endpoint_request_freq",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        rows as i32,
+        cols as i32,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Query range covering the watermark + sketch windows. Prometheus's
+    // /api/v1/query_range expects epoch-second floats for start/end/step.
+    let now_secs = now_ns as f64 / 1e9;
+    let start_secs = now_secs - 10.0;
+    let end_secs = now_secs;
+    let step_secs = 1.0;
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query_range",
+            stack.backend_port
+        ))
+        .query(&[
+            ("query", "count_over_time(endpoint_request_freq[10s])"),
+            ("start", &format!("{start_secs}")),
+            ("end", &format!("{end_secs}")),
+            ("step", &format!("{step_secs}")),
+        ])
+        .send()
+        .await
+        .expect("range query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "count_over_time(...) range-query against heap-less CMS must succeed \
+         end-to-end via the modern execute_range_promql_modern fallback. \
+         Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    assert_eq!(
+        response["data"]["resultType"], "matrix",
+        "range-query result must carry resultType=matrix per the Prometheus \
+         /api/v1/query_range wire spec. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("data.result must be an array of matrix elements");
+    assert!(
+        !arr.is_empty(),
+        "matrix result must contain at least one series. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
