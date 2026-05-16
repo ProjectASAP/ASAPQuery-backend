@@ -499,9 +499,15 @@ fn build_hll_export(
             }),
         })
         .collect();
+    // start_time = time - 1s so the stored window `(start, end)` is
+    // narrow and falls entirely within any reasonable PromQL lookback.
+    // A `start_time_unix_nano: 0` (Unix epoch) would make the window
+    // start in 1970, outside any current-time-relative lookback the
+    // SketchStore range-query expects.
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
     let dp = HllSketchDataPoint {
         attributes,
-        start_time_unix_nano: 0,
+        start_time_unix_nano: start_t_ns,
         time_unix_nano,
         sketch: sketch_bytes,
         encoding: HllSketchEncoding::Proto as i32,
@@ -960,28 +966,39 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
 
 // ── Test 5 — full roundtrip with HLL (cardinality) ──────────────────────────
 //
-// HLL backs the cardinality readout — a fundamentally different query
-// shape from quantile_over_time. The workload pins HLL via
+// HLL backs the cardinality readout. The workload pins HLL via
 // `sketch_type_override: Some(SketchType::HLL)`. The OTLP DP carries
 // a `HllSketchDataPoint` with `HyperLogLogState`.
 //
-// **Currently ignored.** The streaming-config registration succeeds and
-// the sketch state lands in `SketchStore` (verifiable via
-// `runtime_info.earliest_timestamp_per_sid`), but the PromQL query path
-// for HLL needs a query shape the analyzer recognises as
-// `Capability::CardinalityApprox`. `count(metric)` doesn't map
-// straightforwardly today — `resolve_sketch_metric_alias` only
-// rewrites `count(metric)` → `count(metric_hll)` when the bare metric
-// is ABSENT from streaming-config (a deploy-time aliasing tactic),
-// but here we register the bare metric explicitly so the alias path
-// is a no-op. The right canonical PromQL for HLL cardinality on a
-// registered bare metric is an open analyzer question — track in a
-// follow-up. Test stays here as a smoke check that the OTLP ingest
-// path accepts HLL DPs (assertable via removing the `#[ignore]` and
-// inspecting the runtime_info diagnostic).
+// PromQL's `count(metric)` is the spec's distinct-counting idiom —
+// it returns the number of distinct label sets in the result vector.
+// Three engine-side fixes were needed (alongside this PR):
+//
+// 1. **Analyzer (`walk_qe::Expr::VectorSelector`)** — gated the
+//    implicit `Aggregate(Sum)` wrapper on `!ctx.outer_count` so a
+//    bare selector under `count(...)` doesn't synthesize a spurious
+//    `ExactAgg(Sum)` candidate that fails the engine's
+//    "all candidates must succeed" loop.
+// 2. **Reducer (`function_to_family`)** — added `"count"` as an
+//    alias for `QueryFamily::Cardinality`.
+// 3. **Test setup** — OTLP DP precision must match what the
+//    controller plans (`HLLDefaults`); start_time must be near
+//    end_time so the stored window falls within the query's
+//    lookback range.
+//
+// **Currently `#[ignore]`'d.** With all three fixes in place the
+// engine path now goes the distance: streaming-config registers,
+// OTLP DP lands in `SketchStore`, sids share the right `policy_fp`,
+// reducer.evaluate returns `Ok(...)`. But the HTTP response body
+// comes back empty / fails JSON decode (`reqwest::Error: EOF while
+// parsing a value`) — the response-serialization path for
+// instant-vector cardinality results has a separate bug worth its
+// own follow-up. Tracked via the diagnostic comments above and the
+// engine-debug prints kept in the engine path's git history.
 
-#[ignore = "HLL query path needs analyzer support for the cardinality \
-            readout on bare-registered metrics — see test doc"]
+#[ignore = "HLL roundtrip — analyzer, policy match, reducer all succeed; \
+            HTTP response body is empty. Separate serialization bug \
+            in the cardinality response path."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_plan_to_query_full_roundtrip_hll() {
     let stack = start_full_stack(19_565, 19_566).await;
@@ -1003,15 +1020,23 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     );
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
-    let precision = 14u32;
+    // Precision must match what the controller plans for this
+    // workload (`HLLDefaults` in `control_plane::types`). The
+    // accuracy_sla=0.05 above is > the precision_threshold (0.02),
+    // so the planner picks `precision_coarse = 10`. If the OTLP DP
+    // were sent with a different precision, the backend would
+    // register two separate sids for the same metric — one with
+    // policy_fp=UNSET (no matching policy params) — and the query
+    // wouldn't find the policy-tagged one.
+    let precision = 10u32;
     let num_registers = 1usize << precision;
     let mut registers = vec![0u8; num_registers];
     // Set a few non-zero registers so the cardinality estimate is
-    // non-trivial. Indices must fit within `num_registers` (2^14 = 16384).
+    // non-trivial. Indices fit within 1024.
     registers[0] = 5;
     registers[100] = 7;
-    registers[1_000] = 3;
-    registers[15_000] = 4;
+    registers[500] = 3;
+    registers[1000] = 4;
     let hll_state = build_hll_state(precision, registers);
     let sketch_bytes = hll_state.encode_to_vec();
 
@@ -1043,11 +1068,10 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // PromQL `count(metric)` over an HLL-backed agg is the cardinality
-    // readout per `resolve_sketch_metric_alias`'s `QueryShape::Count`
-    // → `_hll` mapping. We emit / register the metric with no `_hll`
-    // suffix; the analyzer / alias resolver treats the bare-present
-    // case as a no-rename (it's locally known) so the lookup hits.
+    // PromQL `count(metric)` lowers to `AggFunc::CountDistinct` →
+    // `AggIntent::Cardinality` → `Capability::CardinalityApprox`,
+    // which is what the HLL policy provides. No range selector
+    // needed — instant-vector cardinality is what HLL answers.
     let response: JsonValue = client
         .get(format!(
             "http://127.0.0.1:{}/api/v1/query",

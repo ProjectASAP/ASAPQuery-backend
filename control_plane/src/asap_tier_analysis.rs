@@ -617,6 +617,32 @@ mod tests {
 
     // ── Supported shapes ─────────────────────────────────────────────────
 
+    /// PromQL `count(metric)` is the spec's distinct-counting idiom
+    /// (count of label sets in the result vector). The analyzer must
+    /// collect EXACTLY ONE candidate — Cardinality — for the outer
+    /// count; the bare-metric inner selector must NOT synthesize an
+    /// `ExactAgg(Sum)` candidate that would force the engine's
+    /// "all candidates must succeed" loop to fail when no Sum policy
+    /// is registered. (The fix lives in
+    /// `query_parser::promql::walk_qe::Expr::VectorSelector` — gates
+    /// the implicit `Aggregate(Sum)` wrapper on `!ctx.outer_count`.)
+    #[test]
+    fn analyze_count_bare_metric_yields_only_cardinality_candidate() {
+        let a = analyze_promql_for_asap_tier("count(unique_users_per_min)");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates.len(),
+            1,
+            "count(metric) must yield exactly one Cardinality candidate \
+             (no implicit Sum from the bare-selector inner): {a:?}"
+        );
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::CardinalityApprox,
+            "{a:?}"
+        );
+    }
+
     #[test]
     fn analyze_quantile_over_time() {
         let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, http_latency_ms[5m])");
