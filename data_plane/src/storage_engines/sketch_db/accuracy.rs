@@ -213,6 +213,26 @@ impl AccuracyProfile {
                 }
             }
 
+            // CountSketchWithHeap: CountSketch frequency estimator
+            // paired with a top-k heap. Mirrors the
+            // CountMinSketchWithHeap branch above — the CountSketch
+            // half gives ε_point = 1/√w; the heap half gives
+            // ε_heap = 1/heap_size for retention. Report the
+            // tighter (max) of the two.
+            AggregationType::CountSketchWithHeap => {
+                let (rows, cols) = cms_params(config);
+                let heap = cms_heap_size(config);
+                let cs_epsilon = 1.0 / (cols as f64).max(1.0).sqrt();
+                let heap_epsilon = 1.0 / (heap as f64).max(1.0);
+                let epsilon = cs_epsilon.max(heap_epsilon);
+                let delta = 0.5_f64.powi(rows as i32);
+                Self {
+                    epsilon,
+                    delta,
+                    kind: AccuracyKind::TopK,
+                }
+            }
+
             // HLL: std-dev ≈ 1.04/√m, m = 2^precision. Report
             // this as relative error ε; δ is the Gaussian
             // std-dev convention (stored as 0 because our δ

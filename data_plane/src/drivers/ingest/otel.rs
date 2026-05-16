@@ -1271,7 +1271,7 @@ fn aggregation_type_for_sketch_handle(
         SketchKindHandle::Kll => Some(AggregationType::DatasketchesKLL),
         SketchKindHandle::Hll => Some(AggregationType::HLL),
         SketchKindHandle::CountSketch => Some(AggregationType::CountSketch),
-        SketchKindHandle::CountSketchWithHeap => Some(AggregationType::CountSketch),
+        SketchKindHandle::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
         SketchKindHandle::CountMin => Some(AggregationType::CountMinSketch),
         SketchKindHandle::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
         SketchKindHandle::Any => None,
@@ -1307,8 +1307,15 @@ fn sketch_config_to_params(
         }
         SketchConfig::CountSketch { rows, cols }
         | SketchConfig::CountMin { rows, cols } => {
-            params.insert("rows".to_string(), serde_json::json!(*rows));
-            params.insert("cols".to_string(), serde_json::json!(*cols));
+            // Canonical key mapping (matches the controller's
+            // `sketch_params_to_json` in
+            // `control_plane::emit::stage_config`): `w` is the
+            // matrix width (=cols), `d` is the depth (=rows). The
+            // controller writes `{w, d}` into the streaming-config
+            // `parameters`, so the policy_fp content match has to
+            // probe the same keys.
+            params.insert("w".to_string(), serde_json::json!(*cols));
+            params.insert("d".to_string(), serde_json::json!(*rows));
         }
     }
     params
@@ -1377,7 +1384,26 @@ fn sketch_kind_handle_for(
         SketchKind::DdSketch => SketchKindHandle::DDSketch,
         SketchKind::Kll => SketchKindHandle::Kll,
         SketchKind::Hll => SketchKindHandle::Hll,
-        SketchKind::CountSketch => SketchKindHandle::CountSketch,
+        SketchKind::CountSketch => {
+            // Mirror the CountMin branch: CountSketch-with-heap
+            // payloads share the same outer msgpack envelope
+            // (`CountMinSketchWithHeapSerialized` — see the comment
+            // in `sketch_reducer.rs` at the dispatch site, which
+            // notes both heap-bearing variants reuse this wire
+            // shape since the heap is the distinguishing payload).
+            // Auto-promote to `CountSketchWithHeap` when the bytes
+            // decode AND the heap is non-empty; otherwise stay with
+            // vanilla `CountSketch`.
+            if dp.encoding == ENCODING_MSGPACK {
+                use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+                if let Ok(cms) = CountMinSketchWithHeap::deserialize_msgpack(&dp.sketch) {
+                    if !cms.topk_heap_items().is_empty() {
+                        return SketchKindHandle::CountSketchWithHeap;
+                    }
+                }
+            }
+            SketchKindHandle::CountSketch
+        }
         SketchKind::CountMin => {
             // Try a no-cost peek: msgpack-encoded CMS-with-heap payloads
             // round-trip through asap_sketchlib's
@@ -2081,15 +2107,17 @@ mod policy_fp_lookup_tests {
             rows: 4,
             cols: 256,
         });
-        assert_eq!(cs.get("rows"), Some(&serde_json::json!(4)));
-        assert_eq!(cs.get("cols"), Some(&serde_json::json!(256)));
+        // Canonical keys: w (=cols, width) and d (=rows, depth) —
+        // matches `control_plane::emit::stage_config::sketch_params_to_json`.
+        assert_eq!(cs.get("w"), Some(&serde_json::json!(256)));
+        assert_eq!(cs.get("d"), Some(&serde_json::json!(4)));
 
         let cm = sketch_config_to_params(&SketchConfig::CountMin {
             rows: 4,
             cols: 256,
         });
-        assert_eq!(cm.get("rows"), Some(&serde_json::json!(4)));
-        assert_eq!(cm.get("cols"), Some(&serde_json::json!(256)));
+        assert_eq!(cm.get("w"), Some(&serde_json::json!(256)));
+        assert_eq!(cm.get("d"), Some(&serde_json::json!(4)));
     }
 }
 

@@ -327,10 +327,15 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
                 None
             } else {
                 // Top-k is intrinsically heavy-hitter — only heap-bearing
-                // handles can enumerate the items. `CmsWithHeap` is the
-                // canonical handle today; `is_satisfied_by` accepts
-                // either heap-bearing variant against an `Any` required.
-                Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
+                // handles can enumerate the items. The analyzer doesn't
+                // care which heap-bearing variant answers (CmsWithHeap or
+                // CountSketchWithHeap both work — the reducer dispatches
+                // both through `decode_cms_with_heap_from_msgpack` and
+                // produces top-k items either way). Return `Any` so
+                // `is_satisfied_by`'s `handles_compatible_for_topk`
+                // wildcard accepts whichever variant the ingest tier
+                // chose to register.
+                Some(Capability::FrequencyTopk(SketchKindHandle::Any))
             }
         }
         AggIntent::Frequency { accuracy } => {
@@ -769,14 +774,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_topk_returns_frequency_topk_cms_with_heap() {
+    fn capability_for_topk_returns_frequency_topk_any() {
+        // The analyzer no longer pins a concrete heap-bearing variant
+        // for top-k — `Any` lets `handles_compatible_for_topk` accept
+        // either `CmsWithHeap` or `CountSketchWithHeap` registered at
+        // ingest time. Both variants share the heap envelope and the
+        // reducer dispatches them identically.
         let intent = AggIntent::TopK {
             k: 10,
             accuracy: AccuracyTarget::Epsilon(0.05),
         };
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
+            Some(Capability::FrequencyTopk(SketchKindHandle::Any))
         );
     }
 

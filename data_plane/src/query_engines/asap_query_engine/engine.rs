@@ -6411,10 +6411,10 @@ mod analyzer_parity_tests {
     ctrl   OK [metric=http_requests_total gbk=[\"region\", \"zone\"] cap=ExactAgg(Sum) fn=sum args=[] range_s=0]
     engine OK pattern=only_spatial stats=[sum] metric=http_requests_total fn= agg_op=sum range_s=- range_ms=None spatial=\"\" grouping=[\"region\", \"zone\"]
 ─── q06: topk(5, http_requests_total)
-    ctrl   OK [metric=http_requests_total gbk=[] cap=FrequencyTopk(CmsWithHeap) fn=topk args=[5.0] range_s=0 | metric=http_requests_total gbk=[] cap=ExactAgg(Sum) fn=topk args=[5.0] range_s=0]
+    ctrl   OK [metric=http_requests_total gbk=[] cap=FrequencyTopk(Any) fn=topk args=[5.0] range_s=0]
     engine OK pattern=only_spatial stats=[topk] metric=http_requests_total fn= agg_op=topk range_s=- range_ms=None spatial=\"\" grouping=[]
 ─── q07: topk(10, sum by (svc) (m))
-    ctrl   OK [metric=m gbk=[\"svc\"] cap=FrequencyTopk(CmsWithHeap) fn=topk args=[10.0] range_s=0 | metric=m gbk=[\"svc\"] cap=ExactAgg(Sum) fn=topk args=[10.0] range_s=0]
+    ctrl   OK [metric=m gbk=[\"svc\"] cap=FrequencyTopk(Any) fn=topk args=[10.0] range_s=0]
     engine MISS(NoPattern)
 ─── q08: count_over_time(http_requests_total[5m])
     ctrl   MISS(UnsupportedAggIntent(\"count\"))

@@ -1396,3 +1396,467 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
+
+// ── Heap-bearing fixtures ───────────────────────────────────────────────────
+//
+// The msgpack envelope `CountMinSketchWithHeap::serialize_msgpack`
+// produces (an outer `{sketch, topk_heap, heap_size}` wrapper, see
+// asap_sketchlib's `CountMinSketchWithHeapSerialized`) is the SHARED
+// wire shape used by both `CmsWithHeap` and `CountSketchWithHeap` —
+// the heap is the distinguishing payload, and the data_plane reducer
+// dispatches both variants through `decode_cms_with_heap_from_msgpack`
+// (see `sketch_reducer.rs` at the FrequencyTopk dispatch site).
+//
+// On the ingest side, `sketch_kind_handle_for` peeks at incoming
+// CountMin / CountSketch DPs with `encoding=MSGPACK`; if the bytes
+// round-trip through the heap envelope AND the heap is non-empty,
+// the sid is auto-promoted to the corresponding `*WithHeap` variant
+// so the ASAP-tier reducer can answer `topk(...)` from the heap.
+
+/// Build a msgpack-encoded `CountMinSketchWithHeap` payload populated
+/// with the supplied `(key, count)` pairs. Returns the bytes ready
+/// for the OTLP DP's `sketch` field with `encoding=MSGPACK`.
+fn build_heap_bearing_msgpack(rows: usize, cols: usize, top_k: usize, items: &[(&str, u64)]) -> Vec<u8> {
+    use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+    let mut cms = CountMinSketchWithHeap::new(rows, cols, top_k);
+    for (key, count) in items {
+        for _ in 0..*count {
+            cms.update(key, 1.0);
+        }
+    }
+    cms.serialize_msgpack()
+        .expect("CountMinSketchWithHeap::serialize_msgpack should not fail")
+}
+
+/// Extract the planner-picked `(w, d)` from a streaming-config aggregation
+/// for CMS / CountSketch policies. Returns `(w as cols, d as rows)`.
+/// The DP's wire-level `rows`/`cols` MUST match these for
+/// `find_policy_by_content` to bind the sid to the policy_fp (the
+/// content match probes `parameters.w` and `parameters.d`).
+fn extract_w_d_from_streaming_config(streaming_config_json: &JsonValue) -> (u32, u32) {
+    let params = &streaming_config_json["aggregations"][0]["parameters"];
+    let w = params["w"].as_u64().expect("streaming-config aggregation must carry parameters.w") as u32;
+    let d = params["d"].as_u64().expect("streaming-config aggregation must carry parameters.d") as u32;
+    (w, d)
+}
+
+/// OTLP `ExportMetricsServiceRequest` with a single `CountMinSketch` DP
+/// carrying msgpack-encoded heap-bearing bytes. `encoding=MSGPACK` (3)
+/// triggers `sketch_kind_handle_for`'s auto-promotion to `CmsWithHeap`.
+/// `rows`/`cols` on the parent `CountMinSketch` MUST match the policy's
+/// `parameters.{d,w}` for the policy_fp content match to bind.
+fn build_cms_with_heap_msgpack_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    wire_rows: i32,
+    wire_cols: i32,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
+    let dp = CountMinSketchDataPoint {
+        attributes,
+        start_time_unix_nano: start_t_ns,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: CountMinSketchEncoding::Msgpack as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Countminsketch(CountMinSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        rows: wire_rows,
+                        cols: wire_cols,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+/// OTLP `ExportMetricsServiceRequest` with a single `CountSketch` DP
+/// carrying msgpack-encoded heap-bearing bytes. `encoding=MSGPACK` (3)
+/// triggers `sketch_kind_handle_for`'s auto-promotion to
+/// `CountSketchWithHeap` (the heap envelope is identical to the CMS
+/// variant). `rows`/`cols` MUST match the policy's `parameters.{d,w}`.
+fn build_count_sketch_with_heap_msgpack_export(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    wire_rows: i32,
+    wire_cols: i32,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
+    let dp = CountSketchDataPoint {
+        attributes,
+        start_time_unix_nano: start_t_ns,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding: CountSketchEncoding::Msgpack as i32,
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Countsketch(CountSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        rows: wire_rows,
+                        cols: wire_cols,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+// ── Test 8 — heap-bearing CMS + topk strict-success ─────────────────────────
+//
+// The full top-k roundtrip with `CmsWithHeap`. Workload pins CMS via
+// `sketch_type_override: Some(SketchType::CountMinSketch)` on the
+// `top_endpoint_qps` metric (TopK statistic class), which the planner
+// binds via `bind_cms_with_heap_on_topk` (CMS-Heap pattern from
+// Cormode & Muthukrishnan 2005).
+//
+// The OTLP DP carries a msgpack-encoded `CountMinSketchWithHeap`
+// payload (`encoding=MSGPACK`); the receiver's `sketch_kind_handle_for`
+// peeks at the bytes and auto-promotes the sid to `CmsWithHeap`,
+// registering it under `Capability::FrequencyTopk(CmsWithHeap)`.
+//
+// The reducer's `topk` family decodes the heap directly via
+// `decode_cms_with_heap_from_msgpack` and emits one output series
+// per top-k item with the item key in the `item` label.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
+    let stack = start_full_stack(19_571, 19_572).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "top_endpoint_qps",
+        vec![AggType::Frequency],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::CountMinSketch),
+    );
+    let mut streaming_config_json = plan_streaming_config_json(&workload);
+    // The controller emits `aggregationType: "CountMinSketch"` regardless
+    // of whether the planner picked the heap-bearing binding — the
+    // `sketch_kind_to_backend_type` mapping doesn't surface the heap
+    // variant. The TopK signal lives in the readouts (`op: topk`).
+    //
+    // For analyzer ↔ policy matching to bind `topk(...)` queries, the
+    // policy's `policy_capability` must be `FrequencyTopk(CmsWithHeap)`,
+    // which only fires for `AggregationType::CountMinSketchWithHeap`
+    // (see `asap_tier_analysis::policy_capability`). So patch the
+    // emitted JSON in-place: replace the `CountMinSketch` aggregationType
+    // with `CountMinSketchWithHeap` to bridge the controller-emit gap.
+    // (Tracked: the controller-side fix is a parallel change to
+    // `sketch_kind_to_backend_type` to consult the readout class +
+    // sketch params — out of scope for this test PR.)
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountMinSketch",
+        "controller must emit CountMinSketch aggregationType\n{streaming_config_json}"
+    );
+    assert_eq!(
+        streaming_config_json["readouts"][0]["op"], "topk",
+        "controller must emit a topk readout for CMS-with-heap binding\n{streaming_config_json}"
+    );
+    streaming_config_json["aggregations"][0]["aggregationType"] =
+        JsonValue::String("CountMinSketchWithHeap".to_string());
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
+    // `rows`/`cols` line up with the policy's `parameters.{d, w}` —
+    // `derive_sketch_policy_fp` content-matches on these keys, so a
+    // dimension mismatch leaves the sid registered with `policy_fp`
+    // = UNSET (unreachable through `sids_for_policy`).
+    let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
+    let rows = d as usize;
+    let cols = w as usize;
+    let wire_rows = d as i32;
+    let wire_cols = w as i32;
+
+    // Heap items with deterministic count ordering. `gamma` is the
+    // unambiguous top-1 (count=200); the heap (top_k=10) keeps all six.
+    let items: &[(&str, u64)] = &[
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+        ("epsilon", 10),
+        ("zeta", 150),
+    ];
+    let sketch_bytes = build_heap_bearing_msgpack(rows, cols, 10, items);
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_cms_with_heap_msgpack_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes.clone(),
+        wire_rows,
+        wire_cols,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    // Watermark MUST also carry the heap — the reducer reads
+    // `samples.iter().next_back()` and decodes the latest sample's
+    // bytes; an empty-heap watermark would shadow the real payload.
+    let watermark_req = build_cms_with_heap_msgpack_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        sketch_bytes,
+        wire_rows,
+        wire_cols,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "topk(3, top_endpoint_qps)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "topk(...) on CmsWithHeap must succeed end-to-end. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    // Top-1 should be `gamma` (count=200). The reducer keys each
+    // top-k item by `item: <key>` in the series labels, but the
+    // wire-format `InstantVectorElement` adapter currently drops
+    // per-element labels (`label_keys_override` only exists on
+    // `RangeVectorElement`); confirmed by the response carrying
+    // `"metric": {}` on every element. Until that adapter gap is
+    // closed, assert the strongest invariants the wire-format DOES
+    // surface: `topk(3)` returned at least one series, the values
+    // include `gamma`'s count (200), and we got at most 3 results.
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("result must be an array of vector elements");
+    assert!(
+        !arr.is_empty() && arr.len() <= 3,
+        "topk(3) must return between 1 and 3 series. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let mut values: Vec<f64> = arr
+        .iter()
+        .filter_map(|e| {
+            e["value"][1]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .collect();
+    values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    assert!(
+        values.first().map(|v| (v - 200.0).abs() < 1.0).unwrap_or(false),
+        "topk(3) on heap-bearing CMS must surface `gamma`'s count (200) as \
+         the top value (received {values:?}). Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
+
+// ── Test 9 — heap-bearing CountSketch + topk strict-success ─────────────────
+//
+// Same shape as Test 8 but the workload defaults the `top_endpoint_qps`
+// metric to `CountSketch` (the canonical TopK pick — unbiased
+// estimator, see `BindCountSketchOnTopK`). The OTLP DP carries the
+// SAME msgpack heap envelope (the wire shape is shared); only the
+// outer DP type changes (`CountSketchDataPoint` instead of
+// `CountMinSketchDataPoint`).
+//
+// `sketch_kind_handle_for` was extended in this PR to peek at
+// CountSketch DPs the same way it does for CountMin — a
+// non-empty heap in a msgpack-encoded payload promotes the sid to
+// `CountSketchWithHeap`, which the analyzer's `is_satisfied_by`
+// recognises as a valid `FrequencyTopk(CountSketchWithHeap)` provider.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_full_roundtrip_count_sketch_with_heap_topk() {
+    let stack = start_full_stack(19_573, 19_574).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "top_endpoint_qps",
+        vec![AggType::Frequency],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        None, // default → CountSketch (canonical TopK pick)
+    );
+    let mut streaming_config_json = plan_streaming_config_json(&workload);
+    // The controller emits `aggregationType: "CountSketch"` and the
+    // heap signal lives in `parameters.with_heap` (true) — but the
+    // analyzer ↔ policy match keys off `aggregation_type`, which
+    // must be `CountSketchWithHeap` for `policy_capability` to
+    // return `FrequencyTopk(CountSketchWithHeap)`. Patch the JSON
+    // in-place: the controller-side fix (consult `with_heap` flag
+    // when emitting `aggregation_type`) is out of scope for this
+    // test PR — tracked alongside the parallel CMS-side patch from
+    // Test 8.
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketch",
+        "controller must emit CountSketch aggregationType for default top_endpoint_qps\n{streaming_config_json}"
+    );
+    assert_eq!(
+        streaming_config_json["aggregations"][0]["parameters"]["with_heap"], true,
+        "controller must set parameters.with_heap=true for CountSketch TopK binding\n{streaming_config_json}"
+    );
+    streaming_config_json["aggregations"][0]["aggregationType"] =
+        JsonValue::String("CountSketchWithHeap".to_string());
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let items: &[(&str, u64)] = &[
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+        ("epsilon", 10),
+        ("zeta", 150),
+    ];
+    let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
+    let rows = d as usize;
+    let cols = w as usize;
+    let wire_rows = d as i32;
+    let wire_cols = w as i32;
+    let sketch_bytes = build_heap_bearing_msgpack(rows, cols, 10, items);
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_count_sketch_with_heap_msgpack_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes.clone(),
+        wire_rows,
+        wire_cols,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_req = build_count_sketch_with_heap_msgpack_export(
+        "top_endpoint_qps",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        sketch_bytes,
+        wire_rows,
+        wire_cols,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "topk(3, top_endpoint_qps)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "topk(...) on CountSketchWithHeap must succeed end-to-end. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    // Same shape-only assertion as Test 8 — `InstantVectorElement`
+    // currently drops per-element labels, so we can't check for
+    // `item: "gamma"`. Verify the strongest invariants the wire
+    // surfaces today: 1..=3 series and gamma's count (200) leads.
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("result must be an array of vector elements");
+    assert!(
+        !arr.is_empty() && arr.len() <= 3,
+        "topk(3) must return between 1 and 3 series. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let mut values: Vec<f64> = arr
+        .iter()
+        .filter_map(|e| {
+            e["value"][1]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .collect();
+    values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    assert!(
+        values.first().map(|v| (v - 200.0).abs() < 1.0).unwrap_or(false),
+        "topk(3) on heap-bearing CountSketch must surface `gamma`'s count (200) \
+         as the top value (received {values:?}). Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+}
