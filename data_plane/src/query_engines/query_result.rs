@@ -153,11 +153,31 @@ pub struct InstantVector {
 pub struct InstantVectorElement {
     pub labels: KeyByLabelValues,
     pub value: f64,
+    /// Optional per-element label-key override. Mirrors the field on
+    /// `RangeVectorElement` — when `Some`, the HTTP serializer uses
+    /// these keys for the PromQL response's `"metric"` object instead
+    /// of the query-scoped `KeyByLabelNames` argument. Used by ASAP-tier
+    /// `topk(...)` (whose reducer synthesizes an `"item"` key not
+    /// present in the query's group-by clause). `None` for everyone
+    /// else — the existing serializer path is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_keys_override: Option<Vec<String>>,
 }
 
 impl InstantVectorElement {
     pub fn new(labels: KeyByLabelValues, value: f64) -> Self {
-        Self { labels, value }
+        Self {
+            labels,
+            value,
+            label_keys_override: None,
+        }
+    }
+
+    /// Attach a per-element label-key override (see field doc on
+    /// `InstantVectorElement::label_keys_override`).
+    pub fn with_label_keys_override(mut self, keys: Vec<String>) -> Self {
+        self.label_keys_override = Some(keys);
+        self
     }
 }
 

@@ -3441,21 +3441,22 @@ fn asap_tier_result_to_query_result(
     if !is_range_query {
         let mut elements: Vec<InstantVectorElement> = Vec::with_capacity(result.series.len());
         for (label_values, samples) in result.series {
-            let (_keys, values): (Vec<String>, Vec<String>) = label_values.into_iter().unzip();
+            // Mirror the range-vector branch: BTreeMap iteration is
+            // key-sorted, so `unzip` produces aligned (keys, values).
+            // Stash the keys in the per-element `label_keys_override`
+            // so the Prometheus adapter renders synthesized keys
+            // (notably ASAP-tier `topk`'s `"item"` key) instead of
+            // the empty `metric: {}` it would produce when the
+            // query-scoped `KeyByLabelNames` is empty.
+            let (keys, values): (Vec<String>, Vec<String>) = label_values.into_iter().unzip();
             let labels = KeyByLabelValues::new_with_labels(values);
             // Take the latest sample (the reducer returns one per
             // window_end; for instant readout we want the most recent).
-            // `InstantVectorElement` doesn't carry a per-element
-            // `label_keys_override` today (only `RangeVectorElement`
-            // does, for the topk-`item`-key case) — labels render
-            // with whatever query-scoped `KeyByLabelNames` the
-            // serializer holds. That's correct for the cardinality
-            // shape that's the only instant-vector consumer at the
-            // moment; if a future instant-vector readout needs
-            // per-element key remapping, add the override field on
-            // `InstantVectorElement` then plumb `keys` here.
             if let Some((_, value)) = samples.into_iter().last() {
-                elements.push(InstantVectorElement::new(labels, value));
+                elements.push(
+                    InstantVectorElement::new(labels, value)
+                        .with_label_keys_override(keys),
+                );
             }
         }
         return QueryResult::vector(elements, now_ms);

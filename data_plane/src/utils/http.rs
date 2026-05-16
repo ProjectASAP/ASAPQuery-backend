@@ -135,10 +135,21 @@ pub fn convert_query_result_to_prometheus(
             let timestamp = instant_vector.timestamp as f64 / 1000.0;
 
             for element in &instant_vector.values {
-                // zip over query_output_labels.keys and element.labels.labels and collect into metric_map
-                let mut metric_map = HashMap::new();
-                for (key, label) in query_output_labels
-                    .labels
+                // Build metric labels object. Per-element override
+                // (`element.label_keys_override`) wins when the
+                // adapter knows the keys at materialization time —
+                // e.g. ASAP-tier `topk(...)` synthesizes an `"item"`
+                // key that's not in the query's group-by clause, so
+                // the outer `query_output_labels` doesn't carry it.
+                // Falls back to the query-scoped key list for everyone
+                // else. Mirrors the matrix branch in
+                // `convert_range_result_to_prometheus`.
+                let mut metric_map: HashMap<&String, &String> = HashMap::new();
+                let effective_keys: &[String] = element
+                    .label_keys_override
+                    .as_deref()
+                    .unwrap_or(&query_output_labels.labels);
+                for (key, label) in effective_keys
                     .iter()
                     .zip(element.labels.labels.iter())
                 {
