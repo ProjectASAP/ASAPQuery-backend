@@ -236,11 +236,22 @@ pub struct EdgeSketchProcessor {
     pub sketch_kind: SketchKind,
     /// Sketch parameters (mirror of the `SketchAgg::params` field).
     pub sketch_params: SketchParams,
-    /// Stable `aggregation_id` the backend uses to look up the
-    /// `(sketch_kind, params)` pair when receiving the corresponding
-    /// OTLP stream. Phase E derives a deterministic id from the
-    /// processor name + a position counter; downstream callers may
-    /// override.
+    /// Internal emitter plumbing — threads `EdgeSketchProcessor` →
+    /// `GatewayMergeProcessor` (which DOES surface it on the wire to
+    /// route merged streams) during the DAG walk. Phase E derives a
+    /// deterministic id from the processor name + a position counter;
+    /// downstream callers may override.
+    ///
+    /// **Wire-format invariant**: the asap-otel agent's
+    /// sketch-processor config does NOT consume this field — the
+    /// patched processors content-address sids via
+    /// `(metric, attrs_fingerprint, agg_kind_canonical)` at the
+    /// backend. See `emit::otap::build_asap_sketches_config` (the
+    /// `EdgeSketchProcessor` → agent YAML emitter) for the explicit
+    /// omission, and `emit::asapquery_backend::tests::emitted_yaml_omits_aggregation_id`
+    /// for the regression guard on the streaming-config side.
+    /// The field stays on the struct because it's still load-bearing
+    /// for gateway-tier merge routing (see `GatewayMergeProcessor`).
     pub aggregation_id: String,
 }
 
@@ -267,6 +278,13 @@ pub struct GatewayMergeProcessor {
     /// Aggregation id — matches the upstream edge's
     /// `EdgeSketchProcessor::aggregation_id` so the gateway routes
     /// streams correctly.
+    ///
+    /// **Wire-format**: unlike its `EdgeSketchProcessor` /
+    /// `BackendAggregation` siblings, this id IS surfaced on the
+    /// gateway YAML wire (see `emit::stage_config::build_gateway_merge_block`)
+    /// — the gateway's sketchmerge processor uses it as its
+    /// per-merge lookup key. Retiring `aggregation_id` would
+    /// require co-retiring the gateway-tier merge protocol.
     pub aggregation_id: String,
 }
 
