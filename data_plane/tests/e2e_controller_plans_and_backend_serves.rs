@@ -968,37 +968,17 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
 //
 // HLL backs the cardinality readout. The workload pins HLL via
 // `sketch_type_override: Some(SketchType::HLL)`. The OTLP DP carries
-// a `HllSketchDataPoint` with `HyperLogLogState`.
+// a `HllSketchDataPoint` with `HyperLogLogState`. PromQL's
+// `count(metric)` is the spec's distinct-counting idiom — returns
+// the number of distinct label sets in the result vector — which
+// the analyzer routes to `Capability::CardinalityApprox` and the
+// reducer dispatches to the HLL cardinality readout.
 //
-// PromQL's `count(metric)` is the spec's distinct-counting idiom —
-// it returns the number of distinct label sets in the result vector.
-// Three engine-side fixes were needed (alongside this PR):
-//
-// 1. **Analyzer (`walk_qe::Expr::VectorSelector`)** — gated the
-//    implicit `Aggregate(Sum)` wrapper on `!ctx.outer_count` so a
-//    bare selector under `count(...)` doesn't synthesize a spurious
-//    `ExactAgg(Sum)` candidate that fails the engine's
-//    "all candidates must succeed" loop.
-// 2. **Reducer (`function_to_family`)** — added `"count"` as an
-//    alias for `QueryFamily::Cardinality`.
-// 3. **Test setup** — OTLP DP precision must match what the
-//    controller plans (`HLLDefaults`); start_time must be near
-//    end_time so the stored window falls within the query's
-//    lookback range.
-//
-// **Currently `#[ignore]`'d.** With all three fixes in place the
-// engine path now goes the distance: streaming-config registers,
-// OTLP DP lands in `SketchStore`, sids share the right `policy_fp`,
-// reducer.evaluate returns `Ok(...)`. But the HTTP response body
-// comes back empty / fails JSON decode (`reqwest::Error: EOF while
-// parsing a value`) — the response-serialization path for
-// instant-vector cardinality results has a separate bug worth its
-// own follow-up. Tracked via the diagnostic comments above and the
-// engine-debug prints kept in the engine path's git history.
+// Closed by a chain of fixes:
+//   * `count(metric)` analyzer fix (PR #255)
+//   * `count` reducer alias (PR #255)
+//   * Vector-vs-Matrix instant-query response shape fix (this PR)
 
-#[ignore = "HLL roundtrip — analyzer, policy match, reducer all succeed; \
-            HTTP response body is empty. Separate serialization bug \
-            in the cardinality response path."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_plan_to_query_full_roundtrip_hll() {
     let stack = start_full_stack(19_565, 19_566).await;

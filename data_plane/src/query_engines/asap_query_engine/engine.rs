@@ -3424,10 +3424,42 @@ fn stitch_warm_and_archive(
 
 fn asap_tier_result_to_query_result(
     result: crate::storage_engines::sketch_db::query::ASAPTierResult,
-    _now_ms: u64,
+    now_ms: u64,
+    is_range_query: bool,
 ) -> crate::query_engines::query_result::QueryResult {
     use crate::storage_engines::types::KeyByLabelValues;
-    use crate::query_engines::query_result::{QueryResult, RangeVectorElement};
+    use crate::query_engines::query_result::{
+        InstantVectorElement, QueryResult, RangeVectorElement,
+    };
+
+    // Instant-query result-shape: the Prometheus adapter's
+    // `format_success_response` rejects `Matrix` for queries the
+    // analyzer marked as instant (`range_seconds == 0`) — produces a
+    // 500 ”shape mismatch”. Project the per-series last sample into
+    // an `InstantVectorElement` and wrap as `Vector` so the wire
+    // response carries `resultType: vector` matching the request.
+    if !is_range_query {
+        let mut elements: Vec<InstantVectorElement> = Vec::with_capacity(result.series.len());
+        for (label_values, samples) in result.series {
+            let (_keys, values): (Vec<String>, Vec<String>) = label_values.into_iter().unzip();
+            let labels = KeyByLabelValues::new_with_labels(values);
+            // Take the latest sample (the reducer returns one per
+            // window_end; for instant readout we want the most recent).
+            // `InstantVectorElement` doesn't carry a per-element
+            // `label_keys_override` today (only `RangeVectorElement`
+            // does, for the topk-`item`-key case) — labels render
+            // with whatever query-scoped `KeyByLabelNames` the
+            // serializer holds. That's correct for the cardinality
+            // shape that's the only instant-vector consumer at the
+            // moment; if a future instant-vector readout needs
+            // per-element key remapping, add the override field on
+            // `InstantVectorElement` then plumb `keys` here.
+            if let Some((_, value)) = samples.into_iter().last() {
+                elements.push(InstantVectorElement::new(labels, value));
+            }
+        }
+        return QueryResult::vector(elements, now_ms);
+    }
 
     let mut elements: Vec<RangeVectorElement> = Vec::with_capacity(result.series.len());
     for (label_values, samples) in result.series {
@@ -3553,6 +3585,16 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
                 None;
             let mut combined_t0: u64 = u64::MAX;
+            // Track whether ANY candidate is range-vector-shaped
+            // (`range_seconds > 0`). Drives the Vector-vs-Matrix
+            // result-shape choice in `asap_tier_result_to_query_result`
+            // below — instant queries (`count(metric)`,
+            // `quantile(...)` without `_over_time` etc.) need
+            // `QueryResult::Vector` so the Prometheus adapter's
+            // `format_success_response` wraps them as `resultType:
+            // vector`. Returning `Matrix` for an instant query
+            // produces a 500 (adapter rejects the shape mismatch).
+            let mut any_range_candidate = false;
 
             // Snapshot the streaming config once for this query's
             // policy lookups. Hot-reload swaps the underlying Arc; the
@@ -3561,6 +3603,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             let policy_registry = streaming_snap.policy_registry();
 
             for candidate in &analysis.candidates {
+                if candidate.range_seconds > 0 {
+                    any_range_candidate = true;
+                }
                 // Content-addressed sid lookup: find matching policies
                 // in the registry → resolve each policy_fp → {sids}
                 // via the reverse index. Both hops are O(1)-amortized.
@@ -3722,7 +3767,11 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // QueryResult and run the hybrid-stitch path if archive
             // is wired and warm coverage is narrower than request.
             if let Some(result) = combined_result {
-                let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms);
+                let warm_qr = asap_tier_result_to_query_result(
+                    result.clone(),
+                    now_ms,
+                    any_range_candidate,
+                );
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
                 {
