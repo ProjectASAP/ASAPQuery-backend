@@ -446,6 +446,9 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
         AggregationType::CountMinSketchWithHeap => {
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
         }
+        AggregationType::CountSketchWithHeap => {
+            Some(Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap))
+        }
         // Keyed-multi-population variants. The capability the policy
         // *provides* is the multi-pop variant itself; the matching
         // predicate (`Capability::is_satisfied_by`) recognises that

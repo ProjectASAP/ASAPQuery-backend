@@ -197,17 +197,20 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         // (sum / avg / min / max / etc.). PromQL's `count(metric)`
         // operates on the result-set's LABEL-SETS — the inner
         // selector is just "the things to count," not a value to sum.
-        // Synthesizing `Aggregate(Sum)` underneath an outer count would
-        // collect a redundant `ExactAgg(Sum)` candidate alongside the
-        // intended `CardinalityApprox` one, and the engine's
-        // "all candidates must succeed" semantic surfaces a
-        // `CapabilityMiss` when no Sum policy is registered for the
-        // metric (e.g. an HLL-only deploy).
+        // PromQL's `topk(k, metric)` operates on the SERIES — the
+        // inner selector is the population to rank, not a value to
+        // sum. Synthesizing `Aggregate(Sum)` underneath either outer
+        // would collect a redundant `ExactAgg(Sum)` candidate
+        // alongside the intended `CardinalityApprox` /
+        // `FrequencyTopk(*WithHeap)` one; the engine's
+        // "all candidates must succeed" semantic then surfaces a
+        // `CapabilityMiss` when no Sum policy is registered (e.g. an
+        // HLL-only or CMS-with-heap-only deploy).
         Expr::VectorSelector(vs) => {
             let (name, filters) = extract_vs_info(vs);
             let source   = QueryExpr::Source(QeSourceSpec { name });
             let filtered = apply_qe_filters(source, filters);
-            if ctx.outer_count {
+            if ctx.outer_count || ctx.topk.is_some() {
                 Ok(filtered)
             } else {
                 Ok(QueryExpr::Aggregate {

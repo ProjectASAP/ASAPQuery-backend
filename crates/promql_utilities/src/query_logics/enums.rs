@@ -274,6 +274,7 @@ pub enum AggregationType {
     CountMinSketch,
     CountMinSketchWithHeap,
     CountSketch,
+    CountSketchWithHeap,
     // ---------- cardinality / set tracking ----------
     SetAggregator,
     DeltaSetAggregator,
@@ -298,6 +299,7 @@ impl AggregationType {
             AggregationType::CountMinSketch => "CountMinSketch",
             AggregationType::CountMinSketchWithHeap => "CountMinSketchWithHeap",
             AggregationType::CountSketch => "CountSketch",
+            AggregationType::CountSketchWithHeap => "CountSketchWithHeap",
             AggregationType::SetAggregator => "SetAggregator",
             AggregationType::DeltaSetAggregator => "DeltaSetAggregator",
             AggregationType::HLL => "HLL",
@@ -318,6 +320,7 @@ impl AggregationType {
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
                 | AggregationType::CountSketch
+                | AggregationType::CountSketchWithHeap
                 | AggregationType::HydraKLL
         )
     }
@@ -332,6 +335,7 @@ impl AggregationType {
                 | AggregationType::CountMinSketch
                 | AggregationType::CountMinSketchWithHeap
                 | AggregationType::CountSketch
+                | AggregationType::CountSketchWithHeap
         )
     }
 
@@ -367,6 +371,7 @@ impl FromStr for AggregationType {
             "CountMinSketch" => Ok(AggregationType::CountMinSketch),
             "CountMinSketchWithHeap" => Ok(AggregationType::CountMinSketchWithHeap),
             "CountSketch" => Ok(AggregationType::CountSketch),
+            "CountSketchWithHeap" => Ok(AggregationType::CountSketchWithHeap),
             "SetAggregator" => Ok(AggregationType::SetAggregator),
             "DeltaSetAggregator" => Ok(AggregationType::DeltaSetAggregator),
             "HLL" | "HyperLogLog" => Ok(AggregationType::HLL),
@@ -395,6 +400,7 @@ impl FromStr for AggregationType {
             "CountSketchAccumulator" | "CS" | "cs" | "count_sketch" => {
                 Ok(AggregationType::CountSketch)
             }
+            "CountSketchWithHeapAccumulator" => Ok(AggregationType::CountSketchWithHeap),
             "SetAggregatorAccumulator" => Ok(AggregationType::SetAggregator),
             "DeltaSetAggregatorAccumulator" => Ok(AggregationType::DeltaSetAggregator),
             _ => Err(format!("Unknown aggregation type: '{s}'")),
