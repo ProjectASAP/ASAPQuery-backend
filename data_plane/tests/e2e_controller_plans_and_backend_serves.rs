@@ -539,7 +539,11 @@ fn build_hll_export(
     }
 }
 
-/// Build a `CountSketchState` proto from a signed matrix in row-major order.
+/// Build a `CountSketchState` proto from a signed matrix in row-major
+/// order. Currently orphaned — Tests 6 + 9 (CountSketch coverage) use
+/// the heap-bearing msgpack helper instead. Retained for future
+/// non-heap CountSketch coverage; delete if no caller materialises.
+#[allow(dead_code)]
 fn build_count_sketch_state(rows: u32, cols: u32, counts_int: Vec<i64>) -> CountSketchState {
     assert_eq!(
         counts_int.len() as u32,
@@ -557,7 +561,11 @@ fn build_count_sketch_state(rows: u32, cols: u32, counts_int: Vec<i64>) -> Count
     }
 }
 
-/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single CountSketch DP.
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single
+/// CountSketch DP (heap-less proto encoding). Sibling helper to
+/// `build_count_sketch_state`; both are retained for future
+/// non-heap coverage despite being orphaned today.
+#[allow(dead_code)]
 fn build_count_sketch_export(
     metric_name: &str,
     attrs: &[(&str, &str)],
@@ -627,12 +635,17 @@ fn build_count_min_state(rows: u32, cols: u32, counts_int: Vec<i64>) -> CountMin
     }
 }
 
-/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single CountMinSketch DP.
+/// Build an OTLP `ExportMetricsServiceRequest` wrapping a single
+/// CountMinSketch DP. `wire_rows`/`wire_cols` MUST match the
+/// policy's `parameters.{d, w}` so `derive_sketch_policy_fp`'s
+/// content match binds the sid to the registered policy.
 fn build_count_min_export(
     metric_name: &str,
     attrs: &[(&str, &str)],
     time_unix_nano: u64,
     sketch_bytes: Vec<u8>,
+    wire_rows: i32,
+    wire_cols: i32,
 ) -> ExportMetricsServiceRequest {
     let attributes = attrs
         .iter()
@@ -666,8 +679,8 @@ fn build_count_min_export(
                     data: Some(Data::Countminsketch(CountMinSketch {
                         data_points: vec![dp],
                         aggregation_temporality: 0,
-                        rows: 0,
-                        cols: 0,
+                        rows: wire_rows,
+                        cols: wire_cols,
                     })),
                 }],
                 schema_url: String::new(),
@@ -1215,23 +1228,23 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
 
 // ── Test 6 — wire-format roundtrip with CountSketch (frequency) ─────────────
 //
-// CountSketch backs FREQUENCY estimation — counting heavy hitters and
-// producing approximate point-frequency answers. Workload pins
-// CountSketch via `sketch_type_override: Some(SketchType::CountSketch)`.
-// The OTLP DP carries a `CountSketchDataPoint` with `CountSketchState`.
+// CountSketch backs FREQUENCY estimation — signed-counter matrix
+// producing approximate point-frequency answers. `top_endpoint_qps`
+// is the canonical TopK metric, so the planner pins
+// `with_heap: true` and the controller emits `CountSketchWithHeap`
+// (regardless of override). To match, the wire DP carries a
+// msgpack-encoded heap envelope (mirroring Test 9), but the query
+// uses `count_over_time(...)` instead of `topk(...)` — the
+// reducer's `decode_frequency_total` reads row-0 of the underlying
+// matrix for heap-bearing variants too, so FrequencyEstimate works
+// on the same sid that Test 9 queries for top-k.
 //
-// **Soft-check on the query (status field exists, no strict success).**
-// Strict-success topk requires a heap-bearing variant
-// (`CountSketchWithHeap` / `CmsWithHeap`) — `is_satisfied_by` rejects
-// `FrequencyTopk` against `FrequencyEstimate`-only sids. Heap-bearing
-// variants need msgpack-encoded payloads (per
-// `sketch_kind_handle_for`'s detection path). Out of scope for this
-// PR; tracked as the natural next step after wire-format coverage.
-//
-// Pure-PromQL has no first-class function for `FrequencyEstimate` (the
-// reducer accepts `"frequency"` / `"frequency_estimate"` but those
-// aren't valid PromQL). MetricsQL extensions in this area would be
-// the queryable surface.
+// **Strict-success: `count_over_time(top_endpoint_qps[1s])`** binds
+// to `Capability::FrequencyEstimate(Any)`, which
+// `is_satisfied_by` accepts against
+// `FrequencyTopk(CountSketchWithHeap)` (heap is additional info
+// layered over the matrix — the matrix is a fully valid frequency
+// sketch on its own).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_plan_to_query_full_roundtrip_count_sketch() {
@@ -1248,22 +1261,28 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
         Some(SketchType::CountSketch),
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    // `top_endpoint_qps` is the canonical TopK metric — the planner
-    // picks `with_heap: true` even with `SketchType::CountSketch`
-    // override, so the controller emits `CountSketchWithHeap`. The
-    // soft-check below verifies wire-format ingest works regardless
-    // of heap-bearing classification.
     assert_eq!(
         streaming_config_json["aggregations"][0]["aggregationType"], "CountSketchWithHeap",
         "controller must emit CountSketchWithHeap for top_endpoint_qps (TopK metric)\n{streaming_config_json}"
     );
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
-    let rows = 5u32;
-    let cols = 1024u32;
-    let counts: Vec<i64> = (0..(rows * cols) as i64).map(|i| i % 7).collect();
-    let cs_state = build_count_sketch_state(rows, cols, counts);
-    let sketch_bytes = cs_state.encode_to_vec();
+    // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
+    // `rows`/`cols` line up with the policy's `parameters.{d, w}` —
+    // same shape constraint as Test 9.
+    let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
+    let rows = d as usize;
+    let cols = w as usize;
+    let wire_rows = d as i32;
+    let wire_cols = w as i32;
+
+    let items: &[(&str, u64)] = &[
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+    ];
+    let sketch_bytes = build_heap_bearing_msgpack(rows, cols, 10, items);
 
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1272,46 +1291,54 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
-    let req = build_count_sketch_export(
+    let req = build_count_sketch_with_heap_msgpack_export(
         "top_endpoint_qps",
         &[("service", "e2e-test")],
         sketch_t_ns,
-        sketch_bytes,
+        sketch_bytes.clone(),
+        wire_rows,
+        wire_cols,
     );
     post_otlp_http(&client, stack.otlp_http_port, req).await;
 
-    let watermark_state = build_count_sketch_state(rows, cols, vec![0i64; (rows * cols) as usize]);
-    let watermark_req = build_count_sketch_export(
+    let watermark_req = build_count_sketch_with_heap_msgpack_export(
         "top_endpoint_qps",
         &[("service", "e2e-test")],
         watermark_t_ns,
-        watermark_state.encode_to_vec(),
+        sketch_bytes,
+        wire_rows,
+        wire_cols,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Soft-check: `topk(5, ...)` won't succeed against heap-less
-    // CountSketch (capability mismatch — see test doc), so we just
-    // assert the response is well-formed JSON with a `status` field.
-    // The real success signal is that the OTLP POSTs above returned
-    // 2xx (the wire-format ingest works) and `runtime_info` would
-    // show the sid registered.
     let response: JsonValue = client
         .get(format!(
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[("query", "topk(5, top_endpoint_qps)")])
+        .query(&[("query", "count_over_time(top_endpoint_qps[10s])")])
         .send()
         .await
         .expect("query failed")
         .json()
         .await
         .expect("response not JSON");
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "count_over_time(...) against heap-bearing CountSketch must succeed \
+         end-to-end. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("result must be an array of vector elements");
     assert!(
-        response.get("status").is_some(),
-        "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
+        !arr.is_empty(),
+        "count_over_time must return at least one series. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
@@ -1323,9 +1350,12 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
 // `sketch_type_override: Some(SketchType::CountMinSketch)`. The OTLP
 // DP carries a `CountMinSketchDataPoint` with `CountMinState`.
 //
-// **Soft-check on the query, same rationale as Test 6.** Strict-success
-// topk needs `CountMinSketchWithHeap` (with msgpack-encoded heap) —
-// out of scope for this PR.
+// **Strict-success on `count_over_time(metric[1s])`** — PromQL's
+// per-series sample-count idiom maps to `FrequencyEstimate(Any)`
+// (see analyzer's `walk_call_to_op` for `count_over_time`), which
+// `is_satisfied_by` accepts against `FrequencyEstimate(CountMin)`.
+// The reducer's `decode_frequency_total` reads row-0 of the CMS
+// matrix and returns the per-window total count.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
@@ -1348,8 +1378,12 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
     );
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
-    let rows = 5u32;
-    let cols = 2048u32;
+    // Use planner-picked `(w, d)` so the wire DP's `rows`/`cols`
+    // match the policy's `parameters.{d, w}` — the policy_fp content
+    // match keys on these values (see `derive_sketch_policy_fp`).
+    let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
+    let rows = d;
+    let cols = w;
     let counts: Vec<i64> = (0..(rows * cols) as i64).map(|i| (i % 11).abs()).collect();
     let cms_state = build_count_min_state(rows, cols, counts);
     let sketch_bytes = cms_state.encode_to_vec();
@@ -1366,6 +1400,8 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
         &[("service", "e2e-test")],
         sketch_t_ns,
         sketch_bytes,
+        rows as i32,
+        cols as i32,
     );
     post_otlp_http(&client, stack.otlp_http_port, req).await;
 
@@ -1375,29 +1411,38 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
         &[("service", "e2e-test")],
         watermark_t_ns,
         watermark_state.encode_to_vec(),
+        rows as i32,
+        cols as i32,
     );
     post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Soft-check: pure-PromQL has no `frequency_estimate` function,
-    // and `topk(...)` requires a heap-bearing CMS. Assert response
-    // shape only; ingest 2xx already confirmed wire-format coverage.
     let response: JsonValue = client
         .get(format!(
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[("query", "topk(5, endpoint_request_freq)")])
+        .query(&[("query", "count_over_time(endpoint_request_freq[10s])")])
         .send()
         .await
         .expect("query failed")
         .json()
         .await
         .expect("response not JSON");
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status, "success",
+        "count_over_time(...) against heap-less CMS must succeed end-to-end. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("result must be an array of vector elements");
     assert!(
-        response.get("status").is_some(),
-        "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
+        !arr.is_empty(),
+        "count_over_time must return at least one series. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
