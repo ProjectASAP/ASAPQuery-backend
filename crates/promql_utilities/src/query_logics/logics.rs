@@ -101,6 +101,12 @@ pub fn does_precompute_operator_support_subpopulations(
         // CountMinSketchWithHeap is only supported for Topk — does not support subpopulations
         AggregationType::CountMinSketchWithHeap if matches!(statistic, Statistic::Topk) => false,
 
+        // CountSketch is the signed-counter equivalent of CMS — same
+        // subpopulation shape for Sum/Count statistics. The
+        // heap-bearing variant covers Topk like its CMS counterpart.
+        AggregationType::CountSketch => matches!(statistic, Statistic::Sum | Statistic::Count),
+        AggregationType::CountSketchWithHeap if matches!(statistic, Statistic::Topk) => false,
+
         // Default: not supported
         _ => panic!("Unexpected precompute operator: {}", precompute_operator),
     }
@@ -185,6 +191,28 @@ mod tests {
         assert!(does_precompute_operator_support_subpopulations(
             Statistic::Sum,
             AggregationType::CountMinSketch,
+        ));
+
+        // Sibling CountSketch path — must not panic, matches
+        // CountMinSketch's Sum/Count subpopulation shape.
+        assert!(does_precompute_operator_support_subpopulations(
+            Statistic::Sum,
+            AggregationType::CountSketch,
+        ));
+        assert!(does_precompute_operator_support_subpopulations(
+            Statistic::Count,
+            AggregationType::CountSketch,
+        ));
+
+        // Heap-bearing variants on Topk — both return false (heap
+        // is per-policy, not subpopulation-keyed) and must not panic.
+        assert!(!does_precompute_operator_support_subpopulations(
+            Statistic::Topk,
+            AggregationType::CountMinSketchWithHeap,
+        ));
+        assert!(!does_precompute_operator_support_subpopulations(
+            Statistic::Topk,
+            AggregationType::CountSketchWithHeap,
         ));
     }
 
