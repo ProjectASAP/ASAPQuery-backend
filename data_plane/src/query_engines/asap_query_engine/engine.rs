@@ -923,31 +923,22 @@ impl ASAPQueryEngine {
         end_timestamp: u64,
         agg_info: &AggregationIdInfo,
     ) -> Result<StoreQueryParams, String> {
-        let (start_timestamp, end_timestamp) = match agg_info.aggregation_type_for_key {
-            AggregationType::DeltaSetAggregator => {
-                // All keys from beginning of time
-                (0, end_timestamp)
-            }
-            AggregationType::SetAggregator => {
-                // Latest window only. `.map(|c| c.window_size * 1000)`
-                // copies out a u64 so the snapshot only needs to live
-                // for the duration of the expression.
-                let window_size = self
-                    .streaming_config_snapshot()
-                    .get_aggregation_config(agg_info.aggregation_id_for_key)
-                    .map(|config| config.window_size * 1000)
-                    .ok_or_else(|| {
-                        format!(
-                            "Failed to get window size for aggregation {}",
-                            agg_info.aggregation_id_for_key
-                        )
-                    })?;
-                (end_timestamp - window_size, end_timestamp)
-            }
-            other => {
-                return Err(format!("Unsupported key aggregation type: {other:?}"));
-            }
-        };
+        // The historical key-tracking family (`SetAggregator` /
+        // `DeltaSetAggregator`) has been retired. After retirement no
+        // production code path produces a key-aggregation distinct
+        // from the value-aggregation, so this function is unreachable
+        // in practice — the caller's `aggregation_id_for_key !=
+        // aggregation_id_for_value` guard never fires. Kept as a
+        // typed-error surface in case a stale stored config still
+        // carries a mismatched pair.
+        let _ = end_timestamp;
+        return Err(format!(
+            "create_keys_query_params is unreachable after SetAggregator / \
+             DeltaSetAggregator retirement; got aggregation_type_for_key={:?}",
+            agg_info.aggregation_type_for_key
+        ));
+        #[allow(unreachable_code)]
+        let (start_timestamp, end_timestamp) = (0u64, end_timestamp);
 
         Ok(StoreQueryParams {
             metric: metric.to_string(),
@@ -2624,8 +2615,13 @@ impl ASAPQueryEngine {
             do_merge, aggregation_type
         );
 
-        // Merge if: temporal query OR DeltaSetAggregator (which accumulates keys over time)
-        let should_merge = do_merge || aggregation_type == AggregationType::DeltaSetAggregator;
+        // Merge iff a temporal query asked us to. The historical
+        // `DeltaSetAggregator` arm (which forced a merge to
+        // accumulate keys over time) is retired with the rest of
+        // the set-tracking family — there's no other accumulator
+        // today that requires the force-merge override.
+        let _ = aggregation_type;
+        let should_merge = do_merge;
 
         let mut merged = HashMap::with_capacity(precomputed_outputs_map.len());
 

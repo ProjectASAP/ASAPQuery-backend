@@ -126,15 +126,15 @@ impl AccuracyProfile {
     /// "0 error" rather than a panic).
     pub fn derive(config: &AggregationConfig) -> Self {
         match config.aggregation_type {
-            // Exact aggregates.
+            // Exact aggregates. (The `SetAggregator` /
+            // `DeltaSetAggregator` exact-set-membership family lived
+            // here too before its retirement.)
             AggregationType::Sum
             | AggregationType::Increase
             | AggregationType::MinMax
             | AggregationType::MultipleSum
             | AggregationType::MultipleIncrease
-            | AggregationType::MultipleMinMax
-            | AggregationType::SetAggregator
-            | AggregationType::DeltaSetAggregator => Self::exact(),
+            | AggregationType::MultipleMinMax => Self::exact(),
 
             // CountMinSketch: classic Cormode-Muthukrishnan bound.
             // ε = e/w, δ = 1/2^d with w = width, d = depth. We
@@ -644,16 +644,9 @@ mod tests {
         assert_eq!(p.epsilon, 0.01);
     }
 
-    #[test]
-    fn set_aggregators_are_exact() {
-        for t in [
-            AggregationType::SetAggregator,
-            AggregationType::DeltaSetAggregator,
-        ] {
-            let p = AccuracyProfile::derive(&base_config(t, HashMap::new()));
-            assert_eq!(p.kind, AccuracyKind::Exact);
-        }
-    }
+    // (The historical `set_aggregators_are_exact` test verified the
+    // accuracy bound for `SetAggregator` / `DeltaSetAggregator`;
+    // retired alongside the family itself.)
 
     #[test]
     fn legacy_wrapper_types_fall_back_to_exact() {

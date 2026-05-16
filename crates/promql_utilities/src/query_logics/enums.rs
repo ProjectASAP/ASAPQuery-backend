@@ -276,8 +276,6 @@ pub enum AggregationType {
     CountSketch,
     CountSketchWithHeap,
     // ---------- cardinality / set tracking ----------
-    SetAggregator,
-    DeltaSetAggregator,
     HLL,
     DDSketch,
     // ---------- legacy config wrapper names ----------
@@ -300,8 +298,6 @@ impl AggregationType {
             AggregationType::CountMinSketchWithHeap => "CountMinSketchWithHeap",
             AggregationType::CountSketch => "CountSketch",
             AggregationType::CountSketchWithHeap => "CountSketchWithHeap",
-            AggregationType::SetAggregator => "SetAggregator",
-            AggregationType::DeltaSetAggregator => "DeltaSetAggregator",
             AggregationType::HLL => "HLL",
             AggregationType::DDSketch => "DDSketch",
             AggregationType::SingleSubpopulation => "SingleSubpopulation",
@@ -340,11 +336,12 @@ impl AggregationType {
     }
 
     /// Returns `true` if this is a key-tracking aggregation type.
+    /// Retained as a stable predicate for downstream callers; the
+    /// historical `SetAggregator` / `DeltaSetAggregator` set-tracking
+    /// family has been retired (no `AggregationType` is key-tracking
+    /// today).
     pub fn is_key_agg_type(self) -> bool {
-        matches!(
-            self,
-            AggregationType::SetAggregator | AggregationType::DeltaSetAggregator
-        )
+        false
     }
 }
 
@@ -372,8 +369,6 @@ impl FromStr for AggregationType {
             "CountMinSketchWithHeap" => Ok(AggregationType::CountMinSketchWithHeap),
             "CountSketch" => Ok(AggregationType::CountSketch),
             "CountSketchWithHeap" => Ok(AggregationType::CountSketchWithHeap),
-            "SetAggregator" => Ok(AggregationType::SetAggregator),
-            "DeltaSetAggregator" => Ok(AggregationType::DeltaSetAggregator),
             "HLL" | "HyperLogLog" => Ok(AggregationType::HLL),
             "DDSketch" | "DdSketch" => Ok(AggregationType::DDSketch),
             "SingleSubpopulation" => Ok(AggregationType::SingleSubpopulation),
@@ -401,8 +396,6 @@ impl FromStr for AggregationType {
                 Ok(AggregationType::CountSketch)
             }
             "CountSketchWithHeapAccumulator" => Ok(AggregationType::CountSketchWithHeap),
-            "SetAggregatorAccumulator" => Ok(AggregationType::SetAggregator),
-            "DeltaSetAggregatorAccumulator" => Ok(AggregationType::DeltaSetAggregator),
             _ => Err(format!("Unknown aggregation type: '{s}'")),
         }
     }
