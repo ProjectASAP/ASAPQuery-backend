@@ -3764,10 +3764,26 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // QueryResult and run the hybrid-stitch path if archive
             // is wired and warm coverage is narrower than request.
             if let Some(result) = combined_result {
+                // `execute(&str)` is the instant-query trait surface —
+                // it's only called from `/api/v1/query` (never from
+                // `/api/v1/query_range`, which has its own
+                // `handle_range_query_promql` path). For PromQL,
+                // instant queries always return a vector: even when
+                // the inner expression carries a range selector like
+                // `count_over_time(metric[10s])`, the outer evaluation
+                // at time `t` yields one value per series (computed
+                // over `[t-range, t]`). So this site always wants
+                // Vector — `any_range_candidate` was the wrong signal
+                // (it captures the inner range, not the outer eval
+                // shape) and produced Matrix for instant queries
+                // with range-bound inners, which the Prometheus
+                // adapter's `format_success_response` rejects with
+                // a 500 ”shape mismatch” / empty-body response.
+                let _ = any_range_candidate;
                 let warm_qr = asap_tier_result_to_query_result(
                     result.clone(),
                     now_ms,
-                    any_range_candidate,
+                    false,
                 );
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
