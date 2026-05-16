@@ -10,7 +10,6 @@ use crate::storage_engines::types::{
 use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::precompute_engine::operators::count_min_sketch_accumulator::CountMinSketchAccumulator;
 use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
-use crate::precompute_engine::operators::delta_set_aggregator_accumulator::DeltaSetAggregatorAccumulator;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use promql_utilities::data_model::KeyByLabelNames;
@@ -82,7 +81,6 @@ fn engine_no_query_configs(
                 let cms = CountMinSketchAccumulator::new(4, 1000);
                 Box::new(cms)
             }
-            "DeltaSetAggregator" => Box::new(DeltaSetAggregatorAccumulator::new()),
             _ => Box::new(SumAccumulator::with_sum(42.0))};
         let resolver = Arc::new(SeriesIdResolver::new());
         sketch_index.ingest_precompute_for_agg_config(
@@ -280,57 +278,8 @@ fn priority_largest_window_wins() {
     );
 }
 
-/// E2E for the headline bug fix: a `sum_over_time(...)` query against a
-/// CMS-only backend (no `Sum` / `MultipleSum` config available) must resolve
-/// via capability matching to the CountMinSketch aggregation, paired with the
-/// `DeltaSetAggregator` key aggregation. Pre-fix, `compatible_agg_types(Sum)`
-/// did not list `CountMinSketch`, so this query fell through capability
-/// matching to the cold tier (or returned an empty result).
-#[test]
-fn cms_only_backend_resolves_sum_over_time_via_capability_matching() {
-    let cms = make_agg_config(
-        100,
-        "http_requests_total",
-        AggregationType::CountMinSketch,
-        300,
-        WindowType::Tumbling,
-        &[],
-    );
-    // CMS is a multi-population value type — `find_compatible_aggregation`
-    // requires a paired key aggregation on the same metric.
-    let key_agg = make_agg_config(
-        101,
-        "http_requests_total",
-        AggregationType::DeltaSetAggregator,
-        300,
-        WindowType::Tumbling,
-        &[],
-    );
-    let expected_value = cms.aggregation_id();
-    let expected_key = key_agg.aggregation_id();
-    let engine = engine_no_query_configs("http_requests_total", &[], vec![cms, key_agg]);
-
-    let ctx = engine
-        .build_query_execution_context_promql(
-            "sum_over_time(http_requests_total[5m])".to_string(),
-            1000.0,
-        )
-        .expect(
-            "post-fix: capability matching must resolve sum_over_time against a CMS-only backend; \
-             pre-fix returned None and the query fell through to the cold tier.",
-        );
-
-    assert_eq!(
-        ctx.agg_info.aggregation_id_for_value, expected_value,
-        "Capability matching should route Sum to the CMS aggregation",
-    );
-    assert_eq!(
-        ctx.agg_info.aggregation_type_for_value,
-        AggregationType::CountMinSketch,
-        "Resolved value aggregation type must be CountMinSketch",
-    );
-    assert_eq!(
-        ctx.agg_info.aggregation_id_for_key, expected_key,
-        "CMS is multi-population — must be paired with the DeltaSetAggregator",
-    );
-}
+// `cms_only_backend_resolves_sum_over_time_via_capability_matching`
+// retired alongside the `SetAggregator` / `DeltaSetAggregator` family.
+// The test asserted that a CMS aggregation paired with a
+// `DeltaSetAggregator` key aggregation would resolve `sum_over_time`
+// via capability matching; the pairing is no longer expressible.

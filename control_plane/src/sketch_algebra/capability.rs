@@ -1025,8 +1025,6 @@ mod tests {
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
             AggregationType::CountSketch,
-            AggregationType::SetAggregator,
-            AggregationType::DeltaSetAggregator,
             AggregationType::HLL,
             AggregationType::DDSketch,
         ];

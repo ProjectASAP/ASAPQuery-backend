@@ -465,15 +465,12 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
         }
         // No ASAP-tier capability today. HydraKLL is a keyed-quantile
         // family that needs its own QuantileApprox arm (with a
-        // multi-pop equivalent rule) — separate follow-up. SetAggregator
-        // and DeltaSetAggregator are exact-set-membership primitives;
-        // they serve `count(distinct ...)` queries through a different
-        // routing path (not via candidate capability matching).
+        // multi-pop equivalent rule) — separate follow-up.
         // `Single/MultipleSubpopulation` are legacy enum wrappers from
         // the pre-refactor config schema and have no semantic shape.
+        // (The retired `SetAggregator` / `DeltaSetAggregator` family
+        // used to live here too.)
         AggregationType::HydraKLL
-        | AggregationType::SetAggregator
-        | AggregationType::DeltaSetAggregator
         | AggregationType::SingleSubpopulation
         | AggregationType::MultipleSubpopulation => None,
     }
@@ -1271,12 +1268,14 @@ mod tests {
 
         #[test]
         fn ignores_unsupported_multi_pop_variants() {
-            // `HydraKLL`, `SetAggregator`, etc. have
-            // `policy_capability == None` because no Capability variant
-            // covers their shape today. Matching skips them.
+            // `HydraKLL` has `policy_capability == None` because no
+            // Capability variant covers its shape today. Matching
+            // skips it. (Historically `SetAggregator` /
+            // `DeltaSetAggregator` were also in this bucket; they've
+            // been retired.)
             let policies = vec![cfg(
                 "http_lat",
-                AggregationType::SetAggregator,
+                AggregationType::HydraKLL,
                 vec!["zone"],
                 60,
                 "",

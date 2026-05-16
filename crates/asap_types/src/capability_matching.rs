@@ -214,20 +214,13 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
             AggregationType::CountMinSketch,
             AggregationType::CountMinSketchWithHeap,
         ],
-        // Cardinality: SetAggregator / DeltaSetAggregator are the
-        // exact key trackers; HLL is the canonical approximator
-        // whose accumulator answers `Statistic::Cardinality` (and
-        // `Statistic::Count` as a cardinality alias) — see
-        // `precompute_operators/hll_sketch_accumulator.rs`. HLL is
-        // not in the planner's canonical map (it's wired in via
-        // modified-OTLP from the agent processors) but the runtime
-        // accumulator surface still resolves it, so list it here so
-        // capability matching can pick it up.
-        Statistic::Cardinality => &[
-            AggregationType::SetAggregator,
-            AggregationType::DeltaSetAggregator,
-            AggregationType::HLL,
-        ],
+        // Cardinality: HLL is the approximate cardinality estimator
+        // (wired in via modified-OTLP from the agent processors) —
+        // see `precompute_operators/hll_sketch_accumulator.rs`. The
+        // historical exact-key trackers (`SetAggregator` /
+        // `DeltaSetAggregator`) were retired wholesale; HLL is the
+        // sole cardinality answerer today.
+        Statistic::Cardinality => &[AggregationType::HLL],
         // Topk: `CountMinSketchWithHeap` is the canonical CMS-Heap
         // pattern. CountSketch is the second-tier reservoir-style
         // approximator the MVP demo's controller plans for
@@ -999,24 +992,11 @@ mod tests {
 
     // --- multi-population ---
 
-    #[test]
-    fn multi_pop_finds_key_agg() {
-        let value_cfg =
-            make_config(10, "req", "CountMinSketchWithHeap", "", 300, "tumbling", &[], "");
-        let key_cfg = make_config(11, "req", "DeltaSetAggregator", "", 300, "tumbling", &[], "");
-        let expected_value = value_cfg.aggregation_id();
-        let expected_key = key_cfg.aggregation_id();
-        let mut configs = HashMap::new();
-        configs.insert(value_cfg.aggregation_id(), value_cfg);
-        configs.insert(key_cfg.aggregation_id(), key_cfg);
-        let result = find_compatible_aggregation(
-            &configs,
-            &req("req", &[Statistic::Topk], Some(300_000), &[], ""),
-        );
-        let info = result.unwrap();
-        assert_eq!(info.aggregation_id_for_value, expected_value);
-        assert_eq!(info.aggregation_id_for_key, expected_key);
-    }
+    // `multi_pop_finds_key_agg` retired alongside the
+    // `SetAggregator` / `DeltaSetAggregator` family — it asserted
+    // that a CountMinSketchWithHeap value paired with a
+    // DeltaSetAggregator key resolved for Topk; the key half is
+    // no longer expressible.
 
     #[test]
     fn multi_pop_no_key_agg_returns_none() {
@@ -1268,55 +1248,10 @@ mod tests {
     /// matching, not fall through to the cold tier. Pre-fix, this returned
     /// `None`; post-fix, it returns the CMS aggregation paired with the
     /// `DeltaSetAggregator` key aggregation.
-    #[test]
-    fn cms_resolves_sum_query_post_fix() {
-        let value_cfg = make_config(
-            42,
-            "http_requests_total",
-            "CountMinSketch",
-            "sum",
-            300,
-            "tumbling",
-            &[],
-            "",
-        );
-        // CountMinSketch is a multi-population value type and
-        // `find_compatible_aggregation` requires a paired key aggregation.
-        let key_cfg = make_config(
-            43,
-            "http_requests_total",
-            "DeltaSetAggregator",
-            "",
-            300,
-            "tumbling",
-            &[],
-            "",
-        );
-        let expected_value = value_cfg.aggregation_id();
-        let expected_key = key_cfg.aggregation_id();
-        let mut configs = HashMap::new();
-        configs.insert(value_cfg.aggregation_id(), value_cfg);
-        configs.insert(key_cfg.aggregation_id(), key_cfg);
-        let result = find_compatible_aggregation(
-            &configs,
-            &req(
-                "http_requests_total",
-                &[Statistic::Sum],
-                Some(300_000),
-                &[],
-                "",
-            ),
-        );
-        let info = result.expect(
-            "post-fix: capability matching must resolve sum_over_time against a CMS-only config",
-        );
-        assert_eq!(info.aggregation_id_for_value, expected_value);
-        assert_eq!(
-            info.aggregation_type_for_value,
-            AggregationType::CountMinSketch
-        );
-        assert_eq!(info.aggregation_id_for_key, expected_key);
-    }
+    // `cms_resolves_sum_query_post_fix` retired alongside the
+    // `SetAggregator` / `DeltaSetAggregator` family — same gist as
+    // `multi_pop_finds_key_agg` above (CountMinSketch value +
+    // DeltaSetAggregator key for Sum).
 
     // -----------------------------------------------------------------------
     // Phase-5: storage-backend routing
