@@ -630,6 +630,8 @@ pub fn config_is_keyed(config: &AggregationConfig) -> bool {
             | AggregationType::MultipleMinMax
             | AggregationType::CountMinSketch
             | AggregationType::CountMinSketchWithHeap
+            | AggregationType::CountSketch
+            | AggregationType::CountSketchWithHeap
             | AggregationType::HydraKLL
     )
 }
@@ -727,6 +729,26 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         )),
         AggregationType::Increase => Box::new(IncreaseAccumulatorUpdater::new()),
         AggregationType::CountMinSketch | AggregationType::CountMinSketchWithHeap => {
+            let (row_num, col_num) = cms_params(config);
+            Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
+        }
+        // CountSketch + CountSketchWithHeap (raw-input ingest path):
+        // route to `CmsAccumulatorUpdater` for now — it handles the
+        // same `(rows, cols)` matrix shape. The OTLP modified-sketch
+        // wire path uses `SketchEnvelope` ingest (not raw), so this
+        // arm fires only for Mode 2 / raw-input policies.
+        //
+        // Limitation: like the `CountMinSketchWithHeap` arm above,
+        // this drops the per-policy top-k heap on the raw-input side.
+        // The heap-bearing accumulator
+        // (`count_min_sketch_with_heap_accumulator.rs`) exists but
+        // doesn't yet have an `AccumulatorUpdater` impl; same is
+        // true for the CountSketch variants. Adding dedicated
+        // updaters is tracked as a follow-up — the present arm is
+        // a correctness floor (registered policy → working
+        // accumulator) without silently falling through to
+        // `SumAccumulatorUpdater`.
+        AggregationType::CountSketch | AggregationType::CountSketchWithHeap => {
             let (row_num, col_num) = cms_params(config);
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
@@ -880,6 +902,18 @@ mod tests {
         )));
         assert!(config_is_keyed(&make_config(
             AggregationType::CountMinSketch,
+            ""
+        )));
+        assert!(config_is_keyed(&make_config(
+            AggregationType::CountMinSketchWithHeap,
+            ""
+        )));
+        assert!(config_is_keyed(&make_config(
+            AggregationType::CountSketch,
+            ""
+        )));
+        assert!(config_is_keyed(&make_config(
+            AggregationType::CountSketchWithHeap,
             ""
         )));
         assert!(config_is_keyed(&make_config(AggregationType::HydraKLL, "")));
