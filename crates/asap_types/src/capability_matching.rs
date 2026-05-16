@@ -235,11 +235,18 @@ pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
         // signed-counter matrix). `CountSketchAccumulator` answers
         // `Statistic::Topk` directly — see
         // `precompute_operators/count_sketch_accumulator.rs:284`.
-        // Without CountSketch listed here, `topk(K, top_endpoint_qps)`
-        // capability-misses and the warm engine returns `status=error`.
+        // `CountSketchWithHeap` is the explicit heap-bearing variant
+        // that also satisfies Topk through the heap directly
+        // (parallel to `CountMinSketchWithHeap`); the analyzer's
+        // `topk(...)` candidate returns `FrequencyTopk(Any)` so
+        // either heap-bearing variant matches.
+        // Without CountSketch / CountSketchWithHeap listed here,
+        // `topk(K, top_endpoint_qps)` capability-misses and the
+        // warm engine returns `status=error`.
         Statistic::Topk => &[
             AggregationType::CountMinSketchWithHeap,
             AggregationType::CountSketch,
+            AggregationType::CountSketchWithHeap,
         ],
     }
 }
