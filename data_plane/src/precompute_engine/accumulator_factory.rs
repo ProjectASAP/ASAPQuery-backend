@@ -649,15 +649,24 @@ fn kll_k_param(config: &AggregationConfig) -> u16 {
 }
 
 /// Extract `(row_num, col_num)` for CMS / HydraKLL configs.
+///
+/// Reads from the canonical `d` (depth = rows) / `w` (width = cols)
+/// keys first — these match what the control plane's
+/// `sketch_params_to_json` emits and what `sketch_config_to_params`
+/// uses for OTLP policy_fp content matching. Falls back to the
+/// legacy `row_num` / `col_num` keys so older asapcollector
+/// configs continue to work.
 fn cms_params(config: &AggregationConfig) -> (usize, usize) {
     let row_num = config
         .parameters
-        .get("row_num")
+        .get("d")
+        .or_else(|| config.parameters.get("row_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(4) as usize;
     let col_num = config
         .parameters
-        .get("col_num")
+        .get("w")
+        .or_else(|| config.parameters.get("col_num"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1000) as usize;
     (row_num, col_num)
@@ -967,5 +976,78 @@ mod tests {
             .downcast_ref::<crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator>()
             .expect("should be KLL");
         assert_eq!(kll.inner.k, 50, "k should be 50 from capital-K param");
+    }
+
+    #[test]
+    fn cms_params_accepts_w_d_canonical_and_row_col_num_legacy() {
+        use std::collections::HashMap;
+        // Canonical `w`/`d` form — what the control plane's
+        // `sketch_params_to_json` emits today.
+        let mut params = HashMap::new();
+        params.insert("d".to_string(), serde_json::Value::from(7_u64));
+        params.insert("w".to_string(), serde_json::Value::from(2048_u64));
+        let config = AggregationConfig::new(
+            AggregationType::CountMinSketch,
+            String::new(),
+            params,
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            String::new(),
+            60,
+            0,
+            WindowType::Tumbling,
+            "m".to_string(),
+            "m".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(super::cms_params(&config), (7, 2048));
+
+        // Legacy `row_num`/`col_num` form — older asapcollector
+        // configs still ship these; the helper must keep accepting
+        // them so existing Docker e2e setups don't silently degrade.
+        let mut legacy = HashMap::new();
+        legacy.insert("row_num".to_string(), serde_json::Value::from(7_u64));
+        legacy.insert("col_num".to_string(), serde_json::Value::from(2048_u64));
+        let legacy_config = AggregationConfig::new(
+            AggregationType::CountMinSketch,
+            String::new(),
+            legacy,
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            String::new(),
+            60,
+            0,
+            WindowType::Tumbling,
+            "m".to_string(),
+            "m".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(super::cms_params(&legacy_config), (7, 2048));
+
+        // Empty params — defaults `(4, 1000)`.
+        let empty_config = AggregationConfig::new(
+            AggregationType::CountMinSketch,
+            String::new(),
+            HashMap::new(),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            String::new(),
+            60,
+            0,
+            WindowType::Tumbling,
+            "m".to_string(),
+            "m".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(super::cms_params(&empty_config), (4, 1000));
     }
 }
