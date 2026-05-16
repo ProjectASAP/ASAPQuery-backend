@@ -293,7 +293,11 @@ fn bind_cms_with_heap_on_topk(
     Some(PhysicalExpr::estimate_over_agg(
         EstimateOp::TopK { k: k_topk },
         SketchKind::Cms,
-        SketchParams::Cms(CmsParams { w, d }),
+        // CMS-Heap pattern: pair the CMS matrix with a heavy-hitter
+        // heap so `topk(...)` can enumerate items from the heap
+        // directly. The streaming-config emit picks
+        // `CountMinSketchWithHeap` for this binding.
+        SketchParams::Cms(CmsParams { w, d, with_heap: true }),
         (**child).clone(),
     ))
 }

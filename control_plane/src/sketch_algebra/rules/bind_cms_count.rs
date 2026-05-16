@@ -93,7 +93,11 @@ impl Rule for BindCmsOnCount {
         Some(PhysicalExpr::estimate_over_agg(
             readout,
             SketchKind::Cms,
-            SketchParams::Cms(CmsParams { w, d }),
+            // Heap-LESS CMS — `BindCmsOnCount` is the
+            // BindCmsOnCount path (frequency / count without TopK).
+            // The CMS-with-heap binding fires from
+            // `bind_cms_with_heap_on_topk` and sets `with_heap: true`.
+            SketchParams::Cms(CmsParams { w, d, with_heap: false }),
             (**child).clone(),
         ))
     }

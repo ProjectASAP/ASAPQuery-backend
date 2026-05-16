@@ -118,7 +118,7 @@ fn physical_expr_serde_roundtrip() {
         },
         PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Cms,
-            params: SketchParams::Cms(CmsParams { w: 2048, d: 5 }),
+            params: SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
             child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         },
     ];

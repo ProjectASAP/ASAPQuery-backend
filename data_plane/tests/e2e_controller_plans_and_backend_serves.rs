@@ -1248,9 +1248,14 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
         Some(SketchType::CountSketch),
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
+    // `top_endpoint_qps` is the canonical TopK metric — the planner
+    // picks `with_heap: true` even with `SketchType::CountSketch`
+    // override, so the controller emits `CountSketchWithHeap`. The
+    // soft-check below verifies wire-format ingest works regardless
+    // of heap-bearing classification.
     assert_eq!(
-        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketch",
-        "controller must emit CountSketch aggregationType for SketchType::CountSketch override\n{streaming_config_json}"
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketchWithHeap",
+        "controller must emit CountSketchWithHeap for top_endpoint_qps (TopK metric)\n{streaming_config_json}"
     );
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
@@ -1583,31 +1588,20 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
         Vec::new(),
         Some(SketchType::CountMinSketch),
     );
-    let mut streaming_config_json = plan_streaming_config_json(&workload);
-    // The controller emits `aggregationType: "CountMinSketch"` regardless
-    // of whether the planner picked the heap-bearing binding — the
-    // `sketch_kind_to_backend_type` mapping doesn't surface the heap
-    // variant. The TopK signal lives in the readouts (`op: topk`).
-    //
-    // For analyzer ↔ policy matching to bind `topk(...)` queries, the
-    // policy's `policy_capability` must be `FrequencyTopk(CmsWithHeap)`,
-    // which only fires for `AggregationType::CountMinSketchWithHeap`
-    // (see `asap_tier_analysis::policy_capability`). So patch the
-    // emitted JSON in-place: replace the `CountMinSketch` aggregationType
-    // with `CountMinSketchWithHeap` to bridge the controller-emit gap.
-    // (Tracked: the controller-side fix is a parallel change to
-    // `sketch_kind_to_backend_type` to consult the readout class +
-    // sketch params — out of scope for this test PR.)
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    // The controller now emits `CountMinSketchWithHeap` directly when
+    // the planner-set `with_heap: true` flag on `CmsParams` fires
+    // (see `sketch_kind_to_backend_type`). No in-test JSON patch is
+    // needed — the analyzer ↔ policy match binds against the
+    // controller-emitted aggregation type as-is.
     assert_eq!(
-        streaming_config_json["aggregations"][0]["aggregationType"], "CountMinSketch",
-        "controller must emit CountMinSketch aggregationType\n{streaming_config_json}"
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountMinSketchWithHeap",
+        "controller must emit CountMinSketchWithHeap when bind_cms_with_heap_on_topk fires\n{streaming_config_json}"
     );
     assert_eq!(
         streaming_config_json["readouts"][0]["op"], "topk",
         "controller must emit a topk readout for CMS-with-heap binding\n{streaming_config_json}"
     );
-    streaming_config_json["aggregations"][0]["aggregationType"] =
-        JsonValue::String("CountMinSketchWithHeap".to_string());
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
     // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
@@ -1747,26 +1741,19 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch_with_heap_topk() {
         Vec::new(),
         None, // default → CountSketch (canonical TopK pick)
     );
-    let mut streaming_config_json = plan_streaming_config_json(&workload);
-    // The controller emits `aggregationType: "CountSketch"` and the
-    // heap signal lives in `parameters.with_heap` (true) — but the
-    // analyzer ↔ policy match keys off `aggregation_type`, which
-    // must be `CountSketchWithHeap` for `policy_capability` to
-    // return `FrequencyTopk(CountSketchWithHeap)`. Patch the JSON
-    // in-place: the controller-side fix (consult `with_heap` flag
-    // when emitting `aggregation_type`) is out of scope for this
-    // test PR — tracked alongside the parallel CMS-side patch from
-    // Test 8.
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    // The controller now emits `CountSketchWithHeap` directly when
+    // the planner-set `with_heap: true` flag on `CountSketchParams`
+    // fires (see `sketch_kind_to_backend_type`). No in-test JSON
+    // patch is needed.
     assert_eq!(
-        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketch",
-        "controller must emit CountSketch aggregationType for default top_endpoint_qps\n{streaming_config_json}"
+        streaming_config_json["aggregations"][0]["aggregationType"], "CountSketchWithHeap",
+        "controller must emit CountSketchWithHeap for default top_endpoint_qps TopK binding\n{streaming_config_json}"
     );
     assert_eq!(
         streaming_config_json["aggregations"][0]["parameters"]["with_heap"], true,
         "controller must set parameters.with_heap=true for CountSketch TopK binding\n{streaming_config_json}"
     );
-    streaming_config_json["aggregations"][0]["aggregationType"] =
-        JsonValue::String("CountSketchWithHeap".to_string());
     post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
 
     let items: &[(&str, u64)] = &[
