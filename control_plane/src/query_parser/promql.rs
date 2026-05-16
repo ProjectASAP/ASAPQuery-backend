@@ -192,22 +192,36 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             })
         }
 
-        // Bare vector selector → Source + Filter + Aggregate(Sum).
+        // Bare vector selector → Source + Filter, with `Aggregate(Sum)`
+        // wrapping ONLY when the outer context is value-aggregating
+        // (sum / avg / min / max / etc.). PromQL's `count(metric)`
+        // operates on the result-set's LABEL-SETS — the inner
+        // selector is just "the things to count," not a value to sum.
+        // Synthesizing `Aggregate(Sum)` underneath an outer count would
+        // collect a redundant `ExactAgg(Sum)` candidate alongside the
+        // intended `CardinalityApprox` one, and the engine's
+        // "all candidates must succeed" semantic surfaces a
+        // `CapabilityMiss` when no Sum policy is registered for the
+        // metric (e.g. an HLL-only deploy).
         Expr::VectorSelector(vs) => {
             let (name, filters) = extract_vs_info(vs);
             let source   = QueryExpr::Source(QeSourceSpec { name });
             let filtered = apply_qe_filters(source, filters);
-            Ok(QueryExpr::Aggregate {
-                keys:   vec![],
-                aggs:   vec![AggItem {
-                    alias:    "value".into(),
-                    func:     AggFunc::Sum,
-                    col:      QeColumnRef::SampleValue,
-                    distinct: false,
-                }],
-                having: None,
-                input:  Box::new(filtered),
-            })
+            if ctx.outer_count {
+                Ok(filtered)
+            } else {
+                Ok(QueryExpr::Aggregate {
+                    keys:   vec![],
+                    aggs:   vec![AggItem {
+                        alias:    "value".into(),
+                        func:     AggFunc::Sum,
+                        col:      QeColumnRef::SampleValue,
+                        distinct: false,
+                    }],
+                    having: None,
+                    input:  Box::new(filtered),
+                })
+            }
         }
 
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) =>
@@ -681,6 +695,7 @@ mod tests {
         let pq = pq("count by (symbol) (count_over_time(financial_last_trade_price[5m]))");
         assert_eq!(pq.aggregations, vec![AggType::Cardinality]);
     }
+
 
     // ── stddev_over_time ──────────────────────────────────────────────────────
 

@@ -210,13 +210,21 @@ impl<'a> SketchReducer<'a> {
             // `distinct_over_time` (MetricsQL) is the canonical
             // distinct-count-over-window name. `cardinality_estimate`
             // and `count_distinct_over_time` are accepted as historical
-            // aliases for back-compat with PR #128's reducer tests; new
-            // callers should pass the analyzer's `required_capability`
-            // and dispatch via [`capability_to_family`] instead.
+            // aliases for back-compat with PR #128's reducer tests.
+            // PromQL's plain `count` is also a distinct-counting
+            // operator per spec (counts the number of label sets in
+            // the result vector — equivalent to cardinality for an
+            // ASAP-tier HLL); the analyzer's `walk_aggregate_qe`
+            // produces `function: "count"` for the outer aggregator
+            // and we route that to the same Cardinality family. New
+            // callers should prefer the analyzer's
+            // `required_capability` and dispatch via
+            // [`capability_to_family`] instead.
             "distinct_over_time"
             | "count_distinct_over_time"
             | "cardinality_estimate"
-            | "count_distinct" => Ok(QueryFamily::Cardinality),
+            | "count_distinct"
+            | "count" => Ok(QueryFamily::Cardinality),
             "topk" | "topk_over_time" | "bottomk" => Ok(QueryFamily::FrequencyTopk),
             // Bare frequency point queries — the MetricsQL surface for
             // `sum by (item) (rate(m[r]))` with epsilon accuracy. The
