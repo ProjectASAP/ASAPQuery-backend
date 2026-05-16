@@ -831,12 +831,14 @@ mod tests {
     }
 
     #[test]
-    fn is_asap_tier_answerable_false_for_unsupported() {
-        // `count_over_time(...)` without an outer `count by (...)` lowers
-        // to `AggIntent::Count { accuracy: Exact }` — exact counts have
-        // no ASAP-tier sketch, so `capability_for` returns `None`.
+    fn is_asap_tier_answerable_true_for_count_over_time() {
+        // `count_over_time(...)` now lowers to
+        // `AggIntent::Frequency{Epsilon}` (per-series sample count
+        // over the window), which `capability_for` maps to
+        // `Capability::FrequencyEstimate(Any)` — answerable by any
+        // frequency-family sketch (CMS / CountSketch, heap-less).
         let a = analyze_promql_for_asap_tier("count_over_time(m[5m])");
-        assert!(!a.is_asap_tier_answerable());
+        assert!(a.is_asap_tier_answerable(), "{a:?}");
     }
 
     #[test]
@@ -849,29 +851,23 @@ mod tests {
 
     // ── Cardinality / count_over_time real-PromQL acceptance ────────────
 
-    /// `count_over_time(...)` is real PromQL and lowers to
-    /// `AggIntent::Count{accuracy:Exact}` per `intent_algebra::lower`.
-    /// Exact-accuracy Count has no ASAP-tier binding, so the analyzer
-    /// surfaces this as `UnsupportedAggIntent("count")` — the routing
-    /// layer then sends it to archive, which is the right behavior
-    /// because `count_over_time` counts samples (not distinct values).
+    /// `count_over_time(metric[range])` is the PromQL per-series
+    /// sample-count idiom — exactly what a heap-less CMS / CountSketch
+    /// estimates. The parser maps it to `AggFunc::Frequency` which
+    /// lowers to `AggIntent::Frequency{Epsilon}`; `capability_for`
+    /// returns `Capability::FrequencyEstimate(Any)`. The warm engine
+    /// binds the query to any frequency-family policy registered for
+    /// the metric.
     #[test]
-    fn count_over_time_is_unsupported_at_exact_accuracy() {
-        // `count_over_time(metric[r])` without an outer `count by (...)`
-        // is the PromQL "count samples per window" idiom — exact at L3.
-        // The lowerer doesn't emit an AggIntent for it (no entry in
-        // `AggType`), so the analyzer surfaces the raw function name
-        // from the AST trace as the `UnsupportedAggIntent` label.
+    fn count_over_time_binds_to_frequency_estimate() {
         let a = analyze_promql_for_asap_tier("count_over_time(http_requests_total[5m])");
-        match a.unsupported {
-            Some(UnsupportedReason::UnsupportedAggIntent(kind)) => {
-                assert!(
-                    kind == "count" || kind == "count_over_time",
-                    "unexpected intent kind: {kind}"
-                );
-            }
-            other => panic!("expected UnsupportedAggIntent, got {other:?}"),
-        }
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates.len(), 1, "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::FrequencyEstimate(SketchKindHandle::Any),
+            "{a:?}"
+        );
     }
 
     /// `count by (...) (count_over_time(...))` is the PromQL distinct-

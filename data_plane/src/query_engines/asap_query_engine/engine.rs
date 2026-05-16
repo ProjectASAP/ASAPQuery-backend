@@ -6414,7 +6414,7 @@ mod analyzer_parity_tests {
     ctrl   OK [metric=m gbk=[\"svc\"] cap=FrequencyTopk(Any) fn=topk args=[10.0] range_s=0]
     engine MISS(NoPattern)
 ─── q08: count_over_time(http_requests_total[5m])
-    ctrl   MISS(UnsupportedAggIntent(\"count\"))
+    ctrl   OK [metric=http_requests_total gbk=[] cap=FrequencyEstimate(Any) fn=count_over_time args=[] range_s=300]
     engine OK pattern=only_temporal stats=[count] metric=http_requests_total fn=count_over_time agg_op= range_s=300 range_ms=Some(300000) spatial=\"\" grouping=[]
 ─── q09: count by (zone) (count_over_time(http_requests_total[5m]))
     ctrl   OK [metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300 | metric=http_requests_total gbk=[\"zone\"] cap=CardinalityApprox fn=count args=[] range_s=300]

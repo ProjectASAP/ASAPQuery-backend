@@ -230,9 +230,13 @@ impl<'a> SketchReducer<'a> {
             // `sum by (item) (rate(m[r]))` with epsilon accuracy. The
             // reducer answers these by decoding the CMS / CountSketch
             // matrix directly (no heap needed). `frequency` is the
-            // canonical name; `count_over_time` is accepted as an alias
-            // for back-compat with PromQL counter-style point queries.
-            "frequency" | "frequency_estimate" => Ok(QueryFamily::FrequencyEstimate),
+            // canonical name; `count_over_time` is the PromQL surface
+            // (per-series sample count over a range window — exactly
+            // what a CMS / CountSketch estimates without distinct-set
+            // tracking).
+            "frequency" | "frequency_estimate" | "count_over_time" => {
+                Ok(QueryFamily::FrequencyEstimate)
+            }
             other => Err(ASAPTierError::UnsupportedFunction(other.to_string())),
         }
     }
