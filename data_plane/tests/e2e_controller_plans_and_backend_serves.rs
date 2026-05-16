@@ -1677,15 +1677,11 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
         "topk(...) on CmsWithHeap must succeed end-to-end. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
-    // Top-1 should be `gamma` (count=200). The reducer keys each
-    // top-k item by `item: <key>` in the series labels, but the
-    // wire-format `InstantVectorElement` adapter currently drops
-    // per-element labels (`label_keys_override` only exists on
-    // `RangeVectorElement`); confirmed by the response carrying
-    // `"metric": {}` on every element. Until that adapter gap is
-    // closed, assert the strongest invariants the wire-format DOES
-    // surface: `topk(3)` returned at least one series, the values
-    // include `gamma`'s count (200), and we got at most 3 results.
+    // Top-1 must be `gamma` (count=200), surfaced via the
+    // `item: <key>` synthesized label on each top-k series. The
+    // `InstantVectorElement::label_keys_override` field (added
+    // alongside this assertion's tightening) carries the synthesized
+    // key through the Prometheus adapter.
     let result = &response["data"]["result"];
     let arr = result
         .as_array()
@@ -1704,6 +1700,21 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
         })
         .collect();
     values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut found_gamma = false;
+    for elem in arr {
+        if let Some(item) = elem["metric"]["item"].as_str() {
+            if item == "gamma" {
+                found_gamma = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_gamma,
+        "topk(3) must surface `gamma` via the `item` label on at least \
+         one series. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
     assert!(
         values.first().map(|v| (v - 200.0).abs() < 1.0).unwrap_or(false),
         "topk(3) on heap-bearing CMS must surface `gamma`'s count (200) as \
