@@ -176,24 +176,7 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
             .filter_map(|m| m.window_secs)
             .min()
             .unwrap_or(60);
-        let gorillas3_yaml = format!(
-            "window_interval: {window_secs}s\n\
-drop_original: false\n\
-endpoint: \"${{ASAP_MINIO_ENDPOINT:-http://minio:9000}}\"\n\
-bucket: \"${{ASAP_GORILLA_BUCKET:-asap-gorilla}}\"\n\
-region: us-east-1\n\
-use_ssl: false\n\
-access_key_id: \"${{ASAP_MINIO_ACCESS_KEY:-asap}}\"\n\
-secret_access_key: \"${{ASAP_MINIO_SECRET_KEY:-asap-local-only}}\"\n\
-prefix_template: \"{{tenant}}/{{metric}}/{{YYYY}}/{{MM}}/{{DD}}/{{HH}}/\"\n\
-tenant: \"${{ASAP_TENANT:-default}}\"\n\
-max_retries: 3\n\
-retry_backoff: 1s\n\
-upload_timeout: 30s\n\
-block_format: prometheus_tsdb\n\
-tsdb_bucket: \"${{ASAP_GORILLA_TSDB_BUCKET:-asap-gorilla-tsdb}}\"\n\
-tsdb_block_duration: {window_secs}s\n",
-        );
+        let gorillas3_yaml = build_gorillas3_yaml(window_secs);
         let gorillas3: Value =
             serde_yaml::from_str(&gorillas3_yaml).context("parse gorillas3 processor block")?;
         processors.insert("gorillas3".to_string(), gorillas3);
@@ -402,7 +385,7 @@ tsdb_block_duration: {window_secs}s\n",
 
     // ── OpAMP extension ───────────────────────────────────────────────────────
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -464,7 +447,7 @@ pub fn emit_gateway_yaml(cfg: &GatewayStageConfig, opamp_endpoint: &str) -> Resu
     let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
 
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -921,24 +904,7 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
             .filter_map(|m| m.window_secs)
             .min()
             .unwrap_or(60);
-        let gorillas3_yaml = format!(
-            "window_interval: {window_secs}s\n\
-drop_original: false\n\
-endpoint: \"${{ASAP_MINIO_ENDPOINT:-http://minio:9000}}\"\n\
-bucket: \"${{ASAP_GORILLA_BUCKET:-asap-gorilla}}\"\n\
-region: us-east-1\n\
-use_ssl: false\n\
-access_key_id: \"${{ASAP_MINIO_ACCESS_KEY:-asap}}\"\n\
-secret_access_key: \"${{ASAP_MINIO_SECRET_KEY:-asap-local-only}}\"\n\
-prefix_template: \"{{tenant}}/{{metric}}/{{YYYY}}/{{MM}}/{{DD}}/{{HH}}/\"\n\
-tenant: \"${{ASAP_TENANT:-default}}\"\n\
-max_retries: 3\n\
-retry_backoff: 1s\n\
-upload_timeout: 30s\n\
-block_format: prometheus_tsdb\n\
-tsdb_bucket: \"${{ASAP_GORILLA_TSDB_BUCKET:-asap-gorilla-tsdb}}\"\n\
-tsdb_block_duration: {window_secs}s\n",
-        );
+        let gorillas3_yaml = build_gorillas3_yaml(window_secs);
         let gorillas3: Value = serde_yaml::from_str(&gorillas3_yaml)
             .context("parse gorillas3 processor block (5-sketch routing)")?;
         processors.insert("gorillas3".to_string(), gorillas3);
@@ -1123,7 +1089,7 @@ tsdb_block_duration: {window_secs}s\n",
 
     // ── OpAMP extension ────────────────────────────────────────────────────
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -1140,6 +1106,50 @@ tsdb_block_duration: {window_secs}s\n",
     };
 
     serde_yaml::to_string(&doc).context("serialize edge stage config (5-sketch)")
+}
+
+/// Emit the gorillas3 (S3 archive-tier) processor YAML with all env
+/// vars resolved to literal values at controller emit time. We can't
+/// use bash-style `${VAR:-default}` interpolation in the emitted
+/// agent YAML because the OTel collector's confmap parser treats
+/// `${...}` as a provider URI (e.g. `${env:VAR}`, `${file:path}`) —
+/// bash-default syntax fails with "invalid uri" at agent boot.
+///
+/// Substitution happens here, in the controller's process, with the
+/// controller's environment as the source of truth. Operators set
+/// `ASAP_MINIO_ACCESS_KEY` etc. on the controller container; the
+/// emitted agent YAML carries literal values and is portable across
+/// agents that don't have those env vars set.
+fn build_gorillas3_yaml(window_secs: u64) -> String {
+    let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+    let endpoint = env_or("ASAP_MINIO_ENDPOINT", "http://minio:9000");
+    let bucket = env_or("ASAP_GORILLA_BUCKET", "asap-gorilla");
+    let access_key = env_or("ASAP_MINIO_ACCESS_KEY", "asap");
+    let secret_key = env_or("ASAP_MINIO_SECRET_KEY", "asap-local-only");
+    let tenant = env_or("ASAP_TENANT", "default");
+    let tsdb_bucket = env_or("ASAP_GORILLA_TSDB_BUCKET", "asap-gorilla-tsdb");
+    // Note: `prefix_template` placeholders (`{tenant}`, `{metric}`,
+    // `{YYYY}`, …) are resolved by the gorillas3 processor at write
+    // time, not by the YAML loader — they stay as literal `{...}`
+    // tokens in the emitted YAML.
+    format!(
+        "window_interval: {window_secs}s\n\
+drop_original: false\n\
+endpoint: \"{endpoint}\"\n\
+bucket: \"{bucket}\"\n\
+region: us-east-1\n\
+use_ssl: false\n\
+access_key_id: \"{access_key}\"\n\
+secret_access_key: \"{secret_key}\"\n\
+prefix_template: \"{{tenant}}/{{metric}}/{{YYYY}}/{{MM}}/{{DD}}/{{HH}}/\"\n\
+tenant: \"{tenant}\"\n\
+max_retries: 3\n\
+retry_backoff: 1s\n\
+upload_timeout: 30s\n\
+block_format: prometheus_tsdb\n\
+tsdb_bucket: \"{tsdb_bucket}\"\n\
+tsdb_block_duration: {window_secs}s\n",
+    )
 }
 
 /// Map a `SketchKind` to the OTel processor name registered by the
@@ -2583,9 +2593,16 @@ mod tests {
             yaml.contains("tsdb_bucket"),
             "gorillas3 needs a TSDBBucket so the Thanos store-gateway can read the blocks\n{yaml}"
         );
+        // The endpoint is resolved at controller emit time from the
+        // controller's environment (`ASAP_MINIO_ENDPOINT`, falling
+        // back to the docker-compose default `http://minio:9000`).
+        // Bash-style `${VAR:-default}` placeholders aren't valid in
+        // emitted YAML — OTel's confmap parser treats `${...}` as a
+        // provider URI and rejects bash-default syntax. So we assert
+        // on the resolved literal that the deploy default produces.
         assert!(
-            yaml.contains("ASAP_MINIO_ENDPOINT"),
-            "endpoint should be env-overridable for the deploy team\n{yaml}"
+            yaml.contains("endpoint: http://minio:9000"),
+            "endpoint should resolve to the docker-compose minio default\n{yaml}"
         );
         // `drop_original: false` so the metric ALSO flows downstream
         // through the ASAP-tier sketch / OTLP exporter (without this
