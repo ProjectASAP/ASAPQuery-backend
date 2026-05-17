@@ -1,2 +1,19 @@
 target/
+**/target/
 .git/
+**/.git/
+# Workspace per-crate caches (control_plane/target, data_plane/target,
+# benchmarks/.../target) that aren't covered by the top-level `target/`
+# pattern. Excluding them shrinks the BuildKit context transfer for
+# `docker build -f deploy/docker/Dockerfile.backend` from multi-GB
+# (every host-side cargo build leaves a few-hundred-MB target there)
+# back down to the source-only size that the in-container `cargo
+# build` needs.
+
+# Editor + tooling state
+.idea/
+.vscode/
+*.swp
+
+# CI / eval artifacts that occasionally land in subdirs
+**/eval-results/

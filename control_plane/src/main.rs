@@ -117,8 +117,17 @@ async fn main() {
         .unwrap_or_else(|_| "0.0.0.0:8080".into());
     let opamp_addr = std::env::var("CONTROLLER_OPAMP_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:4320".into());
+    // The default tracks the compose service name in
+    // `ASAPCollector/deploy/mvp-singlenode/docker-compose/base.yml`,
+    // which is still `controller:` post Phase-9 single-binary
+    // refactor (both controller and backend ship from
+    // `asap/query-backend:dev`, but they bind separate listeners
+    // under separate compose service names). Using the post-reorg
+    // crate name `control_plane` here doesn't resolve under the
+    // canonical compose stack and bakes a broken endpoint into every
+    // agent yaml the controller emits.
     let opamp_ep   = std::env::var("CONTROLLER_OPAMP_ENDPOINT")
-        .unwrap_or_else(|_| "ws://control_plane:4320/v1/opamp".into());
+        .unwrap_or_else(|_| "ws://controller:4320/v1/opamp".into());
     let scrape_interval = Duration::from_secs(
         std::env::var("CONTROLLER_SCRAPE_INTERVAL_SECS")
             .ok()
