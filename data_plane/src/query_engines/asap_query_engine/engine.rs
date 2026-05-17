@@ -608,7 +608,7 @@ impl ASAPQueryEngine {
                 end_timestamp - (range_seconds * 1000)
             }
             QueryPatternType::OnlySpatial => {
-                end_timestamp - (self.prometheus_scrape_interval * 1000)
+                end_timestamp.saturating_sub(self.prometheus_scrape_interval * 1000)
             }
         }
     }
@@ -3015,16 +3015,6 @@ impl ASAPQueryEngine {
             ));
         };
 
-        // Schema-retirement #5 step 2: apply the same metric-rename
-        // rewrite the modern execute() instant path does, so range
-        // queries like `quantile_over_time(0.99, http_latency[5m])`
-        // bind to the suffixed series the agent's DDSketch processor
-        // emits. Mirrors the legacy `handle_query_promql` entry.
-        let query_owned = self
-            .resolve_sketch_metric_alias(query)
-            .unwrap_or_else(|| query.to_string());
-        let query = query_owned.as_str();
-
         let analysis =
             control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
@@ -3512,20 +3502,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //    over to archive (no per-candidate hybrid stitch yet —
         //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
-            // Schema-retirement #5 step 2: apply the agent-side
-            // INGEST-time metric-rename rewrite (DDSketch/KLL
-            // `_quantile`, HLL `_hll`) here at the top of modern
-            // execute() so bare-metric PromQL still hits the
-            // suffixed series the ASAP tier actually holds. The
-            // legacy `handle_query_promql` did this rewrite at
-            // its own entry; with the legacy path slated for
-            // retirement, the modern path needs the same
-            // capability so it can fully supersede.
-            let query_owned = self
-                .resolve_sketch_metric_alias(query)
-                .unwrap_or_else(|| query.to_string());
-            let query = query_owned.as_str();
-
             let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
             // Branch 1 — the control plane analyzer rejects the shape.
@@ -6378,5 +6354,39 @@ mod analyzer_parity_tests {
             "analyzer parity drifted — update control_plane/docs/analyzer-parity-matrix.md \
              and replace GOLDEN with the new ACTUAL block above"
         );
+    }
+}
+
+#[cfg(test)]
+mod calculate_start_timestamp_promql_tests {
+    use super::*;
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+
+    #[test]
+    fn calculate_start_timestamp_promql_handles_time_zero_without_underflow() {
+        // Capability-miss probe queries fire with time=0 (Unix epoch).
+        // Pre-fix: u64 subtraction underflows and panics with
+        // "attempt to subtract with overflow". Post-fix: saturating_sub
+        // clamps to 0, which the downstream store query treats as a
+        // [0, 0]-width range — degenerates to an empty result, the
+        // right answer when the probe is looking for capability-miss
+        // signal not data.
+
+        let hot_reload = HotReloadStreamingConfig::from_arc(Arc::new(StreamingConfig::default()));
+        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000);
+
+        // Synthesize a minimal OnlySpatial match_result. The body of
+        // calculate_start_timestamp_promql for OnlySpatial only reads
+        // `self.prometheus_scrape_interval`; the match_result arg is
+        // unused in that branch. A default-constructed
+        // PromQLMatchResult is fine.
+        let mr = PromQLMatchResult::new();
+
+        let start = engine.calculate_start_timestamp_promql(
+            0, // end_timestamp = 0 (the bug trigger)
+            QueryPatternType::OnlySpatial,
+            &mr,
+        );
+        assert_eq!(start, 0, "saturating_sub should clamp to 0, not panic");
     }
 }
