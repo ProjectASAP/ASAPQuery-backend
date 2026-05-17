@@ -3240,14 +3240,38 @@ impl ASAPQueryEngine {
         > = None;
 
         for candidate in &analysis.candidates {
+            // Resolve candidate → {sids} via the sid catalog. Schema-
+            // retirement #5: prefer `instances_matching` over the
+            // policy-fp reverse index — it's the more general
+            // primitive and works whether or not the ingest path was
+            // able to bind the sid back to a streaming-config policy.
+            //
+            // History: an earlier PR removed an `instances_matching`
+            // fallback under the assumption every production sid
+            // registration would populate `policy_fp`. The MVP smoke
+            // test (issue #271 / tracking #272) showed that
+            // assumption is wrong — sketches arriving from the agent
+            // carry the full wire-attr set rather than the streaming-
+            // config's `grouping_labels` subset, so
+            // `derive_sketch_policy_fp` returns `UNSET` and
+            // `sids_for_policy(fp)` returns empty. The agg_id-aware
+            // path is preserved for ExactAgg sids minted via
+            // `ingest_precompute_for_agg_config` (those carry a
+            // populated `policy_fp`) but its result is unioned with
+            // the catalog-walk result so we don't miss the sketches.
             let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
                 &policy_registry,
                 candidate,
             );
-            let mut sids: Vec<u64> = Vec::new();
+            let mut sids: std::collections::BTreeSet<u64> =
+                std::collections::BTreeSet::new();
             for fp in &policy_fps {
                 sids.extend(idx.sids_for_policy(*fp));
             }
+            sids.extend(idx.instances_matching(
+                &candidate.metric_name,
+                &candidate.group_by_keys,
+            ));
             if sids.is_empty() {
                 return Err(crate::query_engines::EngineError::capability_miss(
                     asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -3746,22 +3770,30 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 if candidate.range_seconds > 0 {
                     any_range_candidate = true;
                 }
-                // Content-addressed sid lookup: find matching policies
-                // in the registry → resolve each policy_fp → {sids}
-                // via the reverse index. Both hops are O(1)-amortized.
-                // The legacy `instances_matching(metric, gbk)`
-                // fallback was retired in this PR — every production
-                // sid registration path now populates `policy_fp`,
-                // and sids that don't are intentionally unreachable
-                // (raw mode, etc. — they map to capability misses).
+                // Schema-retirement #5: resolve candidate → {sids} by
+                // unioning the policy-fp reverse index (fast path for
+                // ExactAgg sids minted via `ingest_precompute_for_agg_config`
+                // where `policy_fp` is set) with `instances_matching`
+                // (catalog walk that subset-matches on
+                // `group_by_keys`, covering raw sketches whose
+                // `derive_sketch_policy_fp` returned `UNSET` because
+                // the wire-attr set didn't match any streaming-config
+                // policy). The earlier policy-fp-only path returned
+                // empty for the MVP demo workload — see issue #271 /
+                // tracking #272.
                 let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
                     &policy_registry,
                     candidate,
                 );
-                let mut sids: Vec<u64> = Vec::new();
+                let mut sids: std::collections::BTreeSet<u64> =
+                    std::collections::BTreeSet::new();
                 for fp in &policy_fps {
                     sids.extend(idx.sids_for_policy(*fp));
                 }
+                sids.extend(idx.instances_matching(
+                    &candidate.metric_name,
+                    &candidate.group_by_keys,
+                ));
                 if sids.is_empty() {
                     return Err(crate::query_engines::EngineError::capability_miss(
                         asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -6265,6 +6297,62 @@ mod asap_tier_classify_tests {
                 );
             }
             other => panic!("expected CapabilityMiss fall-over to archive, got {other:?}")}
+    }
+
+    /// Schema-retirement #5 regression: a sketch sid registered with
+    /// a wider-than-requested `group_by_keys` and `policy_fp=UNSET`
+    /// must still be findable by the query path. Mirrors the MVP
+    /// smoke-test failure (issue #271 / tracking #272): the agent
+    /// emits DDSketch DPs carrying every wire attribute, so the sid
+    /// catalog ends up with `group_by_keys=[zone,rack,node,pod,...]`
+    /// and `derive_sketch_policy_fp` returns `UNSET` because no
+    /// streaming-config policy has that exact key set. The query
+    /// asks for `grouping=[zone]` — a subset. With the policy-fp-only
+    /// lookup the query returned `CapabilityMiss → archive`; with the
+    /// `instances_matching` fallback restored it resolves to the sid
+    /// (and bottoms out at the reducer's sample-state check rather
+    /// than at sid resolution).
+    #[tokio::test]
+    async fn full_attr_sketch_sid_findable_via_subset_grouping() {
+        let idx = Arc::new(SketchStore::new());
+        // Register with the SUPERSET of attrs the agent would emit:
+        // zone, rack, node, pod — none of which the streaming-config
+        // would list directly in `grouping_labels=[zone]`.
+        idx.register(dd_meta(42, "http_latency_ms", &["node", "pod", "rack", "zone"]));
+        idx.append_sample(
+            42,
+            BTreeMap::from([
+                ("zone".to_string(), "z0".to_string()),
+                ("rack".to_string(), "r0".to_string()),
+                ("node".to_string(), "n0".to_string()),
+                ("pod".to_string(), "p0".to_string()),
+            ]),
+            (1_000, 1_010),
+            SketchSampleState {
+                bytes: vec![0],
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+        );
+
+        let engine = build_engine_with_index(idx);
+        // The query asks for grouping=[zone] (subset of registered
+        // group_by_keys). Pre-fix this returned CapabilityMiss because
+        // `sids_for_policy(UNSET)` is empty; post-fix the fallback
+        // finds sid 42 via `instances_matching` and the request
+        // proceeds to the reducer.
+        let result = engine
+            .execute("quantile_over_time(0.99, http_latency_ms{zone=\"z0\"}[5m])")
+            .await;
+        // The reducer can't produce a real quantile from the canned
+        // payload (just `vec![0]`), but it MUST reach the reducer —
+        // the sid-resolution-step CapabilityMiss with "no policy for
+        // metric" detail is the regression we're guarding against.
+        if let Err(EngineError::CapabilityMiss { detail, .. }) = &result {
+            assert!(
+                !detail.contains("has no policy for metric"),
+                "regression: sid was lost at policy-resolution step \
+                 instead of being found via instances_matching: {detail}"
+            );
+        }
     }
 }
 
