@@ -953,7 +953,9 @@ async fn process_via_simple_engine(
             // before falling through to the unsupported-query branch
             // — `execute` uses
             // `idx.sids_for_policy(fp)` + `SketchReducer::evaluate`
-            // and handles sketches natively.
+            // and handles sketches natively, AND (since #273) unions
+            // `instances_matching` for sketches with `policy_fp =
+            // UNSET`.
             //
             // Trait dispatch loses `KeyByLabelNames` (the trait
             // returns just `QueryResult`); we surface an empty
@@ -961,6 +963,18 @@ async fn process_via_simple_engine(
             // handles the same trait surface — the Prometheus
             // adapter renders an empty `metric: {}` object, a valid
             // shape that PromQL clients accept.
+            //
+            // Schema-retirement #5 status: an earlier draft of this
+            // PR reordered to "modern first, legacy as fallback" so
+            // the legacy path could be retired entirely. That broke
+            // `http_capability_miss_feedback_loop_closes_over_http`
+            // — the capability-miss notify side-effect happens
+            // inside legacy `find_compatible_aggregation_with_miss_notify`
+            // (engine.rs:~1772), and a pre-existing time=0 underflow
+            // bug at engine.rs:792 surfaces when legacy is reached
+            // via the modern-Err fallback because of subtle test
+            // setup state. Modern needs to spawn its own
+            // capability-miss notify before we can reorder cleanly.
             use crate::query_engines::routing::query_engine_routing::QueryEngine;
             let modern_result = state
                 .query_engine

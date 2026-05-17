@@ -3210,6 +3210,16 @@ impl ASAPQueryEngine {
             ));
         };
 
+        // Schema-retirement #5 step 2: apply the same metric-rename
+        // rewrite the modern execute() instant path does, so range
+        // queries like `quantile_over_time(0.99, http_latency[5m])`
+        // bind to the suffixed series the agent's DDSketch processor
+        // emits. Mirrors the legacy `handle_query_promql` entry.
+        let query_owned = self
+            .resolve_sketch_metric_alias(query)
+            .unwrap_or_else(|| query.to_string());
+        let query = query_owned.as_str();
+
         let analysis =
             control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
@@ -3697,6 +3707,20 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //    over to archive (no per-candidate hybrid stitch yet —
         //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
+            // Schema-retirement #5 step 2: apply the agent-side
+            // INGEST-time metric-rename rewrite (DDSketch/KLL
+            // `_quantile`, HLL `_hll`) here at the top of modern
+            // execute() so bare-metric PromQL still hits the
+            // suffixed series the ASAP tier actually holds. The
+            // legacy `handle_query_promql` did this rewrite at
+            // its own entry; with the legacy path slated for
+            // retirement, the modern path needs the same
+            // capability so it can fully supersede.
+            let query_owned = self
+                .resolve_sketch_metric_alias(query)
+                .unwrap_or_else(|| query.to_string());
+            let query = query_owned.as_str();
+
             let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
             // Branch 1 — the control plane analyzer rejects the shape.
