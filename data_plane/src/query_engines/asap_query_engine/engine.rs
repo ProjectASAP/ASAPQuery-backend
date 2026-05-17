@@ -29,51 +29,6 @@ use promql_utilities::query_logics::parsing::{
 // Type alias for merged outputs (single aggregate per key after merging)
 type MergedOutputsMap = HashMap<Option<KeyByLabelValues>, Box<dyn AggregateCore>>;
 
-/// Replace every standalone occurrence of the PromQL identifier
-/// `needle` with `replacement` in `haystack`. An occurrence is
-/// "standalone" iff its surrounding characters can't be part of a
-/// PromQL identifier (`[A-Za-z0-9_:]`). Used by the DDSketch
-/// `_quantile` alias resolver so e.g. rewriting `http_latency_ms`
-/// in `quantile_over_time(0.99, http_latency_ms[1m])` doesn't also
-/// touch a hypothetical `http_latency_ms_total` elsewhere in the
-/// query.
-fn replace_metric_token(haystack: &str, needle: &str, replacement: &str) -> String {
-    if needle.is_empty() {
-        return haystack.to_string();
-    }
-    let bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    // PromQL identifiers are ASCII; bound the byte-level scan to
-    // ASCII-only `is_ident` predicates and let multi-byte UTF-8
-    // sequences (which can only occur inside string literals or
-    // comments) pass through untouched. The needle bytes are
-    // ASCII-only by construction (callers pass identifiers).
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b':';
-    let mut out = String::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + needle_bytes.len() <= bytes.len()
-            && &bytes[i..i + needle_bytes.len()] == needle_bytes
-        {
-            let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
-            let next_idx = i + needle_bytes.len();
-            let next_ok = next_idx >= bytes.len() || !is_ident(bytes[next_idx]);
-            if prev_ok && next_ok {
-                out.push_str(replacement);
-                i = next_idx;
-                continue;
-            }
-        }
-        // Advance one UTF-8 char at a time (works for ASCII fast
-        // path AND multi-byte sequences inside e.g. label-value
-        // strings).
-        let ch_len = utf8_char_len(bytes[i]);
-        out.push_str(&haystack[i..i + ch_len]);
-        i += ch_len;
-    }
-    out
-}
-
 /// Phase 5 helper — extract `(metric_name, label_matcher_key_set)` from a
 /// PromQL query for ASAP-tier candidate selection. Walks the AST to find
 /// the first `VectorSelector` / `MatrixSelector`, returns its metric name
@@ -133,22 +88,6 @@ fn extract_metric_and_label_keys(
     }
 
     walk(&ast)
-}
-
-/// Length of the UTF-8 character starting at `b` (the first byte).
-/// Returns 1 for invalid leading bytes, never panics.
-fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 {
-        1
-    } else if b < 0xC0 {
-        1 // continuation byte mid-sequence — defensive fallback
-    } else if b < 0xE0 {
-        2
-    } else if b < 0xF0 {
-        3
-    } else {
-        4
-    }
 }
 
 /// Metadata extracted from a query, independent of query language
@@ -617,126 +556,6 @@ impl ASAPQueryEngine {
     /// Convert query timestamp (seconds) to data timestamp (milliseconds)
     pub fn convert_query_time_to_data_time(query_time: f64) -> u64 {
         (query_time * 1000.0) as u64
-    }
-
-    /// Resolve agent-side INGEST renames (`_quantile`, `_hll`,
-    /// `_count_unique`) so a user PromQL query that names the
-    /// conceptual unsuffixed metric still finds the suffixed series
-    /// the ASAP tier actually holds.
-    ///
-    /// The agent's per-family sketch processors rename the raw input
-    /// metric on egress:
-    ///
-    /// | Processor   | Suffix         | Query shapes that consume it     |
-    /// |-------------|----------------|----------------------------------|
-    /// | DDSketch    | `_quantile`    | `Quantile`                       |
-    /// | KLL         | `_quantile`    | `Quantile`                       |
-    /// | HLL         | `_hll`         | `Count` (cardinality) / `Other`  |
-    ///
-    /// CountSketch / CountMin processors do NOT rename today (the
-    /// agent's `metric_suffix` is empty), so this resolver is a no-op
-    /// for `Topk` / `RatePostHoc` shapes. If a future agent wires
-    /// `_topk` / `_freq` renames the same shape→suffix table grows.
-    ///
-    /// Rewrite happens only when:
-    ///   * the parsed query's shape matches one of the renaming
-    ///     processors above (so a `count(...)` over a non-HLL metric
-    ///     never gets an `_hll` redirect by accident), AND
-    ///   * the bare metric is NOT in the streaming config / schema
-    ///     but the suffixed variant IS — guaranteeing the redirect
-    ///     points at a series the ASAP tier can actually answer.
-    ///
-    /// Substitution is byte-level identifier replacement
-    /// (`replace_metric_token`); the rewritten string is re-parsed
-    /// to guard against PromQL syntax breakage. On any failure the
-    /// caller's original query string is returned untouched.
-    fn resolve_sketch_metric_alias(&self, query: &str) -> Option<String> {
-        // Parse + classify shape; only sketch-renaming-capable
-        // shapes are eligible for this resolver. Any other shape
-        // falls through unchanged.
-        let ast = promql_parser::parser::parse(query).ok()?;
-        let shape = crate::query_engines::routing::classify_query_shape(&ast);
-        let suffixes: &[&str] = match shape {
-            crate::query_engines::routing::QueryShape::Quantile => &["_quantile"],
-            // `count(metric)` against an HLL-backed agg is the
-            // cardinality readout — see `compatible_agg_types(Count)`
-            // and `HllSketchAccumulator::query_statistic`. Capture it
-            // here so the wire-side `_hll` rename is invisible to
-            // user PromQL.
-            crate::query_engines::routing::QueryShape::Count => &["_hll"],
-            _ => return None};
-
-        // Pull the first metric name from the AST.
-        fn first_metric(expr: &promql_parser::parser::Expr) -> Option<String> {
-            use promql_parser::parser::Expr;
-            match expr {
-                Expr::VectorSelector(vs) => vs.name.clone(),
-                Expr::MatrixSelector(ms) => ms.vs.name.clone(),
-                Expr::Call(call) => call.args.args.iter().find_map(|a| first_metric(a)),
-                Expr::Aggregate(agg) => first_metric(&agg.expr),
-                Expr::Binary(bin) => first_metric(&bin.lhs).or_else(|| first_metric(&bin.rhs)),
-                Expr::Subquery(sq) => first_metric(&sq.expr),
-                Expr::Paren(p) => first_metric(&p.expr),
-                Expr::Unary(u) => first_metric(&u.expr),
-                _ => None}
-        }
-        let metric = first_metric(&ast)?;
-
-        let streaming_config = self.streaming_config_snapshot();
-        let metric_known = |name: &str| {
-            streaming_config
-                .aggregation_configs
-                .values()
-                .any(|c| c.metric == name)
-        };
-        // After InferenceConfig retirement: rely on streaming_config
-        // alone to decide whether the metric is locally known. The
-        // old `inference_config.schema` lookup was a secondary path
-        // for schema-defined-but-aggregation-less metrics; with the
-        // control plane driving plans dynamically, every known metric
-        // has a corresponding aggregation_config.
-        let bare_present = metric_known(&metric);
-        if bare_present {
-            // Bare metric is locally known — no rename applied for
-            // this deployment.
-            return None;
-        }
-
-        // Walk the candidate suffixes in declared order; the first
-        // one whose suffixed form is known wins. Skip any suffix the
-        // metric already wears (idempotent under repeated calls).
-        for suffix in suffixes {
-            if metric.ends_with(suffix) {
-                continue;
-            }
-            let suffixed = format!("{metric}{suffix}");
-            if !metric_known(&suffixed) {
-                continue;
-            }
-
-            // Naive but precise substitution: replace `<metric>` only
-            // when surrounded by characters that can't be part of a
-            // PromQL identifier (i.e. not `[A-Za-z0-9_:]`). This
-            // avoids accidentally matching `metric` inside e.g.
-            // `metric_other`.
-            let rewritten = replace_metric_token(query, &metric, &suffixed);
-            // Sanity-check: parses cleanly.
-            if promql_parser::parser::parse(&rewritten).is_err() {
-                warn!(
-                    "resolve_sketch_metric_alias: rewrite to '{}' failed to re-parse; \
-                     leaving query untouched",
-                    rewritten
-                );
-                return None;
-            }
-            debug!(
-                "resolve_sketch_metric_alias: rewriting '{}' -> '{}' \
-                 (shape={:?}, suffix='{}')",
-                metric, suffixed, shape, suffix
-            );
-            return Some(rewritten);
-        }
-        None
     }
 
     /// Finds the query configuration for a SQL query using structural pattern matching.
@@ -2023,20 +1842,6 @@ impl ASAPQueryEngine {
         let query_start_time = Instant::now();
         debug!("Handling query: {} at time {}", query, time);
 
-        // Resolve agent-side INGEST-time metric renames so the
-        // user's bare-metric PromQL still finds the suffixed series
-        // the ASAP tier actually holds. Today: DDSketch / KLL
-        // (`_quantile` for `quantile_over_time` / `quantile`) and
-        // HLL (`_hll` for `count(...)` cardinality). See
-        // `resolve_sketch_metric_alias` for the full shape→suffix
-        // table.
-        //
-        // The rewrite happens once at the entry point so every
-        // downstream stage (pattern match, `QueryConfig` lookup,
-        // capability matching, `StoreQueryParams.metric`, schema
-        // label lookup) sees the same suffixed name.
-        let query = self.resolve_sketch_metric_alias(&query).unwrap_or(query);
-
         // Binary arithmetic dispatch was previously handled here via a
         // DataFusion-based plan combiner. That path was removed alongside
         // the datafusion crate; binary arithmetic on ASAP-tier sketches
@@ -3210,16 +3015,6 @@ impl ASAPQueryEngine {
             ));
         };
 
-        // Schema-retirement #5 step 2: apply the same metric-rename
-        // rewrite the modern execute() instant path does, so range
-        // queries like `quantile_over_time(0.99, http_latency[5m])`
-        // bind to the suffixed series the agent's DDSketch processor
-        // emits. Mirrors the legacy `handle_query_promql` entry.
-        let query_owned = self
-            .resolve_sketch_metric_alias(query)
-            .unwrap_or_else(|| query.to_string());
-        let query = query_owned.as_str();
-
         let analysis =
             control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
@@ -3707,20 +3502,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         //    over to archive (no per-candidate hybrid stitch yet —
         //    that's the documented follow-up).
         if let Some(idx) = self.sketch_index.as_ref() {
-            // Schema-retirement #5 step 2: apply the agent-side
-            // INGEST-time metric-rename rewrite (DDSketch/KLL
-            // `_quantile`, HLL `_hll`) here at the top of modern
-            // execute() so bare-metric PromQL still hits the
-            // suffixed series the ASAP tier actually holds. The
-            // legacy `handle_query_promql` did this rewrite at
-            // its own entry; with the legacy path slated for
-            // retirement, the modern path needs the same
-            // capability so it can fully supersede.
-            let query_owned = self
-                .resolve_sketch_metric_alias(query)
-                .unwrap_or_else(|| query.to_string());
-            let query = query_owned.as_str();
-
             let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
             // Branch 1 — the control plane analyzer rejects the shape.
@@ -5800,168 +5581,6 @@ mod forced_agg_id_tests {
     }
 }
 
-// ===========================================================================
-// `resolve_sketch_metric_alias` — agent-side INGEST suffix rewrites.
-//
-// The agent's per-family sketch processors rename raw input metrics on
-// egress (DDSketch / KLL → `_quantile`, HLL → `_hll`). The user's
-// PromQL still references the conceptual unsuffixed name, so the
-// engine has to rewrite to whatever the ASAP-tier sketch store
-// actually holds. These tests pin the contract:
-//
-//   * Quantile-shape queries redirect bare `M` → `M_quantile` when only
-//     the suffixed variant exists in streaming-config.
-//   * Count-shape queries redirect bare `M` → `M_hll` (HLL ingest
-//     rename) — closes the wire gap for `count(unique_users_per_min)`
-//     against an HLL-backed agg.
-//   * No-op when the bare metric is locally known (no rename was
-//     applied for this deployment) or when no suffixed variant exists.
-//   * Topk / RatePostHoc shapes are NOT touched (CountSketch /
-//     CountMin processors don't suffix-rename today).
-// ===========================================================================
-#[cfg(test)]
-mod sketch_alias_resolver_tests {
-    use super::*;
-    use crate::storage_engines::types::{
-        AggregationConfig, CleanupPolicy, HotReloadStreamingConfig,
-        StreamingConfig, WindowType};
-    use std::sync::Arc;
-
-    fn agg_for(_id: u64, metric: &str, agg_type: AggregationType) -> AggregationConfig {
-        // `_id` is unused after PR 5 — identity is content-addressed.
-        AggregationConfig::new(
-            agg_type,
-            String::new(),
-            HashMap::new(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            30,
-            30,
-            WindowType::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
-    }
-
-    /// Build a ASAPQueryEngine whose streaming-config holds the supplied
-    /// (metric, agg_type) pairs and whose schema is empty (matches the
-    /// production ASAP-tier deploy where the control plane drives the
-    /// label set).
-    fn engine_with(metrics: &[(&str, AggregationType)]) -> ASAPQueryEngine {
-        let mut configs = HashMap::new();
-        for (i, (m, t)) in metrics.iter().enumerate() {
-            configs.insert((i + 1) as u64, agg_for((i + 1) as u64, m, *t));
-        }
-        let streaming_config = StreamingConfig::new(configs);
-        let hot_reload = HotReloadStreamingConfig::from_arc(Arc::new(streaming_config));
-        ASAPQueryEngine::new_with_hot_reload(hot_reload, 1)
-    }
-
-    #[test]
-    fn quantile_query_rewrites_bare_to_quantile_suffix() {
-        let engine = engine_with(&[("http_latency_ms_quantile", AggregationType::DDSketch)]);
-        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
-        let rewritten = engine
-            .resolve_sketch_metric_alias(q)
-            .expect("DDSketch _quantile rewrite should fire");
-        assert!(
-            rewritten.contains("http_latency_ms_quantile"),
-            "expected suffixed name in rewrite, got: {rewritten}"
-        );
-        // Bare metric must not appear as a standalone token any more.
-        assert!(!rewritten.contains("http_latency_ms[")); // matrix-selector form
-    }
-
-    #[test]
-    fn quantile_query_passes_through_when_bare_is_known() {
-        // Both names registered → bare metric is locally known → no
-        // rewrite. Pre-fix this leaked the suffix even when the deploy
-        // never applied the rename.
-        let engine = engine_with(&[
-            ("http_latency_ms", AggregationType::DDSketch),
-            ("http_latency_ms_quantile", AggregationType::DDSketch),
-        ]);
-        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
-        assert!(engine.resolve_sketch_metric_alias(q).is_none());
-    }
-
-    #[test]
-    fn quantile_query_passes_through_when_suffixed_missing() {
-        // Bare unknown AND suffixed not registered → no place to
-        // redirect → return None and let the caller surface the
-        // capability miss.
-        let engine = engine_with(&[("other_metric_quantile", AggregationType::DDSketch)]);
-        let q = "quantile_over_time(0.99, http_latency_ms[30s])";
-        assert!(engine.resolve_sketch_metric_alias(q).is_none());
-    }
-
-    #[test]
-    fn count_query_rewrites_bare_to_hll_suffix() {
-        // The MVP demo's HLL-routing path: agent's HLL processor
-        // renames `unique_users_per_min` → `unique_users_per_min_hll`
-        // on egress. User's `count(unique_users_per_min)` must
-        // resolve to the suffixed series.
-        let engine = engine_with(&[("unique_users_per_min_hll", AggregationType::HLL)]);
-        let q = "count(unique_users_per_min)";
-        let rewritten = engine
-            .resolve_sketch_metric_alias(q)
-            .expect("HLL _hll rewrite should fire for count(...) shape");
-        assert!(
-            rewritten.contains("unique_users_per_min_hll"),
-            "expected suffixed name in rewrite, got: {rewritten}"
-        );
-    }
-
-    #[test]
-    fn count_query_passes_through_when_bare_known() {
-        // `count(metric)` against a non-HLL deploy: the metric is
-        // locally known by its bare name, so no _hll redirect.
-        let engine = engine_with(&[("series_count", AggregationType::Sum)]);
-        let q = "count(series_count)";
-        assert!(engine.resolve_sketch_metric_alias(q).is_none());
-    }
-
-    #[test]
-    fn topk_query_is_not_touched() {
-        // CountSketch processor doesn't rename today; a `topk(...)`
-        // query must pass through unchanged even if a hypothetical
-        // `_hll` suffixed variant happens to exist in config.
-        let engine = engine_with(&[
-            ("top_endpoint_qps_hll", AggregationType::HLL), // distractor
-            ("top_endpoint_qps", AggregationType::CountSketch),
-        ]);
-        let q = "topk(5, top_endpoint_qps)";
-        assert!(engine.resolve_sketch_metric_alias(q).is_none());
-    }
-
-    #[test]
-    fn rate_query_is_not_touched() {
-        // CountMin processor doesn't rename today; `rate(metric[5m])`
-        // must pass through unchanged.
-        let engine = engine_with(&[("endpoint_request_freq", AggregationType::CountMinSketch)]);
-        let q = "rate(endpoint_request_freq[5m])";
-        assert!(engine.resolve_sketch_metric_alias(q).is_none());
-    }
-
-    #[test]
-    fn rewrite_preserves_other_query_text() {
-        // The substitution must be identifier-token-aware: only the
-        // standalone `http_latency_ms` token gets rewritten, not
-        // any other tokens that happen to share a substring.
-        let engine = engine_with(&[("http_latency_ms_quantile", AggregationType::DDSketch)]);
-        let q = "quantile_over_time(0.95, http_latency_ms{zone=\"us\"}[1m])";
-        let rewritten = engine
-            .resolve_sketch_metric_alias(q)
-            .expect("rewrite should succeed");
-        assert!(rewritten.contains("http_latency_ms_quantile{zone=\"us\"}"));
-        assert!(rewritten.contains("0.95"));
-    }
-}
 
 // ===========================================================================
 // HLL count() — capability matching + accumulator query round-trip.
