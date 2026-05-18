@@ -333,15 +333,59 @@ pub struct SketchPoint {
 
 type OtlpParseResult = (Vec<MetricPoint>, Vec<SketchPoint>);
 
+/// Render OTLP `(name, labels)` into the canonical PromQL-style series
+/// key `metric{k1="v1",k2="v2"}` used everywhere in the data plane.
+///
+/// Values are wrapped in double quotes and embedded `"`, `\`, `\n` are
+/// escaped per the PromQL lexer rules. This matches:
+///
+///   * `parse_labels_from_series_key` in `precompute_engine/worker.rs`
+///     (the inverse — expects `key="value"`)
+///   * `render_series_key` in `storage_engines/sketch_db/backfill/
+///     prometheus_reader.rs` (the other producer of this shape)
+///   * `RawSample.labels`' documented shape (`metric{k="v",...}`)
+///   * `sample_matches` in the backfill raw reader (strips `"` when
+///     parsing)
+///
+/// Pre-fix this helper emitted **unquoted** values (`k=v`), which the
+/// parser silently rejected → `IngestState::extract_group_key_for`
+/// returned `""` for every OTLP wire-format input, and the keyed
+/// dispatch path inside `apply_sample` saw empty aggregated keys for
+/// every OTLP sample. The bug was discovered while implementing PR
+/// #284 (B7.6 ingest sid rekey); that PR side-stepped it by reading
+/// `point.labels` directly, but emit-time `KeyByLabelValues`
+/// content elsewhere depended on the roundtrip working — hence this
+/// fix. See the regression test
+/// `format_series_key_roundtrips_through_parse_labels` in
+/// `precompute_engine/worker.rs`.
 fn format_series_key(name: &str, labels: &HashMap<String, String>) -> String {
     let mut pairs: Vec<_> = labels.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
     let labels_str = pairs
         .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
+        .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
         .collect::<Vec<_>>()
         .join(",");
     format!("{}{{{}}}", name, labels_str)
+}
+
+/// Escape a label value for the PromQL series-key format. Mirrors
+/// `storage_engines::sketch_db::backfill::prometheus_reader::
+/// escape_label_value` — both producers must stay in lockstep so the
+/// parser in `precompute_engine::worker::parse_labels_from_series_key`
+/// sees a consistent shape regardless of which ingest path emitted
+/// the series key.
+fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn get_sketch_payload_from_attrs(
@@ -2145,6 +2189,118 @@ fn attributes_to_map(
 }
 
 #[cfg(test)]
+mod series_key_roundtrip_tests {
+    //! Regression coverage for the `format_series_key` ↔
+    //! `parse_labels_from_series_key` roundtrip bug discovered while
+    //! shipping PR #284 (B7.6 ingest sid rekey). The formatter
+    //! emitted unquoted `k=v` pairs but the parser required
+    //! `k="v"`, which silently produced empty group keys for every
+    //! OTLP wire-format input. These tests pin the canonical
+    //! PromQL-style quoted format the data plane now uses
+    //! throughout (see also `render_series_key` in
+    //! `storage_engines/sketch_db/backfill/prometheus_reader.rs`).
+    use super::*;
+    use crate::precompute_engine::worker::{decode_label_value, parse_labels_from_series_key};
+
+    fn roundtrip(name: &str, input: &[(&str, &str)]) {
+        let labels: HashMap<String, String> = input
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let key = format_series_key(name, &labels);
+        let parsed = parse_labels_from_series_key(&key);
+        for (k, v) in input {
+            let got = parsed
+                .get(*k)
+                .map(|raw| decode_label_value(raw).into_owned())
+                .unwrap_or_else(|| panic!("label '{}' missing after roundtrip; key={}", k, key));
+            assert_eq!(
+                got, *v,
+                "label '{}' value mismatch after roundtrip; key={}",
+                k, key
+            );
+        }
+        assert_eq!(
+            parsed.len(),
+            input.len(),
+            "label count mismatch after roundtrip; key={} parsed={:?}",
+            key,
+            parsed
+        );
+    }
+
+    #[test]
+    fn format_series_key_emits_promql_quoted_form() {
+        // The canonical shape every downstream parser
+        // (`parse_labels_from_series_key`, `sample_matches`) expects.
+        let mut labels = HashMap::new();
+        labels.insert("svc".to_string(), "auth".to_string());
+        labels.insert("env".to_string(), "prod".to_string());
+        let key = format_series_key("latency", &labels);
+        // Keys are sorted lexicographically so the formatted output
+        // is deterministic regardless of HashMap iteration order.
+        assert_eq!(key, r#"latency{env="prod",svc="auth"}"#);
+    }
+
+    #[test]
+    fn roundtrip_simple_alphanumeric() {
+        roundtrip("metric", &[("svc", "auth"), ("env", "prod")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_comma() {
+        // Comma is the pair delimiter — quoting must keep it inside
+        // the value. Pre-fix the unquoted format would split mid-value.
+        roundtrip("metric", &[("tag", "a,b,c"), ("svc", "auth")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_equals() {
+        // Equals is the key/value delimiter — quoting must protect it.
+        roundtrip("metric", &[("expr", "x=y"), ("svc", "auth")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_embedded_quote() {
+        // `"` must be escaped as `\"` on emit and decoded back on
+        // read. The parser's closing-quote scan must walk past the
+        // escape; `decode_label_value` un-escapes the slice.
+        roundtrip("metric", &[("msg", r#"hello "world""#), ("svc", "auth")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_backslash() {
+        roundtrip("metric", &[("path", r"C:\Users\app"), ("svc", "auth")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_newline() {
+        // `\n` round-trips through the `\n` escape; verifies the
+        // decoder handles all three escape body variants.
+        roundtrip("metric", &[("multi", "line1\nline2"), ("svc", "auth")]);
+    }
+
+    #[test]
+    fn roundtrip_value_with_all_metacharacters() {
+        // One stress case combining every escape body and every
+        // pair-delimiter character in a single value.
+        roundtrip(
+            "metric",
+            &[("payload", "a,b=c\"d\\e\nf"), ("svc", "auth")],
+        );
+    }
+
+    #[test]
+    fn empty_labels_yield_bare_braces() {
+        let labels: HashMap<String, String> = HashMap::new();
+        let key = format_series_key("metric", &labels);
+        assert_eq!(key, "metric{}");
+        let parsed = parse_labels_from_series_key(&key);
+        assert!(parsed.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod policy_fp_lookup_tests {
     use super::*;
     use crate::storage_engines::sketch_db::data::SketchConfig;
@@ -2722,16 +2878,17 @@ mod sid_bucketing_tests {
     ///   - samples in each bucket are exactly the DPs whose `zone`
     ///     attribute matches that bucket (the GROUP-BY semantic)
     ///
-    /// Note: the `group_key` field on the message currently comes from
-    /// `IngestState::extract_group_key_for(series_key, config)`, and
-    /// that helper has a pre-existing label-parsing inconsistency with
-    /// `format_series_key` (one quotes values, the other doesn't), so
-    /// it currently returns the empty string for OTLP wire-format
-    /// inputs. Bucketing is unaffected because B7.6 routes by sid (read
-    /// directly from `point.labels`, not the joined series_key);
-    /// fixing the group_key-extraction bug is a separate task and
-    /// would update emit-time label rendering, not the routing
-    /// contract this test pins.
+    /// Note: the `group_key` field on the message comes from
+    /// `IngestState::extract_group_key_for(series_key, config)`. Pre-
+    /// PR-after-#284 a quoting mismatch between `format_series_key`
+    /// (unquoted) and `parse_labels_from_series_key` (quoted) caused
+    /// this to return the empty string for OTLP wire inputs; the
+    /// follow-up PR fixed the formatter to emit the canonical
+    /// PromQL `k="v"` form and added a roundtrip regression in
+    /// `series_key_roundtrip_tests`. Bucketing was always correct
+    /// here because B7.6 routes by sid (read directly from
+    /// `point.labels`, not the joined series_key) — the
+    /// group_key value is informational only for this test.
     #[tokio::test]
     async fn raw_otlp_buckets_by_sid_with_distinct_group_keys() {
         // Channel large enough to capture all routed messages without
@@ -2813,10 +2970,10 @@ mod sid_bucketing_tests {
         // Each sid must match what the resolver records for its bucket
         // identity: (metric, "zone=<zv>;", ExactAgg-canonical). Use
         // the bucket's sample values to identify which zone it
-        // represents (group_key is currently empty due to the
-        // unrelated extract_group_key_for inconsistency — see the
-        // test-level doc above), then verify the sid matches the
-        // resolver mint for THAT zone.
+        // represents (sample-value-based identification is robust
+        // regardless of group_key shape — the test pin is on sid
+        // assignment, not on group_key content), then verify the
+        // sid matches the resolver mint for THAT zone.
         let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
             agg_type: cfg.aggregation_type,
             parameters_canonical:
