@@ -1,11 +1,17 @@
 pub mod workload;
-pub use workload::WorkloadStore;
+pub use workload::{WorkloadKey, WorkloadStore};
 
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::types::CollectionPlan;
+use crate::workload::AggRole;
+
+/// Composite key `(metric_name, role)` for the plan store — same
+/// shape as [`WorkloadKey`]. See [`crate::workload::AggRole`] for
+/// the B2 restructure rationale.
+pub type PlanKey = (String, AggRole);
 
 #[derive(Debug)]
 pub struct PlanStore {
@@ -14,7 +20,7 @@ pub struct PlanStore {
 
 #[derive(Debug, Default)]
 struct StoreInner {
-    entries: HashMap<String, Entry>,
+    entries: HashMap<PlanKey, Entry>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,10 +32,10 @@ struct Entry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("plan not found for metric {0:?}")]
-    NotFound(String),
-    #[error("no previous plan for metric {0:?}")]
-    NoPrevious(String),
+    #[error("plan not found for metric {0:?} role {1:?}")]
+    NotFound(String, AggRole),
+    #[error("no previous plan for metric {0:?} role {1:?}")]
+    NoPrevious(String, AggRole),
 }
 
 impl PlanStore {
@@ -39,13 +45,16 @@ impl PlanStore {
         }
     }
 
-    pub fn set(&self, metric: impl Into<String>, plan: CollectionPlan) {
-        let metric = metric.into();
+    /// Insert or replace the plan for `(metric, role)`. When a prior
+    /// plan exists, it is preserved as `previous` so [`Self::rollback`]
+    /// can restore it.
+    pub fn set(&self, metric: impl Into<String>, role: AggRole, plan: CollectionPlan) {
+        let key: PlanKey = (metric.into(), role);
         let mut inner = self.inner.write().unwrap();
-        match inner.entries.get_mut(&metric) {
+        match inner.entries.get_mut(&key) {
             None => {
                 inner.entries.insert(
-                    metric,
+                    key,
                     Entry {
                         current: plan,
                         previous: None,
@@ -62,37 +71,70 @@ impl PlanStore {
         }
     }
 
-    pub fn get(&self, metric: &str) -> Result<CollectionPlan, StoreError> {
+    pub fn get(&self, metric: &str, role: AggRole) -> Result<CollectionPlan, StoreError> {
         self.inner
             .read()
             .unwrap()
             .entries
-            .get(metric)
+            .get(&(metric.to_string(), role))
             .map(|e| e.current.clone())
-            .ok_or_else(|| StoreError::NotFound(metric.to_string()))
+            .ok_or_else(|| StoreError::NotFound(metric.to_string(), role))
     }
 
-    pub fn rollback(&self, metric: &str) -> Result<CollectionPlan, StoreError> {
+    /// Returns all `(role, plan)` pairs for `metric` across every role.
+    /// Empty vec when no role has a plan registered for the metric.
+    pub fn get_all_for_metric(&self, metric: &str) -> Vec<(AggRole, CollectionPlan)> {
+        self.inner
+            .read()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|((m, _), _)| m == metric)
+            .map(|((_, role), e)| (*role, e.current.clone()))
+            .collect()
+    }
+
+    pub fn rollback(&self, metric: &str, role: AggRole) -> Result<CollectionPlan, StoreError> {
+        let key: PlanKey = (metric.to_string(), role);
         let mut inner = self.inner.write().unwrap();
         let e = inner
             .entries
-            .get_mut(metric)
-            .ok_or_else(|| StoreError::NotFound(metric.to_string()))?;
+            .get_mut(&key)
+            .ok_or_else(|| StoreError::NotFound(metric.to_string(), role))?;
 
         let prev = e
             .previous
             .take()
-            .ok_or_else(|| StoreError::NoPrevious(metric.to_string()))?;
+            .ok_or_else(|| StoreError::NoPrevious(metric.to_string(), role))?;
         e.current = prev.clone();
         e.updated_at = Utc::now();
         Ok(prev)
     }
 
-    pub fn metrics(&self) -> Vec<String> {
+    /// Returns every `(metric, role)` key currently in the store.
+    pub fn keys(&self) -> Vec<PlanKey> {
         self.inner.read().unwrap().entries.keys().cloned().collect()
     }
 
-    pub fn expired(&self, now: DateTime<Utc>) -> Vec<String> {
+    /// Returns every distinct metric name currently in the store
+    /// (dedup'd across roles). Used by the metrics-exposer's plan-id
+    /// gauge which aggregates per metric.
+    pub fn metrics(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .inner
+            .read()
+            .unwrap()
+            .entries
+            .keys()
+            .map(|(m, _)| m.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Returns every `(metric, role)` whose `valid_until` is in the past.
+    pub fn expired(&self, now: DateTime<Utc>) -> Vec<PlanKey> {
         self.inner
             .read()
             .unwrap()
@@ -103,14 +145,14 @@ impl PlanStore {
             .collect()
     }
 
-    /// Returns a diff between the current and previous plan for `metric`.
-    /// Returns `None` if no previous plan exists.
-    pub fn diff(&self, metric: &str) -> Result<Option<PlanDiff>, StoreError> {
+    /// Returns a diff between the current and previous plan for the
+    /// `(metric, role)` pair. Returns `None` if no previous plan exists.
+    pub fn diff(&self, metric: &str, role: AggRole) -> Result<Option<PlanDiff>, StoreError> {
         let inner = self.inner.read().unwrap();
         let e = inner
             .entries
-            .get(metric)
-            .ok_or_else(|| StoreError::NotFound(metric.to_string()))?;
+            .get(&(metric.to_string(), role))
+            .ok_or_else(|| StoreError::NotFound(metric.to_string(), role))?;
         let Some(prev) = &e.previous else {
             return Ok(None);
         };
@@ -153,7 +195,6 @@ pub struct PlanDiff {
 mod tests {
     use super::*;
     use crate::types::*;
-    use std::time::Duration;
 
     fn make_plan(valid_secs: i64) -> CollectionPlan {
         let valid_until = Utc::now() + chrono::Duration::seconds(valid_secs);
@@ -188,15 +229,18 @@ mod tests {
     fn set_and_get() {
         let s = PlanStore::new();
         let plan = make_plan(600);
-        s.set("latency", plan.clone());
-        let got = s.get("latency").unwrap();
+        s.set("latency", AggRole::Quantile, plan.clone());
+        let got = s.get("latency", AggRole::Quantile).unwrap();
         assert_eq!(got.valid_until, plan.valid_until);
     }
 
     #[test]
     fn get_not_found() {
         let s = PlanStore::new();
-        assert!(matches!(s.get("missing"), Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            s.get("missing", AggRole::Quantile),
+            Err(StoreError::NotFound(..))
+        ));
     }
 
     #[test]
@@ -204,58 +248,103 @@ mod tests {
         let s = PlanStore::new();
         let p1 = make_plan(100);
         let p2 = make_plan(200);
-        s.set("m", p1.clone());
-        s.set("m", p2.clone());
-        let rolled = s.rollback("m").unwrap();
+        s.set("m", AggRole::Quantile, p1.clone());
+        s.set("m", AggRole::Quantile, p2.clone());
+        let rolled = s.rollback("m", AggRole::Quantile).unwrap();
         assert_eq!(rolled.valid_until, p1.valid_until);
         // After rollback, Get should return p1.
-        assert_eq!(s.get("m").unwrap().valid_until, p1.valid_until);
+        assert_eq!(
+            s.get("m", AggRole::Quantile).unwrap().valid_until,
+            p1.valid_until
+        );
     }
 
     #[test]
     fn rollback_no_previous() {
         let s = PlanStore::new();
-        s.set("m", make_plan(600));
-        assert!(matches!(s.rollback("m"), Err(StoreError::NoPrevious(_))));
+        s.set("m", AggRole::Quantile, make_plan(600));
+        assert!(matches!(
+            s.rollback("m", AggRole::Quantile),
+            Err(StoreError::NoPrevious(..))
+        ));
     }
 
     #[test]
     fn rollback_not_found() {
         let s = PlanStore::new();
-        assert!(matches!(s.rollback("x"), Err(StoreError::NotFound(_))));
+        assert!(matches!(
+            s.rollback("x", AggRole::Quantile),
+            Err(StoreError::NotFound(..))
+        ));
     }
 
     #[test]
-    fn metrics_list() {
+    fn metrics_dedups_across_roles() {
         let s = PlanStore::new();
-        s.set("a", make_plan(600));
-        s.set("b", make_plan(600));
-        let mut m = s.metrics();
-        m.sort();
+        s.set("a", AggRole::Quantile, make_plan(600));
+        s.set("a", AggRole::Sum, make_plan(600));
+        s.set("b", AggRole::Sum, make_plan(600));
+        let m = s.metrics();
         assert_eq!(m, vec!["a", "b"]);
     }
 
     #[test]
     fn expired() {
         let s = PlanStore::new();
-        s.set("old", make_plan(-1)); // already expired
-        s.set("active", make_plan(600));
+        s.set("old", AggRole::Quantile, make_plan(-1)); // already expired
+        s.set("active", AggRole::Sum, make_plan(600));
         let exp = s.expired(Utc::now());
-        assert_eq!(exp, vec!["old"]);
+        assert_eq!(exp, vec![("old".to_string(), AggRole::Quantile)]);
+    }
+
+    #[test]
+    fn different_roles_for_same_metric_coexist() {
+        // The PlanStore's role-keyed mirror of WorkloadStore's
+        // same-named test. Pins the B2 contract: per-role plans
+        // persist independently.
+        let s = PlanStore::new();
+        let plan_q = make_plan(600);
+        let plan_s = make_plan(700);
+        let plan_c = make_plan(800);
+        s.set("http_requests_total", AggRole::Quantile, plan_q.clone());
+        s.set("http_requests_total", AggRole::Sum, plan_s.clone());
+        s.set("http_requests_total", AggRole::Count, plan_c.clone());
+
+        assert_eq!(
+            s.get("http_requests_total", AggRole::Quantile)
+                .unwrap()
+                .valid_until,
+            plan_q.valid_until
+        );
+        assert_eq!(
+            s.get("http_requests_total", AggRole::Sum)
+                .unwrap()
+                .valid_until,
+            plan_s.valid_until
+        );
+        assert_eq!(
+            s.get("http_requests_total", AggRole::Count)
+                .unwrap()
+                .valid_until,
+            plan_c.valid_until
+        );
+
+        let all = s.get_all_for_metric("http_requests_total");
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
     fn concurrent_access() {
         use std::sync::Arc;
         let s = Arc::new(PlanStore::new());
-        s.set("m", make_plan(600));
+        s.set("m", AggRole::Quantile, make_plan(600));
 
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let s = Arc::clone(&s);
                 std::thread::spawn(move || {
                     for _ in 0..100 {
-                        let _ = s.get("m");
+                        let _ = s.get("m", AggRole::Quantile);
                     }
                 })
             })

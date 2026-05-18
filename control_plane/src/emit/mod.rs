@@ -287,18 +287,26 @@ pub fn collect_metric_to_family(
 ) -> std::collections::HashMap<String, SketchKind> {
     let mut out = std::collections::HashMap::new();
     for entry in registry.entries() {
-        let Some((workload, _wc)) = workload_store.get(&entry.metric_name) else {
-            continue;
-        };
-        let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
-            // `http_requests_total` and other raw-passthrough metrics
-            // land here — correctly excluded so they fall through to
-            // the routing connector's default `metrics/raw_passthrough`
-            // pipeline in the emitter.
-            continue;
-        };
-        if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
-            out.insert(entry.metric_name.clone(), kind);
+        // B2 (metric, role) restructure: walk every role registered
+        // for this metric. Sum-shaped roles (raw passthrough / ExactAgg)
+        // decline `bind_workload_typed` and correctly fall through to
+        // the routing-connector's default `metrics/raw_passthrough`
+        // pipeline. The FIRST sketch-shaped role that binds wins the
+        // entry — Quantile / Count / Topk all map to a single sketch
+        // family per metric in the current emitter's wire shape (one
+        // routing-connector OTTL condition per metric → one pipeline).
+        // Multi-sketch-per-metric coverage stays a follow-up; the
+        // streaming-config (`emit_backend_streaming_config_json`)
+        // already iterates per-aggregation so the backend serves all
+        // roles even when the edge emits only the first sketch shape.
+        for (_, workload, _wc) in workload_store.get_all_for_metric(&entry.metric_name) {
+            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
+                continue;
+            };
+            if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
+                out.entry(entry.metric_name.clone()).or_insert(kind);
+                break;
+            }
         }
     }
     out
@@ -329,10 +337,20 @@ pub fn collect_metric_to_grouping_labels(
 ) -> std::collections::HashMap<String, Vec<String>> {
     let mut out = std::collections::HashMap::new();
     for entry in registry.entries() {
-        let Some((workload, _wc)) = workload_store.get(&entry.metric_name) else {
-            continue;
-        };
-        out.insert(entry.metric_name.clone(), workload.group_by_labels.clone());
+        // B2 (metric, role): the FIRST registered role's grouping
+        // labels win — in practice all roles for a metric share the
+        // same `grouping_labels` since the YAML field lives on the
+        // WorkloadEntry. Using `get_all_for_metric().first()` keeps
+        // pre-B2 semantics ("the entry the controller pre-popped first
+        // wins") in the common case AND lets a multi-role metric still
+        // emit a single keep_keys OTTL processor per metric.
+        if let Some((_, workload, _)) = workload_store
+            .get_all_for_metric(&entry.metric_name)
+            .into_iter()
+            .next()
+        {
+            out.insert(entry.metric_name.clone(), workload.group_by_labels.clone());
+        }
     }
     out
 }
@@ -525,8 +543,10 @@ mod runtime_tests {
                 data: types_v2::DataShape::default(),
             };
             if let Ok(wl) = analyzer.analyze(spec) {
+                let role = crate::workload::derive_agg_role(entry);
                 store.set(
                     &entry.metric_name,
+                    role,
                     wl,
                     types::WorkloadCharacteristics::default(),
                 );

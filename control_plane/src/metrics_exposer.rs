@@ -198,8 +198,13 @@ impl MetricsRegistry {
         // ever observed; without this a re-plan would leave the old
         // plan_id label permanently emitting a stale value.
         self.active_plan_id.reset();
-        for metric in plan_store.metrics() {
-            let Ok(plan) = plan_store.get(&metric) else {
+        // B2 (metric, role): iterate per-pair so each role's plan
+        // emits its own `(metric, plan_id)` gauge value. The metric
+        // label retains the un-decorated metric name (pre-B2 wire
+        // shape) — a metric with multiple roles surfaces multiple
+        // active_plan_id rows under the same metric label.
+        for (metric, role) in plan_store.keys() {
+            let Ok(plan) = plan_store.get(&metric, role) else {
                 continue;
             };
             // Stable hash of the plan's debug repr — good enough for
@@ -207,9 +212,12 @@ impl MetricsRegistry {
             let mut hasher = DefaultHasher::new();
             // Cover the fields the planner actually changes per
             // re-plan: agent sketch+mode+delta+grouping, and valid_until
-            // (to catch refresh-only re-plans).
+            // (to catch refresh-only re-plans). Role is folded in so
+            // distinct-role plans produce distinct ids even when their
+            // agent_config fields happen to coincide.
             format!(
-                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                role,
                 plan.agent_config.sketch_type,
                 plan.agent_config.mode,
                 plan.agent_config.delta_transmission,
@@ -457,10 +465,16 @@ mod tests {
             }
         }
 
+        use crate::workload::AggRole;
         let plan_store = Arc::new(PlanStore::new());
-        plan_store.set("http_requests_total", make_plan(SketchType::DDSketch, 600));
+        plan_store.set(
+            "http_requests_total",
+            AggRole::Quantile,
+            make_plan(SketchType::DDSketch, 600),
+        );
         plan_store.set(
             "http_requests_total_latency_ms",
+            AggRole::Quantile,
             make_plan(SketchType::HLL, 600),
         );
 
@@ -483,7 +497,11 @@ mod tests {
         );
         // Re-plan with a different sketch must change the plan_id label.
         let before = text.clone();
-        plan_store.set("http_requests_total", make_plan(SketchType::KLL, 600));
+        plan_store.set(
+            "http_requests_total",
+            AggRole::Quantile,
+            make_plan(SketchType::KLL, 600),
+        );
         registry.refresh_plan_ids(&plan_store);
         let mfs = registry.registry.gather();
         let mut buf = Vec::new();
