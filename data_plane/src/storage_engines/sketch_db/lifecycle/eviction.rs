@@ -285,7 +285,7 @@ mod tests {
         let mut id_to_fp = HashMap::new();
         for &id in ids {
             let cfg = sum_agg_config(id);
-            let fp = cfg.aggregation_id();
+            let fp = cfg.policy_fp_u64();
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }

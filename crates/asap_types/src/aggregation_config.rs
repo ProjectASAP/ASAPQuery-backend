@@ -124,11 +124,11 @@ impl AggregationConfig {
     }
 
     /// `PolicyFingerprint::as_u64()` — the u64-form handle used by the
-    /// legacy aggregation-id-keyed call sites. **Always** equal to
-    /// `self.policy_fingerprint().as_u64()`. Provided so callers that
-    /// previously read `config.aggregation_id` can keep the same
-    /// arithmetic without owning the typed handle.
-    pub fn aggregation_id(&self) -> u64 {
+    /// policy-fingerprint-keyed call sites (e.g. `StreamingConfig`'s
+    /// `HashMap<u64, AggregationConfig>` keys). **Always** equal to
+    /// `self.policy_fingerprint().as_u64()`. The value is content-
+    /// addressed identity, NOT a controller-allocated counter id.
+    pub fn policy_fp_u64(&self) -> u64 {
         self.policy_fingerprint().as_u64()
     }
 
@@ -437,16 +437,16 @@ mod tests {
         );
     }
 
-    /// The `aggregation_id()` accessor is exactly the fingerprint u64.
+    /// The `policy_fp_u64()` accessor is exactly the fingerprint u64.
     #[test]
-    fn aggregation_id_accessor_equals_fingerprint_u64() {
+    fn policy_fp_u64_accessor_equals_fingerprint_u64() {
         let cfg = AggregationConfig::from_yaml_data(
             &sample_yaml(false),
             None,
             QueryLanguage::promql,
         )
         .expect("parse");
-        assert_eq!(cfg.aggregation_id(), cfg.policy_fingerprint().as_u64());
+        assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
     }
 
     /// PR 5: `serialize_to_json` no longer emits `aggregationId`.

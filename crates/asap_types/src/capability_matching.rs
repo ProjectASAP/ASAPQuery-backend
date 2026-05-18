@@ -397,7 +397,7 @@ pub fn spatial_filter_compatible(config_filter: &str, req_filter: &str) -> bool 
 ///    avoids the key-aggregation hunt when both shapes serve the
 ///    statistic — which is the common case for `Statistic::Sum`
 ///    matching both `Sum` and `CountMinSketch`.
-/// 3. **Tie-break on `aggregation_id()` (the policy fingerprint).**
+/// 3. **Tie-break on `policy_fp_u64()` (the policy fingerprint).**
 ///    Deterministic across runs and hosts; fixes the
 ///    HashMap-iteration-order flake on `avg_finds_sum_and_count`.
 pub fn aggregation_priority(a: &AggregationConfig, b: &AggregationConfig) -> Ordering {
@@ -407,7 +407,7 @@ pub fn aggregation_priority(a: &AggregationConfig, b: &AggregationConfig) -> Ord
         .cmp(&a.window_size)
         // `false < true` in Rust's bool Ord → single-pop sorts FIRST.
         .then_with(|| a_multi.cmp(&b_multi))
-        .then_with(|| a.aggregation_id().cmp(&b.aggregation_id()))
+        .then_with(|| a.policy_fp_u64().cmp(&b.policy_fp_u64()))
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +463,7 @@ pub fn find_compatible_aggregation(
                     );
                 if !ok {
                     debug!(
-                        agg_id = c.aggregation_id(),
+                        policy_fp = c.policy_fp_u64(),
                         agg_type = %c.aggregation_type,
                         metric = %c.metric,
                         window_size_s = c.window_size,
@@ -489,7 +489,7 @@ pub fn find_compatible_aggregation(
         debug!(
             statistic = ?stat,
             num_candidates = candidates.len(),
-            chosen_agg_id = candidates[0].aggregation_id(),
+            chosen_policy_fp = candidates[0].policy_fp_u64(),
             chosen_agg_type = %candidates[0].aggregation_type,
             chosen_window_size_s = candidates[0].window_size,
             "capability matching: found candidates, chose best",
@@ -538,17 +538,17 @@ pub fn find_compatible_aggregation(
 
     debug!(
         metric = %requirements.metric,
-        value_agg_id = value_agg.aggregation_id(),
+        value_policy_fp = value_agg.policy_fp_u64(),
         value_agg_type = %value_agg.aggregation_type,
-        key_agg_id = key_agg.aggregation_id(),
+        key_policy_fp = key_agg.policy_fp_u64(),
         key_agg_type = %key_agg.aggregation_type,
         "capability matching: resolved",
     );
 
     Some(AggregationIdInfo {
-        aggregation_id_for_value: value_agg.aggregation_id(),
+        aggregation_id_for_value: value_agg.policy_fp_u64(),
         aggregation_type_for_value: value_agg.aggregation_type,
-        aggregation_id_for_key: key_agg.aggregation_id(),
+        aggregation_id_for_key: key_agg.policy_fp_u64(),
         aggregation_type_for_key: key_agg.aggregation_type,
     })
 }
@@ -620,7 +620,7 @@ mod tests {
 
     fn single_config(config: AggregationConfig) -> HashMap<u64, AggregationConfig> {
         let mut m = HashMap::new();
-        m.insert(config.aggregation_id(), config);
+        m.insert(config.policy_fp_u64(), config);
         m
     }
 
@@ -629,7 +629,7 @@ mod tests {
     #[test]
     fn basic_sum_match() {
         let cfg = make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], "");
-        let expected = cfg.aggregation_id();
+        let expected = cfg.policy_fp_u64();
         let configs = single_config(cfg);
         let result = find_compatible_aggregation(
             &configs,
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn quantile_any_value_finds_kll() {
         let cfg = make_config(2, "lat", "DatasketchesKLL", "", 300, "tumbling", &[], "");
-        let expected = cfg.aggregation_id();
+        let expected = cfg.policy_fp_u64();
         let configs = single_config(cfg);
         // quantile value (0.5 or 0.9) is NOT part of QueryRequirements — both should find the same config
         let r1 = find_compatible_aggregation(
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn quantile_matches_hydrarkll() {
         let cfg = make_config(3, "lat", "HydraKLL", "", 300, "tumbling", &[], "");
-        let expected = cfg.aggregation_id();
+        let expected = cfg.policy_fp_u64();
         let configs = single_config(cfg);
         let result = find_compatible_aggregation(
             &configs,
@@ -757,10 +757,10 @@ mod tests {
     fn window_priority_largest_wins() {
         let small = make_config(1, "cpu", "Sum", "", 300, "tumbling", &[], "");
         let large = make_config(2, "cpu", "Sum", "", 900, "tumbling", &[], "");
-        let expected = large.aggregation_id();
+        let expected = large.policy_fp_u64();
         let mut configs = HashMap::new();
-        configs.insert(small.aggregation_id(), small);
-        configs.insert(large.aggregation_id(), large);
+        configs.insert(small.policy_fp_u64(), small);
+        configs.insert(large.policy_fp_u64(), large);
         // 900_000 ms is divisible by both 300 s and 900 s — prefer 900 s
         let result = find_compatible_aggregation(
             &configs,
@@ -1025,8 +1025,8 @@ mod tests {
         let sum = make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], "");
         let cnt = make_config(2, "cpu", "CountMinSketch", "", 300, "tumbling", &["job"], "");
         let mut configs = HashMap::new();
-        configs.insert(sum.aggregation_id(), sum);
-        configs.insert(cnt.aggregation_id(), cnt);
+        configs.insert(sum.policy_fp_u64(), sum);
+        configs.insert(cnt.policy_fp_u64(), cnt);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1046,8 +1046,8 @@ mod tests {
         // Count config has different window_size — must be rejected
         let cnt = make_config(2, "cpu", "CountMinSketch", "", 900, "tumbling", &["job"], "");
         let mut configs = HashMap::new();
-        configs.insert(sum.aggregation_id(), sum);
-        configs.insert(cnt.aggregation_id(), cnt);
+        configs.insert(sum.policy_fp_u64(), sum);
+        configs.insert(cnt.policy_fp_u64(), cnt);
         let result = find_compatible_aggregation(
             &configs,
             &req(
@@ -1220,9 +1220,9 @@ mod tests {
             &[],
             "",
         );
-        let expected = cfg.aggregation_id();
+        let expected = cfg.policy_fp_u64();
         let mut configs = HashMap::new();
-        configs.insert(cfg.aggregation_id(), cfg);
+        configs.insert(cfg.policy_fp_u64(), cfg);
         let result = find_compatible_aggregation(
             &configs,
             &req(

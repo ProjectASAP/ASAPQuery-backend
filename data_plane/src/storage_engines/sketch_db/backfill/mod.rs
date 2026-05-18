@@ -559,7 +559,7 @@ impl BackfillRegistry {
         windows_total: u64,
         data_retention_ms: Option<u64>,
     ) -> Result<u64, CreateError> {
-        let agg_id = config.aggregation_id();
+        let agg_id = config.policy_fp_u64();
         // Time-disjoint invariant: live ingest writes `[created_at, ∞)`
         // so backfill must stay strictly inside `[0, created_at)` or
         // touch the boundary exactly.

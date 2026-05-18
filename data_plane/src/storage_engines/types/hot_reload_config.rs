@@ -173,7 +173,7 @@ mod tests {
         let mut id_to_fp = std::collections::HashMap::new();
         for &id in ids {
             let cfg = dummy_agg(id);
-            let fp = cfg.aggregation_id();
+            let fp = cfg.policy_fp_u64();
             id_to_fp.insert(id, fp);
             map.insert(fp, cfg);
         }

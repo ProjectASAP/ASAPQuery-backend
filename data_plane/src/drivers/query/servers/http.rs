@@ -2725,7 +2725,7 @@ aggregations:
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
             // POSTs the right id on the wire.
-            let fp = cfg.aggregation_id();
+            let fp = cfg.policy_fp_u64();
             marker_to_fp.insert(*marker, fp);
             agg_map.insert(fp, cfg);
         }
