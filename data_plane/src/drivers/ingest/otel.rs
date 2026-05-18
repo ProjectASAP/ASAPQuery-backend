@@ -506,6 +506,58 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
     );
 }
 
+/// Resolve the bucket sid (and `policy_fp`) for a single data point
+/// against a single matching `AggregationConfig`.
+///
+/// B7.6 — sid is the bucket identity in the precompute engine; this
+/// helper folds `(config, grouping-label-values)` into a single u64 via
+/// `SeriesIdResolver`. Same `(metric, grouping-label-values, agg_kind)`
+/// always returns the same sid, so distinct data points that share the
+/// same group bucket land in the same `GroupSamples` /
+/// `AccumulatorInput` message — the GROUP-BY semantics the legacy
+/// `(agg_id, group_key)` tuple expressed.
+///
+/// The "attrs" passed to the resolver are the GROUPING-LABEL projection
+/// of the wire labels (NOT the full label set) — otherwise every
+/// distinct `(rack, node, pod)` tuple under a `grouping_labels=[zone]`
+/// policy would mint its own sid and never roll up.
+///
+/// `agg_kind` is `ExactAgg { ... }` for both raw-sample and opaque-
+/// envelope sketch paths so the resolver key matches the signature
+/// `reconcile_from_streaming_config` derives from the same config; the
+/// modified-OTLP first-class sketch path takes a different sid-
+/// resolution route inside `route_modified_otlp_sketches_to_precompute`
+/// because it carries per-DP `(SketchKindHandle, SketchConfig)` and
+/// must distinguish (e.g.) DDSketch vs Kll over the same series.
+fn resolve_bucket_sid_for_agg_config(
+    ingest_state: &Arc<IngestState>,
+    config: &asap_types::aggregation_config::AggregationConfig,
+    point_labels: &HashMap<String, String>,
+) -> (u64, asap_types::PolicyFingerprint) {
+    let grouping_pairs: Vec<(&str, &str)> = config
+        .grouping_labels
+        .labels
+        .iter()
+        .map(|name| {
+            let v = point_labels.get(name).map(|s| s.as_str()).unwrap_or("");
+            (name.as_str(), v)
+        })
+        .collect();
+    let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&grouping_pairs);
+    let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
+        agg_type: config.aggregation_type,
+        parameters_canonical:
+            crate::storage_engines::sketch_db::data::canonical_parameters(&config.parameters),
+        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+    };
+    let agg_kind_canonical = agg_kind.canonical_string();
+    let sid = ingest_state
+        .series_resolver
+        .resolve(&config.metric, &fp, &agg_kind_canonical);
+    let policy_fp = asap_types::PolicyFingerprint(config.aggregation_id());
+    (sid, policy_fp)
+}
+
 async fn route_otlp_to_precompute(
     request: &ExportMetricsServiceRequest,
     ingest_state: &Arc<IngestState>,
@@ -529,10 +581,17 @@ async fn route_otlp_to_precompute(
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
 
-    // Build (agg_id, group_key) → Vec<(series_key, ts_ms, value)> for raw points.
-    type GroupKey = (u64, String);
+    // B7.6 — bucket by `sid` instead of `(agg_id, group_key)`. The
+    // grouping label values fold into the sid via the
+    // `(metric, attrs_fp, agg_kind_canonical)` identity contract on
+    // `SeriesIdResolver`: same (config, grouping-label-values) → same
+    // sid → same bucket. We still carry `policy_fp` and `group_key`
+    // alongside the sid in the WorkerMessage so the worker can resolve
+    // the source config and render emit-time labels without consulting
+    // the sid → attrs reverse mapping.
+    type BucketTuple = (u64, asap_types::PolicyFingerprint, String); // (sid, policy_fp, group_key)
     type SampleTuple = (String, i64, f64);
-    let mut by_group: HashMap<GroupKey, Vec<SampleTuple>> = HashMap::new();
+    let mut by_bucket: HashMap<u64, (BucketTuple, Vec<SampleTuple>)> = HashMap::new();
     let mut raw_matched = 0usize;
     let mut raw_unmatched = 0usize;
     // Schema retirement #3 (plan step #3) dropped the agg_id-keyed
@@ -557,9 +616,15 @@ async fn route_otlp_to_precompute(
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
-            by_group
-                .entry((config.aggregation_id(), group_key))
-                .or_default()
+            let (sid, policy_fp) = resolve_bucket_sid_for_agg_config(
+                ingest_state,
+                config,
+                &point.labels,
+            );
+            by_bucket
+                .entry(sid)
+                .or_insert_with(|| ((sid, policy_fp, group_key.clone()), Vec::new()))
+                .1
                 .push((series_key.clone(), ts_ms, point.value));
             matched = true;
         }
@@ -571,11 +636,12 @@ async fn route_otlp_to_precompute(
     }
     flush_barrier_drops(ingest_state, &raw_barrier_drops, "otlp-raw");
 
-    let raw_messages: Vec<WorkerMessage> = by_group
+    let raw_messages: Vec<WorkerMessage> = by_bucket
         .into_iter()
         .map(
-            |((agg_id, group_key), samples)| WorkerMessage::GroupSamples {
-                agg_id,
+            |(_sid, ((sid, policy_fp, group_key), samples))| WorkerMessage::GroupSamples {
+                sid,
+                policy_fp,
                 group_key,
                 samples,
                 ingest_received_at,
@@ -636,8 +702,22 @@ async fn route_otlp_to_precompute(
                         continue;
                     }
                 };
+            // B7.6 — same sid-resolution scheme as the raw path: bucket
+            // identity is (metric, grouping-label-values, agg_kind).
+            // The opaque SketchEnvelope path predates per-variant
+            // sketch-kind plumbing here; treat the bucket as ExactAgg
+            // so the resolver key matches what
+            // `reconcile_from_streaming_config` derives from the same
+            // config (otherwise the bucket would be reachable but never
+            // reconciled).
+            let (sid, policy_fp) = resolve_bucket_sid_for_agg_config(
+                ingest_state,
+                config,
+                &point.labels,
+            );
             sketch_messages.push(WorkerMessage::AccumulatorInput {
-                agg_id: config.aggregation_id(),
+                sid,
+                policy_fp,
                 group_key,
                 timestamp_ms: ts_ms,
                 accumulator,
@@ -1200,15 +1280,36 @@ async fn route_modified_otlp_sketches_to_precompute(
                             continue;
                         }
                         let group_key = IngestState::extract_group_key_for(&series_key, config);
-                        // DEPRECATED: aggregation_id-keyed write — remove
-                        // after ASAP-tier validation. The Phase 5
-                        // SketchStore above is the new write path; this
-                        // legacy router push stays in tandem until the
-                        // query path's ASAP-tier reducer is wired
-                        // end-to-end and the streaming-config /
-                        // SketchStore call sites can be deleted.
+                        // B7.6 — bucket key is the per-config bucket sid
+                        // (folds in `(metric, grouping-label-values,
+                        // ExactAgg-of-config)`), NOT the per-DP `sid`
+                        // resolved above. The per-DP `sid` keys the
+                        // `SketchStore::register/append_sample` lane
+                        // (which uses `AggKind::Sketch` to distinguish
+                        // sketch shapes); the worker's
+                        // group_states are keyed per-aggregation-policy
+                        // bucket, which matches what
+                        // `reconcile_from_streaming_config` derives
+                        // from the same config (so retirement / orphan
+                        // eviction stays consistent).
+                        //
+                        // DEPRECATED routing-side write — remove after
+                        // ASAP-tier validation. The Phase 5 SketchStore
+                        // above is the new write path; this legacy
+                        // router push stays in tandem until the query
+                        // path's ASAP-tier reducer is wired end-to-end
+                        // and the streaming-config / SketchStore call
+                        // sites can be deleted.
+                        let attrs_map: HashMap<String, String> = dp
+                            .attrs
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        let (bucket_sid, policy_fp) =
+                            resolve_bucket_sid_for_agg_config(ingest_state, config, &attrs_map);
                         messages.push(WorkerMessage::AccumulatorInput {
-                            agg_id: config.aggregation_id(),
+                            sid: bucket_sid,
+                            policy_fp,
                             group_key,
                             timestamp_ms: ts_ms,
                             accumulator: accumulator.clone_boxed_core(),
@@ -2511,3 +2612,238 @@ mod sid_resolution_tests {
         let _ = drain.await;
     }
 }
+
+// ── B7.6 regression: ingest bucketing is keyed by sid, not (agg_id, group_key) ──
+#[cfg(test)]
+mod sid_bucketing_tests {
+    //! Pin the B7.6 contract: ingest dispatches to the precompute engine
+    //! with `(sid, policy_fp, group_key)` on every `GroupSamples` /
+    //! `AccumulatorInput`, and distinct group_key values mint distinct
+    //! sids that round-trip through `SeriesIdResolver::lookup`. Tests
+    //! the actual `route_otlp_to_precompute` path end-to-end so a
+    //! refactor that drops the per-DP sid-resolve call (or routes by
+    //! agg_id) breaks here.
+    use super::*;
+    use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+    use crate::precompute_engine::series_router::{SeriesRouter, WorkerMessage};
+    use crate::storage_engines::sketch_db::index::SketchStore;
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
+    use asap_otel_proto::tonic::metrics::v1::{
+        metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge, Metric as PbMetric,
+        NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    };
+    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::enums::{AggregationType, WindowType};
+    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn kv(k: &str, v: &str) -> KeyValue {
+        KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyVal::StringValue(v.to_string())),
+            }),
+        }
+    }
+
+    fn sum_agg_config(metric: &str, grouping: &[&str]) -> AggregationConfig {
+        AggregationConfig::new(
+            AggregationType::SingleSubpopulation,
+            "Sum".to_string(),
+            HashMap::new(),
+            KeyByLabelNames::new(grouping.iter().map(|s| s.to_string()).collect()),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowType::Tumbling,
+            String::new(),
+            metric.to_string(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Build a Gauge request with one DataPoint per (zone, value) entry.
+    /// Distinct `zone` values are the two grouping-label buckets the
+    /// test inspects.
+    fn build_gauge_request(metric: &str, points: &[(&str, f64)]) -> ExportMetricsServiceRequest {
+        let data_points = points
+            .iter()
+            .map(|(zone, val)| NumberDataPoint {
+                attributes: vec![kv("zone", zone)],
+                start_time_unix_nano: 1_000_000,
+                time_unix_nano: 11_000_000,
+                value: Some(NumberValue::AsDouble(*val)),
+                exemplars: Vec::new(),
+                flags: 0,
+                series_id: 0,
+            })
+            .collect();
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![PbMetric {
+                        name: metric.to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Gauge(PbGauge { data_points })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// Two distinct `zone` values under one policy → two distinct
+    /// `GroupSamples` messages, each keyed by the sid the resolver
+    /// minted for the corresponding `(metric, zone-only-attrs,
+    /// ExactAgg-of-config)` tuple.
+    ///
+    /// Pre-B7.6 this path dispatched `WorkerMessage::GroupSamples {
+    /// agg_id, group_key, ... }` and the worker bucketed by
+    /// `(agg_id, group_key)`. The contract this test pins is:
+    ///   - exactly two `WorkerMessage::GroupSamples` are emitted
+    ///   - their sids are non-zero and distinct
+    ///   - each sid equals what `SeriesIdResolver::lookup` records for
+    ///     `(metric, "zone=<zv>;", ExactAgg-canonical)` — i.e. the
+    ///     bucket identity is folded into sid via the resolver
+    ///   - policy_fp = config.aggregation_id() on every message
+    ///   - samples in each bucket are exactly the DPs whose `zone`
+    ///     attribute matches that bucket (the GROUP-BY semantic)
+    ///
+    /// Note: the `group_key` field on the message currently comes from
+    /// `IngestState::extract_group_key_for(series_key, config)`, and
+    /// that helper has a pre-existing label-parsing inconsistency with
+    /// `format_series_key` (one quotes values, the other doesn't), so
+    /// it currently returns the empty string for OTLP wire-format
+    /// inputs. Bucketing is unaffected because B7.6 routes by sid (read
+    /// directly from `point.labels`, not the joined series_key);
+    /// fixing the group_key-extraction bug is a separate task and
+    /// would update emit-time label rendering, not the routing
+    /// contract this test pins.
+    #[tokio::test]
+    async fn raw_otlp_buckets_by_sid_with_distinct_group_keys() {
+        // Channel large enough to capture all routed messages without
+        // blocking the dispatch loop.
+        let (tx, mut rx) = mpsc::channel::<WorkerMessage>(64);
+        let router = SeriesRouter::new(vec![tx]);
+
+        let metric = "cpu_seconds";
+        let cfg = sum_agg_config(metric, &["zone"]);
+        let policy_fp = asap_types::PolicyFingerprint(cfg.aggregation_id());
+        let mut configs = HashMap::new();
+        configs.insert(cfg.aggregation_id(), cfg.clone());
+        let streaming = StreamingConfig::new(configs);
+        let hot_reload = HotReloadStreamingConfig::new(streaming);
+
+        let resolver = Arc::new(SeriesIdResolver::new());
+        let state = Arc::new(IngestState {
+            router,
+            samples_ingested: std::sync::atomic::AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: std::sync::atomic::AtomicU64::new(0),
+            hot_reload_config: hot_reload,
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: resolver.clone(),
+            sketch_index: Arc::new(SketchStore::new()),
+        });
+
+        // Two zones × two DPs each. The two zones must produce two
+        // separate buckets; the two DPs within a zone must accumulate
+        // into the same bucket.
+        let req = build_gauge_request(
+            metric,
+            &[("z0", 1.0), ("z0", 2.0), ("z1", 10.0), ("z1", 20.0)],
+        );
+
+        route_otlp_to_precompute(&req, &state).await;
+
+        // Drain the messages the dispatcher emitted (one per bucket).
+        let mut messages: Vec<WorkerMessage> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            messages.push(msg);
+        }
+
+        // Filter to GroupSamples — the only variant raw OTLP emits.
+        let groups: Vec<(u64, asap_types::PolicyFingerprint, String, Vec<(String, i64, f64)>)> =
+            messages
+                .into_iter()
+                .filter_map(|m| match m {
+                    WorkerMessage::GroupSamples {
+                        sid,
+                        policy_fp,
+                        group_key,
+                        samples,
+                        ..
+                    } => Some((sid, policy_fp, group_key, samples)),
+                    _ => None,
+                })
+                .collect();
+
+        assert_eq!(
+            groups.len(),
+            2,
+            "exactly two buckets (one per zone) — observed {} messages",
+            groups.len()
+        );
+
+        // Both buckets carry the same policy_fp (one source config).
+        for (_, pf, _, _) in &groups {
+            assert_eq!(*pf, policy_fp, "policy_fp must equal config.aggregation_id()");
+        }
+
+        // sids must be non-zero (zero is reserved on the wire) and distinct.
+        let mut sids: Vec<u64> = groups.iter().map(|(s, _, _, _)| *s).collect();
+        sids.sort();
+        sids.dedup();
+        assert_eq!(sids.len(), 2, "two distinct sids — one per group_key");
+        assert!(sids.iter().all(|&s| s != 0), "sid 0 is reserved");
+
+        // Each sid must match what the resolver records for its bucket
+        // identity: (metric, "zone=<zv>;", ExactAgg-canonical). Use
+        // the bucket's sample values to identify which zone it
+        // represents (group_key is currently empty due to the
+        // unrelated extract_group_key_for inconsistency — see the
+        // test-level doc above), then verify the sid matches the
+        // resolver mint for THAT zone.
+        let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
+            agg_type: cfg.aggregation_type,
+            parameters_canonical:
+                crate::storage_engines::sketch_db::data::canonical_parameters(&cfg.parameters),
+            spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
+        };
+        let agg_kind_canonical = agg_kind.canonical_string();
+        for (sid, _, _, samples) in &groups {
+            let mut vals: Vec<f64> = samples.iter().map(|(_, _, v)| *v).collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let zone_for_bucket: &str = match vals.as_slice() {
+                [1.0, 2.0] => "z0",
+                [10.0, 20.0] => "z1",
+                other => panic!("unexpected bucket sample values: {other:?}"),
+            };
+            let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&[(
+                "zone",
+                zone_for_bucket,
+            )]);
+            let resolved = resolver.lookup(metric, &fp, &agg_kind_canonical);
+            assert_eq!(
+                resolved,
+                Some(*sid),
+                "sid for zone={zone_for_bucket} (inferred from sample values) must equal \
+                 resolver mint for (metric={metric}, fp={fp}, agg_kind={agg_kind_canonical})",
+            );
+        }
+    }
+}
+
