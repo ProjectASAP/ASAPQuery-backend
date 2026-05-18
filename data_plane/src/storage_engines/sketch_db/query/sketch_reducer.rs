@@ -50,6 +50,7 @@
 //!   as `UnsupportedCapability` for now and document the gap.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use asap_sketchlib::sketches::countminsketch::CountMinSketch;
 use asap_sketchlib::sketches::countsketch::CountSketch;
@@ -65,9 +66,10 @@ use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
 use crate::storage_engines::sketch_db::index::{
-    Capability, SketchEncoding, SketchStore, SketchInstanceMetadata, SketchKindHandle,
-    SketchSampleState,
+    AggregationType, Capability, SketchEncoding, SketchStore, SketchInstanceMetadata,
+    SketchKindHandle, SketchSampleState,
 };
+use promql_utilities::query_logics::enums::Statistic;
 
 /// Reducer wrapping a `&SketchStore`. Constructed per-query; cheap.
 pub struct SketchReducer<'a> {
@@ -544,6 +546,199 @@ impl<'a> SketchReducer<'a> {
             return Err(ASAPTierError::NoData {
                 metric_name: metric_name_for_err,
             });
+        }
+
+        let coverage = if cov_lo <= cov_hi {
+            Some((cov_lo, cov_hi))
+        } else {
+            None
+        };
+        Ok(ASAPTierResult {
+            series: out_series,
+            coverage,
+        })
+    }
+
+    /// ExactAgg dispatch — sister of [`Self::evaluate`] for sids whose
+    /// `Capability` is `ExactAgg(_)`. The sketch-backed `evaluate`
+    /// path can't answer these because they carry `Box<dyn
+    /// AggregateCore>` payloads (per-window `SumAccumulator` /
+    /// `IncreaseAccumulator` / `MinMaxAccumulator` etc.) rather than
+    /// opaque sketch bytes.
+    ///
+    /// PromQL `sum by (group_by_keys) (metric)` lowers (via the
+    /// control plane's `analyze_promql_for_asap_tier`) to a candidate
+    /// with `required_capability = ExactAgg(Sum)` and
+    /// `group_by_keys = {requested labels}`. This method walks every
+    /// hit sid's exact-aggregation state, projects each window's
+    /// label map onto `group_by_keys` (so a sid registered with
+    /// `[zone, rack]` answering a `by (zone)` query collapses across
+    /// rack values), and emits one `(label_values, [(window_end,
+    /// scalar)])` series per distinct projected group.
+    ///
+    /// For each (group, window_end) pair we MERGE all matching
+    /// accumulators via `AggregateCore::merge_with` and then read the
+    /// `Statistic` the agg_type implies — `Sum`/`Increase` →
+    /// `Statistic::Sum`, `MinMax` → currently UnsupportedCapability
+    /// (min vs max disambiguation needs the outer function name; deferred
+    /// to a follow-up). Both `SumAccumulator` and `IncreaseAccumulator`
+    /// answer `Statistic::Sum` from their `query_statistic` (the latter
+    /// returns the accumulated increase, which is what a PromQL `sum`
+    /// over rate/increase wants).
+    ///
+    /// `group_by_keys` empty (i.e. `sum(metric)` without `by (...)`)
+    /// collapses every series to a single grouping with empty label
+    /// map — the natural PromQL semantics.
+    pub fn evaluate_exact_agg(
+        &self,
+        sids: &[u64],
+        agg_type: AggregationType,
+        group_by_keys: &std::collections::BTreeSet<String>,
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
+        // Pick the Statistic answer this agg_type implies. PromQL
+        // `sum by (...)` against an ExactAgg sid is the standard
+        // counter rollup — every additive type answers via Sum.
+        let stat = match agg_type {
+            AggregationType::Sum
+            | AggregationType::MultipleSum
+            | AggregationType::Increase
+            | AggregationType::MultipleIncrease => Statistic::Sum,
+            // MinMax disambiguation requires the outer PromQL function
+            // name (min vs max); deferred until the engine threads it
+            // through. Today min/max queries are not produced by the
+            // analyzer's ExactAgg(MinMax) capability path for `sum by`
+            // queries, so this branch is defensive.
+            other => {
+                return Err(ASAPTierError::UnsupportedCapability {
+                    function: format!("sum_by_for_{other:?}"),
+                    capability: Capability::ExactAgg(other),
+                });
+            }
+        };
+
+        // (projected_group_map, window_end_ms) -> Vec<accumulator>
+        // BTreeMap so window_ends sort naturally for output and the
+        // group map key is a Vec<(k,v)> tuple sorted by key (BTreeMap
+        // iteration is key-sorted, so collecting yields a canonical
+        // order).
+        type GroupKey = Vec<(String, String)>;
+        let mut grouped: BTreeMap<
+            (GroupKey, i64),
+            Vec<Arc<dyn crate::storage_engines::types::AggregateCore>>,
+        > = BTreeMap::new();
+        let mut metric_name_for_err = String::new();
+        let mut cov_lo: u64 = u64::MAX;
+        let mut cov_hi: u64 = 0;
+        let mut any_window = false;
+
+        for &sid in sids {
+            let meta = match self.index.instance(sid) {
+                Some(m) => m,
+                None => continue,
+            };
+            metric_name_for_err = meta.metric_name.clone();
+
+            // Pull every (label_map, samples) tuple this sid carries
+            // in window. Sketch-backed sids (or sids with no in-window
+            // exact-agg state) return empty.
+            let series_list = self.index.query_exact_agg_range(sid, t0_ms, t1_ms);
+            for (label_map, samples) in series_list {
+                // Project label_map onto group_by_keys. Missing keys are
+                // dropped (the user didn't ask for them); requested keys
+                // absent from the sid's label_map become empty-string
+                // values so a sid registered with a subset of the
+                // requested keys still groups deterministically.
+                let projected: GroupKey = if group_by_keys.is_empty() {
+                    Vec::new()
+                } else {
+                    group_by_keys
+                        .iter()
+                        .map(|k| {
+                            let v = label_map.get(k).cloned().unwrap_or_default();
+                            (k.clone(), v)
+                        })
+                        .collect()
+                };
+
+                for (window_end, acc) in samples {
+                    any_window = true;
+                    let w = if window_end >= 0 { window_end as u64 } else { 0 };
+                    if w < cov_lo {
+                        cov_lo = w;
+                    }
+                    if w > cov_hi {
+                        cov_hi = w;
+                    }
+                    grouped
+                        .entry((projected.clone(), window_end))
+                        .or_default()
+                        .push(acc);
+                }
+            }
+        }
+
+        if !any_window {
+            return Err(ASAPTierError::NoData {
+                metric_name: metric_name_for_err,
+            });
+        }
+
+        // Fold per-(group, window) accumulator lists into a single
+        // scalar via `merge_with` (additive across the list) and
+        // `query_statistic`. Re-bucket by group so each group emits
+        // ONE series with the full per-window timeseries.
+        let mut by_group: BTreeMap<GroupKey, Vec<(i64, f64)>> = BTreeMap::new();
+        for ((group, w_end), accs) in grouped {
+            // Merge all accumulators landing in (group, window). For
+            // a single ExactAgg sid covering one group there's
+            // typically one entry; multiple entries come from multiple
+            // sids that share the projected group (e.g. several
+            // (zone=z0, rack=*) sids collapsing to a single zone=z0
+            // group).
+            let mut iter = accs.into_iter();
+            let head = match iter.next() {
+                Some(h) => h,
+                None => continue,
+            };
+            let mut merged: Box<dyn crate::storage_engines::types::AggregateCore> =
+                head.clone_boxed_core();
+            for next in iter {
+                match merged.merge_with(next.as_ref()) {
+                    Ok(m) => merged = m,
+                    Err(e) => {
+                        return Err(ASAPTierError::DeserializeFailure {
+                            sid: 0,
+                            encoding: SketchEncoding::ProtoFull,
+                            reason: format!("exact-agg merge failed: {e}"),
+                        });
+                    }
+                }
+            }
+            let value = match merged.query_statistic(
+                stat,
+                &None,
+                &std::collections::HashMap::new(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(ASAPTierError::DeserializeFailure {
+                        sid: 0,
+                        encoding: SketchEncoding::ProtoFull,
+                        reason: format!("exact-agg query_statistic({stat:?}) failed: {e}"),
+                    });
+                }
+            };
+            by_group.entry(group).or_default().push((w_end, value));
+        }
+
+        // Build the series. BTreeMap iteration is already sorted, so
+        // each series's samples vec is in window-end order.
+        let mut out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = Vec::new();
+        for (group, samples) in by_group {
+            let label_map: BTreeMap<String, String> = group.into_iter().collect();
+            out_series.push((label_map, samples));
         }
 
         let coverage = if cov_lo <= cov_hi {
