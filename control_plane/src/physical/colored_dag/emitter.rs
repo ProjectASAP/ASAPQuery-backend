@@ -185,6 +185,19 @@ pub struct EdgeStageConfig {
     /// shapes are emitted unchanged (backward-compat).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_family: HashMap<String, SketchKind>,
+    /// MVP blocker B3 — per-metric attribute allowlist the agent must
+    /// reduce wire attrs to BEFORE the sketch processor sees them.
+    /// Maps each metric to its grouping-label list; the 5-sketch routing
+    /// emitter (and the legacy single-pipeline emitter when
+    /// `source_metric` matches) prepends a
+    /// `transform/keep_for_<sanitized_metric>` OTTL processor in front
+    /// of every sketch processor that calls
+    /// `keep_keys(datapoint.attributes, [...])` on the listed labels.
+    /// Without this the agent sketches with the full wire-attr tuple,
+    /// minting one sid per unique tuple — defeating the streaming-config's
+    /// `grouping_labels` contract.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metric_to_grouping_labels: HashMap<String, Vec<String>>,
 }
 
 /// Phase 3.2.5 — one archive-tier metric the agent should land in
@@ -436,6 +449,7 @@ impl Emitter for ThreeStageEmitter {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
+            metric_to_grouping_labels: HashMap::new(),
         };
         let mut backend_aggregations: Vec<BackendAggregation> = Vec::new();
         let mut gateway_processors: Vec<GatewayMergeProcessor> = Vec::new();

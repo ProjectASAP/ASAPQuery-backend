@@ -206,6 +206,11 @@ impl Replanner {
         // covers correctness for the metric being replanned.
         if let Some(registry) = self.workload_registry.as_ref() {
             edge_cfg.metric_to_family = collect_metric_to_family(registry, &self.workload_store);
+            // MVP blocker B3 — companion stitch: per-metric grouping
+            // labels so the emitter prepends a `transform/keep_for_*`
+            // OTTL processor in front of every sketch pipeline.
+            edge_cfg.metric_to_grouping_labels =
+                crate::emit::collect_metric_to_grouping_labels(registry, &self.workload_store);
         }
 
         // OpAMP `on_connect` doesn't expose the agent's runtime

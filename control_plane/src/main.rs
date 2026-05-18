@@ -530,7 +530,21 @@ async fn handle_plan(
             if let Some(configs) = physical::stage_split::split_typed_three_stage(&physical_expr) {
                 for (stage_id, stage_cfg) in configs {
                     match stage_cfg {
-                        crate::physical::colored_dag::StageConfig::Edge(edge) => {
+                        crate::physical::colored_dag::StageConfig::Edge(mut edge) => {
+                            // MVP blocker B3 — patch per-metric grouping
+                            // labels onto the edge cfg so the 5-sketch
+                            // routing emitter prepends a
+                            // `transform/keep_for_*` OTTL processor in
+                            // front of each sketch pipeline. The typed
+                            // L5 emitter leaves
+                            // `metric_to_grouping_labels` empty by
+                            // design (same rationale as the
+                            // `agg.grouping = workload.group_by_labels`
+                            // patch on the Backend stage below).
+                            edge.metric_to_grouping_labels.insert(
+                                workload.metric_name.clone(),
+                                workload.group_by_labels.clone(),
+                            );
                             match emit::emit_edge_yaml(&edge, &st.opamp_endpoint) {
                                 Ok(yaml) => {
                                     let hash = short_hash(&yaml);
@@ -1125,6 +1139,14 @@ async fn emit_bootstrap_typed(
     //    (`replan::Replanner::try_emit_typed_edge_yaml_for_workload`)
     //    applies the same stitch via the same shared helper.
     edge_cfg.metric_to_family = emit::collect_metric_to_family(
+        &st.workload_registry,
+        &st.workload_store,
+    );
+    // MVP blocker B3 — companion stitch: per-metric grouping labels so
+    // the 5-sketch routing emitter can prepend a `transform/keep_for_*`
+    // OTTL processor in front of every sketch pipeline, reducing wire
+    // attrs to the streaming-config's `grouping_labels` BEFORE sketching.
+    edge_cfg.metric_to_grouping_labels = emit::collect_metric_to_grouping_labels(
         &st.workload_registry,
         &st.workload_store,
     );

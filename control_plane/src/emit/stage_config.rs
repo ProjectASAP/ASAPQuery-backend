@@ -182,14 +182,39 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
         processors.insert("gorillas3".to_string(), gorillas3);
     }
 
+    // ── MVP blocker B3: per-metric attribute-allowlist for legacy path ─────
+    //
+    // The legacy `emit_edge_yaml` (non-routing) shape carries ONE source
+    // metric (`cfg.source_metric`), not the per-metric routing table the
+    // 5-sketch shape uses. If the controller has populated
+    // `cfg.metric_to_grouping_labels` for `source_metric`, prepend a
+    // `transform/keep_for_<sanitized_metric>` OTTL processor in front
+    // of the sketch processor so the agent strips wire attrs to the
+    // streaming-config's `grouping_labels` BEFORE sketching.
+    let legacy_keep_proc_name: Option<String> =
+        cfg.source_metric.as_deref().and_then(|m| {
+            cfg.metric_to_grouping_labels.get(m).map(|labels| {
+                let name = transform_keep_processor_name(m);
+                let block = build_transform_keep_processor_block(m, labels);
+                processors.insert(name.clone(), block);
+                name
+            })
+        });
+
     // Pipeline-processor list for the ASAP-tier path. Order matches
     // `asap-otel-agent-b6-asap-single-sketch.yaml`: gorillas3 runs FIRST
     // so the cold-tier write happens on the raw sample BEFORE the sketch
-    // processor mutates / suffix-renames the metric stream.
+    // processor mutates / suffix-renames the metric stream. The
+    // `transform/keep_for_*` allowlist sits between gorillas3 and the
+    // sketch so the cold tier retains full wire attrs while the sketch
+    // only ever sees the reduced label set (MVP blocker B3).
     let asap_tier_processors: Vec<String> = {
         let mut v = Vec::new();
         if has_archive_tier {
             v.push("gorillas3".to_string());
+        }
+        if let Some(name) = &legacy_keep_proc_name {
+            v.push(name.clone());
         }
         v.extend(sketch_pipeline_processors.iter().cloned());
         v
@@ -962,6 +987,39 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
     let mut referenced_pipelines: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
 
+    // ── MVP blocker B3: per-metric attribute-allowlist processors ──────────
+    //
+    // For every metric the planner pinned to a sketch family, register a
+    // `transform/keep_for_<sanitized_metric>` OTTL processor that strips
+    // wire attrs down to the streaming-config's `grouping_labels` BEFORE
+    // the sketch processor mints sids. Without this the agent sketches
+    // with the full wire-attr tuple — one sid per unique tuple,
+    // defeating the streaming-config contract.
+    //
+    // We use the OTTL transform processor (not the attributes processor)
+    // because attributesprocessor has no native "keep only these" /
+    // allowlist action. The transform processor's
+    // `keep_keys(datapoint.attributes, [...])` is the right primitive
+    // and is registered in the asap-otel builder-config.
+    //
+    // Metrics absent from `metric_to_grouping_labels` are skipped
+    // (preserves backward-compat for raw OTel agents bypassing the
+    // typed-stage-split — no keep processor injected, attrs flow
+    // through unmodified).
+    let mut family_to_keep_processors: HashMap<SketchKind, Vec<String>> = HashMap::new();
+    for (metric, kind) in &metric_family_pairs {
+        let Some(labels) = cfg.metric_to_grouping_labels.get(*metric) else {
+            continue;
+        };
+        let proc_name = transform_keep_processor_name(metric);
+        let proc_block = build_transform_keep_processor_block(metric, labels);
+        processors.insert(proc_name.clone(), proc_block);
+        family_to_keep_processors
+            .entry((*kind).clone())
+            .or_default()
+            .push(proc_name);
+    }
+
     for (metric, kind) in &metric_family_pairs {
         let pipeline = sketch_kind_to_pipeline_name(kind);
         table_entries.push(format!(
@@ -1006,11 +1064,22 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
     // BEFORE gorillas3 buffers them into windowState. gorillas3 then
     // does the cold-tier write on raw samples BEFORE the sketch
     // processor mutates / suffix-renames the stream.
-    let make_sketch_pipeline = |family_proc: &str| -> Pipeline {
+    // Per-family pipeline =
+    //   `[memory_limiter, gorillas3?, transform/keep_for_<metric>*, <family>processor, batch]`.
+    // gorillas3 does the cold-tier write on RAW samples (full wire attrs
+    // preserved in MinIO for drill-down) BEFORE the keep-processor
+    // strips attrs down to grouping-labels for the sketch processor's
+    // benefit (MVP blocker B3). `keep_procs` is empty for families
+    // with no metrics declared in `metric_to_grouping_labels` —
+    // pipeline reduces to the pre-B3 shape, attrs flow through.
+    let make_sketch_pipeline = |family_proc: &str, keep_procs: &[String]| -> Pipeline {
         let mut procs: Vec<String> = Vec::new();
         procs.push("memory_limiter".to_string());
         if has_archive_tier {
             procs.push("gorillas3".to_string());
+        }
+        for kp in keep_procs {
+            procs.push(kp.clone());
         }
         procs.push(family_proc.to_string());
         procs.push("batch".to_string());
@@ -1070,7 +1139,19 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
     ] {
         let proc_name = sketch_kind_to_processor_name(&kind);
         let pipeline_name = sketch_kind_to_pipeline_name(&kind);
-        pipelines.insert(pipeline_name.to_string(), make_sketch_pipeline(proc_name));
+        // Sort per-family keep-processor list deterministically so YAML
+        // output is stable across runs (HashMap iteration is not
+        // order-stable). Empty list when no metrics in the family have
+        // grouping labels declared (MVP blocker B3).
+        let mut keep_procs = family_to_keep_processors
+            .get(&kind)
+            .cloned()
+            .unwrap_or_default();
+        keep_procs.sort();
+        pipelines.insert(
+            pipeline_name.to_string(),
+            make_sketch_pipeline(proc_name, &keep_procs),
+        );
     }
 
     // Phase ε.1 — Mode 3 prometheus-archive pipeline (raw passthrough
@@ -1175,6 +1256,54 @@ fn sketch_kind_to_pipeline_name(kind: &SketchKind) -> &'static str {
         SketchKind::CountSketch => "metrics/countsketch_path",
         SketchKind::Cms => "metrics/countminsketch_path",
     }
+}
+
+/// MVP blocker B3 — compute the OTel processor name for a per-metric
+/// `transform/keep_for_*` allowlist processor. OTel component-ids reject
+/// dots/dashes/slashes in the `<type>/<name>` form, so we sanitise the
+/// metric name by replacing every non-`[A-Za-z0-9_]` byte with `_`.
+fn transform_keep_processor_name(metric: &str) -> String {
+    let sanitised: String = metric
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    format!("transform/keep_for_{sanitised}")
+}
+
+/// MVP blocker B3 — build the OTTL `transform` processor block that
+/// reduces a metric's data-point attributes to its grouping-label set.
+///
+/// Emits a block of the form:
+/// ```yaml
+/// error_mode: ignore
+/// metric_statements:
+///   - keep_keys(datapoint.attributes, ["zone"]) where metric.name == "<metric>"
+/// ```
+///
+/// The `where metric.name == "<metric>"` guard makes the statement a
+/// no-op on any metric routed through this pipeline that isn't the one
+/// this processor was minted for — per-family pipelines see ALL metrics
+/// routed to that family by the connector, not just the controller's
+/// currently-planned one.
+///
+/// `error_mode: ignore` mirrors the contrib examples: if a metric
+/// arrives without the gating-label attrs (e.g. during early-life
+/// startup before exporters have populated resource attrs), the
+/// processor logs and continues rather than dropping the whole batch.
+///
+/// Empty `labels` is supported — `keep_keys(datapoint.attributes, [])`
+/// strips every attr (planner's signal for one global sid per metric).
+fn build_transform_keep_processor_block(metric: &str, labels: &[String]) -> Value {
+    let labels_array: String = if labels.is_empty() {
+        "[]".to_string()
+    } else {
+        let quoted: Vec<String> = labels.iter().map(|l| format!("\"{l}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let yaml = format!(
+        "error_mode: ignore\nmetric_statements:\n  - keep_keys(datapoint.attributes, {labels_array}) where metric.name == \"{metric}\"\n",
+    );
+    serde_yaml::from_str(&yaml).expect("transform/keep_for_* yaml is well-formed by construction")
 }
 
 /// Build a default-parameter processor block for a `SketchKind` when
@@ -1526,6 +1655,7 @@ mod tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
+            metric_to_grouping_labels: HashMap::new(),
         }
     }
 
@@ -2487,6 +2617,7 @@ mod tests {
             }],
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
+            metric_to_grouping_labels: HashMap::new(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
 
@@ -2810,6 +2941,7 @@ mod tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
         }
     }
 
@@ -3210,4 +3342,213 @@ mod tests {
             "routing table must dispatch by asap.mode for Mode 3\n{yaml}"
         );
     }
+    // ── MVP blocker B3: attributes/keep allowlist tests ───────────────────
+    //
+    // The controller must inject a `transform/keep_for_<sanitized_metric>`
+    // OTTL processor upstream of every sketch processor so the agent
+    // reduces wire attrs to `streaming_config.grouping_labels` BEFORE
+    // sketching. Without these, the agent sketches with the FULL
+    // wire-attr tuple, minting one sid per unique tuple — defeating
+    // the streaming-config contract and ballooning the schema endpoint
+    // per-metric sid count (51 for `http_requests_total_latency_ms`
+    // in the smoke test).
+    //
+    // We chose OTTL `transform` over `attributes/keep` because the
+    // attributes processor has NO native allowlist action (only
+    // insert/update/delete/hash). OTTL's `keep_keys(datapoint.attributes,
+    // [...])` is the right primitive and the transform processor is
+    // registered in the asap-otel builder-config alongside attributes,
+    // filter, and groupbyattrs.
+
+    /// Helper: 5-sketch edge cfg with per-metric grouping labels declared.
+    fn five_sketch_edge_cfg_with_grouping_labels() -> EdgeStageConfig {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.metric_to_grouping_labels.insert(
+            "http_requests_total_latency_ms".into(),
+            vec!["zone".into()],
+        );
+        cfg.metric_to_grouping_labels
+            .insert("request_size_bytes".into(), vec!["zone".into(), "region".into()]);
+        cfg.metric_to_grouping_labels
+            .insert("unique_users_per_min".into(), vec!["zone".into()]);
+        cfg.metric_to_grouping_labels
+            .insert("top_endpoint_qps".into(), vec!["endpoint".into()]);
+        cfg.metric_to_grouping_labels
+            .insert("endpoint_request_freq".into(), vec!["endpoint".into()]);
+        cfg
+    }
+
+    #[test]
+    fn b3_emits_transform_keep_processor_per_metric_with_grouping_labels() {
+        let cfg = five_sketch_edge_cfg_with_grouping_labels();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        for metric in [
+            "http_requests_total_latency_ms",
+            "request_size_bytes",
+            "unique_users_per_min",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+        ] {
+            let key = format!("transform/keep_for_{metric}:");
+            assert!(
+                yaml.contains(&key),
+                "missing transform processor block {key}\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn b3_transform_block_uses_keep_keys_ottl_with_correct_labels() {
+        let cfg = five_sketch_edge_cfg_with_grouping_labels();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        assert!(
+            yaml.contains(
+                "keep_keys(datapoint.attributes, [\"zone\"]) where metric.name == \"http_requests_total_latency_ms\""
+            ),
+            "missing keep_keys statement for DDSketch metric\n{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "keep_keys(datapoint.attributes, [\"zone\", \"region\"]) where metric.name == \"request_size_bytes\""
+            ),
+            "missing keep_keys statement for KLL metric (multi-label)\n{yaml}"
+        );
+        let count = yaml.matches("error_mode: ignore").count();
+        assert!(
+            count >= 5,
+            "expected at least 5 `error_mode: ignore` markers, got {count}\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn b3_per_family_pipeline_prepends_keep_before_sketch() {
+        let cfg = five_sketch_edge_cfg_with_grouping_labels();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        for (pipeline, metric, family_proc) in [
+            ("metrics/ddsketch_path:", "http_requests_total_latency_ms", "ddsketch"),
+            ("metrics/kll_path:", "request_size_bytes", "KLL"),
+            ("metrics/hll_path:", "unique_users_per_min", "HLL"),
+            ("metrics/countsketch_path:", "top_endpoint_qps", "countsketch"),
+            ("metrics/countminsketch_path:", "endpoint_request_freq", "countmin"),
+        ] {
+            let p_idx = yaml.find(pipeline).expect(pipeline);
+            let after = &yaml[p_idx..];
+            let next_offset = after[1..]
+                .find("    metrics")
+                .map(|x| x + 1)
+                .unwrap_or(after.len());
+            let section = &after[..next_offset];
+            let keep_needle = format!("- transform/keep_for_{metric}");
+            let k_idx = section.find(&keep_needle).unwrap_or_else(|| {
+                panic!("missing {keep_needle} in {pipeline}\n{section}")
+            });
+            let f_idx = section
+                .find(&format!("- {family_proc}"))
+                .unwrap_or_else(|| panic!("{family_proc} missing in {pipeline}\n{section}"));
+            assert!(
+                k_idx < f_idx,
+                "transform/keep_for_{metric} must come BEFORE {family_proc} in {pipeline}\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn b3_keep_lives_after_gorillas3_so_cold_tier_keeps_full_attrs() {
+        let mut cfg = five_sketch_edge_cfg_with_grouping_labels();
+        cfg.archive_tier_metrics = vec![ArchiveTierMetric {
+            metric: "http_requests_total_latency_ms".into(),
+            window_secs: Some(60),
+        }];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let p_idx = yaml.find("metrics/ddsketch_path:").expect("pipeline");
+        let after = &yaml[p_idx..];
+        let next_offset = after[1..]
+            .find("    metrics")
+            .map(|x| x + 1)
+            .unwrap_or(after.len());
+        let section = &after[..next_offset];
+        let g_idx = section.find("- gorillas3").expect("gorillas3");
+        let k_idx = section
+            .find("- transform/keep_for_http_requests_total_latency_ms")
+            .expect("keep");
+        let s_idx = section.find("- ddsketch").expect("ddsketch");
+        assert!(
+            g_idx < k_idx && k_idx < s_idx,
+            "ordering must be gorillas3 < keep_for_* < ddsketch, got g={g_idx} k={k_idx} s={s_idx}\n{section}"
+        );
+    }
+
+    #[test]
+    fn b3_processor_name_sanitises_metric_special_chars() {
+        assert_eq!(
+            transform_keep_processor_name("foo.bar-baz/qux"),
+            "transform/keep_for_foo_bar_baz_qux"
+        );
+        assert_eq!(
+            transform_keep_processor_name("http_requests_total_latency_ms"),
+            "transform/keep_for_http_requests_total_latency_ms"
+        );
+    }
+
+    #[test]
+    fn b3_no_transform_processor_when_grouping_labels_absent() {
+        let cfg = five_sketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        assert!(
+            !yaml.contains("transform/keep_for_"),
+            "no transform/keep_for_* processor should be emitted when grouping-labels map is empty\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("keep_keys(datapoint.attributes"),
+            "no keep_keys OTTL statement should be emitted when grouping-labels map is empty\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn b3_empty_grouping_label_list_emits_empty_keep_keys() {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.metric_to_grouping_labels
+            .insert("http_requests_total_latency_ms".into(), vec![]);
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        assert!(
+            yaml.contains(
+                "keep_keys(datapoint.attributes, []) where metric.name == \"http_requests_total_latency_ms\""
+            ),
+            "empty grouping_labels must emit empty-list keep_keys\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn b3_legacy_emit_edge_yaml_injects_keep_for_source_metric() {
+        let mut cfg = ddsketch_edge_cfg();
+        cfg.source_metric = Some("http_requests_total_latency_ms".to_string());
+        cfg.metric_to_grouping_labels.insert(
+            "http_requests_total_latency_ms".into(),
+            vec!["zone".into()],
+        );
+        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        assert!(
+            yaml.contains("transform/keep_for_http_requests_total_latency_ms:"),
+            "legacy emit must register the keep processor\n{yaml}"
+        );
+        assert!(
+            yaml.contains(
+                "keep_keys(datapoint.attributes, [\"zone\"]) where metric.name == \"http_requests_total_latency_ms\""
+            ),
+            "legacy emit must surface the keep_keys OTTL statement\n{yaml}"
+        );
+        let pipelines_idx = yaml.find("pipelines:").expect("pipelines");
+        let after = &yaml[pipelines_idx..];
+        let entry_idx = after.find("metrics:").expect("metrics pipeline");
+        let section = &after[entry_idx..];
+        let k_idx = section
+            .find("- transform/keep_for_http_requests_total_latency_ms")
+            .expect("keep ref in pipeline");
+        let s_idx = section.find("- ddsketch").expect("ddsketch ref in pipeline");
+        assert!(
+            k_idx < s_idx,
+            "keep_for_* must come BEFORE ddsketch in legacy pipeline\n{section}"
+        );
+    }
+
 }
