@@ -151,6 +151,129 @@ pub enum OuterFn {
     Rate,
 }
 
+/// PromQL outer-aggregation operator carried on each `ASAPTierCandidate`
+/// for the shape `<agg-op> by (labels) (<inner>)` where `<inner>` is a
+/// function the analyzer ALREADY routes to a per-row ASAP-tier
+/// candidate (e.g. `quantile_over_time`, `sum_over_time`, `rate`).
+///
+/// Background: the analyzer's lowerer captures the INNER intent
+/// (`AggIntent::Quantile`, `AggIntent::Sum`, etc.) — that's what
+/// `capability_for` maps to a `Capability`. The OUTER aggregation
+/// operator (`max`, `min`, `avg`, `count`, etc.) wrapping the inner
+/// function is dropped on the floor: the lowerer either folds it into a
+/// dedicated `AggIntent` (`Sum` → `ExactAgg(Sum)`, handled separately)
+/// or returns no extra intent for the wrapper (`max`, `min`, `avg`,
+/// `count` — which are scalar folds over the inner's per-row result).
+///
+/// `OuterAgg` carries that wrapper so the engine's evaluator can
+/// fold per-row results into one row per `by`-group AFTER the inner
+/// function returns its rows. The taxonomy intentionally splits the
+/// fold operators that ARE composable on top of a per-row inner result
+/// — the inner sketch / accumulator computes per-row values, and the
+/// outer aggregation reduces across rows in each `by`-group.
+///
+/// Identity case: when the inner result already has exactly one row
+/// per `by`-group (e.g. asap's per-zone DDSketch quantile), the fold
+/// is the identity — `max(x) = min(x) = avg(x) = x`. The general fold
+/// machinery handles this naturally without a special case.
+///
+/// `None` is the default — `Default::default()` returns `None` so
+/// candidates built without an explicit outer aggregation (test
+/// fixtures, plain inner-only queries) keep the prior behavior.
+///
+/// Out of scope (separate follow-up):
+/// - PromQL `quantile(phi, vec)` (instant) over function results —
+///   needs per-group sketch merging, not a scalar fold.
+/// - `sum` is NOT included here: `sum by (...) (...)` already routes
+///   through `Capability::ExactAgg(Sum)` via the analyzer's lowerer +
+///   the `Sum` intent collapse; adding it here would double-dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OuterAgg {
+    /// No outer aggregation operator wraps the inner function — the
+    /// engine emits the inner result directly. This is the default.
+    #[default]
+    None,
+    /// `max by (labels) (<inner>)` — fold each `by`-group's values by
+    /// taking the maximum.
+    Max(Vec<String>),
+    /// `min by (labels) (<inner>)` — fold each `by`-group's values by
+    /// taking the minimum.
+    Min(Vec<String>),
+    /// `avg by (labels) (<inner>)` — fold each `by`-group's values by
+    /// taking the arithmetic mean.
+    Avg(Vec<String>),
+    /// `count by (labels) (<inner>)` — fold each `by`-group's values
+    /// by counting the contributing rows (cardinality of the group).
+    Count(Vec<String>),
+    /// `group by (labels) (<inner>)` — PromQL `group` operator returns
+    /// 1.0 per `by`-group (label preservation, value-erasing fold).
+    Group(Vec<String>),
+    /// `stddev by (labels) (<inner>)` — fold each `by`-group's values
+    /// by taking the population standard deviation.
+    Stddev(Vec<String>),
+    /// `stdvar by (labels) (<inner>)` — fold each `by`-group's values
+    /// by taking the population variance.
+    Stdvar(Vec<String>),
+}
+
+impl OuterAgg {
+    /// True when an outer aggregation operator is set. False for the
+    /// `None` default. Used by the engine's evaluator to skip the
+    /// fold pass when no outer aggregation applies.
+    pub fn is_some(&self) -> bool {
+        !matches!(self, OuterAgg::None)
+    }
+
+    /// The `by`-labels carried by every operator variant. `None` returns
+    /// an empty slice. Caller projects each result row's label map onto
+    /// these keys to form the group identity.
+    pub fn by_labels(&self) -> &[String] {
+        match self {
+            OuterAgg::None => &[],
+            OuterAgg::Max(l)
+            | OuterAgg::Min(l)
+            | OuterAgg::Avg(l)
+            | OuterAgg::Count(l)
+            | OuterAgg::Group(l)
+            | OuterAgg::Stddev(l)
+            | OuterAgg::Stdvar(l) => l.as_slice(),
+        }
+    }
+
+    /// Fold a slice of f64 values into a single scalar per the operator.
+    /// Returns `None` only for an empty input slice (caller drops empty
+    /// groups). All operators are defined on at least one value.
+    pub fn fold(&self, values: &[f64]) -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        Some(match self {
+            // Identity / no-op — engine shouldn't call this when None,
+            // but defensively return the first value.
+            OuterAgg::None => values[0],
+            OuterAgg::Max(_) => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            OuterAgg::Min(_) => values.iter().copied().fold(f64::INFINITY, f64::min),
+            OuterAgg::Avg(_) => {
+                let sum: f64 = values.iter().sum();
+                sum / values.len() as f64
+            }
+            OuterAgg::Count(_) => values.len() as f64,
+            OuterAgg::Group(_) => 1.0,
+            OuterAgg::Stddev(_) => {
+                let n = values.len() as f64;
+                let mean: f64 = values.iter().sum::<f64>() / n;
+                let var: f64 = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+                var.sqrt()
+            }
+            OuterAgg::Stdvar(_) => {
+                let n = values.len() as f64;
+                let mean: f64 = values.iter().sum::<f64>() / n;
+                values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n
+            }
+        })
+    }
+}
+
 /// Compact, hashable handle for sketch implementation choice. Mirrors
 /// [`SketchKind`] but adds the `CmsWithHeap` and `Any` query-side
 /// concepts (which aren't sketch families, they're dispatch hints).
@@ -1155,6 +1278,96 @@ mod tests {
         assert!(cap
             .supported_intents
             .contains(&SupportedIntent::Cardinality));
+    }
+
+    // ── OuterAgg fold semantics ──────────────────────────────────────────
+    //
+    // Pin the fold-by-operator dispatch shape the engine reads off the
+    // typed `ASAPTierCandidate.outer_agg` field. The identity case
+    // (single-value group) is the load-bearing assertion for asap's
+    // per-zone-DDSketch shape: `max by (zone) (quantile_over_time(...))`
+    // produces one row per zone, and `OuterAgg::Max.fold([x]) == x` —
+    // the wrapper is a no-op for already-grouped inner results.
+
+    #[test]
+    fn outer_agg_default_is_none() {
+        assert_eq!(OuterAgg::default(), OuterAgg::None);
+        assert!(!OuterAgg::default().is_some());
+    }
+
+    #[test]
+    fn outer_agg_none_carries_no_by_labels() {
+        assert!(OuterAgg::None.by_labels().is_empty());
+    }
+
+    #[test]
+    fn outer_agg_max_fold_single_value_is_identity() {
+        // Issue #296 identity case: inner already emits one row per
+        // by-group; the outer max fold must return that row unchanged.
+        let v = OuterAgg::Max(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        assert_eq!(v, 42.5);
+    }
+
+    #[test]
+    fn outer_agg_min_fold_single_value_is_identity() {
+        let v = OuterAgg::Min(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        assert_eq!(v, 42.5);
+    }
+
+    #[test]
+    fn outer_agg_avg_fold_single_value_is_identity() {
+        let v = OuterAgg::Avg(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        assert_eq!(v, 42.5);
+    }
+
+    #[test]
+    fn outer_agg_max_fold_multi_picks_largest() {
+        let v = OuterAgg::Max(vec![]).fold(&[1.0, 5.0, 3.0]).unwrap();
+        assert_eq!(v, 5.0);
+    }
+
+    #[test]
+    fn outer_agg_min_fold_multi_picks_smallest() {
+        let v = OuterAgg::Min(vec![]).fold(&[1.0, 5.0, 3.0]).unwrap();
+        assert_eq!(v, 1.0);
+    }
+
+    #[test]
+    fn outer_agg_avg_fold_multi_is_mean() {
+        let v = OuterAgg::Avg(vec![]).fold(&[1.0, 5.0, 3.0]).unwrap();
+        assert!((v - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outer_agg_count_fold_returns_cardinality() {
+        let v = OuterAgg::Count(vec![]).fold(&[1.0, 5.0, 3.0]).unwrap();
+        assert_eq!(v, 3.0);
+    }
+
+    #[test]
+    fn outer_agg_group_fold_returns_one() {
+        let v = OuterAgg::Group(vec![]).fold(&[1.0, 5.0, 3.0]).unwrap();
+        assert_eq!(v, 1.0);
+    }
+
+    #[test]
+    fn outer_agg_stddev_fold_multi_is_population_stddev() {
+        // population stddev of [1,2,3,4,5] is sqrt(2) ≈ 1.4142
+        let v = OuterAgg::Stddev(vec![]).fold(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert!((v - 2.0_f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outer_agg_stdvar_fold_multi_is_population_variance() {
+        let v = OuterAgg::Stdvar(vec![]).fold(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert!((v - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn outer_agg_empty_input_returns_none() {
+        assert_eq!(OuterAgg::Max(vec![]).fold(&[]), None);
+        assert_eq!(OuterAgg::Avg(vec![]).fold(&[]), None);
+        assert_eq!(OuterAgg::Count(vec![]).fold(&[]), None);
     }
 
     // ── load_capability_overrides ────────────────────────────────────────

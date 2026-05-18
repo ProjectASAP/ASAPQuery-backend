@@ -54,7 +54,7 @@ use crate::intent_algebra::query_expr::QueryExpr;
 use crate::query_parser::{parse_query, parse_query_expr_canonical};
 
 pub use crate::sketch_algebra::capability::{
-    capability_for, Capability, OuterFn, SketchKindHandle,
+    capability_for, Capability, OuterAgg, OuterFn, SketchKindHandle,
 };
 
 // ── Public types ─────────────────────────────────────────────────────────────
@@ -93,6 +93,26 @@ pub struct ASAPTierCandidate {
     /// dispatch can branch on the typed candidate instead of re-parsing
     /// the raw PromQL string. See [`OuterFn`] for the taxonomy.
     pub outer_fn: OuterFn,
+    /// PromQL outer-AGGREGATION operator — `Max(...)` / `Min(...)` /
+    /// `Avg(...)` / `Count(...)` / `Group(...)` / `Stddev(...)` /
+    /// `Stdvar(...)` when the original query is shaped
+    /// `<agg-op> by (labels) (<inner>)` and the inner is a function the
+    /// analyzer already binds to a candidate (e.g.
+    /// `max by (zone) (quantile_over_time(0.99, m[5m]))`). `None`
+    /// otherwise.
+    ///
+    /// The engine's evaluator applies the fold AFTER the inner function
+    /// produces its per-row result — grouping rows by the projected
+    /// by-labels and folding each group's values. For the identity case
+    /// (inner already emits one row per by-group, e.g. asap's per-zone
+    /// DDSketch sketch), the fold returns the single value unchanged.
+    /// Closes [#296](https://github.com/ProjectASAP/ASAPQuery-backend/issues/296).
+    ///
+    /// `sum` is intentionally NOT a variant of `OuterAgg`: the lowerer
+    /// collapses `sum`-shaped outers into `AggIntent::Sum` →
+    /// `Capability::ExactAgg(Sum)`, which has its own engine dispatch
+    /// (see `evaluate_exact_agg`); adding it here would double-dispatch.
+    pub outer_agg: OuterAgg,
 }
 
 /// Whole-query analysis result.
@@ -227,6 +247,7 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
                     range_seconds: trace.range_seconds,
                     spatial_filter_canonical: spatial_filter_canonical.clone(),
                     outer_fn: trace.outer_fn,
+                    outer_agg: trace.outer_agg.clone(),
                 });
             }
             None => {
@@ -357,6 +378,16 @@ struct PromqlTrace {
     /// over the raw query string — done here once so the engine reads
     /// it off the typed candidate.
     outer_fn: OuterFn,
+    /// PromQL outer-aggregation operator wrapping the inner function —
+    /// `max`/`min`/`avg`/`count`/`group`/`stddev`/`stdvar` only. `sum`
+    /// is intentionally excluded; it has its own ExactAgg dispatch.
+    /// `OuterAgg::None` for queries with no such wrapper.
+    ///
+    /// Captured ONLY for the OUTERMOST aggregation node — composed
+    /// shapes like `max by (a) (avg by (b) (q...))` capture only `max`
+    /// because the engine's fold is one-pass over the inner result.
+    /// Deeper nesting is a documented follow-up.
+    outer_agg: OuterAgg,
 }
 
 fn trace_from_promql(metricsql: &str) -> PromqlTrace {
@@ -365,8 +396,96 @@ fn trace_from_promql(metricsql: &str) -> PromqlTrace {
         Err(_) => return PromqlTrace::default(),
     };
     let mut t = PromqlTrace::default();
-    walk_ast_for_trace(&ast, &mut t);
+    // Lift the OUTERMOST aggregation operator into `outer_agg` before
+    // the recursive walker descends into the inner expression — the
+    // walker captures inner-most function-name / range / rate-flag
+    // semantics, while `outer_agg` is a property of the root node only.
+    // See `extract_outer_agg` for the operator → `OuterAgg` mapping
+    // and the explicit-exclusion of `sum` (which has its own
+    // ExactAgg dispatch).
+    t.outer_agg = extract_outer_agg(&ast);
+    // When outer_agg lifts the outermost Aggregate (e.g. `max by (zone) (
+    // quantile_over_time(...))`), the walker must descend INTO the
+    // aggregate's inner expression — otherwise the Aggregate branch in
+    // `walk_ast_for_trace` would set `t.function = "max"` and shadow
+    // the inner function name (`quantile_over_time`) that the engine's
+    // reducer actually dispatches on. The engine then sees the outer
+    // operator name in `candidate.function`, treats it as an unknown
+    // function, and CapabilityMisses to archive. Issue #296.
+    let walk_root = if t.outer_agg.is_some() {
+        unwrap_outermost_aggregate(&ast)
+    } else {
+        &ast
+    };
+    walk_ast_for_trace(walk_root, &mut t);
     t
+}
+
+/// Companion to [`extract_outer_agg`] — peels a leading `Paren` once,
+/// then descends one level into an `Aggregate.expr`. Returns the
+/// original `expr` unchanged if neither pattern matches (caller
+/// should only call this when `outer_agg.is_some()`, in which case the
+/// shape is guaranteed to be `[Paren?]Aggregate{..}`).
+fn unwrap_outermost_aggregate(expr: &Expr) -> &Expr {
+    let root = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        other => other,
+    };
+    match root {
+        Expr::Aggregate(a) => &a.expr,
+        _ => expr,
+    }
+}
+
+/// Lift the OUTERMOST PromQL aggregation operator into `OuterAgg`.
+///
+/// Returns `OuterAgg::None` for any non-aggregation root (bare
+/// selector, `Call(...)` with no outer agg, etc.), for `sum`
+/// (already handled via the ExactAgg pipeline), and for `topk` /
+/// `bottomk` / `quantile` (which have their own dispatch paths or
+/// are out-of-scope for the per-row fold).
+///
+/// The `by`-labels are pulled from the `LabelModifier::Include`
+/// list. `without (labels)` is NOT supported today — the engine's
+/// fold currently keys on the explicit `by`-labels set, and
+/// translating `without` to `by` needs knowledge of the inner
+/// result's label universe; deferred to a follow-up.
+///
+/// A leading `Paren` (e.g. `(max by (zone) (...))`) is unwrapped
+/// once so users who put the root in parens get the same shape.
+fn extract_outer_agg(expr: &Expr) -> OuterAgg {
+    use promql_parser::parser::LabelModifier;
+    let root = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        other => other,
+    };
+    let agg = match root {
+        Expr::Aggregate(a) => a,
+        _ => return OuterAgg::None,
+    };
+    // `by (labels)` → Vec<String>. `without (...)` → no support yet.
+    let by_labels: Vec<String> = match &agg.modifier {
+        Some(LabelModifier::Include(labels)) => labels.labels.iter().cloned().collect(),
+        // `without (...)` — not modeled here. Return None so the engine
+        // emits the inner result unchanged and the query falls over to
+        // archive if the consumer expected the fold. Documented gap.
+        Some(LabelModifier::Exclude(_)) => return OuterAgg::None,
+        None => Vec::new(),
+    };
+    let op = agg.op.to_string().to_lowercase();
+    match op.as_str() {
+        "max" => OuterAgg::Max(by_labels),
+        "min" => OuterAgg::Min(by_labels),
+        "avg" => OuterAgg::Avg(by_labels),
+        "count" => OuterAgg::Count(by_labels),
+        "group" => OuterAgg::Group(by_labels),
+        "stddev" => OuterAgg::Stddev(by_labels),
+        "stdvar" => OuterAgg::Stdvar(by_labels),
+        // `sum` → ExactAgg(Sum) pipeline; `topk`/`bottomk` → engine-side
+        // fallback path; `quantile` → out of scope (instant quantile
+        // over function results needs per-group sketch merging).
+        _ => OuterAgg::None,
+    }
 }
 
 fn walk_ast_for_trace(expr: &Expr, t: &mut PromqlTrace) {
@@ -926,6 +1045,107 @@ mod tests {
         assert_eq!(sot.candidates[0].outer_fn, OuterFn::Plain);
     }
 
+    // ── outer_agg — outer aggregation operator on function results ──────
+    //
+    // Regression coverage for issue #296: the asap engine was rejecting
+    // `max by (zone) (quantile_over_time(0.99, m[5m]))` because no
+    // generic "aggregation operator wraps a function result" path
+    // existed. The analyzer now captures the outer agg operator on a
+    // typed `OuterAgg` field; the engine's fold pass consumes it
+    // after the inner function returns its per-row result.
+
+    #[test]
+    fn max_by_quantile_over_time_carries_outer_agg_max() {
+        let a = analyze_promql_for_asap_tier(
+            "max by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates.len(), 1);
+        let c = &a.candidates[0];
+        // Inner function still binds to QuantileApprox — outer_agg
+        // doesn't alter the candidate's required_capability (the
+        // engine's fold runs over the inner result).
+        assert_eq!(
+            c.required_capability,
+            Capability::QuantileApprox(SketchKindHandle::Any),
+            "{c:?}"
+        );
+        // OuterAgg captured.
+        match &c.outer_agg {
+            OuterAgg::Max(labels) => {
+                assert_eq!(labels, &vec!["zone".to_string()]);
+            }
+            other => panic!("expected OuterAgg::Max([zone]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn avg_by_quantile_over_time_carries_outer_agg_avg() {
+        let a = analyze_promql_for_asap_tier(
+            "avg by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        match &a.candidates[0].outer_agg {
+            OuterAgg::Avg(labels) => assert_eq!(labels, &vec!["zone".to_string()]),
+            other => panic!("expected OuterAgg::Avg([zone]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn min_by_quantile_over_time_carries_outer_agg_min() {
+        let a = analyze_promql_for_asap_tier(
+            "min by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        match &a.candidates[0].outer_agg {
+            OuterAgg::Min(labels) => assert_eq!(labels, &vec!["zone".to_string()]),
+            other => panic!("expected OuterAgg::Min([zone]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_by_rate_carries_outer_agg_count() {
+        let a = analyze_promql_for_asap_tier(
+            "count by (zone) (rate(http_requests_total[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        match &a.candidates[0].outer_agg {
+            OuterAgg::Count(labels) => assert_eq!(labels, &vec!["zone".to_string()]),
+            other => panic!("expected OuterAgg::Count([zone]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sum_over_time_carries_outer_agg_none() {
+        // No outer aggregation wrapper → OuterAgg::None.
+        let a = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_agg, OuterAgg::None);
+    }
+
+    #[test]
+    fn sum_by_zone_does_not_set_outer_agg_sum() {
+        // `sum` MUST NOT populate OuterAgg — that operator routes through
+        // the ExactAgg(Sum) pipeline; double-dispatching would re-fold
+        // values that the per-window reducer has already accumulated.
+        let a = analyze_promql_for_asap_tier("sum by (zone) (http_requests_total)");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].outer_agg,
+            OuterAgg::None,
+            "sum must not populate OuterAgg — handled by ExactAgg(Sum) pipeline"
+        );
+    }
+
+    #[test]
+    fn bare_quantile_over_time_carries_outer_agg_none() {
+        let a = analyze_promql_for_asap_tier(
+            "quantile_over_time(0.99, http_latency_ms[5m])",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_agg, OuterAgg::None);
+    }
+
     // ── Unsupported / rejected shapes ────────────────────────────────────
 
     #[test]
@@ -1085,6 +1305,7 @@ mod tests {
                 range_seconds,
                 spatial_filter_canonical: spatial_filter_canonical.to_string(),
                 outer_fn: OuterFn::default(),
+                outer_agg: OuterAgg::default(),
             }
         }
 
