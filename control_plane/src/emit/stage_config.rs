@@ -49,7 +49,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value as JsonValue};
 use serde_yaml::{Mapping, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::physical::colored_dag::emitter::{
     AggregationInput, ArchiveTierMetric, BackendAggregation, BackendReadout, BackendStageConfig,
@@ -69,9 +69,18 @@ use crate::sketch_algebra::physical_expr::EstimateOp;
 
 #[derive(Serialize)]
 struct CollectorYaml {
-    extensions: HashMap<String, Value>,
-    receivers: HashMap<String, Value>,
-    processors: HashMap<String, Value>,
+    // BTreeMaps (not HashMaps) so serde_yaml emits in deterministic
+    // alphabetical key order. With HashMap, Rust's randomized
+    // iteration produced byte-different YAML on every call to the
+    // emit functions — which broke the agent's opampextension
+    // byte-level no-op check (ASAPCollector#381 follow-up), causing
+    // the agent to apply+restart on every push of the SAME semantic
+    // config. Generating deterministic YAML at the source matches
+    // the rest of the controller's content-addressed identity story
+    // (PolicyFingerprint, SeriesIdResolver, etc.).
+    extensions: BTreeMap<String, Value>,
+    receivers: BTreeMap<String, Value>,
+    processors: BTreeMap<String, Value>,
     /// OTel collector v0.106+ ships the `routing` component as a
     /// **connector**, not a processor (`routingprocessor` was
     /// deprecated and removed). Connectors live in their own
@@ -80,16 +89,16 @@ struct CollectorYaml {
     /// Empty for legacy single-pipeline / Mode-3 / warm-passthrough
     /// emit paths — preserved by `skip_serializing_if` so the YAML
     /// shape doesn't gain an empty `connectors: {}` block.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    connectors: HashMap<String, Value>,
-    exporters: HashMap<String, Value>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    connectors: BTreeMap<String, Value>,
+    exporters: BTreeMap<String, Value>,
     service: ServiceSection,
 }
 
 #[derive(Serialize)]
 struct ServiceSection {
     extensions: Vec<String>,
-    pipelines: HashMap<String, Pipeline>,
+    pipelines: BTreeMap<String, Pipeline>,
 }
 
 #[derive(Serialize)]
@@ -152,7 +161,7 @@ pub fn emit_edge_yaml(
     // `EdgeSketchProcessor::processor_name` (already resolved by
     // `emitter::edge_processor_name`) and the param block is built from
     // the typed `SketchParams` payload.
-    let mut processors: HashMap<String, Value> = HashMap::new();
+    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
     let mut sketch_pipeline_processors: Vec<String> = Vec::new();
     for sp in &cfg.sketch_processors {
         let block = build_edge_processor_block(
@@ -256,8 +265,8 @@ pub fn emit_edge_yaml(
     // exercised in the default deployment.)
     let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
 
-    let mut exporters: HashMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
-    let mut pipelines: HashMap<String, Pipeline> = HashMap::new();
+    let mut exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
+    let mut pipelines: BTreeMap<String, Pipeline> = BTreeMap::new();
 
     let has_prometheus_archive = !cfg.prometheus_archive_metrics.is_empty();
     let has_warm_passthrough = !cfg.warm_passthrough_metrics.is_empty();
@@ -442,7 +451,7 @@ pub fn emit_edge_yaml(
         processors,
         // Legacy emit paths don't use the routing connector — see the
         // MVP §46 dispatch at the top of `emit_edge_yaml`.
-        connectors: HashMap::new(),
+        connectors: BTreeMap::new(),
         exporters,
         service: ServiceSection {
             extensions: vec!["opamp".into()],
@@ -484,7 +493,7 @@ pub fn emit_gateway_yaml(
     // (the typed emitter today populates it as `"sketchmergeprocessor"`
     // — a placeholder until Phase C flips factory names per-family),
     // otherwise we derive the family-specific name from `sketch_kind`.
-    let mut processors: HashMap<String, Value> = HashMap::new();
+    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
     let mut pipeline_processors: Vec<String> = Vec::new();
     for mp in &cfg.merge_processors {
         let key = gateway_merge_processor_name(mp);
@@ -508,7 +517,7 @@ pub fn emit_gateway_yaml(
         receivers: [("otlp".to_string(), otlp_receiver)].into(),
         processors,
         // Gateway stage doesn't use the routing connector.
-        connectors: HashMap::new(),
+        connectors: BTreeMap::new(),
         exporters: [(exporter_key.clone(), exporter_val)].into(),
         service: ServiceSection {
             extensions: vec!["opamp".into()],
@@ -912,7 +921,7 @@ fn emit_edge_yaml_5sketch_routing(
     // can be retargeted at runtime via OpAMP without re-building, so a
     // future plan that maps a new metric to (say) HLL must work without
     // a config push that touches `processors:`.
-    let mut processors: HashMap<String, Value> = HashMap::new();
+    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
 
     // Build per-family processor blocks. We pull from
     // `cfg.sketch_processors` when an entry exists for that family
@@ -1005,7 +1014,7 @@ fn emit_edge_yaml_5sketch_routing(
     // Edge → asapquery-backend OTLP ingest (see emit_edge_yaml for the
     // gateway-less rationale).
     let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
-    let mut exporters: HashMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
+    let mut exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
 
     let has_prometheus_archive = !cfg.prometheus_archive_metrics.is_empty();
     if has_prometheus_archive {
@@ -1095,7 +1104,7 @@ fn emit_edge_yaml_5sketch_routing(
     );
     let routing_block: Value =
         serde_yaml::from_str(&routing_yaml).context("parse routing connector block (5-sketch)")?;
-    let mut connectors: HashMap<String, Value> = HashMap::new();
+    let mut connectors: BTreeMap<String, Value> = BTreeMap::new();
     connectors.insert("routing".to_string(), routing_block);
 
     // ── Pipeline assembly ──────────────────────────────────────────────────
@@ -1132,7 +1141,7 @@ fn emit_edge_yaml_5sketch_routing(
         }
     };
 
-    let mut pipelines: HashMap<String, Pipeline> = HashMap::new();
+    let mut pipelines: BTreeMap<String, Pipeline> = BTreeMap::new();
 
     // Entry pipeline — receivers: [otlp], exporters: [routing]
     // (`routing` here is the connector, used as exporter for the entry
