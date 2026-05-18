@@ -118,9 +118,10 @@ pub fn emit_for_runtime(
     cfg: &EdgeStageConfig,
     opamp_endpoint: &str,
     prometheus_url: Option<&str>,
+    agent_id: &str,
 ) -> Result<String> {
     match runtime {
-        AgentRuntime::AsapOtel => emit_edge_yaml(cfg, opamp_endpoint),
+        AgentRuntime::AsapOtel => emit_edge_yaml(cfg, opamp_endpoint, agent_id),
         AgentRuntime::AsapOtap => emit_otap_dag_yaml(cfg, opamp_endpoint, prometheus_url),
         AgentRuntime::AsapTelegraf => emit_telegraf_toml(cfg, prometheus_url),
     }
@@ -396,9 +397,16 @@ mod runtime_tests {
             metric_to_grouping_labels: std::collections::HashMap::new(),
         };
 
-        let collector = emit_for_runtime(AgentRuntime::AsapOtel, &cfg, "ws://ctrl/v1/opamp", None)
-            .expect("collector emit ok");
-        let direct = emit_edge_yaml(&cfg, "ws://ctrl/v1/opamp").expect("direct emit ok");
+        let collector = emit_for_runtime(
+            AgentRuntime::AsapOtel,
+            &cfg,
+            "ws://ctrl/v1/opamp",
+            None,
+            "test-agent",
+        )
+        .expect("collector emit ok");
+        let direct =
+            emit_edge_yaml(&cfg, "ws://ctrl/v1/opamp", "test-agent").expect("direct emit ok");
         assert_eq!(
             collector, direct,
             "AsapOtel dispatch must equal emit_edge_yaml"
@@ -422,8 +430,14 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
         };
-        let yaml = emit_for_runtime(AgentRuntime::AsapOtap, &cfg, "ws://ctrl/v1/opamp", None)
-            .expect("otap emit ok");
+        let yaml = emit_for_runtime(
+            AgentRuntime::AsapOtap,
+            &cfg,
+            "ws://ctrl/v1/opamp",
+            None,
+            "test-agent",
+        )
+        .expect("otap emit ok");
         // OTAP-specific token.
         assert!(
             yaml.contains("otel_dataflow/v1"),
@@ -448,8 +462,14 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
         };
-        let toml = emit_for_runtime(AgentRuntime::AsapTelegraf, &cfg, "ws://ctrl/v1/opamp", None)
-            .expect("telegraf emit ok");
+        let toml = emit_for_runtime(
+            AgentRuntime::AsapTelegraf,
+            &cfg,
+            "ws://ctrl/v1/opamp",
+            None,
+            "test-agent",
+        )
+        .expect("telegraf emit ok");
         // Telegraf-specific token.
         assert!(
             toml.contains("[[inputs.opentelemetry]]"),

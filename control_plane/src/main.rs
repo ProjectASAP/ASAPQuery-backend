@@ -545,7 +545,12 @@ async fn handle_plan(
                                 workload.metric_name.clone(),
                                 workload.group_by_labels.clone(),
                             );
-                            match emit::emit_edge_yaml(&edge, &st.opamp_endpoint) {
+                            // Issue #2: broadcast push — no single agent id
+                            // in scope, so emit `$AGENT_ID` placeholder and
+                            // rely on the agent container's env to expand it
+                            // at boot. Per-agent re-pushes (push_config_to_agent
+                            // / replan_metric inner loop) get the real id.
+                            match emit::emit_edge_yaml(&edge, &st.opamp_endpoint, "$AGENT_ID") {
                                 Ok(yaml) => {
                                     let hash = short_hash(&yaml);
                                     info!(
@@ -566,7 +571,8 @@ async fn handle_plan(
                             // the gateway YAML is pushed to gateway-role
                             // collectors the same way the edge YAML is
                             // pushed to agent-role collectors above.
-                            match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint) {
+                            // Issue #2: gateway broadcast — `$AGENT_ID` placeholder.
+                            match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint, "$AGENT_ID") {
                                 Ok(yaml) => {
                                     let hash = short_hash(&yaml);
                                     info!(
@@ -1151,7 +1157,13 @@ async fn emit_bootstrap_typed(
         &st.workload_store,
     );
 
-    emit_for_runtime(runtime, &edge_cfg, &st.opamp_endpoint, None)
+    // Issue #2: thread X-Agent-ID into the opamp block. Bootstrap GET
+    // is per-agent when `pinned_agent_id` is set (the agent's own
+    // X-Agent-ID header on the bootstrap request); otherwise fall back
+    // to the `$AGENT_ID` placeholder for the agent container's env to
+    // expand at boot.
+    let agent_id_for_emit = pinned_agent_id.unwrap_or("$AGENT_ID");
+    emit_for_runtime(runtime, &edge_cfg, &st.opamp_endpoint, None, agent_id_for_emit)
         .with_context(|| format!("emit_for_runtime failed for `{metric}`"))
 }
 

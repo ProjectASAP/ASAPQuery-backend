@@ -61,6 +61,11 @@ pub struct OpampEmitter {
     /// OpAMP WebSocket endpoint URL the emitted YAML's
     /// `extensions.opamp.server.ws.endpoint` block must point at.
     pub opamp_endpoint: String,
+    /// Identity the agent presents in the `X-Agent-ID` WS header on
+    /// reconnect (Issue #2). Broadcast callers without a single agent
+    /// in scope use the literal `"$AGENT_ID"` placeholder and rely on
+    /// the agent container's env to expand it at boot.
+    pub agent_id: String,
 }
 
 impl PlanEmitter for OpampEmitter {
@@ -70,7 +75,7 @@ impl PlanEmitter for OpampEmitter {
     fn name(&self) -> &'static str { "opamp_edge_yaml" }
 
     fn emit(&self, input: &EdgeStageConfig) -> Result<String> {
-        super::stage_config::emit_edge_yaml(input, &self.opamp_endpoint)
+        super::stage_config::emit_edge_yaml(input, &self.opamp_endpoint, &self.agent_id)
     }
 }
 
@@ -80,6 +85,10 @@ pub struct OpampGatewayEmitter {
     /// OpAMP WebSocket endpoint URL the emitted YAML's
     /// `extensions.opamp.server.ws.endpoint` block must point at.
     pub opamp_endpoint: String,
+    /// Identity the gateway agent presents in the `X-Agent-ID` WS
+    /// header on reconnect (Issue #2). Broadcast callers use the
+    /// literal `"$AGENT_ID"` placeholder.
+    pub agent_id: String,
 }
 
 impl PlanEmitter for OpampGatewayEmitter {
@@ -89,7 +98,7 @@ impl PlanEmitter for OpampGatewayEmitter {
     fn name(&self) -> &'static str { "opamp_gateway_yaml" }
 
     fn emit(&self, input: &GatewayStageConfig) -> Result<String> {
-        super::stage_config::emit_gateway_yaml(input, &self.opamp_endpoint)
+        super::stage_config::emit_gateway_yaml(input, &self.opamp_endpoint, &self.agent_id)
     }
 }
 
@@ -240,11 +249,13 @@ mod tests {
         let cfg = empty_edge_cfg();
         let emitter = OpampEmitter {
             opamp_endpoint: "ws://controller/v1/opamp".to_string(),
+            agent_id: "test-agent".to_string(),
         };
         let trait_out = emitter.emit(&cfg).expect("trait emit");
         let direct = super::super::stage_config::emit_edge_yaml(
             &cfg,
             "ws://controller/v1/opamp",
+            "test-agent",
         )
         .expect("direct emit");
         assert_eq!(trait_out, direct);
@@ -256,11 +267,13 @@ mod tests {
         let cfg = empty_gateway_cfg();
         let emitter = OpampGatewayEmitter {
             opamp_endpoint: "ws://controller/v1/opamp".to_string(),
+            agent_id: "test-agent".to_string(),
         };
         let trait_out = emitter.emit(&cfg).expect("trait emit");
         let direct = super::super::stage_config::emit_gateway_yaml(
             &cfg,
             "ws://controller/v1/opamp",
+            "test-agent",
         )
         .expect("direct emit");
         assert_eq!(trait_out, direct);
@@ -309,10 +322,12 @@ mod tests {
         let _edge: Box<dyn PlanEmitter<Input = EdgeStageConfig, Output = String>> =
             Box::new(OpampEmitter {
                 opamp_endpoint: "ws://x".into(),
+                agent_id: "test-agent".into(),
             });
         let _gateway: Box<dyn PlanEmitter<Input = GatewayStageConfig, Output = String>> =
             Box::new(OpampGatewayEmitter {
                 opamp_endpoint: "ws://x".into(),
+                agent_id: "test-agent".into(),
             });
         let _streaming: Box<
             dyn PlanEmitter<Input = BackendStageConfig, Output = serde_json::Value>,
