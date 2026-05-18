@@ -261,10 +261,10 @@ mod tests {
     /// vacuously true. Kept as a doc-comment anchor; no runtime test
     /// is needed.
     #[test]
-    fn aggregation_id_accessor_equals_fingerprint_u64() {
+    fn policy_fp_u64_accessor_equals_fingerprint_u64() {
         let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
         assert_eq!(
-            a.aggregation_id(),
+            a.policy_fp_u64(),
             PolicyFingerprint::from_config(&a).as_u64(),
         );
     }

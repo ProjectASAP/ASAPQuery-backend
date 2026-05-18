@@ -350,7 +350,7 @@ mod tests {
 
     fn streaming_with(cfg: AggregationConfig) -> Arc<StreamingConfig> {
         let mut m = std::collections::HashMap::new();
-        m.insert(cfg.aggregation_id(), cfg);
+        m.insert(cfg.policy_fp_u64(), cfg);
         Arc::new(StreamingConfig::new(m))
     }
 
@@ -380,7 +380,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_drains_queued_job_to_complete() {
         let cfg = sum_config(1, "latency");
-        let agg_fp = cfg.aggregation_id();
+        let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -427,7 +427,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_marks_job_failed_when_reader_factory_fails() {
         let cfg = sum_config(1, "latency");
-        let agg_fp = cfg.aggregation_id();
+        let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn service_processes_multiple_jobs_in_id_order() {
         let cfg = sum_config(1, "latency");
-        let agg_fp = cfg.aggregation_id();
+        let agg_fp = cfg.policy_fp_u64();
         let streaming = streaming_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());

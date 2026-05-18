@@ -439,14 +439,14 @@ mod tests {
 
     fn streaming_config_with(config: AggregationConfig) -> Arc<StreamingConfig> {
         let mut map = std::collections::HashMap::new();
-        map.insert(config.aggregation_id(), config);
+        map.insert(config.policy_fp_u64(), config);
         Arc::new(StreamingConfig::new(map))
     }
 
     #[tokio::test]
     async fn happy_path_writes_one_output_per_group() {
         let cfg = sum_config(1, "latency", vec!["svc"]);
-        let fp = cfg.aggregation_id();
+        let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -514,7 +514,7 @@ mod tests {
     #[tokio::test]
     async fn empty_samples_complete_without_write() {
         let cfg = sum_config(1, "m", vec![]);
-        let fp = cfg.aggregation_id();
+        let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -536,7 +536,7 @@ mod tests {
         // Exercise the full chain: BackfillWorker drives the
         // processor over a job that covers 4 windows.
         let cfg = sum_config(1, "latency", vec!["svc"]);
-        let fp = cfg.aggregation_id();
+        let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg);
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
@@ -692,7 +692,7 @@ mod tests {
     fn create_checked_rejects_end_past_created_at() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
-        let expected_fp = cfg.aggregation_id();
+        let expected_fp = cfg.policy_fp_u64();
         let created = now_ms();
         let registry = BackfillRegistry::new();
 
@@ -742,7 +742,7 @@ mod tests {
     fn create_checked_rejects_start_older_than_data_retention() {
         use super::super::CreateError;
         let cfg = sum_config(1, "m", vec![]);
-        let expected_fp = cfg.aggregation_id();
+        let expected_fp = cfg.policy_fp_u64();
         let created = now_ms();
         let registry = BackfillRegistry::new();
         // Created-at is now_ms(), so data retention of 1 hour with
@@ -846,7 +846,7 @@ mod tests {
         use crate::storage_engines::sketch_db::index::{SidLookup, SketchStore};
 
         let cfg = sum_config(1, "latency", vec!["svc"]);
-        let fp = cfg.aggregation_id();
+        let fp = cfg.policy_fp_u64();
         let streaming = streaming_config_with(cfg.clone());
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());

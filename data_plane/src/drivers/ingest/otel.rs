@@ -598,7 +598,7 @@ fn resolve_bucket_sid_for_agg_config(
     let sid = ingest_state
         .series_resolver
         .resolve(&config.metric, &fp, &agg_kind_canonical);
-    let policy_fp = asap_types::PolicyFingerprint(config.aggregation_id());
+    let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
     (sid, policy_fp)
 }
 
@@ -2874,7 +2874,7 @@ mod sid_bucketing_tests {
     ///   - each sid equals what `SeriesIdResolver::lookup` records for
     ///     `(metric, "zone=<zv>;", ExactAgg-canonical)` — i.e. the
     ///     bucket identity is folded into sid via the resolver
-    ///   - policy_fp = config.aggregation_id() on every message
+    ///   - policy_fp = config.policy_fp_u64() on every message
     ///   - samples in each bucket are exactly the DPs whose `zone`
     ///     attribute matches that bucket (the GROUP-BY semantic)
     ///
@@ -2898,9 +2898,9 @@ mod sid_bucketing_tests {
 
         let metric = "cpu_seconds";
         let cfg = sum_agg_config(metric, &["zone"]);
-        let policy_fp = asap_types::PolicyFingerprint(cfg.aggregation_id());
+        let policy_fp = asap_types::PolicyFingerprint(cfg.policy_fp_u64());
         let mut configs = HashMap::new();
-        configs.insert(cfg.aggregation_id(), cfg.clone());
+        configs.insert(cfg.policy_fp_u64(), cfg.clone());
         let streaming = StreamingConfig::new(configs);
         let hot_reload = HotReloadStreamingConfig::new(streaming);
 
@@ -2957,7 +2957,7 @@ mod sid_bucketing_tests {
 
         // Both buckets carry the same policy_fp (one source config).
         for (_, pf, _, _) in &groups {
-            assert_eq!(*pf, policy_fp, "policy_fp must equal config.aggregation_id()");
+            assert_eq!(*pf, policy_fp, "policy_fp must equal config.policy_fp_u64()");
         }
 
         // sids must be non-zero (zero is reserved on the wire) and distinct.

@@ -1285,7 +1285,7 @@ mod tests {
     ) -> AggregationConfig {
         // `_id` is unused after PR 5 — identity is content-addressed
         // via `PolicyFingerprint::from_config`. Callers below build the
-        // streaming-config map by reading `config.aggregation_id()`
+        // streaming-config map by reading `config.policy_fp_u64()`
         // from the returned value.
         let window_type = if slide_secs == 0 || slide_secs == window_secs {
             WindowType::Tumbling

@@ -105,7 +105,7 @@ pub fn create_engine_single_pop_with_aggregated(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let agg_id = agg_config.aggregation_id();
+    let agg_id = agg_config.policy_fp_u64();
     aggregation_configs.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
@@ -188,7 +188,7 @@ pub fn create_engine_dual_input(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let value_id = value_agg_config.aggregation_id();
+    let value_id = value_agg_config.policy_fp_u64();
     aggregation_configs.insert(value_id, value_agg_config);
 
     // Keys aggregation
@@ -209,7 +209,7 @@ pub fn create_engine_dual_input(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let keys_id = keys_agg_config.aggregation_id();
+    let keys_id = keys_agg_config.policy_fp_u64();
     aggregation_configs.insert(keys_id, keys_agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
@@ -282,7 +282,7 @@ pub fn create_engine_two_metrics(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let id_a = agg_config_a.aggregation_id();
+    let id_a = agg_config_a.policy_fp_u64();
     aggregation_configs.insert(id_a, agg_config_a);
 
     let agg_config_b = AggregationConfig {
@@ -302,7 +302,7 @@ pub fn create_engine_two_metrics(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let id_b = agg_config_b.aggregation_id();
+    let id_b = agg_config_b.policy_fp_u64();
     aggregation_configs.insert(id_b, agg_config_b);
 
     let streaming_config = Arc::new(StreamingConfig {
@@ -379,7 +379,7 @@ pub fn create_engine_three_metrics(
             num_aggregates_to_retain: None,
             table_name: None,
             value_column: None};
-        let id = cfg.aggregation_id();
+        let id = cfg.policy_fp_u64();
         ids.push(id);
         aggregation_configs.insert(id, cfg);
     }
@@ -439,7 +439,7 @@ pub fn create_engine_multi_timestamp(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let agg_id = agg_config.aggregation_id();
+    let agg_id = agg_config.policy_fp_u64();
     aggregation_configs.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {
@@ -493,7 +493,7 @@ pub fn create_engine_multi_timestamp_with_window(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None};
-    let agg_id = agg_config.aggregation_id();
+    let agg_id = agg_config.policy_fp_u64();
     aggregation_configs.insert(agg_id, agg_config);
 
     let streaming_config = Arc::new(StreamingConfig {

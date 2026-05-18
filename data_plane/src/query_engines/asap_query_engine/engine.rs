@@ -1722,7 +1722,7 @@ mod hot_reload_phase2_tests {
     fn cfg_with_agg(id: u64, metric: &str) -> (StreamingConfig, u64) {
         let mut map = std::collections::HashMap::new();
         let cfg = dummy_agg(id, metric);
-        let fp = cfg.aggregation_id();
+        let fp = cfg.policy_fp_u64();
         map.insert(fp, cfg);
         (StreamingConfig::new(map), fp)
     }

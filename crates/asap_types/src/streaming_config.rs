@@ -111,9 +111,9 @@ impl StreamingConfig {
                     QueryLanguage::promql,
                 )?;
                 // PR 5: the map key IS the policy-fingerprint u64.
-                // `AggregationConfig::aggregation_id()` is the canonical
+                // `AggregationConfig::policy_fp_u64()` is the canonical
                 // accessor for this value.
-                aggregation_configs.insert(config.aggregation_id(), config);
+                aggregation_configs.insert(config.policy_fp_u64(), config);
             }
         }
 
@@ -181,7 +181,7 @@ aggregations:\n\
         assert_eq!(cfg.aggregation_configs.len(), 1);
         let (k, v) = cfg.aggregation_configs.iter().next().unwrap();
         assert_ne!(*k, 0, "derived id is not the 0 sentinel");
-        assert_eq!(*k, v.aggregation_id(), "map key equals fingerprint u64");
+        assert_eq!(*k, v.policy_fp_u64(), "map key equals fingerprint u64");
         assert_eq!(v.metric, "cpu_seconds");
     }
 
