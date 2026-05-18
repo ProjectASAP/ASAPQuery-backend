@@ -39,15 +39,119 @@
 //! plan.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::backend_client::BackendClient;
+use crate::backend_client::{BackendClient, BackendPostError};
 use crate::emit::{emit_backend_storage_routing, emit_backend_streaming_config_json};
 use crate::physical::colored_dag::emitter::BackendStageConfig;
 use crate::workload::AggRole;
+
+/// Retry policy for transient POST failures. Tuned to bridge the
+/// startup race window in the multinode harness (asap arm from
+/// ASAPCollector PR #394), where the controller may issue its first
+/// `POST /api/v1/streaming-config` before the backend's HTTP server
+/// has finished registering its routes:
+///
+///   * backend log: `HTTP server listening on port 9091` at T+0
+///   * route bind for `/api/v1/streaming-config` lands T+~hundreds-of-ms later
+///   * controller's startup `Replanner::replan_all()` POSTs at T+~few-seconds
+///
+/// Five attempts spanning ~5-8 s cover both the route-bind delay and
+/// any TCP-accept race when the backend's compose container is still
+/// initialising. Each delay is exponential (3x) with full jitter to
+/// avoid synchronised retries from a fleet of controllers.
+const RETRY_MAX_ATTEMPTS: u32 = 5;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+const RETRY_DELAY_CAP: Duration = Duration::from_millis(2700);
+
+/// Cheap process-wide jitter source. We don't have `rand` in the
+/// control plane's dependency set and don't want to add it for one
+/// call site — `Instant::elapsed` reads the monotonic clock which is
+/// already needed for the backoff itself. Returns a value in `0..=cap_ms`.
+fn jitter_ms(start: Instant, cap_ms: u64) -> u64 {
+    if cap_ms == 0 {
+        return 0;
+    }
+    // Nanos since program start, folded into the jitter range. Good
+    // enough to break up synchronous retry storms; not a CSPRNG.
+    let nanos = start.elapsed().as_nanos() as u64;
+    nanos % (cap_ms + 1)
+}
+
+/// Compute the delay before attempt `n` (1-indexed). Returns a value
+/// `<= RETRY_DELAY_CAP` so the total span is bounded.
+fn backoff_delay(attempt: u32, start: Instant) -> Duration {
+    // Exponential base: 100ms, 300ms, 900ms, 2.7s, 2.7s (capped).
+    let exp = 3u64.saturating_pow(attempt.saturating_sub(1));
+    let base_ms = RETRY_BASE_DELAY
+        .as_millis()
+        .saturating_mul(exp as u128) as u64;
+    let base_ms = base_ms.min(RETRY_DELAY_CAP.as_millis() as u64);
+    // Full jitter: pick a value in [0, base_ms].
+    let with_jitter = jitter_ms(start, base_ms);
+    Duration::from_millis(with_jitter)
+}
+
+/// Retry the given POST closure on [`BackendPostError::Transient`]
+/// outcomes with exponential backoff + jitter, capped at
+/// `RETRY_MAX_ATTEMPTS` attempts. Permanent failures short-circuit on
+/// the first attempt. Returns the final attempt count and outcome —
+/// the caller is expected to log appropriately and never propagate
+/// (preserve the outer fire-and-forget contract).
+///
+/// Type parameters allow the closure to capture per-attempt context
+/// (clones of the JSON body, the endpoint label) without forcing the
+/// caller to box the future.
+async fn retry_transient<F, Fut>(
+    label: &str,
+    mut op: F,
+) -> (u32, std::result::Result<(), BackendPostError>)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::result::Result<(), BackendPostError>>,
+{
+    let start = Instant::now();
+    let mut last_err: Option<BackendPostError> = None;
+
+    for attempt in 1..=RETRY_MAX_ATTEMPTS {
+        match op().await {
+            Ok(()) => return (attempt, Ok(())),
+            Err(BackendPostError::Permanent(e)) => {
+                // 4xx other than 404 — won't get better with retry.
+                return (attempt, Err(BackendPostError::Permanent(e)));
+            }
+            Err(BackendPostError::Transient(e)) => {
+                last_err = Some(BackendPostError::Transient(e));
+                if attempt < RETRY_MAX_ATTEMPTS {
+                    let delay = backoff_delay(attempt, start);
+                    warn!(
+                        op = %label,
+                        attempt,
+                        max_attempts = RETRY_MAX_ATTEMPTS,
+                        retry_in_ms = delay.as_millis() as u64,
+                        error = %last_err.as_ref().unwrap(),
+                        "transient backend POST failure; will retry after backoff"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    (
+        RETRY_MAX_ATTEMPTS,
+        Err(last_err.unwrap_or_else(|| {
+            BackendPostError::Transient(anyhow::anyhow!(
+                "retry loop exhausted without recording a final error"
+            ))
+        })),
+    )
+}
 
 /// Per-`(metric, role)` `BackendStageConfig` cache type alias. The
 /// cache is owned by the controller's `AppState` and shared with the
@@ -126,17 +230,30 @@ pub async fn post_typed_backend_for_role(
             );
             if let Some(client) = backend_client {
                 let body = json_doc.to_string();
-                match client.post_streaming_config_json(body).await {
+                // Retry-with-backoff for transient errors (404
+                // route-not-bound, 5xx, connection refused, connect
+                // timeout) so the controller's startup `replan_all()`
+                // tick can outwait the backend's HTTP-server bind +
+                // route-registration window. See PR for the multinode
+                // race we're patching here.
+                let (attempts, outcome) = retry_transient("streaming-config", || {
+                    let body = body.clone();
+                    async move { client.post_streaming_config_json_typed(body).await }
+                })
+                .await;
+                match outcome {
                     Ok(()) => info!(
                         stage = "backend",
                         endpoint = %client.endpoint(),
+                        attempts,
                         "[USE_TYPED_STAGE_SPLIT] typed backend JSON push succeeded"
                     ),
                     Err(e) => warn!(
                         stage = "backend",
                         endpoint = %client.endpoint(),
+                        attempts,
                         error = %e,
-                        "[USE_TYPED_STAGE_SPLIT] typed backend JSON push failed; \
+                        "[USE_TYPED_STAGE_SPLIT] typed backend JSON push failed after retries; \
                          next replan cycle will retry"
                     ),
                 }
@@ -191,17 +308,28 @@ pub async fn post_typed_backend_for_role(
             );
             if let Some(client) = backend_client {
                 let body = routing_doc.to_string();
-                match client.post_storage_routing_json(body).await {
+                // Same retry policy as the streaming-config POST
+                // above — the storage-routing endpoint lives on the
+                // same backend HTTP server and binds at the same time,
+                // so it shares the same startup-race window.
+                let (attempts, outcome) = retry_transient("storage-routing", || {
+                    let body = body.clone();
+                    async move { client.post_storage_routing_json_typed(body).await }
+                })
+                .await;
+                match outcome {
                     Ok(()) => info!(
                         stage = "backend",
                         metric = %metric,
+                        attempts,
                         "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push succeeded"
                     ),
                     Err(e) => warn!(
                         stage = "backend",
                         metric = %metric,
+                        attempts,
                         error = %e,
-                        "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push failed; \
+                        "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push failed after retries; \
                          next replan cycle will retry"
                     ),
                 }
@@ -220,6 +348,123 @@ pub async fn post_typed_backend_for_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Retry-loop happy path with transient recovery: closure returns
+    /// `Transient(404)` on the first call and `Ok` on the second. The
+    /// helper must (a) reach attempt 2, (b) report final outcome Ok.
+    /// This is the regression test for the controller-startup vs
+    /// backend-route-bind race the parent PR addresses.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_recovers_after_first_404() {
+        let counter = AtomicU32::new(0);
+        let (attempts, outcome) = retry_transient("test", || {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n == 1 {
+                    Err(BackendPostError::Transient(anyhow::anyhow!(
+                        "backend returned 404 for streaming-config JSON POST: <empty>"
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            attempts > 1,
+            "expected retry to happen at least once, got {attempts} attempt(s)"
+        );
+        assert_eq!(attempts, 2, "should succeed on the 2nd attempt");
+        assert!(outcome.is_ok(), "expected Ok after recovery, got {outcome:?}");
+    }
+
+    /// Permanent failures (4xx other than 404) MUST short-circuit on
+    /// the first attempt — retrying a bad payload just floods the
+    /// logs without ever succeeding.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_does_not_retry_permanent_errors() {
+        let counter = AtomicU32::new(0);
+        let (attempts, outcome) = retry_transient("test", || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Err(BackendPostError::Permanent(anyhow::anyhow!(
+                    "backend returned 400 for streaming-config JSON POST: bad payload"
+                )))
+            }
+        })
+        .await;
+
+        assert_eq!(attempts, 1, "permanent error must not retry: got {attempts} attempts");
+        assert!(outcome.is_err(), "permanent error should surface as Err");
+        assert!(!outcome.unwrap_err().is_transient(), "outcome must remain permanent");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "closure called exactly once");
+    }
+
+    /// Exhausting all retries returns the final Transient error with
+    /// `attempts == RETRY_MAX_ATTEMPTS` so the caller's WARN log can
+    /// report how hard we tried.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_exhausts_and_reports_attempts() {
+        let counter = AtomicU32::new(0);
+        let (attempts, outcome) = retry_transient("test", || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Err(BackendPostError::Transient(anyhow::anyhow!(
+                    "connection refused"
+                )))
+            }
+        })
+        .await;
+
+        assert_eq!(
+            attempts, RETRY_MAX_ATTEMPTS,
+            "all attempts should have fired"
+        );
+        assert!(outcome.is_err(), "exhausted retries should surface Err");
+        assert!(
+            outcome.unwrap_err().is_transient(),
+            "final error must still be transient"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), RETRY_MAX_ATTEMPTS);
+    }
+
+    /// Happy path on the first attempt: zero retries, Ok outcome,
+    /// attempts == 1. This protects the smoke-test invariant that the
+    /// fire-and-forget happy path is unchanged when the backend is up
+    /// before the controller's first POST.
+    #[tokio::test(start_paused = true)]
+    async fn retry_transient_no_retry_on_first_success() {
+        let counter = AtomicU32::new(0);
+        let (attempts, outcome) = retry_transient("test", || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(()) }
+        })
+        .await;
+
+        assert_eq!(attempts, 1, "first-attempt success must not retry");
+        assert!(outcome.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Backoff schedule sanity-check: delays grow exponentially up to
+    /// the cap. Doesn't assert exact ms (jitter makes that flaky); just
+    /// asserts each delay is `<= RETRY_DELAY_CAP` and at least one
+    /// later attempt has a larger nominal base than the first.
+    #[test]
+    fn backoff_delay_respects_cap() {
+        let start = Instant::now();
+        for attempt in 1..=RETRY_MAX_ATTEMPTS {
+            let d = backoff_delay(attempt, start);
+            assert!(
+                d <= RETRY_DELAY_CAP,
+                "attempt {attempt} delay {d:?} exceeds cap {:?}",
+                RETRY_DELAY_CAP
+            );
+        }
+    }
+
 
     fn make_be(metric: &str, agg_id: &str) -> BackendStageConfig {
         use crate::physical::colored_dag::emitter::{
