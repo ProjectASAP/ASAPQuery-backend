@@ -33,6 +33,7 @@ use crate::optimizer::{cost as cost_model, rules};
 use crate::physical::stage_split;
 use crate::store::{PlanStore, WorkloadStore};
 use crate::types::QueryWorkload;
+use crate::workload::AggRole;
 
 fn short_hash(s: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -69,9 +70,13 @@ pub struct Replanner {
     /// path still works — it just skips the workload-registry archive
     /// extension and only adds the freshness probes.
     workload_registry: Option<Arc<WorkloadRegistry>>,
-    /// Maps agent_id → metric_name so violation callbacks can look up which
-    /// metric a particular agent is serving.
-    agent_to_metric: Arc<RwLock<HashMap<String, String>>>,
+    /// Maps `agent_id → Vec<(metric_name, role)>` so violation callbacks
+    /// can look up which `(metric, role)` pairs a particular agent is
+    /// serving. **B2 restructure**: one agent can serve multiple
+    /// `(metric, role)` pairs (e.g. an agent handling all three of
+    /// `http_requests_total`'s roles registered by `mvp-workload.yaml`
+    /// entries 2/3/4). The vector preserves insertion order.
+    agent_to_metrics: Arc<RwLock<HashMap<String, Vec<(String, AggRole)>>>>,
 }
 
 impl Replanner {
@@ -92,7 +97,7 @@ impl Replanner {
             opamp_endpoint: opamp_endpoint.into(),
             backend_client: None,
             workload_registry: None,
-            agent_to_metric: Arc::new(RwLock::new(HashMap::new())),
+            agent_to_metrics: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -119,25 +124,40 @@ impl Replanner {
 
     // ── Agent registry ────────────────────────────────────────────────────────
 
-    /// Record that `agent_id` is serving `metric`. Called from `handle_plan`
-    /// after pushing configs so violations can be mapped back to a metric.
-    pub async fn register_agent(&self, agent_id: impl Into<String>, metric: impl Into<String>) {
-        self.agent_to_metric
-            .write()
-            .await
-            .insert(agent_id.into(), metric.into());
+    /// Record that `agent_id` is serving `(metric, role)`. Called from
+    /// `handle_plan` after pushing configs so violations can be mapped
+    /// back. Idempotent: re-registering the same `(metric, role)` for
+    /// the same agent leaves the vector unchanged (dedup).
+    ///
+    /// **B2 contract**: an agent may serve MULTIPLE `(metric, role)`
+    /// pairs concurrently (the controller may push a single agent the
+    /// edge YAML for every role of every metric it owns). Each call
+    /// appends a new pair if not already present; the inverse
+    /// [`unregister_agent`] drops all of them at once.
+    pub async fn register_agent(
+        &self,
+        agent_id: impl Into<String>,
+        metric: impl Into<String>,
+        role: AggRole,
+    ) {
+        let key = (metric.into(), role);
+        let mut map = self.agent_to_metrics.write().await;
+        let entry = map.entry(agent_id.into()).or_default();
+        if !entry.contains(&key) {
+            entry.push(key);
+        }
     }
 
-    /// Remove the mapping for a disconnected agent.
+    /// Remove every `(metric, role)` mapping for a disconnected agent.
     pub async fn unregister_agent(&self, agent_id: &str) {
-        self.agent_to_metric.write().await.remove(agent_id);
+        self.agent_to_metrics.write().await.remove(agent_id);
     }
 
-    /// Returns a read-only reference to the agent→metric mapping so that
-    /// callers (e.g. the on_connect callback) can check if an agent has a
-    /// prior assignment.
-    pub fn agent_to_metric(&self) -> &Arc<RwLock<HashMap<String, String>>> {
-        &self.agent_to_metric
+    /// Returns a read-only reference to the agent→`(metric, role)` list
+    /// mapping so callers (e.g. the on_connect callback) can check if an
+    /// agent has a prior assignment.
+    pub fn agent_to_metrics(&self) -> &Arc<RwLock<HashMap<String, Vec<(String, AggRole)>>>> {
+        &self.agent_to_metrics
     }
 
     // ── Config push helpers ──────────────────────────────────────────────────
@@ -164,8 +184,13 @@ impl Replanner {
     /// request (workload missing from store, `bind_workload_typed`
     /// declines the shape, no `Edge` entry, emit failure) — caller
     /// then falls back to the legacy emitter.
-    fn try_emit_typed_edge_yaml(&self, metric: &str, agent_id: &str) -> Option<String> {
-        let (workload, _wc) = self.workload_store.get(metric)?;
+    fn try_emit_typed_edge_yaml(
+        &self,
+        metric: &str,
+        role: AggRole,
+        agent_id: &str,
+    ) -> Option<String> {
+        let (workload, _wc) = self.workload_store.get(metric, role)?;
         self.try_emit_typed_edge_yaml_for_workload(&workload, agent_id)
     }
 
@@ -255,32 +280,43 @@ impl Replanner {
     /// the OpAMP-on-connect side of the typed emit so reconnecting
     /// agents receive the same routed YAML as fresh-connect agents.
     pub async fn push_config_to_agent(&self, agent_id: &str) -> bool {
-        let metric = self.agent_to_metric.read().await.get(agent_id).cloned();
-        let Some(metric) = metric else { return false };
+        // B2: an agent may serve multiple `(metric, role)` pairs. Push
+        // the config for the FIRST pair on connect — same shape as the
+        // pre-B2 single-mapping path. (The 5-sketch routing-connector
+        // edge YAML, once `metric_to_family` is populated by
+        // `collect_metric_to_family`, carries pipelines for every
+        // metric+role anyway, so a single push covers all of them.)
+        let pair = self
+            .agent_to_metrics
+            .read()
+            .await
+            .get(agent_id)
+            .and_then(|v| v.first().cloned());
+        let Some((metric, role)) = pair else { return false };
 
-        let Ok(plan) = self.plan_store.get(&metric) else {
+        let Ok(plan) = self.plan_store.get(&metric, role) else {
             return false;
         };
 
         let yaml = if stage_split::typed_stage_split_enabled() {
-            match self.try_emit_typed_edge_yaml(&metric, agent_id) {
+            match self.try_emit_typed_edge_yaml(&metric, role, agent_id) {
                 Some(y) => {
                     info!(
-                        agent = agent_id, metric = %metric, bytes = y.len(),
+                        agent = agent_id, metric = %metric, role = %role, bytes = y.len(),
                         "[USE_TYPED_STAGE_SPLIT] pushed typed edge YAML on connect"
                     );
                     y
                 }
                 None => {
                     warn!(
-                        agent = agent_id, metric = %metric,
+                        agent = agent_id, metric = %metric, role = %role,
                         "[USE_TYPED_STAGE_SPLIT] typed emit failed on connect; \
                          falling back to legacy generate_agent_collector_config"
                     );
                     match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint) {
                         Ok(y) => y,
                         Err(_) => {
-                            warn!(agent = agent_id, metric = %metric, "failed to generate agent config on connect");
+                            warn!(agent = agent_id, metric = %metric, role = %role, "failed to generate agent config on connect");
                             return false;
                         }
                     }
@@ -290,7 +326,7 @@ impl Replanner {
             match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint) {
                 Ok(y) => y,
                 Err(_) => {
-                    warn!(agent = agent_id, metric = %metric, "failed to generate agent config on connect");
+                    warn!(agent = agent_id, metric = %metric, role = %role, "failed to generate agent config on connect");
                     return false;
                 }
             }
@@ -305,21 +341,44 @@ impl Replanner {
                 },
             )
             .await;
-        info!(agent = agent_id, metric = %metric, "pushed config to reconnecting agent");
+        info!(agent = agent_id, metric = %metric, role = %role, "pushed config to reconnecting agent");
         true
     }
 
     // ── Re-plan helpers ───────────────────────────────────────────────────────
 
-    /// Re-plans a single metric and pushes updated configs.
-    /// Returns `true` if re-planning succeeded, `false` if the metric is unknown.
+    /// Re-plans every role registered for `metric` and pushes updated
+    /// configs. Returns `true` if at least one role was re-planned,
+    /// `false` if the metric has no roles registered at all.
+    ///
+    /// **B2 wrapper**: a single metric may carry multiple `(metric, role)`
+    /// pairs; this function loops over them and delegates per-role to
+    /// [`Self::replan_metric_role`]. Callers that only want to re-plan
+    /// a single role should call `replan_metric_role` directly.
     pub async fn replan_metric(&self, metric: &str) -> bool {
-        let Some((workload, wc)) = self.workload_store.get(metric) else {
+        let pairs = self.workload_store.get_all_for_metric(metric);
+        if pairs.is_empty() {
             warn!(metric, "replan requested but workload not found in store");
+            return false;
+        }
+        let mut any = false;
+        for (role, _, _) in pairs {
+            if self.replan_metric_role(metric, role).await {
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Re-plans a single `(metric, role)` pair and pushes updated configs.
+    /// Returns `true` on success, `false` if the pair is unknown.
+    pub async fn replan_metric_role(&self, metric: &str, role: AggRole) -> bool {
+        let Some((workload, wc)) = self.workload_store.get(metric, role) else {
+            warn!(metric, role = %role, "replan requested but workload not found in store");
             return false;
         };
 
-        info!(metric, "re-planning metric");
+        info!(metric, role = %role, "re-planning metric+role");
 
         // Reset the baseline so the cost model runs fresh rather than returning the
         // previously established baseline — the whole point of a re-plan is to
@@ -327,21 +386,23 @@ impl Replanner {
         self.planner.reset(metric);
         let mut plan = self.planner.plan(&workload, Some(&wc));
         plan.precompute = build_precompute_engine_jobs(&workload, "backend:4317");
-        self.plan_store.set(metric, plan.clone());
+        self.plan_store.set(metric, role, plan.clone());
 
-        // Push agent config only to agents registered for this specific metric,
-        // rather than broadcasting to all agent-role collectors. Same gate
-        // as `push_config_to_agent` — typed path on, legacy fallback on
-        // emit failure or when the gate is off.
+        // Push agent config only to agents registered for this specific
+        // `(metric, role)` pair, rather than broadcasting to all
+        // agent-role collectors. Same gate as `push_config_to_agent`
+        // — typed path on, legacy fallback on emit failure or when the
+        // gate is off.
         //
         // Issue #2: emit per-agent inside the push loop so each agent's
         // opamp `X-Agent-ID` header carries its actual id (the agent
         // re-presents this header after the controller-pushed config
         // triggers a Docker restart).
-        let agents = self.agent_to_metric.read().await;
+        let key = (metric.to_string(), role);
+        let agents = self.agent_to_metrics.read().await;
         let target_agents: Vec<String> = agents
             .iter()
-            .filter(|(_, m)| m.as_str() == metric)
+            .filter(|(_, pairs)| pairs.contains(&key))
             .map(|(id, _)| id.clone())
             .collect();
         drop(agents);
@@ -418,34 +479,41 @@ impl Replanner {
         true
     }
 
-    /// Re-plans all metrics whose `valid_until` has already passed.
+    /// Re-plans every `(metric, role)` pair whose `valid_until` has
+    /// already passed.
     pub async fn replan_expired(&self) {
         let expired = self.plan_store.expired(chrono::Utc::now());
         if expired.is_empty() {
             return;
         }
-        info!(count = expired.len(), "re-planning expired metrics");
-        for metric in expired {
-            self.replan_metric(&metric).await;
+        info!(count = expired.len(), "re-planning expired (metric, role) pairs");
+        for (metric, role) in expired {
+            self.replan_metric_role(&metric, role).await;
         }
     }
 
-    /// Called from the violation callback. Looks up the metric served by
-    /// `agent_id` and triggers an immediate re-plan.
+    /// Called from the violation callback. Looks up the `(metric, role)`
+    /// pairs served by `agent_id` and triggers an immediate re-plan of
+    /// each one.
     pub async fn handle_violation(&self, agent_id: &str) {
-        let metric = self.agent_to_metric.read().await.get(agent_id).cloned();
-        match metric {
-            Some(m) => {
-                info!(agent = agent_id, metric = %m, "SLA violation → triggering re-plan");
-                self.replan_metric(&m).await;
-            }
-            None => {
-                warn!(
-                    agent = agent_id,
-                    "SLA violation but no metric mapping found; re-planning all expired"
-                );
-                self.replan_expired().await;
-            }
+        let pairs = self
+            .agent_to_metrics
+            .read()
+            .await
+            .get(agent_id)
+            .cloned()
+            .unwrap_or_default();
+        if pairs.is_empty() {
+            warn!(
+                agent = agent_id,
+                "SLA violation but no (metric, role) mapping found; re-planning all expired"
+            );
+            self.replan_expired().await;
+            return;
+        }
+        for (metric, role) in pairs {
+            info!(agent = agent_id, metric = %metric, role = %role, "SLA violation → triggering re-plan");
+            self.replan_metric_role(&metric, role).await;
         }
     }
 
@@ -554,13 +622,13 @@ mod tests {
     async fn replan_known_metric_updates_plan_store() {
         let r = make_replanner();
         let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", wl, wc);
-        r.plan_store.set("latency", make_plan());
+        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         let ok = r.replan_metric("latency").await;
         assert!(ok);
         // Plan store should now have a new entry (valid_until in the future).
-        let updated = r.plan_store.get("latency").unwrap();
+        let updated = r.plan_store.get("latency", AggRole::Quantile).unwrap();
         assert!(updated.valid_until > Utc::now());
     }
 
@@ -568,22 +636,22 @@ mod tests {
     async fn replan_expired_replans_only_expired() {
         let r = make_replanner();
         let (wl, wc) = test_workload("old");
-        r.workload_store.set("old", wl, wc);
+        r.workload_store.set("old", AggRole::Quantile, wl, wc);
 
         // Insert an already-expired plan.
         let mut expired_plan = make_plan();
         expired_plan.valid_until = Utc::now() - chrono::Duration::seconds(60);
-        r.plan_store.set("old", expired_plan);
+        r.plan_store.set("old", AggRole::Quantile, expired_plan);
 
         // Insert a still-active plan for "active".
         let (awl, awc) = test_workload("active");
-        r.workload_store.set("active", awl, awc);
-        r.plan_store.set("active", make_plan());
+        r.workload_store.set("active", AggRole::Quantile, awl, awc);
+        r.plan_store.set("active", AggRole::Quantile, make_plan());
 
         r.replan_expired().await;
 
         // "old" should now have a freshly computed plan.
-        let old_plan = r.plan_store.get("old").unwrap();
+        let old_plan = r.plan_store.get("old", AggRole::Quantile).unwrap();
         assert!(old_plan.valid_until > Utc::now());
     }
 
@@ -591,23 +659,127 @@ mod tests {
     async fn register_then_violation_replans_correct_metric() {
         let r = make_replanner();
         let (wl, wc) = test_workload("req_rate");
-        r.workload_store.set("req_rate", wl, wc);
-        r.plan_store.set("req_rate", make_plan());
+        r.workload_store
+            .set("req_rate", AggRole::Quantile, wl, wc);
+        r.plan_store.set("req_rate", AggRole::Quantile, make_plan());
 
-        r.register_agent("agent-1", "req_rate").await;
+        r.register_agent("agent-1", "req_rate", AggRole::Quantile).await;
         r.handle_violation("agent-1").await;
 
         // Plan should have been refreshed.
-        assert!(r.plan_store.get("req_rate").is_ok());
+        assert!(r.plan_store.get("req_rate", AggRole::Quantile).is_ok());
     }
 
     #[tokio::test]
     async fn unregister_removes_mapping() {
         let r = make_replanner();
-        r.register_agent("a1", "m").await;
+        r.register_agent("a1", "m", AggRole::Quantile).await;
         r.unregister_agent("a1").await;
         // After unregister, handle_violation falls back to replan_expired (no-op).
         r.handle_violation("a1").await; // should not panic
+    }
+
+    // ── B2 multi-role regression tests ────────────────────────────────────────
+
+    /// A metric with two different `(metric, role)` registrations
+    /// keeps both plans live after replan. Pre-B2 the store collapsed
+    /// them onto one key and the second replan would overwrite the
+    /// first; this regression test pins the new contract.
+    #[tokio::test]
+    async fn replan_multi_role_metric_updates_both_plans() {
+        let r = make_replanner();
+        let (wl_q, wc_q) = test_workload("http_requests_total");
+        let mut wl_s = wl_q.clone();
+        wl_s.aggregations = vec![AggType::Quantile]; // analyzer-shaped (test fixture)
+        let wc_s = wc_q.clone();
+
+        r.workload_store
+            .set("http_requests_total", AggRole::Quantile, wl_q, wc_q);
+        r.workload_store
+            .set("http_requests_total", AggRole::Sum, wl_s, wc_s);
+        r.plan_store
+            .set("http_requests_total", AggRole::Quantile, make_plan());
+        r.plan_store
+            .set("http_requests_total", AggRole::Sum, make_plan());
+
+        // `replan_metric` is the wrapper that loops over every role
+        // registered for the metric.
+        let ok = r.replan_metric("http_requests_total").await;
+        assert!(ok, "wrapper replan_metric should succeed for ≥1 role");
+
+        // Both roles' plans persist independently.
+        assert!(r
+            .plan_store
+            .get("http_requests_total", AggRole::Quantile)
+            .is_ok());
+        assert!(r.plan_store.get("http_requests_total", AggRole::Sum).is_ok());
+    }
+
+    /// Targeted single-role replan via [`Replanner::replan_metric_role`]
+    /// only touches the specified role's plan and leaves the other
+    /// role's plan unchanged.
+    #[tokio::test]
+    async fn replan_metric_role_only_touches_target_role() {
+        let r = make_replanner();
+        let (wl, wc) = test_workload("m");
+        r.workload_store
+            .set("m", AggRole::Quantile, wl.clone(), wc.clone());
+        r.workload_store.set("m", AggRole::Sum, wl, wc);
+
+        // Make the Sum-role plan expired and Quantile plan fresh.
+        let mut sum_plan = make_plan();
+        sum_plan.valid_until = Utc::now() - chrono::Duration::seconds(60);
+        r.plan_store.set("m", AggRole::Sum, sum_plan);
+        let fresh = make_plan();
+        let fresh_ts = fresh.valid_until;
+        r.plan_store.set("m", AggRole::Quantile, fresh);
+
+        let ok = r.replan_metric_role("m", AggRole::Sum).await;
+        assert!(ok);
+
+        // The Quantile plan stays untouched (same valid_until as
+        // before the replan).
+        let q = r.plan_store.get("m", AggRole::Quantile).unwrap();
+        assert_eq!(q.valid_until, fresh_ts);
+        // Sum has been re-planned (new valid_until in the future).
+        let s = r.plan_store.get("m", AggRole::Sum).unwrap();
+        assert!(s.valid_until > Utc::now());
+    }
+
+    /// One agent serving multiple `(metric, role)` pairs receives a
+    /// re-plan for every one of them on violation.
+    #[tokio::test]
+    async fn agent_serving_multiple_roles_triggers_per_role_replan() {
+        let r = make_replanner();
+        let (wl, wc) = test_workload("m");
+        r.workload_store
+            .set("m", AggRole::Quantile, wl.clone(), wc.clone());
+        r.workload_store.set("m", AggRole::Sum, wl, wc);
+        r.plan_store.set("m", AggRole::Quantile, make_plan());
+        r.plan_store.set("m", AggRole::Sum, make_plan());
+
+        // One agent serves both roles.
+        r.register_agent("agent-1", "m", AggRole::Quantile).await;
+        r.register_agent("agent-1", "m", AggRole::Sum).await;
+
+        // Sanity: agent_to_metrics() carries both pairs in order.
+        let pairs = r
+            .agent_to_metrics()
+            .read()
+            .await
+            .get("agent-1")
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("m".to_string(), AggRole::Quantile),
+                ("m".to_string(), AggRole::Sum)
+            ]
+        );
+
+        // Handle violation — both roles should re-plan without panic.
+        r.handle_violation("agent-1").await;
     }
 
     // ── Typed-emit path tests ─────────────────────────────────────────────────
@@ -662,11 +834,11 @@ mod tests {
 
         let r = make_replanner();
         let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", wl, wc);
-        r.plan_store.set("latency", make_plan());
+        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         let yaml = r
-            .try_emit_typed_edge_yaml("latency", "test-agent")
+            .try_emit_typed_edge_yaml("latency", AggRole::Quantile, "test-agent")
             .expect("typed emit should succeed for a quantile workload");
 
         // gorillas3 — archive-tier write to MinIO. Without this the
@@ -717,12 +889,12 @@ mod tests {
 
         let r = make_replanner();
         let (wl, wc) = test_workload("latency");
-        r.workload_store.set("latency", wl, wc);
-        r.plan_store.set("latency", make_plan());
+        r.workload_store.set("latency", AggRole::Quantile, wl, wc);
+        r.plan_store.set("latency", AggRole::Quantile, make_plan());
 
         // Drive the legacy emitter directly — same code
         // `push_config_to_agent` runs when the gate is off.
-        let plan = r.plan_store.get("latency").unwrap();
+        let plan = r.plan_store.get("latency", AggRole::Quantile).unwrap();
         let yaml = generate_agent_collector_config(&plan.agent_config, &r.opamp_endpoint)
             .expect("legacy emit should succeed");
 

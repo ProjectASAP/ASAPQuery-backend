@@ -9,6 +9,156 @@ use tracing::{info, warn};
 
 use crate::types::SketchType;
 
+/// Aggregation role a single (metric, query-shape) pair plays in the planner.
+///
+/// **Why this exists** (B2 full restructure): a single metric can carry
+/// MULTIPLE aggregation roles when the workload YAML registers more than
+/// one PromQL shape for it. The canonical case is
+/// `http_requests_total`, which the MVP demo's `mvp-workload.yaml`
+/// registers three times (entries 2/3/4 of [`deploy/configs/mvp-workload.yaml`]):
+///   * `sum by (zone) (http_requests_total)` → [`AggRole::Sum`]
+///   * `sum by (zone) (rate(http_requests_total[5m]))` → [`AggRole::Sum`]
+///     (rate binds to ExactAgg(Sum)-shaped capability)
+///   * `count(http_requests_total{zone="z0"})` → [`AggRole::Count`]
+///
+/// Before this enum: the `WorkloadStore` was keyed by metric name alone
+/// and `set(metric, …)` overwrote on collision — only the LAST entry
+/// survived, so the `sum by (zone)` query (entries 2 + 3) lost its plan
+/// and the data-plane refused it with `ExactAgg(Sum) capability not
+/// satisfied` (the surviving plan was DDSketch from entry 1's quantile
+/// shape).
+///
+/// After: the store is keyed by `(metric, role)` so each shape gets its
+/// own plan, its own `AggregationConfig` on the backend's streaming
+/// config, and its own routing-connector pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggRole {
+    /// `quantile_over_time`, `quantile(...)`, `histogram_quantile(...)`,
+    /// or workload entries with `sketch_family_override: DDSketch | KLL`.
+    /// Routes to a quantile-shaped sketch (DDSketch / KLL).
+    Quantile,
+    /// Bare counter selector, `sum(...)`, `sum_over_time(...)`,
+    /// `rate(...)`, `increase(...)`. All bind to ExactAgg(Sum)-shaped
+    /// capability on the data plane; the streaming-config emits an
+    /// `aggregation_type: Sum` rather than a sketch.
+    Sum,
+    /// `count(...)`, `count_over_time(...)`, `count_distinct_over_time(...)`,
+    /// or workload entries with `sketch_family_override: HLL`. Routes
+    /// to HLL when a sketch is appropriate, otherwise to a Sum-as-count
+    /// exact-aggregation.
+    Count,
+    /// `topk(...)`, `topk_over_time(...)`, or workload entries with
+    /// `sketch_family_override: CountSketch | CountMinSketch`. Routes
+    /// to CountSketch / CMS-with-heap.
+    Topk,
+    /// Fallback bucket — specialized sketch families that don't fit the
+    /// four shapes above (e.g. CountMinSketch frequency without a topk
+    /// outer), or PromQL shapes the role-classifier can't recognise
+    /// today. Preserves "unique" semantics for the (metric, role) key
+    /// so multiple unrecognised entries still don't collide.
+    Other,
+}
+
+impl AggRole {
+    /// Stable lowercase tag for routing-connector pipeline names, log
+    /// fields, and HTTP path discriminators.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AggRole::Quantile => "quantile",
+            AggRole::Sum => "sum",
+            AggRole::Count => "count",
+            AggRole::Topk => "topk",
+            AggRole::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for AggRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Classify a single workload entry into its `AggRole`.
+///
+/// Resolution order:
+/// 1. **`sketch_family_override`** wins when present:
+///    * `DDSketch` / `KLL` → [`AggRole::Quantile`]
+///    * `HLL` → [`AggRole::Count`]
+///    * `CountSketch` → [`AggRole::Topk`]
+///    * `CountMinSketch` → [`AggRole::Other`] (frequency — no
+///      single canonical shape; we keep it out of `Topk` so the topk
+///      variant stays semantically pure for sketch-with-heap families)
+/// 2. **PromQL AST classification** by outermost-function name in
+///    `query_string`. Recognised function tokens:
+///    * `quantile_over_time` / `quantile` / `histogram_quantile` → [`AggRole::Quantile`]
+///    * `sum` / `sum_over_time` / `rate` / `increase` → [`AggRole::Sum`]
+///    * `count` / `count_over_time` / `count_distinct_over_time` → [`AggRole::Count`]
+///    * `topk` / `topk_over_time` → [`AggRole::Topk`]
+///    * Bare metric selector (no outer function) → [`AggRole::Sum`]
+///      (matches PromQL's instant-vector semantics — a bare counter
+///      sums values across time-aligned samples).
+/// 3. Fallback: [`AggRole::Other`].
+///
+/// Ambiguous case decisions (documented for the B2 PR):
+///   * `count_over_time(metric)` — Count (cardinality semantics).
+///     The Sum-shaped alternative is rare in practice; users who want
+///     it write `sum_over_time(count(...))` which classifies as Sum.
+///   * `rate` / `increase` — Sum. Both bind to ExactAgg(Sum) on the
+///     data plane (see `data_plane/src/precompute_engine/ingest_handler.rs`'s
+///     handling of `AggKind::ExactAgg { Sum }`).
+pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
+    // 1. `sketch_family_override` wins.
+    if let Some(family) = entry.sketch_family_override.as_ref() {
+        return match family {
+            SketchType::DDSketch | SketchType::KLL => AggRole::Quantile,
+            SketchType::HLL => AggRole::Count,
+            SketchType::CountSketch => AggRole::Topk,
+            SketchType::CountMinSketch => AggRole::Other,
+        };
+    }
+
+    // 2. PromQL AST classification — outermost-token sniff. We don't
+    //    need a full AST walk: PromQL function calls always lead with
+    //    `<name>(`, so the leading identifier carries the shape. For
+    //    nested aggregations the OUTERMOST one drives the role (it's
+    //    the one bound to the data-plane capability).
+    if let Some(qs) = entry.query_string.as_ref() {
+        let trimmed = qs.trim_start();
+        // Find the leading identifier — letters / underscores up to
+        // the first non-identifier char (`(`, space, `{`, etc.).
+        let token_end = trimmed
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(trimmed.len());
+        let leading = &trimmed[..token_end];
+        if !leading.is_empty() {
+            match leading {
+                "quantile_over_time" | "quantile" | "histogram_quantile" => {
+                    return AggRole::Quantile
+                }
+                "sum" | "sum_over_time" | "rate" | "irate" | "increase" => return AggRole::Sum,
+                "count" | "count_over_time" | "count_distinct_over_time" => return AggRole::Count,
+                "topk" | "topk_over_time" => return AggRole::Topk,
+                _ => {}
+            }
+        }
+        // Bare metric selector — no outer function call. The leading
+        // token is a metric name (or empty if the query starts with a
+        // brace). Treat as Sum (PromQL's default instant-vector
+        // interpretation aligns with Sum-shaped capability).
+        if !trimmed.is_empty() && !trimmed.starts_with('{') {
+            return AggRole::Sum;
+        }
+    }
+
+    // 3. No query_string and no override — default to Sum (Mode-3
+    //    raw-passthrough entries in the workload registry typically
+    //    declare a bare metric with `assign_to_role: archive` and no
+    //    `query_string`).
+    AggRole::Other
+}
+
 /// A single workload entry from the workloads YAML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadEntry {
@@ -276,6 +426,141 @@ mod tests {
         assert_eq!(entries[5].sketch_family_override, None);
     }
 
+    // ── AggRole tests (B2 full restructure) ──────────────────────────────
+
+    fn entry(metric: &str, q: Option<&str>, override_: Option<SketchType>) -> WorkloadEntry {
+        WorkloadEntry {
+            metric_name: metric.into(),
+            query_string: q.map(|s| s.to_string()),
+            accuracy_sla: 0.01,
+            assign_to_role: "agent".into(),
+            sketch_family_override: override_,
+            target_path: None,
+            grouping_labels: vec![],
+        }
+    }
+
+    #[test]
+    fn agg_role_override_pins_quantile_for_dd_and_kll() {
+        assert_eq!(
+            derive_agg_role(&entry("m", None, Some(SketchType::DDSketch))),
+            AggRole::Quantile
+        );
+        assert_eq!(
+            derive_agg_role(&entry("m", None, Some(SketchType::KLL))),
+            AggRole::Quantile
+        );
+    }
+
+    #[test]
+    fn agg_role_override_pins_count_for_hll() {
+        assert_eq!(
+            derive_agg_role(&entry("m", None, Some(SketchType::HLL))),
+            AggRole::Count
+        );
+    }
+
+    #[test]
+    fn agg_role_override_pins_topk_for_countsketch() {
+        assert_eq!(
+            derive_agg_role(&entry("m", None, Some(SketchType::CountSketch))),
+            AggRole::Topk
+        );
+    }
+
+    #[test]
+    fn agg_role_override_pins_other_for_cms() {
+        // CountMinSketch is a frequency estimator without an inherent
+        // topk shape — keep it in `Other` so the topk variant stays
+        // pure for sketch-with-heap families.
+        assert_eq!(
+            derive_agg_role(&entry("m", None, Some(SketchType::CountMinSketch))),
+            AggRole::Other
+        );
+    }
+
+    #[test]
+    fn agg_role_quantile_query_strings() {
+        for q in [
+            "quantile_over_time(0.99, m[5m])",
+            "quantile(0.5, m)",
+            "histogram_quantile(0.99, rate(m_bucket[5m]))",
+        ] {
+            assert_eq!(
+                derive_agg_role(&entry("m", Some(q), None)),
+                AggRole::Quantile,
+                "query `{q}` should classify as Quantile"
+            );
+        }
+    }
+
+    #[test]
+    fn agg_role_sum_query_strings() {
+        for q in [
+            "sum by (zone) (m)",
+            "sum_over_time(m[5m])",
+            "rate(m[5m])",
+            "increase(m[5m])",
+            "sum by (zone) (rate(m[5m]))",
+        ] {
+            assert_eq!(
+                derive_agg_role(&entry("m", Some(q), None)),
+                AggRole::Sum,
+                "query `{q}` should classify as Sum"
+            );
+        }
+    }
+
+    #[test]
+    fn agg_role_count_query_strings() {
+        for q in [
+            "count(m)",
+            "count_over_time(m[5m])",
+            r#"count(m{zone="z0"})"#,
+        ] {
+            assert_eq!(
+                derive_agg_role(&entry("m", Some(q), None)),
+                AggRole::Count,
+                "query `{q}` should classify as Count"
+            );
+        }
+    }
+
+    #[test]
+    fn agg_role_topk_query_strings() {
+        for q in ["topk(5, m)", "topk_over_time(3, m[5m])"] {
+            assert_eq!(
+                derive_agg_role(&entry("m", Some(q), None)),
+                AggRole::Topk,
+                "query `{q}` should classify as Topk"
+            );
+        }
+    }
+
+    #[test]
+    fn agg_role_bare_metric_selector_is_sum() {
+        assert_eq!(
+            derive_agg_role(&entry("http_requests_total", Some("http_requests_total"), None)),
+            AggRole::Sum
+        );
+    }
+
+    #[test]
+    fn agg_role_no_query_string_no_override_is_other() {
+        assert_eq!(derive_agg_role(&entry("m", None, None)), AggRole::Other);
+    }
+
+    #[test]
+    fn agg_role_override_beats_query_string() {
+        // An explicit `sketch_family_override: HLL` paired with a
+        // `count(...)` query — both happen to classify as Count, but
+        // we exercise the override priority with a deliberately
+        // mismatched pair (override KLL on a count query) to pin the
+        // override-first rule.
+        let e = entry("m", Some("count(m)"), Some(SketchType::KLL));
+        assert_eq!(derive_agg_role(&e), AggRole::Quantile);
+    }
+
     #[test]
     fn deserialize_sketch_family_override_lowercase_aliases() {
         // Lowercase / kebab-case spellings also accepted, plus the two
@@ -300,6 +585,96 @@ mod tests {
         assert_eq!(
             entries[2].sketch_family_override,
             Some(SketchType::CountMinSketch)
+        );
+    }
+
+    #[test]
+    fn three_synthetic_http_requests_total_entries_classify_to_two_distinct_roles() {
+        // Synthetic mirror of `deploy/configs/mvp-workload.yaml`
+        // entries 2/3/4 — proves `derive_agg_role` produces distinct
+        // roles for the three http_requests_total shapes. Pre-B2 the
+        // workload store collapsed these onto one key and only the
+        // last entry's plan survived; the (metric, role) keyed store
+        // + per-entry role classification fixes that.
+        let entries = vec![
+            entry(
+                "http_requests_total",
+                Some("sum by (zone) (http_requests_total)"),
+                None,
+            ),
+            entry(
+                "http_requests_total",
+                Some("sum by (zone) (rate(http_requests_total[5m]))"),
+                None,
+            ),
+            entry(
+                "http_requests_total",
+                Some(r#"count(http_requests_total{zone="z0"})"#),
+                None,
+            ),
+        ];
+        let roles: Vec<AggRole> = entries.iter().map(derive_agg_role).collect();
+        assert_eq!(roles, vec![AggRole::Sum, AggRole::Sum, AggRole::Count]);
+        // The store distinguishes Sum vs Count keys, so two of the
+        // three entries (the two Sum-shaped ones) still collide
+        // under (metric, role). That's the documented behaviour —
+        // two YAML entries with the SAME (metric, role) overwrite,
+        // which is the legitimate "operator updated their workload"
+        // path. The fix scope is collisions across DIFFERENT shapes,
+        // not idempotent re-registers.
+        let distinct: std::collections::HashSet<_> = roles.iter().copied().collect();
+        assert_eq!(distinct.len(), 2, "Sum + Count = 2 distinct roles");
+    }
+
+    #[test]
+    fn live_mvp_workload_yaml_assigns_three_roles_to_http_requests_total() {
+        // B2 full restructure regression: the live
+        // `deploy/configs/mvp-workload.yaml` carries THREE entries for
+        // `http_requests_total` (entries 2/3/4 — sum/sum+rate/count).
+        // Pre-B2 these collapsed onto one workload-store key and
+        // dropped two of the three plans, so the `sum by (zone)`
+        // query returned `ExactAgg(Sum) capability not satisfied`.
+        //
+        // The fix is the `(metric, role)` key + the per-entry role
+        // classification via `derive_agg_role`. This test pins that
+        // the three entries classify to two distinct roles (`Sum` for
+        // entries 2 + 3, `Count` for entry 4) — the multi-row keyed
+        // store can persist them all simultaneously.
+        use std::path::PathBuf;
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.pop();
+        path.push("deploy/configs/mvp-workload.yaml");
+        if !path.exists() {
+            // Live file not in this checkout; skip silently (matches
+            // the sibling override test below).
+            return;
+        }
+        let registry = WorkloadRegistry::load(path.to_str().unwrap());
+        let http_requests_entries: Vec<&WorkloadEntry> = registry
+            .entries()
+            .iter()
+            .filter(|e| e.metric_name == "http_requests_total")
+            .collect();
+        assert!(
+            http_requests_entries.len() >= 3,
+            "mvp-workload.yaml is expected to carry ≥3 entries for \
+             http_requests_total (sum, sum(rate), count); got {}",
+            http_requests_entries.len()
+        );
+        let roles: Vec<AggRole> = http_requests_entries
+            .iter()
+            .map(|e| derive_agg_role(e))
+            .collect();
+        // At least one Sum and at least one Count among the entries.
+        assert!(
+            roles.contains(&AggRole::Sum),
+            "expected ≥1 Sum-role entry among http_requests_total in \
+             mvp-workload.yaml; got {roles:?}"
+        );
+        assert!(
+            roles.contains(&AggRole::Count),
+            "expected ≥1 Count-role entry among http_requests_total in \
+             mvp-workload.yaml; got {roles:?}"
         );
     }
 

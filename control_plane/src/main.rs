@@ -209,10 +209,16 @@ async fn main() {
                             let pushed = r.push_config_to_agent(&aid).await;
                             // If the agent has no prior assignment, assign it a workload
                             // from the registry (if available).
+                            //
+                            // B2 (metric, role): bind the on-connect default to
+                            // the first agent-role registry entry's CLASSIFIED
+                            // role (via `derive_agg_role`) so the workload-store
+                            // lookup in `push_config_to_agent` resolves.
                             if !pushed {
                                 if let Some(registry) = reg.read().await.as_ref() {
                                     if let Some(entry) = registry.first_for_role("agent") {
-                                        r.register_agent(&aid, &entry.metric_name).await;
+                                        let role = control_plane::workload::derive_agg_role(entry);
+                                        r.register_agent(&aid, &entry.metric_name, role).await;
                                         r.push_config_to_agent(&aid).await;
                                     }
                                 }
@@ -319,16 +325,29 @@ async fn main() {
                 shape:            types_v2::QueryShape::default(),
                 data:             types_v2::DataShape::default(),
             };
+            // B2 full restructure — derive the AggRole for this entry
+            // BEFORE store insertion so collisions on metric name don't
+            // overwrite a prior role's entry. The pre-B2 loop wrote
+            // `set(metric, ...)` and silently dropped every entry but
+            // the LAST one when a metric appeared multiple times in the
+            // YAML — that's the bug that caused `sum by (zone)
+            // (http_requests_total)` to return `ExactAgg(Sum)
+            // capability not satisfied` (entries 2 + 3 of
+            // mvp-workload.yaml were both Sum-shaped but only the
+            // count(...) entry 4 survived, with DDSketch from the
+            // unrelated `http_requests_total_latency_ms` quantile
+            // entry).
+            let role = control_plane::workload::derive_agg_role(entry);
             match analyzer.analyze(spec) {
                 Ok(wl) => {
                     let wc = types::WorkloadCharacteristics::default();
                     let plan = planner.plan(&wl, Some(&wc));
                     let metric_name = wl.metric_name.clone();
-                    plan_store.set(&metric_name, plan);
-                    workload_store.set(&metric_name, wl, wc);
+                    plan_store.set(&metric_name, role, plan);
+                    workload_store.set(&metric_name, role, wl, wc);
                 }
                 Err(e) => {
-                    warn!(metric = %entry.metric_name, error = %e,
+                    warn!(metric = %entry.metric_name, role = %role, error = %e,
                         "failed to pre-populate plan from workload registry");
                 }
             }
@@ -528,9 +547,26 @@ async fn handle_plan(
     }
 
     plan.precompute = build_precompute_engine_jobs(&workload, "backend:4317");
-    st.store.set(&workload.metric_name, plan.clone());
+    // B2 (metric, role): derive the role from the request's
+    // query_string + optional `sketch_type` override so the
+    // store keys at (metric, role) granularity. Without the role
+    // a second POST for the same metric with a different shape
+    // (Quantile vs Sum) would silently overwrite the prior plan.
+    let role = {
+        let entry = control_plane::workload::WorkloadEntry {
+            metric_name: workload.metric_name.clone(),
+            query_string: query_string.clone(),
+            accuracy_sla: workload.accuracy_sla,
+            assign_to_role: String::from("agent"),
+            sketch_family_override: workload.sketch_type_override.clone(),
+            target_path: None,
+            grouping_labels: workload.group_by_labels.clone(),
+        };
+        control_plane::workload::derive_agg_role(&entry)
+    };
+    st.store.set(&workload.metric_name, role, plan.clone());
     // Persist workload so the replanner can re-run plan() without the original spec.
-    st.workload_store.set(&workload.metric_name, workload.clone(), wc);
+    st.workload_store.set(&workload.metric_name, role, workload.clone(), wc);
 
     // ── Push agent config to agent-role collectors ────────────────────────────
     if let Ok(agent_yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
@@ -785,11 +821,11 @@ async fn handle_plan(
         }
     }
 
-    // ── Update scrape-endpoint sketch types and agent→metric mapping ──────────
+    // ── Update scrape-endpoint sketch types and agent→(metric, role) mapping ──
     let sketch_type = plan.agent_config.sketch_type.clone();
     for agent_id in st.opamp.connected_agents().await {
         st.scraper.set_sketch_type(&agent_id, sketch_type.clone()).await;
-        st.replanner.register_agent(&agent_id, &workload.metric_name).await;
+        st.replanner.register_agent(&agent_id, &workload.metric_name, role).await;
     }
 
     // `plan_summary` was computed in the single algebra pipeline above.
@@ -870,14 +906,38 @@ async fn handle_get_plan(
     State(st): State<AppState>,
     Path(metric): Path<String>,
 ) -> impl IntoResponse {
-    match st.store.get(&metric) {
-        Ok(plan) => (StatusCode::OK, Json(json!({
-            "metric":      metric,
-            "sketch_type": plan.agent_config.sketch_type.to_string(),
-            "valid_until": plan.valid_until,
-        }))).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    // B2 (metric, role): return every role's plan for this metric.
+    // Wire shape (additive, no breaking change): when only one role is
+    // registered, the response still carries the pre-B2 top-level
+    // `sketch_type` / `valid_until` fields for backward compat. The
+    // new `roles` array is always present so clients can opt in to
+    // the multi-role view.
+    let plans = st.store.get_all_for_metric(&metric);
+    if plans.is_empty() {
+        return (StatusCode::NOT_FOUND, format!("plan not found for metric {metric:?}"))
+            .into_response();
     }
+    let roles: Vec<serde_json::Value> = plans
+        .iter()
+        .map(|(role, plan)| {
+            json!({
+                "role": role.as_str(),
+                "sketch_type": plan.agent_config.sketch_type.to_string(),
+                "valid_until": plan.valid_until,
+            })
+        })
+        .collect();
+    let first = &plans[0].1;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "metric":      metric,
+            "sketch_type": first.agent_config.sketch_type.to_string(),
+            "valid_until": first.valid_until,
+            "roles":       roles,
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_rollback(
@@ -886,18 +946,70 @@ async fn handle_rollback(
 ) -> impl IntoResponse {
     // Reset the baseline so the next POST /api/v1/plan re-runs the cost
     // model and establishes a fresh baseline plan for this metric.
+    //
+    // B2 (metric, role): rollback ALL roles for this metric. The
+    // response surfaces the per-role outcome so clients can see which
+    // roles had a previous plan and which were no-ops. Pre-B2 callers
+    // who fired a rollback on a metric got back `{rolled_back: true}`
+    // unconditionally for a single role; the new shape stays additive
+    // (carries `rolled_back: true` when ≥1 role rolled back).
     st.planner.reset(&metric);
-    match st.store.rollback(&metric) {
-        Ok(plan) => {
-            if let Ok(yaml) = generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
-                st.opamp.push_to_role(AgentRole::Agent, RemoteConfig {
-                    config_hash: short_hash(&yaml), yaml,
-                }).await;
-            }
-            (StatusCode::OK, Json(json!({ "metric": metric, "rolled_back": true }))).into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let plans = st.store.get_all_for_metric(&metric);
+    if plans.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("plan not found for metric {metric:?}"),
+        )
+            .into_response();
     }
+    let mut per_role = Vec::with_capacity(plans.len());
+    let mut any_rolled_back = false;
+    for (role, _) in plans {
+        match st.store.rollback(&metric, role) {
+            Ok(plan) => {
+                if let Ok(yaml) =
+                    generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint)
+                {
+                    st.opamp
+                        .push_to_role(
+                            AgentRole::Agent,
+                            RemoteConfig {
+                                config_hash: short_hash(&yaml),
+                                yaml,
+                            },
+                        )
+                        .await;
+                }
+                per_role.push(json!({ "role": role.as_str(), "rolled_back": true }));
+                any_rolled_back = true;
+            }
+            Err(e) => {
+                per_role.push(json!({
+                    "role": role.as_str(),
+                    "rolled_back": false,
+                    "reason": e.to_string(),
+                }));
+            }
+        }
+    }
+    // Pre-B2 contract: return BAD_REQUEST when no role could roll
+    // back (e.g. every role's plan has no `previous` slot). The
+    // multi-role variants are surfaced in the `roles` array so
+    // callers can distinguish "rolled back N of K" cases.
+    let status = if any_rolled_back {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(json!({
+            "metric":       metric,
+            "rolled_back":  any_rolled_back,
+            "roles":        per_role,
+        })),
+    )
+        .into_response()
 }
 
 async fn handle_agents(State(st): State<AppState>) -> impl IntoResponse {
@@ -911,16 +1023,28 @@ async fn handle_get_config(
     State(st): State<AppState>,
     Path(metric): Path<String>,
 ) -> impl IntoResponse {
-    match st.store.get(&metric) {
-        Ok(plan) => match generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
-            Ok(yaml) => (
-                StatusCode::OK,
-                [("content-type", "application/yaml")],
-                yaml,
-            ).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    // B2 (metric, role): the legacy `generate_agent_collector_config`
+    // emits a SINGLE-pipeline YAML — when a metric has multiple roles,
+    // pick the FIRST registered role's plan. The 5-sketch routing-
+    // connector emit path (the `USE_TYPED_STAGE_SPLIT` typed pipeline)
+    // is the supported multi-role wire shape; this endpoint stays
+    // legacy-compat by picking one role's plan.
+    let plan = st.store.get_all_for_metric(&metric).into_iter().next();
+    let Some((_role, plan)) = plan else {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("plan not found for metric {metric:?}"),
+        )
+            .into_response();
+    };
+    match generate_agent_collector_config(&plan.agent_config, &st.opamp_endpoint) {
+        Ok(yaml) => (
+            StatusCode::OK,
+            [("content-type", "application/yaml")],
+            yaml,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -1049,14 +1173,20 @@ async fn emit_bootstrap_typed(
     // 1. Resolve the metric this bootstrap should target.
     //    When the agent has a prior pinned assignment we honour it
     //    (pre-existing on_connect contract). The replanner's
-    //    `agent_to_metric()` is the source of truth for this mapping.
+    //    `agent_to_metrics()` is the source of truth for this mapping.
+    //
+    //    B2 (metric, role): an agent may pin multiple `(metric, role)`
+    //    pairs. The bootstrap returns a single edge YAML, so we pick
+    //    the FIRST pair's metric — the 5-sketch routing-connector
+    //    pipeline emitted below covers every metric in the registry,
+    //    not just this one.
     let pinned_metric: Option<String> = if let Some(aid) = pinned_agent_id {
         st.replanner
-            .agent_to_metric()
+            .agent_to_metrics()
             .read()
             .await
             .get(aid)
-            .cloned()
+            .and_then(|v| v.first().map(|(m, _)| m.clone()))
     } else {
         None
     };
@@ -1095,12 +1225,20 @@ async fn emit_bootstrap_typed(
     // 2-3. Walk candidates: first metric that pre-populated the
     //      workload store AND binds via the typed path provides the
     //      base edge_cfg shape.
+    //
+    //      B2 (metric, role): a metric may have multiple roles
+    //      registered; we walk every role's workload entry until one
+    //      binds. The Sum-shaped roles (raw passthrough) decline the
+    //      typed bind, so for `http_requests_total` the
+    //      Quantile-shaped role on `http_requests_total_latency_ms`
+    //      stays the source of the edge config.
     let mut chosen: Option<(String, crate::sketch_algebra::PhysicalExpr)> = None;
-    for cand in &candidates {
-        let Some((wl, _wc)) = st.workload_store.get(cand) else { continue };
-        if let Some(expr) = optimizer::rules::bind_workload_typed(&wl) {
-            chosen = Some((cand.clone(), expr));
-            break;
+    'outer: for cand in &candidates {
+        for (_, wl, _) in st.workload_store.get_all_for_metric(cand) {
+            if let Some(expr) = optimizer::rules::bind_workload_typed(&wl) {
+                chosen = Some((cand.clone(), expr));
+                break 'outer;
+            }
         }
     }
     let (metric, physical_expr) = chosen.ok_or_else(|| {
@@ -1202,18 +1340,63 @@ async fn handle_plan_diff(
     State(st): State<AppState>,
     Path(metric): Path<String>,
 ) -> impl IntoResponse {
-    match st.store.diff(&metric) {
-        Ok(Some(diff)) => (StatusCode::OK, Json(json!({
-            "metric": metric,
-            "has_diff": true,
-            "diff": diff,
-        }))).into_response(),
-        Ok(None) => (StatusCode::OK, Json(json!({
-            "metric": metric,
-            "has_diff": false,
-        }))).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+    // B2 (metric, role): a metric may carry multiple roles; surface a
+    // per-role `roles` array. The top-level `has_diff` is true iff at
+    // least one role has a diff. Pre-B2 single-role clients see
+    // `has_diff` and the `diff` field of the first role with one;
+    // the new shape stays additive (no URL change, response keys
+    // preserved).
+    let plans = st.store.get_all_for_metric(&metric);
+    if plans.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            format!("plan not found for metric {metric:?}"),
+        )
+            .into_response();
     }
+    let mut roles: Vec<serde_json::Value> = Vec::with_capacity(plans.len());
+    let mut first_diff: Option<serde_json::Value> = None;
+    let mut any_has_diff = false;
+    for (role, _) in plans {
+        match st.store.diff(&metric, role) {
+            Ok(Some(diff)) => {
+                let diff_json = serde_json::to_value(&diff).unwrap_or(serde_json::Value::Null);
+                if first_diff.is_none() {
+                    first_diff = Some(diff_json.clone());
+                }
+                any_has_diff = true;
+                roles.push(json!({
+                    "role": role.as_str(),
+                    "has_diff": true,
+                    "diff": diff_json,
+                }));
+            }
+            Ok(None) => {
+                roles.push(json!({ "role": role.as_str(), "has_diff": false }));
+            }
+            Err(e) => {
+                roles.push(json!({
+                    "role": role.as_str(),
+                    "error": e.to_string(),
+                }));
+            }
+        }
+    }
+    let body = if any_has_diff {
+        json!({
+            "metric":   metric,
+            "has_diff": true,
+            "diff":     first_diff,
+            "roles":    roles,
+        })
+    } else {
+        json!({
+            "metric":   metric,
+            "has_diff": false,
+            "roles":    roles,
+        })
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 /// Returns the current EMA cost model state — blended benchmark + observed costs
@@ -1468,7 +1651,7 @@ mod api_tests {
             repeat_every: None, accuracy_sla: 0.01, latency_sla: None,
             sketch_type_override: None, exact_required: false, quantiles: vec![],
         };
-        st.store.set("m", RulesPlanner::new().plan(&wl));
+        st.store.set("m", control_plane::workload::AggRole::Quantile, RulesPlanner::new().plan(&wl));
         let req = Request::builder()
             .method("POST").uri("/api/v1/plan/m/rollback")
             .body(Body::empty()).unwrap();
@@ -1699,8 +1882,14 @@ mod api_tests {
         let wl = analyzer.analyze(spec).unwrap();
         let wc = types::WorkloadCharacteristics::default();
         let plan = planner.plan(&wl, Some(&wc));
-        plan_store.set("http_latency", plan);
-        workload_store.set("http_latency", wl, wc);
+        // B2 (metric, role): pre-populate using the same role the
+        // on_connect callback's `derive_agg_role(entry)` will compute
+        // for this test's workloads.yaml entry (no query_string + no
+        // sketch_family_override → AggRole::Other). Without matching
+        // the role, `push_config_to_agent`'s workload_store.get
+        // returns None and the on_connect path silently bails.
+        plan_store.set("http_latency", control_plane::workload::AggRole::Other, plan);
+        workload_store.set("http_latency", control_plane::workload::AggRole::Other, wl, wc);
 
         // Build replanner and late-binding cells.
         let replanner_cell: Arc<tokio::sync::RwLock<Option<Arc<Replanner>>>> =
@@ -1730,7 +1919,8 @@ mod api_tests {
                             if !pushed {
                                 if let Some(registry) = reg.read().await.as_ref() {
                                     if let Some(entry) = registry.first_for_role("agent") {
-                                        r.register_agent(&aid, &entry.metric_name).await;
+                                        let role = control_plane::workload::derive_agg_role(entry);
+                                        r.register_agent(&aid, &entry.metric_name, role).await;
                                         r.push_config_to_agent(&aid).await;
                                     }
                                 }
@@ -1829,8 +2019,8 @@ mod api_tests {
         let wl = analyzer.analyze(spec).unwrap();
         let wc = types::WorkloadCharacteristics::default();
         let plan = planner.plan(&wl, Some(&wc));
-        plan_store.set("metric_a", plan);
-        workload_store.set("metric_a", wl, wc);
+        plan_store.set("metric_a", control_plane::workload::AggRole::Quantile, plan);
+        workload_store.set("metric_a", control_plane::workload::AggRole::Quantile, wl, wc);
 
         let replanner = Arc::new(Replanner::new(
             Arc::clone(&planner),
@@ -1849,8 +2039,12 @@ mod api_tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Register agent-a for metric_a, agent-b is NOT registered for metric_a.
-        replanner.register_agent("agent-a", "metric_a").await;
-        replanner.register_agent("agent-b", "metric_b").await;
+        replanner
+            .register_agent("agent-a", "metric_a", control_plane::workload::AggRole::Quantile)
+            .await;
+        replanner
+            .register_agent("agent-b", "metric_b", control_plane::workload::AggRole::Quantile)
+            .await;
 
         // Trigger replan for metric_a.
         let ok = replanner.replan_metric("metric_a").await;
@@ -2058,8 +2252,8 @@ mod api_tests {
         let wl = analyzer.analyze(spec).expect("analyze");
         let wc = types::WorkloadCharacteristics::default();
         let plan = state.planner.plan(&wl, Some(&wc));
-        state.store.set(metric, plan);
-        state.workload_store.set(metric, wl, wc);
+        state.store.set(metric, control_plane::workload::AggRole::Quantile, plan);
+        state.workload_store.set(metric, control_plane::workload::AggRole::Quantile, wl, wc);
 
         // 4. Swap in the populated registry.
         state.workload_registry = registry;
@@ -2276,8 +2470,8 @@ mod api_tests {
             let wl = analyzer.analyze(spec).expect("analyze");
             let wc = types::WorkloadCharacteristics::default();
             let plan = state.planner.plan(&wl, Some(&wc));
-            state.store.set(*m, plan);
-            state.workload_store.set(*m, wl, wc);
+            state.store.set(*m, control_plane::workload::AggRole::Quantile, plan);
+            state.workload_store.set(*m, control_plane::workload::AggRole::Quantile, wl, wc);
         }
 
         // 4. Swap in the populated registry.
@@ -2471,8 +2665,9 @@ mod api_tests {
                 let wc = types::WorkloadCharacteristics::default();
                 let plan = state.planner.plan(&wl, Some(&wc));
                 let metric_name = wl.metric_name.clone();
-                state.store.set(&metric_name, plan);
-                state.workload_store.set(&metric_name, wl, wc);
+                let role = control_plane::workload::derive_agg_role(entry);
+                state.store.set(&metric_name, role, plan);
+                state.workload_store.set(&metric_name, role, wl, wc);
             }
         }
 
