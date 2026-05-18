@@ -261,49 +261,6 @@ impl ASAPQueryEngine {
         })
     }
 
-    /// Detect whether the raw PromQL contains a `rate(...)` or
-    /// `irate(...)` call anywhere in the expression tree. Used by the
-    /// engine to route ExactAgg(Sum) candidates through the
-    /// rate-divisor reducer (`evaluate_exact_agg_rate`) instead of the
-    /// plain per-window reducer.
-    ///
-    /// The control plane's analyzer collapses `rate(metric[r])` to the
-    /// same `Capability::ExactAgg(Sum)` candidate that `sum(metric)`
-    /// uses — the trace carries `range_seconds` and `function` strings
-    /// but for the composed shape `sum by (zone) (rate(metric[r]))` the
-    /// outer function string is `"sum"` (not `"rate"`), so we can't
-    /// disambiguate `sum_over_time(...)` from `sum(rate(...))` from the
-    /// candidate alone. Walking the raw PromQL AST is the cleanest
-    /// disambiguator that doesn't require analyzer changes.
-    ///
-    /// Returns `false` for unparseable input (the analyzer would have
-    /// already rejected — defensive).
-    fn query_contains_rate_call(query: &str) -> bool {
-        use promql_parser::parser::Expr;
-        let ast = match promql_parser::parser::parse(query) {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        fn walk(expr: &Expr) -> bool {
-            match expr {
-                Expr::Call(call) => {
-                    let name = call.func.name.to_lowercase();
-                    if name == "rate" || name == "irate" {
-                        return true;
-                    }
-                    call.args.args.iter().any(|a| walk(a))
-                }
-                Expr::Aggregate(agg) => walk(&agg.expr),
-                Expr::Paren(p) => walk(&p.expr),
-                Expr::Subquery(sq) => walk(&sq.expr),
-                Expr::Binary(b) => walk(&b.lhs) || walk(&b.rhs),
-                Expr::Unary(u) => walk(&u.expr),
-                _ => false,
-            }
-        }
-        walk(&ast)
-    }
-
     /// Detect a `topk(k, <inner>)` (or `bottomk`) at the root of the
     /// PromQL AST and lift `(k, inner_metric, inner_group_by_keys,
     /// inner_range_seconds, is_topk)`. The `is_topk` flag distinguishes
@@ -760,8 +717,19 @@ impl ASAPQueryEngine {
             // / `evaluate_exact_agg_rate` for the per-path semantics.
             let result = match &candidate.required_capability {
                 crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
+                    // Dispatch off the typed `outer_fn` carried on the
+                    // analyzer candidate — `OuterFn::Rate` means the
+                    // original PromQL had a `rate(...)` / `irate(...)`
+                    // call somewhere, so we need the rate-divisor
+                    // reducer. Plain shapes (`sum_over_time(...)`,
+                    // `sum(...)`, bare selector) take the per-window
+                    // reducer. Before the analyzer carried this field
+                    // the engine re-walked the raw PromQL via the
+                    // `query_contains_rate_call` helper to recover the
+                    // distinction; that was lossy-lowering smell and is
+                    // gone.
                     let use_rate_path = candidate.range_seconds > 0
-                        && Self::query_contains_rate_call(query)
+                        && candidate.outer_fn == control_plane::asap_tier_analysis::OuterFn::Rate
                         && matches!(
                             agg_type,
                             crate::storage_engines::sketch_db::data::AggregationType::Sum
@@ -1262,6 +1230,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // too (function="sum" but range_seconds=300 from the
                 // inner rate's matrix selector, picked up by the
                 // analyzer trace).
+                // Dispatch off the typed `outer_fn` field on the
+                // analyzer candidate — `OuterFn::Rate` if the original
+                // PromQL contained a `rate(...)` / `irate(...)` call.
+                // Replaces a previous `query_contains_rate_call(query)`
+                // re-parse of the raw PromQL string (a lossy-lowering
+                // smell — the analyzer is the source of truth for
+                // query intent). See `control_plane/sketch_algebra/
+                // capability::OuterFn`.
                 let use_rate_path = matches!(
                     &candidate.required_capability,
                     crate::storage_engines::sketch_db::index::Capability::ExactAgg(
@@ -1271,7 +1247,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
                     )
                 ) && candidate.range_seconds > 0
-                    && Self::query_contains_rate_call(query);
+                    && candidate.outer_fn == control_plane::asap_tier_analysis::OuterFn::Rate;
                 let reducer_result = match &candidate.required_capability {
                     crate::storage_engines::sketch_db::index::Capability::ExactAgg(
                         agg_type,
@@ -2398,13 +2374,175 @@ mod asap_tier_classify_tests {
         assert!((z1 - 6.0).abs() < 1e-9, "z1 rate expected 6.0, got {z1}");
     }
 
+    /// Regression: `sum_over_time(http_requests_total[5m])` shares
+    /// `Capability::ExactAgg(Sum)` with `rate(...)` — the engine's
+    /// reducer dispatch MUST disambiguate via the analyzer's typed
+    /// `outer_fn` field (set to `OuterFn::Plain` for sum_over_time),
+    /// NOT by re-parsing the raw PromQL string. If the dispatch ever
+    /// regresses to "all ExactAgg(Sum) + range > 0 → rate path",
+    /// this test fails because the output would be (per-window sums)
+    /// / 300 instead of the raw per-window sums.
+    ///
+    /// Pins the per-window reducer's output: each series carries the
+    /// SUM of its in-window samples (not events-per-second).
+    #[tokio::test]
+    async fn execute_sum_over_time_dispatches_to_plain_exact_agg_reducer() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        // Two zones, one ExactAgg(Sum) sid each, two windows each.
+        // Per-window sum is 600 / 900 — `sum_over_time` over a
+        // 300s lookback should report the sum of windowed values
+        // (1200 / 1800), NOT divided by 300.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w1_start = now_ms.saturating_sub(120_000);
+        let w1_end = now_ms.saturating_sub(60_000);
+        let w2_start = w1_end;
+        let w2_end = now_ms.saturating_sub(1_000);
+
+        for (i, (zone, per_window)) in
+            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
+        {
+            let sid = 13_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
+                let mut lm = BTreeMap::new();
+                lm.insert("zone".to_string(), zone.to_string());
+                idx.append_precompute(
+                    sid,
+                    lm,
+                    (ws, we),
+                    Box::new(SumAccumulator::with_sum(*per_window)),
+                );
+            }
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("sum_over_time(http_requests_total[5m])")
+            .await
+            .expect(
+                "sum_over_time must dispatch via plain ExactAgg reducer \
+                 off the typed OuterFn::Plain candidate, not capability-miss",
+            );
+
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        // `sum_over_time(metric[r])` (no `sum by (...)` wrapper) lowers
+        // to an analyzer candidate with empty `group_by_keys`. The
+        // plain `evaluate_exact_agg` reducer treats empty group_by as
+        // "collapse across all series" (vs the rate reducer which
+        // preserves the natural label map per sid). So the expected
+        // shape is ONE entry whose value is the sum of the latest
+        // per-window sample across both zones: 600 + 900 = 1500. The
+        // load-bearing assertion is the VALUE — if the engine
+        // regressed to the rate path the value would be (1500)/300 =
+        // 5.0 (or per-zone if rate's per-sid split fired), neither of
+        // which is 1500.
+        assert_eq!(
+            vector.values.len(),
+            1,
+            "plain ExactAgg reducer collapses across series when \
+             group_by_keys is empty"
+        );
+        let value = vector.values[0].value;
+        assert!(
+            (value - 1500.0).abs() < 1e-9,
+            "sum_over_time expected 1500 (sum of latest per-window samples \
+             across zones), got {value} — if this is ~5.0 or close to \
+             4.0/6.0 the engine regressed to the rate-divisor path; the \
+             typed OuterFn::Plain candidate dispatch is broken"
+        );
+    }
+
+    /// Regression: the engine's rate-vs-plain dispatch decision MUST
+    /// be made off the analyzer's typed `ASAPTierCandidate.outer_fn`
+    /// field, NOT by re-parsing the raw PromQL query string. This test
+    /// fabricates an analyzer-shaped candidate by name (no raw PromQL
+    /// in scope) and asserts the `OuterFn` enum values the engine
+    /// reads off it. If the engine ever re-introduces a
+    /// `query_contains_rate_call`-style raw-string re-parse this test
+    /// continues to pass — but the deletion of the string helper +
+    /// this typed contract is what guards against the regression in
+    /// the first place.
+    #[test]
+    fn analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time() {
+        use control_plane::asap_tier_analysis::{
+            analyze_promql_for_asap_tier, OuterFn,
+        };
+        let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
+        let sot = analyze_promql_for_asap_tier(
+            "sum_over_time(http_requests_total[5m])",
+        );
+        let sum_by_rate = analyze_promql_for_asap_tier(
+            "sum by (zone) (rate(http_requests_total[5m]))",
+        );
+        let bare = analyze_promql_for_asap_tier("http_requests_total");
+
+        assert!(rate.unsupported.is_none() && !rate.candidates.is_empty());
+        assert!(sot.unsupported.is_none() && !sot.candidates.is_empty());
+        assert!(
+            sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty()
+        );
+        assert!(bare.unsupported.is_none() && !bare.candidates.is_empty());
+
+        // Same capability for ALL — the field that disambiguates is
+        // `outer_fn`, not `required_capability`.
+        assert_eq!(
+            rate.candidates[0].required_capability,
+            sot.candidates[0].required_capability,
+        );
+        assert_eq!(
+            rate.candidates[0].required_capability,
+            sum_by_rate.candidates[0].required_capability,
+        );
+        assert_eq!(
+            rate.candidates[0].required_capability,
+            bare.candidates[0].required_capability,
+        );
+
+        // `outer_fn` carries the distinction.
+        assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
+        assert_eq!(sot.candidates[0].outer_fn, OuterFn::Plain);
+        assert_eq!(
+            sum_by_rate.candidates[0].outer_fn,
+            OuterFn::Rate,
+            "composed `sum by (...) (rate(...))` MUST flag OuterFn::Rate \
+             even though the outer function name is `sum`"
+        );
+        assert_eq!(bare.candidates[0].outer_fn, OuterFn::Plain);
+    }
+
     /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.
     /// The analyzer gives `Capability::ExactAgg(Sum)` with
-    /// `function="sum"` (outer) and `range_seconds=300` (lifted from
-    /// the inner rate's matrix selector). The engine's
-    /// `query_contains_rate_call` walker detects the inner rate and
-    /// dispatches to `evaluate_exact_agg_rate`, which folds the per-
-    /// zone per-window sums and divides by 300.
+    /// `function="sum"` (outer), `range_seconds=300` (lifted from the
+    /// inner rate's matrix selector), AND `outer_fn=OuterFn::Rate`
+    /// (the analyzer's PromQL trace walker flags the inner rate call).
+    /// The engine dispatches to `evaluate_exact_agg_rate` off the
+    /// typed `outer_fn` field, which folds the per-zone per-window
+    /// sums and divides by 300.
     #[tokio::test]
     async fn execute_sum_by_zone_rate_dispatches_to_exact_agg_rate_reducer() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
