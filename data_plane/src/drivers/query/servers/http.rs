@@ -888,12 +888,19 @@ fn parse_last_over_time_probe(query: &str) -> Option<(String, i64)> {
     Some((metric, range_ms))
 }
 
-/// Direct `ASAPQueryEngine::handle_query` dispatch — preserves the
-/// `KeyByLabelNames` the Prometheus adapter needs to fill in the
-/// `metric` map. Used for ASAP-tier metrics (the default) so the
-/// response surface is byte-identical to the pre-router path. Adds a
+/// Direct `ASAPQueryEngine::execute(&str)` dispatch — B7.5 retired
+/// the legacy `handle_query` path; this handler is now a thin
+/// wrapper around the modern `QueryEngine::execute(&str)` trait
+/// surface, which classifies via the analyzer + ASAP-tier reducer
+/// and fires capability-miss notifies natively. Adds a
 /// `data_source: asap_query` info-line at the JSON layer so Phase-6
 /// callers can byte-compare regardless of the dispatch path.
+///
+/// Trait dispatch loses `KeyByLabelNames` (the trait returns just
+/// `QueryResult`); we surface an empty `KeyByLabelNames`, identical
+/// to how `process_via_router` handles the same trait surface — the
+/// Prometheus adapter renders an empty `metric: {}` object, a valid
+/// shape that PromQL clients accept.
 async fn process_via_simple_engine(
     state: &AppState,
     parsed_request: &ParsedQueryRequest,
@@ -902,37 +909,28 @@ async fn process_via_simple_engine(
 ) -> Response {
     let query_start_time = Instant::now();
     debug!(
-        "About to call query_engine.handle_query with query='{}' and time={}",
+        "About to call query_engine.execute with query='{}' and time={}",
         parsed_request.query, parsed_request.time
     );
-    match state
-        .query_engine
-        .handle_query(parsed_request.query.clone(), parsed_request.time)
-    {
-        Some((query_output_labels, query_result)) => {
+    use crate::query_engines::routing::query_engine_routing::QueryEngine;
+    use crate::drivers::query::adapters::QueryExecutionResult;
+    match state.query_engine.execute(&parsed_request.query).await {
+        Ok(query_result) => {
             let query_duration = query_start_time.elapsed();
-            debug!("=== QUERY ENGINE SUCCESS ===");
             debug!(
-                "Query engine execution took: {:.2}ms",
+                "Modern execute() succeeded for query='{}' in {:.2}ms",
+                parsed_request.query,
                 query_duration.as_secs_f64() * 1000.0
             );
-            debug!("Query output labels: {:?}", query_output_labels);
-            debug!("Query result: {:?}", query_result);
-
-            // Step 3: Format success response using adapter
-            // (Adapter handles protocol-specific formatting, e.g., convert_query_result_to_prometheus)
-            use crate::drivers::query::adapters::QueryExecutionResult;
             let execution_result = QueryExecutionResult {
-                query_output_labels,
-                query_result};
-
+                query_output_labels: promql_utilities::data_model::KeyByLabelNames::default(),
+                query_result,
+            };
             let total_duration = start_time.elapsed();
             debug!(
                 "Total request processing took: {:.2}ms",
                 total_duration.as_secs_f64() * 1000.0
             );
-            debug!("=== RETURNING SUCCESS RESPONSE ===");
-
             match state
                 .adapter
                 .format_success_response(&execution_result)
@@ -942,85 +940,18 @@ async fn process_via_simple_engine(
                     annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
                         .await
                 }
-                Err(status) => status.into_response()}
-        }
-        None => {
-            // Legacy `handle_query` returned None — likely the
-            // sketch-vs-precompute query gap pinned in #252:
-            // `query_precomputes_by_agg` only picks up
-            // `AggKind::ExactAgg` sids, never `AggKind::Sketch`. Try
-            // the modern `ASAPQueryEngine::execute(&str)` trait path
-            // before falling through to the unsupported-query branch
-            // — `execute` uses
-            // `idx.sids_for_policy(fp)` + `SketchReducer::evaluate`
-            // and handles sketches natively, AND (since #273) unions
-            // `instances_matching` for sketches with `policy_fp =
-            // UNSET`.
-            //
-            // Trait dispatch loses `KeyByLabelNames` (the trait
-            // returns just `QueryResult`); we surface an empty
-            // `KeyByLabelNames`, identical to how `process_via_router`
-            // handles the same trait surface — the Prometheus
-            // adapter renders an empty `metric: {}` object, a valid
-            // shape that PromQL clients accept.
-            //
-            // Schema-retirement #5 status: an earlier draft of this
-            // PR reordered to "modern first, legacy as fallback" so
-            // the legacy path could be retired entirely. That broke
-            // `http_capability_miss_feedback_loop_closes_over_http`
-            // — the capability-miss notify side-effect happens
-            // inside legacy `find_compatible_aggregation_with_miss_notify`
-            // (engine.rs:~1772), and a pre-existing time=0 underflow
-            // bug at engine.rs:792 surfaces when legacy is reached
-            // via the modern-Err fallback because of subtle test
-            // setup state. Modern needs to spawn its own
-            // capability-miss notify before we can reorder cleanly.
-            use crate::query_engines::routing::query_engine_routing::QueryEngine;
-            let modern_result = state
-                .query_engine
-                .execute(&parsed_request.query)
-                .await;
-            if let Ok(query_result) = modern_result {
-                debug!(
-                    "Modern execute() handled what legacy handle_query missed \
-                     (query='{}')",
-                    parsed_request.query
-                );
-                use crate::drivers::query::adapters::QueryExecutionResult;
-                let execution_result = QueryExecutionResult {
-                    query_output_labels: promql_utilities::data_model::KeyByLabelNames::default(),
-                    query_result,
-                };
-                let total_duration = start_time.elapsed();
-                debug!(
-                    "Total request processing took (modern fallback): {:.2}ms",
-                    total_duration.as_secs_f64() * 1000.0
-                );
-                return match state
-                    .adapter
-                    .format_success_response(&execution_result)
-                    .await
-                {
-                    Ok(response) => {
-                        annotate_data_source(
-                            response,
-                            StorageBackend::SketchStore.data_source_id(),
-                        )
-                        .await
-                    }
-                    Err(status) => status.into_response(),
-                };
+                Err(status) => status.into_response(),
             }
+        }
+        Err(_) => {
             debug!(
-                "Both legacy handle_query AND modern execute() returned None/Err for \
-                 query='{}', falling through to fallback / unsupported",
+                "Modern execute() returned CapabilityMiss for query='{}', \
+                 falling through to fallback / unsupported",
                 parsed_request.query
             );
-
             let total_duration = start_time.elapsed();
-            debug!("=== QUERY ENGINE RETURNED NONE ===");
             debug!(
-                "Request failed after: {:.2}ms",
+                "Request capability-missed after: {:.2}ms",
                 total_duration.as_secs_f64() * 1000.0
             );
 
@@ -1683,92 +1614,51 @@ async fn process_range_query_request(
         parsed_request.query, parsed_request.start, parsed_request.end, parsed_request.step
     );
 
-    match state.query_engine.handle_range_query_promql(
-        parsed_request.query.clone(),
-        parsed_request.start,
-        parsed_request.end,
-        parsed_request.step,
-    ) {
-        Some((query_output_labels, query_result)) => {
+    // B7.5 retirement — legacy `handle_range_query_promql` is gone.
+    // Route directly through the modern warm-tier path
+    // (`execute_range_promql_modern`), which classifies via the
+    // analyzer + ASAP-tier reducer and returns Matrix shape per the
+    // `/api/v1/query_range` wire-format requirement.
+    let start_ms = (parsed_request.start * 1000.0) as u64;
+    let end_ms = (parsed_request.end * 1000.0) as u64;
+    let step_ms = (parsed_request.step * 1000.0) as u64;
+    let modern_result = state
+        .query_engine
+        .execute_range_promql_modern(
+            &parsed_request.query,
+            start_ms,
+            end_ms,
+            step_ms,
+        )
+        .await;
+    match modern_result {
+        Ok(query_result) => {
             let query_duration = query_start_time.elapsed();
             debug!(
-                "Range query execution took: {:.2}ms",
+                "Modern range execute took: {:.2}ms",
                 query_duration.as_secs_f64() * 1000.0
             );
-
             let total_duration = start_time.elapsed();
             debug!(
                 "Total range query processing took: {:.2}ms",
                 total_duration.as_secs_f64() * 1000.0
             );
-
-            // Format range success response
             match state
                 .adapter
-                .format_range_success_response(&query_result, &query_output_labels)
+                .format_range_success_response(
+                    &query_result,
+                    &promql_utilities::data_model::KeyByLabelNames::default(),
+                )
                 .await
             {
                 Ok(response) => response.into_response(),
-                Err(status) => status.into_response()}
-        }
-        None => {
-            // Legacy `handle_range_query_promql` returned None — try
-            // the modern warm-tier path. Mirrors the instant-query
-            // fallback in `process_via_simple_engine` that PR #253
-            // wired through the trait's `execute(&str)`; this site
-            // uses the range-aware sibling
-            // `execute_range_promql_modern(query, start, end, step)`
-            // which returns Matrix per the
-            // `/api/v1/query_range` wire-format requirement.
-            //
-            // Shapes that go through this fallback: anything the
-            // legacy path doesn't know (notably the modified-OTLP
-            // sketch-backed sids — count_over_time / quantile_over_time
-            // / etc. against CMS / CountSketch / KLL / DDSketch / HLL
-            // policies). Shapes still unsupported in the warm tier
-            // (topk_over_time — not standard PromQL anyway) fall
-            // through this branch too and continue to the unsupported-
-            // query response, which the EngineRouter can route to a
-            // cold-tier fallback if one is configured.
-            let start_ms = (parsed_request.start * 1000.0) as u64;
-            let end_ms = (parsed_request.end * 1000.0) as u64;
-            let step_ms = (parsed_request.step * 1000.0) as u64;
-            let modern_result = state
-                .query_engine
-                .execute_range_promql_modern(
-                    &parsed_request.query,
-                    start_ms,
-                    end_ms,
-                    step_ms,
-                )
-                .await;
-            if let Ok(query_result) = modern_result {
-                debug!(
-                    "Modern execute_range_promql_modern handled what legacy \
-                     handle_range_query_promql missed (query='{}')",
-                    parsed_request.query
-                );
-                let total_duration = start_time.elapsed();
-                debug!(
-                    "Total range query processing took (modern fallback): {:.2}ms",
-                    total_duration.as_secs_f64() * 1000.0
-                );
-                return match state
-                    .adapter
-                    .format_range_success_response(
-                        &query_result,
-                        &promql_utilities::data_model::KeyByLabelNames::default(),
-                    )
-                    .await
-                {
-                    Ok(response) => response.into_response(),
-                    Err(status) => status.into_response(),
-                };
+                Err(status) => status.into_response(),
             }
-
+        }
+        Err(_) => {
             debug!(
-                "Both legacy and modern range-query paths returned None/Err \
-                 for query='{}', falling through to unsupported",
+                "Modern range-query path returned CapabilityMiss for query='{}', \
+                 falling through to unsupported",
                 parsed_request.query
             );
             match state.adapter.format_unsupported_query_response().await {
@@ -4703,18 +4593,22 @@ async fn handle_precompute_job(
         "Executing precompute job from controller"
     );
 
-    match state.query_engine.handle_query_promql(req.query_expr, time) {
-        Some((key_by, result)) => {
+    // B7.5: legacy `handle_query_promql` retired; route through the
+    // modern `execute(&str)` trait surface.
+    use crate::query_engines::routing::query_engine_routing::QueryEngine;
+    let _ = time;
+    match state.query_engine.execute(&req.query_expr).await {
+        Ok(result) => {
             let body = serde_json::json!({
                 "status": "success",
                 "data": {
                     "result_type": "precompute",
-                    "key_by": format!("{:?}", key_by),
+                    "key_by": "{}",
                     "result": format!("{:?}", result)}
             });
             (StatusCode::OK, axum::Json(body)).into_response()
         }
-        None => {
+        Err(_) => {
             // Query not answerable by sketches — return 404 with hint
             let body = serde_json::json!({
                 "status": "error",

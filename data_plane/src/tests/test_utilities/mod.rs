@@ -1,11 +1,11 @@
 //! Test utilities for query equivalence testing
 //!
-//! This module provides utilities for testing that semantically equivalent
-//! PromQL and SQL queries produce equivalent internal logic in the QueryEngine.
+//! Provides engine-construction helpers shared by the surviving
+//! capability-miss + asap-tier integration tests. The
+//! `comparison.rs` module was retired with B7.5 because it
+//! reached into the now-deleted `QueryExecutionContext` /
+//! `StoreQueryPlan` legacy types.
 
-pub mod comparison;
 pub mod engine_factories;
 
-// Re-export commonly used items
-pub use comparison::*;
 pub use engine_factories::*;

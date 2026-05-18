@@ -18,7 +18,4 @@ pub use crate::storage_engines::sketch_db::query as asap_tier;
 #[cfg(test)]
 pub mod tests;
 
-pub use engine::{
-    ASAPQueryEngine, QueryExecutionContext, QueryMetadata, QueryTimestamps,
-    StoreQueryParams, StoreQueryPlan,
-};
+pub use engine::ASAPQueryEngine;
