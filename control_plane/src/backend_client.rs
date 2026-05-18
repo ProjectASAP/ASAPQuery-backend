@@ -19,6 +19,77 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{debug, warn};
 
+/// Classification of an HTTP push failure used by the retry layer in
+/// [`crate::emit::backend_push`]. Transient errors are safe to retry
+/// (the controller raced ahead of the backend's route bind, the host
+/// hasn't finished accepting TCP yet, a transient 5xx during backend
+/// startup, etc.); permanent errors indicate the call itself is wrong
+/// (bad payload, 4xx other than 404) and retrying just amplifies the
+/// log noise without improving the outcome.
+///
+/// This type sits next to [`BackendClient`] because the classification
+/// is a property of how the backend responded, not of how the caller
+/// retries — keeping the classifier here lets every endpoint method
+/// share the same transient/permanent definition.
+#[derive(Debug)]
+pub enum BackendPostError {
+    /// Worth another attempt after backoff: connection refused,
+    /// connect timeout, DNS resolution failure, 404 (route not yet
+    /// registered), or any 5xx.
+    Transient(anyhow::Error),
+    /// Will fail again the same way: 4xx other than 404 (bad payload,
+    /// auth, etc.). The retry layer surfaces these immediately.
+    Permanent(anyhow::Error),
+}
+
+impl BackendPostError {
+    pub fn is_transient(&self) -> bool {
+        matches!(self, BackendPostError::Transient(_))
+    }
+
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            BackendPostError::Transient(e) | BackendPostError::Permanent(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for BackendPostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendPostError::Transient(e) => write!(f, "transient: {e}"),
+            BackendPostError::Permanent(e) => write!(f, "permanent: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BackendPostError {}
+
+/// Inspect a `reqwest::Error` and decide whether the failure is worth
+/// retrying. Connection-level failures (no TCP socket / DNS / connect
+/// timeout) and request-side timeouts are transient — the backend is
+/// likely still coming up.
+fn classify_reqwest_error(err: reqwest::Error) -> BackendPostError {
+    if err.is_connect() || err.is_timeout() || err.is_request() {
+        BackendPostError::Transient(anyhow::Error::new(err))
+    } else {
+        // body decode, redirect loops, etc. — these will not resolve
+        // themselves on retry.
+        BackendPostError::Permanent(anyhow::Error::new(err))
+    }
+}
+
+/// Map a non-2xx HTTP status to a [`BackendPostError`]. 404 and 5xx
+/// are transient; every other 4xx is permanent.
+fn classify_http_status(status: reqwest::StatusCode, body: String, what: &str) -> BackendPostError {
+    let err = anyhow::anyhow!("backend returned {} for {}: {}", status, what, body);
+    if status == reqwest::StatusCode::NOT_FOUND || status.is_server_error() {
+        BackendPostError::Transient(err)
+    } else {
+        BackendPostError::Permanent(err)
+    }
+}
+
 /// Minimal HTTP client for ASAPQuery-backend's streaming-config endpoint.
 /// Built once at control-plane startup from the
 /// `CONTROL_PLANE_BACKEND_ENDPOINT` environment variable and shared
@@ -129,6 +200,79 @@ impl BackendClient {
                 status,
                 body
             ))
+        }
+    }
+
+    /// Typed sibling of [`Self::post_streaming_config_json`] for the
+    /// retry layer. Returns the same `Ok(())` on 2xx, but on failure
+    /// classifies the underlying cause as [`BackendPostError::Transient`]
+    /// or [`BackendPostError::Permanent`] so the caller can decide
+    /// whether another attempt is worthwhile.
+    ///
+    /// Public-interface preservation: the existing
+    /// [`Self::post_streaming_config_json`] remains untouched — callers
+    /// that don't need retry semantics keep their `anyhow::Result`
+    /// shape. The retry layer in `emit::backend_push` uses this typed
+    /// variant.
+    pub async fn post_streaming_config_json_typed(
+        &self,
+        json: String,
+    ) -> std::result::Result<(), BackendPostError> {
+        debug!(
+            endpoint = %self.endpoint,
+            json_bytes = json.len(),
+            "posting streaming-config JSON to ASAPQuery-backend (typed)"
+        );
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .header("content-type", "application/json")
+            .body(json)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(classify_http_status(
+                status,
+                body,
+                "streaming-config JSON POST",
+            ))
+        }
+    }
+
+    /// Typed sibling of [`Self::post_storage_routing_json`] for the
+    /// retry layer. Identical contract to
+    /// [`Self::post_streaming_config_json_typed`].
+    pub async fn post_storage_routing_json_typed(
+        &self,
+        json: String,
+    ) -> std::result::Result<(), BackendPostError> {
+        let url = derive_storage_routing_url(&self.endpoint);
+        debug!(
+            endpoint = %url,
+            json_bytes = json.len(),
+            "posting storage-routing JSON to ASAPQuery-backend (typed)"
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(json)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(classify_http_status(status, body, "storage-routing JSON POST"))
         }
     }
 
@@ -395,6 +539,83 @@ mod tests {
         let received = sink.0.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0], json);
+    }
+
+    /// Typed-variant classification: 404 from the backend is
+    /// transient (route not yet registered during startup race).
+    #[tokio::test]
+    async fn typed_streaming_config_404_is_transient() {
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::NOT_FOUND).await;
+
+        let client = BackendClient::new(url);
+        let err = client
+            .post_streaming_config_json_typed("{}".to_string())
+            .await
+            .expect_err("404 should surface as Err");
+        assert!(err.is_transient(), "404 must classify as transient: {err}");
+    }
+
+    /// Typed-variant classification: 500 is transient.
+    #[tokio::test]
+    async fn typed_streaming_config_500_is_transient() {
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let url =
+            start_mock_backend(sink.clone(), axum::http::StatusCode::INTERNAL_SERVER_ERROR).await;
+
+        let client = BackendClient::new(url);
+        let err = client
+            .post_streaming_config_json_typed("{}".to_string())
+            .await
+            .expect_err("500 should surface as Err");
+        assert!(err.is_transient(), "500 must classify as transient: {err}");
+    }
+
+    /// Typed-variant classification: 400 (other 4xx) is permanent —
+    /// retrying won't fix a malformed payload.
+    #[tokio::test]
+    async fn typed_streaming_config_400_is_permanent() {
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::BAD_REQUEST).await;
+
+        let client = BackendClient::new(url);
+        let err = client
+            .post_streaming_config_json_typed("{}".to_string())
+            .await
+            .expect_err("400 should surface as Err");
+        assert!(
+            !err.is_transient(),
+            "400 must classify as permanent: {err}"
+        );
+    }
+
+    /// Typed-variant classification: connection refused (no listener
+    /// on the target port) is transient — the backend may still be
+    /// binding.
+    #[tokio::test]
+    async fn typed_connection_refused_is_transient() {
+        // Port 1 on loopback is reserved and refuses connections.
+        let client = BackendClient::new("http://127.0.0.1:1/api/v1/streaming-config");
+        let err = client
+            .post_streaming_config_json_typed("{}".to_string())
+            .await
+            .expect_err("connection refused should surface as Err");
+        assert!(
+            err.is_transient(),
+            "connection-refused must classify as transient: {err}"
+        );
+    }
+
+    /// Typed-variant happy path: 2xx returns Ok.
+    #[tokio::test]
+    async fn typed_streaming_config_success_is_ok() {
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::OK).await;
+        let client = BackendClient::new(url);
+        client
+            .post_streaming_config_json_typed("{}".to_string())
+            .await
+            .expect("2xx must be Ok");
     }
 
     #[tokio::test]
