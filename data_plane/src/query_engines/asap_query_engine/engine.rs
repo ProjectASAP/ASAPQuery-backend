@@ -56,6 +56,24 @@ pub struct ASAPQueryEngine {
     /// the rest of the routing matrix.
     archive_engine: Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>}
 
+/// Lifted shape of a `topk(K, sum by (gbk) (rate(metric[r])))` (or
+/// `bottomk` / `irate`) query. Produced by
+/// [`ASAPQueryEngine::extract_topk_over_rate_shape`] when the
+/// analyzer-driven candidate path can't bind to any sid; lets the
+/// engine synthesize an ExactAgg(Sum) fallback that runs
+/// `evaluate_exact_agg_rate` and post-applies the top-/bottom-k slice
+/// in-engine. Scoped tight to the multinode demo shape — broader
+/// "frequency-with-fallback" compositions are deferred.
+#[derive(Debug, Clone)]
+struct TopkOverRateShape {
+    k: usize,
+    /// `true` for `topk` (descending), `false` for `bottomk` (ascending).
+    is_topk: bool,
+    metric_name: String,
+    group_by_keys: std::collections::BTreeSet<String>,
+    range_seconds: u64,
+}
+
 impl ASAPQueryEngine {
     /// Construct a `ASAPQueryEngine` with a static `Arc<StreamingConfig>`.
     /// Wraps the config in a fresh `HotReloadStreamingConfig` internally
@@ -243,6 +261,327 @@ impl ASAPQueryEngine {
         })
     }
 
+    /// Detect whether the raw PromQL contains a `rate(...)` or
+    /// `irate(...)` call anywhere in the expression tree. Used by the
+    /// engine to route ExactAgg(Sum) candidates through the
+    /// rate-divisor reducer (`evaluate_exact_agg_rate`) instead of the
+    /// plain per-window reducer.
+    ///
+    /// The control plane's analyzer collapses `rate(metric[r])` to the
+    /// same `Capability::ExactAgg(Sum)` candidate that `sum(metric)`
+    /// uses — the trace carries `range_seconds` and `function` strings
+    /// but for the composed shape `sum by (zone) (rate(metric[r]))` the
+    /// outer function string is `"sum"` (not `"rate"`), so we can't
+    /// disambiguate `sum_over_time(...)` from `sum(rate(...))` from the
+    /// candidate alone. Walking the raw PromQL AST is the cleanest
+    /// disambiguator that doesn't require analyzer changes.
+    ///
+    /// Returns `false` for unparseable input (the analyzer would have
+    /// already rejected — defensive).
+    fn query_contains_rate_call(query: &str) -> bool {
+        use promql_parser::parser::Expr;
+        let ast = match promql_parser::parser::parse(query) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        fn walk(expr: &Expr) -> bool {
+            match expr {
+                Expr::Call(call) => {
+                    let name = call.func.name.to_lowercase();
+                    if name == "rate" || name == "irate" {
+                        return true;
+                    }
+                    call.args.args.iter().any(|a| walk(a))
+                }
+                Expr::Aggregate(agg) => walk(&agg.expr),
+                Expr::Paren(p) => walk(&p.expr),
+                Expr::Subquery(sq) => walk(&sq.expr),
+                Expr::Binary(b) => walk(&b.lhs) || walk(&b.rhs),
+                Expr::Unary(u) => walk(&u.expr),
+                _ => false,
+            }
+        }
+        walk(&ast)
+    }
+
+    /// Detect a `topk(k, <inner>)` (or `bottomk`) at the root of the
+    /// PromQL AST and lift `(k, inner_metric, inner_group_by_keys,
+    /// inner_range_seconds, is_topk)`. The `is_topk` flag distinguishes
+    /// `topk` (descending slice) from `bottomk` (ascending slice).
+    /// Returns `None` for any non-topk-shaped query, or for shapes the
+    /// fallback path doesn't try to recover (the analyzer's path is
+    /// preferred whenever it succeeds — this helper only fires when
+    /// analyzer candidates fail to bind to any sid).
+    ///
+    /// Specifically matches the multinode demo shape:
+    ///   `topk(K, sum by (gbk...) (rate(metric[r])))`
+    /// — plus its `bottomk` / `irate` variants. The synthesized
+    /// `ExactAgg(Sum)` candidate uses the inner `metric` +
+    /// `group_by_keys` for `instances_matching` and the inner range
+    /// for the rate divisor.
+    fn extract_topk_over_rate_shape(
+        query: &str,
+    ) -> Option<TopkOverRateShape> {
+        use promql_parser::parser::{Expr, LabelModifier};
+        let ast = promql_parser::parser::parse(query).ok()?;
+        // Strip a leading Paren so `(topk(...))` works.
+        fn unparen(e: &Expr) -> &Expr {
+            match e {
+                Expr::Paren(p) => unparen(&p.expr),
+                other => other,
+            }
+        }
+        let root = unparen(&ast);
+        let agg = match root {
+            Expr::Aggregate(a) => a,
+            _ => return None,
+        };
+        let op = agg.op.to_string().to_lowercase();
+        let is_topk = match op.as_str() {
+            "topk" => true,
+            "bottomk" => false,
+            _ => return None,
+        };
+        let k = match agg.param.as_ref() {
+            Some(p) => match p.as_ref() {
+                Expr::NumberLiteral(nl) => nl.val as usize,
+                _ => return None,
+            },
+            None => return None,
+        };
+        if k == 0 {
+            return None;
+        }
+        // Walk the inner expression to find (group_by_keys,
+        // range_seconds, metric_name). For the multinode demo shape
+        // the inner is a `sum by (zone) (...)` Aggregate whose own
+        // inner is a Call("rate", [MatrixSelector(metric[r])]).
+        // Also accept `topk(K, rate(metric[r]))` (no inner sum) — the
+        // implicit group is each metric series.
+        let inner = unparen(&agg.expr);
+
+        let mut group_by_keys: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        let inner_expr = if let Expr::Aggregate(inner_agg) = inner {
+            // `sum by (gbk) (...)`; capture the by-modifier and recurse
+            // into its expr to find rate(...) below.
+            if let Some(LabelModifier::Include(labels)) = &inner_agg.modifier {
+                for l in &labels.labels {
+                    group_by_keys.insert(l.clone());
+                }
+            }
+            // Only `sum`-like inner aggregates compose meaningfully
+            // with rate(...) under topk for ExactAgg(Sum) fallback;
+            // anything else (avg/min/max/count) doesn't safely
+            // reduce to a per-(group) Σwindow_sum / range.
+            let inner_op = inner_agg.op.to_string().to_lowercase();
+            if !matches!(inner_op.as_str(), "sum") {
+                return None;
+            }
+            unparen(&inner_agg.expr)
+        } else {
+            inner
+        };
+
+        // `inner_expr` should be a Call("rate"/"irate", [MatrixSelector]).
+        let call = match inner_expr {
+            Expr::Call(c) => c,
+            _ => return None,
+        };
+        let call_name = call.func.name.to_lowercase();
+        if !matches!(call_name.as_str(), "rate" | "irate") {
+            return None;
+        }
+        let matrix = call.args.args.iter().find_map(|a| match a.as_ref() {
+            Expr::MatrixSelector(ms) => Some(ms),
+            _ => None,
+        })?;
+        let range_seconds = matrix.range.as_secs();
+        if range_seconds == 0 {
+            return None;
+        }
+        let metric_name = matrix.vs.name.clone().unwrap_or_else(|| {
+            // Fallback: pull `__name__` out of matchers.
+            matrix
+                .vs
+                .matchers
+                .matchers
+                .iter()
+                .find(|m| m.name == "__name__")
+                .map(|m| m.value.clone())
+                .unwrap_or_default()
+        });
+        if metric_name.is_empty() {
+            return None;
+        }
+        Some(TopkOverRateShape {
+            k,
+            is_topk,
+            metric_name,
+            group_by_keys,
+            range_seconds,
+        })
+    }
+
+    /// Engine-side fallback for `topk(K, sum by (gbk) (rate(metric[r])))`
+    /// shapes that the control plane's analyzer routes to FrequencyTopk
+    /// + FrequencyEstimate (because PromQL's `topk` lowers to
+    /// `AggIntent::TopK` and the optimizer's CMS-topk binder rewrites
+    /// the inner Sum into Frequency). Those capabilities don't match
+    /// the ExactAgg(Sum) sids the MVP demo registers — without this
+    /// fallback the multinode demo query falls over to archive.
+    ///
+    /// Approach:
+    /// 1. Lift `(K, metric, group_by_keys, range_seconds, is_topk)`
+    ///    from the raw PromQL AST via [`Self::extract_topk_over_rate_shape`].
+    /// 2. Find ExactAgg(Sum) sids via `instances_matching(metric, gbk)`
+    ///    (subset-match, mirrors the analyzer-driven path).
+    /// 3. Run `evaluate_exact_agg_rate` to fold per-(group) rates.
+    /// 4. Post-apply the top-/bottom-k slice in-engine: sort each
+    ///    series by its last-sample value descending (topk) or
+    ///    ascending (bottomk) and keep the first `K`.
+    ///
+    /// Returns:
+    /// * `Ok(Some(QueryResult))` — fallback fired and produced a vector
+    ///   result; engine should return this directly.
+    /// * `Ok(None)` — shape didn't match (analyzer-driven path should
+    ///   run unchanged).
+    /// * `Err(_)` — shape matched but execution failed (no sids found,
+    ///   no in-window data, reducer error etc.); callers can choose
+    ///   to surface as CapabilityMiss → archive failover.
+    fn try_topk_over_rate_fallback(
+        &self,
+        query: &str,
+        now_ms: u64,
+    ) -> Result<
+        Option<crate::query_engines::query_result::QueryResult>,
+        crate::query_engines::EngineError,
+    > {
+        let Some(idx) = self.sketch_index.as_ref() else {
+            return Ok(None);
+        };
+        let Some(shape) = Self::extract_topk_over_rate_shape(query) else {
+            return Ok(None);
+        };
+
+        // Find ExactAgg(Sum)-class sids for (metric, gbk). The
+        // instances_matching call is subset-match: a sid registered
+        // with `[zone, rack, node]` answers a `[zone]` query, matching
+        // the rest of the engine's sid-resolution semantics.
+        let candidate_sids: Vec<u64> =
+            idx.instances_matching(&shape.metric_name, &shape.group_by_keys);
+        if candidate_sids.is_empty() {
+            // No sids at all — let the analyzer-driven path produce
+            // its standard "no policy" error.
+            return Ok(None);
+        }
+        // Filter to ExactAgg(Sum-family) sids only — frequency sids
+        // for the same metric should fall back to the analyzer's
+        // FrequencyTopk path (which will rightly capability-miss
+        // until CMS-with-heap is wired).
+        let mut hit_sids: Vec<u64> = Vec::new();
+        for sid in &candidate_sids {
+            let Some(meta) = idx.instance(*sid) else { continue };
+            if let Some(cap) = meta.capability.as_ref() {
+                use crate::storage_engines::sketch_db::data::AggregationType;
+                use crate::storage_engines::sketch_db::index::Capability;
+                if matches!(
+                    cap,
+                    Capability::ExactAgg(
+                        AggregationType::Sum
+                            | AggregationType::MultipleSum
+                            | AggregationType::Increase
+                            | AggregationType::MultipleIncrease
+                    )
+                ) {
+                    hit_sids.push(*sid);
+                }
+            }
+        }
+        if hit_sids.is_empty() {
+            return Ok(None);
+        }
+
+        // Pick the agg_type from the first sid; all hits share the
+        // same family by construction (Sum / Increase variants are
+        // accumulator-compatible via `merge_with` / `Statistic::Sum`).
+        let agg_type = {
+            use crate::storage_engines::sketch_db::data::AggregationType;
+            let first = idx.instance(hit_sids[0]).and_then(|m| {
+                match m.capability.as_ref()? {
+                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(t) => Some(*t),
+                    _ => None,
+                }
+            });
+            first.unwrap_or(AggregationType::Sum)
+        };
+
+        let lookback_ms = shape.range_seconds.saturating_mul(1000);
+        let t0_ms = now_ms.saturating_sub(lookback_ms);
+
+        let reducer = crate::storage_engines::sketch_db::query::SketchReducer::new(idx);
+        let result = reducer
+            .evaluate_exact_agg_rate(
+                &hit_sids,
+                agg_type,
+                &shape.group_by_keys,
+                shape.range_seconds,
+                t0_ms,
+                now_ms,
+            )
+            .map_err(|e| {
+                crate::query_engines::EngineError::capability_miss(
+                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    format!(
+                        "SketchStore topk-over-rate fallback reducer failed for `{query}`: \
+                         {e:?} — failing over to archive"
+                    ),
+                )
+            })?;
+
+        // Post-apply topk / bottomk: sort series by their (single)
+        // sample value and slice. `evaluate_exact_agg_rate` emits ONE
+        // sample per series so the comparison is unambiguous.
+        let mut series_with_value: Vec<(
+            std::collections::BTreeMap<String, String>,
+            Vec<(i64, f64)>,
+            f64,
+        )> = result
+            .series
+            .into_iter()
+            .filter_map(|(labels, samples)| {
+                let v = samples.last().map(|(_, v)| *v)?;
+                Some((labels, samples, v))
+            })
+            .collect();
+        // Sort: topk = descending by value, bottomk = ascending.
+        if shape.is_topk {
+            series_with_value.sort_by(|a, b| {
+                b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            series_with_value.sort_by(|a, b| {
+                a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        series_with_value.truncate(shape.k);
+        let sliced: Vec<(std::collections::BTreeMap<String, String>, Vec<(i64, f64)>)> =
+            series_with_value
+                .into_iter()
+                .map(|(l, s, _)| (l, s))
+                .collect();
+
+        let sliced_result = crate::storage_engines::sketch_db::query::ASAPTierResult {
+            series: sliced,
+            coverage: result.coverage,
+        };
+        // Instant-query result shape (Vector, not Matrix). topk over
+        // an instant aggregation is itself an instant vector — one
+        // value per series in the slice.
+        let qr = asap_tier_result_to_query_result(sliced_result, now_ms, false);
+        Ok(Some(qr))
+    }
+
     #[cfg(test)]
     fn query_precompute_for_statistic(
         &self,
@@ -412,27 +751,62 @@ impl ASAPQueryEngine {
 
             // ExactAgg capability → dispatch the per-(group_by_keys)
             // accumulator-merge path; sketch capabilities → the
-            // sketch-decode path. See `SketchReducer::evaluate_exact_agg`
-            // for the ExactAgg path's semantics.
+            // sketch-decode path. For ExactAgg(Sum-family) candidates,
+            // if the raw PromQL contains a `rate(...)` / `irate(...)`
+            // call AND the candidate's range_seconds > 0, dispatch to
+            // `evaluate_exact_agg_rate` instead — that path folds all
+            // sub-window sums and divides by the range to produce
+            // events-per-second. See `SketchReducer::evaluate_exact_agg`
+            // / `evaluate_exact_agg_rate` for the per-path semantics.
             let result = match &candidate.required_capability {
                 crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
-                    reducer
-                        .evaluate_exact_agg(
-                            &hit_sids,
-                            *agg_type,
-                            &candidate.group_by_keys,
-                            start_ms,
-                            end_ms,
-                        )
-                        .map_err(|e| {
-                            crate::query_engines::EngineError::capability_miss(
-                                asap_types::StorageBackend::SketchStore.data_source_id(),
-                                format!(
-                                    "SketchStore exact-agg reducer failed for `{query}` over \
-                                     [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                                ),
+                    let use_rate_path = candidate.range_seconds > 0
+                        && Self::query_contains_rate_call(query)
+                        && matches!(
+                            agg_type,
+                            crate::storage_engines::sketch_db::data::AggregationType::Sum
+                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
+                                | crate::storage_engines::sketch_db::data::AggregationType::Increase
+                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
+                        );
+                    if use_rate_path {
+                        reducer
+                            .evaluate_exact_agg_rate(
+                                &hit_sids,
+                                *agg_type,
+                                &candidate.group_by_keys,
+                                candidate.range_seconds,
+                                start_ms,
+                                end_ms,
                             )
-                        })?
+                            .map_err(|e| {
+                                crate::query_engines::EngineError::capability_miss(
+                                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                                    format!(
+                                        "SketchStore exact-agg rate reducer failed for `{query}` over \
+                                         [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                                    ),
+                                )
+                            })?
+                    } else {
+                        reducer
+                            .evaluate_exact_agg(
+                                &hit_sids,
+                                *agg_type,
+                                &candidate.group_by_keys,
+                                start_ms,
+                                end_ms,
+                            )
+                            .map_err(|e| {
+                                crate::query_engines::EngineError::capability_miss(
+                                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                                    format!(
+                                        "SketchStore exact-agg reducer failed for `{query}` over \
+                                         [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                                    ),
+                                )
+                            })?
+                    }
                 }
                 _ => reducer
                     .evaluate(
@@ -663,6 +1037,29 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         if let Some(idx) = self.sketch_index.as_ref() {
             let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
+            // ── topk-over-rate fallback (multinode demo) ────────────
+            // Detect `topk(K, sum by (gbk) (rate(metric[r])))` shapes
+            // upfront and route them to the ExactAgg(Sum) reducer +
+            // engine-side topk slice. The analyzer's lowerer rewrites
+            // this shape into FrequencyTopk + FrequencyEstimate
+            // candidates which don't match ExactAgg(Sum) sids — so the
+            // analyzer-driven path below would CapabilityMiss. The
+            // fallback returns `Ok(None)` when the shape doesn't match
+            // OR no ExactAgg(Sum) sids exist, letting the
+            // analyzer-driven path run as usual.
+            //
+            // Defer the `let _ = idx` capture: the helper takes `&self`
+            // and re-reads `sketch_index` internally.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match self.try_topk_over_rate_fallback(query, now_ms) {
+                Ok(Some(qr)) => return Ok(qr),
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+
             // Branch 1 — the control plane analyzer rejects the shape.
             if let Some(reason) = &analysis.unsupported {
                 return Err(crate::query_engines::EngineError::capability_miss(
@@ -691,10 +1088,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // dispatch the reducer. Today this is single-candidate
             // for every supported PromQL shape; the loop is here
             // for the per-candidate hybrid-stitch follow-up.
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            // `now_ms` is captured above (also used by the
+            // topk-over-rate fallback).
             // Time bounds: the trait's `execute(&str)` adapter
             // doesn't carry an explicit range today (it's an
             // instant-query surface). For each candidate, prefer the
@@ -855,7 +1250,39 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `SumAccumulator` / `IncreaseAccumulator` /
                 // `MinMaxAccumulator` etc.) rather than opaque sketch
                 // bytes, so they need a different reducer entry point.
+                //
+                // ExactAgg(Sum-family) candidates whose raw query
+                // contains `rate(...)` / `irate(...)` AND
+                // `range_seconds > 0` dispatch to the rate variant
+                // (`evaluate_exact_agg_rate`) — that path folds every
+                // sub-window sum across the range and divides by the
+                // range to produce events-per-second, matching PromQL
+                // `rate` semantics. Composed shapes like
+                // `sum by (zone) (rate(metric[5m]))` go through here
+                // too (function="sum" but range_seconds=300 from the
+                // inner rate's matrix selector, picked up by the
+                // analyzer trace).
+                let use_rate_path = matches!(
+                    &candidate.required_capability,
+                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                        crate::storage_engines::sketch_db::data::AggregationType::Sum
+                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
+                            | crate::storage_engines::sketch_db::data::AggregationType::Increase
+                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
+                    )
+                ) && candidate.range_seconds > 0
+                    && Self::query_contains_rate_call(query);
                 let reducer_result = match &candidate.required_capability {
+                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                        agg_type,
+                    ) if use_rate_path => reducer.evaluate_exact_agg_rate(
+                        &hit_sids,
+                        *agg_type,
+                        &candidate.group_by_keys,
+                        candidate.range_seconds,
+                        t0_ms,
+                        now_ms,
+                    ),
                     crate::storage_engines::sketch_db::index::Capability::ExactAgg(
                         agg_type,
                     ) => reducer.evaluate_exact_agg(
@@ -1878,6 +2305,350 @@ mod asap_tier_classify_tests {
         assert_eq!(by_zone.get("z1").copied(), Some(200.0));
         assert_eq!(by_zone.get("z2").copied(), Some(300.0));
         assert_eq!(by_zone.get("z3").copied(), Some(400.0));
+    }
+
+    /// `rate(http_requests_total[5m])` end-to-end via `execute(&str)`.
+    /// The analyzer hands the engine `Capability::ExactAgg(Sum)` with
+    /// `function="rate"` and `range_seconds=300`; the engine must
+    /// dispatch to `evaluate_exact_agg_rate` (not the per-window
+    /// `evaluate_exact_agg`) so each output sample carries
+    /// events-per-second, not the raw per-window sum.
+    #[tokio::test]
+    async fn execute_rate_dispatches_to_exact_agg_rate_reducer() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        // Two zones, each its own sid, two windows each. Per-zone
+        // per-window sums chosen so the rate over 300s is a clean
+        // integer: zone z0 → 600+600 / 300 = 4.0; z1 → 900+900 / 300
+        // = 6.0.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w1_start = now_ms.saturating_sub(120_000);
+        let w1_end = now_ms.saturating_sub(60_000);
+        let w2_start = w1_end;
+        let w2_end = now_ms.saturating_sub(1_000);
+
+        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
+            let sid = 11_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
+                let mut lm = BTreeMap::new();
+                lm.insert("zone".to_string(), zone.to_string());
+                idx.append_precompute(
+                    sid,
+                    lm,
+                    (ws, we),
+                    Box::new(SumAccumulator::with_sum(*per_window)),
+                );
+            }
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("rate(http_requests_total[5m])")
+            .await
+            .expect("rate must dispatch to ExactAgg rate reducer, not capability-miss");
+
+        // Instant vector with two entries (one per natural series —
+        // there's no outer aggregation collapsing zones).
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        assert_eq!(vector.values.len(), 2, "one entry per per-sid series");
+        let mut by_zone: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for el in &vector.values {
+            let keys = el
+                .label_keys_override
+                .as_ref()
+                .expect("label keys override populated");
+            let vals = &el.labels.labels;
+            let zone_idx = keys
+                .iter()
+                .position(|k| k == "zone")
+                .expect("zone key present");
+            by_zone.insert(vals[zone_idx].clone(), el.value);
+        }
+        // Values are per-second rates, not raw per-window sums.
+        // (600 + 600) / 300 = 4.0; (900 + 900) / 300 = 6.0.
+        let z0 = by_zone.get("z0").copied().expect("zone z0 present");
+        let z1 = by_zone.get("z1").copied().expect("zone z1 present");
+        assert!((z0 - 4.0).abs() < 1e-9, "z0 rate expected 4.0, got {z0}");
+        assert!((z1 - 6.0).abs() < 1e-9, "z1 rate expected 6.0, got {z1}");
+    }
+
+    /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.
+    /// The analyzer gives `Capability::ExactAgg(Sum)` with
+    /// `function="sum"` (outer) and `range_seconds=300` (lifted from
+    /// the inner rate's matrix selector). The engine's
+    /// `query_contains_rate_call` walker detects the inner rate and
+    /// dispatches to `evaluate_exact_agg_rate`, which folds the per-
+    /// zone per-window sums and divides by 300.
+    #[tokio::test]
+    async fn execute_sum_by_zone_rate_dispatches_to_exact_agg_rate_reducer() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        // Four zones. Two windows each; per-zone sums chosen so the
+        // per-zone rate over 300s is a clean integer.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w1_start = now_ms.saturating_sub(120_000);
+        let w1_end = now_ms.saturating_sub(60_000);
+        let w2_start = w1_end;
+        let w2_end = now_ms.saturating_sub(1_000);
+
+        let zones = ["z0", "z1", "z2", "z3"];
+        for (i, zone) in zones.iter().enumerate() {
+            let sid = 12_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            // per_window: 300, 600, 900, 1200 → per-zone rates over
+            // 300s are 2, 4, 6, 8.
+            let per_window = ((i + 1) * 300) as f64;
+            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
+                let mut lm = BTreeMap::new();
+                lm.insert("zone".to_string(), zone.to_string());
+                idx.append_precompute(
+                    sid,
+                    lm,
+                    (ws, we),
+                    Box::new(SumAccumulator::with_sum(per_window)),
+                );
+            }
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("sum by (zone) (rate(http_requests_total[5m]))")
+            .await
+            .expect("composed sum-rate must dispatch via rate reducer, not capability-miss");
+
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        assert_eq!(vector.values.len(), 4, "one entry per zone");
+        let mut by_zone: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for el in &vector.values {
+            let keys = el
+                .label_keys_override
+                .as_ref()
+                .expect("override populated");
+            let vals = &el.labels.labels;
+            let zone_idx = keys.iter().position(|k| k == "zone").expect("zone key present");
+            by_zone.insert(vals[zone_idx].clone(), el.value);
+        }
+        for (zone, expected) in [("z0", 2.0_f64), ("z1", 4.0), ("z2", 6.0), ("z3", 8.0)] {
+            let got = by_zone.get(zone).copied().unwrap_or(f64::NAN);
+            assert!((got - expected).abs() < 1e-9, "{zone} expected {expected}, got {got}");
+        }
+    }
+
+    /// `topk(5, sum by (zone) (rate(http_requests_total[5m])))` —
+    /// the multinode demo's flagship query. The control-plane analyzer
+    /// rewrites the inner sum/rate into FrequencyTopk + FrequencyEstimate
+    /// candidates (the optimizer's CMS-topk binder) which the
+    /// ExactAgg(Sum) sids can't satisfy. The engine's
+    /// `try_topk_over_rate_fallback` lifts the shape from the raw
+    /// PromQL, finds the ExactAgg(Sum) sids via `instances_matching`,
+    /// runs `evaluate_exact_agg_rate`, and slices the top-K by descending
+    /// value. With K=5 and 4 zones the result is all 4 zones sorted
+    /// descending.
+    #[tokio::test]
+    async fn execute_topk_over_sum_by_zone_rate_uses_fallback() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w_start = now_ms.saturating_sub(60_000);
+        let w_end = now_ms.saturating_sub(1_000);
+
+        // Four zones with distinct per-window sums → distinct rates.
+        let zones = ["z0", "z1", "z2", "z3"];
+        for (i, zone) in zones.iter().enumerate() {
+            let sid = 13_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            let per_window = ((i + 1) * 300) as f64;
+            let mut lm = BTreeMap::new();
+            lm.insert("zone".to_string(), zone.to_string());
+            idx.append_precompute(
+                sid,
+                lm,
+                (w_start, w_end),
+                Box::new(SumAccumulator::with_sum(per_window)),
+            );
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("topk(5, sum by (zone) (rate(http_requests_total[5m])))")
+            .await
+            .expect(
+                "topk over sum-rate must route through the ExactAgg(Sum) fallback, \
+                 not capability-miss",
+            );
+
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        // K=5, only 4 zones — all 4 returned.
+        assert_eq!(vector.values.len(), 4, "all 4 zones returned (k≥n)");
+        // Slice ordering: descending by value. Read off values in
+        // emit order and pair with their zone label.
+        let mut ordered: Vec<(String, f64)> = Vec::new();
+        for el in &vector.values {
+            let keys = el
+                .label_keys_override
+                .as_ref()
+                .expect("override populated");
+            let vals = &el.labels.labels;
+            let zone_idx = keys
+                .iter()
+                .position(|k| k == "zone")
+                .expect("zone key present");
+            ordered.push((vals[zone_idx].clone(), el.value));
+        }
+        // Per-window sums 300,600,900,1200 / 300s = 1, 2, 3, 4 → topk
+        // descending = z3, z2, z1, z0.
+        let labels_in_order: Vec<&str> =
+            ordered.iter().map(|(z, _)| z.as_str()).collect();
+        assert_eq!(
+            labels_in_order,
+            vec!["z3", "z2", "z1", "z0"],
+            "topk emits zones in descending rate order: {ordered:?}"
+        );
+        assert!((ordered[0].1 - 4.0).abs() < 1e-9);
+        assert!((ordered[3].1 - 1.0).abs() < 1e-9);
+    }
+
+    /// `topk(2, sum by (zone) (rate(...)))` — same shape but K < n,
+    /// so the fallback must truncate to the top 2 by descending rate.
+    #[tokio::test]
+    async fn execute_topk_2_slices_to_top_2() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w_start = now_ms.saturating_sub(60_000);
+        let w_end = now_ms.saturating_sub(1_000);
+
+        for (i, zone) in ["z0", "z1", "z2", "z3"].iter().enumerate() {
+            let sid = 14_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            let mut lm = BTreeMap::new();
+            lm.insert("zone".to_string(), zone.to_string());
+            idx.append_precompute(
+                sid,
+                lm,
+                (w_start, w_end),
+                Box::new(SumAccumulator::with_sum(((i + 1) * 300) as f64)),
+            );
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("topk(2, sum by (zone) (rate(http_requests_total[5m])))")
+            .await
+            .expect("topk fallback ok");
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        assert_eq!(vector.values.len(), 2, "K=2 keeps only top 2 entries");
+        // Top 2 in descending order = z3 (rate 4), z2 (rate 3).
+        let zones: Vec<String> = vector
+            .values
+            .iter()
+            .map(|el| {
+                let keys = el.label_keys_override.as_ref().unwrap();
+                let vals = &el.labels.labels;
+                let z = keys.iter().position(|k| k == "zone").unwrap();
+                vals[z].clone()
+            })
+            .collect();
+        assert_eq!(zones, vec!["z3".to_string(), "z2".to_string()]);
     }
 }
 
