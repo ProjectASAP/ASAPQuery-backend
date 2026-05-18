@@ -1,4 +1,5 @@
 use crate::storage_engines::types::AggregateCore;
+use asap_types::PolicyFingerprint;
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::fmt;
@@ -7,6 +8,20 @@ use tokio::sync::mpsc;
 use xxhash_rust::xxh64::xxh64;
 
 /// A message sent from the router to a worker.
+///
+/// B7.6 (schema-retirement #5): the per-group bucket key on `GroupSamples`
+/// and `AccumulatorInput` is now a single `sid` (registry-allocated by
+/// `SeriesIdResolver`), not the `(agg_id, group_key)` tuple. The grouping
+/// label values are already folded into the sid via the
+/// `(metric, attrs_fingerprint, agg_kind)` identity contract — so one sid
+/// uniquely names one bucket, with no extra discriminator needed for
+/// hashing or pane lookup. `group_key` and `policy_fp` still travel
+/// alongside the sid: `group_key` is consumed at emit-time to render the
+/// output label vector; `policy_fp` is the handle the worker uses to fetch
+/// the source `AggregationConfig` from the hot-reload snapshot (window
+/// shape, late-data policy, etc.). Together they let the worker key state
+/// by sid without losing the data the legacy `(agg_id, group_key)` shape
+/// carried.
 pub enum WorkerMessage {
     /// A batch of samples for the same series, routed by series key.
     /// Used in `pass_raw_samples` mode where no aggregation is needed.
@@ -15,13 +30,24 @@ pub enum WorkerMessage {
         samples: Vec<(i64, f64)>, // (timestamp_ms, value)
         ingest_received_at: Instant,
     },
-    /// A batch of samples destined for a specific aggregation group.
-    /// All samples share the same (agg_id, group_key) and are fed into
-    /// a single shared accumulator (like Arroyo's GROUP BY).
+    /// A batch of samples destined for a specific sid (group bucket).
+    /// All samples share the same `sid` and are fed into a single shared
+    /// accumulator (like Arroyo's GROUP BY). `sid` is the registry-
+    /// allocated identity for `(metric, attrs, agg_kind)`; `policy_fp` is
+    /// the source config's content-addressed fingerprint; `group_key` is
+    /// kept for emit-time label rendering.
     GroupSamples {
-        agg_id: u64,
+        /// Registry-allocated bucket identity. Folds in
+        /// `(metric, attrs_fingerprint, agg_kind_canonical)` — see
+        /// `SeriesIdResolver::resolve`. Worker keys `group_states` on this.
+        sid: u64,
+        /// Source `AggregationConfig` fingerprint. Worker looks up its
+        /// `AggregationConfig` (window size, sketch kind/config, late
+        /// data policy, etc.) via `snap.get_aggregation_config(policy_fp.as_u64())`.
+        policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons (e.g. "constant").
-        /// Empty string if the aggregation has no grouping labels.
+        /// Empty string if the aggregation has no grouping labels. Used
+        /// at emit time to render the output's `KeyByLabelValues`.
         group_key: String,
         /// Each entry: (series_key, timestamp_ms, value).
         /// series_key is needed for keyed (MultipleSubpopulation) accumulators
@@ -29,19 +55,26 @@ pub enum WorkerMessage {
         samples: Vec<(String, i64, f64)>,
         ingest_received_at: Instant,
     },
-    /// A pre-built accumulator destined for a specific (agg_id, group_key)
-    /// pane. The worker merges it into that pane's existing accumulator
-    /// (or inserts it if the pane is empty) via `AggregateCore::merge_with`.
+    /// A pre-built accumulator destined for a specific sid's pane. The
+    /// worker merges it into that pane's existing accumulator (or
+    /// inserts it if the pane is empty) via `AggregateCore::merge_with`.
     ///
     /// Produced by ingest sources that deliver pre-aggregated sketches —
     /// e.g. the OTLP receiver when DataCollector emits KLL / CountMin /
     /// CountSketch payloads on a `SketchEnvelope`. Lets the precompute
     /// engine perform further window-aligned aggregation on sketches the
     /// same way it does on raw samples.
+    ///
+    /// Same sid / policy_fp / group_key contract as `GroupSamples`.
     AccumulatorInput {
-        agg_id: u64,
+        /// Registry-allocated bucket identity; see `GroupSamples::sid`.
+        sid: u64,
+        /// Source `AggregationConfig` fingerprint; see
+        /// `GroupSamples::policy_fp`.
+        policy_fp: PolicyFingerprint,
         /// Grouping label values joined by semicolons, matching the
         /// format produced by `IngestState::extract_group_key_for`.
+        /// Used at emit time to render the output's `KeyByLabelValues`.
         group_key: String,
         /// Wall-clock timestamp the sketch refers to (millis since epoch).
         /// Used to place the sketch into the correct pane.
@@ -69,25 +102,25 @@ impl fmt::Debug for WorkerMessage {
                 .field("sample_count", &samples.len())
                 .finish(),
             Self::GroupSamples {
-                agg_id,
+                sid,
                 group_key,
                 samples,
                 ..
             } => f
                 .debug_struct("GroupSamples")
-                .field("agg_id", agg_id)
+                .field("sid", sid)
                 .field("group_key", group_key)
                 .field("sample_count", &samples.len())
                 .finish(),
             Self::AccumulatorInput {
-                agg_id,
+                sid,
                 group_key,
                 timestamp_ms,
                 accumulator,
                 ..
             } => f
                 .debug_struct("AccumulatorInput")
-                .field("agg_id", agg_id)
+                .field("sid", sid)
                 .field("group_key", group_key)
                 .field("timestamp_ms", timestamp_ms)
                 .field("accumulator_type", &accumulator.type_name())
@@ -115,8 +148,10 @@ impl SeriesRouter {
 
     /// Route a pre-grouped batch of group messages to workers concurrently.
     ///
-    /// Each `GroupSamples` message is routed by `hash(agg_id, group_key)`.
-    /// Messages within a single worker are sent sequentially to preserve ordering.
+    /// Each `GroupSamples` / `AccumulatorInput` message is routed by
+    /// `worker_for_sid(sid)` — same `sid` always lands on the same worker,
+    /// so per-bucket state stays single-owner. Messages within a single
+    /// worker are sent sequentially to preserve ordering.
     pub async fn route_group_batch(
         &self,
         messages: Vec<WorkerMessage>,
@@ -126,12 +161,8 @@ impl SeriesRouter {
         let mut per_worker: HashMap<usize, Vec<WorkerMessage>> = HashMap::new();
         for msg in messages {
             let worker_idx = match &msg {
-                WorkerMessage::GroupSamples {
-                    agg_id, group_key, ..
-                } => self.worker_for_group(*agg_id, group_key),
-                WorkerMessage::AccumulatorInput {
-                    agg_id, group_key, ..
-                } => self.worker_for_group(*agg_id, group_key),
+                WorkerMessage::GroupSamples { sid, .. } => self.worker_for_sid(*sid),
+                WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
                 _ => 0,
             };
@@ -181,12 +212,13 @@ impl SeriesRouter {
         Ok(())
     }
 
-    /// Determine which worker handles a given group key.
-    fn worker_for_group(&self, agg_id: u64, group_key: &str) -> usize {
-        // Hash both agg_id and group_key together for consistent routing
-        let mut hash_input = agg_id.to_le_bytes().to_vec();
-        hash_input.extend_from_slice(group_key.as_bytes());
-        let hash = xxh64(&hash_input, 0);
+    /// Determine which worker handles a given sid bucket.
+    ///
+    /// Hashes the sid alone — the legacy `(agg_id, group_key)` tuple folded
+    /// into one u64 by `SeriesIdResolver`, so a single xxh64 over the sid
+    /// gives the same per-bucket sharding the tuple-hash produced.
+    fn worker_for_sid(&self, sid: u64) -> usize {
+        let hash = xxh64(&sid.to_le_bytes(), 0);
         (hash as usize) % self.num_workers
     }
 
@@ -202,24 +234,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_consistent_group_routing() {
+    fn test_consistent_sid_routing() {
         let (senders, _receivers): (Vec<_>, Vec<_>) =
             (0..4).map(|_| mpsc::channel::<WorkerMessage>(10)).unzip();
 
         let router = SeriesRouter::new(senders);
 
-        // Same (agg_id, group_key) should always go to the same worker
-        let w1 = router.worker_for_group(1, "constant");
-        let w2 = router.worker_for_group(1, "constant");
+        // Same sid should always go to the same worker.
+        let w1 = router.worker_for_sid(42);
+        let w2 = router.worker_for_sid(42);
         assert_eq!(w1, w2);
 
-        // Different group keys may go to different workers
-        let _ = router.worker_for_group(1, "sine");
-        assert!(router.worker_for_group(1, "linear-up") < 4);
-
-        // Different agg_ids with same group key may go to different workers
-        let _ = router.worker_for_group(2, "constant");
-        assert!(router.worker_for_group(2, "constant") < 4);
+        // All resolved buckets land within the worker count.
+        assert!(router.worker_for_sid(7) < 4);
+        assert!(router.worker_for_sid(99) < 4);
+        assert!(router.worker_for_sid(0) < 4);
     }
 
     #[test]

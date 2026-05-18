@@ -10,19 +10,41 @@ use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
 use std::collections::{BTreeMap, HashMap};
+// (PolicyFingerprint is used for both `PolicyFingerprint::from_config(...)`
+//  on the emit path and the `policy_fp` field of GroupState below.)
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, debug_span, info, warn};
 
-/// Per-group aggregation state: window manager + active pane accumulators.
-/// This is the equivalent of one (agg_id, group_key) in Arroyo's GROUP BY.
+/// Per-bucket aggregation state: window manager + active pane accumulators.
 ///
-/// All raw series sharing the same grouping label values feed into the same
-/// accumulator, producing one output per (group_key, window) — exactly like
-/// Arroyo's `GROUP BY window, key`.
+/// B7.6 (schema-retirement #5): one `GroupState` per `sid`, where `sid` is
+/// the registry-allocated identity for `(metric, attrs, agg_kind)`. The
+/// legacy `(agg_id, group_key)` tuple folds into this single u64 — the
+/// grouping label values participate in `attrs`, and the source policy
+/// participates in `agg_kind`, so distinct buckets always carry distinct
+/// sids. `policy_fp` and `group_key` are held here so the worker can
+/// recover the source config (for window shape / late-data policy) and
+/// the emit-time `KeyByLabelValues` without re-parsing the sid.
+///
+/// All raw series sharing the same sid feed into the same accumulator,
+/// producing one output per (sid, window) — exactly like Arroyo's
+/// `GROUP BY window, key`.
 struct GroupState {
     config: Arc<AggregationConfig>,
+    /// Source policy fingerprint that minted this sid. Held so
+    /// `evict_orphaned_groups` can check liveness against the streaming
+    /// config snapshot (a sid stays alive only while its source policy is
+    /// still configured), and so the worker can re-derive the
+    /// `PolicyFingerprint` on the emit path without a second config
+    /// fingerprint pass.
+    policy_fp: PolicyFingerprint,
+    /// Grouping label values joined by semicolons. Held so the emit path
+    /// can render the output's `KeyByLabelValues` without consulting the
+    /// sid → attrs reverse mapping. Format matches the input messages'
+    /// `group_key` field.
+    group_key: String,
     window_manager: WindowManager,
     /// Active panes for raw-sample accumulation, keyed by pane_start_ms.
     active_panes: BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
@@ -70,18 +92,22 @@ pub struct WorkerRuntimeConfig {
     /// (event-time-only behaviour, matching pre-fix semantics).
     pub wall_clock_grace_period_ms: i64}
 
-/// Worker that processes samples for a shard of the group space.
+/// Worker that processes samples for a shard of the sid space.
 ///
 /// Unlike the old per-series design, this worker maintains accumulators
-/// keyed by `(agg_id, group_key)`. Multiple raw series with the same
-/// grouping label values share a single accumulator, producing one merged
-/// output per window — matching Arroyo's `GROUP BY` semantics.
+/// keyed by `sid` (B7.6 — was `(agg_id, group_key)`). Multiple raw series
+/// with the same grouping label values share a single accumulator,
+/// producing one merged output per window — matching Arroyo's `GROUP BY`
+/// semantics. The grouping label values participate in the sid via the
+/// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
+/// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
     id: usize,
     receiver: mpsc::Receiver<WorkerMessage>,
     output_sink: Arc<dyn OutputSink>,
-    /// Map from (agg_id, group_key) to per-group state.
-    group_states: HashMap<(u64, String), GroupState>,
+    /// Map from sid to per-bucket state. One entry per active sid this
+    /// worker shard owns.
+    group_states: HashMap<u64, GroupState>,
     /// Hot-reload handle — workers read config directly from ArcSwap
     /// instead of holding a local copy. All components see the same
     /// config at the same time.
@@ -165,7 +191,8 @@ impl Worker {
         while let Some(msg) = self.receiver.recv().await {
             match msg {
                 WorkerMessage::GroupSamples {
-                    agg_id,
+                    sid,
+                    policy_fp,
                     group_key,
                     samples,
                     ingest_received_at} => {
@@ -173,15 +200,18 @@ impl Worker {
                     let _span = debug_span!(
                         "worker_process_group",
                         worker_id = self.id,
-                        agg_id,
+                        sid,
+                        policy_fp = %policy_fp,
                         group = %group_key,
                         sample_count,
                     )
                     .entered();
-                    if let Err(e) = self.process_group_samples(agg_id, &group_key, samples) {
+                    if let Err(e) =
+                        self.process_group_samples(sid, policy_fp, &group_key, samples)
+                    {
                         warn!(
-                            "Worker {} error processing group ({}, {}): {}",
-                            self.id, agg_id, group_key, e
+                            "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
+                            self.id, sid, policy_fp, group_key, e
                         );
                     }
                     debug!(
@@ -209,7 +239,8 @@ impl Worker {
                     );
                 }
                 WorkerMessage::AccumulatorInput {
-                    agg_id,
+                    sid,
+                    policy_fp,
                     group_key,
                     timestamp_ms,
                     accumulator,
@@ -217,21 +248,23 @@ impl Worker {
                     let _span = debug_span!(
                         "worker_process_accumulator",
                         worker_id = self.id,
-                        agg_id,
+                        sid,
+                        policy_fp = %policy_fp,
                         group = %group_key,
                         timestamp_ms,
                         accumulator_type = accumulator.type_name(),
                     )
                     .entered();
                     if let Err(e) = self.process_accumulator_input(
-                        agg_id,
+                        sid,
+                        policy_fp,
                         &group_key,
                         timestamp_ms,
                         accumulator,
                     ) {
                         warn!(
-                            "Worker {} accumulator input error for ({}, {}): {}",
-                            self.id, agg_id, group_key, e
+                            "Worker {} accumulator input error for sid={} (policy_fp={}, group={}): {}",
+                            self.id, sid, policy_fp, group_key, e
                         );
                     }
                     debug!(
@@ -266,42 +299,57 @@ impl Worker {
         );
     }
 
-    /// Get or create the GroupState for a (agg_id, group_key) pair.
+    /// Get or create the GroupState for a sid.
+    ///
+    /// B7.6 — buckets are now keyed by `sid` (a single u64) rather than
+    /// `(agg_id, group_key)`. `policy_fp` is the source config's
+    /// fingerprint, used to fetch the `AggregationConfig` from the
+    /// hot-reload snapshot the first time we see this sid; `group_key` is
+    /// remembered on the `GroupState` for emit-time label rendering.
+    ///
     /// Reads config directly from the `HotReloadStreamingConfig`
-    /// ArcSwap handle, so new agg_ids from a config swap are visible
+    /// ArcSwap handle, so new policies from a config swap are visible
     /// immediately — no message passing, no delay.
-    /// Returns None if agg_id has no matching config.
+    /// Returns None if `policy_fp` has no matching config (e.g. arrived
+    /// after the policy was retired).
     fn get_or_create_group_state(
         &mut self,
-        agg_id: u64,
+        sid: u64,
+        policy_fp: PolicyFingerprint,
         group_key: &str,
     ) -> Option<&mut GroupState> {
-        let key = (agg_id, group_key.to_string());
-        if !self.group_states.contains_key(&key) {
+        if !self.group_states.contains_key(&sid) {
             let snap = self.hot_reload.snapshot();
-            let cfg = snap.get_aggregation_config(agg_id)?;
+            let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
                 window_manager: WindowManager::new(config.window_size, config.slide_interval),
                 config,
+                policy_fp,
+                group_key: group_key.to_string(),
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
                 pane_wall_clock_starts_ms: BTreeMap::new()};
-            self.group_states.insert(key.clone(), gs);
+            self.group_states.insert(sid, gs);
             self.group_count
                 .store(self.group_states.len(), Ordering::Relaxed);
         }
-        self.group_states.get_mut(&key)
+        self.group_states.get_mut(&sid)
     }
 
-    /// Process a batch of samples for a specific (agg_id, group_key).
+    /// Process a batch of samples for a specific sid bucket.
     /// All samples in the batch feed into the same shared accumulator.
     ///
     /// This is the core of the Arroyo-equivalent GROUP BY logic.
+    /// B7.6 — buckets are keyed by `sid`; `policy_fp` is the source
+    /// `AggregationConfig` fingerprint used to resolve the bucket's
+    /// config on first sight; `group_key` is held on the resulting
+    /// `GroupState` for emit-time label rendering.
     pub fn process_group_samples(
         &mut self,
-        agg_id: u64,
+        sid: u64,
+        policy_fp: PolicyFingerprint,
         group_key: &str,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -310,17 +358,17 @@ impl Worker {
         let late_data_policy = self.late_data_policy;
         let now_ms = (self.now_ms_fn)();
 
-        if self.get_or_create_group_state(agg_id, group_key).is_none() {
+        if self
+            .get_or_create_group_state(sid, policy_fp, group_key)
+            .is_none()
+        {
             warn!(
-                "Worker {} skipping samples for unknown agg_id={}, group_key={}",
-                self.id, agg_id, group_key
+                "Worker {} skipping samples for unknown policy_fp={} (sid={}, group_key={})",
+                self.id, policy_fp, sid, group_key
             );
             return Ok(());
         }
-        let state = self
-            .group_states
-            .get_mut(&(agg_id, group_key.to_string()))
-            .unwrap();
+        let state = self.group_states.get_mut(&sid).unwrap();
 
         // Find the max timestamp in this batch to advance the watermark
         let batch_max_ts = samples
@@ -342,8 +390,8 @@ impl Worker {
             // Drop late samples
             if previous_wm != i64::MIN && *ts < previous_wm - allowed_lateness_ms {
                 debug!(
-                    "Worker {} dropping late sample for group ({}, {}): ts={} watermark={}",
-                    worker_id, agg_id, group_key, ts, previous_wm
+                    "Worker {} dropping late sample for sid={} (group={}): ts={} watermark={}",
+                    worker_id, sid, group_key, ts, previous_wm
                 );
                 continue;
             }
@@ -427,10 +475,10 @@ impl Worker {
         // Emit to output sink
         if !emit_batch.is_empty() {
             debug!(
-                "Worker {} emitting {} outputs for group ({}, {})",
+                "Worker {} emitting {} outputs for sid={} (group={})",
                 worker_id,
                 emit_batch.len(),
-                agg_id,
+                sid,
                 group_key
             );
             self.output_sink.emit_batch(emit_batch)?;
@@ -440,7 +488,7 @@ impl Worker {
     }
 
     /// Process a pre-built accumulator (e.g. an OTLP-delivered sketch) for a
-    /// specific (agg_id, group_key) pane.
+    /// specific sid bucket's pane.
     ///
     /// The incoming accumulator is merged into `sketch_panes[pane_start]` via
     /// `AggregateCore::merge_with`. If the pane is empty the accumulator is
@@ -451,9 +499,13 @@ impl Worker {
     /// Unlike `process_group_samples`, this path does not touch
     /// `active_panes` — sketches live in their own pane map and get merged
     /// at window close (see `merge_sketch_panes_for_window`).
+    ///
+    /// `policy_fp` / `group_key` carry the same semantics as on
+    /// `process_group_samples` — policy lookup + emit-time label rendering.
     pub fn process_accumulator_input(
         &mut self,
-        agg_id: u64,
+        sid: u64,
+        policy_fp: PolicyFingerprint,
         group_key: &str,
         timestamp_ms: i64,
         incoming: Box<dyn AggregateCore>,
@@ -463,17 +515,17 @@ impl Worker {
         let late_data_policy = self.late_data_policy;
         let now_ms = (self.now_ms_fn)();
 
-        if self.get_or_create_group_state(agg_id, group_key).is_none() {
+        if self
+            .get_or_create_group_state(sid, policy_fp, group_key)
+            .is_none()
+        {
             warn!(
-                "Worker {} skipping accumulator input for unknown agg_id={}, group_key={}",
-                self.id, agg_id, group_key
+                "Worker {} skipping accumulator input for unknown policy_fp={} (sid={}, group_key={})",
+                self.id, policy_fp, sid, group_key
             );
             return Ok(());
         }
-        let state = self
-            .group_states
-            .get_mut(&(agg_id, group_key.to_string()))
-            .unwrap();
+        let state = self.group_states.get_mut(&sid).unwrap();
 
         let previous_wm = state.previous_watermark_ms;
         let current_wm = if timestamp_ms > previous_wm {
@@ -494,8 +546,8 @@ impl Worker {
             match late_data_policy {
                 LateDataPolicy::Drop => {
                     debug!(
-                        "Worker {} dropping late accumulator input for group ({}, {}): ts={} watermark={}",
-                        worker_id, agg_id, group_key, timestamp_ms, previous_wm
+                        "Worker {} dropping late accumulator input for sid={} (group={}): ts={} watermark={}",
+                        worker_id, sid, group_key, timestamp_ms, previous_wm
                     );
                 }
                 LateDataPolicy::ForwardToStore => {
@@ -582,10 +634,10 @@ impl Worker {
 
         if !emit_batch.is_empty() {
             debug!(
-                "Worker {} emitting {} sketch outputs for group ({}, {})",
+                "Worker {} emitting {} sketch outputs for sid={} (group={})",
                 worker_id,
                 emit_batch.len(),
-                agg_id,
+                sid,
                 group_key
             );
             self.output_sink.emit_batch(emit_batch)?;
@@ -644,30 +696,35 @@ impl Worker {
     /// 3. Compute global watermark = min(all worker watermarks)
     /// 4. Advance idle groups to the global watermark, closing due windows
     ///
-    /// Remove GroupStates whose agg_id is no longer in the current
-    /// config (i.e. the control plane removed the aggregation). Groups
-    /// with non-empty panes are kept until flush_all closes their
-    /// windows; once both pane maps are empty, the GroupState shell
-    /// is freed.
+    /// Remove GroupStates whose source policy is no longer in the
+    /// current config (i.e. the control plane removed the
+    /// aggregation). Liveness is checked against each bucket's stored
+    /// `policy_fp` — a sid stays alive only while its minting policy is
+    /// still configured. Buckets with non-empty panes are kept until
+    /// flush_all closes their windows; once both pane maps are empty,
+    /// the GroupState shell is freed.
     fn evict_orphaned_groups(&mut self) {
         let snap = self.hot_reload.snapshot();
         let before = self.group_states.len();
-        self.group_states.retain(|&(agg_id, _), gs| {
-            if snap.contains(agg_id) {
-                return true; // still in config, keep
+        self.group_states.retain(|&sid, gs| {
+            if snap.contains(gs.policy_fp.as_u64()) {
+                return true; // policy still in config, keep
             }
-            // Not in config — keep only if there's residual data
+            // Policy retired — keep only if there's residual data
             // that flush_all hasn't drained yet.
             let has_data = !gs.active_panes.is_empty() || !gs.sketch_panes.is_empty();
             if !has_data {
-                debug!("evicting orphaned group (agg_id={})", agg_id);
+                debug!(
+                    "evicting orphaned bucket (sid={}, policy_fp={})",
+                    sid, gs.policy_fp
+                );
             }
             has_data
         });
         let after = self.group_states.len();
         if before != after {
             info!(
-                "Worker {} evicted {} orphaned groups ({} → {})",
+                "Worker {} evicted {} orphaned buckets ({} → {})",
                 self.id,
                 before - after,
                 before,
@@ -700,13 +757,19 @@ impl Worker {
         // Step 3: Compute global watermark = min(all worker watermarks).
         let global_wm = self.compute_global_watermark();
 
-        // Step 4: For each group, advance watermark and close due windows.
+        // Step 4: For each bucket, advance watermark and close due windows.
         let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
 
-        for ((agg_id, group_key), state) in &mut self.group_states {
+        for (&sid, state) in &mut self.group_states {
+            let _ = sid; // sid is the bucket key; group_key/policy_fp live on `state`
             if state.previous_watermark_ms == i64::MIN {
                 continue; // No samples received yet — no panes to close.
             }
+            // group_key/policy_fp travelled in on the message and are
+            // stored on `state` so the emit path can reach them without
+            // re-keying the bucket. Clone so the body below can borrow
+            // `state` mutably for pane drains.
+            let group_key = state.group_key.clone();
 
             // Effective watermark: max(group's own, global) + 1ms for boundary.
             let propagated_wm = if global_wm != i64::MIN {
@@ -750,7 +813,7 @@ impl Worker {
                 if let Some(accumulator) =
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
                 {
-                    let key = build_group_key_label_values(group_key);
+                    let key = build_group_key_label_values(&group_key);
                     let output = PrecomputedOutput::new(
                         *window_start as u64,
                         window_end as u64,
@@ -763,7 +826,7 @@ impl Worker {
                 if let Some(accumulator) =
                     merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
-                    let key = build_group_key_label_values(group_key);
+                    let key = build_group_key_label_values(&group_key);
                     let output = PrecomputedOutput::new(
                         *window_start as u64,
                         window_end as u64,
@@ -1247,21 +1310,22 @@ mod tests {
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Samples in window [0, 10000ms): sum should be 1+2+3=6.
-        // All go to the same group (agg_id=1, group_key="")
+        // All go to the same bucket (sid=1, group_key="")
+        let pf = PolicyFingerprint(1);
         worker
-            .process_group_samples(1, "", group_samples("cpu", vec![(1000, 1.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu", vec![(1000, 1.0)]))
             .unwrap();
         worker
-            .process_group_samples(1, "", group_samples("cpu", vec![(5000, 2.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu", vec![(5000, 2.0)]))
             .unwrap();
         worker
-            .process_group_samples(1, "", group_samples("cpu", vec![(9000, 3.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu", vec![(9000, 3.0)]))
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         // Sample at t=10000ms closes [0, 10000)
         worker
-            .process_group_samples(1, "", group_samples("cpu", vec![(10000, 100.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu", vec![(10000, 100.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1309,11 +1373,13 @@ mod tests {
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
-        // Two different series, same group (agg_id=1, group_key="")
+        // Two different series, same bucket (sid=1, group_key="")
         // Both feed into the same accumulator
+        let pf = PolicyFingerprint(1);
         worker
             .process_group_samples(
                 1,
+                pf,
                 "",
                 vec![
                     ("cpu{host=\"A\"}".to_string(), 1000, 10.0),
@@ -1325,7 +1391,7 @@ mod tests {
 
         // Close the window
         worker
-            .process_group_samples(1, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1371,34 +1437,43 @@ mod tests {
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
-        // Group "constant" gets samples
+        // Two distinct group_keys → two distinct sids (sid IS the bucket
+        // identity; the legacy `(agg_id, group_key)` tuple folds in).
+        let pf = PolicyFingerprint(1);
+        let sid_constant = 11_u64;
+        let sid_sine = 12_u64;
+        // Bucket sid_constant gets samples
         worker
             .process_group_samples(
-                1,
+                sid_constant,
+                pf,
                 "constant",
                 group_samples("cpu{pattern=\"constant\"}", vec![(1000, 5.0)]),
             )
             .unwrap();
-        // Group "sine" gets samples
+        // Bucket sid_sine gets samples
         worker
             .process_group_samples(
-                1,
+                sid_sine,
+                pf,
                 "sine",
                 group_samples("cpu{pattern=\"sine\"}", vec![(2000, 7.0)]),
             )
             .unwrap();
 
-        // Close both groups' windows
+        // Close both buckets' windows
         worker
             .process_group_samples(
-                1,
+                sid_constant,
+                pf,
                 "constant",
                 group_samples("cpu{pattern=\"constant\"}", vec![(10000, 0.0)]),
             )
             .unwrap();
         worker
             .process_group_samples(
-                1,
+                sid_sine,
+                pf,
                 "sine",
                 group_samples("cpu{pattern=\"sine\"}", vec![(10000, 0.0)]),
             )
@@ -1442,9 +1517,11 @@ mod tests {
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Three different series all in group "constant" — all feed one KLL
+        let pf = PolicyFingerprint(1);
         worker
             .process_group_samples(
                 1,
+                pf,
                 "constant",
                 vec![
                     (
@@ -1470,6 +1547,7 @@ mod tests {
         worker
             .process_group_samples(
                 1,
+                pf,
                 "constant",
                 group_samples(
                     "latency{pattern=\"constant\",host=\"a\"}",
@@ -1520,15 +1598,16 @@ mod tests {
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // Sample at t=15000ms → goes to pane 10000ms
+        let pf = PolicyFingerprint(2);
         worker
-            .process_group_samples(2, "", group_samples("cpu", vec![(15_000, 42.0)]))
+            .process_group_samples(2, pf, "", group_samples("cpu", vec![(15_000, 42.0)]))
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         // Sample at t=45000ms → advances watermark to 45000ms
         // Closes windows [0, 30000) and [10000, 40000)
         worker
-            .process_group_samples(2, "", group_samples("cpu", vec![(45_000, 0.0)]))
+            .process_group_samples(2, pf, "", group_samples("cpu", vec![(45_000, 0.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1581,11 +1660,13 @@ mod tests {
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
-        // Both series go to the SAME group (group_key="" since grouping is empty).
+        // Both series go to the SAME bucket (group_key="" since grouping is empty).
         // The host label is extracted as the aggregated key inside the accumulator.
+        let pf = PolicyFingerprint(3);
         worker
             .process_group_samples(
                 3,
+                pf,
                 "",
                 vec![
                     ("cpu{host=\"A\"}".to_string(), 1000, 10.0),
@@ -1594,9 +1675,9 @@ mod tests {
             )
             .unwrap();
 
-        // Close the single group's window
+        // Close the single bucket's window
         worker
-            .process_group_samples(3, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
+            .process_group_samples(3, pf, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1667,14 +1748,15 @@ mod tests {
         );
 
         // Establish watermark at t=20000ms
+        let pf = PolicyFingerprint(4);
         worker
-            .process_group_samples(4, "", group_samples("cpu", vec![(20_000, 1.0)]))
+            .process_group_samples(4, pf, "", group_samples("cpu", vec![(20_000, 1.0)]))
             .unwrap();
         let _ = sink.drain();
 
         // Send a late sample
         worker
-            .process_group_samples(4, "", group_samples("cpu", vec![(5_000, 99.0)]))
+            .process_group_samples(4, pf, "", group_samples("cpu", vec![(5_000, 99.0)]))
             .unwrap();
 
         assert_eq!(sink.len(), 0, "late sample should be dropped");
@@ -1719,17 +1801,18 @@ mod tests {
         );
 
         // Seed then advance watermark to 20000
+        let pf = PolicyFingerprint(5);
         worker
-            .process_group_samples(5, "", group_samples("cpu", vec![(500, 1.0)]))
+            .process_group_samples(5, pf, "", group_samples("cpu", vec![(500, 1.0)]))
             .unwrap();
         worker
-            .process_group_samples(5, "", group_samples("cpu", vec![(20_000, 0.0)]))
+            .process_group_samples(5, pf, "", group_samples("cpu", vec![(20_000, 0.0)]))
             .unwrap();
         let _ = sink.drain();
 
         // Send late sample for evicted pane
         worker
-            .process_group_samples(5, "", group_samples("cpu", vec![(8_000, 55.0)]))
+            .process_group_samples(5, pf, "", group_samples("cpu", vec![(8_000, 55.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1790,19 +1873,21 @@ aggregations:
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
+        let pf = PolicyFingerprint(agg_id);
+        let sid = 1_u64;
         worker
-            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(1_000, 3.0)]))
+            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(1_000, 3.0)]))
             .unwrap();
         worker
-            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(5_000, 4.0)]))
+            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(5_000, 4.0)]))
             .unwrap();
         worker
-            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(9_000, 5.0)]))
+            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(9_000, 5.0)]))
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         worker
-            .process_group_samples(agg_id, "", group_samples("requests_total", vec![(10_000, 0.0)]))
+            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(10_000, 0.0)]))
             .unwrap();
 
         let captured = sink.drain();
@@ -1889,19 +1974,25 @@ aggregations:
         let sink = Arc::new(CapturingOutputSink::new());
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
+        // Two distinct group_keys ("groupA" / "groupB") under the same
+        // policy → two distinct sids (each sid is one bucket; the legacy
+        // `(agg_id, group_key)` tuple folded into a single u64).
+        let pf = PolicyFingerprint(1);
+        let sid_a = 21_u64;
+        let sid_b = 22_u64;
         // Group A: send sample at t=5s (within window [0, 10s))
         worker
-            .process_group_samples(1, "groupA", group_samples("cpu", vec![(5_000, 1.0)]))
+            .process_group_samples(sid_a, pf, "groupA", group_samples("cpu", vec![(5_000, 1.0)]))
             .unwrap();
         // Group B: send sample at t=5s (within window [0, 10s))
         worker
-            .process_group_samples(1, "groupB", group_samples("cpu", vec![(5_000, 2.0)]))
+            .process_group_samples(sid_b, pf, "groupB", group_samples("cpu", vec![(5_000, 2.0)]))
             .unwrap();
         let _ = sink.drain();
 
         // Advance group A's watermark to t=100s (closes many windows).
         worker
-            .process_group_samples(1, "groupA", group_samples("cpu", vec![(100_000, 3.0)]))
+            .process_group_samples(sid_a, pf, "groupA", group_samples("cpu", vec![(100_000, 3.0)]))
             .unwrap();
         let _ = sink.drain();
 
@@ -2052,8 +2143,9 @@ aggregations:
         assert_eq!(wm.load(Ordering::Acquire), i64::MIN);
 
         // Send data at t=50s
+        let pf = PolicyFingerprint(1);
         worker
-            .process_group_samples(1, "", group_samples("cpu", vec![(50_000, 1.0)]))
+            .process_group_samples(1, pf, "", group_samples("cpu", vec![(50_000, 1.0)]))
             .unwrap();
 
         // Flush should publish worker watermark
@@ -2118,12 +2210,15 @@ aggregations:
         let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
 
         // First batch: 10 sketches at t=60_000 ms, all under the same
-        // group_key="us-east" — mirrors the agent emitting one sketch per
-        // (zone,rack,node,pod) tuple while the backend rolls them up by zone.
+        // bucket (group_key="us-east") — mirrors the agent emitting one
+        // sketch per (zone,rack,node,pod) tuple while the backend rolls
+        // them up by zone.
+        let pf = PolicyFingerprint(1);
+        let sid = 31_u64;
         for i in 0..10 {
             let s = make_ddsketch(0.01, &[1.0 + i as f64, 2.0, 3.0]);
             worker
-                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
+                .process_accumulator_input(sid, pf, "us-east", 60_000, Box::new(s))
                 .expect("first batch must process");
         }
         assert_eq!(
@@ -2139,7 +2234,7 @@ aggregations:
         // and the output is emitted.
         let s2 = make_ddsketch(0.01, &[5.0, 6.0]);
         worker
-            .process_accumulator_input(1, "us-east", 120_000, Box::new(s2))
+            .process_accumulator_input(sid, pf, "us-east", 120_000, Box::new(s2))
             .expect("second batch must process");
 
         let captured = sink.drain();
@@ -2209,29 +2304,33 @@ aggregations:
 
         // Three sketches in the SAME zone but different (rack,node,pod)
         // tuples — emulating what the agent ships. Group key the ingest
-        // path computes is the zone value alone.
+        // path computes is the zone value alone; distinct group_keys
+        // (us-east vs us-west) get distinct sids.
+        let pf = PolicyFingerprint(1);
+        let sid_east = 41_u64;
+        let sid_west = 42_u64;
         for i in 0..3 {
             let s = make_ddsketch(0.01, &[100.0 + i as f64]);
             worker
-                .process_accumulator_input(1, "us-east", 60_000, Box::new(s))
+                .process_accumulator_input(sid_east, pf, "us-east", 60_000, Box::new(s))
                 .unwrap();
         }
         // Two sketches in a different zone.
         for i in 0..2 {
             let s = make_ddsketch(0.01, &[200.0 + i as f64]);
             worker
-                .process_accumulator_input(1, "us-west", 60_000, Box::new(s))
+                .process_accumulator_input(sid_west, pf, "us-west", 60_000, Box::new(s))
                 .unwrap();
         }
 
         // Advance the watermark past 90_000 to close window [60_000, 90_000).
         let s = make_ddsketch(0.01, &[1.0]);
         worker
-            .process_accumulator_input(1, "us-east", 120_000, Box::new(s))
+            .process_accumulator_input(sid_east, pf, "us-east", 120_000, Box::new(s))
             .unwrap();
         let s = make_ddsketch(0.01, &[1.0]);
         worker
-            .process_accumulator_input(1, "us-west", 120_000, Box::new(s))
+            .process_accumulator_input(sid_west, pf, "us-west", 120_000, Box::new(s))
             .unwrap();
 
         let captured = sink.drain();
@@ -2348,10 +2447,12 @@ aggregations:
         worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
 
         // Ingest 10 sketches all stamped at frozen event-time t_event=0.
+        let pf = PolicyFingerprint(1);
+        let sid = 51_u64;
         for i in 0..10 {
             let s = make_ddsketch(0.01, &[1.0 + i as f64]);
             worker
-                .process_accumulator_input(1, "us-east", 0, Box::new(s))
+                .process_accumulator_input(sid, pf, "us-east", 0, Box::new(s))
                 .expect("ingest must accept frozen-event-time sketches");
         }
         assert_eq!(
@@ -2452,7 +2553,7 @@ aggregations:
 
         let s = make_ddsketch(0.01, &[42.0]);
         worker
-            .process_accumulator_input(1, "us-east", 0, Box::new(s))
+            .process_accumulator_input(1, PolicyFingerprint(1), "us-east", 0, Box::new(s))
             .unwrap();
 
         // Even after a wall-clock eternity, no emit happens with
