@@ -34,7 +34,7 @@ use tracing::{info, warn};
 use optimizer::engine::QueryOptimizer;
 use physical::allocator::SketchAllocator;
 use pipeline::{Analyzer, QuerySpec};
-use emit::{generate_agent_collector_config, build_precompute_engine_jobs};
+use emit::{generate_agent_collector_config, build_precompute_engine_jobs, post_typed_backend_for_role};
 use workload::WorkloadRegistry;
 use emit::{AgentRuntime, emit_for_runtime};
 use types::AgentCollectorConfig;
@@ -241,6 +241,16 @@ async fn main() {
                                     }
                                 }
                             }
+                            // Option B (defensive): re-fire the
+                            // cumulative replan tick on every connect so
+                            // the backend's swap-installed
+                            // streaming-config always reflects every
+                            // planned `(metric, role)` pair. Idempotent
+                            // — cumulative + swap means re-POSTing the
+                            // same plan is a no-op. Guards against
+                            // start-order races where the backend came
+                            // up AFTER the startup replan_all tick fired.
+                            r.replan_all().await;
                         }
                     });
                 })
@@ -394,6 +404,16 @@ async fn main() {
         );
     }
 
+    // ── Shared per-(metric, role) BackendStageConfig cache ───────────────────
+    // Built BEFORE the Replanner so it can be wired through
+    // `with_backend_routing_cache` — every plan-emit cycle
+    // (handle_plan, replan triggers, startup replan_all tick, OpAMP
+    // on-connect tick) reads/writes the SAME cumulative state, so the
+    // data plane's atomic `handle.swap(new_config)` never wipes
+    // sibling `(metric, role)` aggregations.
+    let backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // ── Replanner — closes the SP-8 feedback loop ─────────────────────────────
     let replanner = {
         let mut r = Replanner::new(
@@ -407,6 +427,9 @@ async fn main() {
         if let Some(client) = backend_client_shared.as_ref() {
             r = r.with_backend_client(Arc::clone(client));
         }
+        // Option B: share the cumulative cache so replan triggers
+        // accumulate against the SAME state `handle_plan` writes to.
+        r = r.with_backend_routing_cache(Arc::clone(&backend_routing_cache));
         // Wire the workload registry so the typed-emit path
         // (`USE_TYPED_STAGE_SPLIT`) can extend its edge stage config
         // with the same archive-tier metrics the bootstrap GET path
@@ -418,6 +441,21 @@ async fn main() {
     *replanner_cell.write().await = Some(Arc::clone(&replanner));
     *registry_cell.write().await = Some(Arc::clone(&workload_registry));
 
+    // ── Startup replan-tick ───────────────────────────────────────────────────
+    // Loop through every `(metric, role)` pair the workload-registry
+    // pre-pop loop populated and POST the typed cumulative
+    // streaming-config + storage-routing to the backend. Without this,
+    // queries that never trigger `POST /api/v1/plan` (the smoke
+    // harness, bootstrap deployments) hit the data plane's static
+    // startup config (DDSketch only) and `sum by (zone) (…)` returns
+    // `ExactAgg(Sum) capability not satisfied`.
+    //
+    // Runs BEFORE the HTTP server starts accepting requests so the
+    // first query never lands on a half-warmed backend. Inline
+    // (not spawned) for the same reason.
+    info!("startup replan_all: priming cumulative backend state before HTTP server bind");
+    replanner.replan_all().await;
+
     let replan_interval = Duration::from_secs(
         std::env::var("CONTROLLER_REPLAN_INTERVAL_SECS")
             .ok()
@@ -426,8 +464,6 @@ async fn main() {
     );
 
     let runtime_samples_store = runtime_samples::RuntimeSamplesStore::new(1024);
-    let backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>> =
-        Arc::new(Mutex::new(HashMap::new()));
     let state = AppState {
         analyzer:          Arc::new(Analyzer::new()),
         planner,
@@ -700,193 +736,20 @@ async fn handle_plan(
                                 }
                                 agg.grouping = workload.group_by_labels.clone();
                             }
-                            // B2 cumulative-emit follow-up: update the
-                            // per-(metric, role) cache with THIS
-                            // iteration's `be`, then BOTH the
-                            // streaming-config emit and the
-                            // storage-routing emit below derive their
-                            // payload from the FULL cache. The
-                            // single-iteration `be` is never sent on
-                            // the wire on its own — every post is
-                            // cumulative across all `(metric, role)`
-                            // pairs the control plane has planned.
-                            //
-                            // Why: the data plane's
-                            // `POST /api/v1/streaming-config` handler
-                            // is `handle.swap(new_config)` (an atomic
-                            // full replace) and the storage-routing
-                            // handler is similarly an atomic per-tenant
-                            // swap. Per-iteration posts overwrite
-                            // siblings:
-                            //   * streaming-config — drops the prior
-                            //     role's `aggregations`, so a metric
-                            //     with both DDSketch (Quantile) and
-                            //     ExactAgg (Sum) loses one on the
-                            //     backend → `sum by (zone)
-                            //     (http_requests_total)` returns
-                            //     `ExactAgg(Sum) capability not satisfied`
-                            //     (the regression that motivates this
-                            //     PR — direct follow-up to #283 which
-                            //     made the workload/plan stores
-                            //     (metric, role)-keyed but left the
-                            //     emit path metric-only).
-                            //   * storage-routing — drops other
-                            //     metrics' entries → default
-                            //     `sketch_store` engine → `archive_miss`.
-                            let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
-                                let mut cache = st.backend_routing_cache.lock().await;
-                                cache.insert((workload.metric_name.clone(), role), be.clone());
-                                let mut v: Vec<((String, AggRole), BackendStageConfig)> = cache
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect();
-                                // Deterministic ordering so the emitted
-                                // JSON body is reproducible across runs
-                                // and across test invocations. HashMap
-                                // iteration order would otherwise make
-                                // captured-body regression assertions
-                                // flaky.
-                                v.sort_by(|(a_k, _), (b_k, _)| {
-                                    a_k.0
-                                        .cmp(&b_k.0)
-                                        .then_with(|| a_k.1.as_str().cmp(b_k.1.as_str()))
-                                });
-                                v
-                            };
-
-                            // Cumulative streaming-config — one
-                            // `BackendStageConfig` whose `aggregations`
-                            // + `readouts` are the concatenation of
-                            // every cache entry's. The data plane's
-                            // swap installs this single
-                            // multi-aggregation config atomically, so
-                            // ALL roles for ALL metrics survive.
-                            let cumulative_be = BackendStageConfig {
-                                aggregations: cumulative_entries
-                                    .iter()
-                                    .flat_map(|(_, c)| c.aggregations.iter().cloned())
-                                    .collect(),
-                                readouts: cumulative_entries
-                                    .iter()
-                                    .flat_map(|(_, c)| c.readouts.iter().cloned())
-                                    .collect(),
-                            };
-
-                            // Phase C: post the cumulative typed L5
-                            // streaming-config JSON to ASAPQuery-backend
-                            // via the shared BackendClient when
-                            // configured. Without a configured endpoint
-                            // this still no-ops silently — same
-                            // fire-and-forget contract as the existing
-                            // Replanner path.
-                            match emit::emit_backend_streaming_config_json(&cumulative_be) {
-                                Ok(json_doc) => {
-                                    info!(
-                                        stage = "backend",
-                                        aggregations = cumulative_be.aggregations.len(),
-                                        readouts = cumulative_be.readouts.len(),
-                                        cumulative_pairs = cumulative_entries.len(),
-                                        "[USE_TYPED_STAGE_SPLIT] posting typed backend JSON"
-                                    );
-                                    if let Some(client) = st.backend_client.as_ref() {
-                                        let body = json_doc.to_string();
-                                        match client.post_streaming_config_json(body).await {
-                                            Ok(()) => info!(
-                                                stage = "backend",
-                                                endpoint = %client.endpoint(),
-                                                "[USE_TYPED_STAGE_SPLIT] typed backend JSON push succeeded"
-                                            ),
-                                            Err(e) => warn!(
-                                                stage = "backend",
-                                                endpoint = %client.endpoint(),
-                                                error = %e,
-                                                "[USE_TYPED_STAGE_SPLIT] typed backend JSON push failed; \
-                                                 next replan cycle will retry"
-                                            ),
-                                        }
-                                    } else {
-                                        info!(
-                                            stage = "backend",
-                                            "[USE_TYPED_STAGE_SPLIT] no backend client configured; \
-                                             skipping JSON push (set CONTROLLER_BACKEND_ENDPOINT to enable)"
-                                        );
-                                    }
-                                }
-                                Err(e) => warn!(error = %e, "emit_backend_streaming_config_json failed"),
-                            }
-
-                            // Phase α (MVP) cumulative storage-routing.
-                            // The routing classifier
-                            // (`build_routing_entry` in
-                            // `emit/stage_config.rs`) reads
-                            // `cfg.aggregations` to derive shape
-                            // routing, so we MUST merge every role's
-                            // aggregations for one metric into a single
-                            // `BackendStageConfig` before passing it
-                            // through — otherwise a metric with both
-                            // DDSketch (Quantile) and ExactAgg (Sum)
-                            // would emit only the last-cached role's
-                            // shape classifications and route the
-                            // siblings to archive.
-                            //
-                            // `emit_backend_storage_routing`'s signature
-                            // is `&[(String, &BackendStageConfig)]` —
-                            // per-metric, NOT per-(metric, role) — so
-                            // the merge happens at the call site (per
-                            // the PR's no-signature-change constraint).
-                            let mut by_metric: std::collections::BTreeMap<String, BackendStageConfig> =
-                                std::collections::BTreeMap::new();
-                            for ((m, _r), cfg) in &cumulative_entries {
-                                let entry = by_metric.entry(m.clone()).or_insert_with(|| {
-                                    BackendStageConfig {
-                                        aggregations: Vec::new(),
-                                        readouts: Vec::new(),
-                                    }
-                                });
-                                entry.aggregations.extend(cfg.aggregations.iter().cloned());
-                                entry.readouts.extend(cfg.readouts.iter().cloned());
-                            }
-                            let routing_owned: Vec<(String, BackendStageConfig)> =
-                                by_metric.into_iter().collect();
-                            let routing_input: Vec<(String, &BackendStageConfig)> = routing_owned
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v))
-                                .collect();
-                            match emit::emit_backend_storage_routing(&routing_input) {
-                                Ok(routing_doc) => {
-                                    info!(
-                                        stage = "backend",
-                                        metric = %workload.metric_name,
-                                        cumulative_metrics = routing_owned.len(),
-                                        cumulative_pairs = cumulative_entries.len(),
-                                        "[USE_TYPED_STAGE_SPLIT] posting cumulative storage-routing JSON"
-                                    );
-                                    if let Some(client) = st.backend_client.as_ref() {
-                                        let body = routing_doc.to_string();
-                                        match client.post_storage_routing_json(body).await {
-                                            Ok(()) => info!(
-                                                stage = "backend",
-                                                metric = %workload.metric_name,
-                                                "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push succeeded"
-                                            ),
-                                            Err(e) => warn!(
-                                                stage = "backend",
-                                                metric = %workload.metric_name,
-                                                error = %e,
-                                                "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push failed; \
-                                                 next replan cycle will retry"
-                                            ),
-                                        }
-                                    } else {
-                                        info!(
-                                            stage = "backend",
-                                            "[USE_TYPED_STAGE_SPLIT] no backend client configured; \
-                                             skipping storage-routing JSON push"
-                                        );
-                                    }
-                                }
-                                Err(e) => warn!(error = %e, "emit_backend_storage_routing failed"),
-                            }
+                            // Option B unification: every typed cumulative
+                            // emit (handle_plan here, Replanner triggers
+                            // below, startup pre-pop tick, OpAMP
+                            // on-connect tick) flows through the same
+                            // helper. See [`post_typed_backend_for_role`]
+                            // doc for the swap-semantics rationale +
+                            // cumulative-cache contract.
+                            post_typed_backend_for_role(
+                                st.backend_client.as_ref(),
+                                &st.backend_routing_cache,
+                                &workload.metric_name,
+                                role,
+                                be,
+                            ).await;
 
                             // Mention stage_id so `match` arms aren't
                             // collapsed into untagged log lines if the

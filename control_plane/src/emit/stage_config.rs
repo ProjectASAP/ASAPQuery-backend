@@ -8,10 +8,11 @@
 //!   aggregator (OTLP receiver → per-family `*merge` processor(s) → OTLP
 //!   exporter to backend).
 //! - [`emit_backend_streaming_config_json`] → JSON document matching the
-//!   ASAPQuery-backend `POST /api/v1/streaming-config` API surface — same
-//!   shape that [`crate::config::asapquery_backend::generate_streaming_config_yaml`]
-//!   builds today, just from the typed [`BackendStageConfig`] instead of
-//!   a `CollectionPlan`.
+//!   ASAPQuery-backend `POST /api/v1/streaming-config` API surface,
+//!   sourced from the typed [`BackendStageConfig`]. The legacy
+//!   `generate_streaming_config_yaml` `CollectionPlan`-shaped emitter
+//!   was retired in the Option B unification (see
+//!   [`crate::emit::backend_push`]).
 //! - [`emit_backend_storage_routing`] → JSON document matching the
 //!   ASAPQuery-backend `POST /api/v1/storage_routing` API surface —
 //!   per-metric query-shape → engine routing table (Phase α). Sources
@@ -584,11 +585,12 @@ pub fn emit_gateway_yaml(
 /// `POST /api/v1/streaming-config` endpoint accepts, sourced from the
 /// typed L5 [`BackendStageConfig`].
 ///
-/// Output shape mirrors the YAML shape produced by
-/// [`crate::config::asapquery_backend::generate_streaming_config_yaml`]:
-/// a top-level `aggregations` array of
+/// Output shape: a top-level `aggregations` array of
 /// `{ aggregationType, aggregationSubType, metric, labels, parameters,
 /// windowSize, windowType, spatialFilter, aggregationInput }` rows.
+/// (The legacy `generate_streaming_config_yaml` YAML emitter that
+/// shipped the same shape from a `CollectionPlan` was retired in the
+/// Option B unification — see [`crate::emit::backend_push`].)
 /// `aggregationId` is **not** emitted — identity is content-addressed in
 /// the backend via `PolicyFingerprint(u64)`.
 /// We additionally surface a parallel `readouts` array so the backend's
@@ -1634,7 +1636,20 @@ fn build_gateway_merge_block(mp: &GatewayMergeProcessor) -> Value {
 /// in the backend via `PolicyFingerprint(u64)` derived from the fields
 /// above.
 fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
-    let parameters = sketch_params_to_json(&agg.sketch_params);
+    // Option B (post-PR-#287): when `agg_type_override` is set, use
+    // it as the wire `aggregationType` and emit an empty
+    // `parameters` object — bypasses the sketch_kind → backend type
+    // mapping for ExactAgg(Sum/Increase/Count) rows the Replanner
+    // synthesizes for non-sketch (Sum-shaped) workloads. The
+    // `sketch_kind` / `sketch_params` fields carry sentinel values
+    // in this case and are not emitted on the wire.
+    let (aggregation_type, parameters) = match &agg.agg_type_override {
+        Some(s) => (s.clone(), json!({})),
+        None => (
+            sketch_kind_to_backend_type(&agg.sketch_kind, &agg.sketch_params).to_string(),
+            sketch_params_to_json(&agg.sketch_params),
+        ),
+    };
     let aggregation_input = match agg.aggregation_input {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",
@@ -1651,7 +1666,7 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
     let window_size = clamp_window_secs(Some(agg.window_secs))
         .expect("clamp_window_secs preserves Some");
     json!({
-        "aggregationType": sketch_kind_to_backend_type(&agg.sketch_kind, &agg.sketch_params),
+        "aggregationType": aggregation_type,
         "aggregationSubType": "",
         "metric": agg.metric_name,
         "labels": {
@@ -2030,6 +2045,7 @@ mod tests {
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
+                    agg_type_override: None,
                 },
                 BackendAggregation {
                     aggregation_id: "agg1".into(),
@@ -2040,6 +2056,7 @@ mod tests {
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
+                    agg_type_override: None,
                 },
             ],
             readouts: vec![
@@ -2096,6 +2113,7 @@ mod tests {
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
+                    agg_type_override: None,
                 },
                 BackendAggregation {
                     aggregation_id: "agg1".into(),
@@ -2106,6 +2124,7 @@ mod tests {
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
                     aggregation_input: AggregationInput::SketchEnvelope,
+                    agg_type_override: None,
                 },
             ],
             readouts: vec![
@@ -2175,6 +2194,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".into(),
@@ -2554,6 +2574,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: vec!["zone".into(), "service".into()],
                 aggregation_input: AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![],
         };
@@ -2598,6 +2619,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "phase_b_agg0".into(),
@@ -2644,6 +2666,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: Vec::new(),
                 aggregation_input: AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![],
         };
@@ -2667,6 +2690,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: Vec::new(),
                 aggregation_input: AggregationInput::Raw,
+                agg_type_override: None,
             }],
             readouts: vec![],
         };
@@ -3932,6 +3956,7 @@ mod tests {
                 spatial_filter: String::new(),
                 grouping: vec!["zone".to_string()],
                 aggregation_input: AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".to_string(),
