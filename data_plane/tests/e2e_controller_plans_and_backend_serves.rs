@@ -375,9 +375,17 @@ fn build_dd_sketch_export(
             }),
         })
         .collect();
+    // start_time = time - 1s so the stored window `(start, end)` is
+    // narrow and falls entirely within any reasonable PromQL lookback.
+    // A `start_time_unix_nano: 0` (Unix epoch) would make the window
+    // start in 1970, outside any current-time-relative lookback the
+    // SketchStore range-query expects (`w.0 >= start && w.1 <= end`
+    // in `MutableEpoch::range_query_into` — a window starting at 0
+    // is rejected against `start = now - lookback_ms`).
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
     let dp = DdSketchDataPoint {
         attributes,
-        start_time_unix_nano: 0,
+        start_time_unix_nano: start_t_ns,
         time_unix_nano,
         sketch: sketch_bytes,
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
@@ -440,9 +448,13 @@ fn build_kll_export(
             }),
         })
         .collect();
+    // start_time = time - 1s so the stored window `(start, end)` is
+    // narrow and falls entirely within any reasonable PromQL lookback —
+    // same reasoning as `build_dd_sketch_export` above.
+    let start_t_ns = time_unix_nano.saturating_sub(1_000_000_000);
     let dp = KllSketchDataPoint {
         attributes,
-        start_time_unix_nano: 0,
+        start_time_unix_nano: start_t_ns,
         time_unix_nano,
         sketch: sketch_bytes,
         encoding: KllSketchEncoding::Proto as i32,
@@ -845,15 +857,13 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //      window end) so the precompute engine flushes the closed window
 //      to `SketchStoreSink` → `SketchStore`. Asserts the receiver
 //      returns 2xx.
-//   4. Soft-check: harness queries `/api/v1/query`. Currently the query
-//      returns `errorType: bad_data` (”No result for query”) — same
-//      symptom that has the sibling `e2e_dd_sketch_modified_otlp_path`
-//      test `#[ignore]`'d (”broken since proto refactor”). The
-//      OTLP→precompute→`SketchStore` path is broken upstream from
-//      this PR's scope, and tightening the query assertion is
-//      deferred to whoever fixes the underlying proto path.
+//   4. Strict-success: harness queries `/api/v1/query` and asserts
+//      `status == "success"`. The modern `execute()` trait-dispatch
+//      path (post-#280, with PR #273's union of `instances_matching`
+//      into ASAP-tier sid resolution) reaches the sketch-backed sid
+//      and the reducer returns the quantile.
 //
-// What this PR's Test 3 anchors:
+// What this Test 3 anchors:
 //   * Controller-emitted streaming-config + content fields are
 //     parseable AND accepted at /api/v1/streaming-config (already
 //     covered by Tests 1+2, re-exercised here to verify it doesn't
@@ -863,14 +873,11 @@ async fn controller_plans_with_grouping_and_backend_parses_grouping_labels() {
 //   * The full stack (PrecomputeEngine + SketchStoreSink + OtlpReceiver
 //     + HttpServer all sharing SketchStore + HotReloadStreamingConfig)
 //     comes up and stays up under POST + query traffic.
-//
-// What it does NOT anchor (deferred):
-//   * Whether the sketch state actually lands in `SketchStore` keyed
-//     by the right `PolicyFingerprint`.
-//   * Whether the query engine resolves the metric against the
-//     stored sketch and returns the correct quantile.
-// These hinge on the proto-refactor fix the existing
-// `e2e_dd_sketch_modified_otlp_path` test is also waiting on.
+//   * The OTLP-ingested sketch lands in `SketchStore` keyed by the
+//     right `PolicyFingerprint` (or via the `instances_matching`
+//     fallback) AND the query engine's modern trait-dispatch path
+//     resolves the metric against the stored sketch and returns the
+//     quantile.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn controller_plan_to_query_full_roundtrip_ddsketch() {
@@ -981,18 +988,16 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
         .await
         .expect("PromQL response was not JSON");
 
-    // ── 6. Soft-check the query response. ──────────────────────────────
+    // ── 6. Strict-success check on the query response. ────────────────
     //
-    // Status field must exist (HTTP layer is healthy). Strict
-    // `status == "success"` is still deferred. Investigation done in
-    // the wake of #249's L5-walk fix surfaced a deeper gap further
-    // along the query path:
+    // Investigation done in the wake of #249's L5-walk fix surfaced
+    // several constraints on the OTLP wire shape:
     //
     //   * The OTLP DP MUST carry at least one attribute (or known
     //     sid). With both empty, the receiver hits the
     //     "invalid wire shape" drop in
     //     `route_modified_otlp_sketches_to_precompute` (otel.rs:926
-    //     comment block — `(sid=0, no attrs)` is dropped). Test now
+    //     comment block — `(sid=0, no attrs)` is dropped). Test
     //     attaches `service="e2e-test"` to the DP.
     //
     //   * The sketch's group_by_keys (derived from `dp.attrs.keys()`)
@@ -1002,18 +1007,17 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     //     (asap_tier_analysis.rs:525) but **subset** at query time
     //     (asap_tier_analysis.rs:587) — that asymmetry is intentional
     //     (ingest needs uniqueness; queries can re-aggregate down).
-    //     Test now uses `group_by_labels: ["service"]` to align.
+    //     Test uses `group_by_labels: ["service"]` to align.
     //
-    //   * After both fixes, sketches DO reach `SketchStore` (the
-    //     runtime-info `earliest_timestamp_per_sid` map is populated)
-    //     but the query still returns `bad_data`/"No result for
-    //     query". The remaining gap is between
-    //     `SketchStore::instances_matching` and the engine's reducer
-    //     dispatch — likely an asymmetry between the engine's
-    //     candidate.required_capability and the policy_capability
-    //     lookup, OR a sid-by-policy_fp reverse-index lookup failure.
-    //     Untangling that requires deeper engine-path tracing not
-    //     covered by this PR.
+    //   * The stored window `(start, end)` from
+    //     `(dp.start_time_unix_nano, dp.time_unix_nano) / 1e6` must
+    //     fall entirely within the PromQL query's lookback range —
+    //     `MutableEpoch::range_query_into` accepts only windows where
+    //     `w.0 >= start && w.1 <= end`. `start_time_unix_nano: 0`
+    //     would peg the window start in 1970 and the modern
+    //     trait-dispatch path's `query_range` would skip it. Test
+    //     uses `start_t_ns = time_unix_nano - 1s` (see
+    //     `build_dd_sketch_export`).
     assert!(
         response.get("status").is_some(),
         "PromQL response missing `status` field — HTTP layer is unhealthy\n{}",
@@ -1022,10 +1026,9 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
         status, "success",
-        "PromQL query did not succeed after the modern-execute() fallback in \
-         process_via_simple_engine. The legacy handle_query path can't read \
-         sketch-backed sids (#252), but the fallback should now reach them via \
-         the trait-dispatch path. Response:\n{}",
+        "PromQL quantile_over_time query against a DDSketch-backed sid \
+         did not succeed via the modern execute() trait-dispatch path. \
+         Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
