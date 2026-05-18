@@ -983,3 +983,297 @@ fn coverage_reports_observed_window_range() {
     assert_eq!(coverage.0, 200);
     assert_eq!(coverage.1, 400);
 }
+
+// ---------------------------------------------------------------------------
+// ExactAgg-rate dispatch — regression coverage for `rate(metric[r])` /
+// `sum by (gbk) (rate(metric[r]))` PromQL. Pins that
+// `SketchReducer::evaluate_exact_agg_rate`:
+//   1. Folds EVERY in-window sub-window accumulator (per group) into
+//      one merged accumulator (unlike `evaluate_exact_agg`, which
+//      keeps per-window samples).
+//   2. Divides the merged `Statistic::Sum` by `range_seconds` to yield
+//      events-per-second.
+//   3. Emits exactly ONE sample per group, timestamped at `t1_ms`
+//      (instant-rate semantics).
+//   4. Surfaces `UnsupportedCapability` for MinMax (no rate semantic)
+//      and for `range_seconds == 0` (defensive guard).
+//   5. Surfaces `NoData` when the window holds no state.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn evaluate_exact_agg_rate_divides_total_events_by_range() {
+    // One zone, two windows. Each window's SumAccumulator carries
+    // 600 events (a steady 10 req/sec over a 60s window). Over a
+    // 300s rate range we'd want (600 + 600) / 300 = 4 events/sec at
+    // instant readout — and ONLY one sample (not per-window).
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        2100,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::Sum,
+    ));
+    let mut lm = BTreeMap::new();
+    lm.insert("zone".to_string(), "z0".to_string());
+    idx.append_precompute(
+        2100,
+        lm.clone(),
+        (0, 60_000),
+        Box::new(SumAccumulator::with_sum(600.0)),
+    );
+    idx.append_precompute(
+        2100,
+        lm,
+        (60_000, 120_000),
+        Box::new(SumAccumulator::with_sum(600.0)),
+    );
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg_rate(
+            &[2100],
+            AggregationType::Sum,
+            &group_by,
+            300, // range_seconds
+            0,
+            120_000,
+        )
+        .expect("rate evaluate ok");
+    assert_eq!(result.series.len(), 1, "one series for the lone zone");
+    let (labels, samples) = &result.series[0];
+    assert_eq!(labels.get("zone").cloned(), Some("z0".to_string()));
+    assert_eq!(samples.len(), 1, "rate emits ONE sample per group");
+    let (ts, value) = samples[0];
+    assert_eq!(ts, 120_000, "sample timestamped at t1");
+    // (600 + 600) / 300 = 4.0
+    assert!(
+        (value - 4.0).abs() < 1e-9,
+        "expected 4.0 events/sec, got {value}"
+    );
+}
+
+#[test]
+fn evaluate_exact_agg_rate_per_group_across_zones() {
+    // Multinode-demo shape: 4 zones, each its own sid, two windows
+    // each. Per-zone rate = (sum of windows) / range_seconds. Mirrors
+    // the smoke test's `sum by (zone) (rate(http_requests_total[5m]))`
+    // pre-engine-dispatch (the reducer is what produces the per-zone
+    // events/sec).
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    let zones = ["z0", "z1", "z2", "z3"];
+    // Per-zone per-window sums: 300, 600, 900, 1200 → with two windows
+    // each that's 600, 1200, 1800, 2400 totals; over a 300s range the
+    // rates are 2, 4, 6, 8.
+    for (i, zone) in zones.iter().enumerate() {
+        let sid = 2200 + i as u64;
+        idx.register(exact_agg_meta(
+            sid,
+            "http_requests_total",
+            &["zone"],
+            AggregationType::Sum,
+        ));
+        let per_window = ((i + 1) * 300) as f64;
+        for (ws, we) in [(0u64, 60_000u64), (60_000, 120_000)] {
+            let mut lm = BTreeMap::new();
+            lm.insert("zone".to_string(), zone.to_string());
+            idx.append_precompute(
+                sid,
+                lm,
+                (ws, we),
+                Box::new(SumAccumulator::with_sum(per_window)),
+            );
+        }
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg_rate(
+            &[2200, 2201, 2202, 2203],
+            AggregationType::Sum,
+            &group_by,
+            300,
+            0,
+            120_000,
+        )
+        .expect("rate evaluate ok");
+    assert_eq!(result.series.len(), 4, "one series per zone");
+    let mut by_zone: BTreeMap<String, f64> = BTreeMap::new();
+    for (labels, samples) in &result.series {
+        assert_eq!(samples.len(), 1, "one rate sample per zone");
+        let zone = labels.get("zone").cloned().expect("zone label");
+        by_zone.insert(zone, samples[0].1);
+    }
+    assert!((by_zone.get("z0").copied().unwrap() - 2.0).abs() < 1e-9);
+    assert!((by_zone.get("z1").copied().unwrap() - 4.0).abs() < 1e-9);
+    assert!((by_zone.get("z2").copied().unwrap() - 6.0).abs() < 1e-9);
+    assert!((by_zone.get("z3").copied().unwrap() - 8.0).abs() < 1e-9);
+}
+
+#[test]
+fn evaluate_exact_agg_rate_collapses_subgroups_into_requested_groups() {
+    // Two sids share (zone, rack); a `sum by (zone) (rate(...))`
+    // collapses both racks' sub-window sums into one zone's rate.
+    // 100 + 200 = 300 over 100s = 3.0 events/sec.
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    for (sid, rack, value) in [(5100u64, "r0", 100.0_f64), (5101, "r1", 200.0)] {
+        idx.register(exact_agg_meta(
+            sid,
+            "http_requests_total",
+            &["rack", "zone"],
+            AggregationType::Sum,
+        ));
+        let mut lm = BTreeMap::new();
+        lm.insert("zone".to_string(), "z0".to_string());
+        lm.insert("rack".to_string(), rack.to_string());
+        idx.append_precompute(sid, lm, (100, 200), Box::new(SumAccumulator::with_sum(value)));
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg_rate(
+            &[5100, 5101],
+            AggregationType::Sum,
+            &group_by,
+            100,
+            0,
+            300,
+        )
+        .expect("rate evaluate ok");
+    assert_eq!(result.series.len(), 1, "racks collapse into one zone group");
+    let (labels, samples) = &result.series[0];
+    assert_eq!(labels.get("zone").cloned(), Some("z0".to_string()));
+    assert!(!labels.contains_key("rack"));
+    assert_eq!(samples.len(), 1);
+    assert!((samples[0].1 - 3.0).abs() < 1e-9, "got {}", samples[0].1);
+}
+
+#[test]
+fn evaluate_exact_agg_rate_no_group_by_keeps_per_sid_series() {
+    // `rate(metric[r])` (no outer aggregation) — every sid's natural
+    // label map identifies its own series. Two distinct sids → two
+    // distinct rate series.
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    for (sid, zone, value) in [(6100u64, "z0", 150.0_f64), (6101, "z1", 450.0)] {
+        idx.register(exact_agg_meta(
+            sid,
+            "http_requests_total",
+            &["zone"],
+            AggregationType::Sum,
+        ));
+        let mut lm = BTreeMap::new();
+        lm.insert("zone".to_string(), zone.to_string());
+        idx.append_precompute(sid, lm, (0, 60_000), Box::new(SumAccumulator::with_sum(value)));
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let empty: BTreeSet<String> = BTreeSet::new();
+    let result = reducer
+        .evaluate_exact_agg_rate(&[6100, 6101], AggregationType::Sum, &empty, 150, 0, 60_000)
+        .expect("rate evaluate ok");
+    assert_eq!(result.series.len(), 2, "two distinct series preserved");
+    let mut by_zone: BTreeMap<String, f64> = BTreeMap::new();
+    for (labels, samples) in &result.series {
+        let zone = labels.get("zone").cloned().expect("zone preserved");
+        by_zone.insert(zone, samples[0].1);
+    }
+    // 150 / 150 = 1.0; 450 / 150 = 3.0
+    assert!((by_zone.get("z0").copied().unwrap() - 1.0).abs() < 1e-9);
+    assert!((by_zone.get("z1").copied().unwrap() - 3.0).abs() < 1e-9);
+}
+
+#[test]
+fn evaluate_exact_agg_rate_zero_range_is_unsupported_capability() {
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        7100,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::Sum,
+    ));
+    let mut lm = BTreeMap::new();
+    lm.insert("zone".to_string(), "z0".to_string());
+    idx.append_precompute(7100, lm, (0, 1000), Box::new(SumAccumulator::with_sum(1.0)));
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let err = reducer
+        .evaluate_exact_agg_rate(
+            &[7100],
+            AggregationType::Sum,
+            &group_by,
+            0, // range_seconds — guarded
+            0,
+            1000,
+        )
+        .expect_err("range_seconds=0 must surface as UnsupportedCapability");
+    assert!(matches!(err, ASAPTierError::UnsupportedCapability { .. }));
+}
+
+#[test]
+fn evaluate_exact_agg_rate_minmax_is_unsupported_capability() {
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        7200,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::MinMax,
+    ));
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let err = reducer
+        .evaluate_exact_agg_rate(&[7200], AggregationType::MinMax, &group_by, 60, 0, 1000)
+        .expect_err("MinMax has no rate semantic");
+    match err {
+        ASAPTierError::UnsupportedCapability { capability, .. } => {
+            assert!(matches!(
+                capability,
+                Capability::ExactAgg(AggregationType::MinMax)
+            ));
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluate_exact_agg_rate_no_data_when_window_empty() {
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        7300,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::Sum,
+    ));
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let err = reducer
+        .evaluate_exact_agg_rate(&[7300], AggregationType::Sum, &group_by, 60, 0, 1000)
+        .expect_err("empty window must surface as NoData");
+    match err {
+        ASAPTierError::NoData { metric_name } => {
+            assert_eq!(metric_name, "http_requests_total");
+        }
+        other => panic!("expected NoData, got {other:?}"),
+    }
+}

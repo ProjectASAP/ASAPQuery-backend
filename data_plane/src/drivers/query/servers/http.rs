@@ -726,7 +726,40 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
             Ok(expr) => {
                 if let Some(metric_name) = first_metric_name(&expr) {
                     let shape = crate::storage_engines::types::classify_query_shape(&expr);
-                    let backend = routing.lookup_with_shape(&metric_name, shape);
+                    let mut backend = routing.lookup_with_shape(&metric_name, shape);
+
+                    // ── ExactAgg(Sum) override for rate / topk shapes ──
+                    // The control plane's `build_routing_entry` puts
+                    // `RatePostHoc` and `Topk` (when no CountSketch is
+                    // planned) on the archive's claim list — based on
+                    // the assumption that warm-tier sketches can't
+                    // serve them natively. For metrics backed by
+                    // ExactAgg(Sum) sids the warm tier CAN serve
+                    // `rate(metric[r])`, `sum by (gbk) (rate(...))`,
+                    // and `topk(K, sum by (gbk) (rate(...)))` via the
+                    // engine's `evaluate_exact_agg_rate` reducer +
+                    // `try_topk_over_rate_fallback` engine path. When
+                    // we see those shapes routed to a non-SketchStore
+                    // backend but ExactAgg(Sum) sids exist for the
+                    // metric, override to SketchStore so the asap
+                    // engine answers natively.
+                    if !matches!(backend, StorageBackend::SketchStore)
+                        && matches!(
+                            shape,
+                            crate::storage_engines::types::QueryShape::RatePostHoc
+                                | crate::storage_engines::types::QueryShape::Topk
+                        )
+                        && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                    {
+                        debug!(
+                            "resolve_metric_storage: overriding {:?} → SketchStore \
+                             for metric={} shape={:?} (ExactAgg(Sum) sid present, \
+                             warm tier serves rate/topk via exact-agg reducer)",
+                            backend, metric_name, shape,
+                        );
+                        backend = StorageBackend::SketchStore;
+                    }
+
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
                         tenant, metric_name, shape, backend,
@@ -751,6 +784,43 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
         .as_ref()
         .map(|h| h.snapshot().storage_backend())
         .unwrap_or_default()
+}
+
+/// True when the sketch index carries at least one ExactAgg(Sum-family)
+/// sid for `metric_name`. Used by [`resolve_metric_storage`] to override
+/// the routing-table decision for `rate(...)` / `topk(...)` shapes when
+/// the warm tier can answer them via the engine's
+/// `evaluate_exact_agg_rate` reducer.
+///
+/// Subset-match-on-group-by-keys isn't needed here — we only care
+/// whether the metric has ANY ExactAgg(Sum) sid; the engine's
+/// `try_topk_over_rate_fallback` + per-candidate dispatch handle the
+/// per-(group_by_keys) match downstream.
+fn metric_has_exact_agg_sum_sid(
+    idx: &crate::storage_engines::sketch_db::index::SketchStore,
+    metric_name: &str,
+) -> bool {
+    use crate::storage_engines::sketch_db::data::AggregationType;
+    use crate::storage_engines::sketch_db::index::Capability;
+    let sids = idx.instances_matching(metric_name, &std::collections::BTreeSet::new());
+    for sid in sids {
+        if let Some(meta) = idx.instance(sid) {
+            if let Some(cap) = meta.capability.as_ref() {
+                if matches!(
+                    cap,
+                    Capability::ExactAgg(
+                        AggregationType::Sum
+                            | AggregationType::MultipleSum
+                            | AggregationType::Increase
+                            | AggregationType::MultipleIncrease
+                    )
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Walk a PromQL AST and return the first metric name we encounter.

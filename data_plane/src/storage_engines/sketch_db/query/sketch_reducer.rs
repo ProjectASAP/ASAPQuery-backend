@@ -752,6 +752,211 @@ impl<'a> SketchReducer<'a> {
         })
     }
 
+    /// ExactAgg-rate dispatch — sister of [`Self::evaluate_exact_agg`]
+    /// for `rate(metric[r])` / `irate(metric[r])` (plus the composed
+    /// shape `sum by (gbk) (rate(metric[r]))`) over `ExactAgg(Sum)` /
+    /// `ExactAgg(Increase)` sids.
+    ///
+    /// Semantics: for an ExactAgg(Sum) sid, the per-window accumulator
+    /// carries the count of events in that window. PromQL's
+    /// `rate(metric[r])` at instant `t` is "events per second in
+    /// `[t-r, t]`" — for our sub-window-sized sids that's:
+    ///
+    /// ```text
+    /// rate(t) = (Σ over windows w ⊆ [t-r, t] of Sum[w])  /  r_seconds
+    /// ```
+    ///
+    /// Differs from `evaluate_exact_agg` in two ways:
+    /// 1. Folds EVERY window's accumulator (in `[t0_ms, t1_ms]`) into
+    ///    ONE merged accumulator per group rather than keeping per-window
+    ///    samples. For an instant rate query that's the correct shape:
+    ///    one number per series, where the number is "events per second
+    ///    in the lookback".
+    /// 2. Divides the merged `Statistic::Sum` by `range_seconds` to
+    ///    produce the rate (events/sec). `range_seconds == 0` would
+    ///    indicate a non-range query routing through this path by
+    ///    mistake — defensive, surface as `UnsupportedCapability` so
+    ///    the engine falls over rather than divide-by-zero.
+    ///
+    /// Emits ONE sample per group, timestamped at `t1_ms` (the right
+    /// edge of the request window), matching PromQL's "evaluate rate
+    /// at time `t` over the trailing window" semantics.
+    ///
+    /// `group_by_keys` empty (i.e. `rate(metric[r])` without any outer
+    /// aggregation) collapses every series to the natural per-(sid's
+    /// own full label map) grouping — same as `evaluate_exact_agg`,
+    /// preserving full per-series rate values.
+    pub fn evaluate_exact_agg_rate(
+        &self,
+        sids: &[u64],
+        agg_type: AggregationType,
+        group_by_keys: &std::collections::BTreeSet<String>,
+        range_seconds: u64,
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
+        // Only additive types answer Statistic::Sum (same restriction as
+        // `evaluate_exact_agg`).
+        let stat = match agg_type {
+            AggregationType::Sum
+            | AggregationType::MultipleSum
+            | AggregationType::Increase
+            | AggregationType::MultipleIncrease => Statistic::Sum,
+            other => {
+                return Err(ASAPTierError::UnsupportedCapability {
+                    function: format!("rate_for_{other:?}"),
+                    capability: Capability::ExactAgg(other),
+                });
+            }
+        };
+
+        if range_seconds == 0 {
+            // Defensive — the engine should only route here when a
+            // matrix selector was present.
+            return Err(ASAPTierError::UnsupportedCapability {
+                function: "rate_with_zero_range".to_string(),
+                capability: Capability::ExactAgg(agg_type),
+            });
+        }
+        let divisor = range_seconds as f64;
+
+        // Choice of grouping mirrors `evaluate_exact_agg`:
+        // * `group_by_keys` empty → preserve each sid's own full
+        //   label map (one rate series per natural series).
+        // * `group_by_keys` non-empty → project each sid's label map
+        //   onto that subset, merging across subgroups.
+        type GroupKey = Vec<(String, String)>;
+        let mut by_group: BTreeMap<
+            GroupKey,
+            Option<Box<dyn crate::storage_engines::types::AggregateCore>>,
+        > = BTreeMap::new();
+        // Remember the natural label_map for each group_key so we can
+        // emit it on the output side (only relevant when
+        // `group_by_keys` is empty; otherwise the key IS the label
+        // map). For the projected case the BTreeMap from GroupKey is
+        // fine.
+        let mut natural_label_map: BTreeMap<GroupKey, BTreeMap<String, String>> = BTreeMap::new();
+
+        let mut metric_name_for_err = String::new();
+        let mut cov_lo: u64 = u64::MAX;
+        let mut cov_hi: u64 = 0;
+        let mut any_window = false;
+
+        for &sid in sids {
+            let meta = match self.index.instance(sid) {
+                Some(m) => m,
+                None => continue,
+            };
+            metric_name_for_err = meta.metric_name.clone();
+
+            let series_list = self.index.query_exact_agg_range(sid, t0_ms, t1_ms);
+            for (label_map, samples) in series_list {
+                let projected: GroupKey = if group_by_keys.is_empty() {
+                    // Use the natural label map as the grouping key so
+                    // distinct series stay separated. Sort the (k,v)
+                    // pairs by key for canonical ordering — BTreeMap
+                    // iteration is already key-sorted, so collecting
+                    // is enough.
+                    label_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                } else {
+                    group_by_keys
+                        .iter()
+                        .map(|k| {
+                            let v = label_map.get(k).cloned().unwrap_or_default();
+                            (k.clone(), v)
+                        })
+                        .collect()
+                };
+                natural_label_map
+                    .entry(projected.clone())
+                    .or_insert_with(|| projected.iter().cloned().collect());
+
+                for (window_end, acc) in samples {
+                    any_window = true;
+                    let w = if window_end >= 0 { window_end as u64 } else { 0 };
+                    if w < cov_lo {
+                        cov_lo = w;
+                    }
+                    if w > cov_hi {
+                        cov_hi = w;
+                    }
+                    let slot = by_group.entry(projected.clone()).or_insert(None);
+                    match slot.take() {
+                        None => {
+                            *slot = Some(acc.clone_boxed_core());
+                        }
+                        Some(prev) => {
+                            match prev.merge_with(acc.as_ref()) {
+                                Ok(m) => *slot = Some(m),
+                                Err(e) => {
+                                    return Err(ASAPTierError::DeserializeFailure {
+                                        sid,
+                                        encoding: SketchEncoding::ProtoFull,
+                                        reason: format!(
+                                            "exact-agg rate merge failed: {e}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_window {
+            return Err(ASAPTierError::NoData {
+                metric_name: metric_name_for_err,
+            });
+        }
+
+        // Emit one sample per group, timestamped at t1_ms (instant-rate
+        // semantics: the rate is "at time t over the trailing window").
+        let sample_ts = if t1_ms <= i64::MAX as u64 {
+            t1_ms as i64
+        } else {
+            i64::MAX
+        };
+        let mut out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = Vec::new();
+        for (group, slot) in by_group {
+            let merged = match slot {
+                Some(m) => m,
+                None => continue,
+            };
+            let raw = match merged.query_statistic(
+                stat,
+                &None,
+                &std::collections::HashMap::new(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(ASAPTierError::DeserializeFailure {
+                        sid: 0,
+                        encoding: SketchEncoding::ProtoFull,
+                        reason: format!(
+                            "exact-agg rate query_statistic({stat:?}) failed: {e}"
+                        ),
+                    });
+                }
+            };
+            let rate_value = raw / divisor;
+            let label_map: BTreeMap<String, String> = natural_label_map
+                .remove(&group)
+                .unwrap_or_else(|| group.into_iter().collect());
+            out_series.push((label_map, vec![(sample_ts, rate_value)]));
+        }
+
+        let coverage = if cov_lo <= cov_hi {
+            Some((cov_lo, cov_hi))
+        } else {
+            None
+        };
+        Ok(ASAPTierResult {
+            series: out_series,
+            coverage,
+        })
+    }
+
     /// Decode one window's sketch state and run the family-appropriate
     /// reduction.
     ///
