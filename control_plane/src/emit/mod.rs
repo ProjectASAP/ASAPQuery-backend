@@ -303,6 +303,39 @@ pub fn collect_metric_to_family(
     out
 }
 
+/// MVP blocker B3 — sibling of [`collect_metric_to_family`]: walk every
+/// registry entry, look the workload up, and assemble a map from metric
+/// name → the workload-spec `group_by_labels` list. Drops directly into
+/// `EdgeStageConfig::metric_to_grouping_labels`.
+///
+/// The 5-sketch routing emitter prepends a `transform/keep_for_<metric>`
+/// OTTL processor in front of each per-family sketch pipeline that
+/// calls `keep_keys(datapoint.attributes, [...])` on the listed labels.
+/// Without this the agent sketches with the full wire-attr tuple
+/// (e.g. `{zone, rack, node, pod, endpoint, service.name,
+/// telemetry.sdk.*}`) — one sid per unique tuple, defeating the
+/// streaming-config's `grouping_labels` contract.
+///
+/// Metrics with an empty `group_by_labels` list are included with an
+/// empty `Vec<String>` — that's the planner's signal that the
+/// streaming-config wants a single global sid per metric. The emitter
+/// handles empty by emitting `keep_keys(datapoint.attributes, [])`.
+/// Metrics absent from `workload_store` are skipped; the emitter
+/// treats absent entries as "no keep processor, attrs flow through".
+pub fn collect_metric_to_grouping_labels(
+    registry: &WorkloadRegistry,
+    workload_store: &WorkloadStore,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    for entry in registry.entries() {
+        let Some((workload, _wc)) = workload_store.get(&entry.metric_name) else {
+            continue;
+        };
+        out.insert(entry.metric_name.clone(), workload.group_by_labels.clone());
+    }
+    out
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
@@ -360,6 +393,7 @@ mod runtime_tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         };
 
         let collector = emit_for_runtime(AgentRuntime::AsapOtel, &cfg, "ws://ctrl/v1/opamp", None)
@@ -386,6 +420,7 @@ mod runtime_tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         };
         let yaml = emit_for_runtime(AgentRuntime::AsapOtap, &cfg, "ws://ctrl/v1/opamp", None)
             .expect("otap emit ok");
@@ -411,6 +446,7 @@ mod runtime_tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         };
         let toml = emit_for_runtime(AgentRuntime::AsapTelegraf, &cfg, "ws://ctrl/v1/opamp", None)
             .expect("telegraf emit ok");

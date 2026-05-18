@@ -394,6 +394,7 @@ mod tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         }
     }
 
@@ -408,6 +409,7 @@ mod tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         }
     }
 
@@ -426,6 +428,7 @@ mod tests {
             archive_tier_metrics: Vec::new(),
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
         }
     }
 
