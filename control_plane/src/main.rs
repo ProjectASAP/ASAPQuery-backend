@@ -51,6 +51,7 @@ use replan::Replanner;
 use physical::colored_dag::emitter::BackendStageConfig;
 use store::{PlanStore, WorkloadStore};
 use types::StageResourceBudgets;
+use workload::AggRole;
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -80,31 +81,48 @@ struct AppState {
     /// `CONTROLLER_BACKEND_ENDPOINT` is unset, matching the
     /// pre-existing fire-and-forget contract.
     backend_client:    Option<Arc<backend_client::BackendClient>>,
-    /// Per-metric `BackendStageConfig` cache used to emit a
-    /// **cumulative** `BackendStorageRouting` JSON document on every
-    /// per-metric replan.
+    /// Per-`(metric, role)` `BackendStageConfig` cache used to emit
+    /// **cumulative** `StreamingConfig` AND `BackendStorageRouting`
+    /// JSON documents on every plan-emit cycle.
     ///
-    /// Why this exists: `POST /api/v1/storage_routing` on the backend
-    /// is an atomic per-tenant SWAP — every push replaces the whole
-    /// tenant's routing table. The control plane's pre-existing per-metric
-    /// post path emits a single-element `metrics:[…]` document per
-    /// `handle_plan` call, so when N metrics replan in sequence only
-    /// the last metric's entry survives in the backend's routing table.
-    /// That defaults the other N-1 metrics to `sketch_store`, which
-    /// has no ASAP-tier sketch state for archive-shape queries
-    /// (`count`, `topk`, `rate_post_hoc`, `histogram_quantile`,
-    /// `delta`, `deriv`, `absent`) → the backend returns empty / 404 →
-    /// the demo's accuracy reducer logs `archive_miss` for those metrics
-    /// even though gorillas3 wrote their TSDB blocks to MinIO and Thanos
-    /// has them indexed.
+    /// **Why this is (metric, role)-keyed** (B2 cumulative-emit follow-up
+    /// to PR #283): a single metric can carry MULTIPLE [`AggRole`]
+    /// entries (e.g. post-B2 the workload-registry pre-pop loop registers
+    /// `http_requests_total` against BOTH a DDSketch-Quantile role from
+    /// `quantile_over_time(...)` AND an ExactAgg-Sum role from
+    /// `sum by (zone) (http_requests_total)`). Pre-fix the cache was
+    /// keyed by metric name alone, so the second role's
+    /// `BackendStageConfig` overwrote the first. The data plane's
+    /// `POST /api/v1/streaming-config` handler is an atomic full
+    /// `handle.swap(new_config)` (see
+    /// `data_plane/src/drivers/query/servers/http.rs`), so the second
+    /// per-role POST destroys the first role's aggregations on the
+    /// backend → `sum by (zone) (http_requests_total)` returns
+    /// `ExactAgg(Sum) capability not satisfied`.
     ///
-    /// The cache is a `HashMap<metric_name, BackendStageConfig>` keyed
-    /// by metric name. On every plan-emit cycle we update the entry for
-    /// the metric being planned and re-emit the storage-routing JSON
-    /// from the union of all currently-known plans, then push the
-    /// cumulative table. The next cycle's swap then preserves every
-    /// previously-seen metric's routing entry.
-    backend_routing_cache: Arc<Mutex<HashMap<String, BackendStageConfig>>>,
+    /// **Why this also matters for storage-routing**: `POST
+    /// /api/v1/storage_routing` is similarly an atomic per-tenant SWAP
+    /// — every push replaces the whole tenant's routing table. Pre-fix
+    /// the per-metric cache emitted a single-element `metrics:[…]`
+    /// document per `handle_plan` call, so when N metrics replanned in
+    /// sequence only the last metric's entry survived → archive-shape
+    /// queries fell to `default_engine: sketch_store` → `archive_miss`
+    /// for the other N-1 metrics.
+    ///
+    /// **Cumulative emit semantics** (post-fix): on every plan-emit
+    /// cycle the cache entry for the `(metric, role)` being planned is
+    /// updated, then:
+    ///   * Concatenate `aggregations` + `readouts` across ALL cache
+    ///     entries into a single cumulative `BackendStageConfig`, and
+    ///     post that one config to `/api/v1/streaming-config` so the
+    ///     data plane's swap installs every role's aggregations
+    ///     simultaneously.
+    ///   * Group cache entries by metric name and merge each metric's
+    ///     `BackendStageConfig`s (concat aggregations + readouts) into
+    ///     one entry per metric. Pass that per-metric list to
+    ///     `emit_backend_storage_routing` so a metric carrying both
+    ///     DDSketch + ExactAgg routes both shape families correctly.
+    backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -408,7 +426,7 @@ async fn main() {
     );
 
     let runtime_samples_store = runtime_samples::RuntimeSamplesStore::new(1024);
-    let backend_routing_cache: Arc<Mutex<HashMap<String, BackendStageConfig>>> =
+    let backend_routing_cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let state = AppState {
         analyzer:          Arc::new(Analyzer::new()),
@@ -682,18 +700,92 @@ async fn handle_plan(
                                 }
                                 agg.grouping = workload.group_by_labels.clone();
                             }
-                            // Phase C: post the typed L5 streaming-config
-                            // JSON to ASAPQuery-backend via the shared
-                            // BackendClient when configured. Without a
-                            // configured endpoint this still no-ops
-                            // silently — same fire-and-forget contract
-                            // as the existing Replanner path.
-                            match emit::emit_backend_streaming_config_json(&be) {
+                            // B2 cumulative-emit follow-up: update the
+                            // per-(metric, role) cache with THIS
+                            // iteration's `be`, then BOTH the
+                            // streaming-config emit and the
+                            // storage-routing emit below derive their
+                            // payload from the FULL cache. The
+                            // single-iteration `be` is never sent on
+                            // the wire on its own — every post is
+                            // cumulative across all `(metric, role)`
+                            // pairs the control plane has planned.
+                            //
+                            // Why: the data plane's
+                            // `POST /api/v1/streaming-config` handler
+                            // is `handle.swap(new_config)` (an atomic
+                            // full replace) and the storage-routing
+                            // handler is similarly an atomic per-tenant
+                            // swap. Per-iteration posts overwrite
+                            // siblings:
+                            //   * streaming-config — drops the prior
+                            //     role's `aggregations`, so a metric
+                            //     with both DDSketch (Quantile) and
+                            //     ExactAgg (Sum) loses one on the
+                            //     backend → `sum by (zone)
+                            //     (http_requests_total)` returns
+                            //     `ExactAgg(Sum) capability not satisfied`
+                            //     (the regression that motivates this
+                            //     PR — direct follow-up to #283 which
+                            //     made the workload/plan stores
+                            //     (metric, role)-keyed but left the
+                            //     emit path metric-only).
+                            //   * storage-routing — drops other
+                            //     metrics' entries → default
+                            //     `sketch_store` engine → `archive_miss`.
+                            let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
+                                let mut cache = st.backend_routing_cache.lock().await;
+                                cache.insert((workload.metric_name.clone(), role), be.clone());
+                                let mut v: Vec<((String, AggRole), BackendStageConfig)> = cache
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect();
+                                // Deterministic ordering so the emitted
+                                // JSON body is reproducible across runs
+                                // and across test invocations. HashMap
+                                // iteration order would otherwise make
+                                // captured-body regression assertions
+                                // flaky.
+                                v.sort_by(|(a_k, _), (b_k, _)| {
+                                    a_k.0
+                                        .cmp(&b_k.0)
+                                        .then_with(|| a_k.1.as_str().cmp(b_k.1.as_str()))
+                                });
+                                v
+                            };
+
+                            // Cumulative streaming-config — one
+                            // `BackendStageConfig` whose `aggregations`
+                            // + `readouts` are the concatenation of
+                            // every cache entry's. The data plane's
+                            // swap installs this single
+                            // multi-aggregation config atomically, so
+                            // ALL roles for ALL metrics survive.
+                            let cumulative_be = BackendStageConfig {
+                                aggregations: cumulative_entries
+                                    .iter()
+                                    .flat_map(|(_, c)| c.aggregations.iter().cloned())
+                                    .collect(),
+                                readouts: cumulative_entries
+                                    .iter()
+                                    .flat_map(|(_, c)| c.readouts.iter().cloned())
+                                    .collect(),
+                            };
+
+                            // Phase C: post the cumulative typed L5
+                            // streaming-config JSON to ASAPQuery-backend
+                            // via the shared BackendClient when
+                            // configured. Without a configured endpoint
+                            // this still no-ops silently — same
+                            // fire-and-forget contract as the existing
+                            // Replanner path.
+                            match emit::emit_backend_streaming_config_json(&cumulative_be) {
                                 Ok(json_doc) => {
                                     info!(
                                         stage = "backend",
-                                        aggregations = be.aggregations.len(),
-                                        readouts = be.readouts.len(),
+                                        aggregations = cumulative_be.aggregations.len(),
+                                        readouts = cumulative_be.readouts.len(),
+                                        cumulative_pairs = cumulative_entries.len(),
                                         "[USE_TYPED_STAGE_SPLIT] posting typed backend JSON"
                                     );
                                     if let Some(client) = st.backend_client.as_ref() {
@@ -723,58 +815,50 @@ async fn handle_plan(
                                 Err(e) => warn!(error = %e, "emit_backend_streaming_config_json failed"),
                             }
 
-                            // Phase α (MVP): emit per-metric storage
-                            // routing table from the same typed L5
-                            // BackendStageConfig, and POST it to the
-                            // backend's `/api/v1/storage_routing`
-                            // endpoint via the BackendClient sibling
-                            // method. The classification rules live in
-                            // `config::stage_emit::emit_backend_storage_routing`
-                            // — see that function's doc-comment for the
-                            // sketch-family → query-shape mapping.
+                            // Phase α (MVP) cumulative storage-routing.
+                            // The routing classifier
+                            // (`build_routing_entry` in
+                            // `emit/stage_config.rs`) reads
+                            // `cfg.aggregations` to derive shape
+                            // routing, so we MUST merge every role's
+                            // aggregations for one metric into a single
+                            // `BackendStageConfig` before passing it
+                            // through — otherwise a metric with both
+                            // DDSketch (Quantile) and ExactAgg (Sum)
+                            // would emit only the last-cached role's
+                            // shape classifications and route the
+                            // siblings to archive.
                             //
-                            // CRITICAL: the backend's
-                            // `POST /api/v1/storage_routing` handler is
-                            // an atomic per-tenant SWAP — every push
-                            // replaces the whole tenant's routing
-                            // table. We MUST emit the cumulative
-                            // routing JSON across every metric the
-                            // control plane has planned to date, otherwise
-                            // each per-metric replan erases the routing
-                            // entries for every other metric and the
-                            // backend defaults them to
-                            // `sketch_store` (which has nothing for
-                            // archive-shape queries). That's the
-                            // `archive_miss` failure mode for
-                            // HLL/CountSketch/CountMin/KLL metrics in
-                            // the post-#345 demo runs even though
-                            // gorillas3 writes their TSDB blocks to
-                            // MinIO and Thanos has them indexed.
-                            //
-                            // We thread the per-metric `BackendStageConfig`
-                            // through `state.backend_routing_cache` so
-                            // a metric replan picks up an updated entry
-                            // for itself but preserves every previously
-                            // planned metric's entry.
-                            let cumulative_plans = {
-                                let mut cache = st.backend_routing_cache.lock().await;
-                                cache.insert(workload.metric_name.clone(), be.clone());
-                                cache
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect::<Vec<(String, BackendStageConfig)>>()
-                            };
-                            let routing_input: Vec<(String, &BackendStageConfig)> =
-                                cumulative_plans
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v))
-                                    .collect();
+                            // `emit_backend_storage_routing`'s signature
+                            // is `&[(String, &BackendStageConfig)]` —
+                            // per-metric, NOT per-(metric, role) — so
+                            // the merge happens at the call site (per
+                            // the PR's no-signature-change constraint).
+                            let mut by_metric: std::collections::BTreeMap<String, BackendStageConfig> =
+                                std::collections::BTreeMap::new();
+                            for ((m, _r), cfg) in &cumulative_entries {
+                                let entry = by_metric.entry(m.clone()).or_insert_with(|| {
+                                    BackendStageConfig {
+                                        aggregations: Vec::new(),
+                                        readouts: Vec::new(),
+                                    }
+                                });
+                                entry.aggregations.extend(cfg.aggregations.iter().cloned());
+                                entry.readouts.extend(cfg.readouts.iter().cloned());
+                            }
+                            let routing_owned: Vec<(String, BackendStageConfig)> =
+                                by_metric.into_iter().collect();
+                            let routing_input: Vec<(String, &BackendStageConfig)> = routing_owned
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v))
+                                .collect();
                             match emit::emit_backend_storage_routing(&routing_input) {
                                 Ok(routing_doc) => {
                                     info!(
                                         stage = "backend",
                                         metric = %workload.metric_name,
-                                        cumulative_metrics = cumulative_plans.len(),
+                                        cumulative_metrics = routing_owned.len(),
+                                        cumulative_pairs = cumulative_entries.len(),
                                         "[USE_TYPED_STAGE_SPLIT] posting cumulative storage-routing JSON"
                                     );
                                     if let Some(client) = st.backend_client.as_ref() {
