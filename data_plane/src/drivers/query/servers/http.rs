@@ -2429,13 +2429,19 @@ aggregations:
         }
     }
 
-    // Schema retirement #2 — the endpoint now reads from the sid
+    // Schema retirement #2/#5 — the endpoint reads from the sid
     // catalog. The reconfigure → timeline flow this test exercised
-    // depended on `SchemaRegistry::reconcile()` propagating to the
-    // timeline source. Sid-level reconcile lands in the next sub-PR;
-    // until then, register sids directly via `SketchStore::register`
-    // instead of going through the YAML POST.
-    #[ignore = "depends on sid-level reconcile from streaming-config (next schema-retirement sub-PR)"]
+    // depended on `SchemaRegistry::reconcile()` eagerly populating
+    // the timeline source on YAML POST. Post-#189 the registry is
+    // gone and sid-level reconcile (see
+    // `lifecycle::reconcile_from_streaming_config`) deliberately
+    // does NOT pre-mint sids on POST — they're minted lazily by the
+    // first ingest write under the new config. Re-enabling this
+    // test requires either an interleaved ingest step (changes the
+    // contract being tested) or an architectural switch to eager
+    // sid minting (contradicts the documented sid lifecycle); both
+    // are out of scope for #272 step 4.
+    #[ignore = "obsoleted by sid lazy-mint lifecycle; see comment above and #272 step 4 resolution"]
     #[tokio::test]
     async fn test_get_timeline_returns_segments_after_reconfigure() {
         use crate::storage_engines::sketch_db::index::SketchStore;
