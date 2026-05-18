@@ -164,15 +164,23 @@ impl Replanner {
     /// request (workload missing from store, `bind_workload_typed`
     /// declines the shape, no `Edge` entry, emit failure) — caller
     /// then falls back to the legacy emitter.
-    fn try_emit_typed_edge_yaml(&self, metric: &str) -> Option<String> {
+    fn try_emit_typed_edge_yaml(&self, metric: &str, agent_id: &str) -> Option<String> {
         let (workload, _wc) = self.workload_store.get(metric)?;
-        self.try_emit_typed_edge_yaml_for_workload(&workload)
+        self.try_emit_typed_edge_yaml_for_workload(&workload, agent_id)
     }
 
     /// Same as [`try_emit_typed_edge_yaml`] but takes the
     /// `QueryWorkload` directly. Used by `replan_metric` which already
     /// has the workload in scope.
-    fn try_emit_typed_edge_yaml_for_workload(&self, workload: &QueryWorkload) -> Option<String> {
+    ///
+    /// `agent_id` is threaded into the emitted opamp `X-Agent-ID` header
+    /// (Issue #2). Callers per-agent pass the real id; broadcast callers
+    /// pass `"$AGENT_ID"` and rely on the agent container's env.
+    fn try_emit_typed_edge_yaml_for_workload(
+        &self,
+        workload: &QueryWorkload,
+        agent_id: &str,
+    ) -> Option<String> {
         let physical_expr = rules::bind_workload_typed(workload)?;
         let configs = stage_split::split_typed_three_stage(&physical_expr)?;
         let mut edge_cfg = configs.into_iter().find_map(|(_, cfg)| match cfg {
@@ -224,6 +232,7 @@ impl Replanner {
             &edge_cfg,
             &self.opamp_endpoint,
             None,
+            agent_id,
         )
         .ok()
     }
@@ -254,7 +263,7 @@ impl Replanner {
         };
 
         let yaml = if stage_split::typed_stage_split_enabled() {
-            match self.try_emit_typed_edge_yaml(&metric) {
+            match self.try_emit_typed_edge_yaml(&metric, agent_id) {
                 Some(y) => {
                     info!(
                         agent = agent_id, metric = %metric, bytes = y.len(),
@@ -324,42 +333,56 @@ impl Replanner {
         // rather than broadcasting to all agent-role collectors. Same gate
         // as `push_config_to_agent` — typed path on, legacy fallback on
         // emit failure or when the gate is off.
-        let agent_yaml: Option<String> = if stage_split::typed_stage_split_enabled() {
-            match self.try_emit_typed_edge_yaml_for_workload(&workload) {
-                Some(y) => {
-                    info!(
-                        metric,
-                        bytes = y.len(),
-                        "[USE_TYPED_STAGE_SPLIT] re-plan emitted typed edge YAML"
-                    );
-                    Some(y)
+        //
+        // Issue #2: emit per-agent inside the push loop so each agent's
+        // opamp `X-Agent-ID` header carries its actual id (the agent
+        // re-presents this header after the controller-pushed config
+        // triggers a Docker restart).
+        let agents = self.agent_to_metric.read().await;
+        let target_agents: Vec<String> = agents
+            .iter()
+            .filter(|(_, m)| m.as_str() == metric)
+            .map(|(id, _)| id.clone())
+            .collect();
+        drop(agents);
+
+        // Pre-emit the legacy fallback YAML once (it has no per-agent
+        // identity to thread) so each agent that falls back gets the
+        // same bytes.
+        let legacy_fallback: Option<String> =
+            generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint).ok();
+
+        for agent_id in target_agents {
+            let agent_yaml: Option<String> = if stage_split::typed_stage_split_enabled() {
+                match self.try_emit_typed_edge_yaml_for_workload(&workload, &agent_id) {
+                    Some(y) => {
+                        info!(
+                            metric,
+                            agent = %agent_id,
+                            bytes = y.len(),
+                            "[USE_TYPED_STAGE_SPLIT] re-plan emitted typed edge YAML"
+                        );
+                        Some(y)
+                    }
+                    None => {
+                        warn!(
+                            metric,
+                            agent = %agent_id,
+                            "[USE_TYPED_STAGE_SPLIT] re-plan typed emit failed; \
+                             falling back to legacy generate_agent_collector_config"
+                        );
+                        legacy_fallback.clone()
+                    }
                 }
-                None => {
-                    warn!(
-                        metric,
-                        "[USE_TYPED_STAGE_SPLIT] re-plan typed emit failed; \
-                         falling back to legacy generate_agent_collector_config"
-                    );
-                    generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint).ok()
-                }
-            }
-        } else {
-            generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint).ok()
-        };
-        if let Some(yaml) = agent_yaml {
-            let cfg = RemoteConfig {
-                config_hash: short_hash(&yaml),
-                yaml,
+            } else {
+                legacy_fallback.clone()
             };
-            let agents = self.agent_to_metric.read().await;
-            let target_agents: Vec<String> = agents
-                .iter()
-                .filter(|(_, m)| m.as_str() == metric)
-                .map(|(id, _)| id.clone())
-                .collect();
-            drop(agents);
-            for agent_id in target_agents {
-                self.opamp.push(&agent_id, cfg.clone()).await;
+            if let Some(yaml) = agent_yaml {
+                let cfg = RemoteConfig {
+                    config_hash: short_hash(&yaml),
+                    yaml,
+                };
+                self.opamp.push(&agent_id, cfg).await;
             }
         }
         // Push the ASAPQuery-backend StreamingConfig YAML via HTTP if a
@@ -643,7 +666,7 @@ mod tests {
         r.plan_store.set("latency", make_plan());
 
         let yaml = r
-            .try_emit_typed_edge_yaml("latency")
+            .try_emit_typed_edge_yaml("latency", "test-agent")
             .expect("typed emit should succeed for a quantile workload");
 
         // gorillas3 — archive-tier write to MinIO. Without this the

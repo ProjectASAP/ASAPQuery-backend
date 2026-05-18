@@ -29,10 +29,21 @@
 //! directly to asapquery-backend's precompute engine over HTTP via
 //! `emit_backend_streaming_config_json`.
 //!
-//! All three are pure transformations: no I/O, no env lookup. The
-//! `opamp_endpoint` parameter is the controller's WebSocket URL the
-//! emitted YAML's `extensions.opamp` block must point at; the caller
-//! threads it through from `AppState::opamp_endpoint`.
+//! All three are pure transformations: no I/O. The `opamp_endpoint`
+//! parameter is the controller's WebSocket URL the emitted YAML's
+//! `extensions.opamp` block must point at; the caller threads it
+//! through from `AppState::opamp_endpoint`. The `agent_id` parameter
+//! is the identity the agent presents in the `X-Agent-ID` WS header
+//! when it reconnects after a controller-pushed restart (Issue #2 —
+//! without this header the controller's OpAMP server can't re-identify
+//! the agent). Broadcast callers that don't have a single agent in
+//! scope pass the literal placeholder `"$AGENT_ID"` and rely on the
+//! agent container's env to expand it at boot.
+//!
+//! NOTE: the memory_limiter soft threshold the 5-sketch routing path
+//! emits can be tuned via the controller's `ASAP_AGENT_MEMORY_LIMIT_MIB`
+//! env var (default 1280 MiB). Operators bumping the agent container's
+//! cgroup limit raise both together. See `emit_edge_yaml_5sketch_routing`.
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -102,7 +113,11 @@ struct Pipeline {
 /// then, we emit a documented placeholder (`gateway:4317`) so the YAML
 /// is syntactically valid and round-trips through Otel's loader for
 /// integration tests.
-pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<String> {
+pub fn emit_edge_yaml(
+    cfg: &EdgeStageConfig,
+    opamp_endpoint: &str,
+    agent_id: &str,
+) -> Result<String> {
     // ── MVP §46: 5-sketch routing-connector dispatch ───────────────────────
     //
     // When the planner has populated `cfg.metric_to_family` (the per-metric
@@ -119,7 +134,7 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
     // Empty `metric_to_family` ⇒ legacy single-pipeline / Mode-3 /
     // warm-passthrough emit paths kick in (preserved verbatim below).
     if !cfg.metric_to_family.is_empty() {
-        return emit_edge_yaml_5sketch_routing(cfg, opamp_endpoint);
+        return emit_edge_yaml_5sketch_routing(cfg, opamp_endpoint, agent_id);
     }
 
     // ── Receivers ─────────────────────────────────────────────────────────────
@@ -409,8 +424,14 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
     }
 
     // ── OpAMP extension ───────────────────────────────────────────────────────
+    //
+    // Issue #2: include `X-Agent-ID` in the ws headers so the agent
+    // re-presents the same identity to the controller's OpAMP server
+    // after a Docker restart (the on_connect handler keys on this
+    // header). Without it, `/api/v1/agents` is empty post-restart and
+    // the controller can't push config to the orphaned agent.
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n    headers:\n      X-Agent-ID: \"{agent_id}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -438,7 +459,11 @@ pub fn emit_edge_yaml(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<Str
 /// The gateway runs one `<sketch_kind>merge` processor per
 /// `GatewayMergeProcessor` entry — these are the patched merge
 /// processors in `opentelemetry-collector-contrib-patch/processor/`.
-pub fn emit_gateway_yaml(cfg: &GatewayStageConfig, opamp_endpoint: &str) -> Result<String> {
+pub fn emit_gateway_yaml(
+    cfg: &GatewayStageConfig,
+    opamp_endpoint: &str,
+    agent_id: &str,
+) -> Result<String> {
     // Receiver — port from cfg, both gRPC + HTTP.
     let port = cfg.otlp_receiver_port;
     let otlp_receiver: Value = serde_yaml::from_str(&format!(
@@ -471,8 +496,10 @@ pub fn emit_gateway_yaml(cfg: &GatewayStageConfig, opamp_endpoint: &str) -> Resu
     // Exporter — backend OTLP.
     let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
 
+    // Issue #2: gateway also needs X-Agent-ID so its OpAMP-pushed
+    // reconnect re-identifies to the controller.
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n    headers:\n      X-Agent-ID: \"{agent_id}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -866,7 +893,11 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
 // `warm_passthrough_metrics` (the freshness probes) are folded into
 // the routing table's `table:` and route to the `metrics/raw_passthrough`
 // pipeline — they intentionally bypass every sketch processor.
-fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -> Result<String> {
+fn emit_edge_yaml_5sketch_routing(
+    cfg: &EdgeStageConfig,
+    opamp_endpoint: &str,
+    agent_id: &str,
+) -> Result<String> {
     use crate::sketch_algebra::params::SketchKind;
 
     let otlp_receiver: Value = serde_yaml::from_str(
@@ -948,15 +979,26 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
     // (gorillas3 archive write fix): even with `window_interval: 5s`
     // the agent was OOM-killed (exit 137) ~3 min into sustained load
     // because six per-family in-memory windowState buffers can overshoot
-    // the 1.5 GiB cgroup ceiling at peak. Threshold = 1280 MiB / 256 MiB
-    // spike (≈ 80 % / 17 % of cgroup), mirrors gateway shape but scaled
-    // to the agent's smaller cgroup. MUST be the first processor in
-    // every per-sketch pipeline (see `make_sketch_pipeline` below) —
-    // limiting AFTER gorillas3 would mean the buffer has already
-    // accreted on heap by the time the limiter rejects.
-    let memory_limiter_block: Value =
-        serde_yaml::from_str("check_interval: 1s\nlimit_mib: 1280\nspike_limit_mib: 256\n")
-            .context("parse memory_limiter processor block")?;
+    // the 1.5 GiB cgroup ceiling at peak. Threshold default = 1280 MiB
+    // / 256 MiB spike (≈ 80 % / 17 % of a 1.5 GiB cgroup); operators who
+    // raise the agent container's cgroup limit can also raise the soft
+    // limit at controller emit time via `ASAP_AGENT_MEMORY_LIMIT_MIB`
+    // (mirrors the env-substitute pattern in `build_gorillas3_yaml`).
+    // `spike_limit_mib` is fixed at 20 % of the soft limit (min 256
+    // MiB) so the ratio stays sensible as operators tune the limit.
+    // MUST be the first processor in every per-sketch pipeline (see
+    // `make_sketch_pipeline` below) — limiting AFTER gorillas3 would
+    // mean the buffer has already accreted on heap by the time the
+    // limiter rejects.
+    let memory_limit_mib: u64 = std::env::var("ASAP_AGENT_MEMORY_LIMIT_MIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1280);
+    let spike_limit_mib: u64 = std::cmp::max(256, memory_limit_mib / 5);
+    let memory_limiter_block: Value = serde_yaml::from_str(&format!(
+        "check_interval: 1s\nlimit_mib: {memory_limit_mib}\nspike_limit_mib: {spike_limit_mib}\n"
+    ))
+    .context("parse memory_limiter processor block")?;
     processors.insert("memory_limiter".to_string(), memory_limiter_block);
 
     // ── Exporters ──────────────────────────────────────────────────────────
@@ -1169,8 +1211,13 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
     }
 
     // ── OpAMP extension ────────────────────────────────────────────────────
+    //
+    // Issue #2: X-Agent-ID header — see legacy `emit_edge_yaml` for the
+    // full rationale. Without it the agent has no identity after a
+    // controller-pushed config triggers a Docker restart, and the
+    // controller's `/api/v1/agents` is empty post-restart.
     let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\nremote_config_path: /etc/otel/config.yaml\n"
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n    headers:\n      X-Agent-ID: \"{agent_id}\"\nremote_config_path: /etc/otel/config.yaml\n"
     ))
     .context("parse opamp extension block")?;
 
@@ -1204,7 +1251,6 @@ fn emit_edge_yaml_5sketch_routing(cfg: &EdgeStageConfig, opamp_endpoint: &str) -
 fn build_gorillas3_yaml(window_secs: u64) -> String {
     let env_or = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
     let endpoint = env_or("ASAP_MINIO_ENDPOINT", "http://minio:9000");
-    let bucket = env_or("ASAP_GORILLA_BUCKET", "asap-gorilla");
     let access_key = env_or("ASAP_MINIO_ACCESS_KEY", "asap");
     let secret_key = env_or("ASAP_MINIO_SECRET_KEY", "asap-local-only");
     let tenant = env_or("ASAP_TENANT", "default");
@@ -1213,11 +1259,17 @@ fn build_gorillas3_yaml(window_secs: u64) -> String {
     // `{YYYY}`, …) are resolved by the gorillas3 processor at write
     // time, not by the YAML loader — they stay as literal `{...}`
     // tokens in the emitted YAML.
+    //
+    // Phase 2 (post-ASAPCollector#387): the legacy `bucket:` field is
+    // no longer read at runtime — only `tsdb_bucket:` (the TSDB block
+    // destination) drives the gorillas3 writer. We therefore stop
+    // emitting `bucket:` here. The agent's gorillas3 Config struct
+    // still carries a `Bucket` field for mapstructure compatibility,
+    // but it stays at its zero value, which is fine post-#387.
     format!(
         "window_interval: {window_secs}s\n\
 drop_original: false\n\
 endpoint: \"{endpoint}\"\n\
-bucket: \"{bucket}\"\n\
 region: us-east-1\n\
 use_ssl: false\n\
 access_key_id: \"{access_key}\"\n\
@@ -1639,6 +1691,13 @@ mod tests {
         CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams,
     };
 
+    // env vars are process-global; cargo runs unit tests on multiple
+    // threads. Serialize every test that reads or writes
+    // `ASAP_AGENT_MEMORY_LIMIT_MIB` (the memory_limiter knob) so a
+    // parallel test thread doesn't observe one test's setup as
+    // another test's input.
+    static MEMORY_LIMIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn ddsketch_edge_cfg() -> EdgeStageConfig {
         EdgeStageConfig {
             source_metric: Some("http_request_duration_seconds".to_string()),
@@ -1661,7 +1720,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_contains_processor_and_pipeline_refs() {
-        let yaml = emit_edge_yaml(&ddsketch_edge_cfg(), "ws://ctrl:4320/v1/opamp")
+        let yaml = emit_edge_yaml(&ddsketch_edge_cfg(), "ws://ctrl:4320/v1/opamp", "test-agent")
             .expect("emit_edge_yaml ok");
 
         // Receiver block.
@@ -1721,7 +1780,7 @@ mod tests {
             sketch_params: SketchParams::Kll(KllParams { k: 200 }),
             aggregation_id: "agg7".to_string(),
         };
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(yaml.contains("KLL:"), "{yaml}");
         assert!(yaml.contains("k: 200"), "{yaml}");
         assert!(
@@ -1782,7 +1841,7 @@ mod tests {
                 sketch_params: params,
                 aggregation_id: "agg-delta".to_string(),
             };
-            let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+            let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
             assert!(
                 yaml.contains("delta_transmission: true"),
                 "{processor_name:?} emit must carry delta_transmission: true\n{yaml}"
@@ -1800,7 +1859,7 @@ mod tests {
             sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
             aggregation_id: "agg-cms".to_string(),
         };
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(yaml.contains("countmin:"), "{yaml}");
         assert!(
             yaml.contains("metric_name: endpoint_request_freq"),
@@ -1812,7 +1871,7 @@ mod tests {
     fn edge_yaml_batch_mode_when_no_window() {
         let mut cfg = ddsketch_edge_cfg();
         cfg.window_secs = None;
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(yaml.contains("mode: batch"), "{yaml}");
         assert!(
             !yaml.contains("window_duration"),
@@ -1834,7 +1893,7 @@ mod tests {
 
     #[test]
     fn gateway_yaml_uses_family_specific_merge_name() {
-        let yaml = emit_gateway_yaml(&ddsketch_gateway_cfg(), "ws://ctrl:4320/v1/opamp")
+        let yaml = emit_gateway_yaml(&ddsketch_gateway_cfg(), "ws://ctrl:4320/v1/opamp", "test-agent")
             .expect("emit_gateway_yaml ok");
 
         // Family-specific merge name (NOT the placeholder).
@@ -1876,7 +1935,7 @@ mod tests {
             ],
             exporter_target: ExportTarget::Stage(StageId::Backend),
         };
-        let yaml = emit_gateway_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_gateway_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(yaml.contains("kllmerge:"), "{yaml}");
         assert!(yaml.contains("hllmerge:"), "{yaml}");
         assert!(
@@ -2016,7 +2075,7 @@ mod tests {
     fn export_target_endpoint_is_passed_through_verbatim() {
         let mut cfg = ddsketch_edge_cfg();
         cfg.exporter_target = ExportTarget::Endpoint("custom-gw:5317".into());
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(yaml.contains("custom-gw:5317"), "{yaml}");
     }
 
@@ -2619,7 +2678,7 @@ mod tests {
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
         };
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Exporter — Prometheus's native OTLP receiver, full path.
         assert!(
@@ -2673,7 +2732,7 @@ mod tests {
     #[test]
     fn phase_eps1_no_mode3_edge_yaml_unchanged_from_phase_b() {
         let cfg = ddsketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             !yaml.contains("otlphttp/prometheus"),
             "no Mode 3 → no otlphttp/prometheus\n{yaml}"
@@ -2707,7 +2766,7 @@ mod tests {
             metric: "http_freshness_probe_archive".to_string(),
             window_secs: Some(5),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Processor block surfaced at the top level.
         assert!(
@@ -2766,7 +2825,7 @@ mod tests {
             metric: "http_freshness_probe_archive".to_string(),
             window_secs: Some(5),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Find the pipeline processor list — should contain gorillas3
         // ahead of ddsketch in the serialized order. Robust
@@ -2802,7 +2861,7 @@ mod tests {
             window_secs: Some(1),
         }];
         cfg.warm_passthrough_metrics = vec!["http_freshness_probe_warm".to_string()];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Routing processor present, dispatches by metric name (OTTL form).
         assert!(
@@ -2870,7 +2929,7 @@ mod tests {
             window_secs: Some(60),
             label_proj: Vec::new(),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // OTTL form gives us a single routing processor that handles
         // both dispatch axes.
@@ -2948,7 +3007,7 @@ mod tests {
     #[test]
     fn mvp46_emit_loads_all_5_sketch_processors() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for proc in ["ddsketch", "KLL", "HLL", "countsketch", "countmin"] {
             assert!(
                 yaml.contains(&format!("{proc}:")),
@@ -2963,7 +3022,7 @@ mod tests {
         // `routingprocessor`; the routing component is now a
         // `routingconnector`. We MUST emit it under `connectors:`.
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Connectors block exists with a `routing:` entry.
         assert!(
@@ -3010,7 +3069,7 @@ mod tests {
     #[test]
     fn mvp46_emits_all_6_named_pipelines() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for pl in [
             // Entry pipeline.
             "metrics:",
@@ -3030,7 +3089,7 @@ mod tests {
     #[test]
     fn mvp46_entry_pipeline_routes_to_connector_not_processor() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Find the entry `metrics:` pipeline section (under
         // service.pipelines) and verify it has `exporters: [routing]`
         // and no processors list (or empty).
@@ -3061,7 +3120,7 @@ mod tests {
             metric: "http_requests_total_latency_ms".into(),
             window_secs: Some(60),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // gorillas3 processor block present.
         assert!(
@@ -3108,12 +3167,22 @@ mod tests {
         // FIRST processor so backpressure refuses incoming batches
         // BEFORE gorillas3 buffers them — the previous shape OOM-killed
         // the agent at ~3 min under sustained load.
+        //
+        // B1 follow-up: asserts on `limit_mib: 1280` (the env-var
+        // default) — serialize against MEMORY_LIMIT_ENV_LOCK so the
+        // companion `b1_memory_limiter_honours_*` tests can't
+        // race-set `ASAP_AGENT_MEMORY_LIMIT_MIB=1600` mid-emit.
+        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: see MEMORY_LIMIT_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
+        }
         let mut cfg = five_sketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_requests_total_latency_ms".into(),
             window_secs: Some(60),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // memory_limiter processor block present with the chosen
         // threshold (1280 MiB ≈ 80 % of agent's 1536 MiB cgroup).
@@ -3164,7 +3233,7 @@ mod tests {
     #[test]
     fn mvp46_routing_table_dispatches_per_metric_to_correct_family() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Every metric in the contract dispatches via routingconnector OTTL
         // conditions.
         // to its family pipeline. serde_yaml may render sequences
@@ -3194,7 +3263,7 @@ mod tests {
     #[test]
     fn mvp46_default_pipeline_is_raw_passthrough() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Tolerate inline-vs-block list rendering — serde_yaml chooses
         // based on width.
         let inline = "default_pipelines: [metrics/raw_passthrough]";
@@ -3218,7 +3287,7 @@ mod tests {
             window_secs: Some(1),
         }];
         cfg.warm_passthrough_metrics = vec!["http_freshness_probe_warm".into()];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         let needle = "name == \"http_freshness_probe_warm\"";
         let idx = yaml
@@ -3263,7 +3332,7 @@ mod tests {
         // pipeline) and a receiver (each per-family pipeline). This
         // pins the receiver-side wiring.
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for pipeline in [
             "metrics/ddsketch_path:",
             "metrics/kll_path:",
@@ -3297,7 +3366,7 @@ mod tests {
             cfg.metric_to_family.is_empty(),
             "ddsketch_edge_cfg fixture must keep metric_to_family empty"
         );
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // No connectors block.
         assert!(
             !yaml.contains("connectors:"),
@@ -3325,7 +3394,7 @@ mod tests {
             window_secs: Some(60),
             label_proj: vec!["service.name".into()],
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         assert!(
             yaml.contains("metrics/prometheus_archive:"),
@@ -3381,7 +3450,7 @@ mod tests {
     #[test]
     fn b3_emits_transform_keep_processor_per_metric_with_grouping_labels() {
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for metric in [
             "http_requests_total_latency_ms",
             "request_size_bytes",
@@ -3400,7 +3469,7 @@ mod tests {
     #[test]
     fn b3_transform_block_uses_keep_keys_ottl_with_correct_labels() {
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             yaml.contains(
                 "keep_keys(datapoint.attributes, [\"zone\"]) where metric.name == \"http_requests_total_latency_ms\""
@@ -3423,7 +3492,7 @@ mod tests {
     #[test]
     fn b3_per_family_pipeline_prepends_keep_before_sketch() {
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for (pipeline, metric, family_proc) in [
             ("metrics/ddsketch_path:", "http_requests_total_latency_ms", "ddsketch"),
             ("metrics/kll_path:", "request_size_bytes", "KLL"),
@@ -3459,7 +3528,7 @@ mod tests {
             metric: "http_requests_total_latency_ms".into(),
             window_secs: Some(60),
         }];
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         let p_idx = yaml.find("metrics/ddsketch_path:").expect("pipeline");
         let after = &yaml[p_idx..];
         let next_offset = after[1..]
@@ -3493,7 +3562,7 @@ mod tests {
     #[test]
     fn b3_no_transform_processor_when_grouping_labels_absent() {
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             !yaml.contains("transform/keep_for_"),
             "no transform/keep_for_* processor should be emitted when grouping-labels map is empty\n{yaml}"
@@ -3509,7 +3578,7 @@ mod tests {
         let mut cfg = five_sketch_edge_cfg();
         cfg.metric_to_grouping_labels
             .insert("http_requests_total_latency_ms".into(), vec![]);
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             yaml.contains(
                 "keep_keys(datapoint.attributes, []) where metric.name == \"http_requests_total_latency_ms\""
@@ -3526,7 +3595,7 @@ mod tests {
             "http_requests_total_latency_ms".into(),
             vec!["zone".into()],
         );
-        let yaml = emit_edge_yaml(&cfg, "ws://c/").expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             yaml.contains("transform/keep_for_http_requests_total_latency_ms:"),
             "legacy emit must register the keep processor\n{yaml}"
@@ -3548,6 +3617,159 @@ mod tests {
         assert!(
             k_idx < s_idx,
             "keep_for_* must come BEFORE ddsketch in legacy pipeline\n{section}"
+        );
+    }
+
+    // ── B1-downstream Issue #2: X-Agent-ID header threading ────────────────
+
+    /// Legacy (`emit_edge_yaml`, no `metric_to_family`) emit threads the
+    /// supplied agent_id into the opamp `headers.X-Agent-ID` field so
+    /// the agent re-identifies to the controller after a Docker
+    /// restart triggered by a controller-pushed OpAMP config apply.
+    #[test]
+    fn b1_legacy_emit_threads_x_agent_id_header() {
+        let cfg = ddsketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-7")
+            .expect("emit ok");
+        assert!(
+            yaml.contains("X-Agent-ID:"),
+            "legacy edge emit must include the X-Agent-ID header in the opamp block\n{yaml}"
+        );
+        assert!(
+            yaml.contains("agent-7"),
+            "legacy edge emit must surface the threaded agent_id value\n{yaml}"
+        );
+    }
+
+    /// 5-sketch routing emit (`emit_edge_yaml_5sketch_routing`,
+    /// activated by non-empty `metric_to_family`) also threads
+    /// `X-Agent-ID`. This is the wire shape MVP §46 deployments push,
+    /// so the header MUST be present in the routed YAML too.
+    #[test]
+    fn b1_5sketch_emit_threads_x_agent_id_header() {
+        let cfg = five_sketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-9")
+            .expect("emit ok");
+        assert!(
+            yaml.contains("X-Agent-ID:"),
+            "5-sketch edge emit must include the X-Agent-ID header in the opamp block\n{yaml}"
+        );
+        assert!(
+            yaml.contains("agent-9"),
+            "5-sketch edge emit must surface the threaded agent_id value\n{yaml}"
+        );
+    }
+
+    /// `emit_gateway_yaml` likewise threads the X-Agent-ID. The
+    /// gateway role goes through the same OpAMP apply-then-restart
+    /// dance and needs the same identity contract.
+    #[test]
+    fn b1_gateway_emit_threads_x_agent_id_header() {
+        let yaml = emit_gateway_yaml(
+            &ddsketch_gateway_cfg(),
+            "ws://ctrl:4320/v1/opamp",
+            "gw-3",
+        )
+        .expect("emit ok");
+        assert!(
+            yaml.contains("X-Agent-ID:"),
+            "gateway emit must include the X-Agent-ID header in the opamp block\n{yaml}"
+        );
+        assert!(
+            yaml.contains("gw-3"),
+            "gateway emit must surface the threaded agent_id value\n{yaml}"
+        );
+    }
+
+    /// Broadcast callers (handle_plan / handle_rollback / replan_metric's
+    /// pre-#PR loop) don't have a single agent_id in scope and pass the
+    /// literal `$AGENT_ID` so the agent container's env can expand it
+    /// at boot. The placeholder must survive the YAML serialiser without
+    /// being mangled.
+    #[test]
+    fn b1_emit_preserves_dollar_agent_id_placeholder_for_broadcast() {
+        let yaml =
+            emit_edge_yaml(&ddsketch_edge_cfg(), "ws://c/", "$AGENT_ID").expect("emit ok");
+        assert!(
+            yaml.contains("$AGENT_ID"),
+            "broadcast emit must preserve the $AGENT_ID env placeholder verbatim\n{yaml}"
+        );
+    }
+
+    // ── B1-downstream Issue #3: ASAP_AGENT_MEMORY_LIMIT_MIB env knob ──────
+
+    /// Default behaviour — without the env var set, the 5-sketch
+    /// routing emit pins memory_limiter at 1280 MiB (matches the
+    /// pre-PR fixed value, so existing 1.5 GiB cgroup deployments
+    /// don't shift).
+    #[test]
+    fn b1_memory_limiter_defaults_to_1280_mib_when_env_unset() {
+        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: see comment on MEMORY_LIMIT_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
+        }
+        let cfg = five_sketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            yaml.contains("limit_mib: 1280"),
+            "default memory_limiter must be 1280 MiB\n{yaml}"
+        );
+    }
+
+    /// Operator bumps `ASAP_AGENT_MEMORY_LIMIT_MIB=1600` on the
+    /// controller container → emitted YAML carries the bumped value
+    /// (and `spike_limit_mib` follows the 20%-of-limit rule, clamped
+    /// to at least 256 MiB).
+    #[test]
+    fn b1_memory_limiter_honours_asap_agent_memory_limit_mib_env() {
+        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: see comment on MEMORY_LIMIT_ENV_LOCK.
+        unsafe {
+            std::env::set_var("ASAP_AGENT_MEMORY_LIMIT_MIB", "1600");
+        }
+        let cfg = five_sketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        unsafe {
+            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
+        }
+        assert!(
+            yaml.contains("limit_mib: 1600"),
+            "operator-bumped ASAP_AGENT_MEMORY_LIMIT_MIB=1600 must flow through to the emit\n{yaml}"
+        );
+        // spike = max(256, 1600/5) = 320
+        assert!(
+            yaml.contains("spike_limit_mib: 320"),
+            "spike_limit_mib must scale as max(256, limit/5) when limit is bumped\n{yaml}"
+        );
+    }
+
+    // ── B1-downstream gorillas3 bucket Phase 2: drop `bucket:` ────────────
+
+    /// ASAPCollector#387 retired the gorillas3 `Bucket` field's
+    /// runtime use — only `TSDBBucket` drives writes. The controller
+    /// no longer emits `bucket:`; we keep `tsdb_bucket:` (the actual
+    /// write destination). We assert ABSENCE line-by-line so the
+    /// `tsdb_bucket:` line (which contains the substring `bucket:`)
+    /// doesn't falsely trigger the negative match.
+    #[test]
+    fn b1_gorillas3_emit_drops_bucket_field_keeps_tsdb_bucket() {
+        let yaml = build_gorillas3_yaml(60);
+        let has_bare_bucket_line = yaml
+            .lines()
+            .any(|line| line.trim_start().starts_with("bucket:"));
+        assert!(
+            !has_bare_bucket_line,
+            "gorillas3 emit must NOT contain a top-level `bucket:` line after \
+             Phase 2 (ASAPCollector#387 made the Bucket field unread at runtime)\n{yaml}"
+        );
+        let has_tsdb_bucket_line = yaml
+            .lines()
+            .any(|line| line.trim_start().starts_with("tsdb_bucket:"));
+        assert!(
+            has_tsdb_bucket_line,
+            "gorillas3 emit MUST keep `tsdb_bucket:` — that's the real \
+             TSDB block write destination\n{yaml}"
         );
     }
 
