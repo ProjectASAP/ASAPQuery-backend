@@ -2978,4 +2978,160 @@ mod api_tests {
             );
         }
     }
+
+    // ── Regression: cumulative streaming-config across (metric, role) ─────────
+    //
+    // PR #283 made `WorkloadStore` and `PlanStore` (metric, role)-keyed,
+    // so a single metric can carry MULTIPLE aggregation roles (e.g.
+    // post-B2 `http_requests_total` has both a DDSketch-Quantile entry
+    // from `quantile_over_time(...)` AND an ExactAgg-Sum entry from
+    // `sum by (zone) (...)` in the workload store).
+    //
+    // Pre-this-fix the streaming-config emit path in `handle_plan` was
+    // still metric-keyed and posted the CURRENT iteration's
+    // `BackendStageConfig` alone. The data plane's
+    // `POST /api/v1/streaming-config` handler is an atomic full
+    // `handle.swap(new_config)`, so the second per-(metric, role) plan
+    // POST destroyed the first one's aggregations on the backend and
+    // `sum by (zone) (http_requests_total)` lands with
+    // `ExactAgg(Sum) capability not satisfied`.
+    //
+    // This test replays the demo's per-metric plan-POST sequence
+    // against a mock backend and captures every streaming-config body.
+    // The LAST body (the one the data plane's swap installs) MUST
+    // carry aggregations from EVERY prior plan POST, otherwise the
+    // swap erases the earlier metrics' rows and the data plane can't
+    // answer queries against them.
+    //
+    // The (metric, role) cache key is exercised in tandem by the live
+    // mvp-workload.yaml pre-pop loop (the workload registry lists 3
+    // entries for `http_requests_total`) → see the MVP smoke-test
+    // pipeline. This in-process test exercises the cumulative-merge
+    // plumbing in isolation against the same emit path used by both
+    // the pre-pop loop and per-request replans.
+    #[tokio::test]
+    async fn streaming_config_cumulative_push_covers_all_planned_metrics() {
+        // Activate the typed-stage-split path (the only path that emits
+        // the typed streaming-config JSON; the legacy emit path no-ops).
+        let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
+
+        // Mock backend that captures every streaming-config body. Same
+        // pattern as the sibling `storage_routing_cumulative_push_...`
+        // test — an axum router that drains the request body into a
+        // shared sink. Mounted at the canonical
+        // `/api/v1/streaming-config` path so `BackendClient`'s URL
+        // forwarding hits it directly.
+        type SinkInner = std::sync::Mutex<Vec<String>>;
+        let sink: Arc<SinkInner> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&sink);
+        let mock_app = axum::Router::new()
+            .route(
+                "/api/v1/streaming-config",
+                axum::routing::post(move |body: axum::body::Bytes| {
+                    let sink = Arc::clone(&sink_capture);
+                    async move {
+                        let s = String::from_utf8_lossy(&body).to_string();
+                        sink.lock().unwrap().push(s);
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            )
+            // Sibling storage-routing endpoint stubbed so the
+            // `handle_plan` cycle's second POST doesn't 404 and
+            // pollute the test log (the assertion only inspects the
+            // streaming-config sink).
+            .route(
+                "/api/v1/storage_routing",
+                axum::routing::post(|| async { axum::http::StatusCode::OK }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Build an AppState with the backend pointed at the mock URL.
+        let backend_url = format!("http://{addr}/api/v1/streaming-config");
+        let (state, _) = test_app_with_backend(Some(backend_url));
+        let app = axum::Router::new()
+            .route("/api/v1/plan", axum::routing::post(handle_plan))
+            .with_state(state.clone());
+
+        // The 5 sketched contract metrics from MVP §46 — the SAME
+        // set the sibling `storage_routing_cumulative_push_...` test
+        // exercises. Each gets a separate `POST /api/v1/plan` with
+        // the metric-name → classified sketch family from
+        // `classify_demo_metric`. Pre-fix the metric-only cache
+        // would have collapsed sequential same-metric POSTs onto one
+        // slot; this test uses 5 distinct metrics so the assertion
+        // surfaces the cumulative-merge gap (every metric's row must
+        // survive every other metric's swap).
+        let sketched = [
+            "http_requests_total_latency_ms",
+            "request_size_bytes",
+            "unique_users_per_min",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+        ];
+
+        for m in &sketched {
+            let app = app.clone();
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/v1/plan")
+                .header("content-type", "application/json")
+                .body(Body::from(plan_spec(m).to_string()))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "POST /api/v1/plan for `{m}` must return 200",
+            );
+        }
+
+        // Drain the mock sink: every plan-emit must have produced
+        // exactly one streaming-config body (5 plans → 5 bodies).
+        let bodies = sink.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            sketched.len(),
+            "expected one streaming-config POST per plan; got {} bodies",
+            bodies.len(),
+        );
+
+        // The LAST body is the one the data plane's swap installs
+        // (the swap is destructive — last write wins). It MUST list
+        // aggregations for ALL 5 sketched metrics, otherwise the
+        // swap erases the earlier metrics' rows and queries against
+        // them fail with `…capability not satisfied` — the
+        // streaming-config analogue of the storage-routing
+        // `archive_miss` failure documented on the sibling test.
+        let last: serde_json::Value =
+            serde_json::from_str(bodies.last().unwrap()).expect("last body is valid JSON");
+        let aggs = last["aggregations"]
+            .as_array()
+            .expect("aggregations array on cumulative streaming-config body");
+        // Wire-format note: `build_backend_aggregation_json` writes
+        // the field under key `metric` (NOT `metric_name`) — see
+        // `emit/stage_config.rs::build_backend_aggregation_json`.
+        let metric_names: std::collections::BTreeSet<String> = aggs
+            .iter()
+            .filter_map(|a| {
+                a.get("metric")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+        for m in &sketched {
+            assert!(
+                metric_names.contains(*m),
+                "final cumulative streaming-config missing aggregations \
+                 for metric `{m}`; contains only {metric_names:?}\n\
+                 full body: {}",
+                bodies.last().unwrap(),
+            );
+        }
+    }
 }
