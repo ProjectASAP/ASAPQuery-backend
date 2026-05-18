@@ -112,6 +112,45 @@ pub enum Capability {
     ExactAgg(AggregationType),
 }
 
+/// PromQL outer-function flavour carried on each `ASAPTierCandidate` so
+/// the engine can distinguish `rate(metric[r])` / `irate(...)` from
+/// `sum_over_time(metric[r])` / `sum(metric)` / bare selector WITHOUT
+/// re-parsing the raw PromQL string.
+///
+/// Background: the lowerer collapses every `AggFunc` in
+/// `{Sum, Rate, Increase, Delta}` onto a single `AggIntent::Sum`, which
+/// `capability_for` then maps to `Capability::ExactAgg(Sum)`. That
+/// collapse erases the rate-vs-plain distinction the engine needs to
+/// decide between the plain ExactAgg reducer and the rate-divisor
+/// reducer (`evaluate_exact_agg_rate`). Before this enum landed the
+/// engine re-walked the raw PromQL via a `query_contains_rate_call`
+/// helper to recover the distinction; that was a lossy-lowering smell.
+///
+/// The walker that populates this lives in `asap_tier_analysis.rs`
+/// (`trace_from_promql`) — it sets `Rate` if ANY `rate(...)` or
+/// `irate(...)` Call appears anywhere in the expression tree, otherwise
+/// `Plain`. The taxonomy is intentionally minimal: today the engine
+/// only branches on "needs rate divisor or not". Future shape-specific
+/// dispatch (e.g. separating `increase` from `sum`) can extend this
+/// enum without touching the `Capability` algebra.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OuterFn {
+    /// No rate-style outer function in the expression — bare selector,
+    /// `sum(metric)`, `sum by (...) (metric)`, `sum_over_time(metric[r])`,
+    /// `increase(metric[r])`, `count_over_time(metric[r])`, etc. The
+    /// engine dispatches to the plain per-window reducer. This is the
+    /// default — `Default::default()` returns `Plain` so candidates
+    /// built without an explicit outer-fn (test fixtures, fallback
+    /// paths) get the safe non-rate dispatch.
+    #[default]
+    Plain,
+    /// `rate(metric[r])` or `irate(metric[r])` appears in the expression
+    /// (possibly nested inside an outer `sum by (...) (...)`). The
+    /// engine dispatches to `evaluate_exact_agg_rate`, which divides by
+    /// the range to produce events-per-second.
+    Rate,
+}
+
 /// Compact, hashable handle for sketch implementation choice. Mirrors
 /// [`SketchKind`] but adds the `CmsWithHeap` and `Any` query-side
 /// concepts (which aren't sketch families, they're dispatch hints).

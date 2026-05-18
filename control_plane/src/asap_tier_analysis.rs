@@ -53,7 +53,9 @@ use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::QueryExpr;
 use crate::query_parser::{parse_query, parse_query_expr_canonical};
 
-pub use crate::sketch_algebra::capability::{capability_for, Capability, SketchKindHandle};
+pub use crate::sketch_algebra::capability::{
+    capability_for, Capability, OuterFn, SketchKindHandle,
+};
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -84,6 +86,13 @@ pub struct ASAPTierCandidate {
     /// byte-for-byte. Drives the candidate → policy filter match in
     /// `find_matching_policies`.
     pub spatial_filter_canonical: String,
+    /// PromQL outer-function flavour — `Rate` if the expression
+    /// contains `rate(...)` / `irate(...)` anywhere in the tree,
+    /// `Plain` otherwise. Preserves the rate-vs-plain distinction the
+    /// `AggIntent::Sum` collapse erases, so the engine's reducer
+    /// dispatch can branch on the typed candidate instead of re-parsing
+    /// the raw PromQL string. See [`OuterFn`] for the taxonomy.
+    pub outer_fn: OuterFn,
 }
 
 /// Whole-query analysis result.
@@ -217,6 +226,7 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
                     function_args: trace.function_args.clone(),
                     range_seconds: trace.range_seconds,
                     spatial_filter_canonical: spatial_filter_canonical.clone(),
+                    outer_fn: trace.outer_fn,
                 });
             }
             None => {
@@ -323,17 +333,30 @@ fn intent_kind_label(intent: &AggIntent) -> &'static str {
     }
 }
 
-/// Telemetry-only metadata recovered from the raw PromQL AST: the
-/// outer function name, leading scalar args, and the matrix selector's
-/// `[r]` range in seconds. None of this drives capability dispatch —
-/// dispatch is `capability_for(&AggIntent)`. This walker exists ONLY
-/// so the `ASAPTierCandidate.function` / `.function_args` / `.range_seconds`
-/// fields populate for downstream logging and the reducer's range hint.
+/// Metadata recovered from the raw PromQL AST that the lowered
+/// `AggIntent` doesn't carry: the outer function name, leading scalar
+/// args, matrix selector's `[r]` range in seconds, and the rate-vs-plain
+/// outer-function flavour ([`OuterFn`]) used by engine reducer
+/// dispatch.
+///
+/// The `function` / `function_args` / `range_seconds` fields are for
+/// telemetry + the reducer's range hint. The `outer_fn` field is the
+/// load-bearing signal that lets the engine pick `evaluate_exact_agg`
+/// vs `evaluate_exact_agg_rate` for `Capability::ExactAgg(Sum)`
+/// candidates — preserving the rate-vs-plain distinction that the
+/// `AggIntent::Sum` collapse erases.
 #[derive(Debug, Default)]
 struct PromqlTrace {
     function: String,
     function_args: Vec<f64>,
     range_seconds: u64,
+    /// Set to `OuterFn::Rate` when ANY `rate(...)` or `irate(...)`
+    /// call is found anywhere in the expression tree; otherwise
+    /// `OuterFn::Plain`. The flag-style detection mirrors what the
+    /// retired `query_contains_rate_call` engine helper used to do
+    /// over the raw query string — done here once so the engine reads
+    /// it off the typed candidate.
+    outer_fn: OuterFn,
 }
 
 fn trace_from_promql(metricsql: &str) -> PromqlTrace {
@@ -349,8 +372,18 @@ fn trace_from_promql(metricsql: &str) -> PromqlTrace {
 fn walk_ast_for_trace(expr: &Expr, t: &mut PromqlTrace) {
     match expr {
         Expr::Call(call) => {
+            let name = call.func.name.to_lowercase();
             if t.function.is_empty() {
-                t.function = call.func.name.to_lowercase();
+                t.function = name.clone();
+            }
+            // Flag `rate(...)` / `irate(...)` ANYWHERE in the tree —
+            // mirrors the retired `query_contains_rate_call` walker.
+            // For composed shapes like `sum by (zone) (rate(metric[r]))`
+            // the FIRST function set above is `"sum"` (the outer
+            // Aggregate), but `outer_fn` must still report `Rate` so
+            // the engine dispatches through `evaluate_exact_agg_rate`.
+            if matches!(name.as_str(), "rate" | "irate") {
+                t.outer_fn = OuterFn::Rate;
             }
             for a in &call.args.args {
                 if let Expr::NumberLiteral(nl) = a.as_ref() {
@@ -789,6 +822,110 @@ mod tests {
         assert_eq!(a.candidates[0].group_by_keys, keys(&["zone"]));
     }
 
+    // ── outer_fn — rate vs plain disambiguation ──────────────────────────
+    //
+    // Regression coverage for the PR that retired the engine's
+    // `query_contains_rate_call` raw-PromQL re-parser. The analyzer's
+    // lowerer collapses `rate(metric[r])`, `sum_over_time(metric[r])`,
+    // `sum(metric)`, and the bare selector all onto `AggIntent::Sum` /
+    // `Capability::ExactAgg(Sum)` — so the engine can't tell from the
+    // capability alone which the user wrote. The `outer_fn` field on
+    // `ASAPTierCandidate` carries the rate-vs-plain distinction so the
+    // engine's reducer dispatch is a typed branch instead of a raw-PromQL
+    // re-parse.
+
+    #[test]
+    fn rate_candidate_carries_outer_fn_rate() {
+        let a = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Rate, "{a:?}");
+    }
+
+    #[test]
+    fn irate_candidate_carries_outer_fn_rate() {
+        let a = analyze_promql_for_asap_tier("irate(http_requests_total[5m])");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Rate, "{a:?}");
+    }
+
+    #[test]
+    fn sum_over_time_candidate_carries_outer_fn_plain() {
+        // `sum_over_time(metric[r])` shares `Capability::ExactAgg(Sum)`
+        // with `rate(metric[r])` — the capability alone can't
+        // disambiguate. The `outer_fn` field MUST report `Plain` so
+        // the engine takes the per-window reducer (no rate divisor).
+        let a = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum),
+            "{a:?}"
+        );
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Plain, "{a:?}");
+    }
+
+    #[test]
+    fn sum_by_candidate_carries_outer_fn_plain() {
+        let a = analyze_promql_for_asap_tier("sum by (zone) (http_requests_total)");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Plain, "{a:?}");
+    }
+
+    #[test]
+    fn bare_selector_candidate_carries_outer_fn_plain() {
+        let a = analyze_promql_for_asap_tier("http_requests_total{zone=\"z0\"}");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Plain, "{a:?}");
+    }
+
+    #[test]
+    fn sum_by_over_rate_candidate_carries_outer_fn_rate() {
+        // Composed shape `sum by (zone) (rate(metric[5m]))` — the
+        // outer function NAME is `"sum"` (the trace's `.function`
+        // field) but `outer_fn` MUST be `Rate` because the inner
+        // `rate(...)` call needs the rate-divisor reducer. This is
+        // the case that motivated the original `query_contains_rate_call`
+        // walker — now satisfied by walking the AST once in the
+        // analyzer and emitting the typed `OuterFn::Rate` flag.
+        let a = analyze_promql_for_asap_tier(
+            "sum by (zone) (rate(http_requests_total[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum),
+            "{a:?}"
+        );
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Rate, "{a:?}");
+        // Range is lifted from the inner rate's matrix selector.
+        assert_eq!(a.candidates[0].range_seconds, 300, "{a:?}");
+    }
+
+    #[test]
+    fn rate_and_sum_over_time_share_capability_but_differ_on_outer_fn() {
+        // Both collapse to `Capability::ExactAgg(Sum)`; the engine MUST
+        // disambiguate via the typed `outer_fn` field, not by string-
+        // parsing the raw PromQL. This test pins the asymmetry the
+        // engine's dispatch reads off.
+        let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
+        let sot = analyze_promql_for_asap_tier(
+            "sum_over_time(http_requests_total[5m])",
+        );
+        assert_eq!(
+            rate.candidates[0].required_capability,
+            sot.candidates[0].required_capability,
+            "rate and sum_over_time should produce the same Capability"
+        );
+        assert_ne!(
+            rate.candidates[0].outer_fn,
+            sot.candidates[0].outer_fn,
+            "rate and sum_over_time MUST differ on outer_fn so the engine \
+             can dispatch correctly without re-parsing the raw PromQL"
+        );
+        assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
+        assert_eq!(sot.candidates[0].outer_fn, OuterFn::Plain);
+    }
+
     // ── Unsupported / rejected shapes ────────────────────────────────────
 
     #[test]
@@ -947,6 +1084,7 @@ mod tests {
                 function_args: Vec::new(),
                 range_seconds,
                 spatial_filter_canonical: spatial_filter_canonical.to_string(),
+                outer_fn: OuterFn::default(),
             }
         }
 
