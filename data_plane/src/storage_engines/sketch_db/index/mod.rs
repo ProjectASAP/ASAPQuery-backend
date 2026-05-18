@@ -45,6 +45,41 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Joint helper shared by [`SketchStore::ingest_precompute_for_agg_config`]
+/// and [`SketchStore::ingest_precompute_with_sid`] — folds the
+/// grouping-label values on `output` against the
+/// `agg_cfg.grouping_labels` ordering into:
+///
+/// 1. `attrs_fp`: the `key=value;` canonical attrs-fingerprint string
+///    `SeriesIdResolver` uses as one third of the sid identity tuple.
+/// 2. `label_values_map`: the `BTreeMap<String, String>` shape
+///    `append_precompute` records on the per-window precompute row.
+///
+/// Both are pure functions of `(agg_cfg, output.key)` — kept together
+/// so the mint-driven path (B7.6) and the sid-direct path (B7.7) stay
+/// byte-identical on the values they hand to the index.
+fn build_attrs_fp_and_label_map(
+    agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+    output: &crate::storage_engines::types::PrecomputedOutput,
+) -> (String, BTreeMap<String, String>) {
+    let label_values_vec = output
+        .key
+        .as_ref()
+        .map(|k| k.labels.clone())
+        .unwrap_or_default();
+    let key_names = &agg_cfg.grouping_labels.labels;
+    let mut attrs_fp = String::new();
+    let mut label_values_map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
+        attrs_fp.push_str(k);
+        attrs_fp.push('=');
+        attrs_fp.push_str(v);
+        attrs_fp.push(';');
+        label_values_map.insert(k.clone(), v.clone());
+    }
+    (attrs_fp, label_values_map)
+}
+
 /// Metadata for one logical sketch instance, keyed by `series_id`.
 /// Populated at ingest time when a sketch DataPoint with a fresh sid
 /// arrives (or `(metric, attrs)` produces a fresh sid via the
@@ -690,22 +725,13 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
-        let label_values_vec = output
-            .key
-            .as_ref()
-            .map(|k| k.labels.clone())
-            .unwrap_or_default();
-        let key_names = &agg_cfg.grouping_labels.labels;
-        let mut attrs_fp = String::new();
-        let mut label_values_map: BTreeMap<String, String> = BTreeMap::new();
-        for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
-            attrs_fp.push_str(k);
-            attrs_fp.push('=');
-            attrs_fp.push_str(v);
-            attrs_fp.push(';');
-            label_values_map.insert(k.clone(), v.clone());
-        }
-
+        // B7.7 — this wrapper now derives the sid via `mint_sid` and
+        // delegates to `ingest_precompute_with_sid`. Callers that
+        // already hold the bucket sid (B7.6's worker passes it on the
+        // `WorkerMessage`; B7.7's backfill processor groups raw
+        // samples by sid up-front) skip the resolver round-trip by
+        // invoking the sid-direct sibling.
+        let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
         let agg_kind = AggKind::ExactAgg {
             agg_type: agg_cfg.aggregation_type,
             parameters_canonical: canonical_parameters(&agg_cfg.parameters),
@@ -724,6 +750,37 @@ impl SketchStore {
         // closure.
         let agg_kind_canonical = agg_kind.canonical_string();
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
+        self.ingest_precompute_with_sid(sid, agg_cfg, output, accumulator)
+    }
+
+    /// B7.7 sid-direct sibling of [`Self::ingest_precompute_for_agg_config`].
+    ///
+    /// Callers that already hold the bucket sid (the live worker after
+    /// B7.6 reshaped its `WorkerMessage`, and the backfill processor
+    /// after B7.7 rekeyed its per-window grouping from group_key to
+    /// sid) skip the mint round-trip by handing the sid in directly.
+    /// The mint-driven [`Self::ingest_precompute_for_agg_config`] is
+    /// content-addressed and idempotent with this method — passing the
+    /// resolver-minted sid here yields the same state under the same
+    /// sid — so both methods can coexist while migration finishes.
+    ///
+    /// The §6.3 ingest barrier (`Retired` / `Expired` sids reject
+    /// writes) and first-sight metadata registration are identical to
+    /// the mint-driven path.
+    pub fn ingest_precompute_with_sid(
+        &self,
+        sid: u64,
+        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        accumulator: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
+        let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
+        let key_names = &agg_cfg.grouping_labels.labels;
+        let agg_kind = AggKind::ExactAgg {
+            agg_type: agg_cfg.aggregation_type,
+            parameters_canonical: canonical_parameters(&agg_cfg.parameters),
+            spatial_filter_canonical: agg_cfg.spatial_filter_normalized.clone(),
+        };
 
         match self.instance(sid) {
             None => {
@@ -741,7 +798,7 @@ impl SketchStore {
                     metric_name: agg_cfg.metric.clone(),
                     group_by_keys,
                     capability: Some(Capability::ExactAgg(agg_cfg.aggregation_type)),
-                    agg_kind: agg_kind.clone(),
+                    agg_kind,
                     accuracy: None,
                     first_seen_unix_ms: output.start_timestamp as i64,
                     retired_at_ms: None,

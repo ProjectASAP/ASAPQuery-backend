@@ -69,15 +69,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
+use crate::drivers::ingest::canonical_attrs_fingerprint;
+use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
+use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
+use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
 
-use super::BackfillRegistry;
+use super::raw_sample_reader::RawSample;
 use super::window_builder::build_backfilled_accumulator;
 use super::worker::WindowProcessor;
-use super::raw_sample_reader::RawSample;
+use super::BackfillRegistry;
 
 /// Turn a series key into the `group_key` string the
 /// grouping_labels-based partitioning produces in live ingest.
@@ -107,6 +110,54 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
 fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
     let labels: Vec<String> = group_key.split(';').map(|s| s.to_string()).collect();
     KeyByLabelValues::new_with_labels(labels)
+}
+
+/// B7.7 — resolve the bucket sid for a backfill sample's
+/// `(config, series_key)` pair. Mirrors
+/// `resolve_bucket_sid_for_agg_config` in `drivers/ingest/otel.rs`
+/// but adapted to the backfill side: the raw sample carries its labels
+/// embedded in `series_key` (the `metric{k1="v1",k2="v2"}` text shape
+/// `RawSample::labels` holds), so we parse them out first.
+///
+/// The sid identity tuple is `(metric, attrs_fp, agg_kind_canonical)`
+/// — identical to what the live ingest path computes, so the same
+/// `(metric, grouping-values, agg_kind)` produces the SAME sid no
+/// matter which path (live or backfill) saw the sample first. That
+/// invariant is what lets backfill writes land in the same store
+/// row the live ingest already populated for `[created_at, ∞)`.
+fn resolve_backfill_bucket_sid(
+    resolver: &SeriesIdResolver,
+    config: &AggregationConfig,
+    series_key: &str,
+) -> u64 {
+    let labels = parse_labels_from_series_key(series_key);
+    let grouping_pairs: Vec<(&str, &str)> = config
+        .grouping_labels
+        .labels
+        .iter()
+        .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
+        .collect();
+    let attrs_fp = canonical_attrs_fingerprint(&grouping_pairs);
+    let agg_kind = AggKind::ExactAgg {
+        agg_type: config.aggregation_type,
+        parameters_canonical: canonical_parameters(&config.parameters),
+        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+    };
+    let agg_kind_canonical = agg_kind.canonical_string();
+    resolver.resolve(&config.metric, &attrs_fp, &agg_kind_canonical)
+}
+
+/// Fallback bucket id for the resolver-less code path (registry-only
+/// processors / legacy tests). Stable per `group_key` so all samples
+/// in one group still aggregate into one bucket; the value never
+/// reaches `SketchStore` because the resolver-less branch in
+/// `process_window` skips the precompute write entirely.
+fn fallback_bucket_id(group_key: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    group_key.hash(&mut h);
+    h.finish()
 }
 
 /// `WindowProcessor` that rebuilds sketches from raw samples and
@@ -195,6 +246,14 @@ impl BackfillWindowProcessor {
     }
 }
 
+/// One per-sid bucket assembled by [`BackfillWindowProcessor::process_window`].
+/// Carries the grouping-label string alongside the samples so emit-time
+/// `KeyByLabelValues` rendering matches what the live ingest path produces.
+struct SidBucket {
+    group_key: String,
+    samples: Vec<RawSample>,
+}
+
 #[async_trait]
 impl WindowProcessor for BackfillWindowProcessor {
     async fn process_window(
@@ -205,17 +264,44 @@ impl WindowProcessor for BackfillWindowProcessor {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config_for_agg(agg_id)?;
 
-        // Group samples by `group_key` — the same partitioning
-        // live ingest does. Uses insertion-order preserving Vec
-        // per group so §10.5 ordering is preserved within each
-        // group's sample stream.
-        let mut by_group: HashMap<String, Vec<RawSample>> = HashMap::new();
+        // B7.7 — sid-keyed bucketing. Per the schema-retirement #5
+        // step 6 plan, the backfill processor's per-window grouping is
+        // rekeyed from `group_key: String` to `sid: u64`. The grouping
+        // label values fold into the sid via
+        // `SeriesIdResolver::resolve(metric, attrs_fp, agg_kind)` —
+        // the same identity contract the live ingest path uses, so a
+        // backfilled bucket lands on the SAME sid that live ingest
+        // would mint for the same `(metric, grouping-values, agg_kind)`
+        // tuple. `group_key` is kept alongside the sid so emit-time
+        // `KeyByLabelValues` rendering on `PrecomputedOutput` matches
+        // what live ingest produces. Uses insertion-order preserving
+        // Vec per bucket so §10.5 ordering is preserved within each
+        // bucket's sample stream.
+        //
+        // When no SeriesIdResolver is attached (legacy / registry-only
+        // tests), we fall back to a stable per-`group_key` bucket id —
+        // the per-window write is skipped anyway in that path, so the
+        // bucket identity doesn't matter beyond preserving sample
+        // ordering for the (unused) accumulator builds.
+        let resolver_opt = self.series_resolver.as_ref();
+        let mut by_bucket: HashMap<u64, SidBucket> = HashMap::new();
         for sample in samples {
             let group_key = extract_group_key(&sample.labels, &config);
-            by_group.entry(group_key).or_default().push(sample);
+            let sid = match resolver_opt {
+                Some(r) => resolve_backfill_bucket_sid(r.as_ref(), &config, &sample.labels),
+                None => fallback_bucket_id(&group_key),
+            };
+            by_bucket
+                .entry(sid)
+                .or_insert_with(|| SidBucket {
+                    group_key: group_key.clone(),
+                    samples: Vec::new(),
+                })
+                .samples
+                .push(sample);
         }
 
-        if by_group.is_empty() {
+        if by_bucket.is_empty() {
             // Empty window — no samples, no writes. Still count as
             // "processed" since the worker's tick_progress will
             // increment.
@@ -228,11 +314,19 @@ impl WindowProcessor for BackfillWindowProcessor {
             return Ok(());
         }
 
-        let mut batch: Vec<(crate::storage_engines::types::PrecomputedOutput, Box<dyn AggregateCore>)> =
-            Vec::with_capacity(by_group.len());
+        // Build per-sid `(sid, PrecomputedOutput, accumulator)` triples.
+        // Carrying the sid alongside the pair lets the write loop hand
+        // it straight to `ingest_precompute_with_sid` instead of
+        // re-resolving inside the mint-driven path.
+        let mut batch: Vec<(
+            u64,
+            crate::storage_engines::types::PrecomputedOutput,
+            Box<dyn AggregateCore>,
+        )> = Vec::with_capacity(by_bucket.len());
 
-        for (group_key, group_samples) in by_group {
-            let accumulator = build_backfilled_accumulator(&config, &group_samples);
+        for (sid, bucket) in by_bucket {
+            let SidBucket { group_key, samples } = bucket;
+            let accumulator = build_backfilled_accumulator(&config, &samples);
             // Keyed accumulators (MultipleSubpopulation) carry their
             // subpopulation keys internally; the PrecomputedOutput's
             // `key` represents the *group* key (grouping_labels
@@ -250,8 +344,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                 self.job_id,
                 PolicyFingerprint::from_config(&config),
             );
-            let _ = agg_id;
-            batch.push((output, accumulator));
+            batch.push((sid, output, accumulator));
         }
 
         // Phase 5 M2.3.6g — replayed batches land in SketchStore only.
@@ -263,11 +356,17 @@ impl WindowProcessor for BackfillWindowProcessor {
         // with a warn — sid minting requires the shared resolver.
         if let Some(idx) = self.sketch_index.as_ref() {
             match self.series_resolver.as_ref() {
-                Some(resolver) => {
-                    for (output, accumulator) in &batch {
-                        let resolver = resolver.clone();
-                        idx.ingest_precompute_for_agg_config(
-                            |metric, fp, ak| resolver.resolve(metric, fp, ak),
+                Some(_resolver) => {
+                    // B7.7 — sid is pre-resolved per bucket above; hand
+                    // it directly to the index's sid-direct ingest
+                    // path. The mint-driven sibling
+                    // `ingest_precompute_for_agg_config` would resolve
+                    // to the same sid (the resolver is idempotent),
+                    // but the round-trip is redundant now that we hold
+                    // the value.
+                    for (sid, output, accumulator) in &batch {
+                        idx.ingest_precompute_with_sid(
+                            *sid,
                             &config,
                             output,
                             accumulator.as_ref(),
@@ -719,5 +818,146 @@ mod tests {
             )
             .expect("within-retention start should be accepted");
         assert!(registry.get(job_id).is_some());
+    }
+
+    // ─── B7.7: sid-keyed bucketing tests ─────────────────────────────────
+
+    /// Regression for B7.7 (schema-retirement #5 step 6): the
+    /// backfill processor groups raw samples by `sid: u64` and writes
+    /// each bucket via `SketchStore::ingest_precompute_with_sid`. The
+    /// sids it allocates match what the shared `SeriesIdResolver`
+    /// would mint for the same `(metric, grouping-values, agg_kind)`
+    /// tuple — i.e. live ingest and backfill share one sid namespace.
+    ///
+    /// Drives `process_window` end-to-end with samples spanning two
+    /// distinct `svc` values × two samples each. Asserts:
+    ///   - exactly two `SketchInstanceMetadata` entries land in the
+    ///     `SketchStore` (one per distinct sid bucket)
+    ///   - their sids equal what the shared `SeriesIdResolver` would
+    ///     mint for the same `(metric, grouping-values, agg_kind)`
+    ///     tuple (so live-vs-backfill sid identity holds)
+    ///   - both sids `classify()` as `Hit` (i.e. the per-sid append
+    ///     paths landed under the same sids the metadata was
+    ///     registered with)
+    ///   - the registry recorded one provenance entry for the window
+    #[tokio::test]
+    async fn process_window_buckets_by_sid_via_resolver() {
+        use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+        use crate::storage_engines::sketch_db::index::{SidLookup, SketchStore};
+
+        let cfg = sum_config(1, "latency", vec!["svc"]);
+        let fp = cfg.aggregation_id();
+        let streaming = streaming_config_with(cfg.clone());
+        let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
+        let registry = Arc::new(BackfillRegistry::new());
+        let sketch_index = Arc::new(SketchStore::new());
+        let resolver = Arc::new(SeriesIdResolver::new());
+
+        let job_id = registry.create(
+            fp,
+            (0, 100),
+            BackfillSource::Prometheus { url: "x".into() },
+            1,
+        );
+
+        let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id)
+            .with_sketch_index(sketch_index.clone())
+            .with_series_resolver(resolver.clone());
+
+        // Two distinct svc values × two samples each. Same window
+        // (0, 100). After the processor runs, we expect exactly two
+        // sids in the SketchStore — one per distinct svc value.
+        let samples = vec![
+            RawSample {
+                labels: "latency{svc=\"a\"}".into(),
+                timestamp_ms: 10,
+                value: 1.0,
+            },
+            RawSample {
+                labels: "latency{svc=\"a\"}".into(),
+                timestamp_ms: 20,
+                value: 2.0,
+            },
+            RawSample {
+                labels: "latency{svc=\"b\"}".into(),
+                timestamp_ms: 15,
+                value: 3.0,
+            },
+            RawSample {
+                labels: "latency{svc=\"b\"}".into(),
+                timestamp_ms: 25,
+                value: 4.0,
+            },
+        ];
+        processor
+            .process_window(fp, (0, 100), samples)
+            .await
+            .expect("happy path");
+
+        // Two distinct sids landed in the index.
+        assert_eq!(
+            sketch_index.instance_count(),
+            2,
+            "one sid per distinct svc bucket"
+        );
+
+        // The sids the processor allocated equal what
+        // `SeriesIdResolver::lookup` would return for the same
+        // `(metric, grouping-values, agg_kind)` tuple — i.e. live
+        // ingest and backfill share one sid namespace.
+        let sid_a = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}");
+        let sid_b = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}");
+        assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
+        assert_eq!(sketch_index.classify(sid_a), SidLookup::Hit);
+        assert_eq!(sketch_index.classify(sid_b), SidLookup::Hit);
+
+        // Provenance was recorded once per window (not once per
+        // bucket) — same shape as the pre-rekey path.
+        let written = registry.windows_written_by(job_id);
+        assert_eq!(written, vec![(fp, (0u64, 100u64))]);
+    }
+
+    /// B7.7 invariant: the sid the backfill processor mints for a
+    /// `(config, grouping-values)` tuple is bit-equal to the sid the
+    /// live ingest path's `resolve_bucket_sid_for_agg_config` would
+    /// mint via the SAME `SeriesIdResolver`. Locks the "live and
+    /// backfill share one sid namespace" contract — without it, the
+    /// `[created_at, ∞)` and `[0, created_at)` halves of the agg's
+    /// timeline would live under DIFFERENT sids and the query path
+    /// would only see half the history.
+    #[test]
+    fn backfill_sid_matches_live_ingest_sid_for_same_grouping_values() {
+        use crate::drivers::ingest::canonical_attrs_fingerprint;
+        use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+        use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
+
+        let cfg = sum_config(1, "latency", vec!["svc", "zone"]);
+        let resolver = SeriesIdResolver::new();
+
+        // Backfill side: derive sid via the new helper.
+        let backfill_sid = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"a\",zone=\"z0\"}",
+        );
+
+        // Live side: mirror what `resolve_bucket_sid_for_agg_config`
+        // in drivers/ingest/otel.rs does, manually here so the test
+        // doesn't need to drive the OTLP pipeline.
+        let live_attrs_fp =
+            canonical_attrs_fingerprint(&[("svc", "a"), ("zone", "z0")]);
+        let live_agg_kind = AggKind::ExactAgg {
+            agg_type: cfg.aggregation_type,
+            parameters_canonical: canonical_parameters(&cfg.parameters),
+            spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
+        };
+        let live_sid =
+            resolver.resolve(&cfg.metric, &live_attrs_fp, &live_agg_kind.canonical_string());
+
+        assert_eq!(
+            backfill_sid, live_sid,
+            "backfill and live ingest MUST mint the same sid for the same \
+             (metric, grouping-values, agg_kind) tuple"
+        );
     }
 }
