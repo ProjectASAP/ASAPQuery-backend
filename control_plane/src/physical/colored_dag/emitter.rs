@@ -365,6 +365,28 @@ pub struct BackendAggregation {
     /// Phase ε.2 implements the raw-input ingest path.
     #[serde(default)]
     pub aggregation_input: AggregationInput,
+
+    /// Option B (post-PR-#287) — when `Some(s)`, the wire-side
+    /// `aggregationType` is `s` (e.g. `"Sum"`, `"Increase"`,
+    /// `"MinMax"`) and the `parameters` object is emitted as `{}`,
+    /// bypassing the sketch-kind → backend-type mapping that runs
+    /// for the regular sketched aggregations.
+    ///
+    /// Why: the typed `bind_workload_typed` rule chain only knows
+    /// how to lower sketch-shaped statistics (Quantile / Cardinality
+    /// / Frequency / TopK). Sum/Rate/Count workloads — `sum by
+    /// (zone) (http_requests_total)`, `rate(metric[5m])`,
+    /// `count(metric)` — currently decline binding (return None) so
+    /// the typed L5 stage-split emits nothing for them. Under the
+    /// Option B unification, the Replanner falls back to this
+    /// override shape to emit an `ExactAgg(Sum)` (or Increase /
+    /// Count) row into the cumulative streaming-config so the data
+    /// plane recognises the metric and `sum by (zone) (…)` queries
+    /// resolve. `sketch_kind` / `sketch_params` carry sentinel
+    /// values when the override is in effect (their emitted form is
+    /// suppressed in `build_backend_aggregation_json`).
+    #[serde(default)]
+    pub agg_type_override: Option<String>,
 }
 
 /// Phase ε.1 — what wire shape the backend ingests for an aggregation.
@@ -544,6 +566,8 @@ impl Emitter for ThreeStageEmitter {
                         grouping: Vec::new(),
                         // Mode 1 — sketch built at edge, ships envelope.
                         aggregation_input: AggregationInput::SketchEnvelope,
+                        // Regular sketch path — no override.
+                        agg_type_override: None,
                     });
                 }
                 // Gateway: SketchMerge over edge sketches → one merge
@@ -622,6 +646,8 @@ impl Emitter for ThreeStageEmitter {
                         grouping: Vec::new(),
                         // Mode 2 — backend builds sketch from raw OTLP.
                         aggregation_input: AggregationInput::Raw,
+                        // Regular sketch path — no override.
+                        agg_type_override: None,
                     });
                 }
                 _ => {}

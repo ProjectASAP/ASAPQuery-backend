@@ -17,19 +17,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::backend_client::{push_or_log, BackendClient};
+use crate::backend_client::BackendClient;
 use crate::emit::{
     build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
     extend_edge_with_demo_plumbing, generate_agent_collector_config,
-    generate_streaming_config_yaml, AgentRuntime, WorkloadRegistry,
+    post_typed_backend_for_role, AgentRuntime, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
 use crate::optimizer::baseline::BaselinePlanner;
 use crate::optimizer::{cost as cost_model, rules};
+use crate::physical::colored_dag::emitter::BackendStageConfig;
 use crate::physical::stage_split;
 use crate::store::{PlanStore, WorkloadStore};
 use crate::types::QueryWorkload;
@@ -53,14 +54,27 @@ pub struct Replanner {
     scraper: Arc<Scraper>,
     opamp_endpoint: String,
     /// Optional client for pushing newly-generated `StreamingConfig`
-    /// YAML to the ASAPQuery-backend's `/api/v1/streaming-config`
+    /// JSON to the ASAPQuery-backend's `/api/v1/streaming-config`
     /// endpoint. When present, every successful replan POSTs the new
-    /// plan to the backend in addition to the existing OpAMP pushes
-    /// to agent-role and backend-role collectors. Configured via the
+    /// plan to the backend through [`post_typed_backend_for_role`] —
+    /// same typed cumulative path the HTTP `POST /api/v1/plan` handler
+    /// in `main::handle_plan` uses. Configured via the
     /// `CONTROLLER_BACKEND_ENDPOINT` env var; defaults to `None` so
     /// existing deployments that don't yet run ASAPQuery-backend
     /// behave exactly as before.
     backend_client: Option<Arc<BackendClient>>,
+    /// Shared per-`(metric, role)` `BackendStageConfig` cache used by
+    /// [`post_typed_backend_for_role`]. Holding it on the `Replanner`
+    /// means SLA-violation / plan-expiry replans, startup pre-pop
+    /// ticks, and OpAMP on-connect ticks all derive their cumulative
+    /// POST from the SAME state `handle_plan` writes to — so the
+    /// data plane's atomic `handle.swap` swap never loses sibling
+    /// `(metric, role)` aggregations.
+    ///
+    /// `None` when no backend is configured (the helper is still
+    /// invoked — it logs and returns).
+    backend_routing_cache:
+        Option<Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>>,
     /// Optional handle to the control-plane-wide [`WorkloadRegistry`].
     /// Used only by the typed-emit path
     /// ([`Replanner::try_emit_typed_edge_yaml`]) to extend the edge
@@ -96,18 +110,41 @@ impl Replanner {
             scraper,
             opamp_endpoint: opamp_endpoint.into(),
             backend_client: None,
+            backend_routing_cache: None,
             workload_registry: None,
             agent_to_metrics: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Attach a [`BackendClient`] so every replan also pushes the new
-    /// `StreamingConfig` YAML to the ASAPQuery-backend via HTTP.
+    /// typed cumulative `StreamingConfig` + `BackendStorageRouting`
+    /// JSON to the ASAPQuery-backend via HTTP — through the same
+    /// [`post_typed_backend_for_role`] helper `handle_plan` uses, so
+    /// the data plane's atomic swap never loses sibling `(metric,
+    /// role)` aggregations.
+    ///
     /// Builder-style — call during control plane startup in `main.rs`.
     /// Without this call, replans continue to push only via OpAMP and
     /// the ASAPQuery-backend (if running) keeps its startup config.
     pub fn with_backend_client(mut self, client: Arc<BackendClient>) -> Self {
         self.backend_client = Some(client);
+        self
+    }
+
+    /// Attach the shared per-`(metric, role)` `BackendStageConfig`
+    /// cache so the typed cumulative emit reads from + writes to the
+    /// SAME state `main::handle_plan` mutates. Without this the
+    /// Replanner's cumulative POSTs would derive from an empty
+    /// cache and overwrite `handle_plan`'s state on every fire.
+    ///
+    /// Builder-style; safe to omit (the typed emit still works — it
+    /// just operates on a Replanner-local cache, which is fine when
+    /// the Replanner is the sole producer, e.g. in unit tests).
+    pub fn with_backend_routing_cache(
+        mut self,
+        cache: Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>,
+    ) -> Self {
+        self.backend_routing_cache = Some(cache);
         self
     }
 
@@ -446,24 +483,44 @@ impl Replanner {
                 self.opamp.push(&agent_id, cfg).await;
             }
         }
-        // Push the ASAPQuery-backend StreamingConfig YAML via HTTP if a
-        // backend client is configured. This is the producer side of the
-        // ASAPQuery PR E hot-reload contract: the backend receives the
-        // new plan on its /api/v1/streaming-config endpoint and makes it
-        // visible to the next query without restarting.
-        if let Some(backend_client) = self.backend_client.as_ref() {
-            match generate_streaming_config_yaml(metric, &plan) {
-                Ok(yaml) => {
-                    push_or_log(backend_client, metric, yaml).await;
-                }
-                Err(e) => {
-                    warn!(
-                        metric,
-                        error = %e,
-                        "failed to build ASAPQuery streaming-config YAML — \
-                         skipping backend HTTP push for this replan cycle"
-                    );
-                }
+        // Option B: post the typed cumulative `StreamingConfig` +
+        // `BackendStorageRouting` JSON to the backend through the
+        // SAME helper `main::handle_plan` uses. The shared
+        // `backend_routing_cache` (when wired via
+        // `with_backend_routing_cache`) is updated under the helper's
+        // lock and the cumulative POST surfaces every `(metric, role)`
+        // pair the controller has planned — so the data plane's
+        // atomic `handle.swap(new_config)` never wipes sibling
+        // aggregations the way the retired
+        // `generate_streaming_config_yaml` single-aggregation YAML
+        // path did.
+        //
+        // The cache is shared with `AppState`; if the Replanner was
+        // built without one (test fixture), we fall back to a
+        // throwaway local cache so the helper still emits — the
+        // cumulative semantics degrade gracefully (the Replanner is
+        // the sole writer in that scenario).
+        if stage_split::typed_stage_split_enabled() {
+            if let Some(be) = self.build_backend_stage_config(&workload, role) {
+                let fallback_cache = self.backend_routing_cache.clone();
+                let cache_arc = fallback_cache.unwrap_or_else(|| {
+                    Arc::new(Mutex::new(HashMap::new()))
+                });
+                post_typed_backend_for_role(
+                    self.backend_client.as_ref(),
+                    cache_arc.as_ref(),
+                    metric,
+                    role,
+                    be,
+                )
+                .await;
+            } else {
+                warn!(
+                    metric,
+                    role = %role,
+                    "could not build BackendStageConfig for replan — \
+                     skipping backend HTTP push for this cycle"
+                );
             }
         }
 
@@ -477,6 +534,134 @@ impl Replanner {
 
         info!(metric, sketch_type = %sketch_type, "re-plan complete");
         true
+    }
+
+    /// Run the same planner → stage-split → Backend extraction
+    /// `handle_plan` runs, then return the patched
+    /// `BackendStageConfig` ready for [`post_typed_backend_for_role`].
+    ///
+    /// Mirrors the L4/L5 flow in `main::handle_plan` for specs that
+    /// supply only explicit fields (no `query_string`): runs
+    /// `bind_workload_typed` to lower the workload to a
+    /// `PhysicalExpr`, then `split_typed_three_stage` to extract the
+    /// per-stage configs, finds the `Backend` arm, and patches
+    /// `metric_name` / `window_secs` / `grouping` on each
+    /// `BackendAggregation` from the workload spec (same patch the
+    /// `handle_plan` Backend arm applies).
+    ///
+    /// **ExactAgg fallback (Option B)**: when `bind_workload_typed`
+    /// declines (Sum/Rate/Count workloads — `sum by (zone)
+    /// (http_requests_total)`, `rate(metric[5m])`,
+    /// `count(metric)`) AND the role classifies as
+    /// Sum/Count/Other/Topk, synthesize a single ExactAgg-shaped
+    /// `BackendStageConfig` carrying an `agg_type_override` of
+    /// `"Sum"` / `"Increase"` / `"MinMax"` so the cumulative
+    /// streaming-config still surfaces the metric to the backend.
+    /// Without this fallback the typed cumulative POST would omit
+    /// every Sum-shaped metric and `sum by (zone) (…)` queries would
+    /// return `No result for query`.
+    fn build_backend_stage_config(
+        &self,
+        workload: &QueryWorkload,
+        role: AggRole,
+    ) -> Option<BackendStageConfig> {
+        // ── Typed sketch path (Quantile / Cardinality / TopK / Frequency) ──
+        if let Some(physical_expr) = rules::bind_workload_typed(workload) {
+            if let Some(configs) = stage_split::split_typed_three_stage(&physical_expr) {
+                if let Some(mut be) = configs.into_iter().find_map(|(_, cfg)| match cfg {
+                    crate::physical::colored_dag::StageConfig::Backend(be) => Some(be),
+                    _ => None,
+                }) {
+                    // Same patch the `handle_plan` Backend arm applies: the L5
+                    // emitter leaves `metric_name` empty when path-recovery
+                    // through `extract_edge_facts` fails, and always leaves
+                    // `grouping` empty (`QueryExpr::Aggregate.by` is positional
+                    // `ColumnId`s with no label-name resolution today). The
+                    // `QueryWorkload` carries both unambiguously, and every
+                    // aggregation under one workload shares them.
+                    for agg in &mut be.aggregations {
+                        if agg.metric_name.is_empty() {
+                            agg.metric_name = workload.metric_name.clone();
+                        }
+                        if agg.window_secs == 0 {
+                            agg.window_secs = workload.time_window.as_secs();
+                        }
+                        agg.grouping = workload.group_by_labels.clone();
+                    }
+                    return Some(be);
+                }
+            }
+        }
+
+        // ── ExactAgg fallback (Sum / Count / Increase) ────────────────────
+        //
+        // The typed binder declined — most likely because the workload is
+        // Sum/Rate/Count-shaped (raw passthrough, no sketch family). Emit a
+        // single-aggregation `BackendStageConfig` with an
+        // `agg_type_override` so the data plane gets an ExactAgg entry it
+        // can dispatch to its `SumAccumulator` / `IncreaseAccumulator`.
+        let agg_type_override = match role {
+            AggRole::Sum => Some("Sum"),
+            AggRole::Count => Some("Sum"), // count(metric) maps to a Sum-as-count accumulator on the backend
+            AggRole::Other => None,
+            AggRole::Quantile | AggRole::Topk => None,
+        };
+        let agg_type_override = agg_type_override?.to_string();
+        use crate::physical::colored_dag::emitter::{
+            AggregationInput, BackendAggregation, BackendStageConfig,
+        };
+        use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
+        let window_secs = workload.time_window.as_secs().max(1);
+        Some(BackendStageConfig {
+            aggregations: vec![BackendAggregation {
+                aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
+                metric_name: workload.metric_name.clone(),
+                // Sentinel sketch_kind / sketch_params — `agg_type_override`
+                // takes precedence in `build_backend_aggregation_json`, so
+                // these are not emitted on the wire. DDSketch is the
+                // chosen sentinel because every backend that recognises
+                // `AggregationType::FromStr` also accepts DDSketch (and
+                // we don't have a `SketchKind::None` variant today).
+                sketch_kind: SketchKind::DDSketch,
+                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs,
+                spatial_filter: String::new(),
+                grouping: workload.group_by_labels.clone(),
+                // ExactAgg consumes raw values at the backend (the agent
+                // ships counter samples; the backend's
+                // SumAccumulator integrates them).
+                aggregation_input: AggregationInput::Raw,
+                agg_type_override: Some(agg_type_override),
+            }],
+            // No readout entries — ExactAgg produces the answer
+            // directly; the readout dispatch happens at PromQL eval
+            // time on the backend.
+            readouts: Vec::new(),
+        })
+    }
+
+    /// Loop through every `(metric, role)` pair in the `WorkloadStore`
+    /// and call [`Self::replan_metric_role`]. Used at startup (after
+    /// the workload-registry pre-pop) and on OpAMP first-connect so
+    /// the backend's cumulative `StreamingConfig` carries every
+    /// planned `(metric, role)` BEFORE the first query lands —
+    /// without this, queries that don't trigger `POST /api/v1/plan`
+    /// hit the data plane's static startup config (DDSketch only) and
+    /// fail.
+    ///
+    /// Idempotent: every call replays the cumulative POST. Re-runs
+    /// over the same set of pairs are a no-op on the backend (same
+    /// shape ⇒ same `handle.swap` payload).
+    pub async fn replan_all(&self) {
+        let keys = self.workload_store.keys();
+        if keys.is_empty() {
+            info!("replan_all: workload store empty — nothing to plan");
+            return;
+        }
+        info!(count = keys.len(), "replan_all: planning every (metric, role) pair");
+        for (metric, role) in keys {
+            self.replan_metric_role(&metric, role).await;
+        }
     }
 
     /// Re-plans every `(metric, role)` pair whose `valid_until` has

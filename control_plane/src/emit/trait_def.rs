@@ -236,6 +236,7 @@ mod tests {
                 grouping: Vec::new(),
                 aggregation_input:
                     crate::physical::colored_dag::emitter::AggregationInput::SketchEnvelope,
+                agg_type_override: None,
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".to_string(),
