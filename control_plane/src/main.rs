@@ -269,13 +269,42 @@ async fn main() {
     {
         let analyzer = Analyzer::new();
         for entry in workload_registry.entries() {
+            // MVP blocker B4 — let the analyzer parse `time_window` from
+            // `query_string` (matrix-selector `[range]`) instead of
+            // forcing a hardcoded "5m" default that overrides whatever
+            // the user wrote. The analyzer falls back to its own 5m
+            // default when the PromQL has no matrix selector (e.g.
+            // `count(unique_users_per_min)`), so this is strictly an
+            // improvement for queries that DO carry an explicit range.
+            // Empty string here means "no override; trust the parsed
+            // value or the analyzer's fallback".
+            //
+            // MVP blocker B3 — thread the WorkloadEntry's declarative
+            // `grouping_labels` into `QuerySpec.group_by_labels`. The
+            // analyzer merges these with any `by (...)` keys the
+            // PromQL parser surfaces, populating `QueryWorkload.
+            // group_by_labels`, which `collect_metric_to_grouping_labels`
+            // then drops into `EdgeStageConfig.metric_to_grouping_labels`
+            // so the agent's `keep_keys(datapoint.attributes, [...])`
+            // OTTL processor strips wire attrs down to this list
+            // BEFORE sketching.
             let spec = pipeline::QuerySpec {
                 query_string:    entry.query_string.clone(),
                 metric_name:     entry.metric_name.clone(),
                 label_filters:   Default::default(),
-                group_by_labels: vec![],
+                group_by_labels: entry.grouping_labels.clone(),
                 aggregations:    vec!["quantile".into()],
-                time_window:     "5m".into(),
+                // Empty when the entry HAS a `query_string` (the parser
+                // surfaces the matrix-selector range or its own 5m
+                // fallback). For entries without a query_string we
+                // can't trust the parser, so fall back to the
+                // historical 5m default so the analyzer doesn't error
+                // out at Step 4.
+                time_window:     if entry.query_string.is_some() {
+                    String::new()
+                } else {
+                    "5m".into()
+                },
                 repeat_every:    None,
                 accuracy_sla:    entry.accuracy_sla,
                 latency_sla:     None,
