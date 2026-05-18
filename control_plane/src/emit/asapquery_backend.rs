@@ -41,9 +41,18 @@ use crate::types::{AgentCollectorConfig, CollectionPlan, SketchType};
 /// serialization fails.
 pub fn generate_streaming_config_yaml(metric: &str, plan: &CollectionPlan) -> Result<String> {
     let agg = &plan.agent_config;
+    // MVP blocker B4: clamp the workload's `window_duration` to
+    // `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]` so the legacy YAML emit
+    // matches the typed L5 JSON emit's `windowSize` clamp. Without
+    // this, the legacy and typed paths can disagree (e.g. typed
+    // clamps `[5m]` → 60, legacy passes 300 → backend reducer keys
+    // a 300s window the agent never closes).
     let window_secs = agg
         .window_duration
-        .map(|d: Duration| d.as_secs())
+        .map(|d: Duration| {
+            super::stage_config::clamp_window_secs(Some(d.as_secs()))
+                .expect("clamp preserves Some")
+        })
         .unwrap_or(0);
     if window_secs == 0 {
         anyhow::bail!(

@@ -137,7 +137,15 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
 
     if cfg.mode == ProcessorMode::Window {
         if let Some(wd) = cfg.window_duration {
-            m.insert("window_duration".into(), Value::String(format_duration(wd)));
+            // MVP blocker B4: clamp `window_duration` to [5, 60] so
+            // the legacy agent emitter matches the typed L5 emitter's
+            // bounds — without this, a `[5m]` workload landing here
+            // mints a 300s sketch window whose closed answer never
+            // falls inside the user's replay range.
+            let clamped = super::stage_config::clamp_window_secs(Some(wd.as_secs()))
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(wd);
+            m.insert("window_duration".into(), Value::String(format_duration(clamped)));
         }
     }
 
@@ -303,9 +311,50 @@ mod tests {
     #[test]
     fn contains_window_duration() {
         let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        // MVP blocker B4: the fixture's 5m window clamps to 60s
+        // (`MAX_WINDOW_SECS`). Assert on the clamped form — a window
+        // larger than 60s would put the sketch close outside any
+        // sensible replay range. Pre-B4 this test asserted "5m".
         assert!(
-            yaml.contains("5m"),
-            "YAML should contain window_duration\n{yaml}"
+            yaml.contains("window_duration: 1m") || yaml.contains("window_duration: 60s"),
+            "YAML should contain clamped window_duration (1m / 60s)\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn clamps_oversize_window_to_max() {
+        let mut cfg = ddsketch_cfg();
+        cfg.window_duration = Some(Duration::from_secs(3600)); // 1h
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        assert!(
+            !yaml.contains("window_duration: 1h"),
+            "1h window must clamp to MAX_WINDOW_SECS, not pass through\n{yaml}"
+        );
+        assert!(
+            yaml.contains("window_duration: 1m") || yaml.contains("window_duration: 60s"),
+            "clamped window must be 60s\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn clamps_undersize_window_to_min() {
+        let mut cfg = ddsketch_cfg();
+        cfg.window_duration = Some(Duration::from_secs(1)); // 1s
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        assert!(
+            yaml.contains("window_duration: 5s"),
+            "1s window must clamp UP to MIN_WINDOW_SECS=5s\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn preserves_window_inside_clamp_range() {
+        let mut cfg = ddsketch_cfg();
+        cfg.window_duration = Some(Duration::from_secs(30));
+        let yaml = generate_agent_collector_config(&cfg, "ws://ctrl:4320/v1/opamp").unwrap();
+        assert!(
+            yaml.contains("window_duration: 30s"),
+            "30s window is inside [5, 60] and must pass through verbatim\n{yaml}"
         );
     }
 

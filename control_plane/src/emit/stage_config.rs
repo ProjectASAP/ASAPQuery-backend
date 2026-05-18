@@ -108,6 +108,45 @@ struct Pipeline {
     exporters: Vec<String>,
 }
 
+// ── Window-size clamping (MVP blocker B4) ─────────────────────────────────────
+//
+// The controller derives `window_secs` from the workload's matrix-selector
+// range (`metric[30s]` → 30s). Two bounds keep the emitted value sane:
+//
+//   * Lower bound 5s — below this the sketch processor mints a new
+//     window before it has enough samples for the family's quality
+//     guarantees, and the per-flush cardinality on the sid catalog
+//     explodes (one (sid, window) row per few seconds).
+//   * Upper bound 60s — above this the user's query range no longer
+//     contains a closed sketch window, and replay queries return NoData
+//     while the warm tier still owns the metric. 60s is also the
+//     historical default the legacy single-pipeline emitter shipped with,
+//     so clamping here preserves backwards-compat for plans without an
+//     explicit range.
+//
+// `None` means "no `Window` node in the typed L5 — agent runs in batch
+// mode, no window_duration in the YAML"; we pass that straight through.
+//
+// Centralised here so [`build_edge_processor_block`] (sketch processor
+// `window_duration`) and the [`BackendAggregation`] consumer
+// ([`emit_backend_streaming_config_json`]) clamp to the same bounds. The
+// downstream backend's reducer keys windows by the emitted value, so
+// the two MUST agree or replay-vs-warm answers go out of sync.
+
+/// Lower bound for [`clamp_window_secs`].
+pub const MIN_WINDOW_SECS: u64 = 5;
+
+/// Upper bound for [`clamp_window_secs`]. Matches the legacy default
+/// the pre-B4 emitter shipped with.
+pub const MAX_WINDOW_SECS: u64 = 60;
+
+/// Clamp a derived window size to `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`.
+/// `None` is preserved as `None` so callers can keep the
+/// "no-window / batch-mode" branch distinguishable from a clamped value.
+pub fn clamp_window_secs(w: Option<u64>) -> Option<u64> {
+    w.map(|s| s.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS))
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Build the OTel-collector YAML for an edge agent from the typed L5
@@ -164,9 +203,14 @@ pub fn emit_edge_yaml(
     let mut processors: BTreeMap<String, Value> = BTreeMap::new();
     let mut sketch_pipeline_processors: Vec<String> = Vec::new();
     for sp in &cfg.sketch_processors {
+        // MVP blocker B4: clamp `window_secs` to [5, 60] so the agent's
+        // sketch processor's `window_duration` always sits inside the
+        // user's query range. Without this, `metric[5m]` lands a
+        // 300s window which is larger than any sensible replay range
+        // and produces NoData under `quantile_over_time`.
         let block = build_edge_processor_block(
             sp,
-            cfg.window_secs,
+            clamp_window_secs(cfg.window_secs),
             &cfg.label_filters,
             cfg.source_metric.as_deref(),
         );
@@ -952,10 +996,15 @@ fn emit_edge_yaml_5sketch_routing(
                 }
             })
             .min();
+        // MVP blocker B4: clamp `window_secs` to [5, 60] on the
+        // 5-sketch routing path too. Without this every per-family
+        // processor in the routed YAML inherits the unclamped 300s
+        // window from `[5m]` queries.
+        let clamped_window = clamp_window_secs(cfg.window_secs);
         let block = if let Some(sp) = family_to_proc.get(&kind) {
-            build_edge_processor_block(sp, cfg.window_secs, &cfg.label_filters, metric_name_hint)
+            build_edge_processor_block(sp, clamped_window, &cfg.label_filters, metric_name_hint)
         } else {
-            build_default_edge_processor_block(&kind, cfg.window_secs, metric_name_hint)
+            build_default_edge_processor_block(&kind, clamped_window, metric_name_hint)
         };
         processors.insert(processor_name.to_string(), block);
     }
@@ -1590,6 +1639,17 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",
     };
+    // MVP blocker B4: clamp `windowSize` so the backend's reducer keys
+    // windows by the SAME size the agent's sketch processor uses. The
+    // backend's `streaming-config.window_size` must match the agent's
+    // `window_duration` exactly — drift here de-syncs the warm tier
+    // and replay queries return NoData (the backend's pre-compute
+    // engine looks for closed windows at the streaming-config size).
+    // `agg.window_secs` is u64 (not Option) here; passing through
+    // `clamp_window_secs(Some(_))` and unwrapping keeps the contract
+    // explicit.
+    let window_size = clamp_window_secs(Some(agg.window_secs))
+        .expect("clamp_window_secs preserves Some");
     json!({
         "aggregationType": sketch_kind_to_backend_type(&agg.sketch_kind, &agg.sketch_params),
         "aggregationSubType": "",
@@ -1600,7 +1660,7 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
             "aggregated": Vec::<String>::new(),
         },
         "parameters": parameters,
-        "windowSize": agg.window_secs,
+        "windowSize": window_size,
         "windowType": "tumbling",
         "spatialFilter": agg.spatial_filter,
         "aggregationInput": aggregation_input,
@@ -3761,6 +3821,132 @@ mod tests {
     /// write destination). We assert ABSENCE line-by-line so the
     /// `tsdb_bucket:` line (which contains the substring `bucket:`)
     /// doesn't falsely trigger the negative match.
+    // ── MVP blocker B4: window-size clamp tests ───────────────────────────
+    //
+    // The controller derives `window_secs` from the workload's matrix-
+    // selector range. Tests below pin the clamp contract:
+    //   * `[30s]` (sensible inner range) → passes through unchanged
+    //   * `[5m]` (300s) → clamps DOWN to MAX_WINDOW_SECS (60)
+    //   * no `[range]` (analyzer's 5m fallback at the spec level) →
+    //     also clamps DOWN to 60
+    //   * `[1s]` (below floor) → clamps UP to MIN_WINDOW_SECS (5)
+    //   * `None` (batch mode, no Window node) → stays None
+    //
+    // Both consumers must agree (sketch processor's window_duration in
+    // the agent YAML AND BackendAggregation's windowSize in the
+    // streaming-config JSON), otherwise the backend's reducer keys
+    // windows by a size the agent never closes.
+
+    #[test]
+    fn b4_clamp_window_secs_in_range_passes_through() {
+        assert_eq!(clamp_window_secs(Some(30)), Some(30));
+        assert_eq!(clamp_window_secs(Some(MIN_WINDOW_SECS)), Some(MIN_WINDOW_SECS));
+        assert_eq!(clamp_window_secs(Some(MAX_WINDOW_SECS)), Some(MAX_WINDOW_SECS));
+    }
+
+    #[test]
+    fn b4_clamp_window_secs_above_max_clamps_down() {
+        assert_eq!(clamp_window_secs(Some(300)), Some(MAX_WINDOW_SECS));
+        assert_eq!(clamp_window_secs(Some(3600)), Some(MAX_WINDOW_SECS));
+    }
+
+    #[test]
+    fn b4_clamp_window_secs_below_min_clamps_up() {
+        assert_eq!(clamp_window_secs(Some(0)), Some(MIN_WINDOW_SECS));
+        assert_eq!(clamp_window_secs(Some(1)), Some(MIN_WINDOW_SECS));
+        assert_eq!(clamp_window_secs(Some(4)), Some(MIN_WINDOW_SECS));
+    }
+
+    #[test]
+    fn b4_clamp_window_secs_none_passes_through() {
+        assert_eq!(clamp_window_secs(None), None);
+    }
+
+    /// Pre-B4: a `[5m]` workload landed `window_duration: 300s` in the
+    /// emitted YAML. Post-B4 the clamp brings it down to 60s so the
+    /// sketch processor's window sits inside any sensible replay range.
+    #[test]
+    fn b4_edge_yaml_clamps_oversize_window_duration() {
+        let mut cfg = ddsketch_edge_cfg();
+        cfg.window_secs = Some(300); // [5m] in the workload
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            yaml.contains("window_duration: 60s"),
+            "5m window must clamp to 60s in the sketch processor block\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("window_duration: 300s"),
+            "unclamped 300s window must not be emitted\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn b4_edge_yaml_preserves_inrange_window_duration() {
+        let mut cfg = ddsketch_edge_cfg();
+        cfg.window_secs = Some(30); // [30s] — canonical MVP query range
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            yaml.contains("window_duration: 30s"),
+            "30s window is inside [5, 60] and must pass through\n{yaml}"
+        );
+    }
+
+    /// 5-sketch routing path applies the same clamp — every per-family
+    /// processor inherits the clamped window.
+    #[test]
+    fn b4_5sketch_routing_clamps_window_duration_across_all_families() {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.window_secs = Some(300);
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("window_duration: 300s"),
+            "5-sketch routing must not leak unclamped 300s windows\n{yaml}",
+        );
+        // The 5-sketch path emits the same processor key 5x (one per
+        // family); at least one must show the clamped value.
+        let clamped_count = yaml.matches("window_duration: 60s").count();
+        assert!(
+            clamped_count >= 1,
+            "5-sketch routing must emit clamped window_duration\n{yaml}",
+        );
+    }
+
+    /// Streaming-config JSON `windowSize` clamps too, so the backend
+    /// reducer keys windows by the SAME size the agent's sketch
+    /// processor closes. Drift here de-syncs warm tier replay answers.
+    #[test]
+    fn b4_streaming_config_clamps_window_size() {
+        use crate::physical::colored_dag::emitter::{
+            AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
+        };
+        use crate::sketch_algebra::params::DDSketchParams;
+        use crate::sketch_algebra::physical_expr::EstimateOp;
+
+        let cfg = BackendStageConfig {
+            aggregations: vec![BackendAggregation {
+                aggregation_id: "agg0".to_string(),
+                metric_name: "http_requests_total_latency_ms".to_string(),
+                sketch_kind: SketchKind::DDSketch,
+                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                window_secs: 300, // pre-clamp 5m
+                spatial_filter: String::new(),
+                grouping: vec!["zone".to_string()],
+                aggregation_input: AggregationInput::SketchEnvelope,
+            }],
+            readouts: vec![BackendReadout {
+                aggregation_id: "agg0".to_string(),
+                op: EstimateOp::Quantile { q: 0.99 },
+            }],
+        };
+        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let aggs = v.get("aggregations").and_then(|a| a.as_array()).expect("aggregations");
+        assert_eq!(
+            aggs[0]["windowSize"].as_u64(),
+            Some(MAX_WINDOW_SECS),
+            "windowSize must clamp 300 → 60 so backend reducer matches the agent's emitted window\n{v}"
+        );
+    }
+
     #[test]
     fn b1_gorillas3_emit_drops_bucket_field_keeps_tsdb_bucket() {
         let yaml = build_gorillas3_yaml(60);

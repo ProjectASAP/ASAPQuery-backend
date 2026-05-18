@@ -41,6 +41,29 @@ pub struct WorkloadEntry {
     /// integration). Not yet read by the planner.
     #[serde(default)]
     pub target_path: Option<String>,
+    /// MVP blocker B3 — declarative grouping labels for the wire-attr
+    /// allowlist the agent applies before sketching. Mirrors the
+    /// streaming-config's `grouping_labels` contract: the agent's
+    /// `transform/keep_for_<metric>` OTTL processor calls
+    /// `keep_keys(datapoint.attributes, [...])` on this list, stripping
+    /// every other attr BEFORE the sketch processor mints sids.
+    ///
+    /// Why this is a separate field (not parsed from `query_string`):
+    /// the canonical MVP workload `quantile_over_time(0.99,
+    /// http_requests_total_latency_ms[30s])` carries no `by (...)`
+    /// clause, so the PromQL parser surfaces an EMPTY group_by_labels.
+    /// Without a declarative field the analyzer ends up with an empty
+    /// `QueryWorkload.group_by_labels` → an empty `keep_keys` list →
+    /// the agent strips ALL attrs and mints a single sid per metric
+    /// (instead of one per `(metric, zone)`), defeating the streaming-
+    /// config contract.
+    ///
+    /// Threaded into `QueryWorkload::group_by_labels` by the registry
+    /// pre-pop loop in `main`, so it merges with any `by (...)` keys
+    /// the PromQL parser surfaces. Empty / missing ⇒ same behaviour as
+    /// pre-B3 (no allowlist injected).
+    #[serde(default)]
+    pub grouping_labels: Vec<String>,
 }
 
 fn default_accuracy_sla() -> f64 {
@@ -187,6 +210,7 @@ mod tests {
                     assign_to_role: "agent".into(),
                     sketch_family_override: None,
                     target_path: None,
+                    grouping_labels: vec![],
                 },
                 WorkloadEntry {
                     metric_name: "b".into(),
@@ -195,6 +219,7 @@ mod tests {
                     assign_to_role: "backend".into(),
                     sketch_family_override: None,
                     target_path: None,
+                    grouping_labels: vec![],
                 },
                 WorkloadEntry {
                     metric_name: "c".into(),
@@ -203,6 +228,7 @@ mod tests {
                     assign_to_role: "agent".into(),
                     sketch_family_override: None,
                     target_path: None,
+                    grouping_labels: vec![],
                 },
             ],
         };

@@ -497,13 +497,20 @@ mod runtime_tests {
         use crate::types_v2;
         let analyzer = Analyzer::new();
         for entry in registry.entries() {
+            // Mirrors main.rs's QuerySpec construction post-B3/B4:
+            // thread grouping_labels into group_by_labels; let the
+            // parser drive time_window when query_string is present.
             let spec = QuerySpec {
                 query_string: entry.query_string.clone(),
                 metric_name: entry.metric_name.clone(),
                 label_filters: Default::default(),
-                group_by_labels: vec![],
+                group_by_labels: entry.grouping_labels.clone(),
                 aggregations: vec!["quantile".into()],
-                time_window: "5m".into(),
+                time_window: if entry.query_string.is_some() {
+                    String::new()
+                } else {
+                    "5m".into()
+                },
                 repeat_every: None,
                 accuracy_sla: entry.accuracy_sla,
                 latency_sla: None,
@@ -600,6 +607,116 @@ mod runtime_tests {
             map.len(),
             5,
             "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}"
+        );
+    }
+
+    // ── B3 regression: WorkloadEntry.grouping_labels populates emit ───────
+    //
+    // Pre-B3 the WorkloadEntry YAML had no way to declare grouping
+    // labels — the analyzer pulled them only from PromQL `by (...)`
+    // clauses. Bare `quantile_over_time(0.99, metric[30s])` carries no
+    // `by`, so `QueryWorkload.group_by_labels` ended up empty, so
+    // `collect_metric_to_grouping_labels` returned `{metric: vec![]}`,
+    // so the 5-sketch routing emitter wrote
+    // `keep_keys(datapoint.attributes, [])` — stripping ALL attrs
+    // instead of keeping `["zone"]`. Sid catalog ended up with one sid
+    // per metric instead of one per (metric × zone).
+    //
+    // Post-B3 a declarative `grouping_labels: [zone]` on WorkloadEntry
+    // is threaded through the pre-pop QuerySpec → analyzer →
+    // QueryWorkload.group_by_labels → collect_metric_to_grouping_labels
+    // → the emitter's keep_keys list. Without this round-trip the
+    // smoke test's sid catalog stays empty-per-zone.
+    #[test]
+    fn workload_entry_grouping_labels_round_trip_through_emit_to_keep_keys() {
+        let yaml = r#"
+- metric_name: http_requests_total_latency_ms
+  query_string: "quantile_over_time(0.99, http_requests_total_latency_ms[30s])"
+  accuracy_sla: 0.01
+  assign_to_role: agent
+  grouping_labels: ["zone"]
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].grouping_labels,
+            vec!["zone".to_string()],
+            "WorkloadEntry must surface grouping_labels from YAML"
+        );
+
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        // The analyzer must have threaded grouping_labels into
+        // QueryWorkload.group_by_labels.
+        let map = collect_metric_to_grouping_labels(&registry, &store);
+        assert_eq!(
+            map.get("http_requests_total_latency_ms"),
+            Some(&vec!["zone".to_string()]),
+            "collect_metric_to_grouping_labels must surface entry.grouping_labels — \
+             without this the agent strips ALL attrs and the sid catalog ends up \
+             with one sid per metric instead of one per (metric, zone)\nmap: {map:?}"
+        );
+    }
+
+    /// Belt-and-braces companion: the emit-side keep_keys statement
+    /// must contain the per-entry grouping_labels VERBATIM. Catches a
+    /// regression where the pre-pop loop populates the workload store
+    /// but the round-trip through the emitter drops the labels.
+    #[test]
+    fn workload_entry_grouping_labels_surface_in_emit_keep_keys_list() {
+        use crate::physical::colored_dag::emitter::{EdgeStageConfig, ExportTarget};
+        use crate::physical::colored_dag::stage_id::StageId;
+        use crate::sketch_algebra::params::SketchKind;
+
+        let yaml = r#"
+- metric_name: http_requests_total_latency_ms
+  query_string: "quantile_over_time(0.99, http_requests_total_latency_ms[30s])"
+  accuracy_sla: 0.01
+  assign_to_role: agent
+  grouping_labels: ["zone"]
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        let mut edge_cfg = EdgeStageConfig {
+            source_metric: Some("http_requests_total_latency_ms".to_string()),
+            label_filters: Vec::new(),
+            window_secs: Some(30),
+            sketch_processors: Vec::new(),
+            exporter_target: ExportTarget::Stage(StageId::Gateway),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family: std::collections::HashMap::from([(
+                "http_requests_total_latency_ms".to_string(),
+                SketchKind::DDSketch,
+            )]),
+            metric_to_grouping_labels: std::collections::HashMap::new(),
+        };
+        edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
+
+        let yaml_out = crate::emit::emit_edge_yaml(&edge_cfg, "ws://c/", "test-agent")
+            .expect("emit ok");
+        assert!(
+            yaml_out.contains(
+                "keep_keys(datapoint.attributes, [\"zone\"]) where metric.name == \"http_requests_total_latency_ms\""
+            ),
+            "keep_keys must list `zone` (NOT empty) for the YAML-declared grouping_labels\n{yaml_out}",
+        );
+        // Belt-and-braces: the bug surface is specifically
+        // `keep_keys(..., [])`. Make sure we don't accidentally emit
+        // the empty-list form for this metric.
+        assert!(
+            !yaml_out.contains(
+                "keep_keys(datapoint.attributes, []) where metric.name == \"http_requests_total_latency_ms\""
+            ),
+            "empty keep_keys would strip all attrs and break per-zone sid splitting\n{yaml_out}",
         );
     }
 }
