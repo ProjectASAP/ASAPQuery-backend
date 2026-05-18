@@ -735,6 +735,219 @@ fn hll_cumulative_full_plus_one_delta() {
 // information it needs.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ExactAgg dispatch — regression coverage for `sum by (...)` PromQL.
+// Pins that `SketchReducer::evaluate_exact_agg`:
+//   1. Walks ExactAgg sids (not sketch sids).
+//   2. Groups per-window AggregateCore state by the projected
+//      `group_by_keys` (subset of each sid's full label map).
+//   3. Merges accumulators inside a group via `AggregateCore::merge_with`
+//      and reads `Statistic::Sum` for additive types.
+//   4. Surfaces `NoData` when no in-window state exists (so the engine
+//      routes the query to archive instead of returning a stale answer).
+// ---------------------------------------------------------------------------
+
+fn exact_agg_meta(
+    sid: u64,
+    metric: &str,
+    group_by_keys: &[&str],
+    agg_type: crate::storage_engines::sketch_db::data::AggregationType,
+) -> SketchInstanceMetadata {
+    SketchInstanceMetadata {
+        sid,
+        metric_name: metric.to_string(),
+        group_by_keys: group_by_keys.iter().map(|s| s.to_string()).collect(),
+        capability: Some(Capability::ExactAgg(agg_type)),
+        agg_kind: AggKind::ExactAgg {
+            agg_type,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        },
+        accuracy: None,
+        first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
+    }
+}
+
+#[test]
+fn evaluate_exact_agg_sums_per_group_across_zones() {
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    // Four sids, one per zone, mirroring the post-#290 startup-replan
+    // ExactAgg(Sum) sids the smoke test exercises.
+    let zones = ["z0", "z1", "z2", "z3"];
+    for (i, zone) in zones.iter().enumerate() {
+        let sid = 1000 + i as u64;
+        idx.register(exact_agg_meta(
+            sid,
+            "http_requests_total",
+            &["zone"],
+            AggregationType::Sum,
+        ));
+        // Two windows of data per zone, the sum value distinct per zone
+        // (10, 20, 30, 40) so the test can assert per-group correctness.
+        let value = ((i + 1) * 10) as f64;
+        for (j, (ws, we)) in [(100u64, 200u64), (200, 300)].iter().enumerate() {
+            let mut lm = BTreeMap::new();
+            lm.insert("zone".to_string(), zone.to_string());
+            // The second window's accumulator carries the same value so
+            // the per-window per-zone scalar is constant; the engine
+            // chooses the last window for instant queries.
+            let _ = j;
+            idx.append_precompute(
+                sid,
+                lm,
+                (*ws, *we),
+                Box::new(SumAccumulator::with_sum(value)),
+            );
+        }
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg(
+            &[1000, 1001, 1002, 1003],
+            AggregationType::Sum,
+            &group_by,
+            0,
+            400,
+        )
+        .expect("exact-agg evaluate should succeed");
+
+    // One series per zone, each with two windows of samples.
+    assert_eq!(result.series.len(), 4, "one series per zone");
+    let mut per_zone: BTreeMap<String, f64> = BTreeMap::new();
+    for (label_map, samples) in &result.series {
+        let zone = label_map
+            .get("zone")
+            .cloned()
+            .expect("series carries `zone` label");
+        // Each window emits one sample; both windows for one zone
+        // share the same value so the last sample is the canonical
+        // instant readout.
+        let last = samples.last().expect("at least one sample").1;
+        per_zone.insert(zone, last);
+    }
+    assert_eq!(per_zone.get("z0").copied(), Some(10.0));
+    assert_eq!(per_zone.get("z1").copied(), Some(20.0));
+    assert_eq!(per_zone.get("z2").copied(), Some(30.0));
+    assert_eq!(per_zone.get("z3").copied(), Some(40.0));
+
+    // Coverage spans the entire window range.
+    let (cov_lo, cov_hi) = result.coverage.expect("coverage populated");
+    assert_eq!(cov_lo, 200);
+    assert_eq!(cov_hi, 300);
+}
+
+#[test]
+fn evaluate_exact_agg_collapses_subgroups_into_requested_groups() {
+    // Two sids share a (zone, rack) label space: sid 5000 is
+    // (zone=z0, rack=r0), sid 5001 is (zone=z0, rack=r1). A
+    // `sum by (zone)` query MUST collapse both racks into one
+    // (zone=z0) group with their values added.
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    for (sid, rack, value) in [(5000u64, "r0", 7.0_f64), (5001, "r1", 13.0)] {
+        idx.register(exact_agg_meta(
+            sid,
+            "http_requests_total",
+            &["rack", "zone"],
+            AggregationType::Sum,
+        ));
+        let mut lm = BTreeMap::new();
+        lm.insert("zone".to_string(), "z0".to_string());
+        lm.insert("rack".to_string(), rack.to_string());
+        idx.append_precompute(
+            sid,
+            lm,
+            (100, 200),
+            Box::new(SumAccumulator::with_sum(value)),
+        );
+    }
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg(
+            &[5000, 5001],
+            AggregationType::Sum,
+            &group_by,
+            0,
+            300,
+        )
+        .expect("evaluate ok");
+
+    assert_eq!(result.series.len(), 1, "rack values collapse into one zone group");
+    let (label_map, samples) = &result.series[0];
+    assert_eq!(label_map.get("zone").cloned(), Some("z0".to_string()));
+    assert!(!label_map.contains_key("rack"), "rack dropped (not in group_by)");
+    let last = samples.last().expect("at least one sample").1;
+    assert!(
+        (last - 20.0).abs() < 1e-9,
+        "merged sum 7 + 13 = 20, got {last}"
+    );
+}
+
+#[test]
+fn evaluate_exact_agg_unsupported_capability_for_minmax() {
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        7000,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::MinMax,
+    ));
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let err = reducer
+        .evaluate_exact_agg(&[7000], AggregationType::MinMax, &group_by, 0, 1000)
+        .expect_err("MinMax dispatch should surface as UnsupportedCapability");
+    match err {
+        ASAPTierError::UnsupportedCapability { capability, .. } => {
+            assert!(matches!(
+                capability,
+                Capability::ExactAgg(AggregationType::MinMax)
+            ));
+        }
+        other => panic!("expected UnsupportedCapability, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluate_exact_agg_no_data_when_window_empty() {
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        8000,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::Sum,
+    ));
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let err = reducer
+        .evaluate_exact_agg(&[8000], AggregationType::Sum, &group_by, 0, 1000)
+        .expect_err("empty in-window state should surface as NoData");
+    match err {
+        ASAPTierError::NoData { metric_name } => {
+            assert_eq!(metric_name, "http_requests_total");
+        }
+        other => panic!("expected NoData, got {other:?}"),
+    }
+}
+
 #[test]
 fn coverage_reports_observed_window_range() {
     let idx = SketchStore::new();

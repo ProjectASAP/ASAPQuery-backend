@@ -424,6 +424,80 @@ impl SketchStore {
             .collect()
     }
 
+    /// Range-query the ExactAgg state for ONE sid. Sister of
+    /// [`Self::query_range`] for the exact-aggregation branch — same
+    /// `[start, end]` semantics, but yields `Box<dyn AggregateCore>`
+    /// payloads keyed by their FULL `BTreeMap<String, String>` label
+    /// map (label KEYS preserved, not just values).
+    ///
+    /// Used by the ASAP-tier `sum by (...)` dispatch path
+    /// (`SketchReducer::evaluate_exact_agg`) so the engine can
+    /// project label maps onto a query-time `group_by_keys` subset
+    /// (`{zone: z0, rack: r0}` → grouped by `zone` only). The
+    /// existing [`Self::query_precomputes_by_agg`] flattens labels
+    /// to a `KeyByLabelValues` (values only, no keys), which loses
+    /// the projection information the engine needs.
+    ///
+    /// Returns an empty Vec when the sid carries no ExactAgg state
+    /// in `[start, end]` (or is sketch-backed). Defensive — caller
+    /// is responsible for confirming the sid's `agg_kind` is
+    /// `AggKind::ExactAgg { .. }` before calling.
+    pub fn query_exact_agg_range(
+        &self,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Vec<(
+        BTreeMap<String, String>,
+        BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+    )> {
+        let store = match self.series.get(&sid) {
+            Some(s) => s.clone(),
+            None => return Vec::new(),
+        };
+        let guard = store.write().unwrap();
+        let mut by_label_id: HashMap<
+            LabelValuesId,
+            BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+        > = HashMap::new();
+
+        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+        guard
+            .current_epoch
+            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+        for (win, label_id, payload) in &buf {
+            if let Some(p) = payload.as_exact_agg() {
+                by_label_id
+                    .entry(*label_id)
+                    .or_default()
+                    .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+            }
+        }
+        buf.clear();
+
+        for sealed in guard.sealed_epochs.values() {
+            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            for (win, label_id, payload) in &buf {
+                if let Some(p) = payload.as_exact_agg() {
+                    by_label_id
+                        .entry(*label_id)
+                        .or_default()
+                        .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                }
+            }
+            buf.clear();
+        }
+
+        by_label_id
+            .into_iter()
+            .map(|(label_id, samples)| {
+                let label_values_map =
+                    guard.intern.resolve(label_id).cloned().unwrap_or_default();
+                (label_values_map, samples)
+            })
+            .collect()
+    }
+
     /// Phase 5 M2.3.5 — query the precompute payloads across every sid
     /// belonging to one `AggregationConfig` (identified by `metric` +
     /// `agg_cfg.aggregation_type`), shaped as the legacy `Store`

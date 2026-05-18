@@ -410,23 +410,48 @@ impl ASAPQueryEngine {
                 ));
             }
 
-            let result = reducer
-                .evaluate(
-                    &hit_sids,
-                    &candidate.function,
-                    &candidate.function_args,
-                    start_ms,
-                    end_ms,
-                )
-                .map_err(|e| {
-                    crate::query_engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchStore.data_source_id(),
-                        format!(
-                            "SketchStore reducer failed for `{query}` over \
-                             [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                        ),
+            // ExactAgg capability → dispatch the per-(group_by_keys)
+            // accumulator-merge path; sketch capabilities → the
+            // sketch-decode path. See `SketchReducer::evaluate_exact_agg`
+            // for the ExactAgg path's semantics.
+            let result = match &candidate.required_capability {
+                crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
+                    reducer
+                        .evaluate_exact_agg(
+                            &hit_sids,
+                            *agg_type,
+                            &candidate.group_by_keys,
+                            start_ms,
+                            end_ms,
+                        )
+                        .map_err(|e| {
+                            crate::query_engines::EngineError::capability_miss(
+                                asap_types::StorageBackend::SketchStore.data_source_id(),
+                                format!(
+                                    "SketchStore exact-agg reducer failed for `{query}` over \
+                                     [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                                ),
+                            )
+                        })?
+                }
+                _ => reducer
+                    .evaluate(
+                        &hit_sids,
+                        &candidate.function,
+                        &candidate.function_args,
+                        start_ms,
+                        end_ms,
                     )
-                })?;
+                    .map_err(|e| {
+                        crate::query_engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            format!(
+                                "SketchStore reducer failed for `{query}` over \
+                                 [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                            ),
+                        )
+                    })?,
+            };
             combined_result = Some(result);
         }
 
@@ -823,13 +848,33 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     combined_t0 = t0_ms;
                 }
 
-                let result = match reducer.evaluate(
-                    &hit_sids,
-                    &candidate.function,
-                    &candidate.function_args,
-                    t0_ms,
-                    now_ms,
-                ) {
+                // ExactAgg capability → dispatch the per-(group_by_keys)
+                // accumulator-merge path; sketch capabilities → the
+                // sketch-decode path. ExactAgg sids carry
+                // `Box<dyn AggregateCore>` payloads (per-window
+                // `SumAccumulator` / `IncreaseAccumulator` /
+                // `MinMaxAccumulator` etc.) rather than opaque sketch
+                // bytes, so they need a different reducer entry point.
+                let reducer_result = match &candidate.required_capability {
+                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                        agg_type,
+                    ) => reducer.evaluate_exact_agg(
+                        &hit_sids,
+                        *agg_type,
+                        &candidate.group_by_keys,
+                        t0_ms,
+                        now_ms,
+                    ),
+                    _ => reducer.evaluate(
+                        &hit_sids,
+                        &candidate.function,
+                        &candidate.function_args,
+                        t0_ms,
+                        now_ms,
+                    ),
+                };
+
+                let result = match reducer_result {
                     Ok(r) => r,
                     Err(
                         crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedFunction(
@@ -1736,6 +1781,103 @@ mod asap_tier_classify_tests {
                  instead of being found via instances_matching: {detail}"
             );
         }
+    }
+
+    /// `sum by (zone) (http_requests_total)` end-to-end via the
+    /// `execute(&str)` adapter. Mirrors the MVP smoke test's Axis-C
+    /// failure: the control plane's analyzer minted ExactAgg(Sum)
+    /// sids for `http_requests_total` (one per zone), the engine
+    /// resolved them via `instances_matching`, but the reducer
+    /// returned `UnsupportedFunction("sum")` because
+    /// `SketchReducer::evaluate` only knows sketch-backed query
+    /// families. This test pins the ExactAgg dispatch branch added
+    /// to `execute` so the new path emits per-zone instant-vector
+    /// results instead of a CapabilityMiss.
+    #[tokio::test]
+    async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        // Mirror the smoke-test setup: four ExactAgg(Sum) sids, one
+        // per zone (z0..z3), registered with `group_by_keys=["zone"]`
+        // and carrying a `SumAccumulator` per window.
+        let zones = ["z0", "z1", "z2", "z3"];
+        // Anchor windows so the engine's instant-query default
+        // lookback (5 min) reaches them.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let window_start = now_ms.saturating_sub(60_000);
+        let window_end = now_ms.saturating_sub(30_000);
+
+        for (i, zone) in zones.iter().enumerate() {
+            let sid = 9000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            let value = ((i + 1) * 100) as f64;
+            let mut lm = BTreeMap::new();
+            lm.insert("zone".to_string(), zone.to_string());
+            idx.append_precompute(
+                sid,
+                lm,
+                (window_start, window_end),
+                Box::new(SumAccumulator::with_sum(value)),
+            );
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("sum by (zone) (http_requests_total)")
+            .await
+            .expect("sum by (zone) must dispatch to ExactAgg reducer, not capability-miss");
+
+        // Expect a Vector (instant) result with one entry per zone.
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        assert_eq!(vector.values.len(), 4, "one entry per zone");
+        // Per-zone values match what each SumAccumulator carries.
+        // KeyByLabelValues stores values only; the override carries
+        // the corresponding keys.
+        let mut by_zone: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for el in &vector.values {
+            // The element's label keys override + label values together
+            // identify the zone.
+            let keys = el
+                .label_keys_override
+                .as_ref()
+                .expect("override populated for ExactAgg path");
+            let vals = &el.labels.labels;
+            assert_eq!(keys.len(), vals.len());
+            let zone_idx = keys
+                .iter()
+                .position(|k| k == "zone")
+                .expect("zone key present");
+            by_zone.insert(vals[zone_idx].clone(), el.value);
+        }
+        assert_eq!(by_zone.get("z0").copied(), Some(100.0));
+        assert_eq!(by_zone.get("z1").copied(), Some(200.0));
+        assert_eq!(by_zone.get("z2").copied(), Some(300.0));
+        assert_eq!(by_zone.get("z3").copied(), Some(400.0));
     }
 }
 
