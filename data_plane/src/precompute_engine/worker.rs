@@ -929,6 +929,19 @@ pub fn extract_key_from_series(series_key: &str, config: &AggregationConfig) -> 
 
 /// Parse label key-value pairs from a series key string.
 /// `"metric{a=\"b\",c=\"d\"}"` → `{("a", "b"), ("c", "d")}`
+///
+/// The returned `&str` value is the **raw, still-escaped** slice
+/// between the opening and closing quote — e.g. for `k="a\"b"` the
+/// value is the four bytes `a\"b`, not the decoded `a"b`. Call
+/// [`decode_label_value`] if you need the decoded form. Most live
+/// callers compare against literal config values that never contain
+/// escapable characters (`"`, `\`, `\n`), so the un-decoded slice
+/// suffices and saves an allocation per label per sample.
+///
+/// The closing-quote scan walks past `\\`, `\"`, `\n` escape pairs
+/// emitted by [`format_series_key`] / `render_series_key`, so a
+/// value containing embedded `"` no longer terminates parsing
+/// prematurely (pre-fix bug — see PR following #284).
 pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
     let mut labels = HashMap::new();
 
@@ -945,7 +958,7 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
 
     let label_str = &series_key[start..end];
 
-    // Parse comma-separated key="value" pairs
+    // Parse comma-separated key="value" pairs.
     let mut remaining = label_str;
     while !remaining.is_empty() {
         let eq_pos = match remaining.find('=') {
@@ -958,10 +971,30 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
             break;
         }
 
+        // Walk after the opening quote looking for the closing quote,
+        // skipping over `\<x>` escape pairs so that values containing
+        // embedded `"` (escaped as `\"`) don't terminate early. ASCII-
+        // byte scan; safe because `\` and `"` are single-byte UTF-8
+        // and never appear as continuation bytes inside a multi-byte
+        // scalar — so byte indexing into a `&str` always lands on a
+        // char boundary at the chosen positions.
         let value_start = 1; // skip opening quote
-        let value_end = match after_eq[value_start..].find('"') {
-            Some(pos) => value_start + pos,
-            None => break};
+        let bytes = after_eq.as_bytes();
+        let mut i = value_start;
+        let value_end = loop {
+            if i >= bytes.len() {
+                // No closing quote — malformed input, abandon parse.
+                return labels;
+            }
+            match bytes[i] {
+                b'\\' if i + 1 < bytes.len() => {
+                    // Skip the escape body byte (\", \\, \n, …).
+                    i += 2;
+                }
+                b'"' => break i,
+                _ => i += 1,
+            }
+        };
 
         let value = &after_eq[value_start..value_end];
         labels.insert(key, value);
@@ -974,6 +1007,49 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
     }
 
     labels
+}
+
+/// Decode a `parse_labels_from_series_key` value slice into its
+/// original textual form by undoing the `\"`, `\\`, `\n` escapes
+/// emitted by `format_series_key` / `render_series_key`.
+///
+/// Returns a borrowed `Cow` when the slice has no `\` byte (the
+/// common case — most label values are alphanumeric / dotted /
+/// dashed), avoiding allocation. Only allocates when an escape is
+/// present.
+pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\\') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    // Walk by `char` boundaries so multi-byte UTF-8 scalars round-
+    // trip intact. Escape recognition operates on ASCII metas (`\`,
+    // `"`, `n`) which are always single-byte chars in UTF-8.
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some(other) => {
+                    // Unknown escape — pass the backslash + body
+                    // through verbatim so we don't silently drop data.
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => {
+                    // Trailing backslash with no escape body — keep
+                    // it so round-tripping is lossless even for
+                    // malformed input.
+                    out.push('\\');
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Route a single sample to `updater`, dispatching keyed vs. non-keyed based on config.
@@ -1124,6 +1200,42 @@ mod tests {
     fn test_parse_labels_empty_braces() {
         let labels = parse_labels_from_series_key("metric{}");
         assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn test_parse_labels_skips_escaped_closing_quote() {
+        // The closing-quote scan must walk past `\"` rather than
+        // terminating the value early. Regression for the
+        // `format_series_key` ↔ `parse_labels_from_series_key`
+        // roundtrip bug — see PR #284's discovery and the
+        // `series_key_roundtrip_tests` module in
+        // `drivers/ingest/otel.rs`.
+        let labels = parse_labels_from_series_key(r#"metric{msg="a\"b",svc="x"}"#);
+        // Raw (un-decoded) values are returned; `decode_label_value`
+        // un-escapes them.
+        assert_eq!(labels.get("msg"), Some(&r#"a\"b"#));
+        assert_eq!(labels.get("svc"), Some(&"x"));
+    }
+
+    #[test]
+    fn test_decode_label_value_unescapes_known_pairs() {
+        assert_eq!(decode_label_value("plain"), "plain");
+        assert_eq!(decode_label_value(r#"a\"b"#), r#"a"b"#);
+        assert_eq!(decode_label_value(r"a\\b"), r"a\b");
+        assert_eq!(decode_label_value(r"line1\nline2"), "line1\nline2");
+        // Unknown escapes pass through unchanged so we don't silently
+        // drop producer-side data.
+        assert_eq!(decode_label_value(r"a\xb"), r"a\xb");
+    }
+
+    #[test]
+    fn test_decode_label_value_borrows_when_no_escapes() {
+        // Borrowed for the common case — no allocation.
+        let s = "no_escapes_here";
+        match decode_label_value(s) {
+            std::borrow::Cow::Borrowed(b) => assert_eq!(b, s),
+            std::borrow::Cow::Owned(_) => panic!("expected borrowed, no `\\` in input"),
+        }
     }
 
     // -----------------------------------------------------------------------
