@@ -209,6 +209,7 @@ mod tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         }
     }
 

@@ -1061,6 +1061,69 @@ fn emit_edge_yaml_5sketch_routing(
     .context("parse memory_limiter processor block")?;
     processors.insert("memory_limiter".to_string(), memory_limiter_block);
 
+    // ── cumulativetodelta processor — Issue #298 ───────────────────────────
+    //
+    // The OTel SDK's `Counter` instruments default to **cumulative**
+    // temporality: every export carries the running lifetime value of
+    // the counter, not the per-export delta. Backend's `SumAccumulator`
+    // (`data_plane/src/precompute_engine/operators/sum_accumulator.rs`)
+    // naïvely sums every incoming value into the per-window state — fed
+    // cumulative data, it computes `Σ-of-cumulatives-in-window`, a
+    // quadratic-in-time blowup. The replay path then re-sums those
+    // inflated per-window values across the lookback range → cubic
+    // blowup for instant `sum by (zone) (counter)` queries.
+    // (Observed: ~300× the baseline pre-fix; see Issue #298.)
+    //
+    // Fix: register the contrib build's `cumulativetodelta` processor
+    // with an `include.metrics` allowlist of the workload's
+    // Counter-shaped metrics (sourced from
+    // `collect_cumulative_counter_metrics` — every workload entry whose
+    // query classifies as `AggRole::Sum`), and run it as the FIRST
+    // processor in the entry (`metrics:`) pipeline so EVERY routed copy
+    // of each listed metric reaches the routing connector with delta
+    // temporality.
+    //
+    // `match_type: strict` keeps the processor a no-op for any other
+    // metric (gauges like `http_requests_total_latency_ms` pass through
+    // unchanged — quantile / histogram workloads keep their wire shape).
+    //
+    // Why entry pipeline (not per-family pipeline): the routing
+    // connector dispatches on `metric.name`; running the conversion
+    // upstream of the connector means every per-family pipeline AND the
+    // `raw_passthrough` default both see deltas. Per-pipeline placement
+    // would duplicate work and risk double-conversion on pipelines that
+    // a future plan fans the metric into.
+    //
+    // Empty `cumulative_counter_metrics` ⇒ no processor declared, no
+    // entry-pipeline processor list — backward-compat for
+    // quantile-only / sketch-only plans that never declare a counter.
+    let needs_cumulativetodelta = !cfg.cumulative_counter_metrics.is_empty();
+    if needs_cumulativetodelta {
+        // Deterministic order so the emitted YAML is stable across
+        // controller runs — mirrors the BTreeMap-not-HashMap rationale
+        // on `CollectorYaml`. The agent's opampextension byte-compares
+        // pushed configs; an unsorted include list would force an
+        // apply+restart on every push of the same semantic plan.
+        let mut sorted_metrics: Vec<&String> =
+            cfg.cumulative_counter_metrics.iter().collect();
+        sorted_metrics.sort();
+        // YAML indentation note: `metrics` and `match_type` are both
+        // direct children of `include` (not of each other). The
+        // `include.metrics` list entries indent two more spaces under
+        // `metrics:`. Get this wrong and serde_yaml rejects the block
+        // with "did not find expected key" at parse time.
+        let mut metrics_yaml = String::new();
+        for m in &sorted_metrics {
+            metrics_yaml.push_str(&format!("    - \"{m}\"\n"));
+        }
+        let cumulativetodelta_yaml = format!(
+            "include:\n  metrics:\n{metrics_yaml}  match_type: strict\n"
+        );
+        let cumulativetodelta_block: Value = serde_yaml::from_str(&cumulativetodelta_yaml)
+            .context("parse cumulativetodelta processor block")?;
+        processors.insert("cumulativetodelta".to_string(), cumulativetodelta_block);
+    }
+
     // ── Exporters ──────────────────────────────────────────────────────────
     // Edge → asapquery-backend OTLP ingest (see emit_edge_yaml for the
     // gateway-less rationale).
@@ -1196,13 +1259,23 @@ fn emit_edge_yaml_5sketch_routing(
 
     // Entry pipeline — receivers: [otlp], exporters: [routing]
     // (`routing` here is the connector, used as exporter for the entry
-    // stage). NO processors on the entry pipeline; the connector is
-    // responsible for fan-out.
+    // stage). The processor list is normally empty (the connector owns
+    // fan-out), but Issue #298 requires `cumulativetodelta` to run
+    // BEFORE the connector so EVERY routed copy of a Counter-shaped
+    // metric reaches the downstream pipelines with delta temporality.
+    // Putting the conversion here (not per-family) avoids duplicating
+    // the conversion across the per-family pipelines AND the
+    // `raw_passthrough` default, and stops fan-in-from-multiple-routes
+    // double-conversion.
+    let mut entry_processors: Vec<String> = Vec::new();
+    if needs_cumulativetodelta {
+        entry_processors.push("cumulativetodelta".to_string());
+    }
     pipelines.insert(
         "metrics".to_string(),
         Pipeline {
             receivers: vec!["otlp".into()],
-            processors: Vec::new(),
+            processors: entry_processors,
             exporters: vec!["routing".to_string()],
         },
     );
@@ -1799,6 +1872,7 @@ mod tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         }
     }
 
@@ -2770,6 +2844,7 @@ mod tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -3094,6 +3169,7 @@ mod tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family,
             metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         }
     }
 
@@ -3993,4 +4069,131 @@ mod tests {
         );
     }
 
+    // ── Issue #298: cumulativetodelta on counter metrics ──────────────────
+    //
+    // OTel SDK `Counter` instruments default to cumulative temporality.
+    // Backend's `SumAccumulator::update` is sum-of-deltas — fed
+    // cumulative data it returns `Σ-of-cumulatives-in-window` (quadratic
+    // in time; cubic after the reducer's outer sum across the lookback
+    // range). The fix is to inject `cumulativetodelta` upstream of the
+    // routing connector, scoped to the workload's Counter-shaped
+    // metrics. Tests below pin:
+    //   * presence of the processor declaration when the list is
+    //     non-empty, with the listed metrics as the `include` filter,
+    //     and the entry pipeline running it FIRST;
+    //   * absence (legacy quantile-only behaviour) when the list is
+    //     empty — backward-compat;
+    //   * sort-stability so the emitted YAML is byte-stable across
+    //     planner runs (HashMap iteration drift would otherwise trip
+    //     the agent's no-op apply check).
+
+    #[test]
+    fn issue298_cumulativetodelta_emitted_when_counter_metrics_present() {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.cumulative_counter_metrics = vec![
+            "http_requests_total".to_string(),
+            "endpoint_request_freq".to_string(),
+        ];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            yaml.contains("cumulativetodelta:"),
+            "expected cumulativetodelta processor declaration when \
+             cumulative_counter_metrics is non-empty\n{yaml}"
+        );
+        // Strict match_type so the processor stays a no-op for metrics
+        // not in the include list (gauges, quantile metrics).
+        assert!(
+            yaml.contains("match_type: strict"),
+            "cumulativetodelta processor must use strict include matching\n{yaml}"
+        );
+        // Both metrics appear under the include.metrics list. The YAML
+        // serializer drops the redundant quotes on simple identifiers
+        // (`- endpoint_request_freq`); we assert on the bare list-item
+        // form, which is what the agent's confmap parser will accept.
+        for m in ["http_requests_total", "endpoint_request_freq"] {
+            assert!(
+                yaml.contains(&format!("- {m}\n")) || yaml.contains(&format!("- \"{m}\"\n")),
+                "expected metric {m} as a list item in include.metrics\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue298_cumulativetodelta_runs_first_on_entry_pipeline() {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.cumulative_counter_metrics = vec!["http_requests_total".to_string()];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+
+        // Locate the entry `metrics:` pipeline (NOT `metrics/...`) under
+        // service.pipelines and verify its `processors:` list contains
+        // `cumulativetodelta` ahead of any other processor (it's the
+        // only entry-pipeline processor, so checking presence on the
+        // entry block is sufficient + the section's `exporters: [routing]`
+        // anchor proves we matched the entry pipeline).
+        let pipelines_idx = yaml.find("pipelines:").expect("pipelines:");
+        let after = &yaml[pipelines_idx..];
+        let entry_marker = "\n    metrics:\n";
+        let entry_idx = after.find(entry_marker).expect("entry pipeline");
+        let entry_after = &after[entry_idx + entry_marker.len()..];
+        let next_metric_pipeline = entry_after
+            .find("\n    metrics/")
+            .map(|x| x)
+            .unwrap_or(entry_after.len());
+        let section = &entry_after[..next_metric_pipeline];
+        assert!(
+            section.contains("- cumulativetodelta"),
+            "entry pipeline must list cumulativetodelta as a processor\n{section}"
+        );
+        assert!(
+            section.contains("- routing"),
+            "entry pipeline must keep exporters: [routing]\n{section}"
+        );
+    }
+
+    #[test]
+    fn issue298_cumulativetodelta_omitted_when_no_counter_metrics() {
+        // five_sketch_edge_cfg() leaves cumulative_counter_metrics
+        // empty by default — verify the processor is NOT declared and
+        // the entry pipeline's processors list stays empty (backward-
+        // compat for quantile-only deployments).
+        let cfg = five_sketch_edge_cfg();
+        assert!(
+            cfg.cumulative_counter_metrics.is_empty(),
+            "test precondition: default cfg has no counter metrics"
+        );
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("cumulativetodelta"),
+            "cumulativetodelta processor must NOT be emitted when \
+             cumulative_counter_metrics is empty\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn issue298_cumulativetodelta_include_list_is_sorted() {
+        // HashMap iteration is not order-stable — but the agent's
+        // opampextension byte-level no-op check would otherwise apply
+        // + restart on every push of the same semantic config. Mirrors
+        // the BTreeMap-not-HashMap rationale on `CollectorYaml`.
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.cumulative_counter_metrics = vec![
+            "zzz_counter".to_string(),
+            "aaa_counter".to_string(),
+            "mmm_counter".to_string(),
+        ];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        // Quotes get stripped by serde_yaml for simple identifiers;
+        // probe both forms so the assertion survives either output.
+        let find_any = |needle_a: &str, needle_b: &str| {
+            yaml.find(needle_a).or_else(|| yaml.find(needle_b))
+        };
+        let a_idx = find_any("- aaa_counter\n", "- \"aaa_counter\"\n").expect("aaa_counter");
+        let m_idx = find_any("- mmm_counter\n", "- \"mmm_counter\"\n").expect("mmm_counter");
+        let z_idx = find_any("- zzz_counter\n", "- \"zzz_counter\"\n").expect("zzz_counter");
+        assert!(
+            a_idx < m_idx && m_idx < z_idx,
+            "include.metrics list must be sorted for byte-stable YAML \
+             (a={a_idx} m={m_idx} z={z_idx})\n{yaml}"
+        );
+    }
 }

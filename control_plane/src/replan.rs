@@ -281,6 +281,14 @@ impl Replanner {
             // OTTL processor in front of every sketch pipeline.
             edge_cfg.metric_to_grouping_labels =
                 crate::emit::collect_metric_to_grouping_labels(registry, &self.workload_store);
+            // Issue #298 — companion stitch: Counter-shaped metrics
+            // that need `cumulativetodelta` upstream of the routing
+            // connector. Mirrors the bootstrap stitch in
+            // `main::emit_bootstrap_typed` so OpAMP-pushed re-plans
+            // carry the same processor declaration the first-connect
+            // bootstrap YAML did.
+            edge_cfg.cumulative_counter_metrics =
+                crate::emit::collect_cumulative_counter_metrics(registry, &self.workload_store);
         }
 
         // OpAMP `on_connect` doesn't expose the agent's runtime

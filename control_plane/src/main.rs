@@ -1270,6 +1270,16 @@ async fn emit_bootstrap_typed(
         &st.workload_registry,
         &st.workload_store,
     );
+    // Issue #298 — companion stitch: list of Counter-shaped metrics
+    // the agent must run through `cumulativetodelta` upstream of the
+    // routing connector. Without this, the OTel SDK's default
+    // cumulative-temporality Counter export inflates the backend's
+    // per-window SumAccumulator into Σ-of-cumulatives, breaking
+    // `sum by (zone) (http_requests_total)` (~300× baseline pre-fix).
+    edge_cfg.cumulative_counter_metrics = emit::collect_cumulative_counter_metrics(
+        &st.workload_registry,
+        &st.workload_store,
+    );
 
     // Issue #2: thread X-Agent-ID into the opamp block. Bootstrap GET
     // is per-agent when `pinned_agent_id` is set (the agent's own
