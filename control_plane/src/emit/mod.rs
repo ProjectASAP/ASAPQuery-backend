@@ -356,6 +356,62 @@ pub fn collect_metric_to_grouping_labels(
     out
 }
 
+/// Issue #298 — sibling of [`collect_metric_to_family`] /
+/// [`collect_metric_to_grouping_labels`]: walk every registry entry and
+/// return the deduped list of metrics whose workload(s) classify as
+/// [`crate::workload::AggRole::Sum`] — bare-selector / `sum` / `rate`
+/// / `increase` / `sum_over_time` / `irate`. These are the
+/// Counter-shaped metrics whose OTel SDK emission defaults to
+/// **cumulative** temporality and must be converted to **delta** before
+/// the backend's `SumAccumulator` folds them, otherwise the
+/// per-window sum is `Σ-of-cumulatives-in-window` (quadratic-in-time
+/// blowup; cubic for instant `sum by (zone) (counter)` reads).
+///
+/// Drops directly into `EdgeStageConfig::cumulative_counter_metrics`,
+/// which the 5-sketch routing emitter consumes to declare a
+/// `cumulativetodelta` processor with `include.metrics = [...]` on the
+/// entry pipeline. Empty list ⇒ no processor emitted (backward-compat
+/// for quantile-only / sketch-only plans).
+///
+/// **A metric is included iff ANY of its registered roles classifies
+/// as Sum**. This is the conservative direction: a metric with even
+/// one Sum-shaped query needs delta conversion for that query to be
+/// correct, and the OTel processor's `match_type: strict` filter then
+/// gates which metrics the processor actually rewrites (every other
+/// metric on the wire is a no-op pass-through). Gauge data points
+/// carry no aggregation_temporality at all (it's a Counter-only
+/// concept), so the processor leaves them untouched if a metric is
+/// also used as a gauge elsewhere.
+pub fn collect_cumulative_counter_metrics(
+    registry: &WorkloadRegistry,
+    workload_store: &WorkloadStore,
+) -> Vec<String> {
+    use crate::workload::{derive_agg_role, AggRole};
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for entry in registry.entries() {
+        // `derive_agg_role` reads the WorkloadEntry directly (query
+        // string + family override), not the lowered QueryWorkload, so
+        // we classify the registry entry. We still consult the
+        // workload_store to confirm the metric was successfully
+        // pre-populated (matching the contract of the sibling
+        // collectors) — silent skips for entries that failed the
+        // pre-pop keep the emit aligned with what the backend actually
+        // knows about.
+        if workload_store
+            .get_all_for_metric(&entry.metric_name)
+            .into_iter()
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        if derive_agg_role(entry) == AggRole::Sum {
+            seen.insert(entry.metric_name.clone());
+        }
+    }
+    seen.into_iter().collect()
+}
+
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
@@ -414,6 +470,7 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
 
         let collector = emit_for_runtime(
@@ -448,6 +505,7 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
         let yaml = emit_for_runtime(
             AgentRuntime::AsapOtap,
@@ -480,6 +538,7 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
         let toml = emit_for_runtime(
             AgentRuntime::AsapTelegraf,
@@ -719,6 +778,7 @@ mod runtime_tests {
                 SketchKind::DDSketch,
             )]),
             metric_to_grouping_labels: std::collections::HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
         edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
 
@@ -738,6 +798,82 @@ mod runtime_tests {
                 "keep_keys(datapoint.attributes, []) where metric.name == \"http_requests_total_latency_ms\""
             ),
             "empty keep_keys would strip all attrs and break per-zone sid splitting\n{yaml_out}",
+        );
+    }
+
+    // ── Issue #298 — collect_cumulative_counter_metrics ────────────────────
+
+    /// Workload with mixed roles — a bare counter selector, a `sum by
+    /// (...)` over a counter, and a quantile gauge. Only the first two
+    /// classify as `AggRole::Sum`; the gauge query is `AggRole::Quantile`
+    /// and must NOT appear in the output. The two Sum entries refer to
+    /// the SAME metric (`http_requests_total`), so the helper dedupes.
+    #[test]
+    fn issue298_collect_cumulative_counter_metrics_picks_sum_role_dedup() {
+        let yaml = r#"
+- metric_name: http_requests_total
+  query_string: "http_requests_total"
+  accuracy_sla: 0.0
+  assign_to_role: agent
+- metric_name: http_requests_total
+  query_string: "sum by (zone) (http_requests_total)"
+  accuracy_sla: 0.0
+  assign_to_role: gateway
+- metric_name: http_requests_total_latency_ms
+  query_string: "quantile_over_time(0.99, http_requests_total_latency_ms[30s])"
+  accuracy_sla: 0.01
+  assign_to_role: agent
+- metric_name: endpoint_request_freq
+  query_string: "rate(endpoint_request_freq[5m])"
+  accuracy_sla: 0.05
+  assign_to_role: agent
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        let counters = collect_cumulative_counter_metrics(&registry, &store);
+        assert_eq!(
+            counters,
+            vec![
+                "endpoint_request_freq".to_string(),
+                "http_requests_total".to_string(),
+            ],
+            "expected the Sum-role metrics deduped + sorted; the \
+             quantile_over_time entry on http_requests_total_latency_ms \
+             must NOT appear (it's AggRole::Quantile)"
+        );
+    }
+
+    /// Workload with zero Sum-shaped entries (all quantile / cardinality)
+    /// produces an empty list — the emitter then skips the
+    /// `cumulativetodelta` processor entirely (backward-compat for
+    /// quantile-only deployments).
+    #[test]
+    fn issue298_collect_cumulative_counter_metrics_empty_for_quantile_only_workload() {
+        let yaml = r#"
+- metric_name: http_requests_total_latency_ms
+  query_string: "quantile_over_time(0.99, http_requests_total_latency_ms[30s])"
+  accuracy_sla: 0.01
+  assign_to_role: agent
+- metric_name: unique_users_per_min
+  query_string: "count(unique_users_per_min)"
+  accuracy_sla: 0.02
+  assign_to_role: agent
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        let counters = collect_cumulative_counter_metrics(&registry, &store);
+        assert!(
+            counters.is_empty(),
+            "quantile / cardinality entries must not be classified as \
+             cumulative counters; got {counters:?}"
         );
     }
 }

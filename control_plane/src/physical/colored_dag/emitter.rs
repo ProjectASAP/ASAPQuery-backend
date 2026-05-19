@@ -198,6 +198,33 @@ pub struct EdgeStageConfig {
     /// `grouping_labels` contract.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_grouping_labels: HashMap<String, Vec<String>>,
+    /// Issue #298 — metrics whose OTel datapoints arrive with
+    /// **cumulative** temporality (OTel SDK's default for `Counter`
+    /// instruments) and need to be converted to **delta** before the
+    /// backend's `SumAccumulator` folds them into per-window sums.
+    ///
+    /// When non-empty, the 5-sketch routing emitter declares a
+    /// `cumulativetodelta` processor with `include.metrics = [...]` and
+    /// inserts it as the FIRST processor in the entry (`metrics:`)
+    /// pipeline so every routed copy of each listed metric goes through
+    /// the conversion. The processor matches on `metric.name`
+    /// (strict), so unrelated metrics flow through unchanged — quantile
+    /// gauges (`http_requests_total_latency_ms`) keep their wire shape.
+    ///
+    /// Sourced from [`crate::emit::collect_cumulative_counter_metrics`]:
+    /// any metric whose workload entry classifies as
+    /// [`crate::workload::AggRole::Sum`] (bare-selector / `sum` /
+    /// `rate` / `increase` / `sum_over_time` / `irate`). Without the
+    /// conversion, the data plane's `SumAccumulator` re-sums each
+    /// cumulative carry-value within and across windows, producing a
+    /// quadratic-in-time blowup (observed: `sum by (zone)
+    /// (http_requests_total)` returned ~300× baseline pre-fix).
+    ///
+    /// Empty list (default) ⇒ no `cumulativetodelta` processor is
+    /// emitted; backward-compat for plans that never declare a counter
+    /// metric (e.g. quantile-only workloads).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cumulative_counter_metrics: Vec<String>,
 }
 
 /// Phase 3.2.5 — one archive-tier metric the agent should land in
@@ -472,6 +499,7 @@ impl Emitter for ThreeStageEmitter {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
         };
         let mut backend_aggregations: Vec<BackendAggregation> = Vec::new();
         let mut gateway_processors: Vec<GatewayMergeProcessor> = Vec::new();
