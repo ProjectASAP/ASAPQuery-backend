@@ -1220,6 +1220,68 @@ fn emit_edge_yaml_5sketch_routing(
         }
     }
 
+    // ── ASAPCollector#403: edge-aggregate Sum-role counters ────────────────
+    //
+    // A Sum-role metric (in `cumulative_counter_metrics`) whose marquee
+    // queries are `sum by (<labels>) (...)` previously fell through the
+    // routing connector's `default_pipelines` into `raw_passthrough` (no
+    // aggregation): every counter datapoint across the full wire-attr
+    // cardinality (e.g. ~10k zone×rack×node×pod series) streamed
+    // continuously to the backend, which did the Sum-by-grouping fan-in
+    // centrally. That inverts the edge-aggregation value prop and was the
+    // dominant driver of the asap arm's backend-ingress blowup
+    // (~12 Mbps of ~12.5 Mbps measured).
+    //
+    // Fix (mirrors the static agent config's `metrics/sum_aggregate`
+    // pipeline): for each Sum-role metric that (a) has grouping_labels
+    // declared and (b) is NOT routed to any sketch family, register a
+    // dedicated `metricstransform/sumby_<metric>` processor +
+    // `metrics/sum_aggregate_<metric>` pipeline and route the metric
+    // there instead of letting it default to raw_passthrough. The agent
+    // then ships one summed series per grouping-label tuple per flush
+    // window. The backend's `evaluate_exact_agg` produces the identical
+    // `sum by (<labels>)` and per-group `rate` answers at reduced
+    // cardinality.
+    //
+    // gorillas3 (cold-tier archive) still writes RAW full-cardinality
+    // samples on this pipeline BEFORE the metricstransform collapses the
+    // stream, preserving cold-fallback drill-down (e.g.
+    // `count(metric{<label>="..."})`).
+    //
+    // A metric already mapped to a sketch family is left on its
+    // sketch path (it isn't a plain Sum-role passthrough). A Sum-role
+    // metric with NO grouping labels keeps the raw_passthrough default
+    // (no grouping to aggregate by).
+    let mut sum_aggregate_pipelines: Vec<(String, String)> = Vec::new();
+    {
+        let mut sum_metrics: Vec<&String> = cfg
+            .cumulative_counter_metrics
+            .iter()
+            .filter(|m| {
+                cfg.metric_to_grouping_labels.contains_key(*m)
+                    && !cfg.metric_to_family.contains_key(*m)
+            })
+            .collect();
+        sum_metrics.sort();
+        sum_metrics.dedup();
+        for metric in sum_metrics {
+            let labels = cfg
+                .metric_to_grouping_labels
+                .get(metric)
+                .cloned()
+                .unwrap_or_default();
+            let proc_name = metricstransform_groupby_processor_name(metric);
+            let proc_block = build_metricstransform_groupby_processor_block(metric, &labels);
+            processors.insert(proc_name.clone(), proc_block);
+            let pipeline_name = sum_aggregate_pipeline_name(metric);
+            referenced_pipelines.insert(pipeline_name.clone());
+            sum_aggregate_pipelines.push((pipeline_name.clone(), proc_name));
+            table_entries.push(format!(
+                "  - context: metric\n    condition: 'name == \"{metric}\"'\n    pipelines: [{pipeline_name}]"
+            ));
+        }
+    }
+
     for (metric, families) in &metric_family_pairs {
         // Emit one routing condition per metric listing every family
         // pipeline in its set (canonical order). A single-family metric
@@ -1350,6 +1412,34 @@ fn emit_edge_yaml_5sketch_routing(
         }
     };
     pipelines.insert("metrics/raw_passthrough".to_string(), raw_passthrough);
+
+    // ── ASAPCollector#403: edge Sum-by-grouping pipelines ──────────────────
+    //
+    // One dedicated pipeline per Sum-role metric routed to edge
+    // aggregation (computed above). Shape:
+    //   `[memory_limiter, gorillas3?, metricstransform/sumby_<metric>, batch]`.
+    // memory_limiter applies backpressure first; gorillas3 (when an
+    // archive tier is declared) writes RAW full-cardinality samples to
+    // the cold tier BEFORE the metricstransform collapses the stream to
+    // one summed series per grouping-label tuple; batch coalesces the
+    // per-window export. The exporter is the same backend OTLP target.
+    for (pipeline_name, proc_name) in &sum_aggregate_pipelines {
+        let mut procs: Vec<String> = Vec::new();
+        procs.push("memory_limiter".to_string());
+        if has_archive_tier {
+            procs.push("gorillas3".to_string());
+        }
+        procs.push(proc_name.clone());
+        procs.push("batch".to_string());
+        pipelines.insert(
+            pipeline_name.clone(),
+            Pipeline {
+                receivers: vec!["routing".into()],
+                processors: procs,
+                exporters: vec![exporter_key.clone()],
+            },
+        );
+    }
 
     // ASAPCollector#400 — emit ONLY the per-family pipelines for
     // families some metric actually needs (`needed_families`, the union
@@ -1510,6 +1600,72 @@ fn transform_keep_processor_name(metric: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
     format!("transform/keep_for_{sanitised}")
+}
+
+/// ASAPCollector#403 — compute the OTel processor name for a per-metric
+/// Sum-by-grouping edge-aggregation processor. Same component-id
+/// sanitisation as [`transform_keep_processor_name`].
+fn metricstransform_groupby_processor_name(metric: &str) -> String {
+    let sanitised: String = metric
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    format!("metricstransform/sumby_{sanitised}")
+}
+
+/// ASAPCollector#403 — compute the dedicated edge-aggregation pipeline
+/// name for a Sum-role metric.
+fn sum_aggregate_pipeline_name(metric: &str) -> String {
+    let sanitised: String = metric
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    format!("metrics/sum_aggregate_{sanitised}")
+}
+
+/// ASAPCollector#403 — build the `metricstransform` processor block that
+/// Sum-by-grouping aggregates a Sum-role counter AT THE EDGE.
+///
+/// Emits a block of the form:
+/// ```yaml
+/// transforms:
+///   - include: http_requests_total
+///     match_type: strict
+///     action: update
+///     operations:
+///       - action: aggregate_labels
+///         label_set: ["zone"]
+///         aggregation_type: sum
+/// ```
+///
+/// `aggregate_labels` aggregates away every datapoint attribute EXCEPT
+/// the ones in `label_set`, summing the datapoints that collapse onto
+/// the same grouping-label tuple. Running on the already-delta stream
+/// (cumulativetodelta is upstream on the entry pipeline), each export
+/// carries one summed series per grouping-label tuple instead of one per
+/// full wire-attr tuple — the bandwidth fix. The backend's
+/// `evaluate_exact_agg` / `SumAccumulator` fold these per-window exactly
+/// as they would the raw deltas, just at reduced cardinality, so
+/// `sum by (<labels>) (metric)` and per-group `rate` produce the
+/// identical answer.
+///
+/// `match_type: strict` keeps this a no-op for every other metric routed
+/// through the pipeline.
+///
+/// Empty `labels` ⇒ `label_set: []` — collapses to one global series per
+/// metric (the planner's signal for an ungrouped Sum).
+fn build_metricstransform_groupby_processor_block(metric: &str, labels: &[String]) -> Value {
+    let labels_array: String = if labels.is_empty() {
+        "[]".to_string()
+    } else {
+        let quoted: Vec<String> = labels.iter().map(|l| format!("\"{l}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    };
+    let yaml = format!(
+        "transforms:\n  - include: {metric}\n    match_type: strict\n    action: update\n    operations:\n      - action: aggregate_labels\n        label_set: {labels_array}\n        aggregation_type: sum\n",
+    );
+    serde_yaml::from_str(&yaml)
+        .expect("metricstransform/sumby_* yaml is well-formed by construction")
 }
 
 /// MVP blocker B3 — build the OTTL `transform` processor block that
@@ -3907,6 +4063,157 @@ mod tests {
                 "transform/keep_for_{metric} must come BEFORE {family_proc} in {pipeline}\n{section}"
             );
         }
+    }
+
+    // ── ASAPCollector#403: edge-aggregate Sum-role counters ────────────────
+
+    /// A Sum-role counter (`http_requests_total`) with grouping labels
+    /// and NO sketch family must be routed to its own
+    /// `metrics/sum_aggregate_<metric>` pipeline carrying a
+    /// `metricstransform/sumby_<metric>` processor instead of falling
+    /// through to raw_passthrough.
+    fn sum_role_edge_cfg() -> EdgeStageConfig {
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.cumulative_counter_metrics = vec!["http_requests_total".into()];
+        cfg.metric_to_grouping_labels
+            .insert("http_requests_total".into(), vec!["zone".into()]);
+        cfg
+    }
+
+    #[test]
+    fn issue403_sum_role_metric_gets_metricstransform_processor() {
+        let cfg = sum_role_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            yaml.contains("metricstransform/sumby_http_requests_total:"),
+            "missing metricstransform processor for Sum-role counter\n{yaml}"
+        );
+        assert!(
+            yaml.contains("aggregation_type: sum"),
+            "metricstransform must use aggregation_type: sum\n{yaml}"
+        );
+        assert!(
+            yaml.contains("action: aggregate_labels"),
+            "metricstransform must use aggregate_labels op\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn issue403_metricstransform_keeps_only_grouping_labels() {
+        let mut cfg = sum_role_edge_cfg();
+        cfg.metric_to_grouping_labels
+            .insert("http_requests_total".into(), vec!["zone".into(), "region".into()]);
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        // serde_yaml may render the label_set inline or block; tolerate both.
+        let inline = "label_set:\n        - zone\n        - region";
+        let inline2 = "label_set: [zone, region]";
+        assert!(
+            yaml.contains(inline) || yaml.contains(inline2),
+            "label_set must keep exactly the grouping labels\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn issue403_sum_role_metric_routes_to_dedicated_pipeline() {
+        let cfg = sum_role_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        // routing-table entry maps the metric to sum_aggregate pipeline
+        let needle = "name == \"http_requests_total\"";
+        let idx = yaml
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing http_requests_total route\n{yaml}"));
+        let near = &yaml[idx..idx.saturating_add(256).min(yaml.len())];
+        assert!(
+            near.contains("[metrics/sum_aggregate_http_requests_total]")
+                || near.contains("- metrics/sum_aggregate_http_requests_total"),
+            "Sum-role metric must route to its sum_aggregate pipeline, not raw_passthrough\n{near}"
+        );
+        // the dedicated pipeline exists and carries the metricstransform
+        assert!(
+            yaml.contains("metrics/sum_aggregate_http_requests_total:"),
+            "missing sum_aggregate pipeline\n{yaml}"
+        );
+        let pl_idx = yaml
+            .find("metrics/sum_aggregate_http_requests_total:")
+            .expect("pipeline");
+        let after = &yaml[pl_idx..];
+        let next_offset = after[1..]
+            .find("    metrics")
+            .map(|x| x + 1)
+            .unwrap_or(after.len());
+        let section = &after[..next_offset];
+        assert!(
+            section.contains("- metricstransform/sumby_http_requests_total"),
+            "sum_aggregate pipeline must include the metricstransform processor\n{section}"
+        );
+        // no sketch processor on this path
+        for forbidden in ["ddsketch", "KLL", "HLL", "countsketch", "countmin"] {
+            assert!(
+                !section.contains(&format!("- {forbidden}")),
+                "sum_aggregate pipeline must NOT include sketch processor {forbidden}\n{section}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue403_metricstransform_runs_after_gorillas3_so_cold_tier_keeps_full_card() {
+        let mut cfg = sum_role_edge_cfg();
+        cfg.archive_tier_metrics = vec![ArchiveTierMetric {
+            metric: "http_requests_total".into(),
+            window_secs: Some(60),
+        }];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        let pl_idx = yaml
+            .find("metrics/sum_aggregate_http_requests_total:")
+            .expect("pipeline");
+        let after = &yaml[pl_idx..];
+        let next_offset = after[1..]
+            .find("    metrics")
+            .map(|x| x + 1)
+            .unwrap_or(after.len());
+        let section = &after[..next_offset];
+        let g_idx = section
+            .find("- gorillas3")
+            .unwrap_or_else(|| panic!("gorillas3 missing on sum_aggregate path\n{section}"));
+        let t_idx = section
+            .find("- metricstransform/sumby_http_requests_total")
+            .unwrap_or_else(|| panic!("metricstransform missing\n{section}"));
+        assert!(
+            g_idx < t_idx,
+            "gorillas3 (RAW cold-tier write) must run BEFORE metricstransform collapses cardinality\n{section}"
+        );
+    }
+
+    #[test]
+    fn issue403_sum_role_without_grouping_labels_stays_raw_passthrough() {
+        // No grouping labels declared ⇒ nothing to aggregate by ⇒ keep
+        // the raw_passthrough default (no dedicated pipeline emitted).
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.cumulative_counter_metrics = vec!["http_requests_total".into()];
+        // intentionally NO metric_to_grouping_labels for it
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("metricstransform/sumby_http_requests_total"),
+            "no edge-aggregation when no grouping labels are declared\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("metrics/sum_aggregate_http_requests_total"),
+            "no dedicated pipeline when no grouping labels\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn issue403_sketched_metric_not_edge_summed() {
+        // A metric mapped to a sketch family must stay on its sketch path
+        // even if it also appears in cumulative_counter_metrics.
+        let mut cfg = five_sketch_edge_cfg_with_grouping_labels();
+        // unique_users_per_min is mapped to HLL in five_sketch_edge_cfg
+        cfg.cumulative_counter_metrics = vec!["unique_users_per_min".into()];
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("metricstransform/sumby_unique_users_per_min"),
+            "sketched metric must NOT also get a Sum-by edge-aggregation processor\n{yaml}"
+        );
     }
 
     #[test]
