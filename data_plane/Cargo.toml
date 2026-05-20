@@ -50,7 +50,11 @@ prost = "0.13"
 # CountMinSketch / HLLSketch). See docs/pipeline-query-catalog.md §5.4 in the
 # DataCollector repo for the rationale.
 asap_otel_proto.workspace = true
-tonic = "0.12"
+# `gzip` feature: enables CompressionEncoding::Gzip so the OTLP gRPC
+# ingest server can `.accept_compressed()` gzip bodies from the
+# `asap-gzip` arm's agent. control_plane already pulls tonic with this
+# feature for its RuntimeSamples gRPC.
+tonic = { version = "0.12", features = ["gzip"] }
 tokio-stream = "0.1"
 regex = "1"
 prometheus = "0.13"
