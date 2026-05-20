@@ -33,7 +33,7 @@ use crate::types::{SketchDefaults, SketchParams as LegacySketchParams, SketchTyp
 ///
 /// The values are 1:1 convertible to the legacy `SketchType` via
 /// [`SketchType::from`]; all rule outputs are round-trippable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SketchKind {
     /// Karnin-Lang-Liberty quantile sketch. Mergeable, exact rank-error

@@ -960,38 +960,63 @@ fn emit_edge_yaml_5sketch_routing(
     )
     .context("parse static OTLP receiver block")?;
 
-    // ── Processors ─────────────────────────────────────────────────────────
+    // ── Required sketch families (ASAPCollector#400) ───────────────────────
     //
-    // We always load all 5 sketch processors regardless of which metrics
-    // route to them — the planner agent's contract is that the agent
-    // can be retargeted at runtime via OpAMP without re-building, so a
-    // future plan that maps a new metric to (say) HLL must work without
-    // a config push that touches `processors:`.
-    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
-
-    // Build per-family processor blocks. We pull from
-    // `cfg.sketch_processors` when an entry exists for that family
-    // (so the params flow through), otherwise we
-    // synthesise a default-param block so the YAML always carries
-    // all 5 processor keys.
-    let mut family_to_proc: HashMap<SketchKind, &EdgeSketchProcessor> = HashMap::new();
-    for sp in &cfg.sketch_processors {
-        family_to_proc.insert(sp.sketch_kind.clone(), sp);
-    }
-
-    for kind in [
+    // Compute the UNION of families across every metric's set. Only
+    // these families get a processor block and a per-family pipeline —
+    // this is the bandwidth fix: the prior emitter loaded all 5 families
+    // and routed every metric through all 5 pipelines, shipping ~5×
+    // the sketch state. Now a workload whose metrics only need DDSketch
+    // ships ONLY the DDSketch pipeline.
+    //
+    // The canonical 5-family order below is the iteration order for
+    // every emit (processors, pipelines, hints) so the YAML is stable
+    // across controller runs regardless of HashMap iteration order.
+    const FAMILY_ORDER: [SketchKind; 5] = [
         SketchKind::DDSketch,
         SketchKind::Kll,
         SketchKind::Hll,
         SketchKind::CountSketch,
         SketchKind::Cms,
-    ] {
+    ];
+    let mut needed_families: std::collections::BTreeSet<SketchKind> =
+        std::collections::BTreeSet::new();
+    for families in cfg.metric_to_family.values() {
+        for kind in families {
+            needed_families.insert(kind.clone());
+        }
+    }
+
+    // ── Processors ─────────────────────────────────────────────────────────
+    //
+    // Load ONLY the sketch processors for the families some metric in
+    // the current plan actually needs. A future plan that maps a new
+    // metric to a family not yet present re-emits via the planner
+    // (`collect_metric_to_family` → fresh `metric_to_family`), which the
+    // OpAMP push delivers as a new config — so pruning here does not
+    // break runtime retargeting, it just stops shipping sketch state
+    // for families nothing queries.
+    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
+
+    // Build per-family processor blocks. We pull from
+    // `cfg.sketch_processors` when an entry exists for that family
+    // (so the params flow through), otherwise we synthesise a
+    // default-param block.
+    let mut family_to_proc: HashMap<SketchKind, &EdgeSketchProcessor> = HashMap::new();
+    for sp in &cfg.sketch_processors {
+        family_to_proc.insert(sp.sketch_kind.clone(), sp);
+    }
+
+    for kind in FAMILY_ORDER {
+        if !needed_families.contains(&kind) {
+            continue;
+        }
         let processor_name = sketch_kind_to_processor_name(&kind);
         let metric_name_hint = cfg
             .metric_to_family
             .iter()
             .filter_map(|(metric, mapped)| {
-                if mapped == &kind {
+                if mapped.contains(&kind) {
                     Some(metric.as_str())
                 } else {
                     None
@@ -1143,8 +1168,13 @@ fn emit_edge_yaml_5sketch_routing(
     // Build the OTTL route table. Iterate the planner's
     // `metric_to_family` map in deterministic order (sorted by metric
     // name) so the YAML is stable across runs — `HashMap` iteration is
-    // not order-stable.
-    let mut metric_family_pairs: Vec<(&String, &SketchKind)> =
+    // not order-stable. Each value is a SET of families
+    // (ASAPCollector#400): a metric needing two capabilities lists BOTH
+    // per-family pipelines in its single OTTL condition, so the routing
+    // connector fans its samples into both pipelines. Family order
+    // within each metric's pipeline list follows the canonical
+    // `FAMILY_ORDER` so the YAML is stable.
+    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchKind>)> =
         cfg.metric_to_family.iter().collect();
     metric_family_pairs.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -1170,27 +1200,47 @@ fn emit_edge_yaml_5sketch_routing(
     // Metrics absent from `metric_to_grouping_labels` are skipped
     // (preserves backward-compat for raw OTel agents bypassing the
     // typed-stage-split — no keep processor injected, attrs flow
-    // through unmodified).
+    // through unmodified). A multi-family metric's keep-processor is
+    // added to EACH of its families' pipelines (the `where metric.name
+    // == "<metric>"` guard makes it a no-op on the family's other
+    // metrics).
     let mut family_to_keep_processors: HashMap<SketchKind, Vec<String>> = HashMap::new();
-    for (metric, kind) in &metric_family_pairs {
+    for (metric, families) in &metric_family_pairs {
         let Some(labels) = cfg.metric_to_grouping_labels.get(*metric) else {
             continue;
         };
         let proc_name = transform_keep_processor_name(metric);
         let proc_block = build_transform_keep_processor_block(metric, labels);
         processors.insert(proc_name.clone(), proc_block);
-        family_to_keep_processors
-            .entry((*kind).clone())
-            .or_default()
-            .push(proc_name);
+        for kind in *families {
+            family_to_keep_processors
+                .entry(kind.clone())
+                .or_default()
+                .push(proc_name.clone());
+        }
     }
 
-    for (metric, kind) in &metric_family_pairs {
-        let pipeline = sketch_kind_to_pipeline_name(kind);
+    for (metric, families) in &metric_family_pairs {
+        // Emit one routing condition per metric listing every family
+        // pipeline in its set (canonical order). A single-family metric
+        // → one pipeline; a multi-capability metric → its samples fan
+        // into each family pipeline so the backend serves every
+        // (metric, capability) the workload needs.
+        let pipelines: Vec<&str> = FAMILY_ORDER
+            .iter()
+            .filter(|k| families.contains(*k))
+            .map(sketch_kind_to_pipeline_name)
+            .collect();
+        if pipelines.is_empty() {
+            continue;
+        }
+        for pl in &pipelines {
+            referenced_pipelines.insert((*pl).to_string());
+        }
+        let pipelines_yaml = pipelines.join(", ");
         table_entries.push(format!(
-            "  - context: metric\n    condition: 'name == \"{metric}\"'\n    pipelines: [{pipeline}]"
+            "  - context: metric\n    condition: 'name == \"{metric}\"'\n    pipelines: [{pipelines_yaml}]"
         ));
-        referenced_pipelines.insert(pipeline.to_string());
     }
 
     // Phase 3.2.5 Bug (b) — warm-passthrough freshness probes route to
@@ -1301,17 +1351,23 @@ fn emit_edge_yaml_5sketch_routing(
     };
     pipelines.insert("metrics/raw_passthrough".to_string(), raw_passthrough);
 
-    // Always emit all 5 per-family pipelines so the agent's pipeline
-    // graph is closed regardless of which families the table currently
-    // references — keeps the runtime swap (planner re-emits with a
-    // different `metric_to_family`) zero-touch on the pipeline graph.
-    for kind in [
-        SketchKind::DDSketch,
-        SketchKind::Kll,
-        SketchKind::Hll,
-        SketchKind::CountSketch,
-        SketchKind::Cms,
-    ] {
+    // ASAPCollector#400 — emit ONLY the per-family pipelines for
+    // families some metric actually needs (`needed_families`, the union
+    // of every metric's set). The prior emitter emitted all 5 pipelines
+    // unconditionally and the routing connector fanned every metric
+    // through all 5, shipping ~5× the sketch state — the dominant cause
+    // of the asap arm's bandwidth blowup. Pruning to the needed set is
+    // safe for runtime retargeting because the planner re-emits a fresh
+    // `metric_to_family` (via `collect_metric_to_family`) when the
+    // workload changes, which the OpAMP push delivers as a new config.
+    // The pipeline graph stays closed: every pipeline referenced by the
+    // routing table's `table:`/`default_pipelines:` is present, because
+    // `referenced_pipelines` is a subset of `needed_families`'s pipelines
+    // plus `metrics/raw_passthrough` (always emitted above).
+    for kind in FAMILY_ORDER {
+        if !needed_families.contains(&kind) {
+            continue;
+        }
         let proc_name = sketch_kind_to_processor_name(&kind);
         let pipeline_name = sketch_kind_to_pipeline_name(&kind);
         // Sort per-family keep-processor list deterministically so YAML
@@ -1323,6 +1379,7 @@ fn emit_edge_yaml_5sketch_routing(
             .cloned()
             .unwrap_or_default();
         keep_procs.sort();
+        keep_procs.dedup();
         pipelines.insert(
             pipeline_name.to_string(),
             make_sketch_pipeline(proc_name, &keep_procs),
@@ -3128,15 +3185,19 @@ mod tests {
     // ── MVP §46: 5-sketch routing-connector edge YAML emit tests ──────────
     //
     // The new emit path activates when `cfg.metric_to_family` is
-    // non-empty. These tests pin:
-    //   * All 5 sketch processors in `processors:` regardless of which
-    //     metrics route to them (runtime swap → zero pipeline graph
-    //     change).
+    // non-empty. The `five_sketch_edge_cfg` fixture maps each of its 5
+    // metrics to a DISTINCT family, so its union-of-needed-families is
+    // all 5 — these tests therefore still see all 5 processors and
+    // pipelines. ASAPCollector#400 pruning is exercised by the
+    // `mvp46_pruned_*` and `mvp46_multi_family_metric_*` tests below.
+    // These tests pin:
+    //   * One sketch processor in `processors:` per family some metric
+    //     needs (for this fixture: all 5).
     //   * `routing` in `connectors:` (NOT `processors:`) — the real
     //     bugfix; `routingprocessor` was removed in OTel-collector
     //     v0.106 so emitting it would fail agent boot.
-    //   * All 6 named pipelines: entry `metrics:` + 5 per-family
-    //     paths + `metrics/raw_passthrough` default.
+    //   * Entry `metrics:` + `metrics/raw_passthrough` default + one
+    //     per-family pipeline per needed family (for this fixture: 5).
     //   * Each per-sketch pipeline starts with `gorillas3` when an
     //     archive tier is declared (cold-tier write happens BEFORE
     //     sketch mutation).
@@ -3144,18 +3205,29 @@ mod tests {
     //     `metrics/raw_passthrough` so the metric name is preserved
     //     end-to-end.
 
+    /// Helper: wrap a single sketch family in the per-metric family SET
+    /// (ASAPCollector#400). Most fixtures map each metric to exactly one
+    /// family — this keeps them concise while exercising the SET-shaped
+    /// `metric_to_family`.
+    fn one(kind: SketchKind) -> std::collections::BTreeSet<SketchKind> {
+        std::collections::BTreeSet::from([kind])
+    }
+
     /// Helper: build a 5-metric `EdgeStageConfig` covering every sketch
-    /// family per the canonical workload-spec table in MVP §46.
+    /// family per the canonical workload-spec table in MVP §46. Each
+    /// metric maps to a single-family set (this workload's per-metric set
+    /// size is 1; see `mvp46_multi_family_metric_*` for the size>1 case).
     fn five_sketch_edge_cfg() -> EdgeStageConfig {
-        let mut metric_to_family: HashMap<String, SketchKind> = HashMap::new();
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
         metric_to_family.insert(
             "http_requests_total_latency_ms".into(),
-            SketchKind::DDSketch,
+            one(SketchKind::DDSketch),
         );
-        metric_to_family.insert("request_size_bytes".into(), SketchKind::Kll);
-        metric_to_family.insert("unique_users_per_min".into(), SketchKind::Hll);
-        metric_to_family.insert("top_endpoint_qps".into(), SketchKind::CountSketch);
-        metric_to_family.insert("endpoint_request_freq".into(), SketchKind::Cms);
+        metric_to_family.insert("request_size_bytes".into(), one(SketchKind::Kll));
+        metric_to_family.insert("unique_users_per_min".into(), one(SketchKind::Hll));
+        metric_to_family.insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
+        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::Cms));
         // `http_requests_total` is intentionally NOT in this map — it
         // falls through to the `metrics/raw_passthrough` default.
         EdgeStageConfig {
@@ -3427,6 +3499,153 @@ mod tests {
                 "{metric} should route to {pipeline}; got\n{near}"
             );
         }
+    }
+
+    // ── ASAPCollector#400: per-metric required-family SET pruning ─────────
+    //
+    // Pre-fix the emitter loaded all 5 sketch processors and emitted all
+    // 5 per-family pipelines, and the routing connector fanned EVERY
+    // metric through all 5 pipelines — shipping ~5× the sketch state to
+    // the backend. The fix prunes processors + pipelines to the UNION of
+    // each metric's required-family SET, and routes each metric only to
+    // the families in its set. These tests pin both the pruning (size-1
+    // sets) and the multi-family-per-metric correctness (size>1 sets).
+
+    /// Helper: build an `EdgeStageConfig` whose `metric_to_family` is the
+    /// given metric→set map, with sensible defaults for the other fields.
+    fn edge_cfg_with_families(
+        metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>>,
+    ) -> EdgeStageConfig {
+        EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: Vec::new(),
+            exporter_target: ExportTarget::Stage(StageId::Gateway),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mvp46_pruned_single_family_emits_only_that_family_pipeline() {
+        // A workload with ONE metric needing ONLY DDSketch must emit the
+        // DDSketch processor + pipeline and NOTHING for the other 4
+        // families — this is the core bandwidth fix.
+        let cfg = edge_cfg_with_families(HashMap::from([(
+            "latency_ms".to_string(),
+            one(SketchKind::DDSketch),
+        )]));
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+
+        // DDSketch present (processor + pipeline).
+        assert!(
+            yaml.contains("ddsketch:"),
+            "ddsketch processor must be present\n{yaml}"
+        );
+        assert!(
+            yaml.contains("metrics/ddsketch_path:"),
+            "ddsketch pipeline must be present\n{yaml}"
+        );
+        // The other 4 families MUST NOT appear — no processor key, no
+        // pipeline. (Match on the YAML key forms to avoid false hits.)
+        for (proc_key, pipeline_key) in [
+            ("KLL:", "metrics/kll_path:"),
+            ("HLL:", "metrics/hll_path:"),
+            ("countsketch:", "metrics/countsketch_path:"),
+            ("countmin:", "metrics/countminsketch_path:"),
+        ] {
+            assert!(
+                !yaml.contains(proc_key),
+                "unneeded processor `{proc_key}` must be pruned (#400)\n{yaml}"
+            );
+            assert!(
+                !yaml.contains(pipeline_key),
+                "unneeded pipeline `{pipeline_key}` must be pruned (#400)\n{yaml}"
+            );
+        }
+        // Entry + default pipelines still present (graph stays closed).
+        assert!(yaml.contains("metrics/raw_passthrough:"), "{yaml}");
+    }
+
+    #[test]
+    fn mvp46_pruned_two_metrics_two_families_emits_exactly_those_two() {
+        // Two metrics, each needing a single distinct family (DDSketch,
+        // HLL). Exactly those two pipelines/processors must be emitted;
+        // KLL/CountSketch/CMS pruned.
+        let cfg = edge_cfg_with_families(HashMap::from([
+            ("latency_ms".to_string(), one(SketchKind::DDSketch)),
+            ("uniques".to_string(), one(SketchKind::Hll)),
+        ]));
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+
+        for present in ["ddsketch:", "metrics/ddsketch_path:", "HLL:", "metrics/hll_path:"] {
+            assert!(yaml.contains(present), "expected `{present}`\n{yaml}");
+        }
+        for pruned in [
+            "KLL:",
+            "metrics/kll_path:",
+            "countsketch:",
+            "metrics/countsketch_path:",
+            "countmin:",
+            "metrics/countminsketch_path:",
+        ] {
+            assert!(
+                !yaml.contains(pruned),
+                "`{pruned}` must be pruned (#400)\n{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn mvp46_multi_family_metric_emits_both_pipelines_and_routes_to_both() {
+        // ASAPCollector#400 SET semantics — the make-or-break case: a
+        // SINGLE metric queried by TWO capabilities (DDSketch + HLL) must
+        // (1) emit BOTH per-family pipelines + processors, and (2) route
+        // that metric to BOTH pipelines in its routing-connector
+        // condition. CountSketch/KLL/CMS stay pruned (no metric needs
+        // them).
+        let cfg = edge_cfg_with_families(HashMap::from([(
+            "http_requests".to_string(),
+            std::collections::BTreeSet::from([SketchKind::DDSketch, SketchKind::Hll]),
+        )]));
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+
+        // Both families emitted.
+        for present in ["ddsketch:", "metrics/ddsketch_path:", "HLL:", "metrics/hll_path:"] {
+            assert!(yaml.contains(present), "expected `{present}`\n{yaml}");
+        }
+        // The other 3 pruned.
+        for pruned in [
+            "metrics/kll_path:",
+            "metrics/countsketch_path:",
+            "metrics/countminsketch_path:",
+        ] {
+            assert!(
+                !yaml.contains(pruned),
+                "`{pruned}` must be pruned (#400)\n{yaml}"
+            );
+        }
+        // The routing condition for http_requests lists BOTH pipelines.
+        let needle = "name == \"http_requests\"";
+        let n_idx = yaml
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing routing condition for http_requests\n{yaml}"));
+        let near = &yaml[n_idx..n_idx.saturating_add(256).min(yaml.len())];
+        // serde_yaml may render the pipelines list inline or block-form;
+        // tolerate both. Family order follows the canonical FAMILY_ORDER
+        // (DDSketch before HLL).
+        let inline = near.contains("[metrics/ddsketch_path, metrics/hll_path]");
+        let block = near.contains("- metrics/ddsketch_path")
+            && near.contains("- metrics/hll_path");
+        assert!(
+            inline || block,
+            "http_requests must route to BOTH ddsketch_path AND hll_path (multi-family fan-in)\n{near}"
+        );
     }
 
     #[test]

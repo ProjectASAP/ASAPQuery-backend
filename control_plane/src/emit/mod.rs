@@ -269,15 +269,28 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
 
 /// Walk every entry in `registry`, look the metric up in `workload_store`,
 /// run `planner::rules::bind_workload_typed` per workload, and assemble
-/// the `metric_to_family` HashMap that drives the 5-sketch
+/// the `metric_to_family` map that drives the 5-sketch
 /// routing-connector emit path in `emit_edge_yaml_5sketch_routing`.
+///
+/// ASAPCollector#400 — SET semantics, NOT one-family-per-metric. A
+/// metric can legitimately need MULTIPLE families because different
+/// planned queries on the same metric require different capabilities
+/// (`quantile_over_time` → DDSketch, `count`-distinct → HLL, `topk` →
+/// CountSketch, …). We therefore collect the UNION of every workload
+/// entry's committed sketch family per metric into a
+/// `BTreeSet<SketchKind>` (deterministic order). The emitter routes the
+/// metric to EACH family in its set and prunes pipelines/processors to
+/// the union of all sets — eliminating the prior all-5 fan-out that
+/// shipped sketch state through every family regardless of need.
 ///
 /// Skipped:
 ///   - Metrics absent from `workload_store` (registry pre-pop failed).
-///   - Metrics where `bind_workload_typed` declines (raw passthrough
-///     like `http_requests_total`, exact-required, multi-intent).
-///     These fall through to `metrics/raw_passthrough` in the emitter,
-///     which is the contract for raw / unsketched metrics.
+///   - Workload entries where `bind_workload_typed` declines (raw
+///     passthrough like `http_requests_total`, exact-required,
+///     multi-intent) — those entries contribute no family. A metric
+///     whose every entry declines is absent from the map entirely and
+///     falls through to `metrics/raw_passthrough`, which is the
+///     contract for raw / unsketched metrics.
 ///
 /// The returned map drops directly into `EdgeStageConfig::metric_to_family`.
 /// Empty map ⇒ caller falls back to legacy single-pipeline emit (the
@@ -285,28 +298,26 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
 pub fn collect_metric_to_family(
     registry: &WorkloadRegistry,
     workload_store: &WorkloadStore,
-) -> std::collections::HashMap<String, SketchKind> {
-    let mut out = std::collections::HashMap::new();
+) -> std::collections::HashMap<String, std::collections::BTreeSet<SketchKind>> {
+    let mut out: std::collections::HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        std::collections::HashMap::new();
     for entry in registry.entries() {
-        // B2 (metric, role) restructure: walk every role registered
-        // for this metric. Sum-shaped roles (raw passthrough / ExactAgg)
-        // decline `bind_workload_typed` and correctly fall through to
-        // the routing-connector's default `metrics/raw_passthrough`
-        // pipeline. The FIRST sketch-shaped role that binds wins the
-        // entry — Quantile / Count / Topk all map to a single sketch
-        // family per metric in the current emitter's wire shape (one
-        // routing-connector OTTL condition per metric → one pipeline).
-        // Multi-sketch-per-metric coverage stays a follow-up; the
-        // streaming-config (`emit_backend_streaming_config_json`)
-        // already iterates per-aggregation so the backend serves all
-        // roles even when the edge emits only the first sketch shape.
+        // B2 (metric, role) restructure: walk EVERY role registered for
+        // this metric and accumulate the UNION of committed families.
+        // Sum-shaped roles (raw passthrough / ExactAgg) decline
+        // `bind_workload_typed` and contribute nothing — they fall
+        // through to the routing-connector's default
+        // `metrics/raw_passthrough` pipeline. Quantile / Cardinality /
+        // Topk / Frequency roles each commit a family; a metric queried
+        // by several capabilities accumulates several families, so its
+        // samples fan into each per-family pipeline at the agent and the
+        // backend serves every (metric, capability) the workload needs.
         for (_, workload, _wc) in workload_store.get_all_for_metric(&entry.metric_name) {
             let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
                 continue;
             };
             if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
-                out.entry(entry.metric_name.clone()).or_insert(kind);
-                break;
+                out.entry(entry.metric_name.clone()).or_default().insert(kind);
             }
         }
     }
@@ -666,13 +677,17 @@ mod runtime_tests {
         let map = collect_metric_to_family(&registry, &store);
 
         // 5 sketched metrics + http_requests_total (raw, declines binding).
-        let expected: Vec<(&str, Option<SketchKind>)> = vec![
-            ("http_latency_ms", Some(SketchKind::DDSketch)),
+        // ASAPCollector#400: each value is now the SET of families the
+        // metric needs. For THIS workload every sketched metric is
+        // queried by exactly one capability, so each set has size 1.
+        use std::collections::BTreeSet;
+        let expected: Vec<(&str, Option<BTreeSet<SketchKind>>)> = vec![
+            ("http_latency_ms", Some(BTreeSet::from([SketchKind::DDSketch]))),
             ("http_requests_total", None), // raw passthrough
-            ("request_size_bytes", Some(SketchKind::Kll)),
-            ("unique_users_per_min", Some(SketchKind::Hll)),
-            ("top_endpoint_qps", Some(SketchKind::CountSketch)),
-            ("endpoint_request_freq", Some(SketchKind::Cms)),
+            ("request_size_bytes", Some(BTreeSet::from([SketchKind::Kll]))),
+            ("unique_users_per_min", Some(BTreeSet::from([SketchKind::Hll]))),
+            ("top_endpoint_qps", Some(BTreeSet::from([SketchKind::CountSketch]))),
+            ("endpoint_request_freq", Some(BTreeSet::from([SketchKind::Cms]))),
         ];
         for (metric, want) in &expected {
             let got = map.get(*metric).cloned();
@@ -687,6 +702,95 @@ mod runtime_tests {
             map.len(),
             5,
             "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}"
+        );
+    }
+
+    /// ASAPCollector#400 — SET semantics at the resolution layer: a
+    /// single metric queried by THREE distinct capabilities
+    /// (quantile → DDSketch, cardinality → HLL, frequency → CMS) must
+    /// accumulate ALL THREE families in its set, not just the first to
+    /// bind. This is the multi-family-per-metric case the emitter must
+    /// fan into three pipelines.
+    ///
+    /// We populate the store directly with three `(metric, role)`
+    /// `QueryWorkload`s — one per capability — so the test pins
+    /// `collect_metric_to_family`'s union semantics independently of the
+    /// analyzer's query-string → AggType parsing.
+    #[test]
+    fn collect_metric_to_family_unions_multiple_capabilities_per_metric() {
+        use crate::sketch_algebra::params::SketchKind;
+        use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
+        use crate::workload::AggRole;
+        use std::collections::BTreeSet;
+        use std::time::Duration;
+
+        const METRIC: &str = "http_requests";
+
+        // The registry only needs ONE entry for the metric — the
+        // collector iterates registry entries and, per metric, walks
+        // EVERY role registered in the store. (Duplicate registry
+        // entries for the same metric would just re-walk the same store
+        // rows; one entry suffices.)
+        let yaml = r#"
+- metric_name: http_requests
+  query_string: "quantile_over_time(0.99, http_requests[1m])"
+  accuracy_sla: 0.01
+  assign_to_role: agent
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+
+        let store = WorkloadStore::new();
+        let mk = |agg: AggType,
+                  override_family: Option<SketchType>,
+                  quantiles: Vec<f64>|
+         -> QueryWorkload {
+            QueryWorkload {
+                metric_name: METRIC.to_string(),
+                label_filters: Default::default(),
+                group_by_labels: Vec::new(),
+                aggregations: vec![agg],
+                time_window: Duration::from_secs(60),
+                repeat_every: None,
+                accuracy_sla: 0.01,
+                latency_sla: None,
+                sketch_type_override: override_family,
+                exact_required: false,
+                quantiles,
+            }
+        };
+        // Quantile → DDSketch (explicit override valid for Quantile).
+        store.set(
+            METRIC,
+            AggRole::Quantile,
+            mk(AggType::Quantile, Some(SketchType::DDSketch), vec![0.99]),
+            WorkloadCharacteristics::default(),
+        );
+        // Cardinality → HLL (override valid for the Cardinality class).
+        store.set(
+            METRIC,
+            AggRole::Count,
+            mk(AggType::Cardinality, Some(SketchType::HLL), Vec::new()),
+            WorkloadCharacteristics::default(),
+        );
+        // Frequency → CMS (capability-matched default for Frequency).
+        store.set(
+            METRIC,
+            AggRole::Other,
+            mk(AggType::Frequency, None, Vec::new()),
+            WorkloadCharacteristics::default(),
+        );
+
+        let map = collect_metric_to_family(&registry, &store);
+        let got = map
+            .get(METRIC)
+            .cloned()
+            .unwrap_or_else(|| panic!("http_requests must be in the map\nmap: {map:?}"));
+        assert_eq!(
+            got,
+            BTreeSet::from([SketchKind::DDSketch, SketchKind::Hll, SketchKind::Cms]),
+            "a metric queried by 3 capabilities must accumulate 3 families (UNION, not first-wins)\nmap: {map:?}"
         );
     }
 
@@ -775,7 +879,7 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::from([(
                 "http_requests_total_latency_ms".to_string(),
-                SketchKind::DDSketch,
+                std::collections::BTreeSet::from([SketchKind::DDSketch]),
             )]),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),

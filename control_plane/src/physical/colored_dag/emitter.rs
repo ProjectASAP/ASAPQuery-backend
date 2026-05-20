@@ -27,7 +27,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -168,23 +168,39 @@ pub struct EdgeStageConfig {
     /// else takes the existing `metrics/asap_tier` pipeline.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warm_passthrough_metrics: Vec<String>,
-    /// MVP §46 — per-metric → sketch-family mapping populated by the
-    /// planner from the workload spec. When non-empty, the L5 edge
-    /// emitter switches to the **5-sketch routing-connector** wire
-    /// shape: it loads all referenced sketch processors and uses the
-    /// OTel `routing` *connector* (NOT the deprecated routing
-    /// processor) to dispatch each metric to the right per-family
-    /// pipeline. Metrics absent from this map fall through to the
+    /// MVP §46 / ASAPCollector#400 — per-metric → **set of** sketch
+    /// families populated by the planner from the workload spec. When
+    /// non-empty, the L5 edge emitter switches to the **5-sketch
+    /// routing-connector** wire shape: it loads ONLY the sketch
+    /// processors for the families that at least one metric needs and
+    /// uses the OTel `routing` *connector* (NOT the deprecated routing
+    /// processor) to dispatch each metric to EACH per-family pipeline in
+    /// its set. Metrics absent from this map fall through to the
     /// `metrics/raw_passthrough` default pipeline.
     ///
-    /// The field is named `metric_to_family` and the value type is
-    /// [`SketchKind`] — agreed convention with the planner agent
-    /// shipping in parallel (`SketchFamily` is a control-plane-side
-    /// alias for `SketchKind` per `sketch_algebra::params`). Empty
-    /// map ⇒ legacy single-pipeline / Mode-3 / warm-passthrough wire
-    /// shapes are emitted unchanged (backward-compat).
+    /// CRITICAL — a metric can legitimately need MULTIPLE families,
+    /// because different planned queries on the same metric require
+    /// different capabilities (e.g. `quantile_over_time` → DDSketch,
+    /// `count`-distinct → HLL, `topk` → CountSketch all on one metric).
+    /// The value type is therefore a `BTreeSet<SketchKind>` (the UNION
+    /// of capabilities across all of that metric's workload entries),
+    /// not a single family. A metric in two families produces two
+    /// routing-connector OTTL conditions → its samples fan into both
+    /// per-family pipelines, so every (metric, capability) the workload
+    /// needs still reaches its sketch family at the backend.
+    ///
+    /// ASAPCollector#400 bandwidth fix: the emitter prunes pipelines and
+    /// processors to the union of these sets — a workload whose metrics
+    /// only need DDSketch ships ONLY the DDSketch pipeline, not all 5.
+    /// This eliminates the prior multi-family fan-out (every metric
+    /// shipped sketch state through all 5 families regardless of need).
+    ///
+    /// `SketchFamily` is a control-plane-side alias for `SketchKind` per
+    /// `sketch_algebra::params`. Empty map ⇒ legacy single-pipeline /
+    /// Mode-3 / warm-passthrough wire shapes are emitted unchanged
+    /// (backward-compat).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub metric_to_family: HashMap<String, SketchKind>,
+    pub metric_to_family: HashMap<String, BTreeSet<SketchKind>>,
     /// MVP blocker B3 — per-metric attribute allowlist the agent must
     /// reduce wire attrs to BEFORE the sketch processor sees them.
     /// Maps each metric to its grouping-label list; the 5-sketch routing
