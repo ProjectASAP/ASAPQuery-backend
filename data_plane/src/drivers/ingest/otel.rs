@@ -138,7 +138,21 @@ impl OtlpReceiver {
             asap_otel_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer::new(
                 grpc_svc,
             )
-            .max_decoding_message_size(64 * 1024 * 1024);
+            .max_decoding_message_size(64 * 1024 * 1024)
+            // Accept gzip-compressed request bodies so the `asap-gzip`
+            // arm's agent (`otlp/backend: compression: gzip`) can
+            // shrink the per-window sketch/aggregate payload on the
+            // wire. This is the matched-codec partner of the OTLP→VM
+            // `b1` baseline (also gzip): comparing b1 vs asap-gzip
+            // isolates the aggregation gain at a fixed codec.
+            // tonic negotiates per-RPC via the grpc-encoding header, so
+            // uncompressed agents (the plain `asap` arm,
+            // `compression: none`, matched against the `b0` baseline)
+            // are unaffected — this only enables the server to decode
+            // gzip when an agent chooses to send it. The control_plane
+            // RuntimeSamples server already does the same
+            // (control_plane/src/runtime_samples.rs).
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
 
         let app = Router::new()
             .route("/v1/metrics", post(handle_otlp_http))
