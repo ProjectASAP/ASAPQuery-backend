@@ -717,26 +717,35 @@ impl ASAPQueryEngine {
             // / `evaluate_exact_agg_rate` for the per-path semantics.
             let result = match &candidate.required_capability {
                 crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
-                    // Dispatch off the typed `outer_fn` carried on the
-                    // analyzer candidate — `OuterFn::Rate` means the
-                    // original PromQL had a `rate(...)` / `irate(...)`
-                    // call somewhere, so we need the rate-divisor
-                    // reducer. Plain shapes (`sum_over_time(...)`,
-                    // `sum(...)`, bare selector) take the per-window
-                    // reducer. Before the analyzer carried this field
-                    // the engine re-walked the raw PromQL via the
-                    // `query_contains_rate_call` helper to recover the
-                    // distinction; that was lossy-lowering smell and is
-                    // gone.
+                    // Counter-function dispatch (issue #301) — mirror the
+                    // instant `execute(&str)` path's branching off the
+                    // typed `candidate.outer_fn`. On this explicit
+                    // RANGE (matrix) surface the per-window timeseries is
+                    // the correct shape for `sum`/`increase` (the wire
+                    // format wants a point per window), so
+                    // `accumulate_windows = false`. `rate` still folds +
+                    // divides; `sum_over_time` over a counter is refused
+                    // (decision (a)) so the query routes to archive.
+                    use control_plane::asap_tier_analysis::OuterFn;
+                    let is_exact_sum_family = matches!(
+                        agg_type,
+                        crate::storage_engines::sketch_db::data::AggregationType::Sum
+                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
+                            | crate::storage_engines::sketch_db::data::AggregationType::Increase
+                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
+                    );
+                    if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
+                        return Err(crate::query_engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            format!(
+                                "SketchStore cannot answer `sum_over_time` over counter \
+                                 deltas for `{query}` (issue #301) — failing over to archive"
+                            ),
+                        ));
+                    }
                     let use_rate_path = candidate.range_seconds > 0
-                        && candidate.outer_fn == control_plane::asap_tier_analysis::OuterFn::Rate
-                        && matches!(
-                            agg_type,
-                            crate::storage_engines::sketch_db::data::AggregationType::Sum
-                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
-                                | crate::storage_engines::sketch_db::data::AggregationType::Increase
-                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
-                        );
+                        && candidate.outer_fn == OuterFn::Rate
+                        && is_exact_sum_family;
                     if use_rate_path {
                         reducer
                             .evaluate_exact_agg_rate(
@@ -764,6 +773,7 @@ impl ASAPQueryEngine {
                                 &candidate.group_by_keys,
                                 start_ms,
                                 end_ms,
+                                false,
                             )
                             .map_err(|e| {
                                 crate::query_engines::EngineError::capability_miss(
@@ -1294,44 +1304,34 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     ));
                 }
 
-                let lookback_ms = if candidate.range_seconds > 0 {
-                    candidate.range_seconds.saturating_mul(1000)
-                } else {
-                    DEFAULT_LOOKBACK_MS
-                };
-                let t0_ms = now_ms.saturating_sub(lookback_ms);
-                if t0_ms < combined_t0 {
-                    combined_t0 = t0_ms;
-                }
-
-                // ExactAgg capability → dispatch the per-(group_by_keys)
-                // accumulator-merge path; sketch capabilities → the
-                // sketch-decode path. ExactAgg sids carry
-                // `Box<dyn AggregateCore>` payloads (per-window
-                // `SumAccumulator` / `IncreaseAccumulator` /
-                // `MinMaxAccumulator` etc.) rather than opaque sketch
-                // bytes, so they need a different reducer entry point.
+                // Counter-function dispatch (issue #301). The four
+                // PromQL counter idioms all lower to
+                // `Capability::ExactAgg(Sum)`; the analyzer's typed
+                // `candidate.outer_fn` carries the function distinction
+                // that the engine MUST honor (otherwise sum /
+                // sum_over_time / increase / rate collapse to the same
+                // wrong number — the bug this fix closes).
                 //
-                // ExactAgg(Sum-family) candidates whose raw query
-                // contains `rate(...)` / `irate(...)` AND
-                // `range_seconds > 0` dispatch to the rate variant
-                // (`evaluate_exact_agg_rate`) — that path folds every
-                // sub-window sum across the range and divides by the
-                // range to produce events-per-second, matching PromQL
-                // `rate` semantics. Composed shapes like
-                // `sum by (zone) (rate(metric[5m]))` go through here
-                // too (function="sum" but range_seconds=300 from the
-                // inner rate's matrix selector, picked up by the
-                // analyzer trace).
-                // Dispatch off the typed `outer_fn` field on the
-                // analyzer candidate — `OuterFn::Rate` if the original
-                // PromQL contained a `rate(...)` / `irate(...)` call.
-                // Replaces a previous `query_contains_rate_call(query)`
-                // re-parse of the raw PromQL string (a lossy-lowering
-                // smell — the analyzer is the source of truth for
-                // query intent). See `control_plane/sketch_algebra/
-                // capability::OuterFn`.
-                let use_rate_path = matches!(
+                //   Rate        → evaluate_exact_agg_rate over `[t-r, t]`
+                //                 (Σ deltas ÷ min(r, coverage)).
+                //   Increase    → evaluate_exact_agg(accumulate) over
+                //                 `[t-r, t]` → Σ deltas, one number.
+                //   Plain (sum) → evaluate_exact_agg(accumulate) over the
+                //                 FULL storage horizon (`t0 = 0`) →
+                //                 cumulative-since-storage-start, the
+                //                 PromQL semantic for an instant counter
+                //                 sum. (Not the most-recent window's
+                //                 delta — Layer 3 of #301.)
+                //   SumOverTime → capability-miss → archive (asap stores
+                //                 deltas and cannot reconstruct the
+                //                 Σ-of-cumulative-samples that
+                //                 sum_over_time wants — issue #301
+                //                 decision (a)).
+                //
+                // `range_seconds` is lifted by the analyzer from the
+                // matrix selector (`[5m]` → 300); 0 for instant shapes.
+                use control_plane::asap_tier_analysis::OuterFn;
+                let is_exact_sum_family = matches!(
                     &candidate.required_capability,
                     crate::storage_engines::sketch_db::index::Capability::ExactAgg(
                         crate::storage_engines::sketch_db::data::AggregationType::Sum
@@ -1339,8 +1339,56 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             | crate::storage_engines::sketch_db::data::AggregationType::Increase
                             | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
                     )
-                ) && candidate.range_seconds > 0
-                    && candidate.outer_fn == control_plane::asap_tier_analysis::OuterFn::Rate;
+                );
+
+                // sum_over_time over a counter sid → refuse (route to
+                // archive) rather than fabricate a wrong delta-sum.
+                if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
+                    let req = Self::requirements_from_candidate(candidate);
+                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                        &self.control_plane_client,
+                        &req,
+                    );
+                    return Err(crate::query_engines::EngineError::capability_miss(
+                        asap_types::StorageBackend::SketchStore.data_source_id(),
+                        format!(
+                            "SketchStore cannot answer `sum_over_time` over counter \
+                             deltas for metric `{}` (issue #301: Σ-of-cumulative-samples \
+                             not reconstructable from per-window deltas) — failing over \
+                             to archive",
+                            candidate.metric_name
+                        ),
+                    ));
+                }
+
+                let use_rate_path =
+                    is_exact_sum_family && candidate.outer_fn == OuterFn::Rate;
+                // Increase + instant Plain sum both accumulate windows
+                // into one cumulative number per group; they differ only
+                // in the time scope (`[t-r,t]` clip vs full storage).
+                let accumulate_windows = is_exact_sum_family
+                    && matches!(candidate.outer_fn, OuterFn::Increase | OuterFn::Plain);
+                // Instant `Plain` sum reads the FULL storage horizon so it
+                // returns cumulative-since-start; `Increase`/`Rate` clip to
+                // the requested `[t-r, t]` (lookback_ms below).
+                let plain_instant_sum = is_exact_sum_family
+                    && candidate.outer_fn == OuterFn::Plain
+                    && candidate.range_seconds == 0;
+
+                let lookback_ms = if candidate.range_seconds > 0 {
+                    candidate.range_seconds.saturating_mul(1000)
+                } else {
+                    DEFAULT_LOOKBACK_MS
+                };
+                let t0_ms = if plain_instant_sum {
+                    0
+                } else {
+                    now_ms.saturating_sub(lookback_ms)
+                };
+                if t0_ms < combined_t0 {
+                    combined_t0 = t0_ms;
+                }
+
                 let reducer_result = match &candidate.required_capability {
                     crate::storage_engines::sketch_db::index::Capability::ExactAgg(
                         agg_type,
@@ -1360,6 +1408,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &candidate.group_by_keys,
                         t0_ms,
                         now_ms,
+                        accumulate_windows,
                     ),
                     _ => reducer.evaluate(
                         &hit_sids,
@@ -2408,18 +2457,23 @@ mod asap_tier_classify_tests {
         use crate::query_engines::query_result::QueryResult;
 
         let idx = Arc::new(SketchStore::new());
-        // Two zones, each its own sid, two windows each. Per-zone
-        // per-window sums chosen so the rate over 300s is a clean
-        // integer: zone z0 → 600+600 / 300 = 4.0; z1 → 900+900 / 300
-        // = 6.0.
+        // Two zones, each its own sid, two windows each. The windows
+        // span `[now-150s, now-30s]` = 120s of ACTUAL coverage inside
+        // the requested 300s `[5m]` lookback. Post-#301 the rate divisor
+        // is the actual coverage span (`min(300, 120) = 120`), NOT the
+        // nominal 300 — so z0 = (600+600)/120 = 10.0; z1 =
+        // (900+900)/120 = 15.0. (Both windows stay strictly inside
+        // `[engine_now-300_000, engine_now]` so the window-contained
+        // range query captures them regardless of the small skew between
+        // the test's captured `now_ms` and the engine's query-time now.)
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(120_000);
-        let w1_end = now_ms.saturating_sub(60_000);
+        let w1_start = now_ms.saturating_sub(150_000);
+        let w1_end = now_ms.saturating_sub(90_000);
         let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(1_000);
+        let w2_end = now_ms.saturating_sub(30_000);
 
         for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 11_000 + i as u64;
@@ -2478,36 +2532,30 @@ mod asap_tier_classify_tests {
                 .expect("zone key present");
             by_zone.insert(vals[zone_idx].clone(), el.value);
         }
-        // Values are per-second rates, not raw per-window sums.
-        // (600 + 600) / 300 = 4.0; (900 + 900) / 300 = 6.0.
+        // Values are per-second rates over the ACTUAL 120s coverage, not
+        // raw per-window sums and not divided by the nominal 300s.
+        // (600 + 600) / 120 = 10.0; (900 + 900) / 120 = 15.0.
         let z0 = by_zone.get("z0").copied().expect("zone z0 present");
         let z1 = by_zone.get("z1").copied().expect("zone z1 present");
-        assert!((z0 - 4.0).abs() < 1e-9, "z0 rate expected 4.0, got {z0}");
-        assert!((z1 - 6.0).abs() < 1e-9, "z1 rate expected 6.0, got {z1}");
+        assert!((z0 - 10.0).abs() < 1e-9, "z0 rate expected 10.0, got {z0}");
+        assert!((z1 - 15.0).abs() < 1e-9, "z1 rate expected 15.0, got {z1}");
     }
 
-    /// Regression: `sum_over_time(http_requests_total[5m])` shares
-    /// `Capability::ExactAgg(Sum)` with `rate(...)` — the engine's
-    /// reducer dispatch MUST disambiguate via the analyzer's typed
-    /// `outer_fn` field (set to `OuterFn::Plain` for sum_over_time),
-    /// NOT by re-parsing the raw PromQL string. If the dispatch ever
-    /// regresses to "all ExactAgg(Sum) + range > 0 → rate path",
-    /// this test fails because the output would be (per-window sums)
-    /// / 300 instead of the raw per-window sums.
-    ///
-    /// Pins the per-window reducer's output: each series carries the
-    /// SUM of its in-window samples (not events-per-second).
+    /// Regression (issue #301, decision (a)): `sum_over_time(counter[r])`
+    /// shares `Capability::ExactAgg(Sum)` with `rate`/`increase`/`sum`,
+    /// but its PromQL semantic (Σ of CUMULATIVE sample values in `[r]`,
+    /// a quadratic) CANNOT be reconstructed from the per-window deltas
+    /// asap stores. Rather than fabricate a wrong number, the engine
+    /// reads the analyzer's typed `OuterFn::SumOverTime` and returns a
+    /// capability-miss so the query routes to the archive tier. Before
+    /// #301 this returned the delta-sum (1500 here) — a wrong answer the
+    /// caller couldn't distinguish from a correct one.
     #[tokio::test]
-    async fn execute_sum_over_time_dispatches_to_plain_exact_agg_reducer() {
+    async fn execute_sum_over_time_over_counter_capability_misses_to_archive() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
         use crate::storage_engines::sketch_db::data::AggregationType;
-        use crate::query_engines::query_result::QueryResult;
 
         let idx = Arc::new(SketchStore::new());
-        // Two zones, one ExactAgg(Sum) sid each, two windows each.
-        // Per-window sum is 600 / 900 — `sum_over_time` over a
-        // 300s lookback should report the sum of windowed values
-        // (1200 / 1800), NOT divided by 300.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -2550,42 +2598,178 @@ mod asap_tier_classify_tests {
         }
 
         let engine = build_engine_with_index(idx);
-        let result = engine
+        let err = engine
             .execute("sum_over_time(http_requests_total[5m])")
             .await
-            .expect(
-                "sum_over_time must dispatch via plain ExactAgg reducer \
-                 off the typed OuterFn::Plain candidate, not capability-miss",
+            .expect_err(
+                "sum_over_time over a counter sid MUST capability-miss → archive \
+                 (issue #301 decision (a)); it must NOT fabricate a delta-sum",
             );
+        assert!(
+            matches!(err, crate::query_engines::EngineError::CapabilityMiss { .. }),
+            "expected CapabilityMiss for sum_over_time over counter, got {err:?}"
+        );
+    }
 
+    /// Issue #301 Layer 3: instant `sum(counter)` must return the
+    /// cumulative-since-storage value (Σ of ALL windows' deltas), NOT
+    /// the most-recent window's delta. Two windows of 600/900 per zone
+    /// → per-zone cumulative = 1200/1800; `sum by (zone)` keeps them
+    /// separate; bare `sum` collapses to 3000. This test pins the
+    /// `accumulate_windows=true` reducer path the engine selects for
+    /// `OuterFn::Plain` instant sums.
+    #[tokio::test]
+    async fn execute_instant_sum_accumulates_all_windows_not_last() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w1_start = now_ms.saturating_sub(120_000);
+        let w1_end = now_ms.saturating_sub(60_000);
+        let w2_start = w1_end;
+        let w2_end = now_ms.saturating_sub(1_000);
+
+        for (i, (zone, per_window)) in
+            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
+        {
+            let sid = 14_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
+                let mut lm = BTreeMap::new();
+                lm.insert("zone".to_string(), zone.to_string());
+                idx.append_precompute(
+                    sid,
+                    lm,
+                    (ws, we),
+                    Box::new(SumAccumulator::with_sum(*per_window)),
+                );
+            }
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("sum by (zone) (http_requests_total)")
+            .await
+            .expect("instant sum by zone must succeed");
         let vector = match result {
             QueryResult::Vector(v) => v,
             other => panic!("expected Vector, got {other:?}"),
         };
-        // `sum_over_time(metric[r])` (no `sum by (...)` wrapper) lowers
-        // to an analyzer candidate with empty `group_by_keys`. The
-        // plain `evaluate_exact_agg` reducer treats empty group_by as
-        // "collapse across all series" (vs the rate reducer which
-        // preserves the natural label map per sid). So the expected
-        // shape is ONE entry whose value is the sum of the latest
-        // per-window sample across both zones: 600 + 900 = 1500. The
-        // load-bearing assertion is the VALUE — if the engine
-        // regressed to the rate path the value would be (1500)/300 =
-        // 5.0 (or per-zone if rate's per-sid split fired), neither of
-        // which is 1500.
-        assert_eq!(
-            vector.values.len(),
-            1,
-            "plain ExactAgg reducer collapses across series when \
-             group_by_keys is empty"
+        assert_eq!(vector.values.len(), 2, "one entry per zone");
+        let mut by_zone: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for el in &vector.values {
+            let keys = el.label_keys_override.as_ref().expect("keys present");
+            let vals = &el.labels.labels;
+            let zi = keys.iter().position(|k| k == "zone").expect("zone key");
+            by_zone.insert(vals[zi].clone(), el.value);
+        }
+        // Cumulative = Σ of ALL windows, NOT the last window's delta
+        // (which would be 600 / 900).
+        let z0 = by_zone.get("z0").copied().expect("z0");
+        let z1 = by_zone.get("z1").copied().expect("z1");
+        assert!(
+            (z0 - 1200.0).abs() < 1e-9,
+            "z0 cumulative expected 1200 (600+600), got {z0} — if 600 the \
+             engine took only the LAST window (Layer-3 bug)"
         );
+        assert!(
+            (z1 - 1800.0).abs() < 1e-9,
+            "z1 cumulative expected 1800 (900+900), got {z1}"
+        );
+    }
+
+    /// Issue #301: `increase(counter[r])` must return Σ of deltas in
+    /// `[t-r, t]` as ONE cumulative number per series (no rate divisor).
+    /// Two windows of 600/900 → 1200/1800; with no `by` grouping the
+    /// reducer collapses to one series = 3000.
+    #[tokio::test]
+    async fn execute_increase_accumulates_windows_without_divisor() {
+        use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::query_engines::query_result::QueryResult;
+
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w1_start = now_ms.saturating_sub(120_000);
+        let w1_end = now_ms.saturating_sub(60_000);
+        let w2_start = w1_end;
+        let w2_end = now_ms.saturating_sub(1_000);
+
+        for (i, (zone, per_window)) in
+            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
+        {
+            let sid = 15_000 + i as u64;
+            idx.register(SketchInstanceMetadata {
+                sid,
+                metric_name: "http_requests_total".to_string(),
+                group_by_keys: ["zone".to_string()].into_iter().collect(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+            for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
+                let mut lm = BTreeMap::new();
+                lm.insert("zone".to_string(), zone.to_string());
+                idx.append_precompute(
+                    sid,
+                    lm,
+                    (ws, we),
+                    Box::new(SumAccumulator::with_sum(*per_window)),
+                );
+            }
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("increase(http_requests_total[5m])")
+            .await
+            .expect("increase must succeed via accumulate path");
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        // No `by` grouping → empty group_by → collapse to one series.
+        // Σ of deltas in window = (600+600) + (900+900) = 3000. NOT
+        // divided by range (that would be the rate path → 10.0).
+        assert_eq!(vector.values.len(), 1, "no group_by collapses to one series");
         let value = vector.values[0].value;
         assert!(
-            (value - 1500.0).abs() < 1e-9,
-            "sum_over_time expected 1500 (sum of latest per-window samples \
-             across zones), got {value} — if this is ~5.0 or close to \
-             4.0/6.0 the engine regressed to the rate-divisor path; the \
-             typed OuterFn::Plain candidate dispatch is broken"
+            (value - 3000.0).abs() < 1e-9,
+            "increase expected 3000 (Σ deltas, no divisor), got {value} — \
+             if ~10 the engine took the rate path; if 1500 it took only \
+             the last window per zone"
         );
     }
 
@@ -2635,9 +2819,9 @@ mod asap_tier_classify_tests {
             bare.candidates[0].required_capability,
         );
 
-        // `outer_fn` carries the distinction.
+        // `outer_fn` carries the counter-function distinction (#301).
         assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
-        assert_eq!(sot.candidates[0].outer_fn, OuterFn::Plain);
+        assert_eq!(sot.candidates[0].outer_fn, OuterFn::SumOverTime);
         assert_eq!(
             sum_by_rate.candidates[0].outer_fn,
             OuterFn::Rate,
@@ -2662,16 +2846,18 @@ mod asap_tier_classify_tests {
         use crate::query_engines::query_result::QueryResult;
 
         let idx = Arc::new(SketchStore::new());
-        // Four zones. Two windows each; per-zone sums chosen so the
-        // per-zone rate over 300s is a clean integer.
+        // Four zones. Two windows each spanning `[now-150s, now-30s]` =
+        // 120s of actual coverage inside the 300s `[5m]` lookback.
+        // Post-#301 the rate divisor is the actual coverage span
+        // (`min(300, 120) = 120`), not the nominal 300.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let w1_start = now_ms.saturating_sub(120_000);
-        let w1_end = now_ms.saturating_sub(60_000);
+        let w1_start = now_ms.saturating_sub(150_000);
+        let w1_end = now_ms.saturating_sub(90_000);
         let w2_start = w1_end;
-        let w2_end = now_ms.saturating_sub(1_000);
+        let w2_end = now_ms.saturating_sub(30_000);
 
         let zones = ["z0", "z1", "z2", "z3"];
         for (i, zone) in zones.iter().enumerate() {
@@ -2692,8 +2878,9 @@ mod asap_tier_classify_tests {
                 expires_at_ms: None,
                 policy_fp: asap_types::PolicyFingerprint::UNSET,
             });
-            // per_window: 300, 600, 900, 1200 → per-zone rates over
-            // 300s are 2, 4, 6, 8.
+            // per_window: 300, 600, 900, 1200 → per-zone totals 600,
+            // 1200, 1800, 2400 → rates over the 120s coverage are
+            // 5, 10, 15, 20.
             let per_window = ((i + 1) * 300) as f64;
             for (ws, we) in [(w1_start, w1_end), (w2_start, w2_end)] {
                 let mut lm = BTreeMap::new();
@@ -2729,7 +2916,7 @@ mod asap_tier_classify_tests {
             let zone_idx = keys.iter().position(|k| k == "zone").expect("zone key present");
             by_zone.insert(vals[zone_idx].clone(), el.value);
         }
-        for (zone, expected) in [("z0", 2.0_f64), ("z1", 4.0), ("z2", 6.0), ("z3", 8.0)] {
+        for (zone, expected) in [("z0", 5.0_f64), ("z1", 10.0), ("z2", 15.0), ("z3", 20.0)] {
             let got = by_zone.get(zone).copied().unwrap_or(f64::NAN);
             assert!((got - expected).abs() < 1e-9, "{zone} expected {expected}, got {got}");
         }
@@ -2756,8 +2943,11 @@ mod asap_tier_classify_tests {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let w_start = now_ms.saturating_sub(60_000);
-        let w_end = now_ms.saturating_sub(1_000);
+        // One window per zone spanning `[now-150s, now-30s]` = 120s of
+        // actual coverage inside the 300s `[5m]` lookback → coverage-aware
+        // rate divisor is `min(300, 120) = 120` (#301).
+        let w_start = now_ms.saturating_sub(150_000);
+        let w_end = now_ms.saturating_sub(30_000);
 
         // Four zones with distinct per-window sums → distinct rates.
         let zones = ["z0", "z1", "z2", "z3"];
@@ -2820,8 +3010,8 @@ mod asap_tier_classify_tests {
                 .expect("zone key present");
             ordered.push((vals[zone_idx].clone(), el.value));
         }
-        // Per-window sums 300,600,900,1200 / 300s = 1, 2, 3, 4 → topk
-        // descending = z3, z2, z1, z0.
+        // Per-window sums 300,600,900,1200 / 120s coverage = 2.5, 5,
+        // 7.5, 10 → topk descending = z3, z2, z1, z0.
         let labels_in_order: Vec<&str> =
             ordered.iter().map(|(z, _)| z.as_str()).collect();
         assert_eq!(
@@ -2829,8 +3019,8 @@ mod asap_tier_classify_tests {
             vec!["z3", "z2", "z1", "z0"],
             "topk emits zones in descending rate order: {ordered:?}"
         );
-        assert!((ordered[0].1 - 4.0).abs() < 1e-9);
-        assert!((ordered[3].1 - 1.0).abs() < 1e-9);
+        assert!((ordered[0].1 - 10.0).abs() < 1e-9, "got {}", ordered[0].1);
+        assert!((ordered[3].1 - 2.5).abs() < 1e-9, "got {}", ordered[3].1);
     }
 
     /// `topk(2, sum by (zone) (rate(...)))` — same shape but K < n,
