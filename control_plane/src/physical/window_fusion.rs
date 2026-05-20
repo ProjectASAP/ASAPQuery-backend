@@ -125,12 +125,6 @@ pub fn resolve_window_canonical(
             eh_k: 50,
             time_window: size,
         },
-        (WindowKind::Tumbling, Placement::Database) => PhysicalWindow::SqlTimeBucket {
-            interval: size,
-            // Canonical `Window` carries no `time_col`; the legacy
-            // `resolve_window` defaults the same way when it is `None`.
-            time_col: "ts".into(),
-        },
         // Fallback: tumbling-at-size for any other (kind, placement)
         // combo — mirrors the legacy `resolve_window` fallback arm.
         _ => PhysicalWindow::OtelTumblingFlush { duration: size },

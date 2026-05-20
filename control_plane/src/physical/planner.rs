@@ -8,7 +8,7 @@
 //! - [`PhysicalAggOp`] — resolved AggIntent → concrete SketchType + SketchParams
 //! - [`PhysicalOp`] — a physical operator (sketch build, merge, exchange, eval, etc.)
 //! - [`PhysicalNode`] — a node in the physical plan tree (operator + placement + cost)
-//! - [`Placement`] — where a physical operator runs (Agent, Backend, PromSketch, DB, etc.)
+//! - [`Placement`] — where a physical operator runs (Agent, Backend, PromSketch, QueryEngine)
 //!
 //! Step γ7: the planner consumes the canonical `query_expr::QueryExpr`.
 //! The legacy `SketchAgg` / `WindowedAgg` / `TopK` variants are gone — they
@@ -119,8 +119,6 @@ pub enum PhysicalOp {
     TopK { k: u64 },
     /// Hash-partitioned aggregation.
     HashAggregate { keys: Vec<String> },
-    /// SQL query to database.
-    DbQuery { sql: String },
     /// Passthrough — no transformation.
     Passthrough,
 }
@@ -132,8 +130,6 @@ pub enum PhysicalWindow {
     OtelTumblingFlush { duration: Duration },
     /// PromSketch ExponentialHistogram: time-decaying buckets.
     PromSketchEH { eh_k: usize, time_window: Duration },
-    /// Database-side: `GROUP BY time_bucket(interval, ts)`.
-    SqlTimeBucket { interval: Duration, time_col: String },
     /// No windowing (unbounded / landmark).
     None,
 }
@@ -155,8 +151,6 @@ pub enum ExchangeFormat {
     Otlp,
     /// Sketch-specific binary (merged sketch bytes).
     SketchBinary,
-    /// Raw samples (for non-sketch path).
-    RawSamples,
 }
 
 /// Where a physical operator runs.
@@ -170,8 +164,6 @@ pub enum Placement {
     PromSketchStore,
     /// General query engine (ASAPQuery).
     QueryEngine,
-    /// Database (ClickHouse, TimescaleDB, etc.).
-    Database,
 }
 
 // ── Physical plan tree ──────────────────────────────────────────────────────
@@ -297,7 +289,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         // WindowedAgg-inner / TopK all into Aggregate, so dispatch on shape:
         //   * single TopK intent, no HAVING → TopK at QueryEngine
         //   * single other intent, no HAVING → sketch build, budget-placed
-        //   * multi-intent or HAVING → exact DbQuery at Database
+        //   * multi-intent or HAVING → exact HashAggregate at QueryEngine
         QueryExpr::Aggregate {
             by,
             aggs,
@@ -340,13 +332,14 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
                 insert_exchange_if_needed(&mut node);
                 return node;
             }
-            // Multi-intent / HAVING aggregate → exact at Database.
+            // Multi-intent / HAVING aggregate → no single sketch can serve
+            // it; fall back to an exact hash aggregation at the query engine.
             let child = plan_node(child, config);
             let mut node = PhysicalNode {
-                op: PhysicalOp::DbQuery {
-                    sql: format!("GROUP BY {by:?}"),
+                op: PhysicalOp::HashAggregate {
+                    keys: by.iter().map(|id| format!("{id:?}")).collect(),
                 },
-                placement: Placement::Database,
+                placement: Placement::QueryEngine,
                 cost: PhysicalCost::default(),
                 children: vec![child],
             };
@@ -511,7 +504,6 @@ fn insert_exchange_if_needed(node: &mut PhysicalNode) {
                 (Placement::BackendCollector, Placement::QueryEngine) => {
                     ExchangeFormat::SketchBinary
                 }
-                (Placement::AgentCollector, Placement::Database) => ExchangeFormat::RawSamples,
                 _ => ExchangeFormat::Otlp,
             };
             // Wrap the child in an Exchange node
@@ -727,8 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_multi_intent_aggregate_at_database() {
-        // Multi-intent Aggregate → exact DbQuery at Database.
+    fn plan_multi_intent_aggregate_at_query_engine() {
+        // Multi-intent Aggregate → exact HashAggregate at QueryEngine
+        // (no single sketch serves multiple intents).
         let expr = QueryExpr::Aggregate {
             by: vec![],
             aggs: vec![AggIntent::Sum, AggIntent::Min],
@@ -736,8 +729,8 @@ mod tests {
             child: Box::new(scan("trades")),
         };
         let node = plan(&expr, &default_config());
-        assert_eq!(node.placement, Placement::Database);
-        assert!(matches!(node.op, PhysicalOp::DbQuery { .. }));
+        assert_eq!(node.placement, Placement::QueryEngine);
+        assert!(matches!(node.op, PhysicalOp::HashAggregate { .. }));
     }
 
     #[test]

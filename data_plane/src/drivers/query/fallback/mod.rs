@@ -13,7 +13,7 @@ use crate::drivers::query::adapters::ParsedQueryRequest;
 pub enum FallbackResponse {
     /// JSON response (used by Prometheus, etc.)
     Json(Value),
-    /// Plain text response (used by ClickHouse TSV, etc.)
+    /// Plain text response.
     Text(String),
 }
 

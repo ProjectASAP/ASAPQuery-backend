@@ -1,4 +1,4 @@
-//! SP-1 query workload extraction — PromQL and SQL parsers.
+//! SP-1 query workload extraction — PromQL parser.
 //!
 //! # Entry points
 //!
@@ -16,19 +16,8 @@
 //! - `count(*_over_time(…) by (dims))` — cardinality
 //! - `changes/resets(m{f}[w])`
 //! - Bare metric selector / binary op → `exact_required`
-//!
-//! # Supported SQL patterns (doc §SQL Operators)
-//! - `COUNT(*)` with/without GROUP BY → frequency / exact
-//! - `COUNT(DISTINCT col)` ± GROUP BY → cardinality / Hydra
-//! - `AVG/MIN/MAX(col)` ± GROUP BY → quantile / exact extrema
-//! - `SUM(col)` → exact
-//! - ORDER BY … DESC LIMIT k → heavy-hitter CountSketch
-//! - Multiple aggs in one SELECT → all ops collected (Merge)
-//! - JOIN … ON key → backend-side Join (sketch-aware push-down: see physical planner)
-//! - UNION ALL → Merge (sketch linearity)
 
 pub mod promql;
-pub mod sql;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -46,7 +35,7 @@ use crate::types::AggType;
 /// Produced by [`parse_query`] via [`QueryExpr`] tree walking.
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
-    /// Metric name (PromQL: from selector; SQL: FROM clause table).
+    /// Metric name (from the PromQL selector).
     pub metric_name: String,
     /// Aggregation types inferred from the query.
     pub aggregations: Vec<AggType>,
@@ -89,30 +78,24 @@ pub enum QueryHint {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Parse a raw query string (PromQL or SQL) into the **legacy Layer-2**
+/// Parse a PromQL query string into the **legacy Layer-2**
 /// [`relational::QueryExpr`](crate::intent_algebra::relational::QueryExpr) IR.
 ///
-/// Both parsers emit Layer-2 relational operators (`Aggregate { AggFunc }`,
-/// `Window`, `Filter`, `Join`, …). The Layer-2 → Layer-3 sketch lowering
+/// The parser emits Layer-2 relational operators (`Aggregate { AggFunc }`,
+/// `Window`, `Filter`, …). The Layer-2 → Layer-3 sketch lowering
 /// and the conversion to the canonical IR both live inside
 /// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root) —
-/// this function is just the language-dispatch front door.
+/// this function is just the parse front door.
 ///
 /// Internal to the crate: the only caller is
 /// [`parse_query_expr_canonical`], which is the public canonical-IR entry.
 pub(crate) fn parse_query_expr(
     query: &str,
 ) -> anyhow::Result<crate::intent_algebra::relational::QueryExpr> {
-    let q = query.trim();
-    let upper = q.to_ascii_uppercase();
-    if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-        sql::parse_sql_expr(q)
-    } else {
-        promql::parse_promql_expr(q)
-    }
+    promql::parse_promql_expr(query.trim())
 }
 
-/// Parse a raw query string (PromQL or SQL) into the **canonical** L3
+/// Parse a PromQL query string into the **canonical** L3
 /// [`query_expr::QueryExpr`](crate::intent_algebra::query_expr::QueryExpr) IR.
 ///
 /// This is the single public algebra-IR entry point. It parses the query
@@ -132,7 +115,7 @@ pub fn parse_query_expr_canonical(
     Ok(canonical)
 }
 
-/// Parse a raw query string (PromQL or SQL) into a [`ParsedQuery`].
+/// Parse a PromQL query string into a [`ParsedQuery`].
 ///
 /// This is the backward-compatible entry point for the existing
 /// [`crate::analyzer::Analyzer`].  Internally it parses via
@@ -446,13 +429,7 @@ pub(super) fn debs_hint(
 mod tests {
     use super::*;
 
-    // Smoke tests for the unified entry point.
-
-    #[test]
-    fn sql_dispatched_correctly() {
-        let pq = parse_query("SELECT COUNT(*) FROM hits GROUP BY AdvEngineID").unwrap();
-        assert!(pq.aggregations.contains(&AggType::Frequency));
-    }
+    // Smoke tests for the parse entry point.
 
     #[test]
     fn promql_dispatched_correctly() {
@@ -584,52 +561,4 @@ mod doc_verify_all {
         }
     }
 
-    #[test]
-    fn example6_sql_avg() {
-        let expr = parse_query_expr_canonical(
-            "SELECT symbol, AVG(price) FROM trades GROUP BY symbol"
-        ).unwrap();
-        // Canonical fold of `Partition { ["symbol"], SketchAgg { Quantile } }`:
-        // `Partition { ["symbol"], Aggregate { by: [], [Quantile] } }`.
-        match &expr {
-            QueryExpr::Partition { keys, child } => {
-                assert_eq!(keys.keys(), &["symbol".to_string()]);
-                match child.as_ref() {
-                    QueryExpr::Aggregate { by, aggs, .. } => {
-                        assert!(by.is_empty());
-                        assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
-                    }
-                    other => panic!("expected Aggregate under Partition, got {other:?}"),
-                }
-            }
-            other => panic!("expected Partition, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn example7_sql_tumble() {
-        let expr = parse_query_expr_canonical(
-            "SELECT region, COUNT(DISTINCT user_id) AS cnt FROM sessions GROUP BY region, TUMBLE(ts, INTERVAL '5' MINUTE) ORDER BY cnt DESC LIMIT 10"
-        ).unwrap();
-        // Canonical fold of
-        // `Limit { Sort { Partition { ["region"], WindowedAgg { Cardinality } } } }`.
-        let QueryExpr::Limit { n: 10, child, .. } = &expr else {
-            panic!("expected Limit, got {expr:?}")
-        };
-        let QueryExpr::Sort { child: sort_child, .. } = child.as_ref() else {
-            panic!("expected Sort, got {child:?}")
-        };
-        let QueryExpr::Partition { keys, child: part_child } = sort_child.as_ref() else {
-            panic!("expected Partition, got {sort_child:?}")
-        };
-        assert_eq!(keys.keys(), &["region".to_string()]);
-        let QueryExpr::Window { child: win_child, .. } = part_child.as_ref() else {
-            panic!("expected Window, got {part_child:?}")
-        };
-        assert!(matches!(
-            win_child.as_ref(),
-            QueryExpr::Aggregate { aggs, .. }
-                if matches!(aggs.as_slice(), [AggIntent::Cardinality { .. }])
-        ));
-    }
 }

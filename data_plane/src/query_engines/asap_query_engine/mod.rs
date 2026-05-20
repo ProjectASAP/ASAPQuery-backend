@@ -1,7 +1,7 @@
 //! Warm-tier sketch query engine.
 //!
-//! `ASAPQueryEngine` is the long-standing PromQL/SQL/Elasticsearch-DSL
-//! query path that answers from the in-memory sketch DB
+//! `ASAPQueryEngine` is the PromQL query path that answers from the
+//! in-memory sketch DB
 //! ([`crate::storage_engines::sketch_db::SketchStore`]) and its
 //! per-`agg_id` precomputed accumulators. It returns ε/δ-bounded
 //! approximate answers for sketch-resident queries and `None` on
