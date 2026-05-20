@@ -2662,12 +2662,15 @@ mod api_tests {
             map.len(), 5,
             "metric_to_family should have 5 sketched entries (raw declines), got {map:?}",
         );
+        // ASAPCollector#400: values are now SETs of families. For the
+        // demo workload each metric is queried by exactly one capability,
+        // so each set has a single member — the debug form is `{Family}`.
         for (metric, want_family) in &[
-            ("http_requests_total_latency_ms", "DDSketch"),
-            ("request_size_bytes",             "Kll"),
-            ("unique_users_per_min",           "Hll"),
-            ("top_endpoint_qps",               "CountSketch"),
-            ("endpoint_request_freq",          "Cms"),
+            ("http_requests_total_latency_ms", "{DDSketch}"),
+            ("request_size_bytes",             "{Kll}"),
+            ("unique_users_per_min",           "{Hll}"),
+            ("top_endpoint_qps",               "{CountSketch}"),
+            ("endpoint_request_freq",          "{Cms}"),
         ] {
             let got = map.get(*metric)
                 .map(|k| format!("{k:?}"))
