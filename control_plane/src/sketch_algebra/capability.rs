@@ -127,28 +127,63 @@ pub enum Capability {
 /// helper to recover the distinction; that was a lossy-lowering smell.
 ///
 /// The walker that populates this lives in `asap_tier_analysis.rs`
-/// (`trace_from_promql`) — it sets `Rate` if ANY `rate(...)` or
-/// `irate(...)` Call appears anywhere in the expression tree, otherwise
-/// `Plain`. The taxonomy is intentionally minimal: today the engine
-/// only branches on "needs rate divisor or not". Future shape-specific
-/// dispatch (e.g. separating `increase` from `sum`) can extend this
-/// enum without touching the `Capability` algebra.
+/// (`trace_from_promql`) — it picks the most-specific counter-function
+/// flavour found anywhere in the expression tree (inner-function wins
+/// for composed shapes like `sum by (...) (rate(...))`).
+///
+/// ## Counter-function taxonomy (issue #301)
+///
+/// Post-#299 the agent streams per-window DELTAS for counters. The four
+/// PromQL counter idioms have genuinely different semantics over those
+/// deltas, but they ALL lower to a single `Capability::ExactAgg(Sum)`
+/// (the `AggIntent::Sum` collapse erases the function name). Before
+/// #301 the engine only distinguished `Rate` from everything else, so
+/// `sum`, `sum_over_time`, `increase`, and instant-sum all hit the same
+/// reducer path and returned the same (wrong) number. This enum carries
+/// the function distinction the engine needs to dispatch correctly:
+///
+/// | Variant       | PromQL                       | Engine dispatch                                   |
+/// |---------------|------------------------------|---------------------------------------------------|
+/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | accumulate ALL windows → cumulative-since-storage |
+/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
+/// | `Increase`    | `increase(c[r])`             | Σ deltas in `[t-r,t]` (one cumulative number)     |
+/// | `SumOverTime` | `sum_over_time(c[r])`        | capability-miss → archive (can't reconstruct)     |
+///
+/// The taxonomy lives on `OuterFn` (not the `Capability` algebra) so the
+/// sid-matching half stays a pure `ExactAgg(Sum)` predicate — the
+/// function distinction is a query-evaluation concern, not a stored-state
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
-    /// No rate-style outer function in the expression — bare selector,
-    /// `sum(metric)`, `sum by (...) (metric)`, `sum_over_time(metric[r])`,
-    /// `increase(metric[r])`, `count_over_time(metric[r])`, etc. The
-    /// engine dispatches to the plain per-window reducer. This is the
-    /// default — `Default::default()` returns `Plain` so candidates
-    /// built without an explicit outer-fn (test fixtures, fallback
-    /// paths) get the safe non-rate dispatch.
+    /// No range-style counter function in the expression — bare selector,
+    /// `sum(metric)`, `sum by (...) (metric)`. PromQL semantics for an
+    /// instant `sum` over a counter is "current cumulative counter value,
+    /// summed per group". Over per-window deltas the engine accumulates
+    /// EVERY window in storage up to `now` into one cumulative number per
+    /// group. This is the default — `Default::default()` returns `Plain`
+    /// so candidates built without an explicit outer-fn (test fixtures,
+    /// fallback paths) get the safe accumulate-all dispatch.
     #[default]
     Plain,
     /// `rate(metric[r])` or `irate(metric[r])` appears in the expression
-    /// (possibly nested inside an outer `sum by (...) (...)`). The
-    /// engine dispatches to `evaluate_exact_agg_rate`, which divides by
-    /// the range to produce events-per-second.
+    /// (possibly nested inside an outer `sum by (...) (...)`). The engine
+    /// dispatches to `evaluate_exact_agg_rate`, which sums the deltas in
+    /// `[t-r, t]` and divides by `min(r, actual_coverage_seconds)` to
+    /// produce events-per-second.
     Rate,
+    /// `increase(metric[r])` appears in the expression. PromQL semantics:
+    /// `counter(t) − counter(t−r)`. Over per-window deltas that is exactly
+    /// the sum of deltas in `[t-r, t]`. The engine dispatches to the
+    /// accumulate-across-windows path scoped to the `[t-r, t]` clip,
+    /// yielding ONE cumulative number per group (no `÷ r`).
+    Increase,
+    /// `sum_over_time(metric[r])` appears in the expression. PromQL
+    /// semantics: Σ of the (cumulative) SAMPLE values in `[r]` — a
+    /// quadratic over the storage horizon that asap CANNOT reconstruct
+    /// from stored deltas. The engine returns a capability-miss so the
+    /// query routes to the archive tier (which has raw samples) rather
+    /// than fabricating a wrong number. See issue #301 decision (a).
+    SumOverTime,
 }
 
 /// PromQL outer-aggregation operator carried on each `ASAPTierCandidate`
