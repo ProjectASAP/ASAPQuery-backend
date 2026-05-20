@@ -1467,7 +1467,7 @@ async fn handle_instant_query_post(
     let tenant = extract_tenant(&headers);
 
     let parsed_request = if content_type.contains("application/json") {
-        // Handle JSON POST (Elasticsearch)
+        // Handle JSON POST
         debug!("Parsing as JSON POST request");
         match state.adapter.parse_json_post_request(body).await {
             Ok(req) => {

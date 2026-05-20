@@ -74,7 +74,7 @@ pub trait QueryRequestAdapter: Send + Sync {
         form_params: Form<HashMap<String, String>>,
     ) -> Result<ParsedQueryRequest, AdapterError>;
 
-    /// Parse a POST request with JSON body (for Elasticsearch)
+    /// Parse a POST request with a JSON body.
     /// Default implementation returns an error - adapters that support JSON
     /// POST requests should override this method.
     async fn parse_json_post_request(
@@ -128,11 +128,7 @@ pub trait QueryResponseAdapter: Send + Sync {
     async fn format_unsupported_query_response(&self) -> Result<Response, StatusCode>;
 }
 
-/// Adapter trait for HTTP-based query protocols
-/// (Prometheus HTTP, ClickHouse HTTP, etc.)
-///
-/// For non-HTTP protocols (Flight SQL, native protocols),
-/// define separate adapter traits.
+/// Adapter trait for HTTP-based query protocols (Prometheus HTTP).
 ///
 /// Note: Fallback logic is handled separately via FallbackClient
 #[async_trait]

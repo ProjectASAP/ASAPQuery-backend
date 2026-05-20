@@ -35,19 +35,13 @@ use serde::{Deserialize, Serialize};
 /// Source language the raw query string is written in. Drives which L1
 /// parser the control plane dispatches to.
 ///
-/// Today the control plane only consumes `PromQL` and `Sql` (see
-/// `query_parser/{promql,sql}.rs`); `ElasticDsl` is reserved for the
-/// future ElasticDSL deployment model described in `design.md` §3.
+/// The control plane consumes `PromQL` only (see `query_parser/promql.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryLanguage {
     /// Prometheus query language. Parsed via `promql-parser`.
     #[serde(rename = "prom_ql", alias = "prom_q_l")]
     PromQL,
-    /// SQL. Parsed via `sqlparser`.
-    Sql,
-    /// Elasticsearch DSL. Reserved — no L1 parser yet.
-    ElasticDsl,
 }
 
 // ── AccuracyTarget ────────────────────────────────────────────────────────────
@@ -110,7 +104,7 @@ impl AccuracyTarget {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QueryShape {
     /// Evaluate once. Plan, execute, return result, discard state.
-    /// SQL ad-hoc queries; one-off PromQL via `POST /plan`.
+    /// One-off PromQL via `POST /plan`.
     #[default]
     OneShot,
     /// Continuous query — output stream that the executor keeps emitting
@@ -143,8 +137,8 @@ pub enum QueryShape {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DataShape {
-    /// Bounded relation, fully materialised at plan time. SQL tables,
-    /// Parquet / CSV files, in-process columnar tables.
+    /// Bounded relation, fully materialised at plan time. Parquet / CSV
+    /// files, in-process columnar tables.
     Batch,
     /// Append-only stream — events arrive over time, never updated or
     /// deleted. Metrics, logs, event streams. The common case for the
@@ -270,15 +264,10 @@ mod tests {
 
     #[test]
     fn query_language_serde_roundtrip() {
-        for variant in [
-            QueryLanguage::PromQL,
-            QueryLanguage::Sql,
-            QueryLanguage::ElasticDsl,
-        ] {
-            let json = serde_json::to_string(&variant).unwrap();
-            let back: QueryLanguage = serde_json::from_str(&json).unwrap();
-            assert_eq!(variant, back, "round-trip failed for {variant:?}");
-        }
+        let variant = QueryLanguage::PromQL;
+        let json = serde_json::to_string(&variant).unwrap();
+        let back: QueryLanguage = serde_json::from_str(&json).unwrap();
+        assert_eq!(variant, back, "round-trip failed for {variant:?}");
     }
 
     #[test]
