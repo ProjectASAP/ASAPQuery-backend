@@ -16,14 +16,14 @@ use crate::types_v2::{AccuracyTarget, DataShape, QueryId, QueryLanguage, QuerySh
 /// 1. **Explicit fields** — supply `metric_name`, `aggregations`,
 ///    `time_window`, etc. directly. This is the original API.
 ///
-/// 2. **Query string** — supply a raw PromQL or SQL string in
+/// 2. **Query string** — supply a raw PromQL string in
 ///    `query_string`.  The analyzer parses it and fills in `metric_name`,
 ///    `aggregations`, `group_by_labels`, `label_filters`, and `time_window`
 ///    automatically.  Any explicit fields that are non-empty / non-default
 ///    **override** the parsed values, so the two approaches compose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuerySpec {
-    /// Raw PromQL or SQL query string to parse (SP-1 automatic extraction).
+    /// Raw PromQL query string to parse (SP-1 automatic extraction).
     /// When provided, metric_name / aggregations / time_window may be omitted
     /// and will be derived from the query.
     #[serde(default)]
@@ -553,20 +553,6 @@ mod tests {
         assert_eq!(w.time_window, Duration::from_secs(300));
         assert_eq!(w.quantiles, vec![0.99]);
         assert!(!w.exact_required);
-    }
-
-    /// SQL query_string auto-populates metric_name, aggregations,
-    /// and group_by_labels.
-    #[test]
-    fn query_string_sql_populates_workload() {
-        let w = Analyzer::new()
-            .analyze(qs_only(
-                "SELECT symbol, COUNT(*) FROM financial_last_trade_price GROUP BY symbol",
-            ))
-            .unwrap();
-        assert_eq!(w.metric_name, "financial_last_trade_price");
-        assert_eq!(w.aggregations, vec![AggType::Frequency]);
-        assert!(w.group_by_labels.contains(&"symbol".to_string()));
     }
 
     /// Explicit metric_name overrides the name derived from query_string.
