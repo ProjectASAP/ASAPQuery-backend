@@ -371,12 +371,14 @@ struct PromqlTrace {
     function: String,
     function_args: Vec<f64>,
     range_seconds: u64,
-    /// Set to `OuterFn::Rate` when ANY `rate(...)` or `irate(...)`
-    /// call is found anywhere in the expression tree; otherwise
-    /// `OuterFn::Plain`. The flag-style detection mirrors what the
-    /// retired `query_contains_rate_call` engine helper used to do
-    /// over the raw query string — done here once so the engine reads
-    /// it off the typed candidate.
+    /// Counter-function flavour recovered from the expression tree
+    /// (issue #301): `Rate` for `rate`/`irate`, `Increase` for
+    /// `increase`, `SumOverTime` for `sum_over_time`, else `Plain`
+    /// (bare selector / instant `sum`). The most-specific counter idiom
+    /// found anywhere in the tree wins (see [`set_counter_fn`]) so
+    /// composed shapes like `sum by (..) (rate(..))` report `Rate`.
+    /// Done here once so the engine reads it off the typed candidate
+    /// instead of re-parsing the raw query string.
     outer_fn: OuterFn,
     /// PromQL outer-aggregation operator wrapping the inner function —
     /// `max`/`min`/`avg`/`count`/`group`/`stddev`/`stdvar` only. `sum`
@@ -488,6 +490,27 @@ fn extract_outer_agg(expr: &Expr) -> OuterAgg {
     }
 }
 
+/// Set `t.outer_fn` honoring counter-idiom precedence (issue #301):
+/// `Rate` > `Increase` > `SumOverTime` > `Plain`. The walker may visit
+/// nested calls in any order, so a more-specific flavour already set
+/// must not be downgraded by a less-specific one seen later. (In
+/// practice a single counter query has exactly one of these, but
+/// pathological compositions like `increase(sum_over_time(...))` resolve
+/// deterministically.)
+fn set_counter_fn(t: &mut PromqlTrace, candidate: OuterFn) {
+    fn rank(f: OuterFn) -> u8 {
+        match f {
+            OuterFn::Rate => 3,
+            OuterFn::Increase => 2,
+            OuterFn::SumOverTime => 1,
+            OuterFn::Plain => 0,
+        }
+    }
+    if rank(candidate) > rank(t.outer_fn) {
+        t.outer_fn = candidate;
+    }
+}
+
 fn walk_ast_for_trace(expr: &Expr, t: &mut PromqlTrace) {
     match expr {
         Expr::Call(call) => {
@@ -495,14 +518,21 @@ fn walk_ast_for_trace(expr: &Expr, t: &mut PromqlTrace) {
             if t.function.is_empty() {
                 t.function = name.clone();
             }
-            // Flag `rate(...)` / `irate(...)` ANYWHERE in the tree —
-            // mirrors the retired `query_contains_rate_call` walker.
-            // For composed shapes like `sum by (zone) (rate(metric[r]))`
-            // the FIRST function set above is `"sum"` (the outer
-            // Aggregate), but `outer_fn` must still report `Rate` so
-            // the engine dispatches through `evaluate_exact_agg_rate`.
-            if matches!(name.as_str(), "rate" | "irate") {
-                t.outer_fn = OuterFn::Rate;
+            // Flag the counter-function flavour ANYWHERE in the tree
+            // (issue #301) — mirrors the retired `query_contains_rate_call`
+            // walker but with the full taxonomy. For composed shapes like
+            // `sum by (zone) (rate(metric[r]))` the FIRST function set
+            // above is `"sum"` (the outer Aggregate), but `outer_fn` must
+            // report the INNER counter function so the engine dispatches
+            // correctly. `rate`/`irate` win over `increase`, which wins
+            // over `sum_over_time` (most-specific-counter-idiom wins);
+            // `set_counter_fn` enforces that precedence so the order in
+            // which the walker encounters nested calls doesn't matter.
+            match name.as_str() {
+                "rate" | "irate" => set_counter_fn(t, OuterFn::Rate),
+                "increase" => set_counter_fn(t, OuterFn::Increase),
+                "sum_over_time" => set_counter_fn(t, OuterFn::SumOverTime),
+                _ => {}
             }
             for a in &call.args.args {
                 if let Expr::NumberLiteral(nl) = a.as_ref() {
@@ -968,11 +998,12 @@ mod tests {
     }
 
     #[test]
-    fn sum_over_time_candidate_carries_outer_fn_plain() {
+    fn sum_over_time_candidate_carries_outer_fn_sum_over_time() {
         // `sum_over_time(metric[r])` shares `Capability::ExactAgg(Sum)`
         // with `rate(metric[r])` — the capability alone can't
-        // disambiguate. The `outer_fn` field MUST report `Plain` so
-        // the engine takes the per-window reducer (no rate divisor).
+        // disambiguate. Post-#301 the `outer_fn` field reports
+        // `SumOverTime` so the engine can capability-miss → archive
+        // (asap can't reconstruct Σ-of-cumulative-samples from deltas).
         let a = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
@@ -980,7 +1011,36 @@ mod tests {
             Capability::ExactAgg(AggregationType::Sum),
             "{a:?}"
         );
-        assert_eq!(a.candidates[0].outer_fn, OuterFn::Plain, "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::SumOverTime, "{a:?}");
+    }
+
+    #[test]
+    fn increase_candidate_carries_outer_fn_increase() {
+        // `increase(metric[r])` shares `Capability::ExactAgg(Sum)` with
+        // `rate`/`sum_over_time`; the `outer_fn` field carries the
+        // distinction so the engine sums deltas in `[t-r,t]` WITHOUT the
+        // rate divisor (issue #301).
+        let a = analyze_promql_for_asap_tier("increase(http_requests_total[5m])");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum),
+            "{a:?}"
+        );
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Increase, "{a:?}");
+    }
+
+    #[test]
+    fn sum_by_over_increase_candidate_carries_outer_fn_increase() {
+        // Composed `sum by (zone) (increase(metric[r]))` — inner counter
+        // function wins over the outer `sum` (same precedence as the
+        // rate case).
+        let a = analyze_promql_for_asap_tier(
+            "sum by (zone) (increase(http_requests_total[5m]))",
+        );
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates[0].outer_fn, OuterFn::Increase, "{a:?}");
+        assert_eq!(a.candidates[0].range_seconds, 300, "{a:?}");
     }
 
     #[test]
@@ -1042,7 +1102,7 @@ mod tests {
              can dispatch correctly without re-parsing the raw PromQL"
         );
         assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
-        assert_eq!(sot.candidates[0].outer_fn, OuterFn::Plain);
+        assert_eq!(sot.candidates[0].outer_fn, OuterFn::SumOverTime);
     }
 
     // ── outer_agg — outer aggregation operator on function results ──────

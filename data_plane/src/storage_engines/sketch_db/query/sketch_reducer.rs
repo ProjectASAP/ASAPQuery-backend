@@ -589,6 +589,20 @@ impl<'a> SketchReducer<'a> {
     /// `group_by_keys` empty (i.e. `sum(metric)` without `by (...)`)
     /// collapses every series to a single grouping with empty label
     /// map — the natural PromQL semantics.
+    ///
+    /// `accumulate_windows` (issue #301) controls the per-group output
+    /// shape:
+    /// - `false` (range-query / matrix surface): emit ONE sample per
+    ///   `(group, window_end)` — the per-window delta timeseries. The
+    ///   range-query wire format wants a matrix with a point per window.
+    /// - `true` (instant `sum(counter)` / `increase(counter[r])`): SUM
+    ///   every in-range window's value into ONE cumulative number per
+    ///   group, timestamped at `t1_ms`. This is the PromQL-correct
+    ///   semantic for instant counter sums (cumulative-since-storage)
+    ///   and `increase` (Σ deltas in `[t-r,t]`). Without this the
+    ///   instant path's `.last()` projection (engine
+    ///   `asap_tier_result_to_query_result`) returned only the MOST
+    ///   RECENT window's delta — the Layer-3 bug from #301.
     pub fn evaluate_exact_agg(
         &self,
         sids: &[u64],
@@ -596,6 +610,7 @@ impl<'a> SketchReducer<'a> {
         group_by_keys: &std::collections::BTreeSet<String>,
         t0_ms: u64,
         t1_ms: u64,
+        accumulate_windows: bool,
     ) -> Result<ASAPTierResult, ASAPTierError> {
         // Pick the Statistic answer this agg_type implies. PromQL
         // `sum by (...)` against an ExactAgg sid is the standard
@@ -735,10 +750,28 @@ impl<'a> SketchReducer<'a> {
 
         // Build the series. BTreeMap iteration is already sorted, so
         // each series's samples vec is in window-end order.
+        //
+        // When `accumulate_windows` is set, collapse each group's
+        // per-window deltas into ONE cumulative sample (Σ of values),
+        // timestamped at `t1_ms`. This is the PromQL semantic for an
+        // instant counter `sum` (cumulative-since-storage) and for
+        // `increase(counter[r])` (Σ deltas in the `[t0,t1]` clip).
+        // Otherwise keep the per-window timeseries for the matrix
+        // (range-query) surface.
+        let sample_ts = if t1_ms <= i64::MAX as u64 {
+            t1_ms as i64
+        } else {
+            i64::MAX
+        };
         let mut out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = Vec::new();
         for (group, samples) in by_group {
             let label_map: BTreeMap<String, String> = group.into_iter().collect();
-            out_series.push((label_map, samples));
+            if accumulate_windows {
+                let total: f64 = samples.iter().map(|(_, v)| *v).sum();
+                out_series.push((label_map, vec![(sample_ts, total)]));
+            } else {
+                out_series.push((label_map, samples));
+            }
         }
 
         let coverage = if cov_lo <= cov_hi {
@@ -763,7 +796,8 @@ impl<'a> SketchReducer<'a> {
     /// `[t-r, t]`" — for our sub-window-sized sids that's:
     ///
     /// ```text
-    /// rate(t) = (Σ over windows w ⊆ [t-r, t] of Sum[w])  /  r_seconds
+    /// rate(t) = (Σ over windows w ⊆ [t-r, t] of Sum[w])  /  divisor
+    /// divisor = min(r_seconds, actual_coverage_span_seconds)
     /// ```
     ///
     /// Differs from `evaluate_exact_agg` in two ways:
@@ -772,8 +806,16 @@ impl<'a> SketchReducer<'a> {
     ///    samples. For an instant rate query that's the correct shape:
     ///    one number per series, where the number is "events per second
     ///    in the lookback".
-    /// 2. Divides the merged `Statistic::Sum` by `range_seconds` to
-    ///    produce the rate (events/sec). `range_seconds == 0` would
+    /// 2. Divides the merged `Statistic::Sum` by `min(range_seconds,
+    ///    coverage_span)` to produce the rate (events/sec). Issue #301
+    ///    Layer 4: dividing by the NOMINAL `range_seconds` (300 for
+    ///    `[5m]`) when the producer has only run for a fraction of that
+    ///    span systematically UNDER-reports the rate (the smoke test's
+    ///    64% rate rel-err). `coverage_span` = `(max_window_end −
+    ///    min_window_start)/1000` across the contributing windows, read
+    ///    from `SketchStore::exact_agg_coverage_bounds`. Clamped to
+    ///    `range_seconds` so a query whose window genuinely spans the
+    ///    full `[r]` still divides by `r`. `range_seconds == 0` would
     ///    indicate a non-range query routing through this path by
     ///    mistake — defensive, surface as `UnsupportedCapability` so
     ///    the engine falls over rather than divide-by-zero.
@@ -818,7 +860,39 @@ impl<'a> SketchReducer<'a> {
                 capability: Capability::ExactAgg(agg_type),
             });
         }
-        let divisor = range_seconds as f64;
+
+        // Coverage-aware divisor (issue #301 Layer 4). The merged Sum is
+        // "events in `[t0,t1] ∩ stored windows`". Dividing by the
+        // NOMINAL `range_seconds` (e.g. 300 for `[5m]`) when the producer
+        // has only run for part of that span under-reports the rate.
+        // Use the ACTUAL covered span = (max_window_end −
+        // min_window_start)/1000 across all contributing sids, clamped to
+        // `[1, range_seconds]`. Clamping to `range_seconds` keeps a
+        // full-window query dividing by `r`; the lower bound of 1s guards
+        // against divide-by-zero when only a single sub-second window
+        // exists. When no bounds are available (no in-range exact-agg
+        // windows on any sid) the per-sid loop below produces NoData
+        // anyway, so the divisor fallback to `range_seconds` is moot.
+        let mut span_lo: u64 = u64::MAX;
+        let mut span_hi: u64 = 0;
+        for &sid in sids {
+            if let Some((start, end)) =
+                self.index.exact_agg_coverage_bounds(sid, t0_ms, t1_ms)
+            {
+                if start < span_lo {
+                    span_lo = start;
+                }
+                if end > span_hi {
+                    span_hi = end;
+                }
+            }
+        }
+        let coverage_seconds: u64 = if span_lo <= span_hi {
+            span_hi.saturating_sub(span_lo) / 1000
+        } else {
+            range_seconds
+        };
+        let divisor = range_seconds.min(coverage_seconds).max(1) as f64;
 
         // Choice of grouping mirrors `evaluate_exact_agg`:
         // * `group_by_keys` empty → preserve each sid's own full

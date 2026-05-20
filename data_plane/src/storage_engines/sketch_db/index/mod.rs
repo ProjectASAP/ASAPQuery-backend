@@ -498,6 +498,69 @@ impl SketchStore {
             .collect()
     }
 
+    /// Actual coverage bounds `(min_window_start_ms, max_window_end_ms)`
+    /// of the exact-agg windows this sid holds within `[start_unix_ms,
+    /// end_unix_ms]`. `None` when no in-range exact-agg window exists.
+    ///
+    /// Issue #301 (Layer 4): `evaluate_exact_agg_rate` must divide by the
+    /// ACTUAL data span — not the nominal `[r]` — when the producer has
+    /// run for less than the requested range. `query_exact_agg_range`
+    /// keys samples by `window_end` only, dropping `window_start`; this
+    /// companion preserves the full `(start, end)` so the rate reducer
+    /// can compute a coverage-aware divisor. Cheap (one epoch scan); the
+    /// rate reducer already walks the same windows.
+    pub fn exact_agg_coverage_bounds(
+        &self,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Option<(u64, u64)> {
+        let store = self.series.get(&sid)?.clone();
+        let guard = store.read().unwrap();
+        let mut min_start: u64 = u64::MAX;
+        let mut max_end: u64 = 0;
+        let mut any = false;
+
+        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+        guard
+            .current_epoch
+            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+        for (win, _label_id, payload) in &buf {
+            if payload.as_exact_agg().is_some() {
+                any = true;
+                if win.0 < min_start {
+                    min_start = win.0;
+                }
+                if win.1 > max_end {
+                    max_end = win.1;
+                }
+            }
+        }
+        buf.clear();
+
+        for sealed in guard.sealed_epochs.values() {
+            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            for (win, _label_id, payload) in &buf {
+                if payload.as_exact_agg().is_some() {
+                    any = true;
+                    if win.0 < min_start {
+                        min_start = win.0;
+                    }
+                    if win.1 > max_end {
+                        max_end = win.1;
+                    }
+                }
+            }
+            buf.clear();
+        }
+
+        if any {
+            Some((min_start, max_end))
+        } else {
+            None
+        }
+    }
+
     /// Phase 5 M2.3.5 — query the precompute payloads across every sid
     /// belonging to one `AggregationConfig` (identified by `metric` +
     /// `agg_cfg.aggregation_type`), shaped as the legacy `Store`

@@ -816,6 +816,7 @@ fn evaluate_exact_agg_sums_per_group_across_zones() {
             &group_by,
             0,
             400,
+            false, // per-window (matrix) shape — no accumulate
         )
         .expect("exact-agg evaluate should succeed");
 
@@ -881,6 +882,7 @@ fn evaluate_exact_agg_collapses_subgroups_into_requested_groups() {
             &group_by,
             0,
             300,
+            false, // per-window (matrix) shape — no accumulate
         )
         .expect("evaluate ok");
 
@@ -910,7 +912,7 @@ fn evaluate_exact_agg_unsupported_capability_for_minmax() {
     let reducer = SketchReducer::new(&idx);
     let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
     let err = reducer
-        .evaluate_exact_agg(&[7000], AggregationType::MinMax, &group_by, 0, 1000)
+        .evaluate_exact_agg(&[7000], AggregationType::MinMax, &group_by, 0, 1000, false)
         .expect_err("MinMax dispatch should surface as UnsupportedCapability");
     match err {
         ASAPTierError::UnsupportedCapability { capability, .. } => {
@@ -938,7 +940,7 @@ fn evaluate_exact_agg_no_data_when_window_empty() {
     let reducer = SketchReducer::new(&idx);
     let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
     let err = reducer
-        .evaluate_exact_agg(&[8000], AggregationType::Sum, &group_by, 0, 1000)
+        .evaluate_exact_agg(&[8000], AggregationType::Sum, &group_by, 0, 1000, false)
         .expect_err("empty in-window state should surface as NoData");
     match err {
         ASAPTierError::NoData { metric_name } => {
@@ -1002,10 +1004,14 @@ fn coverage_reports_observed_window_range() {
 
 #[test]
 fn evaluate_exact_agg_rate_divides_total_events_by_range() {
-    // One zone, two windows. Each window's SumAccumulator carries
-    // 600 events (a steady 10 req/sec over a 60s window). Over a
-    // 300s rate range we'd want (600 + 600) / 300 = 4 events/sec at
-    // instant readout — and ONLY one sample (not per-window).
+    // One zone, two windows that TOGETHER span the full 300s rate range
+    // (`[0, 300_000]`). Each window carries 600 events → (600 + 600) /
+    // 300 = 4 events/sec. Because the data coverage (300s) equals the
+    // nominal range, the coverage-aware divisor (issue #301 Layer 4) is
+    // `min(300, 300) = 300` — same as the nominal divisor — so this
+    // test pins both the fold-to-one-sample behavior AND the
+    // full-coverage divisor case. (The partial-coverage case is pinned
+    // separately in `evaluate_exact_agg_rate_divisor_uses_actual_coverage`.)
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::storage_engines::sketch_db::data::AggregationType;
 
@@ -1021,13 +1027,13 @@ fn evaluate_exact_agg_rate_divides_total_events_by_range() {
     idx.append_precompute(
         2100,
         lm.clone(),
-        (0, 60_000),
+        (0, 150_000),
         Box::new(SumAccumulator::with_sum(600.0)),
     );
     idx.append_precompute(
         2100,
         lm,
-        (60_000, 120_000),
+        (150_000, 300_000),
         Box::new(SumAccumulator::with_sum(600.0)),
     );
 
@@ -1040,7 +1046,7 @@ fn evaluate_exact_agg_rate_divides_total_events_by_range() {
             &group_by,
             300, // range_seconds
             0,
-            120_000,
+            300_000,
         )
         .expect("rate evaluate ok");
     assert_eq!(result.series.len(), 1, "one series for the lone zone");
@@ -1048,11 +1054,68 @@ fn evaluate_exact_agg_rate_divides_total_events_by_range() {
     assert_eq!(labels.get("zone").cloned(), Some("z0".to_string()));
     assert_eq!(samples.len(), 1, "rate emits ONE sample per group");
     let (ts, value) = samples[0];
-    assert_eq!(ts, 120_000, "sample timestamped at t1");
-    // (600 + 600) / 300 = 4.0
+    assert_eq!(ts, 300_000, "sample timestamped at t1");
+    // (600 + 600) / min(300, 300) = 4.0
     assert!(
         (value - 4.0).abs() < 1e-9,
         "expected 4.0 events/sec, got {value}"
+    );
+}
+
+#[test]
+fn evaluate_exact_agg_rate_divisor_uses_actual_coverage() {
+    // Issue #301 Layer 4: when the producer has only run for part of the
+    // requested `[r]` window, the rate divisor must be the ACTUAL covered
+    // span — not the nominal `range_seconds` — otherwise the rate is
+    // systematically under-reported (the smoke test's 64% rate rel-err).
+    //
+    // Data spans `[0, 120_000]` = 120s of the requested 300s `[5m]`
+    // window. Total events = 1200. With the OLD nominal divisor the rate
+    // would be 1200/300 = 4.0 (too low); the coverage-aware divisor is
+    // `min(300, 120) = 120`, giving the correct 1200/120 = 10.0.
+    use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::storage_engines::sketch_db::data::AggregationType;
+
+    let idx = SketchStore::new();
+    idx.register(exact_agg_meta(
+        2150,
+        "http_requests_total",
+        &["zone"],
+        AggregationType::Sum,
+    ));
+    let mut lm = BTreeMap::new();
+    lm.insert("zone".to_string(), "z0".to_string());
+    idx.append_precompute(
+        2150,
+        lm.clone(),
+        (0, 60_000),
+        Box::new(SumAccumulator::with_sum(600.0)),
+    );
+    idx.append_precompute(
+        2150,
+        lm,
+        (60_000, 120_000),
+        Box::new(SumAccumulator::with_sum(600.0)),
+    );
+
+    let reducer = SketchReducer::new(&idx);
+    let group_by: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+    let result = reducer
+        .evaluate_exact_agg_rate(
+            &[2150],
+            AggregationType::Sum,
+            &group_by,
+            300, // nominal [5m] range
+            0,
+            300_000,
+        )
+        .expect("rate evaluate ok");
+    let (_labels, samples) = &result.series[0];
+    let value = samples[0].1;
+    assert!(
+        (value - 10.0).abs() < 1e-9,
+        "coverage-aware divisor: 1200 / min(300, 120) = 10.0, got {value} \
+         (if ~4.0 the divisor regressed to the nominal range)"
     );
 }
 
@@ -1080,7 +1143,9 @@ fn evaluate_exact_agg_rate_per_group_across_zones() {
             AggregationType::Sum,
         ));
         let per_window = ((i + 1) * 300) as f64;
-        for (ws, we) in [(0u64, 60_000u64), (60_000, 120_000)] {
+        // Windows span the full 300s range so coverage == nominal range
+        // and the coverage-aware divisor (#301) is `min(300, 300) = 300`.
+        for (ws, we) in [(0u64, 150_000u64), (150_000, 300_000)] {
             let mut lm = BTreeMap::new();
             lm.insert("zone".to_string(), zone.to_string());
             idx.append_precompute(
@@ -1101,7 +1166,7 @@ fn evaluate_exact_agg_rate_per_group_across_zones() {
             &group_by,
             300,
             0,
-            120_000,
+            300_000,
         )
         .expect("rate evaluate ok");
     assert_eq!(result.series.len(), 4, "one series per zone");
@@ -1121,7 +1186,8 @@ fn evaluate_exact_agg_rate_per_group_across_zones() {
 fn evaluate_exact_agg_rate_collapses_subgroups_into_requested_groups() {
     // Two sids share (zone, rack); a `sum by (zone) (rate(...))`
     // collapses both racks' sub-window sums into one zone's rate.
-    // 100 + 200 = 300 over 100s = 3.0 events/sec.
+    // 100 + 200 = 300 over a window spanning the full 100s range
+    // (coverage-aware divisor min(100, 100) = 100) = 3.0 events/sec.
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
     use crate::storage_engines::sketch_db::data::AggregationType;
 
@@ -1136,7 +1202,12 @@ fn evaluate_exact_agg_rate_collapses_subgroups_into_requested_groups() {
         let mut lm = BTreeMap::new();
         lm.insert("zone".to_string(), "z0".to_string());
         lm.insert("rack".to_string(), rack.to_string());
-        idx.append_precompute(sid, lm, (100, 200), Box::new(SumAccumulator::with_sum(value)));
+        idx.append_precompute(
+            sid,
+            lm,
+            (0, 100_000),
+            Box::new(SumAccumulator::with_sum(value)),
+        );
     }
 
     let reducer = SketchReducer::new(&idx);
@@ -1148,7 +1219,7 @@ fn evaluate_exact_agg_rate_collapses_subgroups_into_requested_groups() {
             &group_by,
             100,
             0,
-            300,
+            300_000,
         )
         .expect("rate evaluate ok");
     assert_eq!(result.series.len(), 1, "racks collapse into one zone group");
@@ -1177,13 +1248,14 @@ fn evaluate_exact_agg_rate_no_group_by_keeps_per_sid_series() {
         ));
         let mut lm = BTreeMap::new();
         lm.insert("zone".to_string(), zone.to_string());
-        idx.append_precompute(sid, lm, (0, 60_000), Box::new(SumAccumulator::with_sum(value)));
+        // Window spans the full 150s range so coverage == nominal range.
+        idx.append_precompute(sid, lm, (0, 150_000), Box::new(SumAccumulator::with_sum(value)));
     }
 
     let reducer = SketchReducer::new(&idx);
     let empty: BTreeSet<String> = BTreeSet::new();
     let result = reducer
-        .evaluate_exact_agg_rate(&[6100, 6101], AggregationType::Sum, &empty, 150, 0, 60_000)
+        .evaluate_exact_agg_rate(&[6100, 6101], AggregationType::Sum, &empty, 150, 0, 300_000)
         .expect("rate evaluate ok");
     assert_eq!(result.series.len(), 2, "two distinct series preserved");
     let mut by_zone: BTreeMap<String, f64> = BTreeMap::new();
