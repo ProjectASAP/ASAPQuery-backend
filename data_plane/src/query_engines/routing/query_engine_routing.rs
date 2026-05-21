@@ -69,6 +69,25 @@ pub trait QueryEngine: Send + Sync {
     /// Answer `query` against this engine's storage tier.
     async fn execute(&self, query: &str) -> Result<QueryResult, EngineError>;
 
+    /// Forward a range query to this engine's storage tier.
+    ///
+    /// Params are milliseconds since epoch. The default returns `CapabilityMiss`
+    /// so existing impls need not change; override when the engine has native
+    /// range-query support (e.g. Thanos).
+    async fn execute_range(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<QueryResult, EngineError> {
+        let _ = (query, start_ms, end_ms, step_ms);
+        Err(EngineError::capability_miss(
+            self.capabilities().data_source_id,
+            "execute_range not implemented for this engine",
+        ))
+    }
+
     /// What this engine can serve. Cheap; the router calls it on every
     /// `register` and may re-call to refresh cost estimates.
     fn capabilities(&self) -> EngineCapabilities;

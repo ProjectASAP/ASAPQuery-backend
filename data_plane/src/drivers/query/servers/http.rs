@@ -1704,14 +1704,52 @@ async fn process_range_query_request(
             }
         }
         Err(_) => {
-            debug!(
-                "Modern range-query path returned CapabilityMiss for query='{}', \
-                 falling through to unsupported",
-                parsed_request.query
-            );
-            match state.adapter.format_unsupported_query_response().await {
-                Ok(json) => json.into_response(),
-                Err(status) => status.into_response()}
+            // ASAP sketch tier returned CapabilityMiss — try ThanosQueryEngine if registered.
+            let thanos_engine = state
+                .query_router
+                .engine_by_id(crate::query_engines::thanos_query_engine::DATA_SOURCE_THANOS_QUERY_ID)
+                .cloned();
+            if let Some(engine) = thanos_engine {
+                debug!(
+                    "Range-query ASAP miss — forwarding to ThanosQueryEngine: query='{}'",
+                    parsed_request.query
+                );
+                match engine
+                    .execute_range(&parsed_request.query, start_ms, end_ms, step_ms)
+                    .await
+                {
+                    Ok(query_result) => match state
+                        .adapter
+                        .format_range_success_response(
+                            &query_result,
+                            &promql_utilities::data_model::KeyByLabelNames::default(),
+                        )
+                        .await
+                    {
+                        Ok(response) => response.into_response(),
+                        Err(status) => status.into_response(),
+                    },
+                    Err(e) => {
+                        warn!(
+                            "ThanosQueryEngine range query failed: {e}"
+                        );
+                        match state.adapter.format_unsupported_query_response().await {
+                            Ok(json) => json.into_response(),
+                            Err(status) => status.into_response(),
+                        }
+                    }
+                }
+            } else {
+                debug!(
+                    "Modern range-query path returned CapabilityMiss for query='{}', \
+                     no ThanosQueryEngine registered — falling through to unsupported",
+                    parsed_request.query
+                );
+                match state.adapter.format_unsupported_query_response().await {
+                    Ok(json) => json.into_response(),
+                    Err(status) => status.into_response(),
+                }
+            }
         }
     }
 }
@@ -4252,6 +4290,64 @@ aggregations:
         assert!(
             body_str.contains("thanos_unreachable"),
             "5xx body must carry thanos_unreachable marker; got {body_str}",
+        );
+    }
+
+    // ── Path A2 range-query e2e test ────────────────────────────────────
+
+    /// GET /api/v1/query_range returns success when ASAP sketch misses
+    /// and ThanosQueryEngine is registered. Covers the full HTTP path:
+    ///   browser → ASAP backend → ThanosQueryEngine → mock thanos → matrix response
+    #[tokio::test]
+    async fn http_query_range_forwards_to_thanos_when_asap_misses() {
+        use crate::query_engines::thanos_query_engine::forward::test_support::CANNED_MATRIX_BODY;
+        use crate::query_engines::thanos_query_engine::forward::test_support::spawn_mock_thanos_capture_range;
+        use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
+
+        let (mock_url, _captured, _mock_handle) =
+            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
+        let cfg = ThanosQueryConfig {
+            base_url: mock_url,
+            request_timeout: std::time::Duration::from_secs(5),
+        };
+        let engine = ThanosQueryEngine::new(cfg).expect("engine");
+        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
+
+        // Use GorillaObjectStore so ASAP-tier misses and router falls through to Thanos.
+        let server_port = setup_test_server_with_named_router(
+            StorageBackend::GorillaObjectStore,
+            vec![arc_engine],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+            .query(&[
+                ("query", "rate(http_requests_total[1m])"),
+                ("start", "1700000000"),
+                ("end", "1700003600"),
+                ("step", "15"),
+            ])
+            .send()
+            .await
+            .expect("request");
+
+        assert!(
+            resp.status().is_success(),
+            "expected 2xx from range query forwarded to Thanos; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["status"].as_str().unwrap_or(""),
+            "success",
+            "wire response must carry status=success; got {body}"
+        );
+        assert_eq!(
+            body["data"]["resultType"].as_str().unwrap_or(""),
+            "matrix",
+            "wire response must carry resultType=matrix; got {body}"
         );
     }
 

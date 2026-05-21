@@ -137,16 +137,15 @@ To build and run just this backend, see **Building from source** below.
 ## Building from source
 
 This repo path-deps `asap-precompute-rs` and `asap-gorilla` from
-[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector), and
-`asap_sketchlib` from
-[asap_sketchlib](https://github.com/ProjectASAP/asap_sketchlib).
-Clone all three repos as siblings under `~/repos/`:
+[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector).
+`asap_sketchlib` is resolved by Cargo from its pinned Git dependency,
+so it does not need to be cloned as a local build prerequisite. Clone
+the backend and collector as siblings under `~/repos/`:
 
 ```
 ~/repos/
 ├── ASAPCollector/         # path-dep'd by this repo
-├── ASAPQuery-backend/     # this repo
-└── asap_sketchlib/        # path-dep'd by both
+└── ASAPQuery-backend/     # this repo
 ```
 
 Then:
