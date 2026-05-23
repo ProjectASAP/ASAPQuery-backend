@@ -148,6 +148,33 @@ pub fn clamp_window_secs(w: Option<u64>) -> Option<u64> {
     w.map(|s| s.clamp(MIN_WINDOW_SECS, MAX_WINDOW_SECS))
 }
 
+/// Process-level gate selecting the FUSED single-pipeline `asap_edge`
+/// edge wire shape (issue #46) over the legacy `routing`-connector
+/// per-family fan-out.
+///
+/// **Default OFF** so the established 5-sketch routing emit (and its
+/// large unit-test surface) is unchanged for callers who haven't
+/// migrated the agent build yet. Set `ASAP_EDGE_FUSED=1` (or
+/// `true` / `yes`) on the controller process to switch every
+/// `metric_to_family`-populated edge config to the fused
+/// `[memory_limiter, cumulativetodelta, asap_edge]` pipeline that the
+/// new fused agent processor consumes.
+///
+/// We gate on an env var (mirroring `typed_stage_split_enabled()` /
+/// `ASAP_AGENT_MEMORY_LIMIT_MIB`) rather than a new `EdgeStageConfig`
+/// field so the change is additive: no struct-literal churn across the
+/// ~17 construction sites, no serde wire-shape bump, and the two emit
+/// paths read the IDENTICAL `cfg` fields. The flag is the canonical
+/// migration switch — once the fused agent build is the default
+/// deployment the gate's default flips to ON (and the routing path is
+/// retired).
+pub fn fused_asap_edge_enabled() -> bool {
+    matches!(
+        std::env::var("ASAP_EDGE_FUSED").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Build the OTel-collector YAML for an edge agent from the typed L5
@@ -182,7 +209,16 @@ pub fn emit_edge_yaml(
     //
     // Empty `metric_to_family` ⇒ legacy single-pipeline / Mode-3 /
     // warm-passthrough emit paths kick in (preserved verbatim below).
+    //
+    // Issue #46 — the agent now runs ONE fused `asap_edge` processor in a
+    // single pipeline instead of the routing-connector per-family
+    // fan-out. When `ASAP_EDGE_FUSED` is set we emit THAT shape; the
+    // legacy routing emit stays the default until the fused agent build
+    // is the default deployment (see `fused_asap_edge_enabled`).
     if !cfg.metric_to_family.is_empty() {
+        if fused_asap_edge_enabled() {
+            return emit_edge_yaml_asap_edge(cfg, opamp_endpoint, agent_id);
+        }
         return emit_edge_yaml_5sketch_routing(cfg, opamp_endpoint, agent_id);
     }
 
@@ -1514,6 +1550,355 @@ fn emit_edge_yaml_5sketch_routing(
     };
 
     serde_yaml::to_string(&doc).context("serialize edge stage config (5-sketch)")
+}
+
+/// Map a `SketchKind` to the `family:` token the fused `asap_edge`
+/// processor's `metrics[]` list expects. These differ from the OTel
+/// component-id processor names (`KLL`, `countmin`, …) used by the
+/// routing-connector path — the fused processor takes a lower-case
+/// family discriminant per entry, matching the hand-written contract in
+/// `asap-otel-agent-b6-asap-single-sketch.yaml`.
+fn sketch_kind_to_asap_edge_family(kind: &SketchKind) -> &'static str {
+    match kind {
+        SketchKind::DDSketch => "ddsketch",
+        SketchKind::Kll => "kll",
+        SketchKind::Hll => "hll",
+        SketchKind::CountSketch => "countsketch",
+        SketchKind::Cms => "countminsketch",
+    }
+}
+
+/// Issue #46 — emit the FUSED single-pipeline `asap_edge` edge agent
+/// wire shape.
+///
+/// This is the replacement for [`emit_edge_yaml_5sketch_routing`]: the
+/// agent now runs ONE processor (`asap_edge`) that does the cold archive
+/// (Gorilla), the Sum-by-grouping aggregation, and all five sketch
+/// families in a single sharded decode pass, instead of a `routing`
+/// connector fanning out to per-family pipelines. The emitted topology
+/// is:
+///
+/// ```text
+/// otlp → [memory_limiter, cumulativetodelta, asap_edge] → otlp/backend
+/// ```
+///
+/// The shape is generalised over the planner's inputs from the SAME
+/// [`EdgeStageConfig`] fields the routing path reads — see the per-block
+/// comments for the exact mapping. Selected by `ASAP_EDGE_FUSED`
+/// (see [`fused_asap_edge_enabled`]); the routing path stays the default
+/// until the fused agent build is the default deployment.
+fn emit_edge_yaml_asap_edge(
+    cfg: &EdgeStageConfig,
+    opamp_endpoint: &str,
+    agent_id: &str,
+) -> Result<String> {
+    use crate::sketch_algebra::params::SketchKind;
+
+    // ── Receivers ──────────────────────────────────────────────────────────
+    // OTLP gRPC on 4317 + HTTP on 4318 — same as every other edge emit.
+    // The fused contract bumps `max_recv_msg_size_mib` to 4096 (the
+    // hand-written config raises it so a window's worth of batched
+    // points never trips the gRPC frame limit before asap_edge buffers
+    // them).
+    let otlp_receiver: Value = serde_yaml::from_str(
+        "protocols:\n  grpc:\n    endpoint: \"0.0.0.0:4317\"\n    max_recv_msg_size_mib: 4096\n  http:\n    endpoint: \"0.0.0.0:4318\"\n",
+    )
+    .context("parse static OTLP receiver block (asap_edge)")?;
+
+    let mut processors: BTreeMap<String, Value> = BTreeMap::new();
+
+    // ── memory_limiter — backpressure before asap_edge buffers a window
+    // in memory. Same env-tunable knob as the routing path so operators
+    // tune one variable for both shapes.
+    let memory_limit_mib: u64 = std::env::var("ASAP_AGENT_MEMORY_LIMIT_MIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1280);
+    let spike_limit_mib: u64 = std::cmp::max(256, memory_limit_mib / 5);
+    let memory_limiter_block: Value = serde_yaml::from_str(&format!(
+        "check_interval: 1s\nlimit_mib: {memory_limit_mib}\nspike_limit_mib: {spike_limit_mib}\n"
+    ))
+    .context("parse memory_limiter processor block (asap_edge)")?;
+    processors.insert("memory_limiter".to_string(), memory_limiter_block);
+
+    // ── cumulativetodelta — Issue #298 / #46 ───────────────────────────────
+    //
+    // Counters → delta upstream of asap_edge so the Sum aggregator and the
+    // backend SumAccumulator see deltas. The include list is the
+    // Counter-shaped metrics the planner classified as `AggRole::Sum`
+    // (`cfg.cumulative_counter_metrics`) — which is exactly "the sum
+    // metrics PLUS the counter-shaped sketch inputs" the fused contract
+    // calls for: a counter that is ALSO sketched (e.g. `top_endpoint_qps`
+    // → CountSketch, `endpoint_request_freq` → Count-Min,
+    // `unique_users_per_min` → HLL) still classifies Sum and so still
+    // lands here, while gauges (latency) are left untouched by
+    // `match_type: strict`.
+    let needs_cumulativetodelta = !cfg.cumulative_counter_metrics.is_empty();
+    if needs_cumulativetodelta {
+        let mut sorted_metrics: Vec<&String> = cfg.cumulative_counter_metrics.iter().collect();
+        sorted_metrics.sort();
+        sorted_metrics.dedup();
+        let mut metrics_yaml = String::new();
+        for m in &sorted_metrics {
+            metrics_yaml.push_str(&format!("    - \"{m}\"\n"));
+        }
+        let cumulativetodelta_yaml =
+            format!("include:\n  metrics:\n{metrics_yaml}  match_type: strict\n");
+        let cumulativetodelta_block: Value = serde_yaml::from_str(&cumulativetodelta_yaml)
+            .context("parse cumulativetodelta processor block (asap_edge)")?;
+        processors.insert("cumulativetodelta".to_string(), cumulativetodelta_block);
+    }
+
+    // ── asap_edge — the fused processor ─────────────────────────────────────
+    //
+    // `metrics[]` is the metric→family map (the job the routing connector
+    // + per-family pipelines used to do). We assemble it from three
+    // planner inputs, all already on `EdgeStageConfig`:
+    //
+    //   * sum family   — every `AggRole::Sum` metric (in
+    //                    `cumulative_counter_metrics`) that has grouping
+    //                    labels declared and is NOT routed to a sketch
+    //                    family. `aggregate_by` = the metric's
+    //                    `group_by_labels` (from `metric_to_grouping_labels`).
+    //                    Mirrors the routing path's `metrics/sum_aggregate`
+    //                    selection (a counter that is sketched stays on its
+    //                    sketch entry; an ungrouped Sum stays raw — no
+    //                    aggregate entry).
+    //   * sketch family — per `metric_to_family` × `sketch_processors`
+    //                    params (`relative_accuracy` / `k` / `rows` / `cols`),
+    //                    mirroring `build_edge_processor_block`'s param reads.
+    //
+    // Entry order is deterministic (sum entries first sorted by metric,
+    // then sketch entries sorted by metric then canonical family order)
+    // so the emitted YAML is byte-stable for the agent's opampextension
+    // no-op check.
+    let window_secs = clamp_window_secs(cfg.window_secs).unwrap_or(MAX_WINDOW_SECS);
+
+    // shard_count: fixed at 4 (the fused contract's default — key-hash
+    // sharding for multi-core decode). No `EdgeStageConfig` field plumbs
+    // a per-deploy override yet; 4 matches the hand-written config.
+    let shard_count: u64 = 4;
+
+    let mut metric_entries: Vec<Value> = Vec::new();
+
+    // Sum-family entries — same predicate as ASAPCollector#403's
+    // edge-aggregate selection: Sum-role metric WITH grouping labels and
+    // NOT mapped to a sketch family.
+    let mut sum_metrics: Vec<&String> = cfg
+        .cumulative_counter_metrics
+        .iter()
+        .filter(|m| {
+            cfg.metric_to_grouping_labels.contains_key(*m)
+                && !cfg.metric_to_family.contains_key(*m)
+        })
+        .collect();
+    sum_metrics.sort();
+    sum_metrics.dedup();
+    for metric in sum_metrics {
+        let labels = cfg
+            .metric_to_grouping_labels
+            .get(metric)
+            .cloned()
+            .unwrap_or_default();
+        let mut e = Mapping::new();
+        e.insert("metric".into(), Value::String((*metric).clone()));
+        e.insert("family".into(), Value::String("sum".to_string()));
+        let by: Vec<Value> = labels.into_iter().map(Value::String).collect();
+        e.insert("aggregate_by".into(), Value::Sequence(by));
+        metric_entries.push(Value::Mapping(e));
+    }
+
+    // Sketch-family entries. Look up params from `sketch_processors`
+    // (keyed by family) so the per-metric param block mirrors the
+    // routing path; fall back to catalog defaults when the planner
+    // mapped a family with no enumerated processor.
+    let mut family_to_proc: HashMap<SketchKind, &EdgeSketchProcessor> = HashMap::new();
+    for sp in &cfg.sketch_processors {
+        family_to_proc.insert(sp.sketch_kind.clone(), sp);
+    }
+    const FAMILY_ORDER: [SketchKind; 5] = [
+        SketchKind::DDSketch,
+        SketchKind::Kll,
+        SketchKind::Hll,
+        SketchKind::CountSketch,
+        SketchKind::Cms,
+    ];
+    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchKind>)> =
+        cfg.metric_to_family.iter().collect();
+    metric_family_pairs.sort_by(|a, b| a.0.cmp(b.0));
+    for (metric, families) in &metric_family_pairs {
+        for kind in FAMILY_ORDER.iter().filter(|k| families.contains(*k)) {
+            let mut e = Mapping::new();
+            e.insert("metric".into(), Value::String((*metric).clone()));
+            e.insert(
+                "family".into(),
+                Value::String(sketch_kind_to_asap_edge_family(kind).to_string()),
+            );
+            // Family-specific params — mirror the reads in
+            // `build_edge_processor_block`. The fused processor's
+            // per-entry surface uses `relative_accuracy` / `k` /
+            // `rows` / `cols` (cols = sketch width, rows = depth).
+            match family_to_proc.get(kind).map(|sp| &sp.sketch_params) {
+                Some(SketchParams::DDSketch(p)) => {
+                    e.insert("relative_accuracy".into(), Value::Number(p.alpha.into()));
+                }
+                Some(SketchParams::Kll(p)) => {
+                    e.insert("k".into(), Value::Number((p.k as u64).into()));
+                }
+                Some(SketchParams::Hll(_)) => { /* HLL takes no per-entry knob */ }
+                Some(SketchParams::CountSketch(p)) => {
+                    e.insert("rows".into(), Value::Number((p.d as u64).into()));
+                    e.insert("cols".into(), Value::Number((p.w as u64).into()));
+                }
+                Some(SketchParams::Cms(p)) => {
+                    e.insert("rows".into(), Value::Number((p.d as u64).into()));
+                    e.insert("cols".into(), Value::Number((p.w as u64).into()));
+                }
+                None => {
+                    // Family with no enumerated processor — emit catalog
+                    // defaults so the entry is still well-formed.
+                    match kind {
+                        SketchKind::DDSketch => {
+                            e.insert("relative_accuracy".into(), Value::Number(0.01.into()));
+                        }
+                        SketchKind::Kll => {
+                            e.insert("k".into(), Value::Number(200u64.into()));
+                        }
+                        SketchKind::Hll => {}
+                        SketchKind::CountSketch => {
+                            e.insert("rows".into(), Value::Number(5u64.into()));
+                            e.insert("cols".into(), Value::Number(2048u64.into()));
+                        }
+                        SketchKind::Cms => {
+                            e.insert("rows".into(), Value::Number(5u64.into()));
+                            e.insert("cols".into(), Value::Number(2048u64.into()));
+                        }
+                    }
+                }
+            }
+            metric_entries.push(Value::Mapping(e));
+        }
+    }
+
+    // ── cold: block ─────────────────────────────────────────────────────────
+    //
+    // The fused processor archives per-emit Gorilla blocks. We turn the
+    // cold tier ON whenever the plan declared any archive-tier metric
+    // (the same `archive_tier_metrics` signal that drove the `gorillas3`
+    // processor on the routing path). `block_duration` / `reorder_grace`
+    // size from the archive window; `external_labels.cluster` comes from
+    // `ASAP_TENANT`-adjacent deploy config.
+    //
+    // GAP — REPORTED, NOT FABRICATED: `EdgeStageConfig` does NOT carry a
+    // cold `ship_endpoint` or an `external_labels` map today (only the
+    // S3/MinIO knobs `build_gorillas3_yaml` reads from the controller's
+    // env). The fused agent ships Gorilla blocks to a backend gorilla
+    // ingest endpoint that does not yet exist (see the Track-2 note in
+    // the hand-written config). We therefore follow the emitter's
+    // documented-placeholder convention for unresolved deploy targets:
+    // derive `ship_endpoint` from the OTLP backend host (analogous to
+    // how `resolve_export_endpoint` synthesises `backend:4317` /
+    // `gateway:4317`) and read `cluster` from `ASAP_CLUSTER` (default
+    // `asap-mvp`). Threading a real per-deploy cold endpoint +
+    // external-label map needs a new `EdgeStageConfig` field populated
+    // from the plan — left as a follow-up.
+    let cold_enabled = !cfg.archive_tier_metrics.is_empty();
+    let cold_block: Value = {
+        // Cold window: smallest declared archive window, else the
+        // pipeline window (clamped), else 60s.
+        let block_secs = cfg
+            .archive_tier_metrics
+            .iter()
+            .filter_map(|m| m.window_secs)
+            .min()
+            .unwrap_or(window_secs);
+        // ship_endpoint placeholder: the backend's gorilla ingest. We
+        // reuse the OTLP backend host so the placeholder tracks the
+        // exporter target (e.g. `backend` → `http://backend:9098/...`).
+        let backend_host = match &cfg.exporter_target {
+            ExportTarget::Endpoint(s) => {
+                s.split(':').next().unwrap_or("backend").to_string()
+            }
+            _ => "backend".to_string(),
+        };
+        let ship_endpoint = format!("http://{backend_host}:9098/ingest/gorilla");
+        let cluster = std::env::var("ASAP_CLUSTER").unwrap_or_else(|_| "asap-mvp".to_string());
+        let mut m = Mapping::new();
+        m.insert("enabled".into(), Value::Bool(cold_enabled));
+        m.insert("ship_endpoint".into(), Value::String(ship_endpoint));
+        m.insert(
+            "block_duration".into(),
+            Value::String(format!("{block_secs}s")),
+        );
+        m.insert("reorder_grace".into(), Value::String("2s".to_string()));
+        let mut ext = Mapping::new();
+        ext.insert("cluster".into(), Value::String(cluster));
+        m.insert("external_labels".into(), Value::Mapping(ext));
+        Value::Mapping(m)
+    };
+
+    let mut asap_edge_block = Mapping::new();
+    asap_edge_block.insert("shard_count".into(), Value::Number(shard_count.into()));
+    asap_edge_block.insert(
+        "window_duration".into(),
+        Value::String(format!("{window_secs}s")),
+    );
+    // drop_original: true — aggregated metrics' raw is dropped (their
+    // sum/sketch output is emitted on the flush tick). Unconfigured
+    // metrics pass through raw; that is the fused processor's default,
+    // independent of this knob.
+    asap_edge_block.insert("drop_original".into(), Value::Bool(true));
+    asap_edge_block.insert("metrics".into(), Value::Sequence(metric_entries));
+    asap_edge_block.insert("cold".into(), cold_block);
+    processors.insert("asap_edge".to_string(), Value::Mapping(asap_edge_block));
+
+    // ── Exporters ──────────────────────────────────────────────────────────
+    // Edge → asapquery-backend OTLP ingest. Same resolver as every other
+    // edge emit (the asap-gateway hop was removed in #400).
+    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
+    let exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
+
+    // ── Pipeline ─────────────────────────────────────────────────────────────
+    // Single `metrics` pipeline: receivers [otlp], processors
+    // [memory_limiter, cumulativetodelta?, asap_edge], exporters
+    // [otlp/backend]. cumulativetodelta is omitted when no counter
+    // metric is declared (sketch-only / quantile-only plans).
+    let mut pipeline_processors: Vec<String> = vec!["memory_limiter".to_string()];
+    if needs_cumulativetodelta {
+        pipeline_processors.push("cumulativetodelta".to_string());
+    }
+    pipeline_processors.push("asap_edge".to_string());
+
+    let mut pipelines: BTreeMap<String, Pipeline> = BTreeMap::new();
+    pipelines.insert(
+        "metrics".to_string(),
+        Pipeline {
+            receivers: vec!["otlp".into()],
+            processors: pipeline_processors,
+            exporters: vec![exporter_key.clone()],
+        },
+    );
+
+    // ── OpAMP extension ────────────────────────────────────────────────────
+    let opamp_ext: Value = serde_yaml::from_str(&format!(
+        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n    headers:\n      X-Agent-ID: \"{agent_id}\"\nremote_config_path: /etc/otel/config.yaml\n"
+    ))
+    .context("parse opamp extension block (asap_edge)")?;
+
+    let doc = CollectorYaml {
+        extensions: [("opamp".to_string(), opamp_ext)].into(),
+        receivers: [("otlp".to_string(), otlp_receiver)].into(),
+        processors,
+        // No routing connector in the fused shape.
+        connectors: BTreeMap::new(),
+        exporters,
+        service: ServiceSection {
+            extensions: vec!["opamp".into()],
+            pipelines,
+        },
+    };
+
+    serde_yaml::to_string(&doc).context("serialize edge stage config (asap_edge)")
 }
 
 /// Emit the gorillas3 (S3 archive-tier) processor YAML with all env
@@ -4720,6 +5105,294 @@ mod tests {
             a_idx < m_idx && m_idx < z_idx,
             "include.metrics list must be sorted for byte-stable YAML \
              (a={a_idx} m={m_idx} z={z_idx})\n{yaml}"
+        );
+    }
+
+    // ── Issue #46: fused single-pipeline asap_edge emit ─────────────────────
+
+    /// Build a fixture mirroring the hand-written fused contract
+    /// (`asap-otel-agent-b6-asap-single-sketch.yaml`): five sketch
+    /// families across five metrics, one Sum-by-zone counter, an archive
+    /// tier (cold), and the counter-shaped sketch inputs in the
+    /// cumulativetodelta list.
+    fn fused_asap_edge_cfg() -> EdgeStageConfig {
+        use crate::sketch_algebra::params::{
+            CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams,
+        };
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert(
+            "http_requests_total_latency_ms".into(),
+            one(SketchKind::DDSketch),
+        );
+        metric_to_family.insert("request_size_bytes".into(), one(SketchKind::Kll));
+        metric_to_family.insert("unique_users_per_min".into(), one(SketchKind::Hll));
+        metric_to_family.insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
+        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::Cms));
+
+        // Per-family params, mirroring the target config's per-entry knobs.
+        let sketch_processors = vec![
+            EdgeSketchProcessor {
+                processor_name: "ddsketch".into(),
+                sketch_kind: SketchKind::DDSketch,
+                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                aggregation_id: "agg0".into(),
+            },
+            EdgeSketchProcessor {
+                processor_name: "KLL".into(),
+                sketch_kind: SketchKind::Kll,
+                sketch_params: SketchParams::Kll(KllParams { k: 200 }),
+                aggregation_id: "agg1".into(),
+            },
+            EdgeSketchProcessor {
+                processor_name: "HLL".into(),
+                sketch_kind: SketchKind::Hll,
+                sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
+                aggregation_id: "agg2".into(),
+            },
+            EdgeSketchProcessor {
+                processor_name: "countsketch".into(),
+                sketch_kind: SketchKind::CountSketch,
+                sketch_params: SketchParams::CountSketch(CountSketchParams {
+                    w: 2048,
+                    d: 5,
+                    with_heap: true,
+                }),
+                aggregation_id: "agg3".into(),
+            },
+            EdgeSketchProcessor {
+                processor_name: "countmin".into(),
+                sketch_kind: SketchKind::Cms,
+                sketch_params: SketchParams::Cms(CmsParams {
+                    w: 2048,
+                    d: 5,
+                    with_heap: false,
+                }),
+                aggregation_id: "agg4".into(),
+            },
+        ];
+
+        // Sum-by-zone counter + the counter-shaped sketch inputs.
+        let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
+        metric_to_grouping_labels.insert("http_requests_total".into(), vec!["zone".into()]);
+
+        EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors,
+            exporter_target: ExportTarget::Endpoint("backend:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: vec![ArchiveTierMetric {
+                metric: "http_requests_total".into(),
+                window_secs: Some(60),
+            }],
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels,
+            // Sum metric + counter-shaped sketch inputs (Sum-role).
+            cumulative_counter_metrics: vec![
+                "http_requests_total".into(),
+                "endpoint_request_freq".into(),
+                "unique_users_per_min".into(),
+                "top_endpoint_qps".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn fused_asap_edge_emits_single_pipeline_and_metrics_list() {
+        // `ASAP_EDGE_FUSED` is process-global; serialize with the same
+        // lock the memory_limiter env tests use so a parallel thread
+        // doesn't observe this test's setenv as its own input.
+        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap();
+        std::env::set_var("ASAP_EDGE_FUSED", "1");
+
+        let cfg = fused_asap_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+
+        std::env::remove_var("ASAP_EDGE_FUSED");
+
+        // 1. Parses as YAML (round-trips through the loader).
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+
+        // 2. NO routing connector in the fused shape.
+        assert!(
+            !yaml.contains("connectors:"),
+            "fused shape must not emit a routing connector\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("raw_passthrough"),
+            "fused shape has no per-family / passthrough pipelines\n{yaml}"
+        );
+
+        // 3. Single `metrics` pipeline with the exact processor list.
+        let pipelines = doc
+            .get("service")
+            .and_then(|s| s.get("pipelines"))
+            .and_then(|p| p.as_mapping())
+            .expect("service.pipelines mapping");
+        assert_eq!(
+            pipelines.len(),
+            1,
+            "fused shape emits exactly one pipeline\n{yaml}"
+        );
+        let metrics_pl = pipelines
+            .get(serde_yaml::Value::String("metrics".into()))
+            .expect("metrics pipeline present");
+        let procs: Vec<String> = metrics_pl
+            .get("processors")
+            .and_then(|p| p.as_sequence())
+            .expect("processors seq")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            procs,
+            vec![
+                "memory_limiter".to_string(),
+                "cumulativetodelta".to_string(),
+                "asap_edge".to_string()
+            ],
+            "pipeline processor order must be [memory_limiter, cumulativetodelta, asap_edge]\n{yaml}"
+        );
+
+        // 4. asap_edge.metrics[] has the sum-by entry + every sketch entry.
+        let asap_edge = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .expect("asap_edge processor present");
+        assert_eq!(
+            asap_edge.get("shard_count").and_then(|v| v.as_u64()),
+            Some(4),
+            "shard_count\n{yaml}"
+        );
+        assert_eq!(
+            asap_edge.get("drop_original").and_then(|v| v.as_bool()),
+            Some(true),
+            "drop_original\n{yaml}"
+        );
+        assert_eq!(
+            asap_edge.get("window_duration").and_then(|v| v.as_str()),
+            Some("60s"),
+            "window_duration\n{yaml}"
+        );
+        let metrics = asap_edge
+            .get("metrics")
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        // One sum entry + five sketch entries.
+        assert_eq!(metrics.len(), 6, "expected 6 metric entries\n{yaml}");
+
+        let entry_for = |name: &str| -> &serde_yaml::Value {
+            metrics
+                .iter()
+                .find(|e| e.get("metric").and_then(|m| m.as_str()) == Some(name))
+                .unwrap_or_else(|| panic!("missing metrics[] entry for {name}\n{yaml}"))
+        };
+
+        // Sum-by-zone entry.
+        let sum_e = entry_for("http_requests_total");
+        assert_eq!(sum_e.get("family").and_then(|v| v.as_str()), Some("sum"));
+        let by: Vec<String> = sum_e
+            .get("aggregate_by")
+            .and_then(|v| v.as_sequence())
+            .expect("aggregate_by seq")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(by, vec!["zone".to_string()], "sum aggregate_by\n{yaml}");
+
+        // Sketch entries + params.
+        let dd = entry_for("http_requests_total_latency_ms");
+        assert_eq!(dd.get("family").and_then(|v| v.as_str()), Some("ddsketch"));
+        assert_eq!(
+            dd.get("relative_accuracy").and_then(|v| v.as_f64()),
+            Some(0.01)
+        );
+        let kll = entry_for("request_size_bytes");
+        assert_eq!(kll.get("family").and_then(|v| v.as_str()), Some("kll"));
+        assert_eq!(kll.get("k").and_then(|v| v.as_u64()), Some(200));
+        let hll = entry_for("unique_users_per_min");
+        assert_eq!(hll.get("family").and_then(|v| v.as_str()), Some("hll"));
+        let cs = entry_for("top_endpoint_qps");
+        assert_eq!(cs.get("family").and_then(|v| v.as_str()), Some("countsketch"));
+        assert_eq!(cs.get("rows").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(cs.get("cols").and_then(|v| v.as_u64()), Some(2048));
+        let cms = entry_for("endpoint_request_freq");
+        assert_eq!(
+            cms.get("family").and_then(|v| v.as_str()),
+            Some("countminsketch")
+        );
+        assert_eq!(cms.get("rows").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(cms.get("cols").and_then(|v| v.as_u64()), Some(2048));
+
+        // 5. cold: block present + enabled.
+        let cold = asap_edge.get("cold").expect("cold block present");
+        assert_eq!(
+            cold.get("enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "cold.enabled\n{yaml}"
+        );
+        assert!(
+            cold.get("ship_endpoint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("ingest/gorilla"))
+                .unwrap_or(false),
+            "cold.ship_endpoint placeholder\n{yaml}"
+        );
+        assert_eq!(
+            cold.get("block_duration").and_then(|v| v.as_str()),
+            Some("60s")
+        );
+        assert!(
+            cold.get("external_labels")
+                .and_then(|v| v.get("cluster"))
+                .is_some(),
+            "cold.external_labels.cluster\n{yaml}"
+        );
+
+        // 6. cumulativetodelta lists the Sum-role counters (strict).
+        let ctd = doc
+            .get("processors")
+            .and_then(|p| p.get("cumulativetodelta"))
+            .and_then(|c| c.get("include"))
+            .expect("cumulativetodelta.include present");
+        assert_eq!(
+            ctd.get("match_type").and_then(|v| v.as_str()),
+            Some("strict")
+        );
+        let ctd_metrics: Vec<String> = ctd
+            .get("metrics")
+            .and_then(|v| v.as_sequence())
+            .expect("ctd metrics seq")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            ctd_metrics.contains(&"http_requests_total".to_string())
+                && ctd_metrics.contains(&"top_endpoint_qps".to_string()),
+            "cumulativetodelta must include sum + counter-shaped sketch inputs\n{yaml}"
+        );
+
+        // 7. OpAMP + exporter wired.
+        assert!(yaml.contains("ws://controller:4320/v1/opamp"), "{yaml}");
+        assert!(yaml.contains("otlp/backend:"), "{yaml}");
+    }
+
+    #[test]
+    fn fused_gate_off_keeps_routing_shape() {
+        // Without the env gate the canonical routing-connector shape is
+        // emitted (backward-compat for un-migrated agent builds).
+        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ASAP_EDGE_FUSED");
+        let cfg = fused_asap_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
+        assert!(
+            yaml.contains("connectors:") && !yaml.contains("asap_edge:"),
+            "gate-off must keep the routing-connector shape\n{yaml}"
         );
     }
 }
