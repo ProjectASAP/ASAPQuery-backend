@@ -317,6 +317,8 @@ mod tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -333,6 +335,8 @@ mod tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -353,6 +357,8 @@ mod tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -505,6 +511,8 @@ mod tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
         let toml = emit_telegraf_toml(&cfg, None).expect("emit ok");
         assert!(toml.contains("k = 200"), "k not propagated\n{toml}");

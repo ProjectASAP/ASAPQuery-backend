@@ -482,6 +482,8 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
 
         let collector = emit_for_runtime(
@@ -517,6 +519,8 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
         let yaml = emit_for_runtime(
             AgentRuntime::AsapOtap,
@@ -550,6 +554,8 @@ mod runtime_tests {
             metric_to_family: std::collections::HashMap::new(),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
         let toml = emit_for_runtime(
             AgentRuntime::AsapTelegraf,
@@ -883,6 +889,8 @@ mod runtime_tests {
             )]),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
         edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
 

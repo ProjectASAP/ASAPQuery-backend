@@ -241,6 +241,55 @@ pub struct EdgeStageConfig {
     /// metric (e.g. quantile-only workloads).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cumulative_counter_metrics: Vec<String>,
+    /// PR #311 follow-up — the cold-tier (Gorilla archive) ingest URL the
+    /// fused `asap_edge` processor ships per-emit Gorilla blocks to. This
+    /// is the gorilla-merger's HTTP ingest endpoint
+    /// (`http://gorilla-merger:10908/ingest/gorilla`; the gRPC side is
+    /// 10907) — NOT the OTLP backend host/port. PR #311 lacked this field
+    /// and derived a wrong placeholder (`http://<backend>:9098/...`) from
+    /// `exporter_target`; threading the real value here fixes that.
+    ///
+    /// `None` ⇒ the emitter falls back to [`default_cold_ship_endpoint`]
+    /// (a single named default), so legacy / test construction sites that
+    /// don't populate it still emit a correct merger endpoint. The
+    /// `colored_dag` L5 layer cannot resolve a real per-deploy endpoint
+    /// (it is deployment-independent — no `DeploymentConstraints` is
+    /// plumbed in), so it populates the named default; a future layer that
+    /// holds deploy info can set a concrete value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_ship_endpoint: Option<String>,
+    /// PR #311 follow-up — external labels stamped on every cold-tier
+    /// Gorilla block the fused `asap_edge` processor ships (the merger
+    /// uses these for cross-cluster disambiguation). Carried as
+    /// `(label, value)` tuples (deterministic order at the emit site).
+    /// PR #311 derived `cluster` from the `ASAP_CLUSTER` env inline; this
+    /// field threads it explicitly. Empty ⇒ the emitter falls back to
+    /// [`default_cold_external_labels`] (a single named default that reads
+    /// `ASAP_CLUSTER`, defaulting to `asap-mvp`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cold_external_labels: Vec<(String, String)>,
+}
+
+/// Named default for [`EdgeStageConfig::cold_ship_endpoint`].
+///
+/// The cold tier ships per-emit Gorilla blocks to the **gorilla-merger**
+/// over HTTP ingest port **10908** (the gRPC ingest side is 10907). This
+/// is the one canonical place that default lives — construction sites and
+/// the `asap_edge` emitter both route through here rather than inlining
+/// the host/port. PR #311's `http://<backend>:9098/ingest/gorilla` guess
+/// was wrong (wrong host, wrong port); this is the correct merger target.
+pub fn default_cold_ship_endpoint() -> String {
+    "http://gorilla-merger:10908/ingest/gorilla".to_string()
+}
+
+/// Named default for [`EdgeStageConfig::cold_external_labels`].
+///
+/// One `cluster` label, read from `ASAP_CLUSTER` (default `asap-mvp`).
+/// Single source of truth for the cold external-label default so the
+/// emitter and any construction site agree.
+pub fn default_cold_external_labels() -> Vec<(String, String)> {
+    let cluster = std::env::var("ASAP_CLUSTER").unwrap_or_else(|_| "asap-mvp".to_string());
+    vec![("cluster".to_string(), cluster)]
 }
 
 /// Phase 3.2.5 — one archive-tier metric the agent should land in
@@ -516,6 +565,14 @@ impl Emitter for ThreeStageEmitter {
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            // The colored-DAG layer is deployment-independent (no
+            // `DeploymentConstraints` is plumbed in here — see the
+            // module header), so we cannot resolve a real per-deploy cold
+            // endpoint at this layer. Populate the single named defaults;
+            // a layer that holds deploy info can overwrite `edge.cold_*`
+            // post-emit (same pattern as `exporter_target`).
+            cold_ship_endpoint: Some(default_cold_ship_endpoint()),
+            cold_external_labels: default_cold_external_labels(),
         };
         let mut backend_aggregations: Vec<BackendAggregation> = Vec::new();
         let mut gateway_processors: Vec<GatewayMergeProcessor> = Vec::new();

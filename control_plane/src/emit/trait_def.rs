@@ -210,6 +210,8 @@ mod tests {
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
