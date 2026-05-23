@@ -53,9 +53,9 @@ use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::physical::colored_dag::emitter::{
-    AggregationInput, ArchiveTierMetric, BackendAggregation, BackendReadout, BackendStageConfig,
-    EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor, GatewayStageConfig,
-    PrometheusArchiveMetric,
+    default_cold_external_labels, default_cold_ship_endpoint, AggregationInput, ArchiveTierMetric,
+    BackendAggregation, BackendReadout, BackendStageConfig, EdgeSketchProcessor, EdgeStageConfig,
+    ExportTarget, GatewayMergeProcessor, GatewayStageConfig, PrometheusArchiveMetric,
 };
 use crate::physical::colored_dag::stage_id::StageId;
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
@@ -1786,22 +1786,19 @@ fn emit_edge_yaml_asap_edge(
     // cold tier ON whenever the plan declared any archive-tier metric
     // (the same `archive_tier_metrics` signal that drove the `gorillas3`
     // processor on the routing path). `block_duration` / `reorder_grace`
-    // size from the archive window; `external_labels.cluster` comes from
-    // `ASAP_TENANT`-adjacent deploy config.
+    // size from the archive window.
     //
-    // GAP — REPORTED, NOT FABRICATED: `EdgeStageConfig` does NOT carry a
-    // cold `ship_endpoint` or an `external_labels` map today (only the
-    // S3/MinIO knobs `build_gorillas3_yaml` reads from the controller's
-    // env). The fused agent ships Gorilla blocks to a backend gorilla
-    // ingest endpoint that does not yet exist (see the Track-2 note in
-    // the hand-written config). We therefore follow the emitter's
-    // documented-placeholder convention for unresolved deploy targets:
-    // derive `ship_endpoint` from the OTLP backend host (analogous to
-    // how `resolve_export_endpoint` synthesises `backend:4317` /
-    // `gateway:4317`) and read `cluster` from `ASAP_CLUSTER` (default
-    // `asap-mvp`). Threading a real per-deploy cold endpoint +
-    // external-label map needs a new `EdgeStageConfig` field populated
-    // from the plan — left as a follow-up.
+    // PR #311 follow-up: `ship_endpoint` and `external_labels` now come
+    // from the threaded `EdgeStageConfig` cold fields rather than a
+    // derived placeholder. PR #311 lacked these fields and guessed
+    // `http://<backend>:9098/ingest/gorilla` from the OTLP exporter host
+    // — WRONG host AND port. The cold tier actually ships to the
+    // gorilla-merger over HTTP ingest port 10908 (gRPC 10907). When a
+    // construction site leaves the fields unset (`cold_ship_endpoint:
+    // None` / empty `cold_external_labels`) we fall back to the single
+    // named defaults (`default_cold_ship_endpoint` /
+    // `default_cold_external_labels`) so the emitted endpoint is always
+    // the correct merger target, never the old backend:9098 guess.
     let cold_enabled = !cfg.archive_tier_metrics.is_empty();
     let cold_block: Value = {
         // Cold window: smallest declared archive window, else the
@@ -1812,17 +1809,20 @@ fn emit_edge_yaml_asap_edge(
             .filter_map(|m| m.window_secs)
             .min()
             .unwrap_or(window_secs);
-        // ship_endpoint placeholder: the backend's gorilla ingest. We
-        // reuse the OTLP backend host so the placeholder tracks the
-        // exporter target (e.g. `backend` → `http://backend:9098/...`).
-        let backend_host = match &cfg.exporter_target {
-            ExportTarget::Endpoint(s) => {
-                s.split(':').next().unwrap_or("backend").to_string()
-            }
-            _ => "backend".to_string(),
+        // ship_endpoint: the threaded per-deploy cold ingest URL (the
+        // gorilla-merger). Falls back to the named default when the
+        // plan didn't carry one.
+        let ship_endpoint = cfg
+            .cold_ship_endpoint
+            .clone()
+            .unwrap_or_else(default_cold_ship_endpoint);
+        // external_labels: the threaded label tuples; named default
+        // (`cluster=<ASAP_CLUSTER|asap-mvp>`) when none were supplied.
+        let external_labels = if cfg.cold_external_labels.is_empty() {
+            default_cold_external_labels()
+        } else {
+            cfg.cold_external_labels.clone()
         };
-        let ship_endpoint = format!("http://{backend_host}:9098/ingest/gorilla");
-        let cluster = std::env::var("ASAP_CLUSTER").unwrap_or_else(|_| "asap-mvp".to_string());
         let mut m = Mapping::new();
         m.insert("enabled".into(), Value::Bool(cold_enabled));
         m.insert("ship_endpoint".into(), Value::String(ship_endpoint));
@@ -1832,7 +1832,9 @@ fn emit_edge_yaml_asap_edge(
         );
         m.insert("reorder_grace".into(), Value::String("2s".to_string()));
         let mut ext = Mapping::new();
-        ext.insert("cluster".into(), Value::String(cluster));
+        for (k, v) in external_labels {
+            ext.insert(Value::String(k), Value::String(v));
+        }
         m.insert("external_labels".into(), Value::Mapping(ext));
         Value::Mapping(m)
     };
@@ -2471,6 +2473,8 @@ mod tests {
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -3443,6 +3447,8 @@ mod tests {
             metric_to_family: HashMap::new(),
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -3783,6 +3789,8 @@ mod tests {
             metric_to_family,
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -4069,6 +4077,8 @@ mod tests {
             metric_to_family,
             metric_to_grouping_labels: HashMap::new(),
             cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
         }
     }
 
@@ -5197,6 +5207,14 @@ mod tests {
                 "unique_users_per_min".into(),
                 "top_endpoint_qps".into(),
             ],
+            // PR #311 follow-up: thread the real per-deploy cold ingest
+            // (the gorilla-merger HTTP ingest on 10908, NOT backend:9098)
+            // + an explicit external label so the emit test asserts the
+            // threaded value flows through rather than the named default.
+            cold_ship_endpoint: Some(
+                "http://gorilla-merger:10908/ingest/gorilla".into(),
+            ),
+            cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
         }
     }
 
@@ -5329,29 +5347,39 @@ mod tests {
         assert_eq!(cms.get("rows").and_then(|v| v.as_u64()), Some(5));
         assert_eq!(cms.get("cols").and_then(|v| v.as_u64()), Some(2048));
 
-        // 5. cold: block present + enabled.
+        // 5. cold: block present + enabled. The ship_endpoint and
+        // external label come from the THREADED `EdgeStageConfig` cold
+        // fields (PR #311 follow-up), NOT a derived placeholder: the cfg
+        // sets `cold_ship_endpoint = http://gorilla-merger:10908/...`
+        // and `cold_external_labels = [(cluster, asap-mvp)]`, and the
+        // emitter must surface exactly those — proving the threading,
+        // and proving we no longer emit the wrong `backend:9098` guess.
         let cold = asap_edge.get("cold").expect("cold block present");
         assert_eq!(
             cold.get("enabled").and_then(|v| v.as_bool()),
             Some(true),
             "cold.enabled\n{yaml}"
         );
+        assert_eq!(
+            cold.get("ship_endpoint").and_then(|v| v.as_str()),
+            Some("http://gorilla-merger:10908/ingest/gorilla"),
+            "cold.ship_endpoint must be the threaded gorilla-merger ingest (10908), \
+             not the old backend:9098 placeholder\n{yaml}"
+        );
         assert!(
-            cold.get("ship_endpoint")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("ingest/gorilla"))
-                .unwrap_or(false),
-            "cold.ship_endpoint placeholder\n{yaml}"
+            !yaml.contains(":9098"),
+            "must not emit the wrong backend:9098 cold endpoint\n{yaml}"
         );
         assert_eq!(
             cold.get("block_duration").and_then(|v| v.as_str()),
             Some("60s")
         );
-        assert!(
+        assert_eq!(
             cold.get("external_labels")
                 .and_then(|v| v.get("cluster"))
-                .is_some(),
-            "cold.external_labels.cluster\n{yaml}"
+                .and_then(|v| v.as_str()),
+            Some("asap-mvp"),
+            "cold.external_labels.cluster must be the threaded value\n{yaml}"
         );
 
         // 6. cumulativetodelta lists the Sum-role counters (strict).
