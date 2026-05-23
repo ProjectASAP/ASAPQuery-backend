@@ -3,7 +3,7 @@ module github.com/ProjectASAP/asapquery-backend/gorilla-merger
 go 1.25.0
 
 require (
-	github.com/ProjectASAP/asap-gorilla-go v0.0.0
+	github.com/ProjectASAP/asap-gorilla-go v0.1.0
 	github.com/go-kit/log v0.2.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/prometheus v0.308.0
@@ -228,11 +228,10 @@ require (
 	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397 // indirect
 )
 
-// The shared edge<->merger wire codec lives in asap-gorilla-go. Point at the
-// pinned, committed checkout so the build is reproducible and does not move
-// under us.
-replace github.com/ProjectASAP/asap-gorilla-go => /mydata/asap-gorilla-pinned/asap-gorilla-go
-
+// The shared edge<->merger wire codec lives in asap-gorilla-go, published as a
+// standalone private module (github.com/ProjectASAP/asap-gorilla-go). Building
+// requires GOPRIVATE=github.com/ProjectASAP/* + git auth to fetch it.
+//
 // Thanos v0.41.0 declares these replace directives in its own go.mod. Go does
 // NOT inherit a dependency's replace directives into the main module, so MVS
 // otherwise picks upstream versions whose APIs differ from what Thanos v0.41.0
