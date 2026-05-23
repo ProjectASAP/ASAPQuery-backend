@@ -1,0 +1,4 @@
+# Local tsdb data dir (WAL + unshipped blocks) and built binary.
+/data/
+/gorilla-merger
+*.test
