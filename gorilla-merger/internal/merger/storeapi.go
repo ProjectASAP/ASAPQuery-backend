@@ -7,7 +7,10 @@ import (
 	kitlog "github.com/go-kit/log"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/info"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"google.golang.org/grpc"
 )
@@ -34,6 +37,25 @@ func NewStoreAPI(s *Storage, extLset labels.Labels, logger kitlog.Logger, addr s
 
 	grpcSrv := grpc.NewServer()
 	storepb.RegisterStoreServer(grpcSrv, tsdbStore)
+
+	// thanos-query (v0.41) discovers an endpoint via the Info service; a
+	// Store-only server is reachable but undiscoverable ("neither info nor
+	// store client found"), so register Info too — mirroring the sidecar.
+	infoSrv := info.NewInfoServer(
+		component.Receive.String(),
+		info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return tsdbStore.LabelSet() }),
+		info.WithStoreInfoFunc(func() (*infopb.StoreInfo, error) {
+			mint, maxt := tsdbStore.TimeRange()
+			return &infopb.StoreInfo{
+				MinTime:                      mint,
+				MaxTime:                      maxt,
+				SupportsSharding:             true,
+				SupportsWithoutReplicaLabels: true,
+				TsdbInfos:                    tsdbStore.TSDBInfos(),
+			}, nil
+		}),
+	)
+	info.RegisterInfoServer(infoSrv)(grpcSrv)
 
 	return &StoreAPI{
 		srv:     grpcSrv,
