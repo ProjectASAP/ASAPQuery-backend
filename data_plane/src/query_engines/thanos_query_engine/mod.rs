@@ -1,8 +1,9 @@
 //! Thanos query-engine wrapper.
 //!
-//! This module owns the public archive query engine, [`ThanosQueryEngine`].
-//! Gorilla object storage and the legacy in-process Gorilla executor live
-//! under [`crate::storage_engines::gorilla_object_store`].
+//! This module owns the public archive query engine, [`ThanosQueryEngine`]
+//! (Path A2). The archive tier reuses the `StorageBackend::GorillaObjectStore`
+//! routing slot, but the answering engine is Thanos; the superseded
+//! in-process Gorilla executor (custom GORILLA1 format) has been deleted.
 
 pub mod forward;
 
