@@ -242,7 +242,7 @@ struct Args {
     /// (`{metric_name: storage_backend}` map). Loaded at startup and
     /// consulted by the HTTP query handler on every PromQL request to
     /// pick the right engine (`ASAPQueryEngine` for ASAP-tier sketches,
-    /// `GorillaQueryEngine` for the cold archive, etc.). Without
+    /// `ThanosQueryEngine` for the cold archive, etc.). Without
     /// this flag the handler falls back to the streaming-config
     /// single axis (always `SketchStore`) and the EngineRouter is
     /// effectively bypassed — the issue-46 v2 demo's criterion ⑤
@@ -608,23 +608,21 @@ async fn main() -> Result<()> {
     server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
 
     // Phase-5/6 + Step-2.3: register the Thanos query engine on the
-    // capability router. Two operating modes, selected at startup:
+    // capability router. Path A2 is the only archive path now: when
+    // `ASAP_THANOS_QUERY_URL` is set, the backend forwards
+    // archive-tier PromQL queries to a `thanos-query` sidecar via the
+    // [`ThanosQueryEngine`], registered under the single public id
+    // `thanos_query`.
     //
-    // * **Path A2 mode** — when `ASAP_THANOS_QUERY_URL` is set, the
-    //   backend forwards archive-tier PromQL queries to a
-    //   `thanos-query` sidecar via the
-    //   [`ThanosQueryEngine`], registered under the single public id
-    //   `thanos_query`. The legacy in-process `GorillaQueryEngine`
-    //   is skipped in this mode.
-    // * **Legacy mode** — when `ASAP_THANOS_QUERY_URL` is unset, the
-    //   in-process `GorillaQueryEngine` answers archive queries
-    //   from per-hour Gorilla chunks landed on S3 / MinIO via the
-    //   `GorillaS3Store`. This is the dev path and is preserved
-    //   verbatim until Phase δ deletes it after Path A2 is verified
-    //   end-to-end.
+    // The superseded legacy in-process `GorillaQueryEngine` /
+    // `GorillaS3Store` leg (which read the custom GORILLA1 container
+    // format from per-hour chunks on S3 / MinIO) has been deleted now
+    // that Path A2 is verified end-to-end (agents emit XOR-chunk
+    // fragments → backend gorilla-merger → TSDB blocks → S3 →
+    // thanos-query).
     //
-    // When neither env-var family is configured the binary registers
-    // a `NoDataArchiveEngine` stub under `thanos_query`
+    // When `ASAP_THANOS_QUERY_URL` is not configured the binary
+    // registers a `NoDataArchiveEngine` stub under `thanos_query`
     // so cold queries succeed with an empty result instead of
     // surfacing as `503 NoEngineRegistered`. Operators that want the
     // original fail-loud behaviour can opt back in by setting
@@ -635,43 +633,17 @@ async fn main() -> Result<()> {
             use data_plane::query_engines::routing::QueryEngine;
             info!(
                 upstream = thanos.base_url(),
-                "Path A2: registering ThanosQueryEngine for the archive tier (data_source_id=thanos_query); legacy in-process GorillaQueryEngine skipped",
+                "Path A2: registering ThanosQueryEngine for the archive tier (data_source_id=thanos_query)",
             );
             let thanos_arc: Arc<dyn QueryEngine> = Arc::new(thanos);
             server = server.with_archive_query_engine(thanos_arc);
             archive_registered = true;
         }
-        Ok(None) => match data_plane::storage_engines::gorilla_object_store::GorillaS3Config::from_env() {
-            Ok(s3_cfg) => {
-                match data_plane::storage_engines::gorilla_object_store::GorillaS3Store::with_default_backend(
-                    s3_cfg,
-                ) {
-                    Ok(store) => {
-                        use data_plane::storage_engines::{GorillaEngineConfig, GorillaQueryEngine};
-                        use data_plane::query_engines::routing::QueryEngine;
-                        let gorilla = Arc::new(GorillaQueryEngine::with_gorilla_s3(
-                            Arc::new(store),
-                            GorillaEngineConfig::default(),
-                        ));
-                        info!(
-                                "Registering legacy in-process GorillaQueryEngine on the archive slot (canonical data_source_id=thanos_query); set ASAP_THANOS_QUERY_URL to use the intended Thanos archive path",
-                            );
-                        server = server.with_archive_query_engine(gorilla as Arc<dyn QueryEngine>);
-                        archive_registered = true;
-                    }
-                    Err(e) => {
-                        warn!(
-                                "ASAP_GORILLA_S3_* env vars present but GorillaS3Store failed to build ({e}); router will not have an archive engine",
-                            );
-                    }
-                }
-            }
-            Err(_) => {
-                info!(
-                        "ASAP_GORILLA_S3_* env vars not configured — router serves ASAP-tier metrics only (set ASAP_GORILLA_S3_BUCKET + ASAP_GORILLA_S3_REGION to enable archive routing, or set ASAP_THANOS_QUERY_URL to enable Path A2 thanos forwarding)",
-                    );
-            }
-        },
+        Ok(None) => {
+            info!(
+                "ASAP_THANOS_QUERY_URL not configured — router serves ASAP-tier metrics only (set ASAP_THANOS_QUERY_URL to enable Path A2 thanos archive forwarding)",
+            );
+        }
         Err(e) => {
             warn!(
                 "ASAP_THANOS_QUERY_URL set but ThanosQueryEngine failed to build ({e}); router will not have an archive engine",

@@ -423,10 +423,6 @@ impl HttpServer {
             .route(runtime_info_path, get(handle_runtime_info))
             .route(runtime_info_path, post(handle_runtime_info))
             .route("/metrics", get(handle_metrics))
-            // mvp/v5: dump the S3 cost-tracking counters as CSV.
-            // The demo's `run_mvp_demo.sh` curls this for each
-            // baseline; missing counters render as zeros.
-            .route("/internal/s3_cost.csv", get(handle_s3_cost_csv))
             // Control plane integration endpoints
             .route("/api/v1/precompute", post(handle_precompute_job))
             // Control plane's `PrecomputeClient` (control_plane/src/emit/precompute.rs)
@@ -1621,30 +1617,12 @@ async fn handle_metrics() -> impl IntoResponse {
     let mut buffer = Vec::new();
     prometheus::Encoder::encode(&encoder, &metric_families, &mut buffer)
         .unwrap_or_else(|e| tracing::error!("Failed to encode metrics: {}", e));
-    // mvp/v5: append the S3 cost counters in Prometheus text
-    // exposition. Mirrors `/internal/s3_cost.csv` — the CSV is for
-    // the demo, this is for live dashboards.
-    let counters = crate::storage_engines::gorilla_object_store::global_s3_cost_counters();
-    buffer.extend_from_slice(counters.render_prometheus().as_bytes());
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
         buffer,
-    )
-}
-
-/// mvp/v5: CSV dump of the S3 cost counters.
-///
-/// Renders ONE header row + ONE data row. Empty when no S3
-/// operations have been issued (the counters default to zero, so
-/// the CSV is still well-formed).
-async fn handle_s3_cost_csv() -> impl IntoResponse {
-    let counters = crate::storage_engines::gorilla_object_store::global_s3_cost_counters();
-    (
-        [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
-        counters.render_csv(),
     )
 }
 

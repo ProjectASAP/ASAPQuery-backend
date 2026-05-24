@@ -8,8 +8,8 @@
 //!
 //! * **Hot** = the `ASAPQueryEngine` handled the query from live
 //!   sketch-backed state.
-//! * **Cold** = the query was answered from the Gorilla archive
-//!   tier ([`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`]).
+//! * **Cold** = the query was answered from the archive tier
+//!   ([`crate::query_engines::thanos_query_engine::ThanosQueryEngine`], Path A2).
 //!
 //! The "shape" label is the parsed query's root op (`sum`,
 //! `count`, `avg`, `selector`, ...) — low-cardinality by design,

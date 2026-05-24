@@ -9,22 +9,19 @@
 //!   layer (schema registry, schema timeline, backfill types /
 //!   workers / HTTP endpoints) AND the physical storage backend
 //!   (`sketch_db::index`) are co-located under this path.
-//! * `gorilla_object_store` — S3/MinIO-backed Gorilla TSDB block
-//!   store used by the archive tier.
+//!
+//! The archive tier is served by the
+//! [`crate::query_engines::thanos_query_engine::ThanosQueryEngine`]
+//! (Path A2). The superseded in-process `gorilla_object_store`
+//! (custom GORILLA1 container format) has been deleted.
 //!
 //! `SketchStore` is re-exported at the top level
 //! (`crate::storage_engines::SketchStore`) for call-site stability.
 
-pub mod gorilla_object_store;
 pub mod sketch_db;
 pub mod traits;
 pub mod types;
 
-pub use gorilla_object_store::{
-    global_s3_cost_counters, ChunkRef, GorillaEngineConfig, GorillaQueryEngine, GorillaS3Config,
-    GorillaS3ConfigError, GorillaS3Store, ObjectStore, RawSample, S3CostCounters, S3CostSnapshot,
-    S3CostTrackingObjectStore,
-};
 pub use sketch_db::index::{
     AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
     SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,

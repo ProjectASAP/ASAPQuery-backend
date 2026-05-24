@@ -7,30 +7,21 @@
 //! Step-2.3 (this file) wires the backend to forward archive-tier
 //! PromQL queries to that sidecar over HTTP.
 //!
-//! Operating modes are selected by the
-//! [`ASAP_THANOS_QUERY_URL_ENV`] env var, consulted at backend
-//! startup:
+//! The engine is selected by the [`ASAP_THANOS_QUERY_URL_ENV`] env
+//! var, consulted at backend startup:
 //!
 //! * **Path A2 mode** (env set) — `ThanosQueryEngine` is
 //!   registered in the [`crate::query_engines::routing::EngineRouter`]. Archive
 //!   queries POST to `${ASAP_THANOS_QUERY_URL}/api/v1/query` and
 //!   the answer is wrapped in ASAP's standard
 //!   [`crate::query_engines::QueryResult`] shape.
-//! * **Legacy mode** (env unset) — the in-process
-//!   [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`]
-//!   handles archive queries from the per-hour Gorilla chunks that
-//!   [`crate::storage_engines::gorilla_object_store::GorillaS3Store`] streams
-//!   from S3 / MinIO.
-//!   Phase δ deletes this leg after Path A2 is verified
-//!   end-to-end.
 //!
-//! The two modes are mutually exclusive: when Path A2 is active,
-//! both the legacy id (`thanos_query`) and the alias id
-//! (`thanos_query`) point at the same `ThanosQueryEngine`
-//! instance, so the per-metric `BackendStorageRouting` config can
-//! target either name without surprise. See the binary's
-//! `register_thanos_or_thanos_query` helper for the
-//! registration site.
+//! Path A2 is now the only archive path. The superseded legacy
+//! in-process Gorilla executor (custom GORILLA1 container format,
+//! read from per-hour chunks on S3 / MinIO) has been deleted after
+//! Path A2 was verified end-to-end. When the env var is unset, the
+//! binary registers a `NoDataArchiveEngine` stub on the archive
+//! slot instead.
 
 use std::time::{Duration, Instant};
 
@@ -55,8 +46,7 @@ use crate::storage_engines::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProf
 /// Env var consulted at backend startup. When set, the binary
 /// registers a [`ThanosQueryEngine`] pointing at the URL and the
 /// router dispatches archive-tier queries to it. When unset, the
-/// legacy in-process [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`]
-/// handles archive queries.
+/// binary registers a `NoDataArchiveEngine` stub on the archive slot.
 pub const ASAP_THANOS_QUERY_URL_ENV: &str = "ASAP_THANOS_QUERY_URL";
 
 /// Default upstream URL when `ASAP_THANOS_QUERY_URL` is set to the
@@ -535,8 +525,8 @@ pub enum ThanosQueryError {
 
 /// Convenience combinator the binary uses at startup: try
 /// [`ThanosQueryEngine::from_env`]; if it returns `None`, the
-/// caller falls through to the legacy in-process
-/// [`crate::storage_engines::gorilla_object_store::GorillaQueryEngine`] path.
+/// caller registers a `NoDataArchiveEngine` stub on the archive
+/// slot (the legacy in-process Gorilla path has been deleted).
 ///
 /// Returning `Result<Option<...>, ...>` instead of unwrapping in
 /// `main.rs` keeps the construction failure (bad URL / bad TLS
