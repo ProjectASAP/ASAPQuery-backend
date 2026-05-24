@@ -4,11 +4,11 @@ target/
 **/.git/
 # Workspace per-crate caches (control_plane/target, data_plane/target,
 # benchmarks/.../target) that aren't covered by the top-level `target/`
-# pattern. Excluding them shrinks the BuildKit context transfer for
-# `docker build -f deploy/docker/Dockerfile.backend` from multi-GB
-# (every host-side cargo build leaves a few-hundred-MB target there)
-# back down to the source-only size that the in-container `cargo
-# build` needs.
+# pattern. Excluding them shrinks the BuildKit context transfer for the
+# image builds (`docker build -f data_plane/Dockerfile` and
+# `-f control_plane/Dockerfile`, each `COPY . ASAPQuery-backend`) from
+# multi-GB (every host-side cargo build leaves a few-hundred-MB target
+# there) back down to the source-only size the in-container build needs.
 
 # Editor + tooling state
 .idea/
