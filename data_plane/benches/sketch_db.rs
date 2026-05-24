@@ -387,11 +387,78 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
     g.finish();
 }
 
+/// Build a `StreamingConfig` whose single agg-config's content
+/// signature matches every sid registered by `build_precompute_store`
+/// (metric / `Sum` / no grouping / empty params+filter). With this
+/// config the reconciler retires nothing — the steady-state ingest
+/// case, where the per-batch reconcile is pure scan overhead.
+fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types::StreamingConfig {
+    use asap_types::aggregation_config::AggregationConfig;
+    use asap_types::enums::{AggregationType as AT, WindowType};
+    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use std::collections::HashMap;
+
+    let cfg = AggregationConfig::new(
+        AT::Sum,
+        String::new(),
+        HashMap::new(),
+        KeyByLabelNames::empty(),
+        KeyByLabelNames::empty(),
+        KeyByLabelNames::empty(),
+        String::new(),
+        60,
+        60,
+        WindowType::Tumbling,
+        String::new(),
+        metric.to_string(),
+        None,
+        None,
+        None,
+    );
+    let mut map = HashMap::new();
+    map.insert(1u64, cfg);
+    data_plane::storage_engines::types::StreamingConfig::new(map)
+}
+
+/// `reconcile_from_streaming_config` ran on EVERY ingest batch and, in
+/// the pre-optimization code, deep-cloned every `SketchInstanceMetadata`
+/// in the catalog (`snapshot_instances()`) — the dominant ingest-path
+/// CPU cost in live `perf` profiling (BTreeMap/String clone + malloc
+/// churn). This bench measures one un-gated reconcile against a
+/// populated store at a few catalog sizes, so the before/after clone
+/// elimination is directly visible.
+fn bench_reconcile_per_batch(c: &mut Criterion) {
+    use std::time::Duration;
+
+    let mut g = c.benchmark_group("reconcile_per_batch");
+    g.sample_size(50);
+
+    let metric = "bench_metric";
+    for num_sids in [100usize, 1_000, 10_000] {
+        let store = build_precompute_store(num_sids, 1, metric);
+        let config = matching_streaming_config(metric);
+        g.throughput(Throughput::Elements(num_sids as u64));
+        g.bench_function(BenchmarkId::new("full_scan", num_sids), |b| {
+            b.iter(|| {
+                let summary =
+                    data_plane::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+                        black_box(&store),
+                        black_box(&config),
+                        Duration::from_secs(60),
+                    );
+                black_box(summary);
+            });
+        });
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_append_sample,
     bench_append_precompute,
     bench_query_range,
     bench_query_precomputes_by_agg,
+    bench_reconcile_per_batch,
 );
 criterion_main!(benches);
