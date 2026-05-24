@@ -250,6 +250,11 @@ mod tests {
 
     #[test]
     fn opamp_emitter_round_trips_through_free_function() {
+        // `emit_edge_yaml` reads process-global env (`ASAP_EDGE_FUSED`,
+        // `ASAP_AGENT_MEMORY_LIMIT_MIB`); hold the crate-wide env lock so
+        // a concurrent env-mutating test can't flip the gate between the
+        // two emit calls this test compares for equality.
+        let _env = crate::test_support::env_lock();
         let cfg = empty_edge_cfg();
         let emitter = OpampEmitter {
             opamp_endpoint: "ws://controller/v1/opamp".to_string(),

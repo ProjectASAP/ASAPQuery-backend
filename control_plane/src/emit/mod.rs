@@ -460,6 +460,10 @@ mod runtime_tests {
 
     #[test]
     fn emit_for_runtime_default_matches_emit_edge_yaml() {
+        // Serialize against the env-mutating tests in `stage_config`:
+        // `emit_edge_yaml` reads `ASAP_EDGE_FUSED` and must observe the
+        // default (unset) gate to emit the routing-connector shape.
+        let _env = crate::test_support::env_lock();
         use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
         use crate::sketch_algebra::params::SketchKind;
@@ -857,6 +861,9 @@ mod runtime_tests {
     /// but the round-trip through the emitter drops the labels.
     #[test]
     fn workload_entry_grouping_labels_surface_in_emit_keep_keys_list() {
+        // Serialize against env-mutating tests: `emit_edge_yaml` reads
+        // `ASAP_EDGE_FUSED` and must observe the default (unset) gate.
+        let _env = crate::test_support::env_lock();
         use crate::physical::colored_dag::emitter::{EdgeStageConfig, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
         use crate::sketch_algebra::params::SketchKind;
