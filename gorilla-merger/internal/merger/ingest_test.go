@@ -138,10 +138,11 @@ func TestIngestRoundTrip(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 
-	// Series A: __name__ + its attrs + external labels.
+	// Series A: __name__ + its attrs only (external labels are added by the
+	// TSDBStore at query time, NOT stamped into the stored series).
 	wantA := labels.FromStrings(
 		labels.MetricName, "http_requests_total",
-		"job", "api", "instance", "a", "merger", "test-merger")
+		"job", "api", "instance", "a")
 	gotA := readBack(t, storage, wantA)
 	wantSamplesA := []sample{{base, 1}, {base + 1000, 2}, {base + 2000, 3}}
 	assertSamples(t, "A", gotA, wantSamplesA)
@@ -149,7 +150,7 @@ func TestIngestRoundTrip(t *testing.T) {
 	// Series B: a distinct instance is a distinct series.
 	wantB := labels.FromStrings(
 		labels.MetricName, "http_requests_total",
-		"job", "api", "instance", "b", "merger", "test-merger")
+		"job", "api", "instance", "b")
 	gotB := readBack(t, storage, wantB)
 	wantSamplesB := []sample{{base, 10}, {base + 1000, 20}}
 	assertSamples(t, "B", gotB, wantSamplesB)
@@ -178,12 +179,14 @@ func TestIngestBadBodyReturns400(t *testing.T) {
 	}
 }
 
-func TestLabelsForExternalWins(t *testing.T) {
-	ext := labels.FromStrings("merger", "m1", "shared", "external")
-	got := labelsFor("metric", map[string]string{"shared": "frag", "job": "x"}, ext)
+func TestLabelsForNoExternalStamping(t *testing.T) {
+	// External labels (cluster/merger) must NOT be stamped at ingest — the
+	// Thanos TSDBStore appends them at query time. Stamping them here too
+	// produced duplicate labels and crashed TSDBStore.Series.
+	got := labelsFor("metric", map[string]string{"shared": "frag", "job": "x"})
 	want := labels.FromStrings(
 		labels.MetricName, "metric",
-		"job", "x", "merger", "m1", "shared", "external")
+		"job", "x", "shared", "frag")
 	if labels.Compare(got, want) != 0 {
 		t.Fatalf("labelsFor mismatch:\n got  %s\n want %s", got.String(), want.String())
 	}

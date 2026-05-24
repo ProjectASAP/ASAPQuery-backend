@@ -47,15 +47,17 @@ func NewIngester(s *Storage, logger *slog.Logger) *Ingester {
 // labelsFor builds the series labels for a fragment: __name__ = MetricName,
 // plus the fragment Attributes, plus the merger's external labels. External
 // labels win on conflict (they identify this merger/agent and must be stable).
-func labelsFor(metricName string, attrs map[string]string, external labels.Labels) labels.Labels {
+func labelsFor(metricName string, attrs map[string]string) labels.Labels {
 	bld := labels.NewBuilder(labels.EmptyLabels())
 	bld.Set(labels.MetricName, metricName)
 	for k, v := range attrs {
 		bld.Set(k, v)
 	}
-	external.Range(func(l labels.Label) {
-		bld.Set(l.Name, l.Value)
-	})
+	// External labels (cluster/merger) are NOT stamped into the stored series:
+	// the Thanos TSDBStore appends them at query time, and the shipper writes
+	// them into each block's meta. Stamping them here too produced DUPLICATE
+	// cluster/merger labels, so thanos TSDBStore.Series -> ReAllocZLabelsStrings
+	// read a malformed label set and crashed (corrupt-length OOM).
 	return bld.Labels()
 }
 
@@ -92,7 +94,7 @@ func (i *Ingester) IngestBatch(ctx context.Context, raw []byte) (ingestResult, e
 			_ = app.Rollback()
 			return ingestResult{}, fmt.Errorf("fragment %d: decode xor chunk: %w", fi, cerr)
 		}
-		ls := labelsFor(f.MetricName, f.Attributes, i.externalLabels)
+		ls := labelsFor(f.MetricName, f.Attributes)
 
 		it := chunk.Iterator(nil)
 		var ref storage.SeriesRef
