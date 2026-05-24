@@ -226,6 +226,16 @@ pub struct SketchStore {
     /// sids without a fingerprint reach those sids through
     /// `instances_matching(metric, gbk)`.
     policy_to_sids: RwLock<HashMap<PolicyFingerprint, BTreeSet<u64>>>,
+    /// Pointer (as `usize`) of the `Arc<StreamingConfig>` this store
+    /// last reconciled against. `reconcile_from_streaming_config` runs
+    /// on every ingest batch, but the config is a lock-free
+    /// `Arc<ArcSwap<StreamingConfig>>` that only changes its `Arc`
+    /// identity on a control-plane swap (rare). Gating the full
+    /// catalog scan on a cheap pointer compare against this field lets
+    /// the steady-state ingest path skip reconcile entirely.
+    /// `0` (the `Default`) means "never reconciled" so the first batch
+    /// always runs. A real `Arc` data pointer is never null.
+    last_reconciled_config_ptr: std::sync::atomic::AtomicUsize,
 }
 
 /// Three possible outcomes of looking up a sid in the SketchStore.
@@ -491,8 +501,7 @@ impl SketchStore {
         by_label_id
             .into_iter()
             .map(|(label_id, samples)| {
-                let label_values_map =
-                    guard.intern.resolve(label_id).cloned().unwrap_or_default();
+                let label_values_map = guard.intern.resolve(label_id).cloned().unwrap_or_default();
                 (label_values_map, samples)
             })
             .collect()
@@ -583,11 +592,17 @@ impl SketchStore {
         end_unix_ms: u64,
     ) -> std::collections::HashMap<
         Option<crate::storage_engines::types::KeyByLabelValues>,
-        Vec<((u64, u64), Arc<dyn crate::storage_engines::types::AggregateCore>)>,
+        Vec<(
+            (u64, u64),
+            Arc<dyn crate::storage_engines::types::AggregateCore>,
+        )>,
     > {
         let mut out: std::collections::HashMap<
             Option<crate::storage_engines::types::KeyByLabelValues>,
-            Vec<((u64, u64), Arc<dyn crate::storage_engines::types::AggregateCore>)>,
+            Vec<(
+                (u64, u64),
+                Arc<dyn crate::storage_engines::types::AggregateCore>,
+            )>,
         > = std::collections::HashMap::new();
 
         // Pick the sids whose metadata describes this (metric,
@@ -649,11 +664,8 @@ impl SketchStore {
                 .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
                 if let Some(p) = payload.as_exact_agg() {
-                    let label_values_map = guard
-                        .intern
-                        .resolve(*label_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let label_values_map =
+                        guard.intern.resolve(*label_id).cloned().unwrap_or_default();
                     let key = if label_values_map.is_empty() {
                         None
                     } else {
@@ -661,10 +673,9 @@ impl SketchStore {
                             labels: label_values_map.values().cloned().collect(),
                         })
                     };
-                    out.entry(key).or_default().push((
-                        *win,
-                        Arc::from(p.clone_boxed_core()),
-                    ));
+                    out.entry(key)
+                        .or_default()
+                        .push((*win, Arc::from(p.clone_boxed_core())));
                 }
             }
             buf.clear();
@@ -673,11 +684,8 @@ impl SketchStore {
                 sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
                 for (win, label_id, payload) in &buf {
                     if let Some(p) = payload.as_exact_agg() {
-                        let label_values_map = guard
-                            .intern
-                            .resolve(*label_id)
-                            .cloned()
-                            .unwrap_or_default();
+                        let label_values_map =
+                            guard.intern.resolve(*label_id).cloned().unwrap_or_default();
                         let key = if label_values_map.is_empty() {
                             None
                         } else {
@@ -685,10 +693,9 @@ impl SketchStore {
                                 labels: label_values_map.values().cloned().collect(),
                             })
                         };
-                        out.entry(key).or_default().push((
-                            *win,
-                            Arc::from(p.clone_boxed_core()),
-                        ));
+                        out.entry(key)
+                            .or_default()
+                            .push((*win, Arc::from(p.clone_boxed_core())));
                     }
                 }
                 buf.clear();
@@ -763,6 +770,48 @@ impl SketchStore {
             .unwrap_or(false)
     }
 
+    /// Record that the store has reconciled against the
+    /// `Arc<StreamingConfig>` identified by `config_ptr` (the value of
+    /// `Arc::as_ptr(..) as usize`), returning `true` if this is a *new*
+    /// config pointer (i.e. the caller should run a full reconcile) or
+    /// `false` if the store already reconciled against this exact
+    /// config and the scan can be skipped.
+    ///
+    /// Used by [`crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed`]
+    /// to make the per-ingest-batch reconcile a single relaxed atomic
+    /// load in the common (config-unchanged) case.
+    pub fn mark_reconciled_config(&self, config_ptr: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.last_reconciled_config_ptr.load(Ordering::Relaxed) == config_ptr {
+            return false;
+        }
+        self.last_reconciled_config_ptr
+            .store(config_ptr, Ordering::Relaxed);
+        true
+    }
+
+    /// Visit every registered instance under a single read lock,
+    /// invoking `f(sid, &meta)` for each. Lets read-side scans that
+    /// only need to *inspect* metadata (signature derivation,
+    /// status filtering) avoid the O(N) deep clone that
+    /// [`Self::snapshot_instances`] performs — each
+    /// `SketchInstanceMetadata` carries a `String` + `BTreeSet<String>`
+    /// + `AggKind` (more strings), so the clone is allocation-heavy at
+    /// production catalog sizes.
+    ///
+    /// The closure runs while the read lock is held, so it must not
+    /// call back into the store (which would deadlock) and should stay
+    /// allocation-light. Callers that need to mutate or call user code
+    /// should collect the cheap data they need (e.g. `Vec<u64>` of
+    /// sids) here, then act after this returns.
+    pub fn for_each_instance<F: FnMut(u64, &SketchInstanceMetadata)>(&self, mut f: F) {
+        if let Ok(map) = self.instances.read() {
+            for (sid, meta) in map.iter() {
+                f(*sid, meta);
+            }
+        }
+    }
+
     /// Iterate (clones) all instance metadata matching `status`.
     /// Used by the eviction service to enumerate `Expired` sids
     /// without holding a long read lock.
@@ -771,7 +820,10 @@ impl SketchStore {
             Ok(m) => m,
             Err(_) => return Vec::new(),
         };
-        map.values().filter(|s| s.status() == status).cloned().collect()
+        map.values()
+            .filter(|s| s.status() == status)
+            .cloned()
+            .collect()
     }
 
     /// Force `sid` into `Retired` status, scheduling expiry
@@ -955,7 +1007,12 @@ impl SketchStore {
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
-        self.append_precompute(sid, label_values_map, window, accumulator.clone_boxed_core());
+        self.append_precompute(
+            sid,
+            label_values_map,
+            window,
+            accumulator.clone_boxed_core(),
+        );
         Some(sid)
     }
 
@@ -1057,8 +1114,9 @@ impl SketchStore {
         );
 
         let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
-        let parts_root =
-            crate::storage_engines::sketch_db::index::persistence::flusher::parts_root(&cfg.disk_path);
+        let parts_root = crate::storage_engines::sketch_db::index::persistence::flusher::parts_root(
+            &cfg.disk_path,
+        );
         let part_cache = PartCache::new(parts_root.clone(), cfg.part_cache_bytes);
 
         let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
@@ -1225,7 +1283,10 @@ mod tests {
         meta_with_policy(sid, asap_types::PolicyFingerprint::UNSET)
     }
 
-    fn meta_with_policy(sid: u64, policy_fp: asap_types::PolicyFingerprint) -> SketchInstanceMetadata {
+    fn meta_with_policy(
+        sid: u64,
+        policy_fp: asap_types::PolicyFingerprint,
+    ) -> SketchInstanceMetadata {
         let cfg = SketchConfig::DDSketch {
             relative_accuracy: 0.01,
         };
@@ -1544,12 +1605,7 @@ mod tests {
             Box::new(SumAccumulator::with_sum(2.0)),
         );
 
-        let result = idx.query_precomputes_by_agg(
-            "cpu_seconds",
-            AggregationType::Sum,
-            0,
-            10_000,
-        );
+        let result = idx.query_precomputes_by_agg("cpu_seconds", AggregationType::Sum, 0, 10_000);
         assert_eq!(result.len(), 1, "one label-values key");
         let buckets = result.values().next().expect("populated");
         assert_eq!(buckets.len(), 2, "two windows for that key");
@@ -1563,12 +1619,7 @@ mod tests {
         idx.register(meta(7));
         idx.append_sample(7, BTreeMap::new(), (1000, 2000), sample(1));
 
-        let result = idx.query_precomputes_by_agg(
-            "m",
-            AggregationType::Sum,
-            0,
-            10_000,
-        );
+        let result = idx.query_precomputes_by_agg("m", AggregationType::Sum, 0, 10_000);
         assert!(result.is_empty(), "sketch sids must not surface");
     }
 
@@ -1626,7 +1677,11 @@ mod tests {
             "sketch_type_name should reflect sid metadata's sketch_kind: {}",
             entry.sketch_type_name
         );
-        assert_eq!(entry.sketch_bytes.len(), 1, "single-byte sample bytes carry");
+        assert_eq!(
+            entry.sketch_bytes.len(),
+            1,
+            "single-byte sample bytes carry"
+        );
     }
 
     #[test]

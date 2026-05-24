@@ -633,7 +633,12 @@ async fn route_otlp_to_precompute(
     // newly-retired sids transition immediately. The §6.3 ingest
     // barrier is enforced at the sid level inside
     // `SketchStore::ingest_precompute_for_agg_config`.
-    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+    //
+    // Gated on the config `Arc` identity: the streaming config only
+    // changes on a (rare) control-plane swap, so in steady state this
+    // collapses to a single relaxed atomic load and skips the full
+    // catalog scan — the dominant ingest-path CPU cost in profiling.
+    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest_state.sketch_index.as_ref(),
         &snap,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
@@ -860,8 +865,9 @@ async fn route_modified_otlp_sketches_to_precompute(
     let agg_configs = snap.get_all_aggregation_configs();
     // Schema retirement #5 — agg_id-keyed registry retired; sid-level
     // reconcile is the only path going forward. See the raw-OTLP
-    // routine above for the full rationale.
-    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+    // routine above for the full rationale (incl. the config-Arc gate
+    // that skips the catalog scan when the config is unchanged).
+    let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest_state.sketch_index.as_ref(),
         &snap,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,

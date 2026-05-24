@@ -27,5 +27,7 @@ pub mod status;
 pub use eviction::{
     warn_if_retention_inverted, SchemaEvictionConfig, SchemaEvictionHandle, SchemaEvictionService,
 };
-pub use reconcile::{reconcile_from_streaming_config, SidReconcileSummary};
+pub use reconcile::{
+    reconcile_from_streaming_config, reconcile_if_config_changed, SidReconcileSummary,
+};
 pub use status::{AggStatus, DEFAULT_RETIREMENT_RETENTION};
