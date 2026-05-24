@@ -984,35 +984,7 @@ mod tests {
     // include `gorillas3` (archive write), `routing` (warm-passthrough
     // dispatch), and the `metrics/warm_passthrough` pipeline.
 
-    /// Serialises tests that mutate `USE_TYPED_STAGE_SPLIT`. Mirror of
-    /// the guard in `main::tests` — `cargo test` runs tests in
-    /// parallel by default and `typed_stage_split_enabled()` reads the
-    /// env var on every call.
-    static TYPED_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct TypedEnvGuard {
-        previous: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl TypedEnvGuard {
-        fn enable() -> Self {
-            let lock = TYPED_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-            let previous = std::env::var("USE_TYPED_STAGE_SPLIT").ok();
-            std::env::set_var("USE_TYPED_STAGE_SPLIT", "1");
-            Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-    impl Drop for TypedEnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(v) => std::env::set_var("USE_TYPED_STAGE_SPLIT", v),
-                None => std::env::remove_var("USE_TYPED_STAGE_SPLIT"),
-            }
-        }
-    }
+    use crate::test_support::EnvVarGuard;
 
     /// Given an agent runtime + a quantile workload registered in the
     /// workload store, the typed emit path produces YAML containing
@@ -1023,7 +995,7 @@ mod tests {
     /// (it builds a single-pipeline DDSketch YAML with no routing).
     #[tokio::test]
     async fn typed_replan_emit_includes_freshness_probe_routing() {
-        let _env = TypedEnvGuard::enable();
+        let _env = EnvVarGuard::set("USE_TYPED_STAGE_SPLIT", "1");
 
         let r = make_replanner();
         let (wl, wc) = test_workload("latency");
@@ -1074,11 +1046,10 @@ mod tests {
     /// can't yet handle the new processors.
     #[tokio::test]
     async fn legacy_path_omits_typed_processors_when_gate_off() {
-        // Hold the env-guard lock so a parallel typed test can't
-        // flip the var underneath us, and explicitly unset.
-        let _lock = TYPED_ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let prior = std::env::var("USE_TYPED_STAGE_SPLIT").ok();
-        std::env::remove_var("USE_TYPED_STAGE_SPLIT");
+        // Hold the crate-wide env lock so a parallel typed test can't
+        // flip the var underneath us; the guard unsets it and restores
+        // the prior value on drop.
+        let _env = EnvVarGuard::unset("USE_TYPED_STAGE_SPLIT");
 
         let r = make_replanner();
         let (wl, wc) = test_workload("latency");
@@ -1102,10 +1073,6 @@ mod tests {
             "legacy path must not emit warm-passthrough pipeline:\n{yaml}"
         );
 
-        // Restore.
-        match prior {
-            Some(v) => std::env::set_var("USE_TYPED_STAGE_SPLIT", v),
-            None => std::env::remove_var("USE_TYPED_STAGE_SPLIT"),
-        }
+        // `_env` restores the prior `USE_TYPED_STAGE_SPLIT` value on drop.
     }
 }

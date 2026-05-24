@@ -2448,13 +2448,6 @@ mod tests {
         CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams,
     };
 
-    // env vars are process-global; cargo runs unit tests on multiple
-    // threads. Serialize every test that reads or writes
-    // `ASAP_AGENT_MEMORY_LIMIT_MIB` (the memory_limiter knob) so a
-    // parallel test thread doesn't observe one test's setup as
-    // another test's input.
-    static MEMORY_LIMIT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn ddsketch_edge_cfg() -> EdgeStageConfig {
         EdgeStageConfig {
             source_metric: Some("http_request_duration_seconds".to_string()),
@@ -2480,6 +2473,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_contains_processor_and_pipeline_refs() {
+        let _env = crate::test_support::env_lock();
         let yaml = emit_edge_yaml(&ddsketch_edge_cfg(), "ws://ctrl:4320/v1/opamp", "test-agent")
             .expect("emit_edge_yaml ok");
 
@@ -2533,6 +2527,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_kll_uses_k_param() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.sketch_processors[0] = EdgeSketchProcessor {
             processor_name: "KLL".to_string(),
@@ -2563,6 +2558,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_emits_delta_transmission_for_supported_families() {
+        let _env = crate::test_support::env_lock();
         // DDSketch / HLL / CountSketch / Count-Min all support sparse
         // delta encoding — the controller emits `delta_transmission:
         // true` so the per-window wire footprint is the bucket / cell
@@ -2611,6 +2607,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_countmin_includes_required_metric_name() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.source_metric = Some("endpoint_request_freq".to_string());
         cfg.sketch_processors[0] = EdgeSketchProcessor {
@@ -2629,6 +2626,7 @@ mod tests {
 
     #[test]
     fn edge_yaml_batch_mode_when_no_window() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.window_secs = None;
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -2837,6 +2835,7 @@ mod tests {
 
     #[test]
     fn export_target_endpoint_is_passed_through_verbatim() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.exporter_target = ExportTarget::Endpoint("custom-gw:5317".into());
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -3424,6 +3423,7 @@ mod tests {
     /// processor that dispatches per-metric on `asap.mode`.
     #[test]
     fn phase_eps1_mode3_edge_yaml_has_otlphttp_prometheus_exporter() {
+        let _env = crate::test_support::env_lock();
         let cfg = EdgeStageConfig {
             source_metric: Some("http_requests_total".to_string()),
             label_filters: Vec::new(),
@@ -3503,6 +3503,7 @@ mod tests {
     /// compatibility.
     #[test]
     fn phase_eps1_no_mode3_edge_yaml_unchanged_from_phase_b() {
+        let _env = crate::test_support::env_lock();
         let cfg = ddsketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
@@ -3533,6 +3534,7 @@ mod tests {
     /// the ASAP-tier engine's `last_over_time(...)` returns empty.
     #[test]
     fn phase_3_2_5_bug_a_archive_tier_metrics_emit_gorillas3_processor() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_freshness_probe_archive".to_string(),
@@ -3592,6 +3594,7 @@ mod tests {
     /// canonical `[gorillas3, ddsketch, batch]` ordering.
     #[test]
     fn phase_3_2_5_bug_a_gorillas3_runs_before_sketch_in_pipeline() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_freshness_probe_archive".to_string(),
@@ -3627,6 +3630,7 @@ mod tests {
     /// else takes `metrics/asap_tier` as before.
     #[test]
     fn phase_3_2_5_bug_b_warm_passthrough_routes_around_sketch() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_freshness_probe_warm".to_string(),
@@ -3690,6 +3694,7 @@ mod tests {
     /// with both an `asap.mode` and a `metric.name` table entry.
     #[test]
     fn phase_3_2_5_bug_b_warm_passthrough_composes_with_prometheus_archive() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_freshness_probe_warm".to_string(),
@@ -3796,6 +3801,7 @@ mod tests {
 
     #[test]
     fn mvp46_emit_loads_all_5_sketch_processors() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for proc in ["ddsketch", "KLL", "HLL", "countsketch", "countmin"] {
@@ -3808,6 +3814,7 @@ mod tests {
 
     #[test]
     fn mvp46_routing_lives_in_connectors_not_processors() {
+        let _env = crate::test_support::env_lock();
         // The real bugfix: OTel collector v0.106+ removed
         // `routingprocessor`; the routing component is now a
         // `routingconnector`. We MUST emit it under `connectors:`.
@@ -3858,6 +3865,7 @@ mod tests {
 
     #[test]
     fn mvp46_emits_all_6_named_pipelines() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for pl in [
@@ -3878,6 +3886,7 @@ mod tests {
 
     #[test]
     fn mvp46_entry_pipeline_routes_to_connector_not_processor() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Find the entry `metrics:` pipeline section (under
@@ -3904,6 +3913,7 @@ mod tests {
 
     #[test]
     fn mvp46_per_sketch_pipelines_have_gorillas3_first_when_archive_declared() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg();
         // Declare an archive-tier metric so gorillas3 is emitted.
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
@@ -3959,14 +3969,11 @@ mod tests {
         // the agent at ~3 min under sustained load.
         //
         // B1 follow-up: asserts on `limit_mib: 1280` (the env-var
-        // default) — serialize against MEMORY_LIMIT_ENV_LOCK so the
-        // companion `b1_memory_limiter_honours_*` tests can't
-        // race-set `ASAP_AGENT_MEMORY_LIMIT_MIB=1600` mid-emit.
-        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: see MEMORY_LIMIT_ENV_LOCK.
-        unsafe {
-            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
-        }
+        // default) — unset the var under the crate-wide env lock so the
+        // companion `b1_memory_limiter_honours_*` tests can't race-set
+        // `ASAP_AGENT_MEMORY_LIMIT_MIB=1600` mid-emit. The guard restores
+        // the prior value on drop.
+        let _env = crate::test_support::EnvVarGuard::unset("ASAP_AGENT_MEMORY_LIMIT_MIB");
         let mut cfg = five_sketch_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_requests_total_latency_ms".into(),
@@ -4022,6 +4029,7 @@ mod tests {
 
     #[test]
     fn mvp46_routing_table_dispatches_per_metric_to_correct_family() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Every metric in the contract dispatches via routingconnector OTTL
@@ -4084,6 +4092,7 @@ mod tests {
 
     #[test]
     fn mvp46_pruned_single_family_emits_only_that_family_pipeline() {
+        let _env = crate::test_support::env_lock();
         // A workload with ONE metric needing ONLY DDSketch must emit the
         // DDSketch processor + pipeline and NOTHING for the other 4
         // families — this is the core bandwidth fix.
@@ -4125,6 +4134,7 @@ mod tests {
 
     #[test]
     fn mvp46_pruned_two_metrics_two_families_emits_exactly_those_two() {
+        let _env = crate::test_support::env_lock();
         // Two metrics, each needing a single distinct family (DDSketch,
         // HLL). Exactly those two pipelines/processors must be emitted;
         // KLL/CountSketch/CMS pruned.
@@ -4154,6 +4164,7 @@ mod tests {
 
     #[test]
     fn mvp46_multi_family_metric_emits_both_pipelines_and_routes_to_both() {
+        let _env = crate::test_support::env_lock();
         // ASAPCollector#400 SET semantics — the make-or-break case: a
         // SINGLE metric queried by TWO capabilities (DDSketch + HLL) must
         // (1) emit BOTH per-family pipelines + processors, and (2) route
@@ -4201,6 +4212,7 @@ mod tests {
 
     #[test]
     fn mvp46_default_pipeline_is_raw_passthrough() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Tolerate inline-vs-block list rendering — serde_yaml chooses
@@ -4217,6 +4229,7 @@ mod tests {
 
     #[test]
     fn mvp46_warm_passthrough_routes_to_raw_passthrough_pipeline() {
+        let _env = crate::test_support::env_lock();
         // Freshness probes (Phase 3.2.5 Bug b) must bypass every sketch
         // processor — they route to `metrics/raw_passthrough` so the
         // metric name is preserved end-to-end.
@@ -4267,6 +4280,7 @@ mod tests {
 
     #[test]
     fn mvp46_per_sketch_pipelines_use_routing_as_receiver() {
+        let _env = crate::test_support::env_lock();
         // The connector is referenced as both an exporter (entry
         // pipeline) and a receiver (each per-family pipeline). This
         // pins the receiver-side wiring.
@@ -4296,6 +4310,7 @@ mod tests {
 
     #[test]
     fn mvp46_empty_metric_to_family_falls_back_to_legacy_emit() {
+        let _env = crate::test_support::env_lock();
         // Backward-compat invariant: when the planner hasn't populated
         // metric_to_family, the emitter must produce the legacy
         // single-pipeline shape (no connectors block, no per-family
@@ -4324,6 +4339,7 @@ mod tests {
 
     #[test]
     fn mvp46_composes_with_prometheus_archive_mode3() {
+        let _env = crate::test_support::env_lock();
         // Mode 3 (Prometheus archive) folds into the same routing
         // connector table — the `metrics/prometheus_archive` pipeline
         // is added as an additional fan-out target.
@@ -4388,6 +4404,7 @@ mod tests {
 
     #[test]
     fn b3_emits_transform_keep_processor_per_metric_with_grouping_labels() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for metric in [
@@ -4407,6 +4424,7 @@ mod tests {
 
     #[test]
     fn b3_transform_block_uses_keep_keys_ottl_with_correct_labels() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
@@ -4430,6 +4448,7 @@ mod tests {
 
     #[test]
     fn b3_per_family_pipeline_prepends_keep_before_sketch() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for (pipeline, metric, family_proc) in [
@@ -4477,6 +4496,7 @@ mod tests {
 
     #[test]
     fn issue403_sum_role_metric_gets_metricstransform_processor() {
+        let _env = crate::test_support::env_lock();
         let cfg = sum_role_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
@@ -4495,6 +4515,7 @@ mod tests {
 
     #[test]
     fn issue403_metricstransform_keeps_only_grouping_labels() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = sum_role_edge_cfg();
         cfg.metric_to_grouping_labels
             .insert("http_requests_total".into(), vec!["zone".into(), "region".into()]);
@@ -4510,6 +4531,7 @@ mod tests {
 
     #[test]
     fn issue403_sum_role_metric_routes_to_dedicated_pipeline() {
+        let _env = crate::test_support::env_lock();
         let cfg = sum_role_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // routing-table entry maps the metric to sum_aggregate pipeline
@@ -4552,6 +4574,7 @@ mod tests {
 
     #[test]
     fn issue403_metricstransform_runs_after_gorillas3_so_cold_tier_keeps_full_card() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = sum_role_edge_cfg();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_requests_total".into(),
@@ -4581,6 +4604,7 @@ mod tests {
 
     #[test]
     fn issue403_sum_role_without_grouping_labels_stays_raw_passthrough() {
+        let _env = crate::test_support::env_lock();
         // No grouping labels declared ⇒ nothing to aggregate by ⇒ keep
         // the raw_passthrough default (no dedicated pipeline emitted).
         let mut cfg = five_sketch_edge_cfg();
@@ -4599,6 +4623,7 @@ mod tests {
 
     #[test]
     fn issue403_sketched_metric_not_edge_summed() {
+        let _env = crate::test_support::env_lock();
         // A metric mapped to a sketch family must stay on its sketch path
         // even if it also appears in cumulative_counter_metrics.
         let mut cfg = five_sketch_edge_cfg_with_grouping_labels();
@@ -4613,6 +4638,7 @@ mod tests {
 
     #[test]
     fn b3_keep_lives_after_gorillas3_so_cold_tier_keeps_full_attrs() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg_with_grouping_labels();
         cfg.archive_tier_metrics = vec![ArchiveTierMetric {
             metric: "http_requests_total_latency_ms".into(),
@@ -4651,6 +4677,7 @@ mod tests {
 
     #[test]
     fn b3_no_transform_processor_when_grouping_labels_absent() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
@@ -4665,6 +4692,7 @@ mod tests {
 
     #[test]
     fn b3_empty_grouping_label_list_emits_empty_keep_keys() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg();
         cfg.metric_to_grouping_labels
             .insert("http_requests_total_latency_ms".into(), vec![]);
@@ -4679,6 +4707,7 @@ mod tests {
 
     #[test]
     fn b3_legacy_emit_edge_yaml_injects_keep_for_source_metric() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.source_metric = Some("http_requests_total_latency_ms".to_string());
         cfg.metric_to_grouping_labels.insert(
@@ -4718,6 +4747,7 @@ mod tests {
     /// restart triggered by a controller-pushed OpAMP config apply.
     #[test]
     fn b1_legacy_emit_threads_x_agent_id_header() {
+        let _env = crate::test_support::env_lock();
         let cfg = ddsketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-7")
             .expect("emit ok");
@@ -4737,6 +4767,7 @@ mod tests {
     /// so the header MUST be present in the routed YAML too.
     #[test]
     fn b1_5sketch_emit_threads_x_agent_id_header() {
+        let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-9")
             .expect("emit ok");
@@ -4778,6 +4809,7 @@ mod tests {
     /// being mangled.
     #[test]
     fn b1_emit_preserves_dollar_agent_id_placeholder_for_broadcast() {
+        let _env = crate::test_support::env_lock();
         let yaml =
             emit_edge_yaml(&ddsketch_edge_cfg(), "ws://c/", "$AGENT_ID").expect("emit ok");
         assert!(
@@ -4794,11 +4826,8 @@ mod tests {
     /// don't shift).
     #[test]
     fn b1_memory_limiter_defaults_to_1280_mib_when_env_unset() {
-        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: see comment on MEMORY_LIMIT_ENV_LOCK.
-        unsafe {
-            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
-        }
+        // Unset under the crate-wide env lock; guard restores on drop.
+        let _env = crate::test_support::EnvVarGuard::unset("ASAP_AGENT_MEMORY_LIMIT_MIB");
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
@@ -4813,16 +4842,12 @@ mod tests {
     /// to at least 256 MiB).
     #[test]
     fn b1_memory_limiter_honours_asap_agent_memory_limit_mib_env() {
-        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: see comment on MEMORY_LIMIT_ENV_LOCK.
-        unsafe {
-            std::env::set_var("ASAP_AGENT_MEMORY_LIMIT_MIB", "1600");
-        }
+        // Set under the crate-wide env lock; guard restores the prior
+        // value (typically unset) on drop, so no other test ever observes
+        // the bumped value.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_AGENT_MEMORY_LIMIT_MIB", "1600");
         let cfg = five_sketch_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
-        unsafe {
-            std::env::remove_var("ASAP_AGENT_MEMORY_LIMIT_MIB");
-        }
         assert!(
             yaml.contains("limit_mib: 1600"),
             "operator-bumped ASAP_AGENT_MEMORY_LIMIT_MIB=1600 must flow through to the emit\n{yaml}"
@@ -4888,6 +4913,7 @@ mod tests {
     /// sketch processor's window sits inside any sensible replay range.
     #[test]
     fn b4_edge_yaml_clamps_oversize_window_duration() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.window_secs = Some(300); // [5m] in the workload
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -4903,6 +4929,7 @@ mod tests {
 
     #[test]
     fn b4_edge_yaml_preserves_inrange_window_duration() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.window_secs = Some(30); // [30s] — canonical MVP query range
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -4916,6 +4943,7 @@ mod tests {
     /// processor inherits the clamped window.
     #[test]
     fn b4_5sketch_routing_clamps_window_duration_across_all_families() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg();
         cfg.window_secs = Some(300);
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -5010,6 +5038,7 @@ mod tests {
 
     #[test]
     fn issue298_cumulativetodelta_emitted_when_counter_metrics_present() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg();
         cfg.cumulative_counter_metrics = vec![
             "http_requests_total".to_string(),
@@ -5041,6 +5070,7 @@ mod tests {
 
     #[test]
     fn issue298_cumulativetodelta_runs_first_on_entry_pipeline() {
+        let _env = crate::test_support::env_lock();
         let mut cfg = five_sketch_edge_cfg();
         cfg.cumulative_counter_metrics = vec!["http_requests_total".to_string()];
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -5073,6 +5103,7 @@ mod tests {
 
     #[test]
     fn issue298_cumulativetodelta_omitted_when_no_counter_metrics() {
+        let _env = crate::test_support::env_lock();
         // five_sketch_edge_cfg() leaves cumulative_counter_metrics
         // empty by default — verify the processor is NOT declared and
         // the entry pipeline's processors list stays empty (backward-
@@ -5092,6 +5123,7 @@ mod tests {
 
     #[test]
     fn issue298_cumulativetodelta_include_list_is_sorted() {
+        let _env = crate::test_support::env_lock();
         // HashMap iteration is not order-stable — but the agent's
         // opampextension byte-level no-op check would otherwise apply
         // + restart on every push of the same semantic config. Mirrors
@@ -5220,17 +5252,14 @@ mod tests {
 
     #[test]
     fn fused_asap_edge_emits_single_pipeline_and_metrics_list() {
-        // `ASAP_EDGE_FUSED` is process-global; serialize with the same
-        // lock the memory_limiter env tests use so a parallel thread
-        // doesn't observe this test's setenv as its own input.
-        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap();
-        std::env::set_var("ASAP_EDGE_FUSED", "1");
+        // `ASAP_EDGE_FUSED` is process-global; set it under the crate-wide
+        // env lock so a parallel thread can't observe this test's setenv
+        // as its own input. The guard restores the prior value on drop.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
 
         let cfg = fused_asap_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
             .expect("emit fused asap_edge ok");
-
-        std::env::remove_var("ASAP_EDGE_FUSED");
 
         // 1. Parses as YAML (round-trips through the loader).
         let doc: serde_yaml::Value =
@@ -5413,9 +5442,9 @@ mod tests {
     #[test]
     fn fused_gate_off_keeps_routing_shape() {
         // Without the env gate the canonical routing-connector shape is
-        // emitted (backward-compat for un-migrated agent builds).
-        let _guard = MEMORY_LIMIT_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("ASAP_EDGE_FUSED");
+        // emitted (backward-compat for un-migrated agent builds). Unset
+        // under the crate-wide env lock; guard restores on drop.
+        let _env = crate::test_support::EnvVarGuard::unset("ASAP_EDGE_FUSED");
         let cfg = fused_asap_edge_cfg();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
         assert!(
