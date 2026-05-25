@@ -140,6 +140,41 @@ Cross-cutting warm levers:
 - All Deltas in a Full-epoch share one offset frame ⇒ they remain mergeable
   (merging `(v−off₁)` and `(v−off₂)` residual-KLLs would be garbage).
 
+### 2.1 Audit of the current serialization (measured)
+
+The backend does NOT re-serialize: `asap_sketchlib` and `sketchlib-go` share one
+cross-language wire format, and the backend stores the wire bytes **opaquely**
+(`SketchSampleState{bytes, encoding}`; flushed parts write `sketch_bytes`
+verbatim, no part-level recompression). So **wire format = sketch_db storage =
+disk-part bytes** — optimizing `sketchlib-go`'s `Serialize*` wins on bandwidth,
+warm memory, AND cold disk at once.
+
+Measured (N=5000/window; harness `/mydata/sketch-audit`):
+
+| family | current encoding | bytes | headroom | verdict |
+|---|---|---|---|---|
+| HLL p=14 | dense 1 byte/register × 16384 (flat, any cardinality) | 16,532 | sparse full-state (delta-idx) → 5–50× for low card; 6-bit dense pack 1.34× | **P1** |
+| KLL k=200 | raw f64 items array | 2,157 | `(v−offset)` fixed-point f64→~4 B → ~2× | **P2** |
+| DDSketch α=.01 | dense varint counts keyed by FOR offset base, zigzag | 556 | already FOR+varint; sparse would be *larger* (85% occupancy) | skip |
+| CMS / CountSketch 3×4096 | sint64 zigzag-varint (~1 B/cell) | ~12.5 KB | per-row FOR ~0 gain | skip |
+| SUM/COUNT | OTLP Sum dp, raw f64/group | ~8 B/grp | OTLP framing dominates; residual marginal | skip |
+
+So the warm scope narrows to **two changes**:
+- **P1 — HLL sparse full-state serialize** (HLL++ style: sorted non-zero
+  registers, delta+varint; fall back to 6-bit-packed dense above the crossover
+  ~6k nonzero regs). The lib already has a sparse *delta* path (`hll/delta.go`),
+  just not for full-state. Biggest lever — and since the 16 KB dense state is
+  stored **uncompressed** per instance, this also cuts **warm SketchStore
+  memory** 5–50× for low-cardinality series (not just wire, which gzip masks).
+- **P2 — KLL value-offset/quantization** (`(v−offset)` fixed-point, ~2×) — the
+  offset idea, measured.
+
+DDSketch (already FOR+varint), CMS/CountSketch (already zigzag-varint, off the
+legacy float64 matrix), and SUM/COUNT (OTLP-framing-bound) are already
+well-encoded — do NOT touch. This **supersedes** the "FOR+delta on DDSketch
+indices" / "narrow CMS counters" rows in the table above, which the audit shows
+are redundant.
+
 ---
 
 ## 3. Offset drift → re-base (Full) — unifies warm & cold
@@ -187,10 +222,10 @@ path) + VM's cheaper decode.
 ## 5. Open decisions
 1. Drift thresholds: correctness (overflow) is forced; the efficiency K-bit
    threshold + heartbeat Full interval need tuning (per-shape defaults).
-2. Which warm sketch families get the offset/FOR re-encoding first (SUM+KLL are
-   the clean wins; DDSketch index-FOR + HLL sparse depend on what the current
-   sketchlib-go / asap-sketchlib serialization already does — audit in progress
-   to size the gain).
+2. ~~Which warm sketch families get the offset/FOR re-encoding first~~
+   **RESOLVED by the §2.1 audit**: P1 = HLL sparse full-state (5–50×, + cuts
+   warm memory), P2 = KLL value-offset (~2×). DDSketch / CMS / CountSketch /
+   SUM are already well-encoded — skip.
 
 Explicitly OUT of scope (decided): no zstd-wrapped variants, and no lossy/Serf
 option — cold stays purely lossless with the {Gorilla-XOR, INT_FOR_DELTA,
