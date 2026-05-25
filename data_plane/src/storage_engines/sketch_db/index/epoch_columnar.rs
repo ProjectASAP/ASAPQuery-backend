@@ -736,6 +736,29 @@ pub struct SidStoreData<K: Eq + std::hash::Hash + Clone, P> {
     /// carry-in reach, so recent range/instant queries never lose a
     /// window or its Full base. See `evict_window_ends_before`.
     pub retention_horizon_ms: Option<u64>,
+    /// Seal cadence (in DISTINCT WINDOWS) for the durable tier. When
+    /// `Some(n)`, `current_epoch` is sealed into `sealed_epochs` once it
+    /// holds `n` distinct windows, so the persistence flusher has sealed
+    /// epochs to flush to disk. `None` (the default) means "never seal
+    /// on cadence" — the in-memory-only deployment where #327 retention
+    /// bounds memory by dropping aged windows from `current_epoch`.
+    ///
+    /// Distinct from [`Self::epoch_capacity`], which is the test-only
+    /// rotation threshold; both feed [`Self::maybe_rotate_epoch`], and
+    /// the smaller of the two (when set) wins. The store sets THIS field
+    /// (not `epoch_capacity`) when persistence is enabled so the
+    /// production seal cadence is decoupled from the test knob.
+    pub seal_window_count: Option<usize>,
+    /// When `true`, this sid's memory is bounded by the persistence
+    /// flush-then-evict loop, NOT by [`Self::enforce_retention`]. The
+    /// flusher owns the lifecycle of sealed epochs (seal → flush to a
+    /// durable disk part → evict from memory), and the disk-tier TTL
+    /// (`delete_older_than_ms`) bounds the durable copy. Retention must
+    /// not drop a sealed epoch out from under a pending flush, nor evict
+    /// un-sealed `current_epoch` windows that were never made durable.
+    /// So when this is `true`, `enforce_retention` is a no-op. When
+    /// `false` (the default), #327 retention is the memory bound.
+    pub persistence_enabled: bool,
 }
 
 /// Default in-memory retention horizon (ms) for the WARM sketch store.
@@ -776,6 +799,8 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
             epoch_capacity: None,
             max_epochs: 4,
             retention_horizon_ms: default_retention_horizon_ms(),
+            seal_window_count: None,
+            persistence_enabled: false,
         }
     }
 
@@ -803,6 +828,14 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
     /// Full base both still resolve. Eviction keys on window-END so a
     /// straddling pane survives until fully behind the horizon.
     fn enforce_retention(&mut self) {
+        // Persistence-enabled sids are bounded by the flush-then-evict
+        // loop, not by dropping. Retention must NOT race the flusher by
+        // dropping a sealed epoch before it has been made durable, nor
+        // evict un-sealed `current_epoch` windows that were never
+        // flushed. The flusher's disk-tier TTL bounds the durable copy.
+        if self.persistence_enabled {
+            return;
+        }
         let Some(horizon) = self.retention_horizon_ms else {
             return;
         };
@@ -837,11 +870,17 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
     }
 
     fn maybe_rotate_epoch(&mut self) {
-        let cap = match self.epoch_capacity {
-            Some(c) if c > 0 => c,
-            _ => return,
+        // The effective rotation threshold is the smaller of the
+        // test-only `epoch_capacity` and the durable-tier
+        // `seal_window_count` (whichever is set); when both are unset,
+        // we never seal on cadence.
+        let cap = match (self.epoch_capacity, self.seal_window_count) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return,
         };
-        if self.current_epoch.distinct_windows() < cap {
+        if cap == 0 || self.current_epoch.distinct_windows() < cap {
             return;
         }
         // Seal the current epoch and rotate.
@@ -853,13 +892,20 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
         self.sealed_epochs.insert(self.current_epoch_id, sealed);
         self.current_epoch_id += 1;
 
-        // Drop oldest sealed if we exceed `max_epochs`.
-        while self.sealed_epochs.len() + 1 > self.max_epochs {
-            // BTreeMap::pop_first is stable in 1.66+
-            if let Some((id, _)) = self.sealed_epochs.iter().next().map(|(k, _)| (*k, ())) {
-                self.sealed_epochs.remove(&id);
-            } else {
-                break;
+        // Drop oldest sealed if we exceed `max_epochs` — but ONLY when
+        // persistence is OFF. Under persistence the flusher owns sealed-
+        // epoch lifecycle (seal → durable part → evict); dropping a
+        // sealed epoch here would discard data that was never flushed,
+        // defeating the durable tier. So persistence-enabled sids keep
+        // every sealed epoch in memory until the flusher evicts it.
+        if !self.persistence_enabled {
+            while self.sealed_epochs.len() + 1 > self.max_epochs {
+                // BTreeMap::pop_first is stable in 1.66+
+                if let Some((id, _)) = self.sealed_epochs.iter().next().map(|(k, _)| (*k, ())) {
+                    self.sealed_epochs.remove(&id);
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -1107,6 +1153,78 @@ mod tests {
         assert!(
             !buf.is_empty(),
             "30m range query within horizon returned no windows — read path regressed"
+        );
+    }
+
+    #[test]
+    fn seal_window_count_seals_current_epoch_on_cadence() {
+        // Persistence mode: seal every 3 distinct windows. After 7
+        // windows we expect 2 sealed epochs (windows 0..3, 3..6) plus a
+        // partial current epoch (window 6). Nothing is dropped — the
+        // flusher owns sealed-epoch lifecycle, so max_epochs does NOT
+        // bite under persistence.
+        let mut s = SidStoreData::<String, u32>::new();
+        s.seal_window_count = Some(3);
+        s.persistence_enabled = true;
+        s.max_epochs = 2; // would normally cap sealed at 1; ignored here
+        let window_ms = 30_000u64;
+        let mut start = 0u64;
+        for i in 0..7u32 {
+            s.insert((start, start + window_ms), "series".into(), i);
+            start += window_ms;
+        }
+        assert_eq!(
+            s.sealed_epochs.len(),
+            2,
+            "expected 2 sealed epochs at cadence 3 over 7 windows; max_epochs must not drop under persistence"
+        );
+        assert!(s.current_epoch.distinct_windows() >= 1);
+    }
+
+    #[test]
+    fn persistence_enabled_disables_retention_drop() {
+        // With persistence on, enforce_retention must be a no-op even
+        // when a retention horizon is set — the flush-then-evict loop
+        // (not dropping) is the memory bound. A long stream keeps every
+        // window in memory until the flusher evicts the sealed epochs.
+        let mut s = SidStoreData::<String, u32>::new();
+        s.persistence_enabled = true;
+        s.retention_horizon_ms = Some(60 * 60 * 1000); // 1h — would normally drop
+        // No seal cadence: everything stays in current_epoch.
+        let window_ms = 30_000u64;
+        let mut start = 0u64;
+        for i in 0..480u32 {
+            // 4h of ingest
+            s.insert((start, start + window_ms), "series".into(), i);
+            start += window_ms;
+        }
+        assert_eq!(
+            s.current_epoch.distinct_windows(),
+            480,
+            "persistence mode must not retention-drop; the flusher bounds memory instead"
+        );
+    }
+
+    #[test]
+    fn sealed_epochs_survive_for_flush_under_persistence() {
+        // Sealed epochs accumulate (pending flush) and are NOT dropped by
+        // either max_epochs rotation or retention while persistence is on.
+        let mut s = SidStoreData::<String, u32>::new();
+        s.seal_window_count = Some(2);
+        s.persistence_enabled = true;
+        s.retention_horizon_ms = Some(1); // aggressive; must be ignored
+        s.max_epochs = 2;
+        let window_ms = 30_000u64;
+        let mut start = 0u64;
+        for i in 0..10u32 {
+            s.insert((start, start + window_ms), "series".into(), i);
+            start += window_ms;
+        }
+        // 10 windows / cadence 2 = up to 5 sealed epochs; none dropped.
+        assert!(
+            s.sealed_epochs.len() >= 4,
+            "sealed epochs were dropped under persistence (got {})",
+            s.sealed_epochs.len()
         );
     }
 }

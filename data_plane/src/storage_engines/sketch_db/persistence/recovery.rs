@@ -138,6 +138,7 @@ mod tests {
                 end_ts: 200,
                 label: Some(KeyByLabelValues::new_with_labels(vec!["x".into()])),
                 sketch_type_name: "SumAccumulator".into(),
+                encoding_tag: 0,
                 sketch_bytes: b"payload".to_vec(),
             }],
         }

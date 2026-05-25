@@ -238,6 +238,14 @@ struct Args {
     #[arg(long)]
     persistence_part_cache_mb: Option<u64>,
 
+    /// Seal cadence in DISTINCT WINDOWS. The per-sid hot epoch is sealed
+    /// into the (pending-flush) sealed ring once it accumulates this
+    /// many distinct windows, giving the flusher sealed epochs to make
+    /// durable. ~30s panes ⇒ 20 windows ≈ 10 min per part. 0 disables
+    /// cadence sealing (no durable tier even with --persistence-enabled).
+    #[arg(long, default_value = "20")]
+    persistence_seal_window_count: usize,
+
     /// Path to the per-metric backend storage routing YAML
     /// (`{metric_name: storage_backend}` map). Loaded at startup and
     /// consulted by the HTTP query handler on every PromQL request to
@@ -376,6 +384,7 @@ async fn main() -> Result<()> {
             ),
             disk_path: index_persistence_dir.clone(),
             part_cache_bytes,
+            seal_window_count: args.persistence_seal_window_count,
         };
         info!(
             "SketchStore persistence enabled: disk_path={:?}",

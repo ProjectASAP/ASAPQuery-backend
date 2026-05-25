@@ -91,6 +91,22 @@ pub fn part_dir_path(parts_root: &Path, part_id: PartId) -> PathBuf {
     parts_root.join(part_dir_name(part_id))
 }
 
+/// Encoding-tag namespace for the per-entry `encoding` byte stored in
+/// `data.bin` (the byte that v1 left as a reserved pad). Lets the disk
+/// read-back path reconstruct the `SketchEncoding` so the
+/// delta-stitching carry-in survives the in-mem/on-disk boundary.
+///
+/// `0` is reserved for "unknown / treat as Full" so parts written by
+/// the original v1 writer (which always wrote `0` into the pad) decode
+/// as Full — the safe default for a carry-in base.
+pub mod encoding_tag {
+    pub const UNKNOWN: u8 = 0;
+    pub const PROTO_FULL: u8 = 1;
+    pub const PROTO_DELTA: u8 = 2;
+    pub const MSGPACK_FULL: u8 = 3;
+    pub const MSGPACK_DELTA: u8 = 4;
+}
+
 /// One entry inside a decoded part. The `start_ts`/`end_ts`/`label`
 /// fields are resolved by the reader; the sketch payload stays as
 /// bytes so the query path can decide whether to decode lazily.
@@ -101,6 +117,9 @@ pub struct SnapshotEntry {
     pub end_ts: u64,
     pub label: Option<crate::storage_engines::types::KeyByLabelValues>,
     pub sketch_type_name: String,
+    /// Wire-encoding tag — see [`encoding_tag`]. `0` for parts written
+    /// before encoding round-tripping landed (decode as Full).
+    pub encoding_tag: u8,
     pub sketch_bytes: Vec<u8>,
 }
 
@@ -159,6 +178,7 @@ impl PartWriter {
                     data_offset,
                     label_bytes,
                     type_name_bytes,
+                    encoding_tag: e.encoding_tag,
                     sketch_bytes: e.sketch_bytes.clone(),
                 });
                 data_len += entry_size as u64;
@@ -193,7 +213,11 @@ impl PartWriter {
                 &mut data_crc,
                 pe.type_name_bytes.len() as u16,
             )?;
-            write_u16(&mut data_file, &mut data_crc, 0)?; // _pad
+            // Repurposed v1 pad u16: low byte carries the encoding tag,
+            // high byte stays zero. v1 parts wrote 0 here → decode as
+            // `encoding_tag::UNKNOWN` (treat as Full), so old parts
+            // remain readable.
+            write_u16(&mut data_file, &mut data_crc, pe.encoding_tag as u16)?;
             write_u32(&mut data_file, &mut data_crc, 0)?; // _pad
             write_padded(&mut data_file, &mut data_crc, &pe.label_bytes, 8)?;
             write_padded(&mut data_file, &mut data_crc, &pe.type_name_bytes, 8)?;
@@ -314,6 +338,7 @@ struct PlannedEntry {
     data_offset: u64,
     label_bytes: Vec<u8>,
     type_name_bytes: Vec<u8>,
+    encoding_tag: u8,
     sketch_bytes: Vec<u8>,
 }
 
@@ -551,7 +576,8 @@ impl PartReader {
             u32::from_le_bytes(self.data_mmap[off + 4..off + 8].try_into().unwrap()) as usize;
         let type_name_len =
             u16::from_le_bytes(self.data_mmap[off + 8..off + 10].try_into().unwrap()) as usize;
-        // 10..12 pad, 12..16 pad
+        // 10..12 repurposed pad: low byte = encoding tag; 12..16 pad.
+        let encoding_tag = self.data_mmap[off + 10];
         let mut cursor = off + 16;
         let label_padded = align_up(label_len, 8);
         let label_bytes = &self.data_mmap[cursor..cursor + label_len];
@@ -577,6 +603,7 @@ impl PartReader {
             end_ts: rec.end_ts,
             label,
             sketch_type_name: type_name,
+            encoding_tag,
             sketch_bytes,
         })
     }
@@ -613,6 +640,7 @@ mod tests {
                         "api".into(),
                     ])),
                     sketch_type_name: "SumAccumulator".into(),
+                    encoding_tag: encoding_tag::PROTO_FULL,
                     sketch_bytes: b"opaque-sketch-1".to_vec(),
                 },
                 EpochSnapshotEntry {
@@ -620,6 +648,7 @@ mod tests {
                     end_ts: 2_000,
                     label: None,
                     sketch_type_name: "DatasketchesKLLAccumulator".into(),
+                    encoding_tag: encoding_tag::MSGPACK_DELTA,
                     sketch_bytes: b"opaque-sketch-2-more-bytes".to_vec(),
                 },
             ],
@@ -655,6 +684,7 @@ mod tests {
 
         let e0 = reader.load_entry(&recs[0]).expect("load_entry 0");
         assert_eq!(e0.sketch_type_name, "SumAccumulator");
+        assert_eq!(e0.encoding_tag, encoding_tag::PROTO_FULL);
         assert_eq!(e0.sketch_bytes, b"opaque-sketch-1");
         assert_eq!(
             e0.label.as_ref().unwrap().labels,
@@ -664,6 +694,7 @@ mod tests {
         let e1 = reader.load_entry(&recs[1]).expect("load_entry 1");
         assert!(e1.label.is_none());
         assert_eq!(e1.sketch_type_name, "DatasketchesKLLAccumulator");
+        assert_eq!(e1.encoding_tag, encoding_tag::MSGPACK_DELTA);
         assert_eq!(e1.sketch_bytes, b"opaque-sketch-2-more-bytes");
     }
 

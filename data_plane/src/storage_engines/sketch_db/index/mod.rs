@@ -45,6 +45,34 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map a [`SketchEncoding`] to the on-disk encoding tag stored per part
+/// entry, so the disk read-back path can reconstruct the Full-vs-Delta
+/// distinction the delta-stitching carry-in relies on.
+fn encoding_to_tag(enc: SketchEncoding) -> u8 {
+    use crate::storage_engines::sketch_db::persistence::part::encoding_tag as t;
+    match enc {
+        SketchEncoding::ProtoFull => t::PROTO_FULL,
+        SketchEncoding::ProtoDelta => t::PROTO_DELTA,
+        SketchEncoding::MsgpackFull => t::MSGPACK_FULL,
+        SketchEncoding::MsgpackDelta => t::MSGPACK_DELTA,
+    }
+}
+
+/// Inverse of [`encoding_to_tag`]. The unknown tag (`0`, written by the
+/// original v1 part writer) decodes to `ProtoFull` — the safe default
+/// for a carry-in base, since a Full snapshot establishes its own
+/// rolling state with no predecessor.
+fn tag_to_encoding(tag: u8) -> SketchEncoding {
+    use crate::storage_engines::sketch_db::persistence::part::encoding_tag as t;
+    match tag {
+        t::PROTO_DELTA => SketchEncoding::ProtoDelta,
+        t::MSGPACK_FULL => SketchEncoding::MsgpackFull,
+        t::MSGPACK_DELTA => SketchEncoding::MsgpackDelta,
+        // t::PROTO_FULL and t::UNKNOWN (legacy) both → Full.
+        _ => SketchEncoding::ProtoFull,
+    }
+}
+
 /// Joint helper shared by [`SketchStore::ingest_precompute_for_agg_config`]
 /// and [`SketchStore::ingest_precompute_with_sid`] — folds the
 /// grouping-label values on `output` against the
@@ -236,6 +264,33 @@ pub struct SketchStore {
     /// `0` (the `Default`) means "never reconciled" so the first batch
     /// always runs. A real `Arc` data pointer is never null.
     last_reconciled_config_ptr: std::sync::atomic::AtomicUsize,
+    /// Durable-tier read handle, installed by [`Self::start_persistence`]
+    /// when `--persistence-enabled`. `None` (the default) means the
+    /// in-memory-only deployment: `query_range` reads HOT + SEALED
+    /// in-memory state and #327 retention bounds memory. When `Some`,
+    /// `query_range` ALSO unions in flushed-then-evicted DISK parts for
+    /// the portion of the range that has left memory, and the per-sid
+    /// `SidStoreData` is configured to seal on a cadence (so the flusher
+    /// has sealed epochs to persist) with retention-drop disabled (the
+    /// flush-then-evict loop is the memory bound).
+    persistence_read: RwLock<Option<Arc<PersistenceReadHandle>>>,
+    /// Seal cadence in distinct windows, applied to every per-sid
+    /// `SidStoreData` once persistence is enabled. `0` (the default)
+    /// disables cadence sealing. Set by [`Self::enable_persistence_mode`].
+    seal_window_count: std::sync::atomic::AtomicUsize,
+}
+
+/// Read-side handle to the durable tier — the manifest of live disk
+/// parts plus the byte-bounded `PartCache` that mmaps them. Cloned (as
+/// an `Arc`) into `SketchStore::persistence_read` so the query path can
+/// consult disk parts without holding a reference to the flusher.
+///
+/// Also recovered on restart: `start_persistence` installs a fresh
+/// handle pointing at the recovered manifest, so a reopened store sees
+/// every part that was durable before the crash.
+pub struct PersistenceReadHandle {
+    pub manifest: Arc<crate::storage_engines::sketch_db::index::persistence::Manifest>,
+    pub part_cache: crate::storage_engines::sketch_db::index::persistence::cache::PartCache,
 }
 
 /// Three possible outcomes of looking up a sid in the SketchStore.
@@ -341,10 +396,26 @@ impl SketchStore {
         let store = self
             .series
             .entry(sid)
-            .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
+            .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
             .clone();
         let mut guard = store.write().unwrap();
         guard.insert(window, series_label_values, AggPayload::Sketch(sample));
+    }
+
+    /// Build a `SidStoreData` pre-configured for the store's current
+    /// persistence mode. When persistence is enabled it seals on the
+    /// configured window cadence and disables retention-drop (the
+    /// flush-then-evict loop bounds memory). When disabled it's the
+    /// plain in-memory store with #327 retention.
+    fn fresh_sid_store(&self) -> SidStoreData<BTreeMap<String, String>, AggPayload> {
+        use std::sync::atomic::Ordering;
+        let mut data = SidStoreData::new();
+        let cadence = self.seal_window_count.load(Ordering::Relaxed);
+        if cadence > 0 {
+            data.seal_window_count = Some(cadence);
+            data.persistence_enabled = true;
+        }
+        data
     }
 
     /// Append a window's exact-aggregation (Sum/Count/Avg/Rate/MinMax)
@@ -366,7 +437,7 @@ impl SketchStore {
         let store = self
             .series
             .entry(sid)
-            .or_insert_with(|| Arc::new(RwLock::new(SidStoreData::new())))
+            .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
             .clone();
         let mut guard = store.write().unwrap();
         guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
@@ -383,10 +454,19 @@ impl SketchStore {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> Vec<SketchTimeSeries> {
-        let store = match self.series.get(&sid) {
-            Some(s) => s.clone(),
-            None => return Vec::new(),
-        };
+        // Result is keyed by the resolved label MAP so the in-memory tier
+        // (its own intern space) and the durable disk tier (independent
+        // intern space) union by label identity, not `LabelValuesId`.
+        let mut by_label_map: HashMap<BTreeMap<String, String>, BTreeMap<i64, SketchSampleState>> =
+            HashMap::new();
+
+        // ── In-memory tier ──────────────────────────────────────────────
+        // Absent series is NOT an early return: under persistence the
+        // sid's hot+sealed state may have been fully flushed-then-evicted
+        // (or recovered from disk after a restart with no fresh ingest
+        // yet), so the answer can live entirely on disk. We still run the
+        // disk union below.
+        if let Some(store) = self.series.get(&sid).map(|s| s.clone()) {
         let guard = store.write().unwrap(); // exact_query may build the lazy index
         let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
             HashMap::new();
@@ -515,10 +595,31 @@ impl SketchStore {
             }
         }
 
-        by_label_id
+        // Materialize the in-memory result keyed by the resolved label
+        // MAP so the disk tier (which has its own intern space) can be
+        // unioned by label identity rather than `LabelValuesId`.
+        for (label_id, samples) in by_label_id {
+            let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
+            by_label_map.entry(label_values).or_default().extend(samples);
+        }
+        // Release the per-sid lock before touching disk — disk reads can
+        // mmap/decode and must not hold the hot ingest lock.
+        drop(guard);
+        } // end in-memory tier
+
+        // Union the DURABLE DISK TIER for the part of `[start, end)` that
+        // has been flushed-then-evicted from memory. Preserves the
+        // #323–#326 read contract across the in-mem/on-disk boundary:
+        // the same half-open overlap admits straddling panes, and a
+        // delta-stitching carry-in Full base is fetched from disk when
+        // it has aged out of memory. In-memory samples win on a
+        // window-end collision (disk is a strict older suffix in steady
+        // state; the guard is belt-and-suspenders).
+        self.union_disk_parts_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
+
+        by_label_map
             .into_iter()
-            .map(|(label_id, samples)| {
-                let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
+            .map(|(label_values, samples)| {
                 SketchTimeSeries {
                     sid,
                     series_label_values: label_values,
@@ -526,6 +627,193 @@ impl SketchStore {
                 }
             })
             .collect()
+    }
+
+    /// Resolve the sorted group-by KEYS for a sid from its instance
+    /// metadata. Disk parts store only label VALUES (a `KeyByLabelValues`
+    /// vector); the per-sid intern table records `BTreeMap<String,String>`
+    /// (key-sorted), so `values()` yields values in key-sorted order.
+    /// Zipping the sorted `group_by_keys` against a disk values vector
+    /// rebuilds the exact `BTreeMap<String,String>` that the in-memory
+    /// path produced — no part-format change needed to round-trip keys.
+    fn sid_group_by_keys(&self, sid: u64) -> Option<Vec<String>> {
+        self.instances
+            .read()
+            .ok()?
+            .get(&sid)
+            .map(|m| m.group_by_keys.iter().cloned().collect())
+    }
+
+    /// Reconstruct the full label MAP for one disk entry by zipping the
+    /// sid's sorted group-by keys against the stored values vector.
+    fn rebuild_label_map(
+        keys: &[String],
+        label: &Option<crate::storage_engines::types::KeyByLabelValues>,
+    ) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        if let Some(kv) = label {
+            for (k, v) in keys.iter().zip(kv.labels.iter()) {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// Union the durable disk tier into `by_label_map` for the requested
+    /// `[start, end)`. No-op when persistence is disabled. Mirrors the
+    /// in-memory read contract: half-open overlap admits straddling
+    /// panes, and the delta-stitching carry-in fetches a Full base from
+    /// disk when it has aged out of memory. In-memory samples already in
+    /// `by_label_map` win on a window-end collision.
+    fn union_disk_parts_into(
+        &self,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+        by_label_map: &mut HashMap<BTreeMap<String, String>, BTreeMap<i64, SketchSampleState>>,
+    ) {
+        let handle = {
+            let g = self.persistence_read.read().unwrap();
+            match g.as_ref() {
+                Some(h) => Arc::clone(h),
+                None => return,
+            }
+        };
+        let Some(keys) = self.sid_group_by_keys(sid) else {
+            return;
+        };
+
+        // ---- Overlap scan over disk parts in [start, end) ----
+        let parts = handle
+            .manifest
+            .live_parts_overlapping(start_unix_ms, end_unix_ms);
+        for pe in &parts {
+            let reader = match handle.part_cache.get_or_load(pe.part_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(part_id = pe.part_id, error = %e, "sketch disk read: open part failed");
+                    continue;
+                }
+            };
+            for rec in reader.index_records() {
+                if rec.agg_id != sid {
+                    continue;
+                }
+                // Half-open overlap, matching the in-memory scan:
+                // `end_ts > start && start_ts < end`.
+                if !(rec.end_ts > start_unix_ms && rec.start_ts < end_unix_ms) {
+                    continue;
+                }
+                let Ok(entry) = reader.load_entry(&rec) else {
+                    continue;
+                };
+                let label_map = Self::rebuild_label_map(&keys, &entry.label);
+                let sample = SketchSampleState {
+                    bytes: entry.sketch_bytes,
+                    encoding: tag_to_encoding(entry.encoding_tag),
+                };
+                by_label_map
+                    .entry(label_map)
+                    .or_default()
+                    .entry(rec.end_ts as i64)
+                    // In-memory wins — only fill window-ends disk uniquely
+                    // owns.
+                    .or_insert(sample);
+            }
+        }
+
+        // ---- Delta-stitching carry-in from disk ----
+        // For each label whose earliest in-window sample is a Delta and
+        // which lacks a Full base ending before `start`, fetch the
+        // most-recent Full snapshot ending at/before `start-1` from disk.
+        if start_unix_ms == 0 {
+            return;
+        }
+        let before = start_unix_ms.saturating_sub(1);
+        let need_base: std::collections::HashSet<BTreeMap<String, String>> = by_label_map
+            .iter()
+            .filter(|(_, samples)| {
+                // Earliest sample is a Delta and there is no Full base
+                // already present at/before `start`.
+                let earliest_is_delta = samples
+                    .values()
+                    .next()
+                    .map(|s| {
+                        matches!(
+                            s.encoding,
+                            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
+                        )
+                    })
+                    .unwrap_or(false);
+                let has_base_before = samples
+                    .iter()
+                    .any(|(w_end, s)| {
+                        *w_end < start_unix_ms as i64
+                            && matches!(
+                                s.encoding,
+                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                            )
+                    });
+                earliest_is_delta && !has_base_before
+            })
+            .map(|(label_map, _)| label_map.clone())
+            .collect();
+        if need_base.is_empty() {
+            return;
+        }
+
+        let carry_parts = handle.manifest.live_parts_overlapping(0, before);
+        // latest Full per label-map (by window-end).
+        let mut latest_full: HashMap<BTreeMap<String, String>, (i64, SketchSampleState)> =
+            HashMap::new();
+        for pe in &carry_parts {
+            let reader = match handle.part_cache.get_or_load(pe.part_id) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            for rec in reader.index_records() {
+                if rec.agg_id != sid || rec.end_ts > before {
+                    continue;
+                }
+                let Ok(entry) = reader.load_entry(&rec) else {
+                    continue;
+                };
+                let encoding = tag_to_encoding(entry.encoding_tag);
+                if !matches!(
+                    encoding,
+                    SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                ) {
+                    continue;
+                }
+                let label_map = Self::rebuild_label_map(&keys, &entry.label);
+                if !need_base.contains(&label_map) {
+                    continue;
+                }
+                let w_end = rec.end_ts as i64;
+                match latest_full.get(&label_map) {
+                    Some((prev_end, _)) if *prev_end >= w_end => {}
+                    _ => {
+                        latest_full.insert(
+                            label_map,
+                            (
+                                w_end,
+                                SketchSampleState {
+                                    bytes: entry.sketch_bytes,
+                                    encoding,
+                                },
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        for (label_map, (w_end, state)) in latest_full {
+            by_label_map
+                .entry(label_map)
+                .or_default()
+                .entry(w_end)
+                .or_insert(state);
+        }
     }
 
     /// Range-query the ExactAgg state for ONE sid. Sister of
@@ -827,6 +1115,20 @@ impl SketchStore {
     /// Number of distinct sids carrying state (excludes ghosts).
     pub fn series_len(&self) -> usize {
         self.series.len()
+    }
+
+    /// Total count of in-memory SEALED epochs across all sids — i.e.
+    /// epochs sealed (pending flush) but not yet evicted to disk. `0`
+    /// once the flusher has drained everything. Used by tests and
+    /// `/runtime` diagnostics to observe the flush-then-evict loop.
+    pub fn list_sealed_epochs_len(&self) -> usize {
+        let mut n = 0usize;
+        for entry in self.series.iter() {
+            if let Ok(data) = entry.value().read() {
+                n += data.sealed_epochs.len();
+            }
+        }
+        n
     }
 
     /// Number of registered instances (includes ghosts).
@@ -1213,6 +1515,19 @@ impl SketchStore {
         );
         let part_cache = PartCache::new(parts_root.clone(), cfg.part_cache_bytes);
 
+        // Install the durable-tier read handle + seal cadence so the
+        // query path unions disk parts and the per-sid stores seal on
+        // cadence with retention-drop disabled. Done BEFORE the flusher
+        // starts so any series created between here and the first flush
+        // tick are already in persistence mode.
+        self.enable_persistence_mode(
+            cfg.seal_window_count,
+            Arc::new(PersistenceReadHandle {
+                manifest: Arc::clone(&manifest),
+                part_cache: part_cache.clone(),
+            }),
+        );
+
         let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
 
         Ok(SketchIndexPersistence {
@@ -1221,6 +1536,32 @@ impl SketchStore {
             flusher,
             parts_root,
         })
+    }
+
+    /// Switch the store into durable-tier mode: install the read handle
+    /// the query path uses to consult disk parts, set the per-sid seal
+    /// cadence, and retro-fit any already-created `SidStoreData` so they
+    /// seal on cadence and stop dropping aged windows (the flush-then-
+    /// evict loop becomes the memory bound). Idempotent.
+    pub fn enable_persistence_mode(
+        &self,
+        seal_window_count: usize,
+        read_handle: Arc<PersistenceReadHandle>,
+    ) {
+        use std::sync::atomic::Ordering;
+        *self.persistence_read.write().unwrap() = Some(read_handle);
+        self.seal_window_count
+            .store(seal_window_count, Ordering::Relaxed);
+        if seal_window_count > 0 {
+            // Retro-fit existing per-sid stores (e.g. series that
+            // ingested before persistence finished starting).
+            for entry in self.series.iter() {
+                if let Ok(mut data) = entry.value().write() {
+                    data.seal_window_count = Some(seal_window_count);
+                    data.persistence_enabled = true;
+                }
+            }
+        }
     }
 }
 
@@ -1311,14 +1652,15 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                     })
                 }
             });
-            let (type_name, bytes) = match payload {
+            let (type_name, encoding_tag, bytes) = match payload {
                 AggPayload::Sketch(s) => (
                     sketch_kind_label
                         .clone()
                         .unwrap_or_else(|| "UnknownSketch".to_string()),
+                    encoding_to_tag(s.encoding),
                     s.bytes.clone(),
                 ),
-                AggPayload::ExactAgg(p) => (p.type_name().to_string(), {
+                AggPayload::ExactAgg(p) => (p.type_name().to_string(), 0u8, {
                     use asap_types::traits::SerializableToSink;
                     p.serialize_to_bytes()
                 }),
@@ -1329,6 +1671,7 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                 end_ts: window.1,
                 label: label_kv,
                 sketch_type_name: type_name,
+                encoding_tag,
                 sketch_bytes: bytes,
             });
         }
@@ -2105,6 +2448,258 @@ mod tests {
         assert!(idx.sids_for_policy(fp).is_empty());
         // Empty entry collapses — policy_count drops to 0.
         assert_eq!(idx.policy_count(), 0);
+    }
+
+    // ── Durable disk-backed tier (feat/sketch-durable-tier) ─────────────
+
+    use crate::storage_engines::sketch_db::index::persistence::EpochSource;
+    use crate::storage_engines::sketch_db::index::persistence::SketchStorePersistenceConfig;
+
+    /// Metadata with a single group-by key `host`, so the disk read-back
+    /// path can rebuild the `{host: <v>}` label map from the stored
+    /// values vector.
+    fn meta_with_host_key(sid: u64) -> SketchInstanceMetadata {
+        let mut m = meta(sid);
+        m.group_by_keys = ["host".to_string()].into_iter().collect();
+        m
+    }
+
+    fn lv_host(v: &str) -> BTreeMap<String, String> {
+        let mut m = BTreeMap::new();
+        m.insert("host".to_string(), v.to_string());
+        m
+    }
+
+    /// Aggressive persistence config: seal every window, force-flush
+    /// everything (hot_window=0), tiny flush interval, no disk TTL, small
+    /// part cache. Memory limit high so the seal/flush is driven by the
+    /// hot-window watermark, not memory pressure — keeps the test
+    /// deterministic.
+    fn durable_cfg(disk_path: std::path::PathBuf) -> SketchStorePersistenceConfig {
+        SketchStorePersistenceConfig {
+            memory_limit_bytes: 1 << 30,
+            memory_low_watermark_bytes: 1 << 29,
+            hard_cap_bytes: 1 << 31,
+            hot_window_ms: Some(0), // every sealed epoch is "old" → flush now
+            delete_older_than_ms: None,
+            flush_interval: std::time::Duration::from_millis(5),
+            disk_path,
+            part_cache_bytes: 1 << 20,
+            seal_window_count: 1, // seal on every distinct window
+        }
+    }
+
+    fn wait_until<F: Fn() -> bool>(f: F, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        f()
+    }
+
+    #[test]
+    fn sealing_fires_under_persistence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        idx.register(meta_with_host_key(101));
+        let _p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+
+        // seal_window_count = 1: each *new distinct window* seals the
+        // prior one. Append several distinct windows for one series.
+        for i in 0..5u64 {
+            let s = i * 30_000;
+            idx.append_sample(101, lv_host("a"), (s, s + 30_000), sample(i as u8));
+        }
+        // At least some sealed epochs must exist (each new window seals
+        // the prior current_epoch). The flusher may evict some before we
+        // look, so we assert that sealing happened OR a part landed.
+        let sealed_now = !idx.list_sealed_epochs().is_empty();
+        let flushed = wait_until(|| !_p.manifest.live_parts().is_empty(), std::time::Duration::from_secs(3));
+        assert!(
+            sealed_now || flushed,
+            "no epochs sealed and nothing flushed — sealing did not fire under persistence"
+        );
+    }
+
+    #[test]
+    fn sealed_epochs_flush_to_disk_and_memory_drops() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        idx.register(meta_with_host_key(202));
+        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+
+        for i in 0..10u64 {
+            let s = i * 30_000;
+            idx.append_sample(202, lv_host("a"), (s, s + 30_000), sample(i as u8));
+        }
+
+        // The flusher should drain sealed epochs to disk; memory
+        // (sealed-epoch bytes) drops to ~0 and parts appear.
+        let drained = wait_until(
+            || idx.approx_memory_bytes() == 0 && !p.manifest.live_parts().is_empty(),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            drained,
+            "flush+evict did not bound memory: sealed_bytes={}, parts={}",
+            idx.approx_memory_bytes(),
+            p.manifest.live_parts().len()
+        );
+    }
+
+    #[test]
+    fn query_resolves_from_disk_after_flush_evict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        idx.register(meta_with_host_key(303));
+        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+
+        // Append windows for series "a" across [0, 300_000).
+        for i in 0..10u64 {
+            let s = i * 30_000;
+            idx.append_sample(303, lv_host("a"), (s, s + 30_000), sample((i + 1) as u8));
+        }
+        // Wait for everything to flush+evict from memory.
+        assert!(
+            wait_until(
+                || idx.approx_memory_bytes() == 0 && idx.list_sealed_epochs_len() == 0,
+                std::time::Duration::from_secs(5)
+            ),
+            "data never fully evicted from memory"
+        );
+        // current_epoch may still hold the most-recent un-sealed window;
+        // query a range covering the EVICTED portion [0, 150_000).
+        let series = idx.query_range(303, 0, 150_000);
+        assert_eq!(series.len(), 1, "expected one series resolved from disk");
+        let s = &series[0];
+        assert_eq!(s.series_label_values, lv_host("a"), "label map rebuilt from disk");
+        assert!(
+            !s.samples.is_empty(),
+            "query over evicted range returned no samples from disk"
+        );
+        // Window-end 30_000 (window (0,30_000)) must be present from disk.
+        assert!(
+            s.samples.contains_key(&30_000),
+            "disk window (0,30000) missing from query result: {:?}",
+            s.samples.keys().collect::<Vec<_>>()
+        );
+        drop(p);
+    }
+
+    #[test]
+    fn query_carry_in_full_base_lives_on_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        idx.register(meta_with_host_key(404));
+        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+
+        // A Full snapshot early (end=100_000), then delta windows later.
+        idx.append_sample(404, lv_host("a"), (70_000, 100_000), sample(1)); // Full base
+        for i in 0..6u64 {
+            let s = 100_000 + i * 30_000;
+            idx.append_sample(404, lv_host("a"), (s, s + 30_000), delta_sample((i + 2) as u8));
+        }
+        // Flush+evict everything to disk.
+        assert!(
+            wait_until(
+                || idx.approx_memory_bytes() == 0 && idx.list_sealed_epochs_len() == 0,
+                std::time::Duration::from_secs(5)
+            ),
+            "data never fully evicted"
+        );
+
+        // Query a window that contains ONLY deltas; the Full base lives on
+        // disk before the window. The carry-in must splice it in.
+        let series = idx.query_range(404, 200_000, 280_000);
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        // A Full-encoded carry-in base (end < 200_000) must be present.
+        let has_full_base = s.samples.iter().any(|(w_end, smp)| {
+            *w_end < 200_000
+                && matches!(
+                    smp.encoding,
+                    SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                )
+        });
+        assert!(
+            has_full_base,
+            "delta-only window did not get a disk-resident Full carry-in base: {:?}",
+            s.samples
+                .iter()
+                .map(|(k, v)| (*k, v.encoding))
+                .collect::<Vec<_>>()
+        );
+        drop(p);
+    }
+
+    #[test]
+    fn restart_recovery_makes_flushed_data_queryable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = tmp.path().to_path_buf();
+        {
+            let idx = Arc::new(SketchStore::new());
+            idx.register(meta_with_host_key(505));
+            let p = idx.start_persistence(durable_cfg(disk.clone())).unwrap();
+            for i in 0..8u64 {
+                let s = i * 30_000;
+                idx.append_sample(505, lv_host("a"), (s, s + 30_000), sample((i + 1) as u8));
+            }
+            assert!(
+                wait_until(
+                    || !p.manifest.live_parts().is_empty()
+                        && idx.list_sealed_epochs_len() == 0
+                        && idx.approx_memory_bytes() == 0,
+                    std::time::Duration::from_secs(5)
+                ),
+                "data never flushed before restart"
+            );
+            // Shutdown the flusher cleanly so the manifest is durable.
+            let mut p = p;
+            p.shutdown();
+        }
+
+        // "Restart": brand-new store + resolver on the SAME disk dir. The
+        // metadata is re-registered (the SeriesIdResolver WAL recovers
+        // sids in prod; here we re-register to model that), then
+        // persistence recovers the manifest+parts.
+        let idx2 = Arc::new(SketchStore::new());
+        idx2.register(meta_with_host_key(505));
+        let p2 = idx2.start_persistence(durable_cfg(disk.clone())).unwrap();
+        assert!(
+            !p2.manifest.live_parts().is_empty(),
+            "recovery did not reload any parts"
+        );
+
+        let series = idx2.query_range(505, 0, 120_000);
+        assert_eq!(series.len(), 1, "recovered data not queryable");
+        let s = &series[0];
+        assert_eq!(s.series_label_values, lv_host("a"));
+        assert!(
+            s.samples.contains_key(&30_000),
+            "recovered disk window missing after restart"
+        );
+        drop(p2);
+    }
+
+    #[test]
+    fn persistence_disabled_keeps_327_retention_behavior() {
+        // Non-regression: with persistence OFF, query_range reads
+        // in-memory only and #327 retention still bounds memory. The
+        // #323–#326 overlap + carry-in shapes still pass (covered by the
+        // dedicated tests above); here we confirm the disk union is a
+        // no-op when no read handle is installed.
+        let idx = SketchStore::new();
+        idx.register(meta_with_host_key(606));
+        idx.append_sample(606, lv_host("a"), (0, 10), sample(1));
+        idx.append_sample(606, lv_host("a"), (10, 20), sample(2));
+        let series = idx.query_range(606, 0, 20);
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].samples.len(), 2);
+        // No persistence handle → seal cadence disabled → no sealing.
+        assert!(idx.persistence_read.read().unwrap().is_none());
     }
 }
 
