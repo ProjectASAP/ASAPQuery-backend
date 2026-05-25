@@ -188,7 +188,7 @@ pub fn emit_otap_dag_yaml(
             });
             prev = name;
         }
-        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("data-plane", &cfg.exporter_target);
         nodes.insert(
             "exporter".to_string(),
             NodeDef {
@@ -202,7 +202,7 @@ pub fn emit_otap_dag_yaml(
         });
     } else {
         // Mode 2 — raw at edge → sketch at backend. Passthrough DAG.
-        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("data-plane", &cfg.exporter_target);
         nodes.insert(
             "exporter".to_string(),
             NodeDef {
@@ -473,10 +473,10 @@ mod tests {
         assert_eq!(pipe.connections[0].to, "sketch_0");
         assert_eq!(pipe.connections[1].from, "sketch_0");
         assert_eq!(pipe.connections[1].to, "exporter");
-        // Endpoint contains backend:4317.
+        // Endpoint contains data-plane:4317.
         assert!(
-            yaml.contains("backend:4317"),
-            "missing backend endpoint\n{yaml}"
+            yaml.contains("data-plane:4317"),
+            "missing data-plane endpoint\n{yaml}"
         );
     }
 

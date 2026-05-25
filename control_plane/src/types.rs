@@ -488,7 +488,7 @@ pub struct AgentCollectorConfig {
 /// translation step; only useful for raw-scalar pipelines.
 #[derive(Debug, Clone)]
 pub enum AgentDataSink {
-    /// `endpoint` is an OTLP gRPC endpoint, e.g. `backend:4317`.
+    /// `endpoint` is an OTLP gRPC endpoint, e.g. `data-plane:4317`.
     /// `compression` is the transport-level codec; the canonical
     /// path uses `none` because the backend's tonic gRPC server
     /// rejects gzip-compressed bodies (returns Unimplemented).
@@ -507,7 +507,7 @@ impl Default for AgentDataSink {
     /// `--agent-data-sink` flag (or future config push).
     fn default() -> Self {
         AgentDataSink::Otlp {
-            endpoint: "backend:4317".to_string(),
+            endpoint: "data-plane:4317".to_string(),
             compression: "none".to_string(),
         }
     }

@@ -600,7 +600,7 @@ async fn handle_plan(
         }
     }
 
-    plan.precompute = build_precompute_engine_jobs(&workload, "backend:4317");
+    plan.precompute = build_precompute_engine_jobs(&workload, "data-plane:4317");
     // B2 (metric, role): derive the role from the request's
     // query_string + optional `sketch_type` override so the
     // store keys at (metric, role) granularity. Without the role
