@@ -2573,7 +2573,7 @@ mod asap_tier_classify_tests {
         use asap_sketchlib::proto::sketchlib::{
             sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
         };
-        use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
+        use asap_sketchlib::{HllSketch, HllVariant};
         use prost::Message;
         let mut sk = HllSketch::new(HllVariant::Regular, precision);
         for i in 0..distinct {
@@ -2585,7 +2585,8 @@ mod asap_tier_classify_tests {
             registers: sk.registers.clone(),
             hip_kxq0: sk.hip_kxq0,
             hip_kxq1: sk.hip_kxq1,
-            hip_est: sk.hip_est};
+            hip_est: sk.hip_est,
+            registers_sparse: None};
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
             ..Default::default()
@@ -3619,7 +3620,8 @@ mod outer_agg_integration_tests {
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchStore,
         SketchInstanceMetadata, SketchKindHandle, SketchSampleState};
-    use asap_sketchlib::sketches::ddsketch::DdSketch;
+    use asap_sketchlib::DdSketch;
+    use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
@@ -3637,7 +3639,7 @@ mod outer_agg_integration_tests {
         for v in values {
             sk.update(*v);
         }
-        sk.serialize_msgpack().expect("ddsketch msgpack serialization")
+        sk.to_msgpack().expect("ddsketch msgpack serialization")
     }
 
     fn dd_meta_for(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {

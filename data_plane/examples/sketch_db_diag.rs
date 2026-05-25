@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-use asap_sketchlib::sketches::ddsketch::DdSketch;
+use asap_sketchlib::DdSketch;
 use prost::Message;
 
 use data_plane::storage_engines::sketch_db::data::{

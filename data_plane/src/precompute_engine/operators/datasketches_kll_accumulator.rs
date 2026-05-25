@@ -2,7 +2,7 @@ use crate::storage_engines::types::{
     AggregateCore, AggregationType, AuxStats, MergeableAccumulator, SerializableToSink,
     SingleSubpopulationAggregate,
 };
-use asap_sketchlib::sketches::kll::KllSketch;
+use asap_sketchlib::{KllSketch, MessagePackCodec};
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ use tracing::debug;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// KLL sketch accumulator — wraps asap_sketchlib::sketches::KllSketch.
+/// KLL sketch accumulator — wraps asap_sketchlib::KllSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
 /// This file retains QE-specific trait impls and JSON output.
 pub struct DatasketchesKLLAccumulator {
@@ -46,7 +46,7 @@ impl DatasketchesKLLAccumulator {
     /// serializes its full internal state to msgpack.
     pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: KllSketch::deserialize_msgpack(buffer)
+            inner: KllSketch::from_msgpack(buffer)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
         })
     }
@@ -207,7 +207,7 @@ impl SerializableToSink for DatasketchesKLLAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 
@@ -556,6 +556,9 @@ mod tests {
             levels: vec![0, 64],
             items: items.clone(),
             coin: None,
+            offset: 0.0,
+            value_scale: 0,
+            residuals: Vec::new(),
         };
         let bytes = state.encode_to_vec();
 
@@ -596,6 +599,9 @@ mod tests {
             levels: vec![0, 64],
             items,
             coin: None,
+            offset: 0.0,
+            value_scale: 0,
+            residuals: Vec::new(),
         };
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
@@ -636,6 +642,9 @@ mod tests {
             levels: Vec::new(),
             items: Vec::new(),
             coin: None,
+            offset: 0.0,
+            value_scale: 0,
+            residuals: Vec::new(),
         };
         let bytes = state.encode_to_vec();
         let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);
@@ -655,6 +664,9 @@ mod tests {
             levels: vec![0, 5, 10],
             items: vec![1.0, 2.0, 3.0, 4.0, 5.0],
             coin: None,
+            offset: 0.0,
+            value_scale: 0,
+            residuals: Vec::new(),
         };
         let bytes = state.encode_to_vec();
         let result = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes);

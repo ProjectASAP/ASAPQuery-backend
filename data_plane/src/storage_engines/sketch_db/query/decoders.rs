@@ -15,9 +15,10 @@
 //! `ASAPTierError::DeserializeFailure` so the engine router falls over
 //! to archive cleanly.
 
-use asap_sketchlib::sketches::countminsketch::CountMinSketch;
-use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
-use asap_sketchlib::sketches::countsketch::CountSketch;
+use asap_sketchlib::CountMinSketch;
+use asap_sketchlib::CountMinSketchWithHeap;
+use asap_sketchlib::CountSketch;
+use asap_sketchlib::MessagePackCodec;
 
 /// Decode a `CountMinSketch` from the modified-OTLP wire bytes.
 /// MSGPACK path round-trips `CountMinSketch::deserialize_msgpack`;
@@ -91,7 +92,7 @@ pub fn decode_cms_from_proto(buffer: &[u8]) -> Result<CountMinSketch, String> {
 /// format). Mirrors
 /// `CountMinSketchAccumulator::from_msgpack_bytes`.
 pub fn decode_cms_from_msgpack(buffer: &[u8]) -> Result<CountMinSketch, String> {
-    CountMinSketch::deserialize_msgpack(buffer)
+    CountMinSketch::from_msgpack(buffer)
         .map_err(|e| format!("deserialize CountMinSketch msgpack: {e}"))
 }
 
@@ -166,7 +167,7 @@ pub fn decode_cs_from_proto(buffer: &[u8]) -> Result<CountSketch, String> {
 
 /// Decode a `CountSketch` from msgpack bytes (sketch-core wire format).
 pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
-    CountSketch::deserialize_msgpack(buffer)
+    CountSketch::from_msgpack(buffer)
         .map_err(|e| format!("deserialize CountSketch msgpack: {e}"))
 }
 
@@ -174,8 +175,8 @@ pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
 /// `CountMinSketch` wire bytes when the gateway/precompute layer
 /// marked the sid as CmsWithHeap (heap embedded in the
 /// `CountMinSketchWithHeapSerialized` outer wrapper). Delegates to
-/// `asap_sketchlib::sketches::CountMinSketchWithHeap::deserialize_msgpack`.
+/// `asap_sketchlib::CountMinSketchWithHeap::deserialize_msgpack`.
 pub fn decode_cms_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountMinSketchWithHeap, String> {
-    CountMinSketchWithHeap::deserialize_msgpack(buffer)
+    CountMinSketchWithHeap::from_msgpack(buffer)
         .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))
 }

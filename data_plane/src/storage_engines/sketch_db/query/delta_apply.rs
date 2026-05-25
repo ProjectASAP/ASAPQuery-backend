@@ -30,9 +30,10 @@
 //! `Full`. For cumulative mode this means the cumulative answer
 //! starts at the first Full in the range, not at `t0`.
 
-use asap_sketchlib::sketches::ddsketch::DdSketch;
-use asap_sketchlib::sketches::hll::HllSketch;
-use asap_sketchlib::sketches::kll::KllSketch;
+use asap_sketchlib::DdSketch;
+use asap_sketchlib::HllSketch;
+use asap_sketchlib::KllSketch;
+use asap_sketchlib::MessagePackCodec;
 
 use crate::storage_engines::sketch_db::index::{SketchEncoding, SketchSampleState};
 
@@ -60,7 +61,7 @@ fn decode_full(
             Ok(RollingState::Dd(sk))
         }
         (DeltaSketchKind::DDSketch, SketchEncoding::MsgpackFull) => {
-            let sk = DdSketch::deserialize_msgpack(bytes)
+            let sk = DdSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize DDSketch msgpack: {e}"))?;
             Ok(RollingState::Dd(sk))
         }
@@ -69,7 +70,7 @@ fn decode_full(
             Ok(RollingState::Hll(sk))
         }
         (DeltaSketchKind::Hll, SketchEncoding::MsgpackFull) => {
-            let sk = HllSketch::deserialize_msgpack(bytes)
+            let sk = HllSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?;
             Ok(RollingState::Hll(sk))
         }
@@ -78,7 +79,7 @@ fn decode_full(
             Ok(RollingState::Kll(sk))
         }
         (DeltaSketchKind::Kll, SketchEncoding::MsgpackFull) => {
-            let sk = KllSketch::deserialize_msgpack(bytes)
+            let sk = KllSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize KllSketch msgpack: {e}"))?;
             Ok(RollingState::Kll(sk))
         }
@@ -147,7 +148,7 @@ impl RollingState {
                     // MsgpackDelta for HLL isn't a sparse encoding;
                     // it's a serialized HllSketch fragment, mergeable
                     // via `HllSketch::merge`.
-                    let other = HllSketch::deserialize_msgpack(bytes)
+                    let other = HllSketch::from_msgpack(bytes)
                         .map_err(|e| format!("deserialize HllSketch (delta-as-msgpack): {e}"))?;
                     sk.merge(&other)
                         .map_err(|e| format!("merge HLL delta: {e}"))?;
@@ -366,7 +367,7 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
     use asap_sketchlib::proto::sketchlib::{
         sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
     };
-    use asap_sketchlib::sketches::hll::HllVariant;
+    use asap_sketchlib::HllVariant;
     use prost::Message;
     let state = match SketchEnvelope::decode(buffer) {
         Ok(env) => match env.sketch_state {
@@ -416,7 +417,7 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
 /// `(index, value)` updates, `register = max(register, value)`).
 fn apply_hll_proto_delta(sk: &mut HllSketch, buffer: &[u8]) -> Result<(), String> {
     use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
-    use asap_sketchlib::sketches::hll::HllSketchDelta;
+    use asap_sketchlib::HllSketchDelta;
     use prost::Message;
 
     let pb = PbDelta::decode(buffer).map_err(|e| format!("decode HLLDelta: {e}"))?;

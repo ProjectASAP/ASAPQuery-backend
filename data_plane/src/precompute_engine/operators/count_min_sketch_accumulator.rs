@@ -2,13 +2,13 @@ use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
-use asap_sketchlib::sketches::countminsketch::{CountMinSketch, CountMinSketchDelta};
+use asap_sketchlib::{CountMinSketch, CountMinSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// Count-Min Sketch accumulator — wraps asap_sketchlib::sketches::CountMinSketch.
+/// Count-Min Sketch accumulator — wraps asap_sketchlib::CountMinSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
 /// This file retains QE-specific trait impls, legacy deserializers, and JSON output.
 #[derive(Debug, Clone)]
@@ -69,7 +69,7 @@ impl CountMinSketchAccumulator {
     /// uses — this method is the modified-OTLP entrypoint for PR I).
     pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: CountMinSketch::deserialize_msgpack(buffer)
+            inner: CountMinSketch::from_msgpack(buffer)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
         })
     }
@@ -309,7 +309,7 @@ impl SerializableToSink for CountMinSketchAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 

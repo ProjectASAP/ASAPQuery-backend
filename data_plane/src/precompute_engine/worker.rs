@@ -1248,7 +1248,7 @@ mod tests {
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
     use crate::precompute_engine::operators::multiple_sum_accumulator::MultipleSumAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-    use asap_sketchlib::sketches::kll::KllSketch;
+    use asap_sketchlib::KllSketch;
     use asap_types::enums::{AggregationType, WindowType};
 
     fn make_agg_config(
@@ -2283,7 +2283,7 @@ aggregations:
     // -----------------------------------------------------------------------
 
     use crate::precompute_engine::operators::DDSketchAccumulator;
-    use asap_sketchlib::sketches::ddsketch::DdSketch;
+    use asap_sketchlib::DdSketch;
 
     /// Build a fresh DDSketch holding `vals` so each test has a real,
     /// non-empty sketch to push through `process_accumulator_input`.

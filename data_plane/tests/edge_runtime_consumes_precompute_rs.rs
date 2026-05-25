@@ -239,7 +239,7 @@ fn kll_envelope_structural_assertions() {
 #[test]
 #[ignore = "blocked on ASAPCollector#243 HLL/CS/CMS byte parity"]
 fn hll_envelope_round_trip_through_backend_adapter() {
-    use asap_sketchlib::sketches::HllVariant;
+    use asap_sketchlib::HllVariant;
     let mut w = HLLWrapper::new(HllVariant::Regular, 12);
     for i in 0..1000u32 {
         w.update(&i.to_le_bytes());

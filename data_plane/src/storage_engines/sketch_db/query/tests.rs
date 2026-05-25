@@ -12,8 +12,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use asap_sketchlib::sketches::ddsketch::DdSketch;
-use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
+use asap_sketchlib::DdSketch;
+use asap_sketchlib::MessagePackCodec;
+use asap_sketchlib::{HllSketch, HllVariant};
 
 use crate::storage_engines::sketch_db::query::{SketchReducer, ASAPTierError};
 use crate::storage_engines::sketch_db::index::{
@@ -81,6 +82,7 @@ fn encode_hll(sk: &HllSketch) -> Vec<u8> {
         hip_kxq0: sk.hip_kxq0,
         hip_kxq1: sk.hip_kxq1,
         hip_est: sk.hip_est,
+        registers_sparse: None,
     };
     let env = SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
@@ -463,7 +465,7 @@ fn multi_series_one_per_label_value() {
 // TODO-1 tests — CMS-with-heap top-k.
 // ---------------------------------------------------------------------------
 
-use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+use asap_sketchlib::CountMinSketchWithHeap;
 
 fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
     let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
@@ -535,7 +537,7 @@ fn cms_with_heap_topk_returns_top_items() {
             cms.update(k, 1.0);
         }
     }
-    let bytes = cms.serialize_msgpack().expect("serialize cms with heap");
+    let bytes = cms.to_msgpack().expect("serialize cms with heap");
     idx.append_sample(sid, BTreeMap::new(), (1000, 1010), msgpack_full(bytes));
 
     let reducer = SketchReducer::new(&idx);
@@ -576,7 +578,7 @@ fn cms_without_heap_returns_missing_heap() {
     // sketch-kind side before decoding bytes.
     let mut cms = CountMinSketchWithHeap::new(4, 256, 20);
     cms.update("foo", 1.0);
-    let bytes = cms.serialize_msgpack().expect("serialize");
+    let bytes = cms.to_msgpack().expect("serialize");
     idx.append_sample(sid, BTreeMap::new(), (1000, 1010), msgpack_full(bytes));
 
     let reducer = SketchReducer::new(&idx);
@@ -696,7 +698,7 @@ fn hll_cumulative_full_plus_one_delta() {
     for i in 500..1000 {
         sk2.update(format!("user-{i}").as_bytes());
     }
-    let bytes2 = sk2.serialize_msgpack().expect("serialize HLL msgpack");
+    let bytes2 = sk2.to_msgpack().expect("serialize HLL msgpack");
     let delta_sample = SketchSampleState {
         bytes: bytes2,
         encoding: SketchEncoding::MsgpackDelta,

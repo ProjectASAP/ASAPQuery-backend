@@ -52,11 +52,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use asap_sketchlib::sketches::countminsketch::CountMinSketch;
-use asap_sketchlib::sketches::countsketch::CountSketch;
-use asap_sketchlib::sketches::ddsketch::DdSketch;
-use asap_sketchlib::sketches::hll::HllSketch;
-use asap_sketchlib::sketches::kll::KllSketch;
+use asap_sketchlib::CountMinSketch;
+use asap_sketchlib::CountSketch;
+use asap_sketchlib::DdSketch;
+use asap_sketchlib::HllSketch;
+use asap_sketchlib::KllSketch;
+use asap_sketchlib::MessagePackCodec;
 
 use crate::storage_engines::sketch_db::query::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
@@ -1160,7 +1161,7 @@ fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, ASAP
                 }
             })
         }
-        SketchEncoding::MsgpackFull => DdSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
+        SketchEncoding::MsgpackFull => DdSketch::from_msgpack(&state.bytes).map_err(|e| {
             ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
@@ -1192,7 +1193,7 @@ fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, ASAPTier
                 }
             })
         }
-        SketchEncoding::MsgpackFull => KllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
+        SketchEncoding::MsgpackFull => KllSketch::from_msgpack(&state.bytes).map_err(|e| {
             ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
@@ -1221,7 +1222,7 @@ fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, ASAPTier
                 }
             })
         }
-        SketchEncoding::MsgpackFull => HllSketch::deserialize_msgpack(&state.bytes).map_err(|e| {
+        SketchEncoding::MsgpackFull => HllSketch::from_msgpack(&state.bytes).map_err(|e| {
             ASAPTierError::DeserializeFailure {
                 sid,
                 encoding: state.encoding,
@@ -1311,7 +1312,7 @@ fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, Stri
     use asap_sketchlib::proto::sketchlib::{
         sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
     };
-    use asap_sketchlib::sketches::hll::HllVariant;
+    use asap_sketchlib::HllVariant;
     use prost::Message;
     let state = match SketchEnvelope::decode(buffer) {
         Ok(env) => match env.sketch_state {
@@ -1362,11 +1363,11 @@ fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, Stri
 // inline in the FrequencyTopk branch via `decode_cms_with_heap_from_msgpack`).
 #[allow(dead_code)]
 fn _unused_cms_kept_for_future_topk(buffer: &[u8]) -> Option<CountMinSketch> {
-    CountMinSketch::deserialize_msgpack(buffer).ok()
+    CountMinSketch::from_msgpack(buffer).ok()
 }
 #[allow(dead_code)]
 fn _unused_count_sketch_kept_for_future_topk(buffer: &[u8]) -> Option<CountSketch> {
-    CountSketch::deserialize_msgpack(buffer).ok()
+    CountSketch::from_msgpack(buffer).ok()
 }
 
 /// Decode a sid's per-window frequency sketch and emit a per-window

@@ -36,6 +36,7 @@ use asap_sketchlib::proto::sketchlib::{
     CountMinState, CountSketchState, CounterType, DdSketchState, HllVariant as ProtoHllVariant,
     HyperLogLogState, KllState,
 };
+use asap_sketchlib::MessagePackCodec;
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::enums::{AggregationType, WindowType};
 use prost::Message;
@@ -580,6 +581,9 @@ fn build_kll_state(k: u32, items: Vec<f64>) -> KllState {
         levels: Vec::new(),
         items,
         coin: None,
+        offset: 0.0,
+        value_scale: 0,
+        residuals: Vec::new(),
     }
 }
 
@@ -937,6 +941,7 @@ fn build_hll_state(precision: u32, registers: Vec<u8>) -> HyperLogLogState {
         hip_kxq0: 0.0,
         hip_kxq1: 0.0,
         hip_est: 0.0,
+        registers_sparse: None,
     }
 }
 
@@ -1185,11 +1190,11 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     // is what the Go producer (sketchlib-go) will emit once PR I's matching
     // Go-side work lands.
     let mut cms =
-        asap_sketchlib::sketches::countminsketch::CountMinSketch::new(rows as usize, cols as usize);
+        asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
     cms.update("user_a", 1.0);
     cms.update("user_b", 1.0);
     cms.update("user_a", 1.0);
-    let sketch_bytes = cms.serialize_msgpack().expect("serialize CMS msgpack");
+    let sketch_bytes = cms.to_msgpack().expect("serialize CMS msgpack");
 
     let client = reqwest::Client::new();
     let req = build_count_min_msgpack_export_request(
@@ -1202,13 +1207,13 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
 
     // Watermark advance using an empty msgpack sketch.
     let empty =
-        asap_sketchlib::sketches::countminsketch::CountMinSketch::new(rows as usize, cols as usize);
+        asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
     let watermark_req = build_count_min_msgpack_export_request(
         metric_name,
         service_label,
         2_000_000_000,
         empty
-            .serialize_msgpack()
+            .to_msgpack()
             .expect("serialize empty CMS msgpack"),
     );
     post_otlp_http(&client, otlp_http_port, watermark_req).await;
