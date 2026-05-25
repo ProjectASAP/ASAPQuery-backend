@@ -536,7 +536,19 @@ impl<'a> SketchReducer<'a> {
                                 reason: e,
                             }
                         })?;
+                    // Drop carry-in base windows: `SketchStore::query_range`
+                    // may splice in a Full snapshot ending BEFORE `t0_ms`
+                    // so the delta-apply walk can establish a rolling base
+                    // for a delta-only window. That base must not surface
+                    // as an output sample in the requested `[t0, t1]`
+                    // range. Cumulative mode emits a single scalar at the
+                    // latest in-window end so it's unaffected; per-window
+                    // mode emits one sample per window, so filter here.
+                    let lo = t0_ms as i64;
                     per_win
+                        .into_iter()
+                        .filter(|(w_end, _)| *w_end >= lo)
+                        .collect()
                 };
                 out_series.push((ts.series_label_values, samples_out));
             }

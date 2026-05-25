@@ -789,7 +789,7 @@ impl ASAPQueryEngine {
                 _ => reducer
                     .evaluate(
                         &hit_sids,
-                        &candidate.function,
+                        effective_sketch_function(candidate),
                         &candidate.function_args,
                         start_ms,
                         end_ms,
@@ -808,7 +808,9 @@ impl ASAPQueryEngine {
             // the range-query path too (issue #296) — same identity
             // case + fold semantics as the instant-query trait
             // adapter above.
-            let result = if candidate.outer_agg.is_some() {
+            let result = if candidate.outer_agg.is_some()
+                && !outer_fold_already_consumed(candidate)
+            {
                 apply_outer_agg_fold(result, &candidate.outer_agg)
             } else {
                 result
@@ -870,6 +872,67 @@ impl ASAPQueryEngine {
 ///
 /// Coverage is preserved from the inner result — the fold doesn't
 /// change which time-range the underlying sids covered.
+/// Effective sketch reducer function-name for a candidate.
+///
+/// `SketchReducer::evaluate` keys its query-family dispatch off a
+/// function-NAME string. The analyzer's `trace.function` is usually that
+/// name (`quantile_over_time`, `cardinality_estimate`, …), BUT for an
+/// outer-aggregation idiom whose inner is a BARE selector — e.g.
+/// `count(metric)` (the HLL distinct-count idiom) — `trace_from_promql`
+/// unwraps the outer `count` into `outer_agg` and then walks the inner
+/// bare selector, which carries no function name. The trace's `function`
+/// is then EMPTY, and the reducer maps `""` → `UnsupportedFunction` →
+/// the engine returns an empty/capability-miss result for a query the
+/// warm tier can actually answer.
+///
+/// When `function` is empty we fall back to a canonical name derived
+/// from the analyzer's typed `required_capability` (the load-bearing
+/// signal), so `count(hll_metric)` dispatches to the Cardinality family
+/// and `quantile(...)` to the Quantile family even when the AST walk
+/// couldn't recover a string. Non-empty function names pass through
+/// unchanged so existing aliases keep their exact semantics.
+fn effective_sketch_function(
+    candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
+) -> &str {
+    if !candidate.function.is_empty() {
+        return &candidate.function;
+    }
+    use crate::storage_engines::sketch_db::index::Capability;
+    match &candidate.required_capability {
+        Capability::QuantileApprox(_) => "quantile",
+        Capability::CardinalityApprox => "cardinality_estimate",
+        Capability::FrequencyTopk(_) => "topk",
+        Capability::FrequencyEstimate(_) => "frequency",
+        // ExactAgg never reaches the sketch `evaluate` path (handled by
+        // the ExactAgg dispatch branch), but return a benign default so
+        // a stray ExactAgg still surfaces as UnsupportedFunction rather
+        // than silently mis-dispatching.
+        Capability::ExactAgg(_) => "",
+    }
+}
+
+/// Whether the analyzer's `outer_agg` should still be folded over the
+/// reducer's result, or has already been CONSUMED by the
+/// capability dispatch.
+///
+/// `count(hll_metric)` is the distinct-count idiom: the analyzer lifts
+/// the outer `count` into both `outer_agg = Count` AND
+/// `required_capability = CardinalityApprox`. The HLL reducer answers
+/// the distinct count directly (one cardinality scalar per window), so
+/// re-applying the `Count` fold would collapse that estimate to the
+/// row-count (`values.len()` → 1) — the wrong answer. Suppress the fold
+/// in that case; the cardinality estimate IS the count.
+fn outer_fold_already_consumed(
+    candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
+) -> bool {
+    use crate::storage_engines::sketch_db::index::Capability;
+    use control_plane::asap_tier_analysis::OuterAgg;
+    matches!(
+        (&candidate.required_capability, &candidate.outer_agg),
+        (Capability::CardinalityApprox, OuterAgg::Count(_))
+    )
+}
+
 fn apply_outer_agg_fold(
     inner: crate::storage_engines::sketch_db::query::ASAPTierResult,
     outer: &control_plane::asap_tier_analysis::OuterAgg,
@@ -1415,7 +1478,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     ),
                     _ => reducer.evaluate(
                         &hit_sids,
-                        &candidate.function,
+                        effective_sketch_function(candidate),
                         &candidate.function_args,
                         t0_ms,
                         now_ms,
@@ -1498,7 +1561,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // a single-value group, returning the same value
                 // unchanged. No special case needed; the general fold
                 // handles it.
-                let result = if candidate.outer_agg.is_some() {
+                let result = if candidate.outer_agg.is_some()
+                    && !outer_fold_already_consumed(candidate)
+                {
                     apply_outer_agg_fold(result, &candidate.outer_agg)
                 } else {
                     result
@@ -2445,6 +2510,313 @@ mod asap_tier_classify_tests {
         assert_eq!(by_zone.get("z1").copied(), Some(200.0));
         assert_eq!(by_zone.get("z2").copied(), Some(300.0));
         assert_eq!(by_zone.get("z3").copied(), Some(400.0));
+    }
+
+    // Build a now-anchored KLL `SketchInstanceMetadata` + sample so the
+    // engine's instant/range default lookbacks reach it. Mirrors the
+    // live MVP workload: the agent emits a bare-named KLL sketch
+    // (`http_requests_total_latency_ms`) into the SketchStore.
+    fn kll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::Kll { k: 200 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::Kll,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new()},
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET}
+    }
+
+    fn encode_kll_items_proto(k: u16, items: &[f64]) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+        let state = KllState {
+            k: k as u32,
+            items: items.to_vec(),
+            levels: vec![],
+            num_levels: 0,
+            ..Default::default()
+        };
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+            ..Default::default()
+        };
+        env.encode_to_vec()
+    }
+
+    fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::Hll { precision: 10 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::CardinalityApprox),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::Hll,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new()},
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET}
+    }
+
+    fn encode_hll_with_cardinality(precision: u32, distinct: usize) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
+        use prost::Message;
+        let mut sk = HllSketch::new(HllVariant::Regular, precision);
+        for i in 0..distinct {
+            sk.update(format!("user-{i}").as_bytes());
+        }
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: sk.precision,
+            registers: sk.registers.clone(),
+            hip_kxq0: sk.hip_kxq0,
+            hip_kxq1: sk.hip_kxq1,
+            hip_est: sk.hip_est};
+        let env = SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        };
+        env.encode_to_vec()
+    }
+
+    /// REGRESSION of the HLL `count(metric)` "No result" e2e failure
+    /// (`controller_plan_to_query_full_roundtrip_hll`) isolated to the
+    /// engine layer. `count(unique_users_per_min)` is the distinct-count
+    /// idiom: the analyzer lifts the outer `count` into `outer_agg=Count`
+    /// AND `required_capability=CardinalityApprox`, and the bare-selector
+    /// inner leaves the trace `function` EMPTY. Before the fix the engine
+    /// passed the empty function to the reducer (→ `UnsupportedFunction`)
+    /// AND re-applied the `Count` fold (→ row-count 1.0). The fix derives
+    /// the reducer family from the capability and suppresses the
+    /// already-consumed `Count` fold, so the HLL distinct-count is
+    /// returned directly. A single FULL HLL frame (~500 users) is used so
+    /// the instant projection reads the real estimate.
+    #[tokio::test]
+    async fn execute_count_hll_returns_cardinality_not_rowcount() {
+        let idx = Arc::new(SketchStore::new());
+        let sid = 7500u64;
+        idx.register(hll_meta(sid, "unique_users_per_min"));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (now_ms.saturating_sub(3_000), now_ms.saturating_sub(2_000)),
+            SketchSampleState {
+                bytes: encode_hll_with_cardinality(10, 500),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+        );
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("count(unique_users_per_min)")
+            .await
+            .expect(
+                "count(hll_metric) must dispatch to the Cardinality family \
+                 via the candidate capability (empty trace function) and \
+                 return the HLL distinct-count, NOT capability-miss",
+            );
+        assert!(
+            result_nonempty(&result),
+            "count(unique_users_per_min) over an HLL sid must return a \
+             non-empty cardinality estimate (regression: empty `asap_query` \
+             No-result)"
+        );
+        // The value must be the HLL distinct-count estimate (~500), NOT
+        // the outer-Count fold collapsing it to the row-count (1.0).
+        let est = match &result {
+            crate::query_engines::query_result::QueryResult::Vector(v) => v.values[0].value,
+            crate::query_engines::query_result::QueryResult::Matrix(m) => {
+                m.values[0].samples.last().map(|s| s.value).unwrap_or(0.0)
+            }
+        };
+        assert!(
+            est > 100.0,
+            "expected the HLL distinct-count estimate (~500), not the \
+             row-count fold (1.0); got {est}"
+        );
+    }
+
+    /// REPRODUCTION (root-cause hunt): `quantile_over_time(0.99,
+    /// http_requests_total_latency_ms[30s])` end-to-end via
+    /// `execute(&str)` against a now-anchored KLL sid carrying real
+    /// sketch state. The window is inside the engine's `[now-30s, now]`
+    /// range. This pins the exact end-to-end behaviour the live deploy
+    /// shows ("No result" tagged `asap_query`) so we can see whether the
+    /// engine produces `Ok(populated)`, `Ok(empty)`, or `CapabilityMiss`.
+    #[tokio::test]
+    async fn execute_quantile_over_time_kll_now_anchored() {
+        let idx = Arc::new(SketchStore::new());
+        let sid = 7100u64;
+        idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // A 10s window ending 5s ago — comfortably inside the 30s range.
+        let window_start = now_ms.saturating_sub(15_000);
+        let window_end = now_ms.saturating_sub(5_000);
+
+        let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        let bytes = encode_kll_items_proto(200, &items);
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (window_start, window_end),
+            SketchSampleState {
+                bytes,
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+        );
+
+        // The sid must classify as Hit (in-memory unsealed state counts).
+        assert_eq!(
+            idx.classify(sid),
+            crate::storage_engines::sketch_db::index::SidLookup::Hit,
+            "KLL sid with appended in-memory state must classify Hit"
+        );
+
+        let result = engine_quantile_result(idx, now_ms).await;
+        let nonempty = match result {
+            crate::query_engines::query_result::QueryResult::Vector(v) => !v.values.is_empty(),
+            crate::query_engines::query_result::QueryResult::Matrix(m) => {
+                m.values.iter().any(|s| !s.samples.is_empty())
+            }
+        };
+        assert!(
+            nonempty,
+            "quantile_over_time over a now-anchored KLL sid must return a \
+             non-empty result (got empty → reproduces the live `asap_query` \
+             + No-result bug)"
+        );
+    }
+
+    async fn engine_quantile_result(
+        idx: Arc<SketchStore>,
+        _now_ms: u64,
+    ) -> crate::query_engines::query_result::QueryResult {
+        let engine = build_engine_with_index(idx);
+        engine
+            .execute("quantile_over_time(0.99, http_requests_total_latency_ms[30s])")
+            .await
+            .expect(
+                "quantile_over_time over a Hit KLL sid must NOT capability-miss \
+                 (if it does, the bug is upstream of the reducer)",
+            )
+    }
+
+    fn result_nonempty(r: &crate::query_engines::query_result::QueryResult) -> bool {
+        match r {
+            crate::query_engines::query_result::QueryResult::Vector(v) => !v.values.is_empty(),
+            crate::query_engines::query_result::QueryResult::Matrix(m) => {
+                m.values.iter().any(|s| !s.samples.is_empty())
+            }
+        }
+    }
+
+    /// REGRESSION (delta-stitching carry-in): the live agent emits a
+    /// periodic Full snapshot followed by many cheap Delta frames to
+    /// save bandwidth, so a short query window (`[30s]`) routinely
+    /// contains ONLY deltas — the Full landed earlier, outside the
+    /// window. Before the fix, `SketchStore::query_range`'s strict
+    /// containment filter (`w.0 >= start`) dropped the out-of-window
+    /// Full, the delta-apply reducer couldn't establish a rolling base,
+    /// and the engine returned `Ok(empty)` (NOT a capability-miss) — so
+    /// the router never failed over and the client saw "No result"
+    /// tagged `asap_query`. The fix splices in the most-recent Full
+    /// ending before `start` as a carry-in base. This test pins that:
+    /// a Full at now-60s + a Delta at now-10s with a `[30s]` window must
+    /// produce a NON-EMPTY answer.
+    #[tokio::test]
+    async fn quantile_over_time_kll_full_before_window_carries_in_base() {
+        let idx = Arc::new(SketchStore::new());
+        let sid = 7400u64;
+        idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        // Full at now-60s..now-55s — OUTSIDE the 30s window.
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (now_ms.saturating_sub(60_000), now_ms.saturating_sub(55_000)),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+        );
+        // Delta at now-15s..now-5s — INSIDE the window.
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta},
+        );
+
+        let result = engine_quantile_result(idx, now_ms).await;
+        assert!(
+            result_nonempty(&result),
+            "quantile_over_time with a Full BEFORE the window + a Delta \
+             inside it must carry in the Full as a base and return a \
+             non-empty result (regression: returned empty `asap_query` \
+             No-result)"
+        );
+    }
+
+    /// A delta-ONLY window with NO Full anywhere is a genuine data gap —
+    /// there is no base to stitch from. The carry-in fix does not (and
+    /// cannot) fabricate one, so the result is empty. Documents the
+    /// boundary so the carry-in change isn't mistaken for "always
+    /// non-empty"; a follow-up may convert this to a NoData → archive
+    /// failover.
+    #[tokio::test]
+    async fn quantile_over_time_kll_delta_only_no_base_is_empty() {
+        let idx = Arc::new(SketchStore::new());
+        let sid = 7300u64;
+        idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta},
+        );
+
+        let result = engine_quantile_result(idx, now_ms).await;
+        assert!(
+            !result_nonempty(&result),
+            "delta-only window with no Full base anywhere has nothing to \
+             stitch from → empty result expected"
+        );
     }
 
     /// `rate(http_requests_total[5m])` end-to-end via `execute(&str)`.

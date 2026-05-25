@@ -256,6 +256,30 @@ impl<P> MutableEpoch<P> {
         }
     }
 
+    /// Push every entry whose window-END is at or before `before` into
+    /// `out`. Used by the sketch read path to fetch a delta-stitching
+    /// "carry-in base" — the most-recent Full snapshot that landed
+    /// before the query window — so a short query window that contains
+    /// only delta frames can still establish its rolling state. The
+    /// caller is responsible for picking the latest Full per label (the
+    /// columnar layer is payload-agnostic). O(M) linear scan.
+    pub fn collect_ending_at_or_before<'a>(
+        &'a self,
+        before: u64,
+        out: &mut Vec<(TimestampRange, LabelValuesId, &'a P)>,
+    ) {
+        if let Some(min_s) = self.min_start {
+            if min_s > before {
+                return;
+            }
+        }
+        for (i, w) in self.windows_col.iter().enumerate() {
+            if w.1 <= before {
+                out.push((*w, self.label_ids_col[i], &self.payloads_col[i]));
+            }
+        }
+    }
+
     /// Total accumulated entries — caller compares against
     /// `epoch_capacity` to decide whether to seal + rotate.
     pub fn distinct_windows(&self) -> usize {
@@ -430,6 +454,32 @@ impl<P> SealedEpoch<P> {
                 break;
             }
             if entry.0 .1 <= end {
+                out.push((entry.0, entry.1, &entry.2));
+            }
+        }
+    }
+
+    /// Push every entry whose window-END is at or before `before` into
+    /// `out`. Sealed sister of
+    /// [`MutableEpoch::collect_ending_at_or_before`]. Entries sort by
+    /// window-START; since `w.1 >= w.0`, any entry with `w.1 <= before`
+    /// also has `w.0 <= before`, so we can stop the scan once
+    /// `w.0 > before`. O(log N + k).
+    pub fn collect_ending_at_or_before<'a>(
+        &'a self,
+        before: u64,
+        out: &mut Vec<(TimestampRange, LabelValuesId, &'a P)>,
+    ) {
+        if let Some(min_s) = self.min_start {
+            if min_s > before {
+                return;
+            }
+        }
+        for entry in &self.entries {
+            if entry.0 .0 > before {
+                break;
+            }
+            if entry.0 .1 <= before {
                 out.push((entry.0, entry.1, &entry.2));
             }
         }
