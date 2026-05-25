@@ -510,3 +510,50 @@ All four are unbiased; the added error is the $\epsilon_s$ / variance term above
 which §6.4 folds into the per-metric accuracy budget (and §6's composition rule —
 store the raw sampled integer state + global `p`, rescale at query — keeps these
 estimators compressible).
+
+---
+
+## 8. Implementation plan / PR sequence
+
+Ordered by isolation + ROI + dependency + risk. Wire/format-changing PRs ship a
+new (proto-additive) field + dual-read so agents and backend can deploy at
+different times; each is validated on-cluster via the auto build-and-load deploy
+(marquee + memory + the metric's accuracy SLA). `∥` = parallelizable.
+
+**Phase 1 — warm sketch serialization (isolated, audit-proven; relieves warm memory)**
+- **PR1 — HLL sparse full-state** (§2.1 P1): sketchlib-go encode + asap_sketchlib
+  decode, additive proto field, dual-read. ROI 5–50× + cuts warm SketchStore
+  memory. No deps.
+- **PR2 — KLL value-offset serialize** (§2.1 P2): `(v−offset)` fixed-point +
+  scale/offset in the sketch header. ROI ~2×. `∥ PR1` (separate sketch + proto
+  message).
+
+**Phase 2 — sampling (CPU; builds on the sketch format + composition rule)**
+- **PR3 — sampling layer in sketchlib-go** (§6/§7): per-family inverse-prob /
+  hash-threshold / weighted + geometric (§6.6) + composition rule (header stores
+  raw sampled int + `p`; backend ×1/p at query). Gated by per-sketch `p`,
+  default `p=1` (no-op). 
+- **PR4 — controller per-metric `p` knob** (§6.4): control-plane annotates +
+  pushes `p` (like tier/sketch-type); agent applies. Activates PR3. Deps PR3.
+
+**Phase 3 — cold custom codec + read path**
+- **PR5 — cold INT best-of-N codec library** (§1.2–1.4): `{Gorilla-XOR,
+  INT_FOR_DELTA, INT_FOR_DOD}` + decimal-exactness guard + chunk header +
+  overflow chunk-cut. Standalone lib + lossless round-trip tests; no deploy. ROI
+  4.8×. No deps — `∥ Phase 1/2`.
+- **PR6 — decode-on-read StoreAPI** (§1.5–1.6): gorilla-merger stores custom
+  chunks (write = no decode) + decodes → XOR `AggrChunk` at query; coexists with
+  existing gorilla blocks. Deps PR5.
+- **PR7 — shared-ts grouped layout** (§1.7): same-metric series share one ts
+  column per part. ROI −43% cross-series. Deps PR5/PR6.
+
+**Phase 4 — offset unification + warm delta-with-offset**
+- **PR8 — parse-once shared scale/stats (§4) + warm drift→Full + Delta-frame
+  epoch-offset (§3.1 v1)**: ties KLL-offset (PR2) into delta-transmission with an
+  epoch-bound offset; adds drift→Full (hard-overflow + fixed heartbeat,
+  zero-tuning). Deps PR2.
+
+Parallel start set (no deps): **PR1 ∥ PR2 ∥ PR5**. Critical path: PR5→PR6→PR7.
+Rationale: warm-serialize first (isolated, proven, relieves the live warm-memory
+concern); sampling next (the CPU axis, gated no-op so it merges safely); the cold
+codec migration (biggest, riskiest) in phase 3; offset unification last.
