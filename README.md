@@ -101,29 +101,28 @@ ASAPQuery-backend/                 # Cargo workspace
 
 ## Where the planner lives
 
-**The planner is in [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller),
-not in this repo.**
+**The planner — the "control plane" — now lives in this repo at
+[`control_plane/`](control_plane/).** It was moved in-tree (Phase 9)
+from its former `ASAPCollector/controller/` location; `data_plane/`
+(the query backend) and `control_plane/` (the planner) are now
+workspace siblings.
 
-This is a deliberate consolidation — the controller is the single
-authority for:
+The control plane is the single authority for:
 
 1. Which sketches to compute, and where (SDK / agent / gateway / backend)
 2. Per-metric `BackendStorageRouting` (which engine answers which query shape)
 3. Per-runtime configuration (agent YAML, gateway YAML, backend
    StreamingConfig + StorageRouting JSON)
 
-The controller pushes its plan to all runtimes via OpAMP. The backend
-hot-loads the new `BackendStorageRouting` and `StreamingConfig` on
-each push without restart. ASAPQuery-backend is therefore mostly an
-**executor** — it ingests sketches, evaluates queries, and dispatches
-based on the controller-emitted routing table.
+It pushes its plan to all runtimes via OpAMP. The data plane hot-loads
+the new `BackendStorageRouting` and `StreamingConfig` on each push
+without restart, so it is mostly an **executor** — it ingests
+sketches, evaluates queries, and dispatches based on the
+control-plane-emitted routing table.
 
 The legacy `asap-planner-rs` workspace member (library + CLI) was
-deleted in Phase γ — its 5 PromQL pattern matchers and 11
-archive-only intents now live in the ASAPCollector controller's L3 /
-L4 stages. External users who previously scripted against
-`bin/asap-planner` should drive the controller directly via its HTTP
-API (or its own CLI surface — separate work item).
+deleted in Phase γ; its PromQL pattern-matching and archive-only
+intents now live in `control_plane/`'s query-lowering stages.
 
 ## Quick start
 

@@ -1,4 +1,4 @@
-# Phase 3 step 3: backend consumes `asap-precompute-rs`
+# Backend consumes `asap-precompute-rs`
 
 ## Status
 
@@ -15,7 +15,7 @@ host-neutral crate
 Every Rust **edge** runtime (Vector adapter, OTAP-Rust, Arrow-backed
 shims, Telegraf input) consumes it, and so does this backend.
 
-Before Phase 3 step 3, the backend's ingest path inlined that shared
+Before this change, the backend's ingest path inlined that shared
 logic:
 
 - `precompute_operators/{ddsketch,kll,hll,countsketch,countmin}_accumulator.rs`

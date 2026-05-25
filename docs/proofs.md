@@ -600,7 +600,7 @@ $\sigma_B.\mathrm{serialize\_to\_bytes}() =
   byte-for-byte. Cross-language byte parity for DDSketch / KLL /
   CountSketch landed in 2026-05-05 (PRs #40/#41/#42 +
   #43/#44/#45); HLL / CMS variants are in flight per
-  `design-phase3-asap-precompute-rs.md`. For deployments where
+  `design-asap-precompute-rs.md`. For deployments where
   this parity hasn't landed, "bit-identical" in §4.1 weakens to
   "agree within sketch error bound $\varepsilon$ of §1."
 - **HashMap-iteration order in grouping.** The backfill processor
