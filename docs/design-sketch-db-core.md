@@ -25,7 +25,7 @@ changes that touch the sketch DB today.
 
 ## 1. Motivation
 
-`SimpleMapStore` today is a KV store bucketed by `aggregation_id`. That was
+`SketchStore` today is a KV store bucketed by `aggregation_id`. That was
 enough for "write sketches, read them back by id." It is no longer enough once:
 
 - The control plane reconfigures sketches at runtime in response to a changing
@@ -227,7 +227,7 @@ forever, you choose per-view and per-situation.
                             │ query_metric / point / range_merge
                             │
              ┌─────────────────────────────────────────────────┐
-             │  Query Engine (SimpleEngine)                     │
+             │  Query Engine (ASAPQueryEngine)                  │
              │  - parses PromQL/SQL                            │
              │  - dispatches by metric, not agg_id             │
              │  - assembles results from DB's per-segment      │
@@ -246,7 +246,7 @@ control plane.
 | Tier | Implementation | Compaction mechanism | Retention | Query latency | Use case |
 |---|---|---|---|---|---|
 | **Tier 1** | PromSketch — in-memory EH-backed sketches over raw samples | **Continuous temporal compaction via the EH bucket structure itself** — fine-grained buckets for recent data, exponentially coarser buckets for older data, merged in place as windows age | seconds to minutes (bounded by memory) | sub-millisecond | live dashboards, alerts; **especially good when many sub-window queries target the same series** — e.g. a dashboard that asks for p50/p95/p99 over 1m, 5m, 15m, 1h all against the same metric. Tier 1 serves all of them from one EH structure with no redundant storage; Tier 2 would store one pre-merged sketch per (agg_id, window) and either duplicate the series across multiple agg_ids or rely on read-time merge. |
-| **Tier 2** | Precompute engine + `SimpleMapStore` LSM parts (memory + disk) | **Batched semantic compaction** via LSM levels — roadmap §9 — N entries at level L merged into one at level L+1 at a coarser window | minutes to weeks (bounded by `persistence_delete_older_than_secs`) | milliseconds | most production queries, longer-horizon analysis |
+| **Tier 2** | Precompute engine + `SketchStore` LSM parts (memory + disk) | **Batched semantic compaction** via LSM levels — roadmap §9 — N entries at level L merged into one at level L+1 at a coarser window | minutes to weeks (bounded by `persistence_delete_older_than_secs`) | milliseconds | most production queries, longer-horizon analysis |
 | **Exact DB** | S3 + Gorilla / Prometheus / VictoriaMetrics / ClickHouse | Storage-native compression (Gorilla / columnar); no sketch-level merging | months+ (configurable, bounded by raw storage cost) | seconds to tens of seconds | fallback for uncovered queries, base relation for refresh |
 
 The two sketch tiers implement the **same abstract concept** — "reduce
@@ -260,7 +260,7 @@ queryable history → Tier 2; both → both.
 
 > **Status note.** Tier 1 (PromSketch) is currently dormant in the codebase;
 > most of its integration points are commented out. Tier 2
-> (`SimpleMapStore` + LSM persistence) is the active path. Tier
+> (`SketchStore` + LSM persistence) is the active path. Tier
 > selection fields on `AggregationConfig` are partially plumbed but not
 > exercised end-to-end.
 
@@ -285,7 +285,7 @@ it is "not sketch DB" — it holds raw samples, not sketches.
 ### 4.2 Why this framing
 
 Before this framing: PromSketch (`stores/promsketch_store/`) and the
-precompute-backed `SimpleMapStore` looked like two independent
+precompute-backed `SketchStore` looked like two independent
 sketch systems that the query engine had to route between. They had
 overlapping but different semantics (incremental MV in both cases, but
 different schema, different retention model, different hot-reload
@@ -380,7 +380,7 @@ the second as a secondary index. Primary order wins during compaction
 pattern); secondary index is maintained via an auxiliary log that the
 reader consults for single-group time scans.
 
-> **Status.** Primary order is the shape of SimpleMapStore today
+> **Status.** Primary order is the shape of SketchStore today
 > (per-`agg_id` bucketing + per-key). A separate materialized
 > secondary index is **not** implemented; single-group time scans
 > iterate the primary structure.
@@ -436,7 +436,7 @@ enum AggStatus {
 }
 ```
 
-Implemented in `asap-query-engine/src/stores/sketch_db/schema.rs`
+Implemented in `data_plane/src/storage_engines/sketch_db/index/mod.rs`
 (`AggSchema`, `AggStatus`, `SchemaRegistry`).
 
 ### 6.2 Status transitions
@@ -561,7 +561,7 @@ recent samples might use a smaller-K KLL than the Tier 2 long-term
 storage. The query engine can prefer Tier 1 for queries whose SLA
 permits the looser bound, and Tier 2 for tighter SLA.
 
-Implemented in `asap-query-engine/src/stores/sketch_db/accuracy.rs`.
+Implemented in `data_plane/src/storage_engines/sketch_db/accuracy.rs`.
 
 ---
 
@@ -605,7 +605,7 @@ timeline_for_metric("latency", day1-1h, day1+1h)
 Query engine uses this to dispatch per-segment. DB provides it from an
 in-memory BTree; cost is one HashMap lookup + BTree range scan,
 nanoseconds. Implemented at `schema.rs`; used by
-`query-engines/timeline_dispatch.rs`.
+`storage_engines/sketch_db/query/timeline_dispatch.rs`.
 
 ### 7.3 Per-segment query dispatch
 
@@ -650,7 +650,7 @@ fall-through to the exact DB for the missing segment. Crucially, this
 failure mode is **explicit** — the user knows they are seeing a
 schema-change artifact.
 
-Implemented in `query-engines/timeline_dispatch.rs`. Coverage-driven branching
+Implemented in `storage_engines/sketch_db/query/timeline_dispatch.rs`. Coverage-driven branching
 (the `match` in the snippet above) is present in skeleton form; the
 `Coverage::BackfillInProgress` → wait-or-fallback policy is still a
 follow-up (see roadmap §16 "Phase 5f").
@@ -889,7 +889,7 @@ enum BackfillStatus {
 }
 ```
 
-Implemented in `stores/sketch_db/backfill.rs` (types + registry) and
+Implemented in `storage_engines/sketch_db/backfill.rs` (types + registry) and
 `backfill_service.rs` / `backfill_worker.rs` (worker pool).
 
 ### 10.3 Refresh is a separate worker pool

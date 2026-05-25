@@ -1,7 +1,7 @@
-# Phase-5 unification plan: SchemaRegistry → SketchIndex, agg_id → sid, MutableEpoch dedup
+# Unification plan: SchemaRegistry → SketchIndex, agg_id → sid, MutableEpoch dedup
 
 This is a planning doc, not an implementation. It explains how three
-in-flight Phase-5 migrations close out together, and what the data
+in-flight migrations close out together, and what the data
 plane looks like after.
 
 **Status as of May 2026:** all three migrations have landed their
@@ -16,7 +16,7 @@ production path. Concretely:
   `data_plane/src/drivers/ingest/otel.rs:526,591,615,1049,1062`.
 - Query path emits `aggregation_id_for_key` / `aggregation_id_for_value`
   on the wire response (asap_query_engine/engine.rs:1019,1064).
-- `data_plane/src/stores/sketch_db/store/{global,per_key}.rs` still
+- `data_plane/src/storage_engines/sketch_db/store/{global,per_key}.rs` still
   use the non-generic legacy `MutableEpoch` / `SealedEpoch` from
   `store/common.rs`. The generic `MutableEpoch<P>` in
   `index/epoch_columnar.rs` is used only by `SketchIndex`.
@@ -139,7 +139,7 @@ From the May 12 controller_todo doc:
 
 ## Concrete unification work, file-by-file
 
-### Phase A — M1 prep (does not change the wire format)
+### Step A — M1 prep (does not change the wire format)
 
 1. Add lifecycle fields to `SketchInstanceMetadata`:
    - `status: AggStatus`
@@ -152,7 +152,7 @@ From the May 12 controller_todo doc:
    so eviction can drive off it.
 4. Tests: replicate every `SchemaRegistry` test against `SketchIndex`.
 
-### Phase B — M1 cutover
+### Step B — M1 cutover
 
 1. Switch `SchemaEvictionService` to call `SketchIndex` methods.
 2. Switch ingest barrier `is_writable(agg_id)` → `is_writable(sid)`.
@@ -160,19 +160,19 @@ From the May 12 controller_todo doc:
    `sketch_db/schema/`. Folder remains for compat re-exports during
    transition; can be deleted once all callers migrated.
 
-### Phase C — M2.1 (parallel-write)
+### Step C — M2.1 (parallel-write)
 
 Ingest emits both `agg_id` and `sid` on every precompute (already
 the case today). Store accepts either as a key; internally maps
 agg_id → sid via a side table. Query path resolves either.
 
-### Phase D — M2.2 cutover
+### Step D — M2.2 cutover
 
 Store keys flip to sid. Wire format drops `aggregation_id` fields.
 Coordinated release with ASAPCollector. After this lands,
 `aggregation_id` is dead.
 
-### Phase E — M3 freebie
+### Step E — M3 freebie
 
 `Arc<dyn AggregateCore>` payloads are no longer the path-of-record;
 they only exist in the legacy `store/{global,per_key}.rs` code, which
@@ -183,21 +183,21 @@ caller.
 
 ## Estimate
 
-- Phase A: 1 day (additive, low risk).
-- Phase B: 1 day (cutover; SchemaRegistry deletion is touchy but
+- Step A: 1 day (additive, low risk).
+- Step B: 1 day (cutover; SchemaRegistry deletion is touchy but
   mechanical).
-- Phase C: 1 day (parallel-write is already partially in place).
-- Phase D: 1 day + ASAPCollector PR coordination + integration
+- Step C: 1 day (parallel-write is already partially in place).
+- Step D: 1 day + ASAPCollector PR coordination + integration
   testing window.
-- Phase E: 0.5 day (mostly deletion).
+- Step E: 0.5 day (mostly deletion).
 
 Total: ~5 working days end-to-end, plus coordination overhead.
 
 ## Open questions for the reader
 
 1. Does the wire format have a stability commitment that constrains
-   Phase D? (Backwards-compat shim period? Versioned acceptance?)
-2. After Phase E, does anything outside `SketchIndex` need to handle
+   Step D? (Backwards-compat shim period? Versioned acceptance?)
+2. After Step E, does anything outside `SketchIndex` need to handle
    the trait-object `AggregateCore` payload? E.g., the
    `PrecomputeEngine` write path serializes via `SerializableToSink`
    — does that path move to typed bytes too?

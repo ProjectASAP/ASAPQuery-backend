@@ -1,5 +1,14 @@
 # Design: Sketch DB as a Pluggable Component
 
+> **Status: not adopted (historical).** This proposal to detach the
+> sketch DB into a standalone `sketch-db` crate / network service was
+> **not implemented**. The 2026-05 reorg instead kept the sketch DB as
+> an in-tree module at `data_plane/src/storage_engines/sketch_db/`
+> (`index/`, `data/`, `query/`, `lifecycle/`, `persistence/`,
+> `backfill/`). The crate names and paths below describe the proposal
+> as originally written and no longer match the tree; kept as a record
+> of the alternative that was considered.
+
 Companion to the sketch DB design set — see
 [`design-sketch-db.md`](./design-sketch-db.md) for the index and
 [`design-sketch-db-core.md`](./design-sketch-db-core.md) for the
@@ -85,7 +94,7 @@ What the boundary has to cut:
 | Piece | Today's location | Who owns it after split |
 |---|---|---|
 | `Store` trait | `asap-query-engine/src/stores/traits.rs` | `sketch-db` (public) |
-| `SimpleMapStore` + LSM | `asap-query-engine/src/stores/sketch_db/simple_map_store/` | `sketch-db` (public) |
+| `SketchStore` + LSM | `asap-query-engine/src/stores/sketch_db/simple_map_store/` | `sketch-db` (public) |
 | `SchemaRegistry`, `AggSchema` | `asap-query-engine/src/stores/sketch_db/schema.rs` | `sketch-db` (public) |
 | Backfill types / worker / registry | `asap-query-engine/src/stores/sketch_db/backfill*.rs` | `sketch-db` (public) |
 | `AggregateCore` trait | `asap-query-engine/src/data_model/` | `sketch-db` (public trait) |

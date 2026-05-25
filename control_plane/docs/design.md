@@ -1606,7 +1606,7 @@ Control plane (ASAPController) and data plane (OTel agents / ASAPQuery-backend /
 | Deployment model | Data plane lives in | Wire protocol |
 |---|---|---|
 | lifecycle | DataCollector (OTel collectors, agent + backend roles) | OpAMP WebSocket (config push) + HTTP POST (`StreamingConfig` → ASAPQuery-backend) + Prometheus scrape (metrics in) |
-| query | ASAPQuery-backend (query engine, SimpleMapStore) | HTTP POST `/api/v1/streaming-config` + `/api/v1/plan` (capability-miss callback in) + YAML file on disk (init-container mode) |
+| query | ASAPQuery-backend (query engine, SketchStore) | HTTP POST `/api/v1/streaming-config` + `/api/v1/plan` (capability-miss callback in) + YAML file on disk (init-container mode) |
 | fusion | Caller's DataFusion `SessionContext` | in-process library call (no wire) |
 
 **Data plane code stays in its original repo.** ASAPController only owns the control plane. The merger doesn't move OTel collectors out of DataCollector, doesn't move the query engine out of ASAPQuery-backend, and doesn't move DataFusion out of asap-fusion's users. Each data plane keeps its own release cadence.
@@ -1843,7 +1843,7 @@ Before PR #129 there were **four** overlapping capability tables in the controll
 All four collapsed into one module: `controller/src/sketch_algebra/capability.rs`. The four-way map is now:
 
 - `SketchCapability` + `SupportedIntent` — per-sketch perf profile, read by L4 cost model + L5 physical planner (formerly the YAML + compiled-in copies).
-- `Capability` + `SketchKindHandle` — query-side capability tag, used by `asap-query-engine`'s ASAP-tier reducer (formerly the per-query invention in PR #128).
+- `Capability` + `SketchKindHandle` — query-side capability tag, used by `data_plane`'s ASAP-tier reducer (formerly the per-query invention in PR #128).
 - `capability_for(intent: &AggIntent) -> Option<Capability>` — the **semantic** intent → ASAP-tier dispatch bridge. The new signature replaces the older `capability_for(query_func: &str)` string-keyed lookup. PromQL → `intent_algebra::lower` → `AggIntent` → (this fn) → `Capability`. The ASAP-tier analyzer at `controller/src/asap_tier_analysis.rs` is now a thin facade around this single function.
 - `default_capability_table()` / `load_capability_overrides()` — compiled-in defaults + YAML override loader.
 

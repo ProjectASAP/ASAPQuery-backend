@@ -225,7 +225,7 @@ Span: http_query (query engine entry)
   └─ Span: find_schema_timeline
   └─ Span: per_segment_dispatch
        ├─ Span: tier1_query (PromSketch)
-       └─ Span: tier2_query (SimpleMapStore)
+       └─ Span: tier2_query (SketchStore)
             ├─ Span: part_scan
             └─ Span: sketch_merge
   └─ Span: combine_statistic
@@ -505,7 +505,7 @@ program of work that continues to be delivered phase by phase.
    partial sketch with partial fallback, or serve from fallback only.
    Trade-off knob on the query level.
 
-5. **Does the current `SimpleMapStore` schema support all of Phase 1
+5. **Does the current `SketchStore` schema support all of Phase 1
    without disk migration?** Mostly. `count`/`sum`/`min`/`max` can be
    written as separate columns in the existing part format; readers
    that don't know about them can skip. The label posting index

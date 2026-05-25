@@ -96,18 +96,18 @@ partially wired; "❌ not started" means spec only.
 | § | Claim | Status | Evidence |
 |---|---|---|---|
 | 5.1 | `SketchEntry` with typed aux columns (count/sum/min/max) as first-class fields | ⚠️ partial | `PrecomputedOutput` carries origin but aux scalars live in the accumulator, not as record columns |
-| 5.2 | Primary key `(agg_id, window_start, group_key)` | ✅ | `SimpleMapStore` per-agg bucketing + per-key |
+| 5.2 | Primary key `(agg_id, window_start, group_key)` | ✅ | `SketchStore` per-agg bucketing + per-key |
 | 5.2 | Secondary index `(agg_id, group_key, window_start)` | ❌ | |
 | 5.3 | Label posting index (Roaring bitmaps) | ❌ | only label interning exists |
-| 6.1–6.2 | `AggSchema`, `AggStatus{Active,Retired,Expired}` | ✅ | `stores/sketch_db/schema.rs` |
+| 6.1–6.2 | `AggSchema`, `AggStatus{Active,Retired,Expired}` | ✅ | `storage_engines/sketch_db/schema.rs` |
 | 6.3 | Write-side schema barrier `is_writable(agg_id)` | ✅ | called in `ingest_handler.rs` |
-| 6.4 | `AccuracyProfile` on schema | ✅ | `stores/sketch_db/accuracy.rs` |
+| 6.4 | `AccuracyProfile` on schema | ✅ | `storage_engines/sketch_db/accuracy.rs` |
 | 7.2 | `timeline_for_metric(...)` | ✅ | `schema.rs:594` |
-| 7.3 | Cross-schema query combiner | ✅ | `query-engines/timeline_dispatch.rs` |
+| 7.3 | Cross-schema query combiner | ✅ | `storage_engines/sketch_db/query/timeline_dispatch.rs` |
 | 8 | Incremental ingest (OTLP / Prometheus / VictoriaMetrics / Kafka drivers) | ✅ | `drivers/ingest/` |
 | 8.4 | Watermark + lateness policy | ✅ | `allowed_lateness_ms` + `LateSampleHandlingPolicy` |
 | 9 | Semantic compaction (LSM levels) | ❌ | comment-level only |
-| 10.2 | Backfill job/source/status types + registry | ✅ | `stores/sketch_db/backfill.rs` |
+| 10.2 | Backfill job/source/status types + registry | ✅ | `storage_engines/sketch_db/backfill.rs` |
 | 10.3 | Separate backfill worker pool | ✅ | `backfill_service.rs`, `backfill_worker.rs` |
 | 10.4 | Coverage tracking | ⚠️ partial | `Coverage` enum exists; not yet wired to query path (Phase 5f) |
 | 10.5 | Deterministic rebuild | ⚠️ partial | processor scaffolded; end-to-end determinism pending |

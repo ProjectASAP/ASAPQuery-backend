@@ -45,7 +45,7 @@ query class or cost regime no current sketch can serve.
 This is the **critical-path order**. Doing it in any other order
 will leave you with broken intermediate states.
 
-### Phase A. sketchlib (the algorithm)
+### Step A. sketchlib (the algorithm)
 
 You ship the algorithm before any consumer can use it.
 
@@ -108,7 +108,7 @@ catalogue knows about it.
 
 ---
 
-### Phase B. DataCollector wire format
+### Step B. DataCollector wire format
 
 Now the agent and the backend can agree on bytes.
 
@@ -172,7 +172,7 @@ duplicate.
 
 ---
 
-### Phase C. DataCollector OTel processor
+### Step C. DataCollector OTel processor
 
 The agent-side processor that produces FooSketch metrics.
 
@@ -213,19 +213,19 @@ can decode.
 
 ---
 
-### Phase D. ASAPQuery-backend ingest path
+### Step D. ASAPQuery-backend ingest path
 
 Now the backend recognises the new wire variant.
 
 #### D.1 Vendored proto regeneration
 
-`asap-common/dependencies/rs/asap_otel_proto/`: regenerate the
+`crates/asap_otel_proto/`: regenerate the
 vendored proto. The tonic build script will produce a new
 `Data::Foosketch` variant on the `Metric.data` oneof automatically.
 
 #### D.2 Ingest router
 
-`asap-query-engine/src/drivers/ingest/otel.rs`:
+`data_plane/src/drivers/ingest/otel.rs`:
 
 ```rust
 enum SketchKind {
@@ -250,7 +250,7 @@ SketchKind::Foo => Ok(Box::new(
 
 #### D.3 Concrete accumulator
 
-`asap-query-engine/src/precompute_operators/foo_sketch_accumulator.rs`:
+`data_plane/src/precompute_engine/operators/foo_sketch_accumulator.rs`:
 
 ```rust
 pub struct FooSketchAccumulator {
@@ -314,9 +314,9 @@ fn foo_params(parameters: &HashMap<String, Value>) -> FooParams {
 
 ---
 
-### Phase E. Type system
+### Step E. Type system
 
-`asap-common/dependencies/rs/promql_utilities/src/query_logics/enums.rs`:
+`crates/promql_utilities/src/query_logics/enums.rs`:
 
 ```rust
 pub enum AggregationType {
@@ -350,9 +350,9 @@ After this, `StreamingConfig` YAML files can carry
 
 ---
 
-### Phase F. Capability matching
+### Step F. Capability matching
 
-`asap-common/dependencies/rs/asap_types/src/capability_matching.rs`:
+`crates/asap_types/src/capability_matching.rs`:
 
 ```rust
 fn compatible_agg_types(stat: &Statistic) -> Vec<AggregationType> {
@@ -366,11 +366,11 @@ fn compatible_agg_types(stat: &Statistic) -> Vec<AggregationType> {
 ```
 
 Without this, even if the control plane plans a Foo sketch,
-SimpleEngine's capability matcher won't route queries to it.
+ASAPQueryEngine's capability matcher won't route queries to it.
 
 ---
 
-### Phase G. Sketch DB integration (assumes sketch DB Phase 6+ has shipped)
+### Step G. Sketch DB integration (assumes sketch DB Phase 6+ has shipped)
 
 #### G.1 Accuracy profile
 
@@ -381,7 +381,7 @@ design doc.
 
 #### G.2 Profiler catalogue
 
-If you completed Phase A.5, the control plane already has cost
+If you completed Step A.5, the control plane already has cost
 numbers. Verify the `/api/v1/db/cost_estimate` endpoint returns
 sensible numbers for `Foo` configs.
 
@@ -394,7 +394,7 @@ candidate set for the relevant query intents. The cost model
 
 ---
 
-### Phase H. Tests
+### Step H. Tests
 
 Minimum bar before merging:
 
@@ -411,7 +411,7 @@ Minimum bar before merging:
 
 ---
 
-### Phase I. Documentation
+### Step I. Documentation
 
 Without these, your sketch is invisible to operators and to the
 next person trying to add another one:
@@ -462,7 +462,7 @@ These are mistakes contributors have made or will make:
 
 ## Rough effort estimate
 
-| Phase | LoC (approx) | Time |
+| Step | LoC (approx) | Time |
 |---|---|---|
 | A. sketchlib (Rust + Go + cross-lang test) | 1,500–3,000 | 1–2 weeks |
 | B. DataCollector proto + pmetric | 800–1,500 | 3–5 days |
@@ -486,7 +486,7 @@ goes below that.
 
 When in doubt, look at the most recent precedent for the same step:
 
-| Phase | Best precedent to copy |
+| Step | Best precedent to copy |
 |---|---|
 | sketchlib-rust algorithm | the `KLL` family if you need quantile-shaped behaviour, `HLL` for set/cardinality, `CountMin` for frequency |
 | sketchlib-go matching impl | same family on the Go side |

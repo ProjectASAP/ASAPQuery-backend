@@ -12,7 +12,7 @@ Pre-commit hooks ensure code quality before committing.
 pip3 install pre-commit
 
 # Install hooks (run from repo root)
-cd /path/to/ASAPQuery
+cd /path/to/ASAPQuery-backend
 pre-commit install
 ```
 

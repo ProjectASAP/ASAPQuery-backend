@@ -52,11 +52,11 @@ not a name suffix.
 ┌──────────────────────────────────────────────────────────────────┐
 │ ASAPQuery-backend repo                                          │
 │                                                                  │
-│  asap-query-engine                                              │
-│    SimpleStore                                                  │
+│  data_plane                                                     │
+│    SketchStore                                                  │
 │      indexed by aggregation_id (integer assigned by             │
 │        StreamingConfig::from_yaml_data on ingest)               │
-│    SimpleEngine query path                                      │
+│    ASAPQueryEngine query path                                   │
 │      PromQL → find_query_config (exact pattern match)           │
 │        ├─ hit: dispatch to aggregation_id                       │
 │        └─ miss: capability_matching by Statistic::{Sum,         │
@@ -64,8 +64,8 @@ not a name suffix.
 │                ├─ hit: dispatch to compatible aggregation       │
 │                └─ miss: fall through to BackendStorageRouting   │
 │                    ├─ shape ∈ [count, topk, rate_post_hoc]      │
-│                    │    → ThanosForwardEngine                   │
-│                    └─ else → SimpleEngine (404 if miss)         │
+│                    │    → ThanosQueryEngine                     │
+│                    └─ else → ASAPQueryEngine (404 if miss)      │
 │                                                                  │
 │ asap-common/                                                    │
 │   asap_types (StorageBackend, AggregationCapability, …)         │
@@ -114,18 +114,18 @@ Three structural problems:
 │    capability map: (metric_name, query_shape) → sketch_kind     │
 │    OpAMP server (originating from this host, pushes to agents)  │
 │                                                                  │
-│  asap-query-engine                                              │
+│  data_plane                                                     │
 │    PrecomputeEngine                                             │
 │      receives OTLP (sketch payloads w/ raw metric names)        │
 │      may merge sketches across agents — otherwise pass-through  │
-│    SimpleStore                                                  │
+│    SketchStore                                                  │
 │      key: (raw_metric_name, raw_labels, capability_set)         │
 │      value: sketch state (encoded per the controller's plan)    │
 │    Query path                                                   │
 │      PromQL parse                                               │
 │      → controller.capability_for(metric, query_shape)           │
 │        ├─ Some(capability):                                     │
-│        │     SimpleStore.get(metric, labels, capability)        │
+│        │     SketchStore.get(metric, labels, capability)        │
 │        │       ├─ hit: return sketch result                     │
 │        │       └─ miss: forward to Thanos (raw fallback)        │
 │        └─ None (controller doesn't plan this query):            │
@@ -163,13 +163,20 @@ Key design rules:
   to agents. Agents only need a way to reach the backend for OpAMP
   + OTLP; they don't have their own controller dependency.
 
-## 4. Phased migration plan
+## 4. Migration plan
 
-Each phase is a minimum-merge unit: the system builds and the
-multi-node demo passes after each phase, with progressively more
+Each step is a minimum-merge unit: the system builds and the
+multi-node demo passes after each step, with progressively more
 of the new design landed.
 
-### Phase 1 — Strip metric-name rewrites (1–2 hours)
+> **Status (2026-05):** Steps 1–5 have all landed — the system now
+> runs on this design (the controller is in-repo as `control_plane/`,
+> `asap-common` has collapsed into `crates/`, `SketchStore` is
+> reindexed, and warm-miss → Thanos routing is live). The per-step
+> detail below is kept as the original plan of record; only Step 6
+> remains future work.
+
+### Step 1 — Strip metric-name rewrites (1–2 hours)
 
 Audit every site that suffixes a metric name and remove the suffix.
 Keep the wire-level encoding hint in the OTLP pdata variant.
@@ -191,10 +198,10 @@ Keep the wire-level encoding hint in the OTLP pdata variant.
 or by reading the OTLP wire bytes.
 
 **Risk:** breaks `backend-inference.yaml` patterns (which are
-keyed on `_quantile`). Phase 2 replaces pattern matching anyway,
+keyed on `_quantile`). Step 2 replaces pattern matching anyway,
 so this is intentional.
 
-### Phase 2 — Backend routing: warm-miss → Thanos (30 min)
+### Step 2 — Backend routing: warm-miss → Thanos (30 min)
 
 `backend-storage-routing.yaml` currently routes by query shape:
 `[count, topk, rate_post_hoc]` to archive, everything else to
@@ -203,9 +210,9 @@ matches the metric+labels+capability), fall through to Thanos.
 
 **Files:**
 
-- `asap-query-engine/src/routing/backend_storage_routing.rs` —
+- `data_plane/src/query_engines/routing/backend_storage_routing.rs` —
   swap "shape allow-list" for "warm-first, archive-fallthrough".
-- `asap-query-engine/src/routing/query_engine_routing.rs` (EngineRouter) — add
+- `data_plane/src/query_engines/routing/query_engine_routing.rs` (EngineRouter) — add
   a `query_with_fallthrough` path.
 
 **Acceptance test:** Same PromQL `count(http_requests_total)` and
@@ -214,18 +221,18 @@ ASAP. ASAP's response carries `data_source: thanos_archive` for
 queries that fall through, `data_source: warm` for those that
 hit a sketch.
 
-### Phase 3 — Reindex SimpleStore by `(metric_name, labels, capability)` (2–3 days)
+### Step 3 — Reindex SketchStore by `(metric_name, labels, capability)` (2–3 days)
 
-Today's `SimpleStore.get_aggregation(aggregation_id: u64)` becomes
-`SimpleStore.get(metric_name: &str, labels: &LabelSet, capability:
+Today's `SketchStore.get_aggregation(aggregation_id: u64)` becomes
+`SketchStore.get(metric_name: &str, labels: &LabelSet, capability:
 &Capability)`. Streaming-config ingest no longer assigns integer
 IDs; it stores under the natural tuple.
 
 **Files:**
 
-- `asap-query-engine/src/stores/sketch_db/simple_map_store/{mod,
+- `data_plane/src/storage_engines/sketch_db/simple_map_store/{mod,
   per_key,common_state}.rs` — refactor key type.
-- `asap-query-engine/src/streaming_engine.rs` — ingest path: when
+- `data_plane/src/streaming_engine.rs` — ingest path: when
   an OTLP sketch sample arrives with `(metric_name, labels)`, look
   up its capability from the in-process controller's plan and
   store under that triple.
@@ -240,9 +247,9 @@ aggregation IDs.
 
 **Migration risk:** Streaming-config YAML format changes
 (`backend-streaming.yaml` no longer needs `aggregationId`). All
-downstream tests under `asap-query-engine/tests/` need updating.
+downstream tests under `data_plane/tests/` need updating.
 
-### Phase 4 — Move `controller/` from ASAPCollector to ASAPQuery-backend (3–5 days)
+### Step 4 — Move `controller/` from ASAPCollector to ASAPQuery-backend (3–5 days)
 
 Physically relocate the crate. Both are Rust, both already use
 prost-build for OTel proto compilation, so the build surface is
@@ -253,7 +260,7 @@ compatible.
 1. Copy `ASAPCollector/controller/` → `ASAPQuery-backend/controller/`.
 2. Add `controller` to ASAPQuery-backend's Cargo workspace; remove
    from ASAPCollector's.
-3. ASAPQuery-backend's `asap-query-engine` Cargo.toml gets `controller
+3. ASAPQuery-backend's `data_plane` Cargo.toml gets `controller
    = { path = "../controller" }`.
 4. Backend binary embeds the controller's L4 `sketch_algebra` as a
    library call (no more HTTP capability-miss notifications between
@@ -274,16 +281,16 @@ query HTTP API (port 9091) and the OpAMP server (port 4320).
 Agent connects to `ws://backend:4320/v1/opamp`, receives plan,
 emits sketches, backend stores them. Same multi-node demo runs.
 
-### Phase 5 — Delete `asap-common` (1–2 days)
+### Step 5 — Delete `asap-common` (1–2 days)
 
-Audit each crate under `asap-common/dependencies/rs/`:
+Audit each crate under `crates/`:
 
 - `asap_types`: most types are backend-internal — move into
-  `asap-query-engine/src/types/`. The wire types (`SketchEnvelope`,
+  `data_plane/src/types/`. The wire types (`SketchEnvelope`,
   `Statistic`) are shared with edge processors via OTLP proto, so
   no Rust-to-Go path-dep needed.
 - `promql_utilities`: backend-only — move into
-  `asap-query-engine/src/promql/`.
+  `data_plane/src/promql/`.
 - `datafusion_summary_library`: backend-only — same.
 - Anything Go-side actually used by edge processors (e.g.
   sketchlib-go interop) is already in `sketchlib-go` itself, not
@@ -291,9 +298,9 @@ Audit each crate under `asap-common/dependencies/rs/`:
 
 **Steps:**
 
-1. List every Rust file under `asap-common/dependencies/rs/`.
+1. List every Rust file under `crates/`.
    Bucket into "backend internal" vs "wire shared".
-2. Move "backend internal" files into `asap-query-engine` or
+2. Move "backend internal" files into `data_plane` or
    `asap-types` (a renamed minimal types-only crate kept inside
    ASAPQuery-backend).
 3. Delete `asap-common/`.
@@ -306,7 +313,7 @@ runs without referencing `asap-common`. ASAPQuery-backend's
 
 ## 4.5 Capability model — what the backend index keys on
 
-The controller's capability map and the backend's SimpleStore index
+The controller's capability map and the backend's SketchStore index
 share one type:
 
 ```rust
@@ -349,7 +356,7 @@ A single metric can have many entries — one per
 | (`http_requests_total_latency_ms`, `{zone}`, QuantileApprox(DDSketch)) | DD-2 |
 
 Query path: parse PromQL → derive `(metric, group_by, capability)` →
-SimpleStore.get() → hit (return sketch eval) or miss (forward raw to
+SketchStore.get() → hit (return sketch eval) or miss (forward raw to
 Thanos).
 
 ## 4.6 OTLP metadata model + backend store layout
@@ -362,7 +369,7 @@ sample_count for CMS). They also repeat sketch-instance config on every
 DP (epsilon/delta on CS, rows/cols on CMS, precision on HLL). Both are
 wasteful and create cache-invalidation bugs.
 
-Phase 1.5 proto patch (metrics.proto):
+Step 1.5 proto patch (metrics.proto):
 
 - **Drop precomputed values from each `*DataPoint` message**: count,
   sum, min, max, cardinality, sample_count. The sketch payload (or its
@@ -469,17 +476,17 @@ This matches stock-OTel and Prometheus semantics for `sum by (zone)`
 
 - **OpAMP origination host**: the runbook's compose currently has
   `controller:4320` and `backend:9091` as distinct services. After
-  Phase 4 they collapse to one container. Do we keep two ports
+  Step 4 they collapse to one container. Do we keep two ports
   (4320 OpAMP + 9091 query) or unify?
 - **Stale `_quantile` patterns in `backend-inference.yaml`**: do
-  we keep this file at all after Phase 3 (no more pattern
+  we keep this file at all after Step 3 (no more pattern
   matching), or repurpose as the controller's bootstrap plan?
 - **Edge-runtime parity**: `asap-precompute-rs` (used by the
   Rust edge agent path) currently uses some `asap-common` types.
-  Phase 5 needs to leave a thin wire-types crate accessible to
+  Step 5 needs to leave a thin wire-types crate accessible to
   edge runtimes — name it `asap-wire-types` and put it in
   ASAPCollector? Or in a third repo?
-- **`_topk` and similar suffixes**: Phase 1 removes `_quantile`.
+- **`_topk` and similar suffixes**: Step 1 removes `_quantile`.
   Are there other suffixes (`_topk`, `_uniques`, `_count`) added
   by other processors? Need to grep more thoroughly.
 
@@ -497,7 +504,7 @@ gateway→backend) and the namespaces don't share meaning.
 
 **New design — centralize series_id minting at asap-query-backend:**
 
-- The backend (which now also hosts the controller — Phase 4) is the
+- The backend (which now also hosts the controller — Step 4) is the
   single authoritative minter of series_ids.
 - Agents and gateway DO NOT mint their own series_ids. They forward
   the original Export upstream, propagate the SeriesAssignment
@@ -727,7 +734,7 @@ layer handles this with a per-(sid, window) merge step using
 (DDSketch.merge, HLL.union, CMS row-add, etc.). Same problem with
 or without centralized sids — sids don't worsen it.
 
-## 5.5 Future-work — Phase 6: multi-window batching per ScopeMetrics
+## 5.5 Future-work — Step 6: multi-window batching per ScopeMetrics
 
 Today each agent emit produces one `Metric` with one window's worth of
 `DataPoint`s (the sketch state at window-close). Wire framing per
@@ -746,7 +753,7 @@ N=4 with window=30s, agent buffers up to 2 minutes of state before
 emit — affects criterion ⑥ freshness but not correctness or query
 results. Operators choose N per their freshness budget.
 
-Tracked as Phase 6.
+Tracked as Step 6.
 
 ## 6. What does NOT change
 

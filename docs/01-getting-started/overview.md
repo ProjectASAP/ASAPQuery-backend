@@ -48,12 +48,14 @@ Key properties:
 
 ### Streaming Pipelines
 
-ASAP builds sketches in **real-time** using streaming pipelines:
+ASAP builds sketches in **real-time at the edge**, before data reaches the backend:
 
-1. **Prometheus** scrapes metrics from exporters
-2. **Remote Write** sends metrics to **Arroyo** (streaming engine)
-3. **Arroyo** builds sketches using SQL queries
-4. **QueryEngine** consumes sketches and answers queries
+1. **Exporters / SDKs** emit metrics, scraped or pushed as **OTLP**
+2. **asap-otel agents** run sketch processors that encode each metric as a sketch payload (DDSketch / KLL / HLL / CountSketch / Count-Min) — the metric name is **preserved**, not rewritten
+3. A **gateway** merges sketches across agents and forwards them (OTLP) to the backend
+4. **ASAPQuery-backend** ingests the sketch payloads into `SketchStore` and answers queries from them via `ASAPQueryEngine`
+
+A **control plane** (the in-repo `control_plane/` planner) decides which sketches to compute and where, then pushes per-runtime config to the agents over **OpAMP**.
 
 ### Query Protocol
 
@@ -71,40 +73,38 @@ Your existing dashboards work without modification!
 
 ### Fallback
 
-Not all queries can be accelerated with sketches. ASAP automatically:
+Not all queries can be answered from sketches. ASAP automatically:
 
-1. **Detects unsupported queries**
-2. **Forwards them to Prometheus** for exact results
+1. **Detects queries the warm sketch tier can't serve** (un-planned shapes, ad-hoc queries)
+2. **Forwards them to the archive tier** — exact PromQL over Gorilla-compressed raw samples on object storage (via Thanos)
 3. **Returns results transparently** to the user
 
-This ensures compatibility while accelerating what's possible.
+This ensures full PromQL compatibility while accelerating what sketches can answer.
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Your Existing Stack                     │
-├─────────────────────────────────────────────────────────────┤
-│  Applications → Exporters → Prometheus → Grafana            │
-└─────────────────────────────────────────────────────────────┘
-                                ↓
-                    ┌───────────────────────┐
-                    │  Prometheus           │
-                    │  Remote Write         │
-                    └───────────────────────┘
-                                ↓
-┌─────────────────────────────────────────────────────────────┐
-│                     ASAP Components                         │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌──────────┐      ┌──────────┐      ┌──────────┐           │
-│  │ Arroyo   │  →   │  Kafka   │  →   │  Query   │           │
-│  │          │      │          │      │  Engine  │           │
-│  └──────────┘      └──────────┘      └──────────┘           │
-└─────────────────────────────────────────────────────────────┘
-                                ↓
-                    ┌───────────────────────┐
-                    │  Grafana              │
-                    │  (query ASAP)         │
-                    └───────────────────────┘
+              Applications / Exporters / SDKs
+                          │ OTLP
+                          ▼
+   ┌─────────────────────────────────────────────┐
+   │  Edge (ASAPCollector)                        │
+   │    asap-otel agents → gateway (sketch-merge) │
+   │    sketch processors encode DDSketch / KLL / │
+   │    HLL / CMS, preserving metric names        │
+   └─────────────────────────────────────────────┘
+                          │ OTLP (sketch payloads, raw metric names)
+                          ▼
+   ┌─────────────────────────────────────────────┐
+   │  ASAPQuery-backend                           │
+   │    control_plane: plans sketches, pushes     │
+   │                   config to agents via OpAMP │
+   │    data_plane (warm):    ASAPQueryEngine     │
+   │                          over SketchStore    │
+   │    data_plane (archive): ThanosQueryEngine ──┼──▶ Thanos + MinIO/S3
+   │                          (exact raw PromQL)  │    (Gorilla-XOR)
+   └─────────────────────────────────────────────┘
+                          ▲ PromQL (Prometheus HTTP API)
+                          │
+                       Grafana
 ```

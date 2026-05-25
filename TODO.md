@@ -87,7 +87,7 @@ encoding string (which had broken the per-series snapshot cache
 key).
 
 - **Inference-YAML pattern coverage.** Expanded
-  `asap-query-engine/examples/promql/inference_config.yaml` (and the
+  `data_plane/examples/promql/inference_config.yaml` (and the
   SQL twin) with multi-quantile / wider-range / rate / increase /
   topk entries; closes
   [ASAPCollector PROGRESS.md follow-up #4](https://github.com/ProjectASAP/ASAPCollector/blob/main/PROGRESS.md#open-follow-ups-not-e2e-blockers)
@@ -124,9 +124,9 @@ data points). Specifically:
 ### Known reconciliation gap (cleanup, not a blocker)
 
 - ~~`compatible_agg_types` in
-  [`asap_types/src/capability_matching.rs`](asap-common/dependencies/rs/asap_types/src/capability_matching.rs)
+  [`asap_types/src/capability_matching.rs`](crates/asap_types/src/capability_matching.rs)
   does not list `CountMinSketch` under `Statistic::Sum`, but
-  [`promql_utilities/src/query_logics/logics.rs`](asap-common/dependencies/rs/promql_utilities/src/query_logics/logics.rs)
+  [`promql_utilities/src/query_logics/logics.rs`](crates/promql_utilities/src/query_logics/logics.rs)
   treats CMS as the canonical approximator for both `Sum` and
   `Count`. The runtime e2e succeeds because the inference YAML's
   exact-match `find_query_config` path bypasses
@@ -153,7 +153,7 @@ data points). Specifically:
   `proto_delta` against their local snapshots, and the backend
   drops them as "delta-sketch arrived before any base snapshot"
   until the agent itself restarts. Persist to the existing
-  per-key disk layer used by `SimpleMapStore::with_persistence_per_key`,
+  per-key disk layer used by `SketchStore::with_persistence_per_key`,
   or add an OpAMP capability for backend → agent "send next
   frame as full state" signalling. Same item lives on the
   collector side
@@ -164,7 +164,7 @@ data points). Specifically:
 
 ### 1. Cold-query fallback — §5.2 of the sketch-DB design — **done (local-FS cold store)**
 
-Initial v1 landed: [`drivers/query/fallback/s3_adapter.rs`](asap-query-engine/src/drivers/query/fallback/s3_adapter.rs)
+Initial v1 landed: [`drivers/query/fallback/s3_adapter.rs`](data_plane/src/drivers/query/fallback/s3_adapter.rs)
 is a `FallbackClient` that serves capability-misses from a
 hour-bucketed JSONL raw store. The format (`raw/<metric>/YYYY/MM/DD/HH/part-NNNNNN.jsonl`)
 is byte-identical to the S3 layout, so a future
@@ -181,11 +181,12 @@ Follow-ups (not paper-blocking):
   grouping + regex is ~200 LOC when needed.
 - **Latency target.** Paper claim is ≤2× P99 vs. warm-hot —
   unverified until the multi-agent harness lands (blocker #6
-  of `DataCollector/TODO.md`). The three-way query harness in
-  [#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66)
-  (`benchmarks/run_full_eval.sh`) is the runner that will produce
+  of `DataCollector/TODO.md`). The old three-way query harness
+  ([#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66))
+  targeted the deprecated Arroyo/Kafka stack and has been removed; a
+  runner for the current OTLP architecture is still needed to produce
   this number.
-- ~~`asap-query-engine` `main.rs` wiring of `ASAP_COLD_STORE_ROOT`~~
+- ~~`data_plane` `main.rs` wiring of `ASAP_COLD_STORE_ROOT`~~
   **done (P1, 2026-04-30).** `--cold-store-root` flag with
   `env = "ASAP_COLD_STORE_ROOT"` plumbed into a
   `build_adapter_config` helper that selects
@@ -216,7 +217,7 @@ against the sketch-bench corpus.
 ### 3. End-to-end capability-miss feedback loop test — **done (HTTP round-trip)**
 
 HTTP-level e2e landed in
-[`asap-query-engine/src/tests/capability_miss_http_e2e_tests.rs`](asap-query-engine/src/tests/capability_miss_http_e2e_tests.rs).
+[`data_plane/src/tests/capability_miss_http_e2e_tests.rs`](data_plane/src/tests/capability_miss_http_e2e_tests.rs).
 Spins up a real backend HTTP server + mock control plane HTTP
 server, fires a PromQL `sum(metric)` query that capability-misses,
 and measures wall-clock `time_to_plan_ready` from query issue to
@@ -245,7 +246,7 @@ Follow-up (not paper-blocking):
 ### 4. Serialization format versioning tests — **done ([#65](https://github.com/ProjectASAP/ASAPQuery-backend/pull/65))**
 
 `mod v2_forward_compat` in
-[`asap-query-engine/src/tests/persist_format_versioning_tests.rs`](asap-query-engine/src/tests/persist_format_versioning_tests.rs)
+[`data_plane/src/tests/persist_format_versioning_tests.rs`](data_plane/src/tests/persist_format_versioning_tests.rs)
 covers all three persistence sites with three tests that pin the contract
 to `PERSIST_FORMAT_VERSION + 1` (self-updating if the version is bumped):
 
@@ -256,7 +257,7 @@ to `PERSIST_FORMAT_VERSION + 1` (self-updating if the version is bumped):
 - `backfill_v1_with_future_version_falls_back_and_rewrites_clean` — same
   contract for `BackfillRegistry`, including `next_job_id` field presence
   post-fallback.
-- `part_meta_with_future_version_returns_format_error` — `SimpleMapStore`
+- `part_meta_with_future_version_returns_format_error` — `SketchStore`
   `meta.bin` has no fallback (parts are opaque), so the contract is a
   clean `PersistError::Format("unsupported version ...")`.
 
@@ -292,7 +293,7 @@ treat as black boxes).
 
 ## Future work (post-paper)
 
-### F1. Phase 4: inter-window compaction
+### F1. Inter-window compaction
 
 Long-running sketchDB needs compaction — merge adjacent small
 windows into larger ones when accuracy can be re-derived, drop

@@ -1,8 +1,8 @@
-# SimpleStore Index Design
+# SketchStore Index Design
 
 ## Overview
 
-`SimpleMapStore` uses an **epoch-partitioned columnar store** with label interning. The design applies six optimizations targeting the two most expensive paths: ingestion and range scan.
+`SketchStore` uses an **epoch-partitioned columnar store** with label interning. The design applies six optimizations targeting the two most expensive paths: ingestion and range scan.
 
 | Opt | What | Where |
 |-----|------|-------|
