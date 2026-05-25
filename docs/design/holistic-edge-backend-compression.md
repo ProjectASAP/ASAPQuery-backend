@@ -116,6 +116,34 @@ Series(req {matchers, min_t, max_t}) -> stream of SeriesResponse:
 Thanos-query unions this with the >=2h store-gateway path, exactly as the
 current gorilla-merger StoreAPI does — we extend that StoreAPI's `Series()`.
 
+### 1.7 Grouped layout — shared timestamp column (cross-series)
+
+Measured (`/mydata/xseries-bench`, real cluster groups @2h/15s k=50 + synthetic).
+Two cross-series levers; only one pays.
+
+- **Shared timestamp column — ADOPT.** Same-metric series in a part share ONE
+  timestamp column instead of every chunk carrying its own. Because INT_FOR
+  values compress so well, timestamps are **36–52% of per-series bytes** on real
+  groups; sharing the column across a k-series group removes ≈ ts_frac·(k−1)/k →
+  **−43% on the real cluster aggregate**, correlation-INdependent, low-risk.
+  (The Heracles VLDB'21 result, confirmed here.) Part layout becomes:
+  per-metric group = `{ one shared ts column (delta-of-delta) }` + `{ per-series
+  value chunks: codec_tag + residuals, NO ts }`. The decode-on-read StoreAPI
+  zips the shared ts with each series' values. Warm sketch parts get the same
+  win (same-window sketch series share the window-end column).
+- **Cross-series value base — do NOT adopt by default.** Per-timestamp base
+  `b(t)=min` + per-series value residuals. Measured **net-NEGATIVE (−3.5% vs
+  shared-ts aggregate)**: it only wins for near-identical-replica series, and
+  the predictor is the **noise/signal ratio, NOT correlation** (even ρ=0.99
+  lost +2.6% when noisy) — per-series delta-of-delta already extracted the
+  per-series common bits, so a noisy cross-series base just adds entropy. Trap:
+  must be done in the integer domain (naive float subtraction breaks decimal
+  representability, ~2× bloat). Optional per-group cost-based opt-in only.
+
+Takeaway: the remaining cross-series "common bits" worth taking are the
+**timestamps** (shared column, −43%), not the values (already extracted
+per-series).
+
 ---
 
 ## 2. Warm sketch encoding
