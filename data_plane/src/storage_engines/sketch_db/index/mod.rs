@@ -73,6 +73,51 @@ fn tag_to_encoding(tag: u8) -> SketchEncoding {
     }
 }
 
+/// Reconstruct an exact-aggregation accumulator from its on-disk
+/// `(type_name, bytes)` pair so the durable tier can serve the
+/// exact-agg query path (`query_exact_agg_range` / `sum by (...)`) after
+/// flush+evict. Covers the deterministic scalar accumulators the live
+/// marquee `sum by (zone)` path uses; the sketch-backed accumulator forms
+/// (DDSketch/KLL/HLL/CountSketch — registered as `AggKind::Sketch`) are
+/// served as opaque bytes via [`SketchStore::query_range`] and are NOT
+/// reconstructed here. Returns `None` for an unrecognized `type_name`
+/// (the caller skips the disk entry rather than fabricating a wrong
+/// payload) — see the remaining-follow-up note in the PR.
+fn reconstruct_exact_agg(
+    type_name: &str,
+    bytes: &[u8],
+) -> Option<Box<dyn crate::storage_engines::types::AggregateCore>> {
+    use crate::precompute_engine::operators::{
+        IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
+        MultipleSumAccumulator, SumAccumulator,
+    };
+    use crate::storage_engines::types::AggregateCore;
+    match type_name {
+        "SumAccumulator" => SumAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "IncreaseAccumulator" => IncreaseAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "MinMaxAccumulator" => MinMaxAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "MultipleSumAccumulator" => MultipleSumAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        "MultipleIncreaseAccumulator" => MultipleIncreaseAccumulator::deserialize_from_bytes(bytes)
+            .ok()
+            .map(|a| Box::new(a) as Box<dyn AggregateCore>),
+        // `MultipleMinMaxAccumulator` needs an external `sub_type`
+        // (min/max) not recorded in the part, and the sketch-backed
+        // accumulator forms have no generic byte factory — both are left
+        // to the deferred exact-agg/sketch precompute read-back work (see
+        // PR follow-up note). They are still served from memory; only the
+        // evicted-to-disk portion is skipped for these types.
+        _ => None,
+    }
+}
+
 /// Joint helper shared by [`SketchStore::ingest_precompute_for_agg_config`]
 /// and [`SketchStore::ingest_precompute_with_sid`] — folds the
 /// grouping-label values on `output` against the
@@ -843,32 +888,29 @@ impl SketchStore {
         BTreeMap<String, String>,
         BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
     )> {
-        let store = match self.series.get(&sid) {
-            Some(s) => s.clone(),
-            None => return Vec::new(),
-        };
-        let guard = store.write().unwrap();
-        let mut by_label_id: HashMap<
-            LabelValuesId,
+        // Key by the resolved label MAP (not `LabelValuesId`) so the
+        // in-memory tier and the durable disk tier — which carry
+        // independent intern spaces — union by label identity. Mirrors
+        // `query_range`. Absent in-memory store is NOT an early return:
+        // under persistence the windows may have been flushed-then-evicted
+        // (or recovered from disk on restart), so the disk union below
+        // still runs.
+        let mut by_label_map: HashMap<
+            BTreeMap<String, String>,
             BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
         > = HashMap::new();
 
-        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
-        guard
-            .current_epoch
-            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
-        for (win, label_id, payload) in &buf {
-            if let Some(p) = payload.as_exact_agg() {
-                by_label_id
-                    .entry(*label_id)
-                    .or_default()
-                    .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
-            }
-        }
-        buf.clear();
+        if let Some(store) = self.series.get(&sid).map(|s| s.clone()) {
+            let guard = store.write().unwrap();
+            let mut by_label_id: HashMap<
+                LabelValuesId,
+                BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+            > = HashMap::new();
 
-        for sealed in guard.sealed_epochs.values() {
-            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+            guard
+                .current_epoch
+                .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
                 if let Some(p) = payload.as_exact_agg() {
                     by_label_id
@@ -878,15 +920,98 @@ impl SketchStore {
                 }
             }
             buf.clear();
+
+            for sealed in guard.sealed_epochs.values() {
+                sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+                for (win, label_id, payload) in &buf {
+                    if let Some(p) = payload.as_exact_agg() {
+                        by_label_id
+                            .entry(*label_id)
+                            .or_default()
+                            .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                    }
+                }
+                buf.clear();
+            }
+
+            for (label_id, samples) in by_label_id {
+                let label_values_map =
+                    guard.intern.resolve(label_id).cloned().unwrap_or_default();
+                by_label_map.entry(label_values_map).or_default().extend(samples);
+            }
+            drop(guard);
         }
 
-        by_label_id
-            .into_iter()
-            .map(|(label_id, samples)| {
-                let label_values_map = guard.intern.resolve(label_id).cloned().unwrap_or_default();
-                (label_values_map, samples)
-            })
-            .collect()
+        // Union the durable disk tier for the flushed-then-evicted portion
+        // of the range. In-memory wins on a window-end collision.
+        self.union_disk_exact_agg_into(sid, start_unix_ms, end_unix_ms, &mut by_label_map);
+
+        by_label_map.into_iter().collect()
+    }
+
+    /// Union the durable disk tier's exact-aggregation entries into
+    /// `by_label_map` for `[start, end)`. No-op when persistence is off.
+    /// Disk entries are reconstructed via [`reconstruct_exact_agg`]; an
+    /// unrecognized accumulator type is skipped (sketch-backed forms are
+    /// served by `query_range`, not here — see PR follow-up note).
+    /// Containment scan (`start_ts >= start && end_ts <= end`) matches the
+    /// in-memory exact-agg `range_query_into`.
+    fn union_disk_exact_agg_into(
+        &self,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+        by_label_map: &mut HashMap<
+            BTreeMap<String, String>,
+            BTreeMap<i64, Arc<dyn crate::storage_engines::types::AggregateCore>>,
+        >,
+    ) {
+        let handle = {
+            let g = self.persistence_read.read().unwrap();
+            match g.as_ref() {
+                Some(h) => Arc::clone(h),
+                None => return,
+            }
+        };
+        let Some(keys) = self.sid_group_by_keys(sid) else {
+            return;
+        };
+        let parts = handle
+            .manifest
+            .live_parts_overlapping(start_unix_ms, end_unix_ms);
+        for pe in &parts {
+            let reader = match handle.part_cache.get_or_load(pe.part_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(part_id = pe.part_id, error = %e, "exact-agg disk read: open part failed");
+                    continue;
+                }
+            };
+            for rec in reader.index_records() {
+                if rec.agg_id != sid {
+                    continue;
+                }
+                // Containment, matching the in-memory exact-agg scan.
+                if !(rec.start_ts >= start_unix_ms && rec.end_ts <= end_unix_ms) {
+                    continue;
+                }
+                let Ok(entry) = reader.load_entry(&rec) else {
+                    continue;
+                };
+                let Some(acc) =
+                    reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
+                else {
+                    continue;
+                };
+                let label_map = Self::rebuild_label_map(&keys, &entry.label);
+                by_label_map
+                    .entry(label_map)
+                    .or_default()
+                    // In-memory wins — only fill window-ends disk uniquely owns.
+                    .entry(rec.end_ts as i64)
+                    .or_insert_with(|| Arc::from(acc));
+            }
+        }
     }
 
     /// Actual coverage bounds `(min_window_start_ms, max_window_end_ms)`
@@ -906,43 +1031,76 @@ impl SketchStore {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> Option<(u64, u64)> {
-        let store = self.series.get(&sid)?.clone();
-        let guard = store.read().unwrap();
         let mut min_start: u64 = u64::MAX;
         let mut max_end: u64 = 0;
         let mut any = false;
 
-        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
-        guard
-            .current_epoch
-            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
-        for (win, _label_id, payload) in &buf {
-            if payload.as_exact_agg().is_some() {
-                any = true;
-                if win.0 < min_start {
-                    min_start = win.0;
-                }
-                if win.1 > max_end {
-                    max_end = win.1;
-                }
-            }
-        }
-        buf.clear();
-
-        for sealed in guard.sealed_epochs.values() {
-            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+        // In-memory tier (absent store is not an early return — disk may
+        // still cover the range after flush+evict / restart).
+        if let Some(store) = self.series.get(&sid).map(|s| s.clone()) {
+            let guard = store.read().unwrap();
+            let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+            guard
+                .current_epoch
+                .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, _label_id, payload) in &buf {
                 if payload.as_exact_agg().is_some() {
                     any = true;
-                    if win.0 < min_start {
-                        min_start = win.0;
-                    }
-                    if win.1 > max_end {
-                        max_end = win.1;
-                    }
+                    min_start = min_start.min(win.0);
+                    max_end = max_end.max(win.1);
                 }
             }
             buf.clear();
+
+            for sealed in guard.sealed_epochs.values() {
+                sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+                for (win, _label_id, payload) in &buf {
+                    if payload.as_exact_agg().is_some() {
+                        any = true;
+                        min_start = min_start.min(win.0);
+                        max_end = max_end.max(win.1);
+                    }
+                }
+                buf.clear();
+            }
+        }
+
+        // Durable disk tier — same coverage-aware divisor must see the
+        // flushed-then-evicted windows, else `rate` over-divides by the
+        // nominal `[r]` once the recent data ages onto disk.
+        if let Some(handle) = {
+            let g = self.persistence_read.read().unwrap();
+            g.as_ref().map(Arc::clone)
+        } {
+            let parts = handle
+                .manifest
+                .live_parts_overlapping(start_unix_ms, end_unix_ms);
+            for pe in &parts {
+                let Ok(reader) = handle.part_cache.get_or_load(pe.part_id) else {
+                    continue;
+                };
+                for rec in reader.index_records() {
+                    if rec.agg_id != sid {
+                        continue;
+                    }
+                    if !(rec.start_ts >= start_unix_ms && rec.end_ts <= end_unix_ms) {
+                        continue;
+                    }
+                    // Only count entries that reconstruct as exact-agg
+                    // (skip sketch-backed disk entries under this sid).
+                    let Ok(entry) = reader.load_entry(&rec) else {
+                        continue;
+                    };
+                    if reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    any = true;
+                    min_start = min_start.min(rec.start_ts);
+                    max_end = max_end.max(rec.end_ts);
+                }
+            }
         }
 
         if any {
@@ -1696,12 +1854,35 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
         data.sealed_epochs.remove(&epoch_id);
     }
 
+    fn seal_aged_epochs(&self, cutoff_end: u64) -> usize {
+        let mut sealed = 0usize;
+        for entry in self.series.iter() {
+            let Ok(mut data) = entry.value().write() else {
+                continue;
+            };
+            sealed += data.seal_aged_windows(cutoff_end);
+        }
+        sealed
+    }
+
     fn approx_memory_bytes(&self) -> usize {
+        // Account for BOTH `current_epoch` (hot, un-sealed) AND sealed
+        // epochs. Counting sealed-only under-reports the true footprint
+        // (the live "0.00–0.12 KB approx sealed bytes" diagnostic) and,
+        // worse, blinds the flusher's memory-pressure trigger to the bulk
+        // of memory — which under persistence (retention-drop disabled)
+        // lives in `current_epoch` until the time-driven seal rolls it
+        // over. The hot-window seal (`seal_aged_epochs`) handles the
+        // common case; this keeps the memory-pressure backstop honest for
+        // a burst that outruns the hot window.
         let mut total = 0usize;
         for entry in self.series.iter() {
             let Ok(data) = entry.value().read() else {
                 continue;
             };
+            for (_, _, payload) in data.current_epoch.iter_entries() {
+                total += payload.approx_bytes();
+            }
             for epoch in data.sealed_epochs.values() {
                 for (_, _, payload) in &epoch.entries {
                     total += payload.approx_bytes();
@@ -2700,6 +2881,200 @@ mod tests {
         assert_eq!(series[0].samples.len(), 2);
         // No persistence handle → seal cadence disabled → no sealing.
         assert!(idx.persistence_read.read().unwrap().is_none());
+    }
+
+    // ── LIVE-scenario regression tests (fix/sketch-durable-live) ────────
+    //
+    // The unit tests above use `hot_window_ms: Some(0)` + epoch-1970
+    // timestamps, which force-flush everything immediately. The LIVE run
+    // (`--persistence-seal-window-count=4 --persistence-hot-window-secs=120`)
+    // ingests panes stamped at WALL-CLOCK ms and uses a 120s hot window,
+    // and exposed three bugs these helpers must reproduce.
+
+    fn now_ms_wall() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// Mirror of the live config: seal every 4 windows, 120s hot window,
+    /// memory limit high (so the flush is driven by the hot-window
+    /// watermark, exactly as in the live run that produced empty parts/).
+    fn live_cfg(disk_path: std::path::PathBuf) -> SketchStorePersistenceConfig {
+        SketchStorePersistenceConfig {
+            memory_limit_bytes: 2048 * 1024 * 1024,
+            memory_low_watermark_bytes: 2048 * 1024 * 1024 * 8 / 10,
+            hard_cap_bytes: 2048 * 1024 * 1024 * 125 / 100,
+            hot_window_ms: Some(120_000), // live: --persistence-hot-window-secs=120
+            delete_older_than_ms: None,
+            flush_interval: std::time::Duration::from_millis(20),
+            disk_path,
+            part_cache_bytes: 1 << 20,
+            seal_window_count: 4, // live: --persistence-seal-window-count=4
+        }
+    }
+
+    /// BUG #1 + #3 (most severe): in the LIVE run the freshest windows of
+    /// every series sit UN-SEALED in `current_epoch` — sealing only fires
+    /// once `current_epoch` reaches the cadence (4 distinct windows). The
+    /// flusher's hot-window phase ONLY ever considers SEALED epochs, so
+    /// any window that ages past the 120s hot window while still in
+    /// `current_epoch` (because the series stopped/slowed before hitting
+    /// cadence) is NEVER flushed. That is exactly what produced the empty
+    /// `parts/` + 0-byte manifest log on node2 after 13 min of ingest:
+    /// data flowed (the resolver WAL grew) but nothing was ever made
+    /// durable, so a `docker restart` recovered `live=0` and the post-
+    /// restart query returned "No result".
+    ///
+    /// This test ingests aged panes that DON'T reach cadence-4, so they
+    /// stay un-sealed, then asserts the flusher still makes them durable
+    /// and they survive a restart. On origin/main nothing flushes.
+    #[test]
+    fn live_aged_unsealed_panes_flush_and_survive_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = tmp.path().to_path_buf();
+        // Panes ending 10 minutes ago → comfortably behind the 120s hot
+        // window the moment they're ingested.
+        let base = now_ms_wall().saturating_sub(10 * 60 * 1000);
+        {
+            let idx = Arc::new(SketchStore::new());
+            idx.register(meta_with_host_key(7001));
+            let p = idx.start_persistence(live_cfg(disk.clone())).unwrap();
+            // Only 3 distinct 30s panes — BELOW the 4-window seal cadence,
+            // so they never rotate into sealed_epochs and (on origin/main)
+            // the flusher's sealed-only hot-window scan never sees them.
+            for i in 0..3u64 {
+                let s = base + i * 30_000;
+                idx.append_sample(7001, lv_host("a"), (s, s + 30_000), sample((i + 1) as u8));
+            }
+            // These aged windows MUST become durable parts even though the
+            // cadence was never reached. On origin/main this never happens
+            // → empty parts/, matching the live failure.
+            let flushed = wait_until(
+                || !p.manifest.live_parts().is_empty(),
+                std::time::Duration::from_secs(5),
+            );
+            assert!(
+                flushed,
+                "LIVE BUG #1: aged un-sealed panes never flushed to disk \
+                 (parts={}, sealed={}, sealed_bytes={})",
+                p.manifest.live_parts().len(),
+                idx.list_sealed_epochs_len(),
+                idx.approx_memory_bytes(),
+            );
+            let mut p = p;
+            p.shutdown();
+        }
+
+        // "Restart" on the SAME dir — recovery must reload the parts.
+        let idx2 = Arc::new(SketchStore::new());
+        idx2.register(meta_with_host_key(7001));
+        let p2 = idx2.start_persistence(live_cfg(disk.clone())).unwrap();
+        assert!(
+            !p2.manifest.live_parts().is_empty(),
+            "LIVE BUG #1: recovery found 0 live parts after restart"
+        );
+        let series = idx2.query_range(7001, base, base + 90_000);
+        assert_eq!(series.len(), 1, "recovered data not queryable after restart");
+        assert!(
+            !series[0].samples.is_empty(),
+            "restart query returned No result — flushed data lost"
+        );
+        drop(p2);
+    }
+
+    /// BUG #2: after flush+evict, an exact-agg (`sum by (zone)` shape)
+    /// range query must still resolve from disk. On origin/main
+    /// `query_exact_agg_range` reads ONLY the in-memory current+sealed
+    /// epochs — it never unions disk parts — so once the windows are
+    /// flushed-then-evicted the query returns empty ("No result").
+    #[test]
+    fn live_exact_agg_resolves_from_disk_after_evict() {
+        use crate::storage_engines::types::AggregationType;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        // Register an ExactAgg(Sum) sid keyed by `zone`.
+        let mut m = meta(8001);
+        m.metric_name = "http_requests_total".into();
+        m.group_by_keys = ["zone".to_string()].into_iter().collect();
+        m.agg_kind = AggKind::ExactAgg {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        };
+        idx.register(m);
+        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+
+        let lv_zone = |v: &str| {
+            let mut x = BTreeMap::new();
+            x.insert("zone".to_string(), v.to_string());
+            x
+        };
+        for i in 0..10u64 {
+            let s = i * 30_000;
+            idx.append_precompute(
+                8001,
+                lv_zone("z0"),
+                (s, s + 30_000),
+                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(
+                    (i + 1) as f64,
+                )),
+            );
+        }
+        assert!(
+            wait_until(
+                || idx.approx_memory_bytes() == 0 && idx.list_sealed_epochs_len() == 0,
+                std::time::Duration::from_secs(5),
+            ),
+            "exact-agg windows never fully evicted"
+        );
+        // Query the EVICTED portion [0, 150_000) — must come back from disk.
+        let series = idx.query_exact_agg_range(8001, 0, 150_000);
+        assert!(
+            !series.is_empty(),
+            "LIVE BUG #2: exact-agg query returned No result after flush+evict \
+             (disk read-back missing)"
+        );
+        let (_label, samples) = &series[0];
+        assert!(
+            samples.contains_key(&30_000),
+            "LIVE BUG #2: evicted exact-agg window (0,30000) missing from disk read-back"
+        );
+        // The coverage-bounds helper (rate divisor) must also see disk.
+        let cov = idx.exact_agg_coverage_bounds(8001, 0, 150_000);
+        assert!(
+            cov.is_some(),
+            "LIVE BUG #2: exact_agg_coverage_bounds blind to disk after evict"
+        );
+        drop(p);
+    }
+
+    /// BUG #3: the memory diagnostic + the flusher's memory-pressure
+    /// trigger must account for `current_epoch`, not just sealed epochs.
+    /// On origin/main `approx_memory_bytes()` sums ONLY sealed epochs, so
+    /// a store holding megabytes of un-sealed `current_epoch` data reports
+    /// ~0 bytes (the live "0.00–0.12 KB approx sealed bytes" under-report)
+    /// and the flusher's `mem > memory_limit` trigger never fires.
+    #[test]
+    fn live_total_memory_accounts_for_current_epoch() {
+        let idx = SketchStore::new();
+        idx.register(meta_with_host_key(9001));
+        // No persistence → no sealing → all data sits in current_epoch.
+        for i in 0..20u64 {
+            let s = i * 30_000;
+            idx.append_sample(9001, lv_host("a"), (s, s + 30_000), sample((i + 1) as u8));
+        }
+        assert_eq!(
+            idx.list_sealed_epochs_len(),
+            0,
+            "precondition: nothing sealed (no persistence)"
+        );
+        assert!(
+            idx.approx_memory_bytes() > 0,
+            "LIVE BUG #3: approx_memory_bytes() reports 0 while current_epoch holds 20 \
+             windows — the diagnostic under-reports and the flusher's memory trigger is blind"
+        );
     }
 }
 

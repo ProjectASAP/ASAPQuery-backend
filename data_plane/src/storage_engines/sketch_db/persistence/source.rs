@@ -99,6 +99,23 @@ pub struct EpochSnapshotEntry {
 pub trait EpochSource: Send + Sync {
     fn list_sealed_epochs(&self) -> Vec<SealedEpochRef>;
 
+    /// Time-driven seal: roll every un-sealed `current_epoch` window
+    /// whose END is at or before `cutoff_end` into a sealed epoch so the
+    /// flusher can make it durable. Called by the flusher each tick with
+    /// `cutoff_end = now - hot_window` BEFORE [`list_sealed_epochs`].
+    ///
+    /// The count-driven seal cadence (`seal_window_count`) only fires once
+    /// `current_epoch` reaches N distinct windows; a slow/stalled series
+    /// never reaches it, leaving aged windows un-sealed — and the flusher
+    /// only flushes SEALED epochs, so those windows are never made durable
+    /// (the live `parts/`-stays-empty bug). This hook closes that gap.
+    ///
+    /// Default impl is a no-op so existing/test sources need not implement
+    /// it. Returns the number of distinct windows newly sealed.
+    fn seal_aged_epochs(&self, _cutoff_end: u64) -> usize {
+        0
+    }
+
     fn snapshot_sealed_epoch(
         &self,
         agg_id: u64,
