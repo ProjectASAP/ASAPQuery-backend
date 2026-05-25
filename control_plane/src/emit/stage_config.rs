@@ -53,9 +53,10 @@ use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 
 use crate::physical::colored_dag::emitter::{
-    default_cold_external_labels, default_cold_ship_endpoint, AggregationInput, ArchiveTierMetric,
-    BackendAggregation, BackendReadout, BackendStageConfig, EdgeSketchProcessor, EdgeStageConfig,
-    ExportTarget, GatewayMergeProcessor, GatewayStageConfig, PrometheusArchiveMetric,
+    coldpart_endpoint_from_ship, default_cold_external_labels, default_cold_ship_endpoint,
+    AggregationInput, ArchiveTierMetric, BackendAggregation, BackendReadout, BackendStageConfig,
+    ColdFormat, EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor,
+    GatewayStageConfig, PrometheusArchiveMetric,
 };
 use crate::physical::colored_dag::stage_id::StageId;
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
@@ -1903,7 +1904,30 @@ fn emit_edge_yaml_asap_edge(
         };
         let mut m = Mapping::new();
         m.insert("enabled".into(), Value::Bool(cold_enabled));
-        m.insert("ship_endpoint".into(), Value::String(ship_endpoint));
+        m.insert(
+            "ship_endpoint".into(),
+            Value::String(ship_endpoint.clone()),
+        );
+        // Cold-archive format: when the deploy opted into the lossless
+        // intchunk cold-part format, emit `format: intchunk` + the
+        // `coldpart_endpoint` so the agent ships to `/ingest/coldpart`
+        // rather than the default gorilla-XOR fragments. `Fragment` (the
+        // default) emits NEITHER key, leaving the cold block byte-identical
+        // to the pre-format emit (`ship_endpoint` only).
+        if cfg.cold_format == ColdFormat::Intchunk {
+            m.insert("format".into(), Value::String("intchunk".to_string()));
+            // coldpart_endpoint: the threaded value, else derived from the
+            // fragment ship_endpoint by swapping the path to
+            // `/ingest/coldpart` (same merger host:port).
+            let coldpart_endpoint = cfg
+                .cold_coldpart_endpoint
+                .clone()
+                .unwrap_or_else(|| coldpart_endpoint_from_ship(&ship_endpoint));
+            m.insert(
+                "coldpart_endpoint".into(),
+                Value::String(coldpart_endpoint),
+            );
+        }
         m.insert(
             "block_duration".into(),
             Value::String(format!("{block_secs}s")),
@@ -2573,6 +2597,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -3555,6 +3581,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -3903,6 +3931,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -4253,6 +4283,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -5414,6 +5446,8 @@ mod tests {
             ),
             cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -5639,6 +5673,109 @@ mod tests {
     }
 
     #[test]
+    fn cold_format_default_fragment_emits_no_format_keys() {
+        // Default cold_format (Fragment) must NOT emit `format:` or
+        // `coldpart_endpoint:` in the agent `cold:` block — the cold block
+        // stays byte-identical to the pre-format emit (ship_endpoint only),
+        // so there is NO behavior change when the operator leaves the knob
+        // unset. The default fixture builds with ColdFormat::default().
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let cfg = fused_asap_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let cold = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("cold"))
+            .expect("cold block present");
+        assert!(
+            cold.get("format").is_none(),
+            "default (fragment) cold block must NOT carry a `format:` key\n{yaml}"
+        );
+        assert!(
+            cold.get("coldpart_endpoint").is_none(),
+            "default (fragment) cold block must NOT carry a `coldpart_endpoint:` key\n{yaml}"
+        );
+        // The fragment ship_endpoint is unchanged.
+        assert_eq!(
+            cold.get("ship_endpoint").and_then(|v| v.as_str()),
+            Some("http://gorilla-merger:10908/ingest/gorilla"),
+            "fragment ship_endpoint must be unchanged\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn cold_format_intchunk_emits_format_and_derived_coldpart_endpoint() {
+        // When the deploy opts into the intchunk cold-part format, the
+        // emitted agent `cold:` block must carry `format: intchunk` and a
+        // `coldpart_endpoint:` derived from the fragment ship_endpoint
+        // (same merger host:port, `/ingest/coldpart` path). The
+        // ship_endpoint (fragment target) is still emitted unchanged.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let mut cfg = fused_asap_edge_cfg();
+        cfg.cold_format = ColdFormat::Intchunk;
+        // cold_coldpart_endpoint left None ⇒ derive from ship_endpoint.
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let cold = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("cold"))
+            .expect("cold block present");
+        assert_eq!(
+            cold.get("format").and_then(|v| v.as_str()),
+            Some("intchunk"),
+            "intchunk cold block must carry `format: intchunk`\n{yaml}"
+        );
+        assert_eq!(
+            cold.get("coldpart_endpoint").and_then(|v| v.as_str()),
+            Some("http://gorilla-merger:10908/ingest/coldpart"),
+            "coldpart_endpoint must be derived from the ship_endpoint (\
+             same merger host:port, /ingest/coldpart path)\n{yaml}"
+        );
+        // The fragment ship_endpoint stays present (the agent still knows
+        // the fragment target; only the active format flips).
+        assert_eq!(
+            cold.get("ship_endpoint").and_then(|v| v.as_str()),
+            Some("http://gorilla-merger:10908/ingest/gorilla"),
+            "ship_endpoint must remain unchanged\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn cold_format_intchunk_honours_explicit_coldpart_endpoint() {
+        // An explicit `cold_coldpart_endpoint` wins over the ship-endpoint
+        // derivation — lets a deploy point the cold-part tier at a
+        // different merger host if needed.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let mut cfg = fused_asap_edge_cfg();
+        cfg.cold_format = ColdFormat::Intchunk;
+        cfg.cold_coldpart_endpoint =
+            Some("http://other-merger:10908/ingest/coldpart".into());
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let cold = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("cold"))
+            .expect("cold block present");
+        assert_eq!(
+            cold.get("coldpart_endpoint").and_then(|v| v.as_str()),
+            Some("http://other-merger:10908/ingest/coldpart"),
+            "explicit coldpart_endpoint must win over the derivation\n{yaml}"
+        );
+    }
+
+    #[test]
     fn fused_asap_edge_tier_derives_from_archive_routing() {
         // Focused regression for the per-metric `tier` contract (companion
         // to the ASAPCollector asapedgeprocessor `tier` field). The tier is
@@ -5681,6 +5818,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
 
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");

@@ -213,6 +213,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
