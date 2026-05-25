@@ -12,14 +12,13 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ProjectASAP/asap-gorilla-go/coldpart"
 	kitlog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/objstore"
 	objclient "github.com/thanos-io/objstore/client"
-
-	"github.com/ProjectASAP/asapquery-backend/gorilla-merger/internal/coldpart"
 )
 
 // BucketCloser is the subset of objstore.Bucket main needs to manage the cold

@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ProjectASAP/asap-gorilla-go/coldpart"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/ProjectASAP/asapquery-backend/gorilla-merger/internal/coldchunk"
-	"github.com/ProjectASAP/asapquery-backend/gorilla-merger/internal/coldpart"
 )
 
 // ColdChunk is one in-window XOR chunk for a cold series, with its own time
