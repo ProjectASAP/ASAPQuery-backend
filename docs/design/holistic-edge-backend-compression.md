@@ -358,3 +358,102 @@ fraction). `p` rides in the Full-epoch frame header alongside the offset.
   expected N (rate/cardinality) + accuracy SLA. Fits the existing
   controller-driven model exactly — the controller already annotates each
   metric's tier + sketch type; it adds `p` the same way.
+
+> §6.5 (the offline Go sampling benchmark proving these benefits empirically —
+> CPU/update reduction vs measured error vs the bounds below) is added once the
+> benchmark lands; §7 is its formal backing.
+
+---
+
+## 7. Sampling-enhanced sketches: algorithms & error-bound derivations
+
+Formal backing for the bounds cited in §6. The rule: **sampling must respect
+each sketch's algebraic structure.**
+
+| Sketch | Core update | Valid sampling |
+|---|---|---|
+| DDSketch | additive bucket count | inverse-probability bucket update |
+| KLL | weighted samples + randomized compaction | inverse-probability item weight, then normal compaction |
+| HLL | max register | hash-threshold element sampling, then rescale |
+| CMS / CountSketch / Nitro | additive counters | inverse-probability counter update |
+
+Let $0<p\le 1$, and $Y_i=Z_i/p$ with $Z_i\sim\mathrm{Bernoulli}(p)$, so
+$\mathbb{E}[Y_i]=1$ and $\mathrm{Var}(Y_i)=\mathbb{E}[Y_i^2]-1=\frac{1-p}{p}$.
+
+### 7.1 DDSketch — inverse-probability bucket update
+Bucket $b(x)=\lceil\log x/\log\gamma\rceil$, $\gamma=\frac{1+\alpha}{1-\alpha}$;
+representative relative error $\alpha$. Update: for $x_i$, add $Y_i$ to
+$\widehat C[b_i]$ (i.e. $+1/p$ w.p. $p$). Sampled count
+$\widehat n_b=\sum_{i:b(x_i)=b}Y_i$.
+- **Unbiased:** $\mathbb{E}[\widehat n_b]=\sum_{i}\mathbb{E}[Y_i]=n_b$.
+- **Prefix concentration** (quantiles use prefix counts $N_{\le b}$):
+  $\mathrm{Var}(\widehat N_{\le b})=N_{\le b}\frac{1-p}{p}$. Bernstein + union over
+  $B$ buckets ⇒ w.p. $1-\delta$,
+  $\sup_b|\widehat N_{\le b}-N_{\le b}|=O\!\big(\sqrt{N\log(B/\delta)/p}+\log(B/\delta)/p\big)$.
+  Rank error $\epsilon_s=O\!\big(\sqrt{\log(B/\delta)/(pN)}+\log(B/\delta)/(pN)\big)$.
+- **Quantile bound:** $\;\tilde x_q\in(1\pm\alpha)\,x_{q\pm\epsilon_s}\;$ w.p.
+  $1-\delta$. The $\alpha$ now applies to $x_{q\pm\epsilon_s}$, not $x_q$ (the
+  pure relative-value guarantee is only preserved when $x_{q\pm\epsilon_s}$ is
+  near $x_q$). Cost: bucket writes/item $1\to p$.
+
+### 7.2 KLL — weighted update sampling
+Original rank error $\epsilon_k=O(\frac1k\sqrt{\log(1/\delta)})$. Update: w.p.
+$p$ insert $x_i$ with weight $1/p$ (a virtual level-$(-1)$ compactor; at level
+$h$ the weight is $2^h/p$); compact normally.
+- **Weighted CDF unbiased:** $\widehat F_s(t)=\frac1N\sum_i\frac{Z_i}{p}\mathbf 1\{x_i\le t\}$,
+  $\mathbb{E}[\widehat F_s(t)]=F(t)$.
+- **Concentration:** $\mathrm{Var}(\widehat F_s(t))=\frac{N_t}{N^2}\frac{1-p}{p}\le\frac{1-p}{pN}$;
+  DKW/union over breakpoints ⇒ $\sup_t|\widehat F_s-F|\le\epsilon_s=O(\sqrt{\log(1/\delta)/(pN)})$.
+- **Combined:** $\sup_t|\widehat F_{KLL}-F|\le\underbrace{|\widehat F_{KLL}-\widehat F_s|}_{\le\,\epsilon_k}+\underbrace{|\widehat F_s-F|}_{\le\,\epsilon_s}$, so
+  $\;\tilde x_q\in[x_{q-(\epsilon_k+\epsilon_s)},\,x_{q+(\epsilon_k+\epsilon_s)}]$.
+  (Martingale view: sampling adds one more zero-mean term to KLL's compaction-error
+  variance budget.)
+- **Design balance:** set $\epsilon_s\approx\epsilon_k$ with
+  $\epsilon_s\approx 1/\sqrt{pN}$, $\epsilon_k\approx 1/k$ ⇒ **$pN\approx k^2$** —
+  the effective number of sampled updates should be $\gtrsim k^2$ or sampling
+  dominates. Cost: insertions/item $1\to p$; memory $O(k\log(pN))$.
+
+### 7.3 HLL — hash-threshold sampling
+RSE $\approx 1.04/\sqrt m$. The update is $R[j]\leftarrow\max(R[j],\rho(x))$ —
+**a max, not additive**, so inverse-probability register updates are INVALID.
+Algorithm: keep a distinct key iff $u(h(x))<p$ (a stable hash ⇒ the same key
+always gets the same decision); update normally; estimate $\widehat n=\widehat n_s/p$.
+- **Why not per-occurrence:** a freq-$f_x$ key would be kept w.p. $1-(1-p)^{f_x}$
+  — frequency-dependent, hence biased for distinct counting. Hash-threshold gives
+  every distinct key the same $\Pr[\text{kept}]=p$.
+- **Unbiased:** $n_s=\sum_{x\in D}I_x$, $I_x\sim\mathrm{Bernoulli}(p)$ ⇒
+  $\mathbb{E}[n_s/p]=n$.
+- **Concentration:** $n_s\sim\mathrm{Binomial}(n,p)$; Chernoff ⇒
+  $\epsilon_s=\sqrt{3\log(2/\delta)/(pn)}$.
+- **Combined RSE:** $\frac{|\widehat n-n|}{n}\lesssim\epsilon_s+\epsilon_h$, i.e.
+  $\;\mathrm{RSE}\approx\sqrt{\frac{1-p}{pn}+\frac{1.04^2}{m}}$ (sampling term +
+  HLL term). Cost: register writes/item $\to p$.
+
+### 7.4 Nitro / additive counters (CMS, CountSketch)
+Update $C_{r,h_r(x)}\mathrel{+}=a_r(x)$ ($a=w$ for Count-Min; $a=s_r(x)w$,
+$s_r\in\{\pm1\}$, for CountSketch). Sampled: add $\frac{Z}{p}a$.
+- **Unbiased counters:** $\mathbb{E}[\widehat C_{r,c}]=C_{r,c}$ (the core
+  NitroSketch argument).
+- **Variance:** for a counter with updates $a_1..a_T$,
+  $\mathrm{Var}(\widehat C-C)=\frac{1-p}{p}\sum_t a_t^2$; Bernstein ⇒
+  $|\widehat C-C|=O\!\big(\sqrt{\frac{1-p}{p}(\sum a_t^2)\log(1/\delta)}+\frac{a_{\max}}{p}\log(1/\delta)\big)$.
+- **CountSketch:** median over $d$ rows; total error = hash-collision + sampling;
+  per-row variance gains $\frac{1-p}{p}\sum_{i:h_r(x_i)=h_r(x)}w_i^2$; the median
+  still drops failure prob exponentially in $d$.
+- **Count-Min:** the deterministic no-underestimate property is LOST (self-updates
+  may be skipped); analyze as a biased-up collision estimator + zero-mean sampling
+  noise.
+- **Fixed-$s$-row variant:** select exactly $s$ of $d$ rows per item, scale by
+  $d/s$; unbiased with a deterministic write count $s$ (set $p=s/d$). Cost:
+  counter writes/item $d\to pd$ (or fixed $s$).
+
+### 7.5 Design rules
+- **Additive update ⇒ inverse-probability update sampling** (DDSketch, CMS,
+  CountSketch, Nitro).
+- **Max update ⇒ threshold sampling + final rescale** (HLL).
+- **Compaction update ⇒ weighted sampling + weighted rank analysis** (KLL).
+
+All four are unbiased; the added error is the $\epsilon_s$ / variance term above,
+which §6.4 folds into the per-metric accuracy budget (and §6's composition rule —
+store the raw sampled integer state + global `p`, rescale at query — keeps these
+estimators compressible).
