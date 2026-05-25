@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod manifest;
+pub mod metadata;
 pub mod part;
 pub mod source;
 
@@ -30,6 +31,7 @@ pub mod recovery;
 
 pub use config::SketchStorePersistenceConfig;
 pub use manifest::{Manifest, PartEntry};
+pub use metadata::{SidMetaRecord, SidMetadataStore};
 pub use part::{PartId, PartReader, PartWriter, SnapshotEntry};
 pub use source::{EpochSource, SealedEpochRef};
 
