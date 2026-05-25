@@ -1016,8 +1016,28 @@ async fn route_modified_otlp_sketches_to_precompute(
                     _ => continue,
                 };
 
+                // Canonicalize the metric name once per metric: strip the
+                // agent-side sketch-family suffix (`_kll`, `_hll`, …) so
+                // the whole ingest pipeline — sid resolution, series-key
+                // snapshot cache, `SketchInstanceMetadata.metric_name`,
+                // `derive_sketch_policy_fp`, and the legacy precompute
+                // router match below — keys on the RAW metric name that
+                // the controller's streaming-config and the query
+                // analyzer speak. Without this the warm-tier sketch
+                // queries can never resolve (see
+                // `canonical_sketch_metric_name` for the full rationale).
+                // All datapoints in one OTLP metric share the same family
+                // (the `metric.data` variant), so the first dp's `kind`
+                // determines the suffix for the whole metric.
+                let canonical_name: String = match dps.first() {
+                    Some(first) => {
+                        canonical_sketch_metric_name(&metric.name, first.kind).to_string()
+                    }
+                    None => metric.name.clone(),
+                };
+
                 for dp in dps {
-                    let series_key = format_series_key(&metric.name, &dp.attrs);
+                    let series_key = format_series_key(&canonical_name, &dp.attrs);
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
                     // Sid resolution — registry-allocated, NOT content-
@@ -1109,7 +1129,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         };
                         let agg_kind_canonical = agg_kind.canonical_string();
                         let assigned = ingest_state.series_resolver.resolve(
-                            &metric.name,
+                            &canonical_name,
                             &fp,
                             &agg_kind_canonical,
                         );
@@ -1212,14 +1232,14 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // covers it).
                             let policy_fp = derive_sketch_policy_fp(
                                 ingest_state,
-                                &metric.name,
+                                &canonical_name,
                                 kind,
                                 &cfg,
                                 &group_by_keys,
                             );
                             ingest_state.sketch_index.register(SketchInstanceMetadata {
                                 sid,
-                                metric_name: metric.name.clone(),
+                                metric_name: canonical_name.clone(),
                                 group_by_keys,
                                 capability: Some(cap),
                                 agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
@@ -1337,9 +1357,9 @@ async fn route_modified_otlp_sketches_to_precompute(
 
                     let mut matched_any = false;
                     for config in agg_configs.values() {
-                        if config.metric != metric.name
-                            && config.spatial_filter_normalized != metric.name
-                            && config.spatial_filter != metric.name
+                        if config.metric != canonical_name
+                            && config.spatial_filter_normalized != canonical_name
+                            && config.spatial_filter != canonical_name
                         {
                             continue;
                         }
@@ -1541,6 +1561,57 @@ fn derive_sketch_policy_fp(
 /// `CountMinSketchWithHeap::deserialize_msgpack`, we classify the sid
 /// as `CmsWithHeap` so the ASAP-tier reducer can later read the heap
 /// directly for `topk` / `topk_over_time` queries.
+/// Strip the agent-side sketch-family name suffix from an OTLP sketch
+/// metric name, returning the *raw* metric name the controller's
+/// streaming-config policies and user PromQL are keyed on.
+///
+/// ## Why this exists
+///
+/// The ASAPCollector edge pipeline's fused `asapedgeprocessor`
+/// (`processor/asapedgeprocessor/sketch.go`) sets
+/// `MetricSuffix: "_" + family` on every sketch it emits, so a KLL
+/// sketch over `request_size_bytes` arrives on the wire named
+/// `request_size_bytes_kll`, an HLL over `unique_users_per_min` arrives
+/// as `unique_users_per_min_hll`, and so on.
+///
+/// Both the controller (which plans + pushes streaming-config policies
+/// keyed on the *bare* metric `request_size_bytes`) and the query
+/// analyzer (`control_plane::asap_tier_analysis`, which lifts the bare
+/// metric name out of the PromQL selector) speak the bare name. With
+/// the suffix left on, `SketchInstanceMetadata.metric_name` is the
+/// suffixed form, so `SketchIndex::instances_matching(bare, …)` and
+/// `find_matching_policies` / `find_policy_by_content` (all of which
+/// compare `metric_name` for equality) never match — every warm sketch
+/// query (`quantile_over_time`, `count`/HLL, `topk`) capability-misses
+/// and the user sees `data_source: asap_query, "No result"`.
+///
+/// Per `docs/design-controller-into-backend.md` §1 the sketch *family*
+/// is a wire-level attribute (carried here in `agg_kind` /
+/// [`SketchKindHandle`]), NOT a name suffix; storage + query must be
+/// keyed on the raw SDK metric name. This helper applies that
+/// canonicalization at the ingest seam so the backend resolves
+/// correctly regardless of whether the deployed agent still suffixes.
+///
+/// The strip is gated on the suffix matching the datapoint's *actual*
+/// sketch kind, so a metric a user legitimately named `foo_hll` that
+/// arrives as a KLL sketch is left untouched, and the operation is a
+/// no-op (and therefore safe / idempotent) once agents stop suffixing.
+fn canonical_sketch_metric_name<'a>(name: &'a str, kind: SketchKind) -> &'a str {
+    let suffix: &str = match kind {
+        SketchKind::DdSketch => "_ddsketch",
+        SketchKind::Kll => "_kll",
+        SketchKind::Hll => "_hll",
+        SketchKind::CountSketch => "_countsketch",
+        SketchKind::CountMin => "_countminsketch",
+    };
+    // Only strip when there's a non-empty base left over (so a metric
+    // literally named `_kll` is never collapsed to the empty string).
+    match name.strip_suffix(suffix) {
+        Some(base) if !base.is_empty() => base,
+        _ => name,
+    }
+}
+
 fn sketch_kind_handle_for(
     dp: &ModifiedOtlpSketchDp,
 ) -> crate::storage_engines::sketch_db::index::SketchKindHandle {
@@ -2206,6 +2277,81 @@ fn attributes_to_map(
         }
     }
     m
+}
+
+#[cfg(test)]
+mod canonical_metric_name_tests {
+    //! Coverage for `canonical_sketch_metric_name` — the ingest-seam
+    //! strip of the agent's `_<family>` suffix (ASAPCollector
+    //! `asapedgeprocessor` sets `MetricSuffix: "_" + family`). Without
+    //! it, warm-tier sketch queries against the raw metric name
+    //! capability-miss because `SketchInstanceMetadata.metric_name` and
+    //! the controller's streaming-config policy `metric` never line up.
+    use super::*;
+
+    #[test]
+    fn strips_matching_family_suffix() {
+        assert_eq!(
+            canonical_sketch_metric_name("request_size_bytes_kll", SketchKind::Kll),
+            "request_size_bytes"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name("http_requests_total_latency_ms_kll", SketchKind::Kll),
+            "http_requests_total_latency_ms"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name("unique_users_per_min_hll", SketchKind::Hll),
+            "unique_users_per_min"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name("top_endpoint_qps_countsketch", SketchKind::CountSketch),
+            "top_endpoint_qps"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name(
+                "endpoint_request_freq_countminsketch",
+                SketchKind::CountMin
+            ),
+            "endpoint_request_freq"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name("latency_ddsketch", SketchKind::DdSketch),
+            "latency"
+        );
+    }
+
+    #[test]
+    fn leaves_bare_name_untouched_idempotent() {
+        // Once agents stop suffixing (design-controller-into-backend
+        // Phase 1), the strip must be a no-op.
+        assert_eq!(
+            canonical_sketch_metric_name("request_size_bytes", SketchKind::Kll),
+            "request_size_bytes"
+        );
+        assert_eq!(
+            canonical_sketch_metric_name("unique_users_per_min", SketchKind::Hll),
+            "unique_users_per_min"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_suffix_of_a_different_family() {
+        // A metric whose name happens to end in `_hll` but arrives as a
+        // KLL sketch keeps its name — the strip is gated on the dp's
+        // actual sketch kind, so we never collapse a legitimately-named
+        // metric onto a different one.
+        assert_eq!(
+            canonical_sketch_metric_name("my_metric_hll", SketchKind::Kll),
+            "my_metric_hll"
+        );
+    }
+
+    #[test]
+    fn never_collapses_to_empty_string() {
+        // A metric literally named `_kll` (base would be empty) is left
+        // intact rather than emptied.
+        assert_eq!(canonical_sketch_metric_name("_kll", SketchKind::Kll), "_kll");
+    }
 }
 
 #[cfg(test)]
