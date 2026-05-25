@@ -87,12 +87,12 @@ pub fn emit_telegraf_toml(
         for sp in &cfg.sketch_processors {
             emit_processors_allsketches(&mut out, sp, cfg.window_secs);
         }
-        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("data-plane", &cfg.exporter_target);
         emit_outputs_opentelemetry(&mut out, &endpoint);
     } else {
         // Mode 2 — raw at edge. Passthrough; outputs.opentelemetry
         // ships raw OTLP to the gateway.
-        let endpoint = resolve_export_endpoint("backend", &cfg.exporter_target);
+        let endpoint = resolve_export_endpoint("data-plane", &cfg.exporter_target);
         emit_outputs_opentelemetry(&mut out, &endpoint);
     }
 
@@ -382,8 +382,8 @@ mod tests {
             "missing output\n{toml}"
         );
         assert!(
-            toml.contains("service_address = \"backend:4317\""),
-            "missing backend endpoint\n{toml}"
+            toml.contains("service_address = \"data-plane:4317\""),
+            "missing data-plane endpoint\n{toml}"
         );
         // Sketch params preserved.
         assert!(
@@ -414,8 +414,8 @@ mod tests {
             "missing output\n{toml}"
         );
         assert!(
-            toml.contains("service_address = \"backend:4317\""),
-            "missing backend endpoint\n{toml}"
+            toml.contains("service_address = \"data-plane:4317\""),
+            "missing data-plane endpoint\n{toml}"
         );
     }
 

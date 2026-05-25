@@ -344,7 +344,7 @@ pub fn emit_edge_yaml(
     // (The gateway typed L5 stage + emit_gateway_yaml machinery stays in
     // source for topologies that re-introduce a middle tier, but is not
     // exercised in the default deployment.)
-    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
+    let (exporter_key, exporter_val) = build_otlp_exporter("data-plane", &cfg.exporter_target);
 
     let mut exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
     let mut pipelines: BTreeMap<String, Pipeline> = BTreeMap::new();
@@ -584,7 +584,7 @@ pub fn emit_gateway_yaml(
     }
 
     // Exporter — backend OTLP.
-    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
+    let (exporter_key, exporter_val) = build_otlp_exporter("data-plane", &cfg.exporter_target);
 
     // Issue #2: gateway also needs X-Agent-ID so its OpAMP-pushed
     // reconnect re-identifies to the controller.
@@ -1188,7 +1188,7 @@ fn emit_edge_yaml_5sketch_routing(
     // ── Exporters ──────────────────────────────────────────────────────────
     // Edge → asapquery-backend OTLP ingest (see emit_edge_yaml for the
     // gateway-less rationale).
-    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
+    let (exporter_key, exporter_val) = build_otlp_exporter("data-plane", &cfg.exporter_target);
     let mut exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
 
     let has_prometheus_archive = !cfg.prometheus_archive_metrics.is_empty();
@@ -1916,7 +1916,7 @@ fn emit_edge_yaml_asap_edge(
     // ── Exporters ──────────────────────────────────────────────────────────
     // Edge → asapquery-backend OTLP ingest. Same resolver as every other
     // edge emit (the asap-gateway hop was removed in #400).
-    let (exporter_key, exporter_val) = build_otlp_exporter("backend", &cfg.exporter_target);
+    let (exporter_key, exporter_val) = build_otlp_exporter("data-plane", &cfg.exporter_target);
     let exporters: BTreeMap<String, Value> = [(exporter_key.clone(), exporter_val)].into();
 
     // ── Pipeline ─────────────────────────────────────────────────────────────
@@ -2186,7 +2186,7 @@ fn build_default_edge_processor_block(
 }
 
 /// Resolve an `ExportTarget` to a concrete `endpoint:port` string. Phase
-/// B uses documented placeholder hostnames (`backend:4317` for the
+/// B uses documented placeholder hostnames (`data-plane:4317` for the
 /// edge→backend default; `gateway:4317` is reachable when a caller
 /// explicitly opts in via `default_host`) for symbolic stages — Phase C
 /// plumbs a real `DeploymentConstraints::executors()` resolver.
@@ -2574,7 +2574,7 @@ mod tests {
         // Exporter — asapquery-backend OTLP ingest.
         assert!(yaml.contains("otlp/backend:"), "missing exporter\n{yaml}");
         assert!(
-            yaml.contains("backend:4317"),
+            yaml.contains("data-plane:4317"),
             "exporter should target asapquery-backend\n{yaml}"
         );
 
@@ -2728,8 +2728,8 @@ mod tests {
         // Aggregation id threaded through.
         assert!(yaml.contains("aggregation_id: agg0"), "{yaml}");
 
-        // Exporter targets backend.
-        assert!(yaml.contains("backend:4317"), "{yaml}");
+        // Exporter targets data-plane.
+        assert!(yaml.contains("data-plane:4317"), "{yaml}");
 
         // OpAMP endpoint embedded.
         assert!(yaml.contains("ws://ctrl:4320/v1/opamp"), "{yaml}");
@@ -5283,7 +5283,7 @@ mod tests {
             label_filters: Vec::new(),
             window_secs: Some(60),
             sketch_processors,
-            exporter_target: ExportTarget::Endpoint("backend:4317".into()),
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
             prometheus_archive_metrics: Vec::new(),
             archive_tier_metrics: vec![ArchiveTierMetric {
                 metric: "http_requests_total".into(),
@@ -5561,7 +5561,7 @@ mod tests {
             label_filters: Vec::new(),
             window_secs: Some(60),
             sketch_processors: Vec::new(),
-            exporter_target: ExportTarget::Endpoint("backend:4317".into()),
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
             prometheus_archive_metrics: Vec::new(),
             archive_tier_metrics: vec![ArchiveTierMetric {
                 metric: "archived_metric".into(),

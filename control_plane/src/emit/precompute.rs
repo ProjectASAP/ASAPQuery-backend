@@ -207,9 +207,9 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "data-plane:4317");
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].sketch_source, "backend:4317");
+        assert_eq!(jobs[0].sketch_source, "data-plane:4317");
         assert_eq!(jobs[0].granularity, Duration::from_secs(60));
         assert!(jobs[0].query_expr.contains("latency"));
     }
@@ -220,7 +220,7 @@ mod tests {
             Some(Duration::from_secs(300)),
             Some(Duration::from_secs(60)),
         );
-        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "data-plane:4317");
         assert!(jobs.is_empty());
     }
 
@@ -230,7 +230,7 @@ mod tests {
             Some(Duration::from_secs(60)),
             Some(Duration::from_secs(600)),
         );
-        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "data-plane:4317");
         assert!(jobs[0].store_path.contains("latency"));
         assert!(jobs[0].store_path.contains("5m"));
     }
@@ -242,7 +242,7 @@ mod tests {
             Some(Duration::from_secs(600)),
         );
         workload.aggregations = vec![AggType::Cardinality];
-        let jobs = build_precompute_engine_jobs(&workload, "backend:4317");
+        let jobs = build_precompute_engine_jobs(&workload, "data-plane:4317");
         assert!(
             jobs[0].query_expr.contains("count_distinct_over_time"),
             "got: {}",
@@ -276,7 +276,7 @@ mod tests {
             .register(&PrecomputeJob {
                 query_expr: "quantile_over_time(0.99, latency[5m])".into(),
                 granularity: Duration::from_secs(60),
-                sketch_source: "backend:4317".into(),
+                sketch_source: "data-plane:4317".into(),
                 store_path: "precomputed/latency/p99/5m".into(),
             })
             .await
