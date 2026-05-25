@@ -1349,3 +1349,141 @@ fn evaluate_exact_agg_rate_no_data_when_window_empty() {
         other => panic!("expected NoData, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Short delta-only window (live gap 1) + bare-instant per-window readout
+// (live gap 2). Both reduce to: the sketch read path must use OVERLAP, not
+// containment, so a query window narrower than the agent's ~30s pane
+// cadence still sees the pane straddling its edge — and the delta-stitching
+// carry-in then establishes a rolling base. Before the fix, a `[30s]`
+// `quantile_over_time` and a bare/instant `quantile` selector both returned
+// "No result" because containment found zero in-window panes.
+//
+// A KLL `ProtoDelta` sample's bytes ARE a full KllState fragment (the
+// reducer merges deltas via `decode_full` — see `delta_apply.rs`), so we
+// encode the delta payload the same way as a Full and only flip the
+// encoding tag.
+// ---------------------------------------------------------------------------
+
+fn proto_delta_kll(k: u16, items: &[f64]) -> SketchSampleState {
+    SketchSampleState {
+        bytes: encode_kll_items_proto(k, items),
+        encoding: SketchEncoding::ProtoDelta,
+    }
+}
+
+#[test]
+fn kll_short_window_quantile_over_time_overlap_and_carry_in() {
+    // Gap 1: a query window (3000..3030, i.e. "[30s]") narrower than the
+    // pane cadence. A Full pane lands fully BEFORE the window; a delta pane
+    // STRADDLES the window's left edge (2995..3025). Containment would
+    // return nothing → NoData → "No result". Overlap admits the straddling
+    // delta, and the carry-in splices the prior Full as its base, so the
+    // cumulative roll-up yields one finite scalar.
+    let idx = SketchStore::new();
+    let sid = 9100;
+    let k: u32 = 200;
+    idx.register(kll_meta(sid, k));
+    let lv = BTreeMap::new();
+
+    // Full pane fully before the window: items 1..=25.
+    let base_items: Vec<f64> = (1..=25).map(|i| i as f64).collect();
+    idx.append_sample(
+        sid,
+        lv.clone(),
+        (2960, 2990),
+        proto_full(encode_kll_items_proto(k as u16, &base_items)),
+    );
+    // Delta pane straddling the window's left edge [3000,3030): adds
+    // items 26..=50. As a mergeable fragment, the rolling state ends up
+    // holding 1..=50 → median ≈ 25.5.
+    let delta_items: Vec<f64> = (26..=50).map(|i| i as f64).collect();
+    idx.append_sample(sid, lv.clone(), (2995, 3025), proto_delta_kll(k as u16, &delta_items));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "quantile_over_time", &[0.5], 3000, 3030)
+        .expect("short delta-only window must now succeed (was NoData)");
+    assert_eq!(result.series.len(), 1);
+    let (_lvs, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1, "cumulative emits one scalar");
+    let est = samples[0].1;
+    assert!(est.is_finite() && est > 0.0, "got a real quantile, not 0/NaN");
+    assert!(
+        (est - 25.5).abs() <= 5.0,
+        "median over carried-in base + straddling delta ({est}) ~ 25.5"
+    );
+}
+
+#[test]
+fn kll_short_window_per_window_instant_readout_nonempty() {
+    // Gap 2: the bare/instant `quantile` selector uses the PER-WINDOW
+    // family; the engine projects the LAST in-window sample as the instant
+    // value. With containment the only in-window pane (a straddling delta)
+    // was invisible AND its base was dropped, so per_window_evaluate
+    // produced ZERO in-window samples → the instant projection found
+    // nothing → "No result". Overlap + carry-in must yield at least one
+    // in-window per-window sample so the engine has a value to project.
+    let idx = SketchStore::new();
+    let sid = 9200;
+    let k: u32 = 200;
+    idx.register(kll_meta(sid, k));
+    let lv = BTreeMap::new();
+
+    let base_items: Vec<f64> = (1..=25).map(|i| i as f64).collect();
+    idx.append_sample(
+        sid,
+        lv.clone(),
+        (2960, 2990),
+        proto_full(encode_kll_items_proto(k as u16, &base_items)),
+    );
+    let delta_items: Vec<f64> = (26..=50).map(|i| i as f64).collect();
+    idx.append_sample(sid, lv.clone(), (2995, 3025), proto_delta_kll(k as u16, &delta_items));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "quantile", &[0.5], 3000, 3030)
+        .expect("per-window over short window must succeed");
+    assert_eq!(result.series.len(), 1);
+    let (_lvs, samples) = &result.series[0];
+    // The carried-in Full (window-end 2990 < t0=3000) is filtered out of
+    // the per-window OUTPUT, but the straddling in-window delta (end 3025)
+    // survives — so the engine's `samples.last()` instant projection finds
+    // a value instead of an empty series.
+    assert!(
+        !samples.is_empty(),
+        "per-window readout must be non-empty for the instant projection"
+    );
+    let (last_end, last_val) = samples.last().copied().unwrap();
+    assert!(last_end >= 3000, "surviving sample is in-window (end={last_end})");
+    assert!(
+        last_val.is_finite() && last_val > 0.0,
+        "instant value is real ({last_val}), not the empty-frame 0"
+    );
+}
+
+#[test]
+fn kll_wide_window_quantile_over_time_unchanged() {
+    // Non-regression: the already-working wide-window (`[2m]+`) cumulative
+    // shape must be unaffected by the overlap switch. A single fully
+    // contained Full pane answers exactly as before.
+    let idx = SketchStore::new();
+    let sid = 9300;
+    let k: u32 = 200;
+    idx.register(kll_meta(sid, k));
+    let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+    idx.append_sample(
+        sid,
+        BTreeMap::new(),
+        (5000, 5010),
+        proto_full(encode_kll_items_proto(k as u16, &items)),
+    );
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "quantile_over_time", &[0.5], 4000, 6000)
+        .expect("wide window still answers");
+    let (_lvs, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1);
+    assert!((samples[0].1 - 25.5).abs() <= 5.0);
+}
