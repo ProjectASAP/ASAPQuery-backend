@@ -256,6 +256,45 @@ impl<P> MutableEpoch<P> {
         }
     }
 
+    /// Range query with HALF-OPEN OVERLAP semantics: include any window
+    /// whose `[w.0, w.1)` intersects `[start, end)` (i.e. `w.1 > start &&
+    /// w.0 < end`). Sister of [`Self::range_query_into`], which uses
+    /// strict CONTAINMENT (`w.0 >= start && w.1 <= end`).
+    ///
+    /// The sketch read path ([`SketchStore::query_range`]) needs overlap,
+    /// not containment: the agent emits ~30s tumbling panes, and a short
+    /// query window (e.g. `quantile_over_time(...[30s])`, or an instant
+    /// query whose freshest pane straddles `now`) routinely fails to FULLY
+    /// CONTAIN any single pane — the pane that covers the window's edge
+    /// starts before `start` or ends after `end`. Containment then returns
+    /// ZERO in-window samples, so the delta-stitching carry-in never fires
+    /// (it keys off the earliest in-window sample) and the reducer yields
+    /// an empty series → the live "No result for query" bug for `[30s]`
+    /// and bare-instant selectors. Overlap admits the straddling pane; the
+    /// reducer's per-window `w_end >= t0` filter and cumulative `latest_end`
+    /// projection already drop windows that fall outside the requested
+    /// `[t0, t1]` time domain, so no out-of-range value leaks into the
+    /// answer. This matches the overlap filter [`Self::range_query_into_grouped`]
+    /// already uses (and the legacy `SketchStore`'s 30s-pane fix).
+    pub fn range_query_overlap_into<'a>(
+        &'a self,
+        start: u64,
+        end: u64,
+        out: &mut Vec<(TimestampRange, LabelValuesId, &'a P)>,
+    ) {
+        // O(1) skip if the epoch's bounds don't overlap the query range.
+        if let (Some(min_s), Some(max_e)) = (self.min_start, self.max_end) {
+            if min_s >= end || max_e <= start {
+                return;
+            }
+        }
+        for (i, w) in self.windows_col.iter().enumerate() {
+            if w.1 > start && w.0 < end {
+                out.push((*w, self.label_ids_col[i], &self.payloads_col[i]));
+            }
+        }
+    }
+
     /// Push every entry whose window-END is at or before `before` into
     /// `out`. Used by the sketch read path to fetch a delta-stitching
     /// "carry-in base" — the most-recent Full snapshot that landed
@@ -454,6 +493,43 @@ impl<P> SealedEpoch<P> {
                 break;
             }
             if entry.0 .1 <= end {
+                out.push((entry.0, entry.1, &entry.2));
+            }
+        }
+    }
+
+    /// Range query with HALF-OPEN OVERLAP semantics: include any window
+    /// whose `[w.0, w.1)` intersects `[start, end)` (`w.1 > start && w.0 <
+    /// end`). Sealed sister of [`MutableEpoch::range_query_overlap_into`] —
+    /// see its doc for why the sketch read path needs overlap rather than
+    /// the containment that [`Self::range_query_into`] applies.
+    ///
+    /// Entries are sorted by window-START, but an overlapping window may
+    /// START before `start` (it straddles the left edge), so the
+    /// `partition_point(|e| e.0.0 < start)` seek the containment variant
+    /// uses would WRONGLY skip it. We instead scan from the front while
+    /// `w.0 < end`, testing `w.1 > start` per entry. O(k) over the prefix
+    /// of windows that start before `end` — bounded by the epoch size and
+    /// fine for the warm read path (epochs are small; nothing is sealed in
+    /// the live single-epoch deployment anyway).
+    pub fn range_query_overlap_into<'a>(
+        &'a self,
+        start: u64,
+        end: u64,
+        out: &mut Vec<(TimestampRange, LabelValuesId, &'a P)>,
+    ) {
+        if let (Some(min_s), Some(max_e)) = (self.min_start, self.max_end) {
+            if min_s >= end || max_e <= start {
+                return;
+            }
+        }
+        for entry in &self.entries {
+            // Sorted by start; once a window starts at/after `end` it (and
+            // every later one) cannot overlap `[start, end)`.
+            if entry.0 .0 >= end {
+                break;
+            }
+            if entry.0 .1 > start {
                 out.push((entry.0, entry.1, &entry.2));
             }
         }
@@ -694,6 +770,38 @@ mod tests {
     }
 
     #[test]
+    fn mutable_epoch_overlap_vs_containment() {
+        let mut e = MutableEpoch::<u32>::new();
+        e.insert((0, 100), 1, 100);
+        e.insert((100, 200), 2, 200);
+        e.insert((200, 300), 3, 300);
+
+        // Containment `[50, 250]`: only (100,200) is fully inside.
+        let mut buf = Vec::new();
+        e.range_query_into(50, 250, &mut buf);
+        let mut ids: Vec<_> = buf.iter().map(|(_, id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![2]);
+
+        // Overlap `[50, 250)`: (0,100) straddles left, (100,200) inside,
+        // (200,300) straddles right → all three intersect.
+        buf.clear();
+        e.range_query_overlap_into(50, 250, &mut buf);
+        let mut ids: Vec<_> = buf.iter().map(|(_, id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // Half-open boundary: a window ending exactly at `start` does NOT
+        // overlap; one starting exactly at `end` does NOT either.
+        buf.clear();
+        e.range_query_overlap_into(100, 200, &mut buf); // start=100, end=200
+        let mut ids: Vec<_> = buf.iter().map(|(_, id, _)| *id).collect();
+        ids.sort();
+        // (0,100) ends at start → out; (100,200) overlaps; (200,300) starts at end → out.
+        assert_eq!(ids, vec![2]);
+    }
+
+    #[test]
     fn sealed_epoch_binary_search_range() {
         let mut m = MutableEpoch::<u32>::new();
         m.insert((0, 10), 1, 100);
@@ -707,6 +815,36 @@ mod tests {
         // (10,20)=200 and (20,30)=300 are fully within [10,30]
         assert!(payloads.contains(&200));
         assert!(payloads.contains(&300));
+    }
+
+    #[test]
+    fn sealed_epoch_overlap_admits_straddling_windows() {
+        let mut m = MutableEpoch::<u32>::new();
+        m.insert((0, 10), 1, 100);
+        m.insert((10, 20), 2, 200);
+        m.insert((20, 30), 3, 300);
+        m.insert((30, 40), 4, 400);
+        let s = SealedEpoch::from_mutable(m);
+
+        // Overlap `[5, 25)`: (0,10) straddles left edge — a window the
+        // start-keyed binary search of the containment scan would skip.
+        let mut buf = Vec::new();
+        s.range_query_overlap_into(5, 25, &mut buf);
+        let mut payloads: Vec<u32> = buf.iter().map(|(_, _, p)| **p).collect();
+        payloads.sort();
+        // (0,10) overlaps (10>5), (10,20) inside, (20,30) overlaps (20<25);
+        // (30,40) is entirely after.
+        assert_eq!(payloads, vec![100, 200, 300]);
+
+        // Half-open: window ending at `start` excluded; starting at `end`
+        // excluded.
+        buf.clear();
+        s.range_query_overlap_into(10, 30, &mut buf); // [10,30)
+        let mut payloads: Vec<u32> = buf.iter().map(|(_, _, p)| **p).collect();
+        payloads.sort();
+        // (0,10) ends at 10=start → out; (10,20) & (20,30) overlap;
+        // (30,40) starts at 30=end → out.
+        assert_eq!(payloads, vec![200, 300]);
     }
 
     #[test]

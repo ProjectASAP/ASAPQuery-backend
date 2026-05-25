@@ -392,9 +392,19 @@ impl SketchStore {
             HashMap::new();
 
         let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+        // Sketch read path uses HALF-OPEN OVERLAP, not containment: the
+        // agent emits ~30s tumbling panes, so a short query window (a
+        // `[30s]` range, or an instant query whose freshest pane straddles
+        // `now`) can't FULLY CONTAIN any pane. Containment then returns
+        // zero in-window samples → the carry-in never fires and the
+        // reducer yields an empty series (the live "No result" bug for
+        // `[30s]` + bare-instant selectors). The reducer's own
+        // `w_end >= t0` / `latest_end` filters keep out-of-range values
+        // from leaking into the answer. See
+        // `MutableEpoch::range_query_overlap_into`.
         guard
             .current_epoch
-            .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            .range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
         for (win, label_id, payload) in &buf {
             // Filter to sketch-variant payloads only; precompute sids
             // (M2.3) are served via the precompute query path
@@ -409,7 +419,7 @@ impl SketchStore {
         buf.clear();
 
         for sealed in guard.sealed_epochs.values() {
-            sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
+            sealed.range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
                 if let Some(s) = payload.as_sketch() {
                     by_label_id
@@ -1445,7 +1455,15 @@ mod tests {
     }
 
     #[test]
-    fn range_query_clips_to_window_bounds() {
+    fn range_query_uses_overlap_not_containment() {
+        // The sketch read path uses HALF-OPEN OVERLAP, not containment:
+        // any pane intersecting `[start, end)` is returned so the reducer
+        // can establish a rolling base even when no pane is fully
+        // contained (the ~30s-pane case behind the live `[30s]` "No
+        // result" bug). Of `(0,10)`, `(10,20)`, `(20,30)` against `[5,25)`:
+        //  - `(0,10)`  overlaps  (10 > 5)            → included (straddles left edge)
+        //  - `(10,20)` overlaps                       → included
+        //  - `(20,30)` overlaps  (20 < 25)            → included (straddles right edge)
         let idx = SketchStore::new();
         idx.register(meta(13));
         let lv = BTreeMap::new();
@@ -1453,12 +1471,62 @@ mod tests {
         idx.append_sample(13, lv.clone(), (10, 20), sample(2));
         idx.append_sample(13, lv.clone(), (20, 30), sample(3));
 
-        // Only the middle window is fully within [5, 25].
         let series = idx.query_range(13, 5, 25);
         assert_eq!(series.len(), 1);
         let s = &series[0];
-        assert_eq!(s.samples.len(), 1);
+        assert_eq!(s.samples.len(), 3, "all three panes overlap [5,25)");
+        assert!(s.samples.contains_key(&10));
         assert!(s.samples.contains_key(&20));
+        assert!(s.samples.contains_key(&30));
+    }
+
+    #[test]
+    fn range_query_excludes_non_overlapping_panes() {
+        // Overlap must still EXCLUDE panes that don't intersect the
+        // window — a pane ending exactly at `start` (half-open: `w.1 >
+        // start` is false) and one starting at/after `end`.
+        let idx = SketchStore::new();
+        idx.register(meta(14));
+        let lv = BTreeMap::new();
+        idx.append_sample(14, lv.clone(), (0, 10), sample(1)); // ends at start=10 → excluded
+        idx.append_sample(14, lv.clone(), (10, 20), sample(2)); // overlaps → included
+        idx.append_sample(14, lv.clone(), (30, 40), sample(3)); // starts at end=30 → excluded
+
+        let series = idx.query_range(14, 10, 30);
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        assert_eq!(s.samples.len(), 1, "only the (10,20) pane overlaps [10,30)");
+        assert!(s.samples.contains_key(&20));
+    }
+
+    #[test]
+    fn range_query_short_window_straddling_pane_with_delta_carry_in() {
+        // Live gap 1: a `[30s]`-style window narrower than the agent's
+        // ~30s pane cadence. The freshest pane STRADDLES the window's left
+        // edge (starts before `start`, ends inside), so strict containment
+        // returned nothing → "No result". Overlap admits the straddling
+        // delta pane, and the carry-in splices the prior Full as its base.
+        let idx = SketchStore::new();
+        idx.register(meta(15));
+        let lv = BTreeMap::new();
+        // Full pane fully before the window.
+        idx.append_sample(15, lv.clone(), (260, 290), sample(1));
+        // Delta pane STRADDLING the window's left edge [300,330): starts
+        // at 295 (< 300), ends at 325 (inside). Containment excludes it
+        // (295 < 300); overlap includes it.
+        idx.append_sample(15, lv.clone(), (295, 325), delta_sample(2));
+
+        let series = idx.query_range(15, 300, 330);
+        assert_eq!(series.len(), 1, "straddling delta pane is now visible");
+        let s = &series[0];
+        assert!(
+            s.samples.contains_key(&325),
+            "straddling in-window delta (end=325) admitted by overlap"
+        );
+        assert!(
+            s.samples.contains_key(&290),
+            "prior Full (end=290) carried in as the delta's base"
+        );
     }
 
     fn delta_sample(b: u8) -> SketchSampleState {
