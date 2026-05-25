@@ -1589,8 +1589,8 @@ fn sketch_kind_to_asap_edge_family(kind: &SketchKind) -> &'static str {
 /// until the fused agent build is the default deployment.
 fn emit_edge_yaml_asap_edge(
     cfg: &EdgeStageConfig,
-    opamp_endpoint: &str,
-    agent_id: &str,
+    _opamp_endpoint: &str,
+    _agent_id: &str,
 ) -> Result<String> {
     use crate::sketch_algebra::params::SketchKind;
 
@@ -1940,21 +1940,22 @@ fn emit_edge_yaml_asap_edge(
         },
     );
 
-    // ── OpAMP extension ────────────────────────────────────────────────────
-    let opamp_ext: Value = serde_yaml::from_str(&format!(
-        "server:\n  ws:\n    endpoint: \"{opamp_endpoint}\"\n    headers:\n      X-Agent-ID: \"{agent_id}\"\nremote_config_path: /etc/otel/config.yaml\n"
-    ))
-    .context("parse opamp extension block (asap_edge)")?;
-
+    // ── No OpAMP extension (agent runs under the opamp-supervisor) ──────────
+    // The supervisor injects its OWN opamp extension (→ the supervisor's local
+    // OpAMP) + health_check and merges them with this remote config, loading
+    // the remote config LAST. An `opamp` block here would overwrite the
+    // supervisor's and make the collector dial the controller directly,
+    // breaking the supervisor's control channel. So emit no opamp extension;
+    // the supervisor owns the OpAMP identity (X-Agent-ID via its own config).
     let doc = CollectorYaml {
-        extensions: [("opamp".to_string(), opamp_ext)].into(),
+        extensions: BTreeMap::new(),
         receivers: [("otlp".to_string(), otlp_receiver)].into(),
         processors,
         // No routing connector in the fused shape.
         connectors: BTreeMap::new(),
         exporters,
         service: ServiceSection {
-            extensions: vec!["opamp".into()],
+            extensions: vec![],
             pipelines,
         },
     };
@@ -5520,8 +5521,13 @@ mod tests {
             "cumulativetodelta must include sum + counter-shaped sketch inputs\n{yaml}"
         );
 
-        // 7. OpAMP + exporter wired.
-        assert!(yaml.contains("ws://controller:4320/v1/opamp"), "{yaml}");
+        // 7. No OpAMP extension — the agent runs under the opamp-supervisor,
+        // which injects its own opamp extension (see emit_edge_yaml_asap_edge).
+        // The OTLP exporter is still wired.
+        assert!(
+            !yaml.contains("opamp"),
+            "fused emit must NOT carry an opamp extension (supervisor-managed)\n{yaml}"
+        );
         assert!(yaml.contains("otlp/backend:"), "{yaml}");
     }
 
