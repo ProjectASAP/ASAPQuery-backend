@@ -290,6 +290,59 @@ pub struct EdgeStageConfig {
     /// Empty map (default) ⇒ no metric carries sampling — backward-compat.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_sample_p: HashMap<String, f64>,
+    /// Cold-archive **wire format** the agent's `asapedgeprocessor` ships
+    /// its cold tier in. Two formats are merged in the agent:
+    ///
+    /// - [`ColdFormat::Fragment`] (default) — gorilla-XOR fragments, shipped
+    ///   to [`cold_ship_endpoint`](Self::cold_ship_endpoint) (`/ingest/gorilla`).
+    /// - [`ColdFormat::Intchunk`] — the lossless intchunk cold-part format,
+    ///   shipped to [`cold_coldpart_endpoint`](Self::cold_coldpart_endpoint)
+    ///   (`/ingest/coldpart`).
+    ///
+    /// The L5 edge emitter writes a `cold.format` + `cold.coldpart_endpoint`
+    /// pair onto the agent `cold:` block ONLY when this is
+    /// [`ColdFormat::Intchunk`]. [`ColdFormat::Fragment`] (the default)
+    /// emits NEITHER key, so the agent's cold block stays byte-identical to
+    /// the pre-format emit (`ship_endpoint` only) — no behavior change when
+    /// unset.
+    #[serde(default, skip_serializing_if = "ColdFormat::is_default")]
+    pub cold_format: ColdFormat,
+    /// Cold-archive intchunk ingest URL — the gorilla-merger's coldpart
+    /// HTTP ingest endpoint (`http://gorilla-merger:10908/ingest/coldpart`).
+    /// Only emitted (and only meaningful) when
+    /// [`cold_format`](Self::cold_format) is [`ColdFormat::Intchunk`].
+    ///
+    /// `None` ⇒ the emitter derives it from
+    /// [`cold_ship_endpoint`](Self::cold_ship_endpoint) by swapping the path
+    /// to `/ingest/coldpart` (same merger host:port as the fragment
+    /// endpoint), falling back to [`default_cold_coldpart_endpoint`] when
+    /// neither is set. Ignored entirely for [`ColdFormat::Fragment`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_coldpart_endpoint: Option<String>,
+}
+
+/// Cold-archive wire format the agent ships its cold tier in. See
+/// [`EdgeStageConfig::cold_format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColdFormat {
+    /// gorilla-XOR fragments → `cold.ship_endpoint` (`/ingest/gorilla`).
+    /// The default — emits NO `format:`/`coldpart_endpoint:` keys, so the
+    /// agent cold block is byte-identical to the pre-format emit.
+    #[default]
+    Fragment,
+    /// Lossless intchunk cold-part → `cold.coldpart_endpoint`
+    /// (`/ingest/coldpart`).
+    Intchunk,
+}
+
+impl ColdFormat {
+    /// `true` for the default ([`ColdFormat::Fragment`]). Drives the
+    /// `skip_serializing_if` on [`EdgeStageConfig::cold_format`] so an unset
+    /// format leaves the serialized config byte-identical to today.
+    pub fn is_default(&self) -> bool {
+        matches!(self, ColdFormat::Fragment)
+    }
 }
 
 /// Named default for [`EdgeStageConfig::cold_ship_endpoint`].
@@ -302,6 +355,30 @@ pub struct EdgeStageConfig {
 /// was wrong (wrong host, wrong port); this is the correct merger target.
 pub fn default_cold_ship_endpoint() -> String {
     "http://gorilla-merger:10908/ingest/gorilla".to_string()
+}
+
+/// Named default for [`EdgeStageConfig::cold_coldpart_endpoint`].
+///
+/// The intchunk cold-part tier ships to the SAME gorilla-merger host:port
+/// as the fragment tier, but on the `/ingest/coldpart` path (the fragment
+/// path is `/ingest/gorilla`). Single source of truth so the emitter and
+/// any construction site agree. Only consulted when
+/// [`EdgeStageConfig::cold_format`] is [`ColdFormat::Intchunk`].
+pub fn default_cold_coldpart_endpoint() -> String {
+    "http://gorilla-merger:10908/ingest/coldpart".to_string()
+}
+
+/// Derive a coldpart ingest URL from a fragment `ship_endpoint` by
+/// swapping the trailing `/ingest/gorilla` path for `/ingest/coldpart`
+/// (the merger host:port is shared between the two cold tiers). Falls back
+/// to [`default_cold_coldpart_endpoint`] when the input doesn't carry the
+/// expected fragment path, so a non-standard endpoint still yields a
+/// well-formed coldpart target rather than a malformed one.
+pub fn coldpart_endpoint_from_ship(ship_endpoint: &str) -> String {
+    match ship_endpoint.strip_suffix("/ingest/gorilla") {
+        Some(host) => format!("{host}/ingest/coldpart"),
+        None => default_cold_coldpart_endpoint(),
+    }
 }
 
 /// Named default for [`EdgeStageConfig::cold_external_labels`].
@@ -596,6 +673,12 @@ impl Emitter for ThreeStageEmitter {
             cold_ship_endpoint: Some(default_cold_ship_endpoint()),
             cold_external_labels: default_cold_external_labels(),
             metric_to_sample_p: HashMap::new(),
+            // Cold-archive format defaults to gorilla-XOR fragments; the
+            // intchunk format (and its coldpart endpoint) is opted into by
+            // a deploy-info-bearing layer post-emit (same pattern as the
+            // cold endpoint above), keeping this layer deployment-agnostic.
+            cold_format: ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         let mut backend_aggregations: Vec<BackendAggregation> = Vec::new();
         let mut gateway_processors: Vec<GatewayMergeProcessor> = Vec::new();

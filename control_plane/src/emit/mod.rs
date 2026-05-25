@@ -207,6 +207,49 @@ pub fn extend_edge_with_demo_plumbing(
             });
         }
     }
+
+    // 4. Cold-archive format opt-in. The colored-DAG L5 layer is
+    //    deployment-independent and can only populate the named default
+    //    (`Fragment`); this bootstrap/replan-scope helper is the first
+    //    place that holds deploy info (env), so it reads the operator's
+    //    `ASAP_COLD_FORMAT` knob (mirrors how `default_cold_external_labels`
+    //    reads `ASAP_CLUSTER`). `intchunk` ⇒ ship the lossless intchunk
+    //    cold-part format; anything else (incl. unset / `fragment`) leaves
+    //    the default gorilla-XOR fragment emit byte-identical.
+    apply_cold_format_from_env(edge_cfg);
+}
+
+/// Read the `ASAP_COLD_FORMAT` env knob and, when it is `intchunk`, flip
+/// `edge_cfg.cold_format` to [`ColdFormat::Intchunk`] and derive the
+/// `cold_coldpart_endpoint` from the cold ship endpoint (swapping the path
+/// to `/ingest/coldpart`) unless an explicit `ASAP_COLD_COLDPART_ENDPOINT`
+/// is supplied.
+///
+/// Any value other than `intchunk` (including unset, empty, or `fragment`)
+/// is a no-op — the default gorilla-XOR fragment emit stays byte-identical,
+/// so there is NO behavior change unless an operator deliberately opts in.
+fn apply_cold_format_from_env(edge_cfg: &mut EdgeStageConfig) {
+    use crate::physical::colored_dag::emitter::{
+        coldpart_endpoint_from_ship, default_cold_ship_endpoint, ColdFormat,
+    };
+    let fmt = std::env::var("ASAP_COLD_FORMAT").unwrap_or_default();
+    if !fmt.eq_ignore_ascii_case("intchunk") {
+        return;
+    }
+    edge_cfg.cold_format = ColdFormat::Intchunk;
+    // An explicit endpoint override wins; otherwise derive from the cold
+    // ship endpoint (same merger host:port, `/ingest/coldpart` path).
+    if let Ok(ep) = std::env::var("ASAP_COLD_COLDPART_ENDPOINT") {
+        if !ep.trim().is_empty() {
+            edge_cfg.cold_coldpart_endpoint = Some(ep);
+            return;
+        }
+    }
+    let ship = edge_cfg
+        .cold_ship_endpoint
+        .clone()
+        .unwrap_or_else(default_cold_ship_endpoint);
+    edge_cfg.cold_coldpart_endpoint = Some(coldpart_endpoint_from_ship(&ship));
 }
 
 // ── MVP §46: planner ↔ 5-sketch emitter stitching ──────────────────────────────
@@ -515,6 +558,71 @@ mod runtime_tests {
     }
 
     #[test]
+    fn cold_format_env_knob_opts_into_intchunk_and_derives_endpoint() {
+        // The operator-facing SET path: `ASAP_COLD_FORMAT=intchunk` flips
+        // the cold format to intchunk and derives the coldpart endpoint
+        // from the cold ship endpoint (same merger host:port,
+        // `/ingest/coldpart` path). Unset / `fragment` is a no-op.
+        use crate::physical::colored_dag::emitter::{
+            default_cold_ship_endpoint, ColdFormat,
+        };
+
+        fn fixture() -> EdgeStageConfig {
+            EdgeStageConfig {
+                source_metric: None,
+                label_filters: Vec::new(),
+                window_secs: None,
+                sketch_processors: Vec::new(),
+                exporter_target:
+                    crate::physical::colored_dag::emitter::ExportTarget::Stage(
+                        crate::physical::colored_dag::stage_id::StageId::Backend,
+                    ),
+                prometheus_archive_metrics: Vec::new(),
+                archive_tier_metrics: Vec::new(),
+                warm_passthrough_metrics: Vec::new(),
+                metric_to_family: std::collections::HashMap::new(),
+                metric_to_grouping_labels: std::collections::HashMap::new(),
+                cumulative_counter_metrics: Vec::new(),
+                cold_ship_endpoint: Some(default_cold_ship_endpoint()),
+                cold_external_labels: Vec::new(),
+                metric_to_sample_p: std::collections::HashMap::new(),
+                cold_format: ColdFormat::default(),
+                cold_coldpart_endpoint: None,
+            }
+        }
+
+        // Unset ⇒ no-op (default fragment, no derived endpoint).
+        {
+            let _env = crate::test_support::EnvVarGuard::unset("ASAP_COLD_FORMAT");
+            let mut cfg = fixture();
+            apply_cold_format_from_env(&mut cfg);
+            assert_eq!(cfg.cold_format, ColdFormat::Fragment);
+            assert!(cfg.cold_coldpart_endpoint.is_none());
+        }
+
+        // `fragment` ⇒ no-op too.
+        {
+            let _env = crate::test_support::EnvVarGuard::set("ASAP_COLD_FORMAT", "fragment");
+            let mut cfg = fixture();
+            apply_cold_format_from_env(&mut cfg);
+            assert_eq!(cfg.cold_format, ColdFormat::Fragment);
+            assert!(cfg.cold_coldpart_endpoint.is_none());
+        }
+
+        // `intchunk` ⇒ flip + derive coldpart endpoint from ship endpoint.
+        {
+            let _env = crate::test_support::EnvVarGuard::set("ASAP_COLD_FORMAT", "intchunk");
+            let mut cfg = fixture();
+            apply_cold_format_from_env(&mut cfg);
+            assert_eq!(cfg.cold_format, ColdFormat::Intchunk);
+            assert_eq!(
+                cfg.cold_coldpart_endpoint.as_deref(),
+                Some("http://gorilla-merger:10908/ingest/coldpart"),
+            );
+        }
+    }
+
+    #[test]
     fn emit_for_runtime_default_matches_emit_edge_yaml() {
         // Serialize against the env-mutating tests in `stage_config`:
         // `emit_edge_yaml` reads `ASAP_EDGE_FUSED` and must observe the
@@ -545,6 +653,8 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
 
         let collector = emit_for_runtime(
@@ -583,6 +693,8 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         let yaml = emit_for_runtime(
             AgentRuntime::AsapOtap,
@@ -619,6 +731,8 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         let toml = emit_for_runtime(
             AgentRuntime::AsapTelegraf,
@@ -958,6 +1072,8 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
 

@@ -320,6 +320,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -339,6 +341,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -362,6 +366,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         }
     }
 
@@ -517,6 +523,8 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
         };
         let toml = emit_telegraf_toml(&cfg, None).expect("emit ok");
         assert!(toml.contains("k = 200"), "k not propagated\n{toml}");
