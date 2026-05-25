@@ -2,3 +2,8 @@
 /data/
 /gorilla-merger
 *.test
+
+# Local-only go workspace used during development to point the asap-gorilla-go
+# replace at a specific intchunk-containing checkout; never committed.
+/go.work
+/go.work.sum

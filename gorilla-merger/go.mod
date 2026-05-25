@@ -232,6 +232,20 @@ require (
 // standalone private module (github.com/ProjectASAP/asap-gorilla-go). Building
 // requires GOPRIVATE=github.com/ProjectASAP/* + git auth to fetch it.
 //
+// The cold value-chunk codec used by the decode-on-read helper
+// (internal/coldchunk) lives in the asap-gorilla-go/intchunk SUBPACKAGE, which
+// the published tag predates. To compile against intchunk WITHOUT cutting a new
+// release we point asap-gorilla-go at the in-repo monorepo checkout via a local
+// `replace`. The relative path mirrors the data_plane crate's sibling path-deps
+// (`../../ASAPCollector/...`): clone ASAPCollector next to ASAPQuery-backend so
+// `<repo>/gorilla-merger/../../ASAPCollector/asap-gorilla-go` resolves. The
+// container build supplies that same checkout as a BuildKit build-context and
+// rewrites this replace to the in-image path (see Dockerfile + run_demo.sh), so
+// the merger image always compiles against the intchunk-containing
+// asap-gorilla-go. intchunk only pulls in prometheus/tsdb/chunkenc (already a
+// merger dependency), so no new module is added to the graph.
+replace github.com/ProjectASAP/asap-gorilla-go => ../../ASAPCollector/asap-gorilla-go
+
 // Thanos v0.41.0 declares these replace directives in its own go.mod. Go does
 // NOT inherit a dependency's replace directives into the main module, so MVS
 // otherwise picks upstream versions whose APIs differ from what Thanos v0.41.0
