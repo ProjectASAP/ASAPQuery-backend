@@ -1175,8 +1175,8 @@ store with the Kafka consumer path.
 
 - **E2E coverage**: end-to-end paths now run through the OTLP receiver
   driving the same `IngestState` (`tests/e2e_modified_otlp_sketch_path.rs`,
-  `tests/edge_runtime_consumes_precompute_rs.rs`, demo runs in
-  `asap-quickstart/`). The legacy in-process remote-write E2E binaries
+  `tests/edge_runtime_consumes_precompute_rs.rs`; the runnable demo
+  lives in ASAPCollector). The legacy in-process remote-write E2E binaries
   (`bin/test_e2e_precompute.rs`, `bin/e2e_quickstart_resource_test.rs`,
   `bin/bench_precompute_sketch.rs`) and the equivalent test
   (`tests/e2e_precompute_equivalence.rs`) were removed when the
