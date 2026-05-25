@@ -1681,6 +1681,55 @@ fn emit_edge_yaml_asap_edge(
 
     let mut metric_entries: Vec<Value> = Vec::new();
 
+    // ── Per-metric storage tier (issue #46 follow-up; companion to the
+    // ASAPCollector asapedgeprocessor `tier` field) ─────────────────────────
+    //
+    // Each emitted `metrics[]` entry carries a `tier` ∈ {warm, both, cold}
+    // telling the fused agent which storage tiers to feed the metric into:
+    //
+    //   * `warm` — warm sketch/aggregation ONLY; the metric is NOT
+    //              cold-archived by the agent's Gorilla encoder.
+    //   * `both` — warm sketch/agg AND cold gorilla archive.
+    //   * `cold` — cold gorilla archive ONLY; no warm sketch/agg.
+    //
+    // We DERIVE the tier from the SAME plan routing the rest of this emit
+    // reads — no hardcoded metric→tier table — so it generalises to any
+    // workload:
+    //
+    //   * "warm" signal — the metric produces a warm entry below (a
+    //     Sum-by aggregate from `cumulative_counter_metrics` +
+    //     `metric_to_grouping_labels`, or a sketch family from
+    //     `metric_to_family`). This is exactly the routing that lands a
+    //     metric in the warm sketch/agg tier.
+    //   * "cold" signal — the metric is in `archive_tier_metrics`, the
+    //     plan's archive-routing decision (an exact / archive query forces
+    //     the Gorilla object-store archive; the routing that the legacy
+    //     `gorillas3` processor consumed).
+    //
+    // tier = both when a metric has BOTH signals (e.g. `http_requests_total`
+    // — warm `sum by (zone)` AND an exact `count(...)` archive query), warm
+    // when only the warm signal is present (the sketch-only quantile / HLL /
+    // topk / rate metrics), cold when only the archive signal is present.
+    // When neither is determinable the metric defaults to `both` (safe —
+    // preserves archival), matching the processor's unset-tier default.
+    let cold_set: std::collections::BTreeSet<&str> = cfg
+        .archive_tier_metrics
+        .iter()
+        .map(|a| a.metric.as_str())
+        .collect();
+    let tier_for = |metric: &str, warm: bool| -> &'static str {
+        let cold = cold_set.contains(metric);
+        match (warm, cold) {
+            (true, true) => "both",
+            (true, false) => "warm",
+            (false, true) => "cold",
+            // No routing signal at all — default to `both` so the agent
+            // keeps archiving (preserves data); the processor treats an
+            // unset tier the same way.
+            (false, false) => "both",
+        }
+    };
+
     // Sum-family entries — same predicate as ASAPCollector#403's
     // edge-aggregate selection: Sum-role metric WITH grouping labels and
     // NOT mapped to a sketch family.
@@ -1705,6 +1754,11 @@ fn emit_edge_yaml_asap_edge(
         e.insert("family".into(), Value::String("sum".to_string()));
         let by: Vec<Value> = labels.into_iter().map(Value::String).collect();
         e.insert("aggregate_by".into(), Value::Sequence(by));
+        // Sum aggregate IS a warm entry → warm signal = true.
+        e.insert(
+            "tier".into(),
+            Value::String(tier_for(metric, true).to_string()),
+        );
         metric_entries.push(Value::Mapping(e));
     }
 
@@ -1776,6 +1830,11 @@ fn emit_edge_yaml_asap_edge(
                     }
                 }
             }
+            // Sketch family IS a warm entry → warm signal = true.
+            e.insert(
+                "tier".into(),
+                Value::String(tier_for(metric, true).to_string()),
+            );
             metric_entries.push(Value::Mapping(e));
         }
     }
@@ -5351,6 +5410,15 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert_eq!(by, vec!["zone".to_string()], "sum aggregate_by\n{yaml}");
+        // tier=both: `http_requests_total` is in `archive_tier_metrics`
+        // (the exact `count(...)` archive query) AND has a warm sum-by
+        // aggregate, so the agent must feed BOTH the warm sum and the
+        // cold gorilla archive.
+        assert_eq!(
+            sum_e.get("tier").and_then(|v| v.as_str()),
+            Some("both"),
+            "archive + warm metric must emit tier=both\n{yaml}"
+        );
 
         // Sketch entries + params.
         let dd = entry_for("http_requests_total_latency_ms");
@@ -5375,6 +5443,24 @@ mod tests {
         );
         assert_eq!(cms.get("rows").and_then(|v| v.as_u64()), Some(5));
         assert_eq!(cms.get("cols").and_then(|v| v.as_u64()), Some(2048));
+
+        // tier=warm: the five sketch-only metrics are NOT in
+        // `archive_tier_metrics` (no exact/archive query), so the agent
+        // builds their warm sketch ONLY and does NOT cold-archive them —
+        // exactly the bandwidth win this contract buys.
+        for sketch_only in [
+            "http_requests_total_latency_ms",
+            "request_size_bytes",
+            "unique_users_per_min",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+        ] {
+            assert_eq!(
+                entry_for(sketch_only).get("tier").and_then(|v| v.as_str()),
+                Some("warm"),
+                "sketch-only metric {sketch_only} must emit tier=warm\n{yaml}"
+            );
+        }
 
         // 5. cold: block present + enabled. The ship_endpoint and
         // external label come from the THREADED `EdgeStageConfig` cold
@@ -5437,6 +5523,79 @@ mod tests {
         // 7. OpAMP + exporter wired.
         assert!(yaml.contains("ws://controller:4320/v1/opamp"), "{yaml}");
         assert!(yaml.contains("otlp/backend:"), "{yaml}");
+    }
+
+    #[test]
+    fn fused_asap_edge_tier_derives_from_archive_routing() {
+        // Focused regression for the per-metric `tier` contract (companion
+        // to the ASAPCollector asapedgeprocessor `tier` field). The tier is
+        // DERIVED from the plan routing already on `EdgeStageConfig`:
+        //   * warm signal  — the metric has a warm entry (sketch family in
+        //     `metric_to_family` or Sum-by aggregate).
+        //   * cold signal  — the metric is in `archive_tier_metrics` (the
+        //     plan's exact/archive routing decision).
+        // tier = both (warm+cold), warm (warm only), defaulting to both
+        // when no signal is present.
+        //
+        // `ASAP_EDGE_FUSED` is process-global; set it under the crate-wide
+        // env lock (the #318 shared harness) so a parallel thread can't
+        // observe this test's setenv as its own input.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        // Two metrics: a sketch-only one (warm) and one that is BOTH
+        // sketched AND archived (both). The archive set is the precise
+        // plan signal — only `archived_metric` is in it.
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert("sketch_only_metric".into(), [SketchKind::Kll].into());
+        metric_to_family.insert("archived_metric".into(), [SketchKind::DDSketch].into());
+
+        let cfg = EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: Vec::new(),
+            exporter_target: ExportTarget::Endpoint("backend:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: vec![ArchiveTierMetric {
+                metric: "archived_metric".into(),
+                window_secs: Some(60),
+            }],
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+        };
+
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse");
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|a| a.get("metrics"))
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        let tier_of = |name: &str| -> Option<String> {
+            metrics
+                .iter()
+                .find(|e| e.get("metric").and_then(|m| m.as_str()) == Some(name))
+                .and_then(|e| e.get("tier"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+
+        assert_eq!(
+            tier_of("sketch_only_metric").as_deref(),
+            Some("warm"),
+            "sketch-only (warm signal, no archive routing) must be tier=warm\n{yaml}"
+        );
+        assert_eq!(
+            tier_of("archived_metric").as_deref(),
+            Some("both"),
+            "sketched + archived metric must be tier=both\n{yaml}"
+        );
     }
 
     #[test]
