@@ -95,7 +95,6 @@ ASAPQuery-backend/                 # Cargo workspace
 │       ├── physical/                # physical plan (colored_dag/)
 │       ├── emit/                    # per-runtime config emission
 │       └── opamp/                   # OpAMP server — pushes plans to runtimes
-├── benchmarks/                    # Benchmarks
 └── docs/                          # Design docs
 ```
 

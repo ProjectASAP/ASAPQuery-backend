@@ -181,9 +181,10 @@ Follow-ups (not paper-blocking):
   grouping + regex is ~200 LOC when needed.
 - **Latency target.** Paper claim is ≤2× P99 vs. warm-hot —
   unverified until the multi-agent harness lands (blocker #6
-  of `DataCollector/TODO.md`). The three-way query harness in
-  [#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66)
-  (`benchmarks/run_full_eval.sh`) is the runner that will produce
+  of `DataCollector/TODO.md`). The old three-way query harness
+  ([#66](https://github.com/ProjectASAP/ASAPQuery-backend/pull/66))
+  targeted the deprecated Arroyo/Kafka stack and has been removed; a
+  runner for the current OTLP architecture is still needed to produce
   this number.
 - ~~`data_plane` `main.rs` wiring of `ASAP_COLD_STORE_ROOT`~~
   **done (P1, 2026-04-30).** `--cold-store-root` flag with

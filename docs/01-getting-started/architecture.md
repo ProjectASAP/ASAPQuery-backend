@@ -252,9 +252,7 @@ ASAPQuery-backend/                 # Cargo workspace
 ├── control_plane/                 # In-repo control plane / planner (binary)
 │   └── src/                         # query_parser, intent_algebra, sketch_algebra,
 │                                    #   optimizer, physical, emit, opamp
-├── benchmarks/                    # Benchmarks
 └── docs/                          # Developer documentation (this)
     ├── 01-getting-started/
-    ├── 02-components/
     └── 03-how-to-guides/
 ```
