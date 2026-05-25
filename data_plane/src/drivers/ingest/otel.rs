@@ -36,6 +36,7 @@ use asap_otel_proto::tonic::collector::metrics::v1::{
 use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
 use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
+use asap_sketchlib::MessagePackCodec;
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
 use flate2::read::GzDecoder;
 use prost::Message;
@@ -1631,8 +1632,8 @@ fn sketch_kind_handle_for(
             // decode AND the heap is non-empty; otherwise stay with
             // vanilla `CountSketch`.
             if dp.encoding == ENCODING_MSGPACK {
-                use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
-                if let Ok(cms) = CountMinSketchWithHeap::deserialize_msgpack(&dp.sketch) {
+                use asap_sketchlib::CountMinSketchWithHeap;
+                if let Ok(cms) = CountMinSketchWithHeap::from_msgpack(&dp.sketch) {
                     if !cms.topk_heap_items().is_empty() {
                         return SketchKindHandle::CountSketchWithHeap;
                     }
@@ -1649,8 +1650,8 @@ fn sketch_kind_handle_for(
             // CmsWithHeap so ASAP-tier `topk` can read the heap.
             // Otherwise stay with vanilla `CountMin`.
             if dp.encoding == ENCODING_MSGPACK {
-                use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
-                if let Ok(cms) = CountMinSketchWithHeap::deserialize_msgpack(&dp.sketch) {
+                use asap_sketchlib::CountMinSketchWithHeap;
+                if let Ok(cms) = CountMinSketchWithHeap::from_msgpack(&dp.sketch) {
                     if !cms.topk_heap_items().is_empty() {
                         return SketchKindHandle::CmsWithHeap;
                     }
@@ -2549,8 +2550,8 @@ mod dispatcher_tests {
     use super::*;
     use crate::storage_engines::types::AggregateCore;
     use crate::precompute_engine::operators::{DDSketchAccumulator, HllSketchAccumulator};
-    use asap_sketchlib::sketches::ddsketch::DdSketch;
-    use asap_sketchlib::sketches::hll::HllVariant;
+    use asap_sketchlib::DdSketch;
+    use asap_sketchlib::HllVariant;
 
     #[test]
     fn apply_modified_otlp_delta_bytes_ddsketch_round_trip() {

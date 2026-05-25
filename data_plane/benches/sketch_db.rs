@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use asap_sketchlib::sketches::ddsketch::DdSketch;
-use asap_sketchlib::sketches::hll::{HllSketch, HllVariant};
+use asap_sketchlib::DdSketch;
+use asap_sketchlib::{HllSketch, HllVariant};
 use asap_sketchlib::proto::sketchlib::{
     sketch_envelope, DdSketchState, HllVariant as ProtoVariant, HyperLogLogState, KllState,
     SketchEnvelope,
@@ -91,6 +91,7 @@ fn encode_hll(distinct_items: usize, precision: u32) -> Vec<u8> {
         hip_kxq0: sk.hip_kxq0,
         hip_kxq1: sk.hip_kxq1,
         hip_est: sk.hip_est,
+        registers_sparse: None,
     };
     SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Hll(state)),

@@ -1,4 +1,4 @@
-//! DDSketch accumulator — wraps `asap_sketchlib::sketches::ddsketch::DdSketch`.
+//! DDSketch accumulator — wraps `asap_sketchlib::DdSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = DDSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,7 +12,7 @@
 //! works end-to-end without that richer query surface.
 
 use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::sketches::ddsketch::{DdSketch, DdSketchDelta};
+use asap_sketchlib::{DdSketch, DdSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -36,7 +36,7 @@ impl DDSketchAccumulator {
     /// `DdSketch` struct — PR I parity entrypoint.
     pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: DdSketch::deserialize_msgpack(buffer)
+            inner: DdSketch::from_msgpack(buffer)
                 .map_err(|e| format!("deserialize DdSketch msgpack: {e}"))?,
         })
     }
@@ -142,7 +142,7 @@ impl SerializableToSink for DDSketchAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_from_msgpack_bytes_round_trip() {
         let original = DdSketch::from_raw(0.01, vec![5, 10, 15, 20], -2, 50, 150.0, 0.25, 8.0);
-        let bytes = original.serialize_msgpack().unwrap();
+        let bytes = original.to_msgpack().unwrap();
         let acc = DDSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.alpha, 0.01);
         assert_eq!(acc.inner.store_counts, vec![5, 10, 15, 20]);

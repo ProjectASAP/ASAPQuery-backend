@@ -2,14 +2,14 @@ use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
 };
-use asap_sketchlib::sketches::countminsketch_topk::{CmsHeapItem, CountMinSketchWithHeap};
+use asap_sketchlib::{CmsHeapItem, CountMinSketchWithHeap, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// Count-Min Sketch with Heap accumulator — wraps `asap_sketchlib::sketches::CountMinSketchWithHeap`.
-/// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches::countminsketch_topk`.
+/// Count-Min Sketch with Heap accumulator — wraps `asap_sketchlib::CountMinSketchWithHeap`.
+/// Core struct, update/merge/serde logic live in `asap_sketchlib::message_pack_format::portable::countminsketch_topk`.
 /// This file retains QE-specific trait impls, legacy deserializers, and JSON output.
 #[derive(Debug, Clone)]
 pub struct CountMinSketchWithHeapAccumulator {
@@ -17,7 +17,7 @@ pub struct CountMinSketchWithHeapAccumulator {
 }
 
 // Re-export HeapItem so existing code using CountMinSketchWithHeapAccumulator::HeapItem still works.
-pub use asap_sketchlib::sketches::countminsketch_topk::CmsHeapItem as HeapItemReexport;
+pub use asap_sketchlib::CmsHeapItem as HeapItemReexport;
 
 impl CountMinSketchWithHeapAccumulator {
     pub fn new(row_num: usize, col_num: usize, heap_size: usize) -> Self {
@@ -123,7 +123,7 @@ impl SerializableToSink for CountMinSketchWithHeapAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 

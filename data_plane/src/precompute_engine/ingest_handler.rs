@@ -172,7 +172,7 @@ mod tests {
         use crate::drivers::ingest::otel::{apply_modified_otlp_delta_bytes, SketchKind};
         use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
-        use asap_sketchlib::sketches::ddsketch::DdSketch;
+        use asap_sketchlib::DdSketch;
         use prost::Message;
 
         const ENCODING_PROTO_DELTA: i32 = 2;

@@ -1,4 +1,4 @@
-//! HLL accumulator — wraps `asap_sketchlib::sketches::hll::HllSketch`.
+//! HLL accumulator — wraps `asap_sketchlib::HllSketch`.
 //!
 //! Concrete accumulator reached from the modified-OTLP
 //! `Metric.data = HLLSketch{…}` hot path (PR C-CountSketch follow-up).
@@ -12,7 +12,7 @@
 //! store round-trip works end-to-end without that richer query surface.
 
 use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::sketches::hll::{HllSketch, HllSketchDelta, HllVariant};
+use asap_sketchlib::{HllSketch, HllSketchDelta, HllVariant, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -36,7 +36,7 @@ impl HllSketchAccumulator {
     /// `HllSketch` struct — PR I parity entrypoint.
     pub fn from_msgpack_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            inner: HllSketch::deserialize_msgpack(buffer)
+            inner: HllSketch::from_msgpack(buffer)
                 .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?,
         })
     }
@@ -152,7 +152,7 @@ impl SerializableToSink for HllSketchAccumulator {
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 
@@ -234,7 +234,7 @@ impl AggregateCore for HllSketchAccumulator {
 /// (linear-counting) and large-range (32-bit space) corrections
 /// from the original Flajolet et al. paper.
 ///
-/// Inlined here rather than added as a method on `asap_sketchlib::sketches::HllSketch`
+/// Inlined here rather than added as a method on `asap_sketchlib::HllSketch`
 /// because the existing `asap_sketchlib::asap` types only expose merge /
 /// serialize today; adding a query method there would force a
 /// cross-crate change.
@@ -296,6 +296,7 @@ mod tests {
             hip_kxq0,
             hip_kxq1,
             hip_est,
+            registers_sparse: None,
         };
         state.encode_to_vec()
     }
@@ -352,6 +353,7 @@ mod tests {
             hip_kxq0: 0.0,
             hip_kxq1: 0.0,
             hip_est: 0.0,
+            registers_sparse: None,
         };
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
@@ -441,7 +443,7 @@ mod tests {
             2.5,
             42.0,
         );
-        let bytes = original.serialize_msgpack().unwrap();
+        let bytes = original.to_msgpack().unwrap();
         let acc = HllSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.variant, HllVariant::Hip);
         assert_eq!(acc.inner.precision, 3);

@@ -104,8 +104,8 @@ pub fn unwrap_envelope_state(
 /// Result of [`reconstruct_via_runtime`] — backend uses the inner
 /// `asap_sketchlib::sketches::*` to construct its own accumulator.
 pub enum ReconstructedSketch {
-    /// Reconstructed [`asap_sketchlib::sketches::DdSketch`] state.
-    DdSketch(asap_sketchlib::sketches::ddsketch::DdSketch),
+    /// Reconstructed [`asap_sketchlib::DdSketch`] state.
+    DdSketch(asap_sketchlib::DdSketch),
     /// Reconstructed KLL — asap-precompute-rs's [`KLLWrapper`] owns
     /// the high-throughput `asap_sketchlib::sketches::kll::KLL<f64>`
     /// internally; backend's KLL accumulator wraps the wire-format-
@@ -203,12 +203,12 @@ pub fn reconstruct_via_runtime(
     }
 }
 
-/// Snapshot a backend-side `asap_sketchlib::sketches::DdSketch` through
+/// Snapshot a backend-side `asap_sketchlib::DdSketch` through
 /// asap-precompute-rs's `Sketch` trait — the canonical encode path
 /// shared with the agent runtime. Used by the round-trip test
 /// (`tests/edge_runtime_adapter.rs`).
 pub fn snapshot_ddsketch_via_runtime(
-    sk: &asap_sketchlib::sketches::ddsketch::DdSketch,
+    sk: &asap_sketchlib::DdSketch,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut wrapper = DDSketchWrapper::new(sk.alpha);
     // Bridge into the wrapper by merging in the existing sketch.
@@ -238,7 +238,7 @@ pub fn snapshot_ddsketch_via_runtime(
 /// `asap_sketchlib::proto::sketchlib::*` types. Lives here so the
 /// backend's existing accumulators don't need to import the wrapper
 /// internals.
-pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::sketches::ddsketch::DdSketch) -> Vec<u8> {
+pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
     use asap_sketchlib::proto::sketchlib::{
         sketch_envelope, DdSketchState, SketchEnvelope as ProtoEnvelope,
     };
@@ -271,15 +271,15 @@ pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::sketches::ddsketch::DdSketc
 
 /// Merge two `DdSketch` instances by routing through asap-precompute-rs's
 /// runtime `Sketch::merge`. The result is byte-identical to
-/// `asap_sketchlib::sketches::DdSketch::merge_refs(&[a, b])` because
+/// `asap_sketchlib::DdSketch::merge_refs(&[a, b])` because
 /// both paths call the same underlying merge logic.
 ///
 /// Used by the cross-runtime parity test
 /// (`tests/edge_runtime_adapter.rs::ddsketch_merge_via_runtime_matches_native`).
 pub fn merge_ddsketches_via_runtime(
-    a: &asap_sketchlib::sketches::ddsketch::DdSketch,
-    b: &asap_sketchlib::sketches::ddsketch::DdSketch,
-) -> Result<asap_sketchlib::sketches::ddsketch::DdSketch, Box<dyn std::error::Error>> {
+    a: &asap_sketchlib::DdSketch,
+    b: &asap_sketchlib::DdSketch,
+) -> Result<asap_sketchlib::DdSketch, Box<dyn std::error::Error>> {
     if (a.alpha - b.alpha).abs() > f64::EPSILON {
         return Err(format!(
             "merge_ddsketches_via_runtime: alpha mismatch ({} vs {})",
@@ -335,7 +335,7 @@ mod tests {
 
     /// asap-precompute-rs's wrapper produces an envelope; the runtime
     /// adapter's reconstruction returns a backend-shaped
-    /// `asap_sketchlib::sketches::DdSketch` whose serialized bytes
+    /// `asap_sketchlib::DdSketch` whose serialized bytes
     /// (re-encoded through the same envelope shape) match the
     /// original.
     #[test]

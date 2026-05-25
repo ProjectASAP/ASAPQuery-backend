@@ -53,6 +53,7 @@ use asap_sketchlib::proto::sketchlib::{
     CountMinState, CountSketchState, CounterType, DdSketchState, HllVariant as ProtoHllVariant,
     HyperLogLogState, KllState,
 };
+use asap_sketchlib::MessagePackCodec;
 use control_plane::types::SketchType;
 use prost::Message;
 
@@ -428,6 +429,9 @@ fn build_kll_state(k: u32, items: Vec<f64>) -> KllState {
         levels: Vec::new(),
         items,
         coin: None,
+        offset: 0.0,
+        value_scale: 0,
+        residuals: Vec::new(),
     }
 }
 
@@ -493,6 +497,7 @@ fn build_hll_state(precision: u32, registers: Vec<u8>) -> HyperLogLogState {
         hip_kxq0: 0.0,
         hip_kxq1: 0.0,
         hip_est: 0.0,
+        registers_sparse: None,
     }
 }
 
@@ -1470,14 +1475,14 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
 /// with the supplied `(key, count)` pairs. Returns the bytes ready
 /// for the OTLP DP's `sketch` field with `encoding=MSGPACK`.
 fn build_heap_bearing_msgpack(rows: usize, cols: usize, top_k: usize, items: &[(&str, u64)]) -> Vec<u8> {
-    use asap_sketchlib::sketches::countminsketch_topk::CountMinSketchWithHeap;
+    use asap_sketchlib::CountMinSketchWithHeap;
     let mut cms = CountMinSketchWithHeap::new(rows, cols, top_k);
     for (key, count) in items {
         for _ in 0..*count {
             cms.update(key, 1.0);
         }
     }
-    cms.serialize_msgpack()
+    cms.to_msgpack()
         .expect("CountMinSketchWithHeap::serialize_msgpack should not fail")
 }
 

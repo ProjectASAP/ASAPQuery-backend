@@ -5,13 +5,13 @@ use crate::{
     },
     KeyByLabelValues,
 };
-use asap_sketchlib::sketches::hydra_kll::HydraKllSketch;
+use asap_sketchlib::{HydraKllSketch, MessagePackCodec};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
 
-/// HydraKLL sketch accumulator — wraps asap_sketchlib::sketches::HydraKllSketch.
+/// HydraKLL sketch accumulator — wraps asap_sketchlib::HydraKllSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
 /// This file retains QE-specific trait impls and JSON output.
 #[derive(Debug, Clone)]
@@ -43,13 +43,13 @@ impl HydraKllSketchAccumulator {
 impl SerializableToSink for HydraKllSketchAccumulator {
     fn serialize_to_json(&self) -> serde_json::Value {
         // Mirror Python implementation: {"sketch": base64_encoded_string}
-        let sketch_bytes = self.inner.serialize_msgpack().unwrap_or_default();
+        let sketch_bytes = self.inner.to_msgpack().unwrap_or_default();
         let sketch_b64 = general_purpose::STANDARD.encode(&sketch_bytes);
         serde_json::json!({ "sketch": sketch_b64 })
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        self.inner.serialize_msgpack().unwrap_or_default()
+        self.inner.to_msgpack().unwrap_or_default()
     }
 }
 
