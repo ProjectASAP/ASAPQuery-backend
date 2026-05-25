@@ -341,6 +341,59 @@ impl<P> MutableEpoch<P> {
         SealedEpoch::from_mutable(self)
     }
 
+    /// Drop every entry whose window-END is at or before `cutoff_end`,
+    /// returning the number of distinct windows evicted.
+    ///
+    /// This is the in-memory retention primitive for the WARM sketch
+    /// store: it bounds `current_epoch` to a recent time horizon so its
+    /// memory is `O(active_series × horizon)` rather than
+    /// `O(active_series × total_elapsed_time)`. It does NOT require
+    /// sealing — unsealed recent windows stay queryable (the read path
+    /// scans `current_epoch` directly), which is the explicit design
+    /// intent. Older data lives in the cold/raw tier.
+    ///
+    /// Uses window-END (`w.1 <= cutoff_end`) rather than window-START so
+    /// a half-open pane that straddles the cutoff is RETAINED until it is
+    /// fully behind the horizon — the read path's overlap scan and the
+    /// delta-stitching carry-in (`collect_ending_at_or_before`) can still
+    /// see it. Callers pick `cutoff_end = newest_end - horizon`, so
+    /// anything kept is within `horizon` of the freshest window.
+    ///
+    /// O(N) — rebuilds the three columns in one pass, same shape as
+    /// [`Self::remove_windows`].
+    pub fn evict_window_ends_before(&mut self, cutoff_end: u64) -> usize {
+        // O(1) skip: nothing is old enough to evict.
+        match self.min_start {
+            // Cheapest guard: if the earliest window-START is already
+            // past the cutoff, no window can END at/before it either.
+            Some(min_s) if min_s > cutoff_end => return 0,
+            None => return 0,
+            _ => {}
+        }
+        let old_windows = std::mem::take(&mut self.windows_col);
+        let old_ids = std::mem::take(&mut self.label_ids_col);
+        let old_payloads = std::mem::take(&mut self.payloads_col);
+        let prev_distinct = self.windows_set.len();
+        self.windows_set.clear();
+        for ((w, id), p) in old_windows.into_iter().zip(old_ids).zip(old_payloads) {
+            if w.1 <= cutoff_end {
+                continue;
+            }
+            self.windows_set.insert(w);
+            self.windows_col.push(w);
+            self.label_ids_col.push(id);
+            self.payloads_col.push(p);
+        }
+        let dropped = prev_distinct.saturating_sub(self.windows_set.len());
+        if dropped > 0 {
+            self.window_to_ids = None;
+            self.last_window = None;
+            self.min_start = self.windows_col.iter().map(|w| w.0).min();
+            self.max_end = self.windows_col.iter().map(|w| w.1).max();
+        }
+        dropped
+    }
+
     /// Remove all entries whose window is in `windows`.
     /// Mirrors the legacy `SketchStore` CircularBuffer
     /// cleanup contract. O(N) — rebuilds columns in one pass.
@@ -670,6 +723,47 @@ pub struct SidStoreData<K: Eq + std::hash::Hash + Clone, P> {
     pub current_epoch_id: EpochId,
     pub epoch_capacity: Option<usize>,
     pub max_epochs: usize,
+    /// In-memory WARM retention horizon, in milliseconds. On each
+    /// insert, windows whose END is older than `newest_end - horizon`
+    /// are evicted from `current_epoch` (and from any `sealed_epochs`),
+    /// bounding per-sid memory to `O(horizon)` instead of growing with
+    /// total elapsed time. `None` disables retention (legacy/unbounded
+    /// behavior — used by tests that want full history).
+    ///
+    /// Defaults from [`default_retention_horizon_ms`] which reads the
+    /// `ASAP_SKETCH_RETENTION_MS` env once. The horizon is deliberately
+    /// larger than the max query window (~30m) plus the delta-stitching
+    /// carry-in reach, so recent range/instant queries never lose a
+    /// window or its Full base. See `evict_window_ends_before`.
+    pub retention_horizon_ms: Option<u64>,
+}
+
+/// Default in-memory retention horizon (ms) for the WARM sketch store.
+/// 2 hours — comfortably exceeds the ~30m max range-query window plus
+/// the delta-stitching carry-in's Full-base reach, so bounding memory
+/// to this horizon cannot regress the recent-window read path. Older
+/// data is served from the cold/raw tier.
+pub const DEFAULT_SKETCH_RETENTION_MS: u64 = 2 * 60 * 60 * 1000;
+
+/// Resolve the WARM retention horizon once from the
+/// `ASAP_SKETCH_RETENTION_MS` env var, caching the result for the life
+/// of the process (read off the per-insert hot path). Falls back to
+/// [`DEFAULT_SKETCH_RETENTION_MS`] when unset or unparseable. A value of
+/// `0` explicitly DISABLES retention (returns `None`) for operators who
+/// need full in-memory history (and accept the unbounded growth).
+pub fn default_retention_horizon_ms() -> Option<u64> {
+    use std::sync::OnceLock;
+    static HORIZON: OnceLock<Option<u64>> = OnceLock::new();
+    *HORIZON.get_or_init(|| {
+        match std::env::var("ASAP_SKETCH_RETENTION_MS") {
+            Ok(v) => match v.trim().parse::<u64>() {
+                Ok(0) => None,
+                Ok(ms) => Some(ms),
+                Err(_) => Some(DEFAULT_SKETCH_RETENTION_MS),
+            },
+            Err(_) => Some(DEFAULT_SKETCH_RETENTION_MS),
+        }
+    })
 }
 
 impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
@@ -681,16 +775,65 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
             current_epoch_id: 0,
             epoch_capacity: None,
             max_epochs: 4,
+            retention_horizon_ms: default_retention_horizon_ms(),
         }
     }
 
     /// Insert a labeled payload for a specific time window. Caller has
     /// already canonicalized the label-values key (e.g. sorted). Hot
-    /// path: amortized O(1) per the optimizations above.
+    /// path: amortized O(1) per the optimizations above, plus a bounded
+    /// retention sweep when the freshest window advances the horizon.
     pub fn insert(&mut self, window: TimestampRange, label_key: K, payload: P) {
         let label_id = self.intern.intern(label_key);
         self.current_epoch.insert(window, label_id, payload);
         self.maybe_rotate_epoch();
+        self.enforce_retention();
+    }
+
+    /// Bound in-memory footprint to the configured horizon. Drops every
+    /// window (in `current_epoch` AND any `sealed_epochs`) whose END is
+    /// older than `newest_end - horizon`. This is what makes SketchStore
+    /// memory `O(active_series × horizon)`: without it `current_epoch`
+    /// accumulates one window per tumbling pane forever (the leak), since
+    /// nothing seals (`epoch_capacity == None`) and the persistence
+    /// flusher only ever evicts SEALED epochs.
+    ///
+    /// Reads stay correct: anything within `horizon` of the freshest
+    /// window is retained, so a `[30m]` range query and the carry-in
+    /// Full base both still resolve. Eviction keys on window-END so a
+    /// straddling pane survives until fully behind the horizon.
+    fn enforce_retention(&mut self) {
+        let Some(horizon) = self.retention_horizon_ms else {
+            return;
+        };
+        // Newest window-end across mutable + sealed state defines "now"
+        // for retention; using max_end (not wall-clock) keeps the bound
+        // robust to clock skew and backfill.
+        let newest_end = self
+            .current_epoch
+            .max_end()
+            .into_iter()
+            .chain(self.sealed_epochs.values().filter_map(|s| s.max_end()))
+            .max();
+        let Some(newest_end) = newest_end else {
+            return;
+        };
+        let cutoff_end = newest_end.saturating_sub(horizon);
+        if cutoff_end == 0 {
+            return;
+        }
+        self.current_epoch.evict_window_ends_before(cutoff_end);
+        if !self.sealed_epochs.is_empty() {
+            let drop_ids: Vec<EpochId> = self
+                .sealed_epochs
+                .iter()
+                .filter(|(_, ep)| ep.max_end().map(|e| e <= cutoff_end).unwrap_or(true))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in drop_ids {
+                self.sealed_epochs.remove(&id);
+            }
+        }
     }
 
     fn maybe_rotate_epoch(&mut self) {
@@ -858,5 +1001,112 @@ mod tests {
         s.insert((30, 40), "a".into(), "p4".into()); // capacity hit → seal again
         s.insert((40, 50), "a".into(), "p5".into()); // third epoch; oldest sealed evicted
         assert!(s.sealed_epochs.len() <= 2);
+    }
+
+    #[test]
+    fn evict_window_ends_before_drops_old_keeps_recent() {
+        let mut e = MutableEpoch::<u32>::new();
+        e.insert((0, 100), 1, 1);
+        e.insert((100, 200), 2, 2);
+        e.insert((150, 250), 3, 3); // straddles a cutoff of 200 (ends after)
+        e.insert((200, 300), 4, 4);
+        assert_eq!(e.distinct_windows(), 4);
+
+        // Cutoff 200: drop windows ending <= 200, i.e. (0,100) & (100,200).
+        // (150,250) straddles (ends at 250 > 200) → retained.
+        let dropped = e.evict_window_ends_before(200);
+        assert_eq!(dropped, 2);
+        assert_eq!(e.distinct_windows(), 2);
+        let mut buf = Vec::new();
+        e.range_query_overlap_into(0, 400, &mut buf);
+        let mut ids: Vec<_> = buf.iter().map(|(_, id, _)| *id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![3, 4]);
+        // bounds recomputed
+        assert_eq!(e.min_start(), Some(150));
+        assert_eq!(e.max_end(), Some(300));
+    }
+
+    #[test]
+    fn evict_window_ends_before_noop_when_all_recent() {
+        let mut e = MutableEpoch::<u32>::new();
+        e.insert((1000, 1100), 1, 1);
+        e.insert((1100, 1200), 2, 2);
+        // Cutoff below everything → nothing dropped, no rebuild.
+        assert_eq!(e.evict_window_ends_before(500), 0);
+        assert_eq!(e.distinct_windows(), 2);
+    }
+
+    #[test]
+    fn retention_bounds_window_count_over_long_elapsed_time() {
+        // Ingest a long stream of 30s tumbling windows. With a bounded
+        // horizon the per-sid distinct-window count stays bounded even as
+        // elapsed time grows without limit — the production leak fix.
+        let horizon_ms = 60 * 60 * 1000; // 1h
+        let window_ms = 30_000u64; // 30s panes
+        let mut s = SidStoreData::<String, u32>::new();
+        s.retention_horizon_ms = Some(horizon_ms);
+
+        let mut start = 0u64;
+        // 4 hours of ingest = 480 windows; unbounded would retain all 480.
+        for i in 0..480u32 {
+            let w = (start, start + window_ms);
+            s.insert(w, "series".into(), i);
+            start += window_ms;
+        }
+
+        // Bounded: at most ~horizon/window windows retained (plus the
+        // straddling boundary pane). 1h / 30s = 120 windows.
+        let retained = s.current_epoch.distinct_windows();
+        assert!(
+            retained <= (horizon_ms / window_ms) as usize + 2,
+            "retained {retained} windows; expected ~{} (bounded by horizon)",
+            horizon_ms / window_ms
+        );
+        // And it actually dropped the bulk of them.
+        assert!(retained < 480, "retention did not evict old windows");
+    }
+
+    #[test]
+    fn retention_disabled_keeps_full_history() {
+        let mut s = SidStoreData::<String, u32>::new();
+        s.retention_horizon_ms = None; // disabled
+        let window_ms = 30_000u64;
+        let mut start = 0u64;
+        for i in 0..200u32 {
+            s.insert((start, start + window_ms), "series".into(), i);
+            start += window_ms;
+        }
+        assert_eq!(s.current_epoch.distinct_windows(), 200);
+    }
+
+    #[test]
+    fn retention_keeps_windows_within_horizon_queryable() {
+        // The freshest `horizon` worth of windows must survive eviction
+        // so a recent range query still resolves (no regression to the
+        // overlap-scan / carry-in read path).
+        let horizon_ms = 60 * 60 * 1000; // 1h
+        let window_ms = 30_000u64;
+        let mut s = SidStoreData::<String, u32>::new();
+        s.retention_horizon_ms = Some(horizon_ms);
+
+        let mut start = 0u64;
+        let mut last_end = 0u64;
+        for i in 0..480u32 {
+            last_end = start + window_ms;
+            s.insert((start, last_end), "series".into(), i);
+            start += window_ms;
+        }
+
+        // A 30m range query ending at the newest window must still find
+        // windows (well inside the 1h horizon).
+        let q_start = last_end - 30 * 60 * 1000;
+        let mut buf = Vec::new();
+        s.current_epoch
+            .range_query_overlap_into(q_start, last_end, &mut buf);
+        assert!(
+            !buf.is_empty(),
+            "30m range query within horizon returned no windows — read path regressed"
+        );
     }
 }

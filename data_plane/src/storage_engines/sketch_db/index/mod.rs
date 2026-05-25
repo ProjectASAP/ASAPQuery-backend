@@ -1594,6 +1594,82 @@ mod tests {
         );
     }
 
+    /// Test-only: override a single sid's WARM retention horizon so a
+    /// test can drive eviction without mutating the process-global
+    /// `ASAP_SKETCH_RETENTION_MS` env (which would race other tests).
+    /// The sid must already have state (call after the first
+    /// `append_sample`).
+    fn set_retention_horizon_for_test(store: &SketchStore, sid: u64, horizon_ms: Option<u64>) {
+        if let Some(s) = store.series.get(&sid) {
+            s.write().unwrap().retention_horizon_ms = horizon_ms;
+        }
+    }
+
+    #[test]
+    fn retention_bounds_memory_yet_keeps_recent_windows_queryable() {
+        // Regression for the production leak: under steady ~30s-pane
+        // ingest the per-sid window count grew unbounded because nothing
+        // sealed and `current_epoch` was never trimmed. With a bounded
+        // horizon (a) old windows are evicted (memory stays O(horizon)),
+        // and (b) recent windows within the horizon remain queryable via
+        // the overlap-scan + delta carry-in read path (#323–#326).
+        let idx = SketchStore::new();
+        idx.register(meta(77));
+        let lv = BTreeMap::new();
+        let window_ms = 30_000u64; // 30s panes
+        let horizon_ms = 60 * 60 * 1000u64; // 1h
+
+        // Seed one window, then set the horizon, then stream the rest.
+        idx.append_sample(77, lv.clone(), (0, window_ms), sample(0));
+        set_retention_horizon_for_test(&idx, 77, Some(horizon_ms));
+
+        // 4h of ingest = 480 panes. Emit a Full at the start of each
+        // 30-pane (~15m) block, deltas otherwise — mirrors the agent's
+        // periodic-Full + cheap-delta cadence so the carry-in has a base.
+        let mut start = window_ms;
+        let mut last_end = window_ms;
+        for i in 1..480u64 {
+            last_end = start + window_ms;
+            let s = if i % 30 == 0 {
+                sample((i % 250) as u8)
+            } else {
+                delta_sample((i % 250) as u8)
+            };
+            idx.append_sample(77, lv.clone(), (start, last_end), s);
+            start += window_ms;
+        }
+
+        // (a) Memory bound: distinct windows ≈ horizon/window, NOT 480.
+        let retained = {
+            let g = idx.series.get(&77).unwrap();
+            let r = g.read().unwrap().current_epoch.distinct_windows();
+            r
+        };
+        let expected = (horizon_ms / window_ms) as usize;
+        assert!(
+            retained <= expected + 2,
+            "retained {retained} windows; horizon should bound to ~{expected}"
+        );
+        assert!(retained < 480, "old windows were not evicted (leak persists)");
+
+        // (b) A 30m range query ending at the freshest window still
+        // resolves (well within the 1h horizon) AND the carry-in finds a
+        // Full base for any leading delta — no regression to #323–#326.
+        let q_start = last_end - 30 * 60 * 1000;
+        let series = idx.query_range(77, q_start, last_end);
+        assert_eq!(series.len(), 1, "recent 30m window must stay queryable");
+        let s = &series[0];
+        assert!(!s.samples.is_empty(), "30m range query returned no samples");
+        let first = s.samples.values().next().unwrap();
+        assert!(
+            matches!(
+                first.encoding,
+                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+            ),
+            "earliest sample in the answer must be a Full base (carry-in intact)"
+        );
+    }
+
     #[test]
     fn ddsketch_accuracy_bound() {
         let bound = AccuracyBound::from_config(&SketchConfig::DDSketch {
