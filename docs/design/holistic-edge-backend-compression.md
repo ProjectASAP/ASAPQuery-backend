@@ -233,6 +233,28 @@ Minimal change to today's pipeline: the agent already emits periodic Fulls;
 add **drift** as a second Full trigger; backend delta-stitching already treats
 a Full as the carry-in base, so a re-base is just a new base.
 
+### 3.1 v1 policy (concrete, zero-tuning)
+
+Ship the simplest correct version first; defer the only tunable knob.
+
+- **Drift trigger = hard/overflow ONLY.** Per frame, pick the residual integer
+  width from the Full's observed range (i16 if it fits, else i32, else i64);
+  re-base (warm: emit Full; cold: cut chunk + new base) the moment a residual
+  would exceed that width. This is a correctness bound, **not a tunable**.
+- **Heartbeat = fixed interval.** Emit a Full at least every **N windows** even
+  without drift. Default `N` = the existing agent Full cadence (today's
+  ProtoFull period); for cold, the natural chunk bound (a time-block / ≤~120-
+  sample chunk) already serves as the heartbeat. Bounds crash-loss and the
+  query base-lookback to ≤ one heartbeat.
+- **Counters:** delta-of-value (no drift); the heartbeat Full still applies
+  (recovery / new-consumer base).
+
+**DEFERRED — soft/efficiency drift (the tunable `K`):** re-base when residuals
+waste `> K` bits vs a fresh frame. Skipped in v1 — it's a second-order
+optimization and the only thing that would need per-shape tuning. Add it ONLY
+if observation shows long-lived frames whose residuals widen (compression
+silently degrading) without ever overflowing. Until then **v1 needs no tuning**.
+
 ---
 
 ## 4. Shared per-series offset from parse-once
@@ -248,8 +270,10 @@ path) + VM's cheaper decode.
 ---
 
 ## 5. Open decisions
-1. Drift thresholds: correctness (overflow) is forced; the efficiency K-bit
-   threshold + heartbeat Full interval need tuning (per-shape defaults).
+1. ~~Drift / heartbeat thresholds~~ **DECIDED (v1 — see §3.1)**: drift =
+   hard/overflow only (correctness bound, no tunable); heartbeat = fixed `N`
+   windows (= existing Full cadence). Soft/efficiency-`K` drift DEFERRED as a
+   later optimization — v1 needs no tuning.
 2. ~~Which warm sketch families get the offset/FOR re-encoding first~~
    **RESOLVED by the §2.1 audit**: P1 = HLL sparse full-state (5–50×, + cuts
    warm memory), P2 = KLL value-offset (~2×). DDSketch / CMS / CountSketch /
