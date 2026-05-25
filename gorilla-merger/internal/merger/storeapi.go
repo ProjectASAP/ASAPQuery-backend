@@ -31,14 +31,19 @@ type StoreAPI struct {
 }
 
 // NewStoreAPI wraps the tsdb.DB in the custom StoreServer (component "receive")
-// and prepares a gRPC server bound to addr.
-func NewStoreAPI(s *Storage, extLset labels.Labels, logger kitlog.Logger, addr string) (*StoreAPI, error) {
+// and prepares a gRPC server bound to addr. When coldStore is non-nil, the
+// store also serves the decode-on-read cold-part path, unioned with the
+// open-window tsdb series.
+func NewStoreAPI(s *Storage, extLset labels.Labels, logger kitlog.Logger, addr string, coldStore *ColdPartStore) (*StoreAPI, error) {
 	if logger == nil {
 		logger = kitlog.NewNopLogger()
 	}
 	// The custom store requires the external label set to be sorted; labels.New
 	// / labels.Builder already returns sorted labels.
 	cs := newCustomStore(s.DB, extLset, logger)
+	if coldStore != nil {
+		cs.setColdQuerier(NewColdQuerier(coldStore))
+	}
 
 	grpcSrv := grpc.NewServer()
 	storepb.RegisterStoreServer(grpcSrv, cs)
