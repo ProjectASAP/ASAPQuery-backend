@@ -392,6 +392,30 @@ const in sketchlib-go (the `m`-sweep is analytical in the RSE column); the HLL
 "sparser→smaller" win only holds below register saturation (distinct ≪ `m`) — at
 n=1e6 registers saturate and sampled/unsampled sizes converge.
 
+### 6.6 Geometric sampling (NitroSketch) — cheap equivalent implementation
+Per-update Bernoulli(p) (a coin per update) wastes RNG. NitroSketch's
+**geometric sampling** instead draws, after each kept update, a `Geometric(p)`
+number of updates to SKIP, and jumps ahead. This is **statistically identical**
+to per-update Bernoulli(p) (gaps `~Geometric(p)` ⟺ each update kept iid w.p. `p`),
+so §7's bounds, unbiasedness, and the §6.1 composition rule are all unchanged —
+it only amortizes the sampling RNG to ~`O(p)` draws per item (and drops the
+per-item branch), on top of the "fewer sketch updates" win.
+- **Applies to the per-update/per-item families:** DDSketch (bucket updates),
+  KLL (per-item insert), CMS / CountSketch / Nitro (counter updates).
+- **NOT HLL:** HLL samples by hash-threshold on the distinct KEY
+  (`u(h(x))<p`) — a value-determined decision, not a stream-position coin — so
+  geometric skip-ahead doesn't apply; and its hash-compare is already O(1) with
+  no RNG, so it needs no such optimization.
+- **Orthogonal to shared-ts (§1.7) and the offset (§4)** — it changes only HOW
+  the kept set is generated and WHICH counter updates land, never timestamps or
+  the value base: (a) cold raw isn't sampled at all; (b) warm "shared-ts" is the
+  window-end column, fixed by the window cadence which sampling doesn't change;
+  (c) the offset comes from the per-series value magnitude, which a uniform
+  random `p`-subset preserves.
+- **Impl note:** over a multi-series interleaved stream a single global geometric
+  counter gives each series ~`p` in expectation (with per-series variance);
+  per-series warm sketches typically keep a per-series counter.
+
 ---
 
 ## 7. Sampling-enhanced sketches: algorithms & error-bound derivations
