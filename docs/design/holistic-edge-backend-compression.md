@@ -359,9 +359,38 @@ fraction). `p` rides in the Full-epoch frame header alongside the offset.
   controller-driven model exactly — the controller already annotates each
   metric's tier + sketch type; it adds `p` the same way.
 
-> §6.5 (the offline Go sampling benchmark proving these benefits empirically —
-> CPU/update reduction vs measured error vs the bounds below) is added once the
-> benchmark lands; §7 is its formal backing.
+### 6.5 Early benefits — offline Go benchmark (pre-integration)
+
+Measured against the REAL sketchlib-go sketches (harness `/mydata/sampling-bench`,
+`go run .`, ~16s; UNSAMPLED vs SAMPLED-at-`p` vs EXACT ground truth, with the
+§6.1 composition rule applied — raw sampled state stored, `×1/p` at query). **All
+§7 bounds held empirically** across the `p`/`N`/`k`/`m` sweeps.
+
+| family | benefit @ `p=0.1` | accuracy | safe-`p` |
+|---|---|---|---|
+| DDSketch (α=1%) | 10× fewer bucket writes (1e6→1e5), ~6× wall-clock (239→34 ms) | q99 rank err ~0.005 (within ε_s); value relErr ≈ α | `p`≈0.05–0.1 (q99 suffers first at tiny `p`) |
+| KLL | 10× fewer inserts, ~6× wall-clock | rank err tracks ε_s **iff `pN≳k²`**; below it q99 jumps (N=1e6,k=400,p=0.1 → pN<k² → relErr 0.225) | **`pN ≳ k²`** |
+| HLL (m=16384) | up to ~100× fewer updates (`p=0.01`) | UNBIASED: relErr 0.017 vs RSE bound 0.013 @ n=1e6 | `p` down to 0.01 for n≥1e5; **hash-threshold only** |
+| CMS / CountSketch | 10× fewer updates | heavy-hitter relErr ~1–2% @ N≥1e5; per-key err ~√(f(1−p)/p) | `p`≈0.1 |
+
+Findings:
+- **CPU benefit is real and ~linear in `p`** (updates ∝ `p`; ~6× wall-clock at
+  `p=0.1`) — exactly the build-cost axis compression can't touch.
+- **`pN≳k²` for KLL is a hard regime boundary**, confirmed empirically (not just
+  asymptotic): cross below it and q99 error jumps.
+- **HLL must use hash-threshold, NEVER per-occurrence** (per-occurrence relErr
+  blew up 0.66→3.8 by over-counting high-multiplicity keys). Implementation
+  gotcha: the threshold hash MUST be **independent of HLL's canonical register
+  hash** — using the same hash correlated the kept set with the register layout
+  and gave 15–84% bias until a separate seed was used.
+- **Serialization composes (§6.1 rule):** the sampled proto state is never larger
+  than unsampled — DDSketch sparser buckets, KLL fewer retained items, HLL/CMS
+  smaller below register saturation. Sampling doesn't bloat the wire.
+
+Caveats (documented in the harness README): HLL precision `m` is a compile-time
+const in sketchlib-go (the `m`-sweep is analytical in the RSE column); the HLL
+"sparser→smaller" win only holds below register saturation (distinct ≪ `m`) — at
+n=1e6 registers saturate and sampled/unsampled sizes converge.
 
 ---
 
