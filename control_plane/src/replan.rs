@@ -289,6 +289,11 @@ impl Replanner {
             // bootstrap YAML did.
             edge_cfg.cumulative_counter_metrics =
                 crate::emit::collect_cumulative_counter_metrics(registry, &self.workload_store);
+            // Per-metric sketch sampling probability — companion stitch,
+            // mirrors the bootstrap path so OpAMP-pushed re-plans carry the
+            // same `sample_p` knob the first-connect bootstrap YAML did.
+            edge_cfg.metric_to_sample_p =
+                crate::emit::collect_metric_to_sample_p(registry, &self.workload_store);
         }
 
         // OpAMP `on_connect` doesn't expose the agent's runtime

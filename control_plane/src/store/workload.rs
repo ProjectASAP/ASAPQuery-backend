@@ -240,6 +240,7 @@ mod tests {
                 sketch_family_override: None,
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
+                sample_p: 1.0,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -249,6 +250,7 @@ mod tests {
                 sketch_family_override: None,
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
+                sample_p: 1.0,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -258,6 +260,7 @@ mod tests {
                 sketch_family_override: None,
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
+                sample_p: 1.0,
             },
         ];
 
