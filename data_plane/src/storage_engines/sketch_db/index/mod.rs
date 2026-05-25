@@ -421,6 +421,90 @@ impl SketchStore {
             buf.clear();
         }
 
+        // Delta-stitching carry-in (issue: quantile/HLL "No result"
+        // bug). The agent emits a periodic Full snapshot followed by
+        // many cheap Delta frames. A short query window (e.g. `[30s]`)
+        // routinely contains ONLY deltas — the Full landed earlier,
+        // outside `[start, end]`. The downstream delta-apply reducer
+        // can't establish a rolling base from a leading delta, so it
+        // silently produces an empty result that the engine returns as
+        // `Ok(empty)` (NOT a capability-miss), so the router never
+        // fails over and the caller sees "No result". To fix, for each
+        // label series whose earliest in-window sample is a Delta,
+        // splice in the most-recent Full snapshot ending at or before
+        // `start` as a carry-in base. Its window-end is `< start`, so
+        // it sorts first in the per-label `BTreeMap` and the reducer's
+        // cumulative/per-window walk uses it as the base; the reducer
+        // drops out-of-range output windows so the carry-in never leaks
+        // into the answer's time domain.
+        if start_unix_ms > 0 {
+            // Which labels need a base? Those present in-window whose
+            // earliest sample is a Delta (a leading Full needs nothing).
+            let need_base: Vec<LabelValuesId> = by_label_id
+                .iter()
+                .filter(|(_, samples)| {
+                    samples
+                        .values()
+                        .next()
+                        .map(|s| {
+                            matches!(
+                                s.encoding,
+                                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
+                            )
+                        })
+                        .unwrap_or(false)
+                })
+                .map(|(label_id, _)| *label_id)
+                .collect();
+
+            if !need_base.is_empty() {
+                let before = start_unix_ms.saturating_sub(1);
+                // Track the latest Full per label (by window-end).
+                let mut latest_full: HashMap<LabelValuesId, (i64, SketchSampleState)> =
+                    HashMap::new();
+                let mut consider = |buf: &Vec<(TimestampRange, LabelValuesId, &AggPayload)>| {
+                    for (win, label_id, payload) in buf {
+                        if !need_base.contains(label_id) {
+                            continue;
+                        }
+                        let Some(s) = payload.as_sketch() else {
+                            continue;
+                        };
+                        if !matches!(
+                            s.encoding,
+                            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                        ) {
+                            continue;
+                        }
+                        let w_end = win.1 as i64;
+                        match latest_full.get(label_id) {
+                            Some((prev_end, _)) if *prev_end >= w_end => {}
+                            _ => {
+                                latest_full.insert(*label_id, (w_end, s.clone()));
+                            }
+                        }
+                    }
+                };
+                guard
+                    .current_epoch
+                    .collect_ending_at_or_before(before, &mut buf);
+                consider(&buf);
+                buf.clear();
+                for sealed in guard.sealed_epochs.values() {
+                    sealed.collect_ending_at_or_before(before, &mut buf);
+                    consider(&buf);
+                    buf.clear();
+                }
+                for (label_id, (w_end, state)) in latest_full {
+                    by_label_id
+                        .entry(label_id)
+                        .or_default()
+                        .entry(w_end)
+                        .or_insert(state);
+                }
+            }
+        }
+
         by_label_id
             .into_iter()
             .map(|(label_id, samples)| {
@@ -1375,6 +1459,71 @@ mod tests {
         let s = &series[0];
         assert_eq!(s.samples.len(), 1);
         assert!(s.samples.contains_key(&20));
+    }
+
+    fn delta_sample(b: u8) -> SketchSampleState {
+        SketchSampleState {
+            bytes: vec![b],
+            encoding: SketchEncoding::ProtoDelta,
+        }
+    }
+
+    #[test]
+    fn range_query_carries_in_latest_full_before_window() {
+        // The delta-stitching carry-in: a Full lands BEFORE the query
+        // window and only deltas land inside it. `query_range` must
+        // splice in the most-recent pre-window Full so the downstream
+        // delta-apply reducer can establish a rolling base. Without it,
+        // a short window that contains only deltas yields an
+        // unanswerable series (the live quantile/HLL "No result" bug).
+        let idx = SketchStore::new();
+        idx.register(meta(21));
+        let lv = BTreeMap::new();
+        // Two Fulls before the window; the LATER one (end=200) is the
+        // base that must be carried in.
+        idx.append_sample(21, lv.clone(), (90, 100), sample(1));
+        idx.append_sample(21, lv.clone(), (190, 200), sample(2));
+        // Delta-only inside the window [300, 400].
+        idx.append_sample(21, lv.clone(), (310, 320), delta_sample(3));
+
+        let series = idx.query_range(21, 300, 400);
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        // In-window delta (end=320) + carried-in latest Full (end=200).
+        assert!(s.samples.contains_key(&320), "in-window delta present");
+        assert!(
+            s.samples.contains_key(&200),
+            "latest pre-window Full (end=200) carried in as base"
+        );
+        assert!(
+            !s.samples.contains_key(&100),
+            "only the LATEST pre-window Full is carried in, not older ones"
+        );
+        // The carried-in entry must be a Full (the reducer needs a base).
+        assert_eq!(s.samples.get(&200).unwrap().encoding, SketchEncoding::ProtoFull);
+    }
+
+    #[test]
+    fn range_query_no_carry_in_when_window_leads_with_full() {
+        // If the in-window samples already lead with a Full, no carry-in
+        // is needed (and none should be spliced — it would be redundant
+        // and could skew coverage).
+        let idx = SketchStore::new();
+        idx.register(meta(22));
+        let lv = BTreeMap::new();
+        idx.append_sample(22, lv.clone(), (90, 100), sample(1));
+        idx.append_sample(22, lv.clone(), (310, 320), sample(2)); // Full in-window
+        idx.append_sample(22, lv.clone(), (330, 340), delta_sample(3));
+
+        let series = idx.query_range(22, 300, 400);
+        assert_eq!(series.len(), 1);
+        let s = &series[0];
+        assert!(s.samples.contains_key(&320));
+        assert!(s.samples.contains_key(&340));
+        assert!(
+            !s.samples.contains_key(&100),
+            "no carry-in when the window already leads with a Full"
+        );
     }
 
     #[test]

@@ -825,6 +825,29 @@ mod tests {
         );
     }
 
+    /// `count(metric)` is the distinct-count idiom: the analyzer lifts
+    /// the outer `count` into BOTH `outer_agg = Count` and the
+    /// `CardinalityApprox` capability, and the bare-selector inner leaves
+    /// `function` empty. The data-plane engine must (a) derive the
+    /// reducer function from the capability when `function` is empty, and
+    /// (b) NOT re-apply the outer `Count` fold (the cardinality estimate
+    /// IS the count). This test pins the analyzer-side shape those
+    /// engine fixes rely on.
+    #[test]
+    fn analyze_count_bare_metric_trace_shape() {
+        let a = analyze_promql_for_asap_tier("count(unique_users_per_min)");
+        let c = &a.candidates[0];
+        assert_eq!(
+            c.function, "",
+            "bare-selector inner leaves the trace function empty: {a:?}"
+        );
+        assert!(
+            matches!(c.outer_agg, OuterAgg::Count(_)),
+            "outer count is lifted into outer_agg: {a:?}"
+        );
+        assert_eq!(c.range_seconds, 0, "instant query: {a:?}");
+    }
+
     #[test]
     fn analyze_quantile_over_time() {
         let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, http_latency_ms[5m])");
