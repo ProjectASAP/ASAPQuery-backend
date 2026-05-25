@@ -1256,24 +1256,27 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 let required: crate::storage_engines::sketch_db::index::Capability =
                     candidate.required_capability.clone();
                 let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
+                // Track whether the candidate's sid set contained ONLY
+                // Ghost/Unknown sids with no usable Hit. A single
+                // metric/group-by selector legitimately resolves to a MIX
+                // of sids: freshly-minted Active sids carrying live sketch
+                // state (`Hit`) alongside retired-then-evicted or
+                // merged-away identities that no longer hold data
+                // (`Ghost`), plus stale sender-cache sids (`Unknown`). The
+                // earlier behavior aborted the whole query to CapabilityMiss
+                // on the FIRST Ghost/Unknown encountered — which, with the
+                // sid set iterated in ascending-u64 order, meant an older
+                // dataless sid masked the newer Active sketch sids that
+                // could answer. Skip non-Hit sids instead; only fail over
+                // to the archive when no Hit sid satisfies the capability
+                // (handled by the `hit_sids.is_empty()` check below, which
+                // preserves the all-ghost → CapabilityMiss contract).
                 for sid in &sids {
                     match idx.classify(*sid) {
                         crate::storage_engines::sketch_db::index::SidLookup::Hit => {}
                         crate::storage_engines::sketch_db::index::SidLookup::Ghost
                         | crate::storage_engines::sketch_db::index::SidLookup::Unknown => {
-                            let req = Self::requirements_from_candidate(candidate);
-                            crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                                &self.control_plane_client,
-                                &req,
-                            );
-                            return Err(crate::query_engines::EngineError::capability_miss(
-                                asap_types::StorageBackend::SketchStore.data_source_id(),
-                                format!(
-                                    "SketchStore ghost/unknown sid {sid} for metric \
-                                     `{}` — failing over to archive",
-                                    candidate.metric_name
-                                ),
-                            ));
+                            continue;
                         }
                     }
                     let meta = match idx.instance(*sid) {
@@ -3383,6 +3386,66 @@ mod outer_agg_integration_tests {
         assert!(z0 > 0.0 && z0 < 50.0, "z0 p99 in [1..=10] range, got {z0}");
         assert!(z1 > 100.0 && z1 < 1000.0, "z1 p99 in [100..=500] range, got {z1}");
         assert!(z1 > z0, "z1 ({z1}) > z0 ({z0}) — per-zone identity preserved");
+    }
+
+    /// Regression: a candidate's sid set legitimately contains a MIX of
+    /// `Ghost` (retired-then-evicted or merged-away, no data) and `Hit`
+    /// (Active, carrying live sketch state) sids under the same metric.
+    /// This is the exact production shape behind the warm-quantile miss:
+    /// the metric's `instances_matching` walk returns the older retired
+    /// sketch sids (now dataless ⇒ Ghost) alongside the freshly-minted
+    /// Active sketch sids. Iterating ascending-u64, the older Ghost sid
+    /// was hit first and aborted the WHOLE query to CapabilityMiss before
+    /// the Active sid could answer. After the fix, non-Hit sids are
+    /// skipped and the query resolves against the Active sid.
+    #[tokio::test]
+    async fn ghost_sid_does_not_mask_active_hit_sid_for_quantile() {
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w_start = now_ms.saturating_sub(60_000);
+        let w_end = now_ms.saturating_sub(30_000);
+
+        // Ghost sid (lower number ⇒ iterated first): registered metadata,
+        // never appended any sample state. `classify` → Ghost.
+        idx.register(dd_meta_for(1, "http_latency_ms", &["zone"]));
+
+        // Active Hit sid (higher number): carries a real DDSketch window.
+        idx.register(dd_meta_for(2, "http_latency_ms", &["zone"]));
+        idx.append_sample(
+            2,
+            BTreeMap::from([("zone".to_string(), "z0".to_string())]),
+            (w_start, w_end),
+            SketchSampleState {
+                bytes: dd_sketch_with_values(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+                encoding: SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("quantile_over_time(0.99, http_latency_ms[5m])")
+            .await
+            .expect(
+                "a dataless Ghost sid must not abort the query when an \
+                 Active Hit sid under the same metric can answer it",
+            );
+        let vector = match result {
+            QueryResult::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        };
+        assert_eq!(
+            vector.values.len(),
+            1,
+            "the single Active sid answers; the Ghost is skipped"
+        );
+        assert!(
+            vector.values[0].value > 0.0,
+            "p99 of [1..=10] is a positive quantile, got {}",
+            vector.values[0].value
+        );
     }
 
     /// `avg by (zone) (quantile_over_time(0.99, m[5m]))` — same shape,

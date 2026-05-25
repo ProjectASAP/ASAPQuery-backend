@@ -110,6 +110,30 @@ pub fn reconcile_from_streaming_config(
         if !matches!(meta.status(), AggStatus::Active) {
             return;
         }
+        // `live_signatures` is built exclusively from
+        // `signature_from_agg_config`, which canonicalizes every
+        // streaming-config `AggregationConfig` to an `AggKind::ExactAgg`
+        // signature (`P`-prefixed). An `AggKind::Sketch` sid (OTLP
+        // modified-sketch ingest path: KLL / HLL / DDSketch / CMS /
+        // CountSketch) always produces an `S`-prefixed signature, so it
+        // can NEVER be present in `live_signatures` — meaning this scan
+        // would unconditionally orphan and retire EVERY sketch-backed sid
+        // on the first config reconcile. That is exactly the opposite of
+        // the documented intent (see this module's header: "sketch sids
+        // never compare equal so they're never retired by this path").
+        //
+        // Retiring a sketch sid bars further ingest (the §6.3 write
+        // barrier rejects writes to Retired/Expired sids), then eviction
+        // drops its per-window state; the query path then classifies it
+        // as `Ghost`, and the analyzer-driven dispatch short-circuits the
+        // whole quantile / cardinality query to CapabilityMiss before it
+        // can reach a freshly-minted Active sketch sid carrying live data.
+        // Sketch-sid lifecycle is driven by the control plane's eviction
+        // RPC, NOT by this precompute-shaped signature reconcile, so skip
+        // them here.
+        if matches!(meta.agg_kind, AggKind::Sketch { .. }) {
+            return;
+        }
         scratch.clear();
         signature_into(
             &meta.metric_name,
@@ -385,6 +409,90 @@ mod tests {
         )]);
         let summary = reconcile_from_streaming_config(&store, &cfg, Duration::from_secs(60));
         assert_eq!(summary.retired, vec![1]);
+    }
+
+    fn meta_sketch(
+        sid: u64,
+        metric: &str,
+        kind: crate::storage_engines::sketch_db::data::SketchKindHandle,
+        config: crate::storage_engines::sketch_db::data::SketchConfig,
+        group_by: Vec<&str>,
+    ) -> SketchInstanceMetadata {
+        let group_by_keys: BTreeSet<String> = group_by.into_iter().map(|s| s.to_string()).collect();
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys,
+            capability: None,
+            agg_kind: AggKind::Sketch {
+                kind,
+                config,
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    // Regression: the precompute-shaped signature reconcile must NOT
+    // retire `AggKind::Sketch` sids. `build_live_signature_set` only ever
+    // emits `ExactAgg`-shaped (`P`-prefixed) signatures from the streaming
+    // config, so a sketch sid's `S`-prefixed signature can never be in the
+    // live set. Before the fix this scan unconditionally orphaned every
+    // OTLP-ingested KLL / HLL / DDSketch sid on the first reconcile, which
+    // barred ingest, let eviction drop their state, and turned them into
+    // query-time `Ghost`s that short-circuited warm quantile / cardinality
+    // queries to CapabilityMiss. Sketch-sid lifecycle is the control
+    // plane's eviction RPC's job, not this path's.
+    #[test]
+    fn sketch_sids_are_never_retired_by_signature_reconcile() {
+        use crate::storage_engines::sketch_db::data::{SketchConfig, SketchKindHandle};
+        let store = SketchStore::new();
+        store.register(meta_sketch(
+            1,
+            "http_requests_total_latency_ms",
+            SketchKindHandle::Kll,
+            SketchConfig::Kll { k: 200 },
+            vec!["node", "pod", "zone"],
+        ));
+        store.register(meta_sketch(
+            2,
+            "unique_users_per_min",
+            SketchKindHandle::Hll,
+            SketchConfig::Hll { precision: 12 },
+            vec!["zone"],
+        ));
+        // A precompute (ExactAgg) sid with no live config entry SHOULD
+        // still retire — the fix is scoped to sketch sids only.
+        store.register(meta(3, "cpu", AggregationType::Sum, vec!["host"]));
+
+        // Live config carries an unrelated ExactAgg policy; none of the
+        // sketch sids' signatures can match it.
+        let cfg = streaming(vec![agg_config("mem", AggregationType::Sum, vec!["host"])]);
+        let summary = reconcile_from_streaming_config(&store, &cfg, Duration::from_secs(60));
+
+        // Only the orphaned precompute sid retires; both sketch sids stay
+        // Active so the warm query path can keep resolving them.
+        assert_eq!(summary.retired, vec![3], "only the ExactAgg orphan retires");
+        assert!(
+            matches!(store.classify(1), crate::storage_engines::sketch_db::index::SidLookup::Ghost),
+            "sketch sid 1 stays registered + Active (Ghost only because no data appended in-test)"
+        );
+        let inst1 = store.instance(1).expect("sketch sid 1 still registered");
+        assert_eq!(
+            inst1.status(),
+            AggStatus::Active,
+            "KLL sketch sid must remain Active after reconcile"
+        );
+        let inst2 = store.instance(2).expect("sketch sid 2 still registered");
+        assert_eq!(
+            inst2.status(),
+            AggStatus::Active,
+            "HLL sketch sid must remain Active after reconcile"
+        );
     }
 
     #[test]
