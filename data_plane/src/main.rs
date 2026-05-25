@@ -851,7 +851,7 @@ async fn spawn_memory_diagnostics(
         let series_count = sketch_index.series_len();
         let approx_bytes = sketch_index.approx_memory_bytes();
         info!(
-            "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, {:.2} KB approx sealed bytes",
+            "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, {:.2} KB approx in-memory bytes (hot current_epoch + sealed)",
             instance_count,
             series_count,
             approx_bytes as f64 / 1024.0,

@@ -262,6 +262,22 @@ struct TickStats {
 fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistResult<TickStats> {
     let mut stats = TickStats::default();
     let now = now_ms();
+    let cfg = &shared.cfg;
+
+    // ---- Phase 0: time-driven seal of aged un-sealed windows ----
+    // The count-driven seal cadence (`seal_window_count`) only fires once
+    // a series' `current_epoch` reaches N distinct windows. A slow or
+    // stalled series never gets there, so its aged windows sit un-sealed
+    // in `current_epoch` — and the hot-window phase below only flushes
+    // SEALED epochs, so those windows would never be made durable. Roll
+    // any window older than the hot window into a sealed epoch first so
+    // it becomes flushable this same tick. (Without `hot_window_ms` the
+    // durable tier is purely memory-pressure driven and phase 1 below
+    // handles eviction.)
+    if let Some(hot) = cfg.hot_window_ms {
+        let cutoff = now.saturating_sub(hot);
+        source.seal_aged_epochs(cutoff);
+    }
 
     // ---- Collect candidates across phase 1 and phase 2 ----
     let mut all = source.list_sealed_epochs();
@@ -269,7 +285,6 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     all.sort_by_key(|r| r.end_ts);
 
     let mem = source.approx_memory_bytes();
-    let cfg = &shared.cfg;
 
     let need_memory_pressure = mem > cfg.memory_limit_bytes;
     let low_water_goal = cfg.memory_low_watermark_bytes;
@@ -494,6 +509,86 @@ mod tests {
         }
     }
 
+    /// A fake source whose epochs start UN-SEALED — they only become
+    /// visible to `list_sealed_epochs` once `seal_aged_epochs` rolls them
+    /// over. Models the live `current_epoch` → `sealed_epochs` transition
+    /// the flusher's phase-0 time-seal drives.
+    struct LazySealSource {
+        unsealed: StdMutex<HashMap<(u64, u64), EpochSnapshot>>,
+        sealed: StdMutex<HashMap<(u64, u64), EpochSnapshot>>,
+        memory: AtomicU64,
+    }
+
+    impl LazySealSource {
+        fn new(snapshots: Vec<EpochSnapshot>) -> Self {
+            let mut map = HashMap::new();
+            let mut total = 0u64;
+            for s in snapshots {
+                total += s.approx_bytes as u64;
+                map.insert((s.agg_id, s.epoch_id), s);
+            }
+            Self {
+                unsealed: StdMutex::new(map),
+                sealed: StdMutex::new(HashMap::new()),
+                memory: AtomicU64::new(total),
+            }
+        }
+    }
+
+    impl EpochSource for LazySealSource {
+        fn list_sealed_epochs(&self) -> Vec<SealedEpochRef> {
+            self.sealed
+                .lock()
+                .unwrap()
+                .values()
+                .map(|s| SealedEpochRef {
+                    agg_id: s.agg_id,
+                    epoch_id: s.epoch_id,
+                    end_ts: s.max_ts,
+                    approx_bytes: s.approx_bytes,
+                })
+                .collect()
+        }
+
+        fn seal_aged_epochs(&self, cutoff_end: u64) -> usize {
+            let mut un = self.unsealed.lock().unwrap();
+            let mut sealed = self.sealed.lock().unwrap();
+            let aged: Vec<(u64, u64)> = un
+                .iter()
+                .filter(|(_, s)| s.max_ts <= cutoff_end)
+                .map(|(k, _)| *k)
+                .collect();
+            let mut n = 0;
+            for k in aged {
+                if let Some(s) = un.remove(&k) {
+                    sealed.insert(k, s);
+                    n += 1;
+                }
+            }
+            n
+        }
+
+        fn snapshot_sealed_epoch(
+            &self,
+            agg_id: u64,
+            epoch_id: u64,
+        ) -> PersistResult<Option<EpochSnapshot>> {
+            Ok(self.sealed.lock().unwrap().get(&(agg_id, epoch_id)).cloned())
+        }
+
+        fn evict_sealed_epoch(&self, agg_id: u64, epoch_id: u64) {
+            let mut map = self.sealed.lock().unwrap();
+            if let Some(removed) = map.remove(&(agg_id, epoch_id)) {
+                self.memory
+                    .fetch_sub(removed.approx_bytes as u64, Ordering::Relaxed);
+            }
+        }
+
+        fn approx_memory_bytes(&self) -> usize {
+            self.memory.load(Ordering::Relaxed) as usize
+        }
+    }
+
     fn snap(agg_id: u64, epoch_id: u64, min_ts: u64, max_ts: u64, approx: usize) -> EpochSnapshot {
         EpochSnapshot {
             agg_id,
@@ -582,6 +677,40 @@ mod tests {
 
         assert_eq!(source.approx_memory_bytes(), 0);
         assert!(!manifest.live_parts().is_empty());
+    }
+
+    #[test]
+    fn hot_window_time_seals_unsealed_aged_epochs_then_flushes() {
+        // LIVE BUG #1 at the flusher level: an epoch that is still
+        // UN-SEALED (below the count cadence) but aged past the hot window
+        // must be time-sealed by phase 0 and then flushed in the SAME
+        // tick. Without the `seal_aged_epochs` hook the flusher's
+        // sealed-only scan never sees it → empty parts/ (the live bug).
+        let tmp = TempDir::new().unwrap();
+        let now = now_ms();
+        // Aged 10 min; never sealed by the source on its own.
+        let snaps = vec![snap(
+            1,
+            1,
+            now.saturating_sub(600_000),
+            now.saturating_sub(595_000),
+            100,
+        )];
+        let source = Arc::new(LazySealSource::new(snaps));
+        let manifest = Arc::new(Manifest::init(tmp.path()).unwrap());
+        let mut cfg = test_cfg(tmp.path().to_path_buf(), 100_000); // under mem limit
+        cfg.hot_window_ms = Some(120_000); // 120s hot window, like live
+        let mut handle = FlusherHandle::start(cfg, manifest.clone(), source.clone()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manifest.live_parts().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        handle.shutdown();
+        assert!(
+            !manifest.live_parts().is_empty(),
+            "time-driven seal did not make the aged un-sealed epoch durable"
+        );
     }
 
     #[test]

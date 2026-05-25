@@ -158,6 +158,20 @@ impl<P> MutableEpoch<P> {
         self.windows_set.len()
     }
 
+    /// Iterate every `(window, label_id, &payload)` entry in insertion
+    /// order. Used by the persistence layer's memory accounting so the
+    /// un-sealed hot epoch's footprint is visible (mirrors
+    /// [`SealedEpoch::entries`]).
+    pub fn iter_entries(
+        &self,
+    ) -> impl Iterator<Item = (TimestampRange, LabelValuesId, &P)> {
+        self.windows_col
+            .iter()
+            .zip(self.label_ids_col.iter())
+            .zip(self.payloads_col.iter())
+            .map(|((w, id), p)| (*w, *id, p))
+    }
+
     pub fn len(&self) -> usize {
         self.windows_col.len()
     }
@@ -392,6 +406,49 @@ impl<P> MutableEpoch<P> {
             self.max_end = self.windows_col.iter().map(|w| w.1).max();
         }
         dropped
+    }
+
+    /// Split off every entry whose window-END is at or before
+    /// `cutoff_end`, returning them as a fresh `MutableEpoch` (the
+    /// retained, more-recent entries stay in `self`). Mirrors
+    /// [`Self::evict_window_ends_before`] but PRESERVES the aged entries
+    /// (returned) instead of dropping them, so a time-driven seal can
+    /// turn the aged-but-un-sealed tail of `current_epoch` into a sealed
+    /// epoch the persistence flusher can make durable.
+    ///
+    /// Returns `None` when nothing is old enough to split (so the caller
+    /// can skip the seal+rotate entirely). O(N) — one rebuild pass, same
+    /// shape as `evict_window_ends_before`.
+    pub fn split_window_ends_before(&mut self, cutoff_end: u64) -> Option<MutableEpoch<P>> {
+        // O(1) skip: the earliest window-START is already past the
+        // cutoff, so no window can END at/before it either.
+        match self.min_start {
+            Some(min_s) if min_s > cutoff_end => return None,
+            None => return None,
+            _ => {}
+        }
+        let old_windows = std::mem::take(&mut self.windows_col);
+        let old_ids = std::mem::take(&mut self.label_ids_col);
+        let old_payloads = std::mem::take(&mut self.payloads_col);
+        self.windows_set.clear();
+        self.window_to_ids = None;
+        self.last_window = None;
+        self.min_start = None;
+        self.max_end = None;
+
+        let mut aged: MutableEpoch<P> = MutableEpoch::new();
+        for ((w, id), p) in old_windows.into_iter().zip(old_ids).zip(old_payloads) {
+            if w.1 <= cutoff_end {
+                aged.insert(w, id, p);
+            } else {
+                self.insert(w, id, p);
+            }
+        }
+        if aged.is_empty() {
+            None
+        } else {
+            Some(aged)
+        }
     }
 
     /// Remove all entries whose window is in `windows`.
@@ -869,6 +926,37 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
         }
     }
 
+    /// Time-driven seal for the persistence tier: roll every window in
+    /// `current_epoch` whose END is at or before `cutoff_end` into a
+    /// freshly-sealed epoch, leaving the more-recent windows in
+    /// `current_epoch`. Returns the number of distinct windows sealed.
+    ///
+    /// The count-driven [`Self::maybe_rotate_epoch`] cadence only seals
+    /// once `current_epoch` accumulates `seal_window_count` DISTINCT
+    /// windows. A slow or stalled series never reaches that threshold, so
+    /// its aged windows sit un-sealed in `current_epoch` forever — and the
+    /// flusher's hot-window phase only ever flushes SEALED epochs, so they
+    /// are never made durable (the live `parts/`-stays-empty bug). This
+    /// method, called by the flusher each tick with `cutoff_end = now -
+    /// hot_window`, guarantees that any window older than the hot window
+    /// becomes sealed (and therefore flushable) regardless of cadence.
+    ///
+    /// No-op when persistence is disabled (the in-memory-only path bounds
+    /// memory via retention-drop, not flush).
+    pub fn seal_aged_windows(&mut self, cutoff_end: u64) -> usize {
+        if !self.persistence_enabled {
+            return 0;
+        }
+        let Some(aged) = self.current_epoch.split_window_ends_before(cutoff_end) else {
+            return 0;
+        };
+        let sealed_windows = aged.distinct_windows();
+        let sealed = SealedEpoch::from_mutable(aged);
+        self.sealed_epochs.insert(self.current_epoch_id, sealed);
+        self.current_epoch_id += 1;
+        sealed_windows
+    }
+
     fn maybe_rotate_epoch(&mut self) {
         // The effective rotation threshold is the smaller of the
         // test-only `epoch_capacity` and the durable-tier
@@ -1203,6 +1291,64 @@ mod tests {
             480,
             "persistence mode must not retention-drop; the flusher bounds memory instead"
         );
+    }
+
+    #[test]
+    fn split_window_ends_before_partitions_aged_tail() {
+        let mut e = MutableEpoch::<u32>::new();
+        e.insert((0, 100), 1, 1);
+        e.insert((100, 200), 2, 2);
+        e.insert((150, 250), 3, 3); // straddles 200 (ends after) → retained
+        e.insert((200, 300), 4, 4);
+
+        // Cutoff 200: aged = windows ending <= 200 → (0,100) & (100,200).
+        let aged = e.split_window_ends_before(200).expect("aged tail exists");
+        let mut aged_ids: Vec<_> = aged.iter_entries().map(|(_, id, _)| id).collect();
+        aged_ids.sort();
+        assert_eq!(aged_ids, vec![1, 2]);
+        // Retained: (150,250) & (200,300).
+        let mut kept_ids: Vec<_> = e.iter_entries().map(|(_, id, _)| id).collect();
+        kept_ids.sort();
+        assert_eq!(kept_ids, vec![3, 4]);
+        assert_eq!(e.min_start(), Some(150));
+        assert_eq!(e.max_end(), Some(300));
+    }
+
+    #[test]
+    fn split_window_ends_before_noop_when_all_recent() {
+        let mut e = MutableEpoch::<u32>::new();
+        e.insert((1000, 1100), 1, 1);
+        assert!(e.split_window_ends_before(500).is_none());
+        assert_eq!(e.distinct_windows(), 1);
+    }
+
+    #[test]
+    fn seal_aged_windows_rolls_unsealed_tail_under_persistence() {
+        // The time-driven seal: aged windows below the count-cadence must
+        // still seal so the flusher can make them durable.
+        let mut s = SidStoreData::<String, u32>::new();
+        s.seal_window_count = Some(10); // high cadence → never count-seals
+        s.persistence_enabled = true;
+        for i in 0..3u32 {
+            let start = (i as u64) * 30_000;
+            s.insert((start, start + 30_000), "series".into(), i);
+        }
+        // Below cadence → nothing sealed yet.
+        assert_eq!(s.sealed_epochs.len(), 0);
+        // Seal everything ending at/before 90_000 (all 3 windows).
+        let sealed = s.seal_aged_windows(90_000);
+        assert_eq!(sealed, 3, "all three aged windows should seal");
+        assert_eq!(s.sealed_epochs.len(), 1);
+        assert_eq!(s.current_epoch.distinct_windows(), 0);
+    }
+
+    #[test]
+    fn seal_aged_windows_noop_when_persistence_disabled() {
+        let mut s = SidStoreData::<String, u32>::new();
+        s.persistence_enabled = false;
+        s.insert((0, 30_000), "series".into(), 1);
+        assert_eq!(s.seal_aged_windows(60_000), 0);
+        assert_eq!(s.sealed_epochs.len(), 0);
     }
 
     #[test]
