@@ -7,12 +7,11 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/ProjectASAP/asap-gorilla-go/coldpart"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-
-	"github.com/ProjectASAP/asapquery-backend/gorilla-merger/internal/coldpart"
 )
 
 // ---------------------------------------------------------------------------
