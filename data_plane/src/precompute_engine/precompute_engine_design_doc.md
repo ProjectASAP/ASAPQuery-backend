@@ -36,7 +36,7 @@ and VictoriaMetrics remote write), buffers them, computes windowed aggregations
                              OutputSink.emit_batch()
                                     |
                                  Store
-                          (SimpleMapStore / PerKey)
+                          (SketchStore / PerKey)
                                     |
                              Query Engine
                           (PromQL / SQL / etc.)
@@ -1022,7 +1022,7 @@ Worker: updater.take_accumulator()     → Box<dyn AggregateCore>  (in-memory)
    ↓  (direct function call, no IPC)
 OutputSink: store.insert_precomputed_output_batch(outputs)  (pass-through)
    ↓  (direct function call, same process)
-SimpleMapStore: HashMap entry insert   → Box<dyn AggregateCore>  (stored as-is)
+SketchStore: HashMap entry insert   → Box<dyn AggregateCore>  (stored as-is)
 ```
 
 No serialization, deserialization, compression, or network transfer occurs
@@ -1035,7 +1035,7 @@ This is in contrast to the external Kafka ingest path, where precomputes from
 Arroyo/Flink arrive hex-encoded + gzip-compressed + MessagePack-serialized and
 require multiple deserialization steps.
 
-The `SimpleMapStore` (PerKey variant) uses:
+The `SketchStore` (PerKey variant) uses:
 ```
 DashMap<aggregation_id, Arc<RwLock<StoreKeyData>>>
 ```

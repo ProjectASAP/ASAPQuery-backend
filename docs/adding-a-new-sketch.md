@@ -366,7 +366,7 @@ fn compatible_agg_types(stat: &Statistic) -> Vec<AggregationType> {
 ```
 
 Without this, even if the control plane plans a Foo sketch,
-SimpleEngine's capability matcher won't route queries to it.
+ASAPQueryEngine's capability matcher won't route queries to it.
 
 ---
 

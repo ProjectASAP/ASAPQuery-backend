@@ -9,7 +9,7 @@ ASAPQuery-backend exposes a **single PromQL HTTP surface** that
 internally dispatches to one of two engines based on the control plane's
 plan and the query's shape:
 
-- **Warm tier** — in-process `SimpleEngine` over a sketch precompute
+- **Warm tier** — in-process `ASAPQueryEngine` over a sketch precompute
   store (DDSketch / KLL / HLL / CountSketch / Count-Min Sketch).
   Sub-millisecond responses with bounded `(ε, δ)` accuracy for
   control-plane-planned query shapes.
@@ -35,7 +35,7 @@ plan and the query's shape:
             ▼                               ▼
    ┌─────────────────┐             ┌────────────────────┐
    │   ASAP tier     │             │   archive tier     │
-   │   SimpleEngine  │             │   thanos-query     │
+   │ ASAPQueryEngine │             │   thanos-query     │
    │   (sketch state │             │   (Prometheus      │
    │   in RAM)       │             │    promql.Engine   │
    │                 │             │    over Gorilla    │
@@ -63,46 +63,40 @@ escalate.
 ## Repository layout
 
 ```
-ASAPQuery-backend/
-├── asap-common/              # Shared types + utilities
-│   └── dependencies/rs/
-│       ├── asap_types/         # StorageBackend enum, accuracy envelopes
-│       ├── promql_utilities/   # PromQL AST helpers
-│       └── ...
-├── asap-query-engine/        # The backend (this is the binary)
+ASAPQuery-backend/                 # Cargo workspace
+├── crates/                        # Shared workspace libraries
+│   ├── asap_types/                  # StorageBackend enum, accuracy envelopes
+│   ├── promql_utilities/            # PromQL AST helpers
+│   └── asap_otel_proto/             # OTLP protobuf bindings
+├── data_plane/                    # The query backend (binary; src/main.rs)
 │   └── src/
-│       ├── main.rs              # Entrypoint; wires engines and routing
-│       │                        # (also the Docker production entry —
-│       │                        # see deploy/docker/Dockerfile.backend
-│       │                        # in ASAPCollector)
-│       ├── bin/                 # auxiliary binaries (offline tests,
-│       │                        # logical-plan dumper)
-│       ├── query-engines/
-│       │   ├── simple/                # ASAP tier — SimpleEngine
-│       │   │                          # (33 PromQL pattern matchers)
-│       │   └── gorilla/               # archive tier
-│       │       ├── engine.rs            # in-process curated-subset
-│       │       │                        # (fallback when Thanos unset)
-│       │       ├── thanos_forward.rs    # ThanosForwardEngine — HTTP
-│       │       │                        # forwards to thanos-query
-│       │       ├── store.rs             # GorillaS3 chunk fetcher
-│       │       ├── postings.rs          # Postings index cache
-│       │       └── s3_cost.rs           # Per-engine S3 op counters
-│       ├── routing/
-│       │   ├── backend_storage_routing.rs  # Per-metric multi-target
-│       │   │                                # routing; hot-loaded
-│       │   └── engine_router.rs              # Query-shape dispatcher
-│       ├── stores/                # SimpleMapStore (warm sketch state)
-│       ├── precompute_operators/  # Per-sketch AggregateCore (query)
-│       ├── precompute_engine/     # Streaming pipeline (pane folding)
-│       └── drivers/
-│           └── query/servers/http.rs   # PromQL HTTP API surface
-├── asap-quickstart/          # Self-contained 5-min demo
-├── asap-summary-ingest/      # Optional alternative ingest path
-│                              #   (Arroyo pipelines for users who
-│                              #    prefer it over canonical OTLP
-│                              #    ingest from ASAPCollector)
-└── docs/                      # Design docs
+│       ├── main.rs                  # Entrypoint; wires engines and routing
+│       ├── query_engines/
+│       │   ├── asap_query_engine/     # warm/ASAP tier — ASAPQueryEngine
+│       │   ├── thanos_query_engine/   # archive tier — ThanosQueryEngine
+│       │   │                          #   (forward.rs HTTP-forwards to thanos-query)
+│       │   └── routing/               # EngineRouter + BackendStorageRouting
+│       ├── storage_engines/
+│       │   ├── sketch_db/             # SketchStore — warm sketch state
+│       │   │                          #   (index/ data/ query/ lifecycle/
+│       │   │                          #    persistence/ backfill/)
+│       │   ├── gorilla_object_store/  # GorillaS3Store + GorillaQueryEngine
+│       │   │                          #   (in-process archive fallback)
+│       │   └── types/                 # shared storage types
+│       ├── precompute_engine/         # Streaming pipeline (+ operators/)
+│       └── drivers/                   # ingest/, query/ (PromQL HTTP API),
+│                                      #   control_plane_client/
+├── control_plane/                 # In-repo control plane / planner (binary)
+│   └── src/
+│       ├── query_parser/            # PromQL/SQL parsing → intent algebra
+│       ├── intent_algebra/          # shared intent representation
+│       ├── sketch_algebra/          # sketch planning (+ rules/)
+│       ├── optimizer/               # plan optimization (cost/ + rules/)
+│       ├── physical/                # physical plan (colored_dag/)
+│       ├── emit/                    # per-runtime config emission
+│       └── opamp/                   # OpAMP server — pushes plans to runtimes
+├── benchmarks/                    # Benchmarks
+└── docs/                          # Design docs
 ```
 
 ## Where the planner lives
@@ -195,7 +189,7 @@ mode:
 | `CONTROLLER_BACKEND_ENDPOINT` | URL the controller pushes plans to | unset (static-config mode) |
 
 When `ASAP_THANOS_QUERY_URL` is set, the backend registers the
-`ThanosForwardEngine` and `BackendStorageRouting` can dispatch
+`ThanosQueryEngine` and `BackendStorageRouting` can dispatch
 archive queries to it. When unset, the backend falls back to the
 in-process curated-subset `GorillaQueryEngine`.
 

@@ -85,7 +85,7 @@ What the boundary has to cut:
 | Piece | Today's location | Who owns it after split |
 |---|---|---|
 | `Store` trait | `asap-query-engine/src/stores/traits.rs` | `sketch-db` (public) |
-| `SimpleMapStore` + LSM | `asap-query-engine/src/stores/sketch_db/simple_map_store/` | `sketch-db` (public) |
+| `SketchStore` + LSM | `asap-query-engine/src/stores/sketch_db/simple_map_store/` | `sketch-db` (public) |
 | `SchemaRegistry`, `AggSchema` | `asap-query-engine/src/stores/sketch_db/schema.rs` | `sketch-db` (public) |
 | Backfill types / worker / registry | `asap-query-engine/src/stores/sketch_db/backfill*.rs` | `sketch-db` (public) |
 | `AggregateCore` trait | `asap-query-engine/src/data_model/` | `sketch-db` (public trait) |

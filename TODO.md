@@ -153,7 +153,7 @@ data points). Specifically:
   `proto_delta` against their local snapshots, and the backend
   drops them as "delta-sketch arrived before any base snapshot"
   until the agent itself restarts. Persist to the existing
-  per-key disk layer used by `SimpleMapStore::with_persistence_per_key`,
+  per-key disk layer used by `SketchStore::with_persistence_per_key`,
   or add an OpAMP capability for backend → agent "send next
   frame as full state" signalling. Same item lives on the
   collector side
@@ -256,7 +256,7 @@ to `PERSIST_FORMAT_VERSION + 1` (self-updating if the version is bumped):
 - `backfill_v1_with_future_version_falls_back_and_rewrites_clean` — same
   contract for `BackfillRegistry`, including `next_job_id` field presence
   post-fallback.
-- `part_meta_with_future_version_returns_format_error` — `SimpleMapStore`
+- `part_meta_with_future_version_returns_format_error` — `SketchStore`
   `meta.bin` has no fallback (parts are opaque), so the contract is a
   clean `PersistError::Format("unsupported version ...")`.
 

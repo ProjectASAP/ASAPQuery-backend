@@ -53,10 +53,10 @@ not a name suffix.
 │ ASAPQuery-backend repo                                          │
 │                                                                  │
 │  asap-query-engine                                              │
-│    SimpleStore                                                  │
+│    SketchStore                                                  │
 │      indexed by aggregation_id (integer assigned by             │
 │        StreamingConfig::from_yaml_data on ingest)               │
-│    SimpleEngine query path                                      │
+│    ASAPQueryEngine query path                                   │
 │      PromQL → find_query_config (exact pattern match)           │
 │        ├─ hit: dispatch to aggregation_id                       │
 │        └─ miss: capability_matching by Statistic::{Sum,         │
@@ -64,8 +64,8 @@ not a name suffix.
 │                ├─ hit: dispatch to compatible aggregation       │
 │                └─ miss: fall through to BackendStorageRouting   │
 │                    ├─ shape ∈ [count, topk, rate_post_hoc]      │
-│                    │    → ThanosForwardEngine                   │
-│                    └─ else → SimpleEngine (404 if miss)         │
+│                    │    → ThanosQueryEngine                     │
+│                    └─ else → ASAPQueryEngine (404 if miss)      │
 │                                                                  │
 │ asap-common/                                                    │
 │   asap_types (StorageBackend, AggregationCapability, …)         │
@@ -118,14 +118,14 @@ Three structural problems:
 │    PrecomputeEngine                                             │
 │      receives OTLP (sketch payloads w/ raw metric names)        │
 │      may merge sketches across agents — otherwise pass-through  │
-│    SimpleStore                                                  │
+│    SketchStore                                                  │
 │      key: (raw_metric_name, raw_labels, capability_set)         │
 │      value: sketch state (encoded per the controller's plan)    │
 │    Query path                                                   │
 │      PromQL parse                                               │
 │      → controller.capability_for(metric, query_shape)           │
 │        ├─ Some(capability):                                     │
-│        │     SimpleStore.get(metric, labels, capability)        │
+│        │     SketchStore.get(metric, labels, capability)        │
 │        │       ├─ hit: return sketch result                     │
 │        │       └─ miss: forward to Thanos (raw fallback)        │
 │        └─ None (controller doesn't plan this query):            │
@@ -214,10 +214,10 @@ ASAP. ASAP's response carries `data_source: thanos_archive` for
 queries that fall through, `data_source: warm` for those that
 hit a sketch.
 
-### Phase 3 — Reindex SimpleStore by `(metric_name, labels, capability)` (2–3 days)
+### Phase 3 — Reindex SketchStore by `(metric_name, labels, capability)` (2–3 days)
 
-Today's `SimpleStore.get_aggregation(aggregation_id: u64)` becomes
-`SimpleStore.get(metric_name: &str, labels: &LabelSet, capability:
+Today's `SketchStore.get_aggregation(aggregation_id: u64)` becomes
+`SketchStore.get(metric_name: &str, labels: &LabelSet, capability:
 &Capability)`. Streaming-config ingest no longer assigns integer
 IDs; it stores under the natural tuple.
 
@@ -306,7 +306,7 @@ runs without referencing `asap-common`. ASAPQuery-backend's
 
 ## 4.5 Capability model — what the backend index keys on
 
-The controller's capability map and the backend's SimpleStore index
+The controller's capability map and the backend's SketchStore index
 share one type:
 
 ```rust
@@ -349,7 +349,7 @@ A single metric can have many entries — one per
 | (`http_requests_total_latency_ms`, `{zone}`, QuantileApprox(DDSketch)) | DD-2 |
 
 Query path: parse PromQL → derive `(metric, group_by, capability)` →
-SimpleStore.get() → hit (return sketch eval) or miss (forward raw to
+SketchStore.get() → hit (return sketch eval) or miss (forward raw to
 Thanos).
 
 ## 4.6 OTLP metadata model + backend store layout

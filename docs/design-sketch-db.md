@@ -96,7 +96,7 @@ partially wired; "❌ not started" means spec only.
 | § | Claim | Status | Evidence |
 |---|---|---|---|
 | 5.1 | `SketchEntry` with typed aux columns (count/sum/min/max) as first-class fields | ⚠️ partial | `PrecomputedOutput` carries origin but aux scalars live in the accumulator, not as record columns |
-| 5.2 | Primary key `(agg_id, window_start, group_key)` | ✅ | `SimpleMapStore` per-agg bucketing + per-key |
+| 5.2 | Primary key `(agg_id, window_start, group_key)` | ✅ | `SketchStore` per-agg bucketing + per-key |
 | 5.2 | Secondary index `(agg_id, group_key, window_start)` | ❌ | |
 | 5.3 | Label posting index (Roaring bitmaps) | ❌ | only label interning exists |
 | 6.1–6.2 | `AggSchema`, `AggStatus{Active,Retired,Expired}` | ✅ | `stores/sketch_db/schema.rs` |

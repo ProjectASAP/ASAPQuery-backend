@@ -27,14 +27,14 @@ pub struct FlightSqlServerConfig {
 
 pub struct FlightSqlServer {
     config: FlightSqlServerConfig,
-    query_engine: Arc<SimpleEngine>,
+    query_engine: Arc<ASAPQueryEngine>,
     store: Arc<dyn Store>,
 }
 
 impl FlightSqlServer {
     pub fn new(
         config: FlightSqlServerConfig,
-        query_engine: Arc<SimpleEngine>,
+        query_engine: Arc<ASAPQueryEngine>,
         store: Arc<dyn Store>,
     ) -> Self {
         Self {

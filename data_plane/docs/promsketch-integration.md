@@ -4,7 +4,7 @@
 
 QueryEngine supports two parallel data ingestion paths:
 
-1. **Precomputed pipeline**: A Kafka topic carrying pre-aggregated sketch buckets is consumed by `KafkaConsumer`, stored in `SimpleMapStore`, and served through the standard query path.
+1. **Precomputed pipeline**: A Kafka topic carrying pre-aggregated sketch buckets is consumed by `KafkaConsumer`, stored in `SketchStore`, and served through the standard query path.
 2. **Raw sample pipeline (Prometheus Remote Write)**: A standalone HTTP endpoint (`/api/v1/write`) accepts standard Prometheus remote write requests (Snappy-compressed protobuf). Decoded samples are inserted into `PromSketchStore` (which maintains live EHUniv, EHKLL, and USampling sketch instances per series) and served through the sketch query path.
 
 When a query arrives, the engine tries the sketch path first, then falls through to the precomputed path, and finally (optionally) to a remote Prometheus server.
@@ -20,21 +20,21 @@ Raw Samples Path (Prometheus Remote Write):
                                                                    (EHUniv, EHKLL, USampling)
 
 Precomputed Path:
-  Prometheus --> PrecomputeEngine --> Kafka [precomputed] --> KafkaConsumer --> SimpleMapStore
+  Prometheus --> PrecomputeEngine --> Kafka [precomputed] --> KafkaConsumer --> SketchStore
 
 Query Path:
-  HTTP Request --> SimpleEngine
+  HTTP Request --> ASAPQueryEngine
                      |-- (1) handle_sketch_query_promql() --> PromSketchStore.eval_matching()
-                     |-- (2) precomputed pipeline (SimpleMapStore)
+                     |-- (2) precomputed pipeline (SketchStore)
                      +-- (3) fallback --> Prometheus server
 ```
 
 ## 3. Query Routing
 
-When a PromQL query arrives, `SimpleEngine` dispatches it as follows:
+When a PromQL query arrives, `ASAPQueryEngine` dispatches it as follows:
 
 1. **PromSketch path** — `handle_sketch_query_promql()` parses the query (AST first, regex fallback for custom functions). If the function name is in `promsketch_func_map` and the `PromSketchStore` has matching series data, results are returned immediately.
-2. **Precomputed path** — If the sketch path returns `None` (function not sketch-backed, no store configured, or no matching series), the query falls through to `SimpleMapStore`.
+2. **Precomputed path** — If the sketch path returns `None` (function not sketch-backed, no store configured, or no matching series), the query falls through to `SketchStore`.
 3. **Prometheus fallback** — If `--forward-unsupported-queries` is set and the precomputed path also misses, the query is forwarded to the remote Prometheus server.
 
 ### Sketch-Backed Functions (13 total)

@@ -72,7 +72,7 @@ sequenceDiagram
     A->>A: Build sketches (SQL pipeline)
     A->>K: Produce sketches
     K->>Q: Consume sketches
-    Q->>Q: Store in SimpleMapStore
+    Q->>Q: Store in SketchStore
 ```
 
 **Step-by-step:**
@@ -84,7 +84,7 @@ sequenceDiagram
 5. **Arroyo** executes SQL pipelines that build sketches in real-time (configured by **ArroyoSketch**)
 6. **Arroyo** produces sketches to **Kafka** output topic
 7. **QueryEngine** consumes sketches from **Kafka**
-8. **QueryEngine** stores sketches in **SimpleMapStore** (in-memory)
+8. **QueryEngine** stores sketches in **SketchStore** (in-memory)
 
 **Data format transformations:**
 - **Exporter → Prometheus**: Prometheus exposition format (text)
@@ -100,7 +100,7 @@ How queries are executed:
 sequenceDiagram
     participant G as Grafana
     participant Q as QueryEngine
-    participant S as SimpleMapStore
+    participant S as SketchStore
     participant P as Prometheus
 
     G->>Q: PromQL query (HTTP)
@@ -110,7 +110,7 @@ sequenceDiagram
     alt Supported query
         Q->>S: Fetch sketches
         S->>Q: Return sketches
-        Q->>Q: Execute query (SimpleEngine)
+        Q->>Q: Execute query (ASAPQueryEngine)
         Q->>G: Approximate result
     else Unsupported query
         Q->>P: Forward query (fallback)
@@ -123,9 +123,9 @@ sequenceDiagram
 
 1. **Grafana** sends PromQL query to **QueryEngine** (port 8088)
 2. **PrometheusHttpAdapter** parses the HTTP request and extracts the query
-3. **SimpleEngine** checks if the query can be answered with sketches
+3. **ASAPQueryEngine** checks if the query can be answered with sketches
 4. **If supported:**
-   - Fetch relevant sketches from **SimpleMapStore**
+   - Fetch relevant sketches from **SketchStore**
    - Execute query using sketch operations
    - Format result as Prometheus-compatible JSON
 5. **If unsupported:**
@@ -248,54 +248,24 @@ graph LR
 ## Repository Structure
 
 ```
-ASAPQuery/
-├── asap-query-engine/        # Rust query processor
-│   ├── src/
-│   │   ├── drivers/          # Ingest, query adapters, servers
-│   │   ├── query-engines/    # Query execution (SimpleEngine)
-│   │   ├── stores/           # Data storage (SimpleMapStore)
-│   │   ├── data_model/       # Core data structures
-│   │   ├── precompute_operators/  # Sketch operators
-│   │   └── tests/            # Integration tests
-│   └── docs/                 # QueryEngine dev docs
-│
-├── asap-summary-ingest/       # Pipeline configurator
-│   ├── run_arroyosketch.py   # Main script
-│   ├── templates/            # Jinja2 SQL templates
-│   └── utils/                # Arroyo API client
-│
-├── (Planner: lives in ASAPCollector/controller/, deleted from this
-│    repo in Phase γ — see https://github.com/ProjectASAP/ASAPCollector)
-│
-├── asap-tools/               # Experiment framework & tooling
-│   ├── data-sources/
-│   │   └── prometheus-exporters/ # Metric generators
-│   │       ├── fake_exporter/        # Rust/Python fake exporters
-│   │       ├── cluster_data_exporter/  # Real trace data
-│   │       ├── query_cost_exporter/  # Resource metrics
-│   │       └── query_latency_exporter/  # Latency metrics
-│   ├── queriers/
-│   │   └── prometheus-client/    # PromQL query client
-│   ├── experiments/
-│   │   ├── experiment_run_e2e.py  # Main orchestrator
-│   │   ├── config/           # Hydra configs
-│   │   ├── experiment_utils/ # Services, providers
-│   │   └── post_experiment/  # Analysis scripts
-│   └── docs/                 # asap-tools dev docs
-│
-├── asap-common/              # Shared libraries
-│   ├── dependencies/
-│   │   ├── rs/               # Rust shared crates
-│   │   └── py/               # Python shared packages
-│   └── sketch-core/          # Core sketch library (Rust)
-│
-├── asap-quickstart/          # Self-contained demo
-│   ├── docker-compose.yml    # Demo stack
-│   └── config/               # Demo configs
-│
-└── docs/                     # Developer documentation (this)
+ASAPQuery-backend/                 # Cargo workspace
+├── crates/                        # Shared workspace libraries
+│   ├── asap_types/                  # StorageBackend enum, accuracy envelopes
+│   ├── promql_utilities/            # PromQL AST helpers
+│   └── asap_otel_proto/             # OTLP protobuf bindings
+├── data_plane/                    # Query backend (binary)
+│   └── src/
+│       ├── drivers/                 # ingest, query adapters/servers, control_plane_client
+│       ├── query_engines/           # ASAPQueryEngine (warm) + ThanosQueryEngine (archive) + routing
+│       ├── storage_engines/         # SketchStore (sketch_db) + gorilla_object_store + types
+│       ├── precompute_engine/       # Streaming pipeline (+ operators/)
+│       └── tests/                   # Integration tests
+├── control_plane/                 # In-repo control plane / planner (binary)
+│   └── src/                         # query_parser, intent_algebra, sketch_algebra,
+│                                    #   optimizer, physical, emit, opamp
+├── benchmarks/                    # Benchmarks
+└── docs/                          # Developer documentation (this)
     ├── 01-getting-started/
     ├── 02-components/
-    ├── 03-how-to-guides/
-    └── 04-development/
+    └── 03-how-to-guides/
 ```

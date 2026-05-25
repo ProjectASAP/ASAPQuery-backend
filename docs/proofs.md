@@ -212,7 +212,7 @@ so $|\hat a - \sigma(S)| \le \max_i B_i$.
 non-combinable arm of the `match`). The contract is that `Partial`
 is **not** a single-schema answer; the caller (the engine) routes
 non-combinable cases to fallback per
-`SimpleEngine::try_handle_query_promql_via_timeline`. There is
+`ASAPQueryEngine::try_handle_query_promql_via_timeline`. There is
 nothing further to prove.
 
 ### 2.4 Caveats
@@ -266,7 +266,7 @@ nothing further to prove.
     (L2.1).
   - `AggSchema::config` — pinned-at-creation invariant (caveat 1).
 - `asap-query-engine/src/query-engines/asap_query/engine.rs`
-  - `SimpleEngine::try_handle_query_promql_via_timeline` — caller
+  - `ASAPQueryEngine::try_handle_query_promql_via_timeline` — caller
     that wires per-segment evaluation into `combine_statistic`.
 - `asap-query-engine/src/stores/sketch_db/accuracy.rs`
   - `AccuracyProfile::derive` — source of $B_i$ (L2.6).
@@ -333,10 +333,10 @@ the payload from `by_group`; samples blocked at L3.3 are not in
 `by_group`). Workers have no other ingest channel.
 
 **L3.6 — Queries read only what workers wrote.** The store
-(`SimpleMapStore` and friends, `asap-query-engine/src/stores/`)
+(`SketchStore` and friends, `asap-query-engine/src/stores/`)
 exposes no API that returns samples not previously written through
 `insert_precomputed_output_batch`. Queries flow through
-`SimpleEngine::query_*`, which read the same store the workers
+`ASAPQueryEngine::query_*`, which read the same store the workers
 wrote into.
 
 ### 3.3 Proof

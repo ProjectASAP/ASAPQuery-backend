@@ -1,8 +1,8 @@
-# Design: SimpleMapStore Persistence (Memory Limit + Disk Flush)
+# Design: SketchStore Persistence (Memory Limit + Disk Flush)
 
 ## Problem
 
-`SimpleMapStore` (`asap-query-engine/src/stores/simple_map_store/`) is currently an
+`SketchStore` (`asap-query-engine/src/stores/simple_map_store/`) is currently an
 in-memory-only store. Under long-running ingest it grows unboundedly: every sealed
 window for every `(aggregation_id, group_key)` is held in `DashMap<u64, RwLock<StoreKeyData>>`
 until one of the three existing `CleanupPolicy` variants (`CircularBuffer`,
@@ -19,7 +19,7 @@ persist it. That creates two problems:
 2. **No durability.** Cold data (older than the query working set) still occupies
    RAM even though most queries hit only the last few minutes.
 
-We want `SimpleMapStore` to replace the existing cleanup-policy knob with a
+We want `SketchStore` to replace the existing cleanup-policy knob with a
 single persistence policy driven by **two** knobs, in priority order:
 
 1. **Primary — memory budget.** A configurable hard ceiling on in-memory sketch
@@ -34,14 +34,14 @@ Flushed sketches are read back transparently at query time.
 
 Scope is **single-node, single-process**. Replication, sharding, compression,
 and query pushdown into segments are explicitly out of scope for v1. The three
-existing destructive `CleanupPolicy` variants are removed from `SimpleMapStore`
+existing destructive `CleanupPolicy` variants are removed from `SketchStore`
 (the enum stays in `asap_types` for any other store that still uses it).
 
 ---
 
 ## Current shape (relevant facts)
 
-- `SimpleMapStorePerKey` (`per_key.rs:160`) keeps per-agg-id state in
+- `SketchStorePerKey` (`per_key.rs:160`) keeps per-agg-id state in
   `DashMap<u64, Arc<RwLock<StoreKeyData>>>`.
 - Each `StoreKeyData` has a `current_epoch` (actively being written) and
   `sealed_epochs: BTreeMap<epoch_id, Epoch>` (`per_key.rs`).
@@ -53,7 +53,7 @@ existing destructive `CleanupPolicy` variants are removed from `SimpleMapStore`
 - Query hot path: `query_precomputed_output{,_exact}` iterates
   `current_epoch` + `sealed_epochs` under `RwLock::read`.
 - `CleanupPolicy` (`asap_types::enums`) currently has three destructive variants
-  (`CircularBuffer`, `ReadBased`, `NoCleanup`); `SimpleMapStore` will stop
+  (`CircularBuffer`, `ReadBased`, `NoCleanup`); `SketchStore` will stop
   taking a `CleanupPolicy` at all and use the new persistence config instead.
   The enum itself stays in `asap_types` for other stores.
 
@@ -241,7 +241,7 @@ knobs match the priority order in the problem statement: **memory budget
 first, time watermark second**.
 
 ```rust
-pub struct SimpleMapStorePersistenceConfig {
+pub struct SketchStorePersistenceConfig {
     // ---- Primary: memory budget ----
     //
     // High-water mark. When the store's tracked in-memory sketch bytes
@@ -287,7 +287,7 @@ pub struct SimpleMapStorePersistenceConfig {
 }
 ```
 
-`SimpleMapStorePerKey::new` now takes a `SimpleMapStorePersistenceConfig`
+`SketchStorePerKey::new` now takes a `SketchStorePersistenceConfig`
 instead of a `CleanupPolicy`. There is no "persistence disabled" escape
 hatch — this is now the only cleanup mechanism this store has. If someone
 wants the old in-memory-only behavior, they can set `hot_window_ms = None`
@@ -323,7 +323,7 @@ Rationale:
 ### Background flusher
 
 A dedicated `std::thread` owned by the store, started in
-`SimpleMapStorePerKey::new`. Each tick, it checks the primary trigger
+`SketchStorePerKey::new`. Each tick, it checks the primary trigger
 (memory) first, the secondary trigger (time watermark), then the
 disk-retention sweep:
 
@@ -520,7 +520,7 @@ because:
 Sync I/O keeps the store out of Tokio's executor entirely, keeps stack
 traces readable, and eliminates a class of "why is my future not making
 progress" failure modes. The flusher thread is `std::thread::spawn`'d in
-`SimpleMapStorePerKey::new` and joined in `close`, with a `shutdown`
+`SketchStorePerKey::new` and joined in `close`, with a `shutdown`
 flag checked on each loop iteration.
 
 ### Query path
@@ -594,7 +594,7 @@ always the part directory on disk — the cache is a pure optimization,
 drop-anytime, never dirty. Managed by the query path, not the flusher.
 
 ```rust
-pub struct SimpleMapStorePersistenceConfig {
+pub struct SketchStorePersistenceConfig {
     // ... existing fields ...
 
     // Read-side part cache. Bounded independently of
@@ -714,22 +714,22 @@ No lock of any kind is held across a `fsync` or disk I/O.
 
 Changes:
 
-- `SimpleMapStorePerKey::new` no longer takes a `CleanupPolicy`; it takes a
-  `SimpleMapStorePersistenceConfig`. The three destructive cleanup variants
+- `SketchStorePerKey::new` no longer takes a `CleanupPolicy`; it takes a
+  `SketchStorePersistenceConfig`. The three destructive cleanup variants
   (`CircularBuffer`, `ReadBased`, `NoCleanup`) are no longer wired into this
   store at all. The code paths in `per_key.rs` that branch on
   `CleanupPolicy` (`cleanup_old_aggregates`, `maybe_rotate_epoch`'s retention
   logic) are deleted in favor of the flusher.
-- Call sites that construct `SimpleMapStore::new_with_strategy(..., cleanup_policy, ...)`
-  update to pass a `SimpleMapStorePersistenceConfig` instead. Main.rs and any
+- Call sites that construct `SketchStore::new_with_strategy(..., cleanup_policy, ...)`
+  update to pass a `SketchStorePersistenceConfig` instead. Main.rs and any
   tests that construct the store directly will need to change.
 
 Does not change:
 
 - The `CleanupPolicy` enum itself stays in `asap_types` — other stores
   (`promsketch_store`, legacy paths) may still reference it. This PR only
-  severs `SimpleMapStore`'s dependency on it.
-- `SimpleMapStoreGlobal` is intentionally left in-memory-only. Persistence
+  severs `SketchStore`'s dependency on it.
+- `SketchStoreGlobal` is intentionally left in-memory-only. Persistence
   targets `PerKey`, which is the production path. Adding it to `Global` is a
   small follow-up if anyone needs it.
 - Query planning, the control plane client, and the precompute engine's output
@@ -744,7 +744,7 @@ the pieces can be reviewed independently:
 
 1. **Sizing + config plumbing + cleanup-policy removal.** Add
    `approx_memory_bytes` to `AggregateCore` and all concrete accumulators.
-   Add `SimpleMapStorePersistenceConfig`. Track `mem_bytes_in_use`. Rip the
+   Add `SketchStorePersistenceConfig`. Track `mem_bytes_in_use`. Rip the
    `CleanupPolicy` branches out of `per_key.rs` and update call sites. No
    disk I/O yet — expose the memory counter in `StoreDiagnostics` so we can
    validate sizing in isolation and be confident nothing else regressed.
