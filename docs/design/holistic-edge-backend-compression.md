@@ -32,10 +32,14 @@ Benchmark headline (real Chimp/Serf datasets, lossless, block-avg 1000/chunk):
   idea, on the integer-scaled values. **NOTE on the magnitude:** the
   VictoriaMetrics `lib/encoding` number (~4.8× avg) included zstd-wrapping on
   some series; since we decided **no zstd** (§5), the realized win is the
-  **no-zstd FOR+delta codec measured in PR #434 (`asap-gorilla-go/intchunk`):
-  ~2.2–3.6× on fixed-decimal** (City-temp 2.8×, Dew-point 2.9×, Stocks 2.7×,
-  Wind 3.6×). A `varint`-residual refinement (vs fixed-width packing) is being
-  added to push toward ~3×+ without zstd.
+  **no-zstd best-of-N codec measured in PR #434 (`asap-gorilla-go/intchunk`):
+  ~2.33× aggregate on fixed-decimal** (up to ~3.6× per series — Wind 3.6×,
+  Dew-point 2.9×, City-temp 2.8×, Stocks 2.7×). The codec tries fixed-width AND
+  zigzag-varint residuals (×{delta, delta-of-delta}) plus Gorilla and keeps the
+  smallest; varint helps skewed blocks but only nudged the aggregate (2.22→2.33×).
+  **Bottom line: no-zstd cold compression caps ~2.3×; the 4.8× genuinely needs
+  zstd, which we excluded.** Gorilla-XOR remains the lossless fallback for true
+  high-precision floats.
 - Genuinely high-precision float (float32-derived, 15 sig digits): VM can't
   stay decimal-exact → falls back to bit-pattern (worse); **Gorilla-XOR wins**.
 - ⇒ The codec must be a per-block **best-of-N including Gorilla-XOR**, not
@@ -545,9 +549,9 @@ different times; each is validated on-cluster via the auto build-and-load deploy
 **Phase 3 — cold custom codec + read path**
 - **PR5 — cold INT best-of-N codec library** (§1.2–1.4): `{Gorilla-XOR,
   INT_FOR_DELTA, INT_FOR_DOD}` + decimal-exactness guard + chunk header +
-  overflow chunk-cut. Standalone lib + lossless round-trip tests; no deploy. ROI
-  ~2.2–3.6× no-zstd (PR #434, merged-pending; varint-residual refinement to
-  reach ~3×+). No deps — `∥ Phase 1/2`.
+  overflow chunk-cut + zigzag-varint residual sub-codecs in the best-of-N.
+  Standalone lib + lossless round-trip tests; no deploy. ROI ~2.33× aggregate
+  no-zstd (PR #434). No deps — `∥ Phase 1/2`.
 - **PR6 — decode-on-read StoreAPI** (§1.5–1.6): gorilla-merger stores custom
   chunks (write = no decode) + decodes → XOR `AggrChunk` at query; coexists with
   existing gorilla blocks. Deps PR5.
