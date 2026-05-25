@@ -367,6 +367,62 @@ pub fn collect_metric_to_grouping_labels(
     out
 }
 
+/// Sibling of [`collect_metric_to_grouping_labels`]: walk every registry
+/// entry and return the per-metric **sampling probability** map the L5
+/// edge emitter drops into [`crate::physical::colored_dag::emitter::EdgeStageConfig::metric_to_sample_p`].
+///
+/// Only metrics whose workload sets a `sample_p` in `(0, 1)` are
+/// included — `1.0` (the default / sampling-disabled) and out-of-range
+/// values are skipped, so the map stays empty when no metric requests
+/// sampling and the emitted agent config (hence the on-wire sketch bytes)
+/// is byte-identical to the pre-sampling format. The edge emitter's
+/// `insert_sample_p` re-guards the range defensively.
+///
+/// As with the sibling collectors, an entry is only honoured when its
+/// metric was successfully pre-populated into the workload store, keeping
+/// the emit aligned with what the backend knows about. When a metric
+/// carries multiple roles the FIRST registered entry's `sample_p` wins
+/// (in practice all share it, since the field lives on the WorkloadEntry).
+///
+/// A `p <= 0` or `p > 1` value is logged and skipped rather than emitted,
+/// so a typo degrades to "no sampling" instead of a mis-scaled sketch.
+///
+/// NOTE: this is a static operator-set knob. A dynamic, optimizer-driven
+/// `p` (tuned online against an accuracy/bandwidth budget from runtime
+/// samples) is a deliberate follow-up and is out of scope here.
+pub fn collect_metric_to_sample_p(
+    registry: &WorkloadRegistry,
+    workload_store: &WorkloadStore,
+) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    for entry in registry.entries() {
+        if workload_store
+            .get_all_for_metric(&entry.metric_name)
+            .into_iter()
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        let p = entry.sample_p;
+        if p >= 1.0 {
+            // Sampling disabled (the default) — emit nothing so the wire
+            // bytes stay byte-identical.
+            continue;
+        }
+        if p <= 0.0 || !p.is_finite() {
+            tracing::warn!(
+                metric = %entry.metric_name,
+                sample_p = p,
+                "ignoring out-of-range sample_p (must be in (0, 1]); treating metric as unsampled"
+            );
+            continue;
+        }
+        out.entry(entry.metric_name.clone()).or_insert(p);
+    }
+    out
+}
+
 /// Issue #298 — sibling of [`collect_metric_to_family`] /
 /// [`collect_metric_to_grouping_labels`]: walk every registry entry and
 /// return the deduped list of metrics whose workload(s) classify as
@@ -488,6 +544,7 @@ mod runtime_tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: std::collections::HashMap::new(),
         };
 
         let collector = emit_for_runtime(
@@ -525,6 +582,7 @@ mod runtime_tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: std::collections::HashMap::new(),
         };
         let yaml = emit_for_runtime(
             AgentRuntime::AsapOtap,
@@ -560,6 +618,7 @@ mod runtime_tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: std::collections::HashMap::new(),
         };
         let toml = emit_for_runtime(
             AgentRuntime::AsapTelegraf,
@@ -898,6 +957,7 @@ mod runtime_tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: std::collections::HashMap::new(),
         };
         edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
 

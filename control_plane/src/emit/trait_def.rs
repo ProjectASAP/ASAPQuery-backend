@@ -212,6 +212,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         }
     }
 

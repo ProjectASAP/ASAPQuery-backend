@@ -250,6 +250,9 @@ pub fn emit_edge_yaml(
             clamp_window_secs(cfg.window_secs),
             &cfg.label_filters,
             cfg.source_metric.as_deref(),
+            cfg.source_metric
+                .as_deref()
+                .and_then(|m| cfg.metric_to_sample_p.get(m).copied()),
         );
         // Use the processor_name verbatim as the YAML key — matches the
         // factory `Type` strings the patched OTel-contrib build registers
@@ -1064,10 +1067,19 @@ fn emit_edge_yaml_5sketch_routing(
         // processor in the routed YAML inherits the unclamped 300s
         // window from `[5m]` queries.
         let clamped_window = clamp_window_secs(cfg.window_secs);
+        // Per-metric sampling probability for the metric routed to this
+        // family (keyed by the same `metric_name_hint` used above).
+        let sample_p = metric_name_hint.and_then(|m| cfg.metric_to_sample_p.get(m).copied());
         let block = if let Some(sp) = family_to_proc.get(&kind) {
-            build_edge_processor_block(sp, clamped_window, &cfg.label_filters, metric_name_hint)
+            build_edge_processor_block(
+                sp,
+                clamped_window,
+                &cfg.label_filters,
+                metric_name_hint,
+                sample_p,
+            )
         } else {
-            build_default_edge_processor_block(&kind, clamped_window, metric_name_hint)
+            build_default_edge_processor_block(&kind, clamped_window, metric_name_hint, sample_p)
         };
         processors.insert(processor_name.to_string(), block);
     }
@@ -1830,6 +1842,13 @@ fn emit_edge_yaml_asap_edge(
                     }
                 }
             }
+            // Per-metric sampling: emit `sample_p` for the sampling-aware
+            // families (CMS / HLL) only when `p < 1.0`. Mirrors
+            // `build_edge_processor_block`'s guarded emit so an unset /
+            // 1.0 probability keeps the fused entry byte-identical.
+            if matches!(kind, SketchKind::Cms | SketchKind::Hll) {
+                insert_sample_p(&mut e, cfg.metric_to_sample_p.get(*metric).copied());
+            }
             // Sketch family IS a warm entry → warm signal = true.
             e.insert(
                 "tier".into(),
@@ -2161,6 +2180,7 @@ fn build_default_edge_processor_block(
     kind: &SketchKind,
     window_secs: Option<u64>,
     metric_name_hint: Option<&str>,
+    sample_p: Option<f64>,
 ) -> Value {
     use crate::sketch_algebra::params::{
         CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams,
@@ -2182,7 +2202,7 @@ fn build_default_edge_processor_block(
         sketch_params: params,
         aggregation_id: format!("agg_default_{}", sketch_kind_tag(kind)),
     };
-    build_edge_processor_block(&synthetic, window_secs, &[], metric_name_hint)
+    build_edge_processor_block(&synthetic, window_secs, &[], metric_name_hint, sample_p)
 }
 
 /// Resolve an `ExportTarget` to a concrete `endpoint:port` string. Phase
@@ -2220,6 +2240,7 @@ fn build_edge_processor_block(
     window_secs: Option<u64>,
     label_filters: &[(String, String)],
     metric_name_hint: Option<&str>,
+    sample_p: Option<f64>,
 ) -> Value {
     let mut m = Mapping::new();
 
@@ -2279,6 +2300,9 @@ fn build_edge_processor_block(
             // patched build hard-codes p=14); nothing further to set.
             m.insert("encoding".into(), Value::String("msgpack".into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
+            // Per-metric sampling: HLL's processor honours `sample_p`
+            // (hash-threshold element sampling in sketchlib-go).
+            insert_sample_p(&mut m, sample_p);
         }
         SketchParams::Cms(p) => {
             m.insert(
@@ -2293,6 +2317,9 @@ fn build_edge_processor_block(
             m.insert("columns".into(), Value::Number((p.w as u64).into()));
             m.insert("encoding".into(), Value::String("msgpack".into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
+            // Per-metric sampling: the CMS processor honours `sample_p`
+            // (geometric admission sampling in sketchlib-go).
+            insert_sample_p(&mut m, sample_p);
         }
         SketchParams::CountSketch(p) => {
             // Translate (w, d) to the legacy (epsilon, delta) surface
@@ -2308,6 +2335,23 @@ fn build_edge_processor_block(
     }
 
     Value::Mapping(m)
+}
+
+/// Write the per-metric `sample_p` knob onto a sketch-processor block,
+/// but ONLY when sampling is actually requested (`p < 1.0`).
+///
+/// `None` or `p >= 1.0` (the default / disabled state) emits no key, so
+/// the agent processor's `Config.Validate` normalises the unset field to
+/// `1.0` (sampling disabled) and the emitted YAML — hence the on-wire
+/// sketch bytes — stays byte-identical to the pre-sampling format. Values
+/// outside `(0, 1]` are dropped here too (the planner validates the range
+/// before populating `metric_to_sample_p`, so this is a defensive guard).
+fn insert_sample_p(m: &mut Mapping, sample_p: Option<f64>) {
+    if let Some(p) = sample_p {
+        if p > 0.0 && p < 1.0 {
+            m.insert("sample_p".into(), Value::Number(p.into()));
+        }
+    }
 }
 
 /// Compute the gateway-side merge processor name for a `GatewayMergeProcessor`.
@@ -2528,6 +2572,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         }
     }
 
@@ -3509,6 +3554,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -3856,6 +3902,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         }
     }
 
@@ -3870,6 +3917,64 @@ mod tests {
                 "missing top-level processor key {proc}\n{yaml}"
             );
         }
+    }
+
+    #[test]
+    fn mvp46_default_emits_no_sample_p() {
+        // Default fixture (metric_to_sample_p empty) must NOT emit any
+        // `sample_p` knob — keeps the agent config byte-identical to the
+        // pre-sampling format when no metric requests sampling.
+        let _env = crate::test_support::env_lock();
+        let cfg = five_sketch_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("sample_p"),
+            "default (unset) sample_p must not appear in the emitted YAML\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn mvp46_configured_sample_p_reaches_cms_and_hll_blocks() {
+        // A configured per-metric `sample_p < 1` must be threaded into the
+        // emitted agent sketch-processor config for the sampling-aware
+        // families (CMS / HLL). This is the control-plane half of the
+        // end-to-end path: workload `sample_p` → EdgeStageConfig.
+        // metric_to_sample_p → build_edge_processor_block → agent YAML →
+        // processor Config.SampleP → sketchlib-go WithSampleP.
+        let _env = crate::test_support::env_lock();
+        let mut cfg = five_sketch_edge_cfg();
+        // endpoint_request_freq → CMS, unique_users_per_min → HLL.
+        cfg.metric_to_sample_p
+            .insert("endpoint_request_freq".into(), 0.1);
+        cfg.metric_to_sample_p
+            .insert("unique_users_per_min".into(), 0.25);
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+
+        // The CMS block carries sample_p: 0.1.
+        assert!(
+            yaml.contains("sample_p: 0.1"),
+            "CMS sample_p 0.1 did not reach the emitted YAML\n{yaml}"
+        );
+        // The HLL block carries sample_p: 0.25.
+        assert!(
+            yaml.contains("sample_p: 0.25"),
+            "HLL sample_p 0.25 did not reach the emitted YAML\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn mvp46_sample_p_of_one_emits_nothing() {
+        // sample_p == 1.0 is the disabled state — even when present in the
+        // map it must emit no knob (insert_sample_p guards on `< 1.0`).
+        let _env = crate::test_support::env_lock();
+        let mut cfg = five_sketch_edge_cfg();
+        cfg.metric_to_sample_p
+            .insert("endpoint_request_freq".into(), 1.0);
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
+        assert!(
+            !yaml.contains("sample_p"),
+            "sample_p == 1.0 must not be emitted\n{yaml}"
+        );
     }
 
     #[test]
@@ -4147,6 +4252,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         }
     }
 
@@ -5307,6 +5413,7 @@ mod tests {
                 "http://gorilla-merger:10908/ingest/gorilla".into(),
             ),
             cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
+            metric_to_sample_p: HashMap::new(),
         }
     }
 
@@ -5573,6 +5680,7 @@ mod tests {
             cumulative_counter_metrics: Vec::new(),
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
         };
 
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");

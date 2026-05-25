@@ -268,6 +268,28 @@ pub struct EdgeStageConfig {
     /// `ASAP_CLUSTER`, defaulting to `asap-mvp`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cold_external_labels: Vec<(String, String)>,
+    /// Per-metric sketch **sampling probability** `p` in `(0, 1]`,
+    /// populated by the planner from each workload entry's
+    /// [`crate::workload::WorkloadEntry::sample_p`].
+    ///
+    /// The L5 edge emitter reads this in `build_edge_processor_block` and
+    /// writes a `sample_p: <p>` knob onto the matching metric's
+    /// sketch-processor block ONLY when `p < 1.0`. A metric absent from
+    /// this map (or mapped to `1.0`) emits no `sample_p` key, so the
+    /// agent's processor `Config.Validate` normalises the unset field to
+    /// `1.0` (sampling disabled) and the wire bytes stay byte-identical to
+    /// the pre-sampling format.
+    ///
+    /// Activates the warm-sketch sampling layer the agent's sketch
+    /// processors carry (sketchlib-go geometric / hash-threshold sampling):
+    /// the encoder admits a `p` fraction of updates, stores the RAW
+    /// sampled state + `p`, and the backend rescales count-like estimates
+    /// by `1/p` at query time. This is a static operator-set knob; an
+    /// optimizer-driven dynamic `p` is a follow-up (out of scope here).
+    ///
+    /// Empty map (default) ⇒ no metric carries sampling — backward-compat.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metric_to_sample_p: HashMap<String, f64>,
 }
 
 /// Named default for [`EdgeStageConfig::cold_ship_endpoint`].
@@ -573,6 +595,7 @@ impl Emitter for ThreeStageEmitter {
             // post-emit (same pattern as `exporter_target`).
             cold_ship_endpoint: Some(default_cold_ship_endpoint()),
             cold_external_labels: default_cold_external_labels(),
+            metric_to_sample_p: HashMap::new(),
         };
         let mut backend_aggregations: Vec<BackendAggregation> = Vec::new();
         let mut gateway_processors: Vec<GatewayMergeProcessor> = Vec::new();

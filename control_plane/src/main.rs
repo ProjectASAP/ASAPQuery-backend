@@ -615,6 +615,8 @@ async fn handle_plan(
             sketch_family_override: workload.sketch_type_override.clone(),
             target_path: None,
             grouping_labels: workload.group_by_labels.clone(),
+            // Role derivation does not depend on sampling; default 1.0.
+            sample_p: 1.0,
         };
         control_plane::workload::derive_agg_role(&entry)
     };
@@ -1277,6 +1279,15 @@ async fn emit_bootstrap_typed(
     // per-window SumAccumulator into Σ-of-cumulatives, breaking
     // `sum by (zone) (http_requests_total)` (~300× baseline pre-fix).
     edge_cfg.cumulative_counter_metrics = emit::collect_cumulative_counter_metrics(
+        &st.workload_registry,
+        &st.workload_store,
+    );
+    // Per-metric sketch sampling probability — companion stitch: maps
+    // each metric whose workload set `sample_p < 1` to its probability so
+    // the L5 edge emitter writes a `sample_p` knob onto the metric's
+    // CMS / HLL sketch-processor block. Empty when nothing is sampled
+    // (the default) ⇒ byte-identical agent config.
+    edge_cfg.metric_to_sample_p = emit::collect_metric_to_sample_p(
         &st.workload_registry,
         &st.workload_store,
     );

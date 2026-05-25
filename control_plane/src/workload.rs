@@ -214,10 +214,39 @@ pub struct WorkloadEntry {
     /// pre-B3 (no allowlist injected).
     #[serde(default)]
     pub grouping_labels: Vec<String>,
+    /// Optional per-metric sketch sampling probability `p` in `(0, 1]`.
+    ///
+    /// Activates the warm-sketch sampling layer (geometric admission for
+    /// the frequency families / hash-threshold for HLL) the agent's
+    /// sketch processors carry: the encoder admits a `p` fraction of
+    /// updates, stores the RAW sampled state, stamps `p` on the
+    /// `SketchEnvelope`, and the backend rescales count-like estimates by
+    /// `1/p` at query time. `1.0` (the default — also the value `0`/unset
+    /// normalises to) disables sampling so the emitted agent config and
+    /// wire bytes are byte-identical to today.
+    ///
+    /// Today this is a static operator-set knob; a dynamic
+    /// optimizer-driven `p` (tuned from runtime samples against an
+    /// accuracy/bandwidth budget) is a follow-up and is intentionally out
+    /// of scope here.
+    ///
+    /// Threaded into `EdgeStageConfig::metric_to_sample_p` by the registry
+    /// pre-pop loop in `main`, which the L5 edge emitter reads in
+    /// `build_edge_processor_block` and writes onto the per-metric
+    /// sketch-processor block (`sample_p`) only when `< 1.0`.
+    #[serde(default = "default_sample_p")]
+    pub sample_p: f64,
 }
 
 fn default_accuracy_sla() -> f64 {
     0.01
+}
+
+/// Default per-metric sampling probability — `1.0` (sampling disabled,
+/// exact). Keeps the emitted config byte-identical to pre-sampling when a
+/// workload entry omits `sample_p`.
+fn default_sample_p() -> f64 {
+    1.0
 }
 fn default_role() -> String {
     "agent".into()
@@ -361,6 +390,7 @@ mod tests {
                     sketch_family_override: None,
                     target_path: None,
                     grouping_labels: vec![],
+                    sample_p: 1.0,
                 },
                 WorkloadEntry {
                     metric_name: "b".into(),
@@ -370,6 +400,7 @@ mod tests {
                     sketch_family_override: None,
                     target_path: None,
                     grouping_labels: vec![],
+                    sample_p: 1.0,
                 },
                 WorkloadEntry {
                     metric_name: "c".into(),
@@ -379,12 +410,36 @@ mod tests {
                     sketch_family_override: None,
                     target_path: None,
                     grouping_labels: vec![],
+                    sample_p: 1.0,
                 },
             ],
         };
         assert_eq!(reg.for_role("agent").len(), 2);
         assert_eq!(reg.for_role("backend").len(), 1);
         assert_eq!(reg.first_for_role("agent").unwrap().metric_name, "a");
+    }
+
+    #[test]
+    fn deserialize_sample_p_default_and_explicit() {
+        // sample_p is optional and defaults to 1.0 (sampling disabled);
+        // an explicit value round-trips. This is the operator-facing
+        // per-metric sampling knob.
+        let yaml = r#"
+- metric_name: freq_metric
+  sketch_family_override: CountMinSketch
+  sample_p: 0.1
+- metric_name: card_metric
+  sketch_family_override: HLL
+  sample_p: 0.25
+- metric_name: unset_metric
+  sketch_family_override: HLL
+"#;
+        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert!((entries[0].sample_p - 0.1).abs() < 1e-12);
+        assert!((entries[1].sample_p - 0.25).abs() < 1e-12);
+        // Unset ⇒ default 1.0 (sampling disabled / byte-identical).
+        assert!((entries[2].sample_p - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -437,6 +492,7 @@ mod tests {
             sketch_family_override: override_,
             target_path: None,
             grouping_labels: vec![],
+            sample_p: 1.0,
         }
     }
 
