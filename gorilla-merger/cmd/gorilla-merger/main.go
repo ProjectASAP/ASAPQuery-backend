@@ -100,17 +100,46 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 2. Ingest HTTP frontend.
+	// 2. Cold-part store (optional — needs the object store). Write-no-decode
+	// part ingest + decode-on-read query path. Shares the SAME bucket the
+	// shipper uses (cold parts live under their own "cold/" key prefix), so
+	// cold parts and shipped 2h blocks coexist without colliding.
+	var coldStore *merger.ColdPartStore
+	var coldBucket merger.BucketCloser
+	if cfg.objstoreFile != "" {
+		objYAML, rerr := os.ReadFile(cfg.objstoreFile)
+		if rerr != nil {
+			return fmt.Errorf("read objstore config %q: %w", cfg.objstoreFile, rerr)
+		}
+		bkt, berr := merger.NewBucket(objYAML, "gorilla-merger-cold", reg, kitLogger)
+		if berr != nil {
+			return fmt.Errorf("cold-part bucket: %w", berr)
+		}
+		coldBucket = bkt
+		defer func() { _ = coldBucket.Close() }()
+		coldStore = merger.NewColdPartStore(bkt, kitLogger)
+		// Rediscover any parts already in the bucket (header/index only).
+		if rerr := coldStore.Reload(context.Background()); rerr != nil {
+			logger.Warn("cold manifest reload failed (continuing empty)", "err", rerr)
+		}
+	} else {
+		logger.Warn("no objstore config provided; cold-part store disabled (decode-on-read unavailable)")
+	}
+
+	// 3. Ingest HTTP frontend.
 	ingester := merger.NewIngester(storage, logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/gorilla", ingester.HandleIngest)
+	if coldStore != nil {
+		mux.HandleFunc("/ingest/coldpart", coldStore.HandlePut)
+	}
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/-/healthy", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/-/ready", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	httpSrv := &http.Server{Addr: cfg.httpAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 
-	// 3. StoreAPI (gRPC) over the open window.
-	storeAPI, err := merger.NewStoreAPI(storage, extLset, kitLogger, cfg.grpcAddr)
+	// 4. StoreAPI (gRPC) over the open window + decode-on-read cold parts.
+	storeAPI, err := merger.NewStoreAPI(storage, extLset, kitLogger, cfg.grpcAddr, coldStore)
 	if err != nil {
 		return err
 	}
@@ -118,7 +147,7 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		return err
 	}
 
-	// 4. Shipper (optional — disabled when no objstore config is provided).
+	// 5. Shipper (optional — disabled when no objstore config is provided).
 	var shipperRunner *merger.ShipperRunner
 	if cfg.objstoreFile != "" {
 		objYAML, rerr := os.ReadFile(cfg.objstoreFile)

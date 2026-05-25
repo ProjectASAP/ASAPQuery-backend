@@ -407,6 +407,19 @@ func OpenPart(b []byte) (*Part, error) {
 // NumSeries reports how many series the part indexes (without decoding any).
 func (p *Part) NumSeries() int { return len(p.series) }
 
+// SeriesLabels returns the label set of every indexed series, in part-stored
+// (sorted-by-labels) order, WITHOUT decoding any chunk body. It lets a caller
+// (e.g. a part manifest) record which series a part covers for overlap/matcher
+// pre-filtering. The returned slice is freshly allocated; the labels.Labels
+// values were materialized at OpenPart time and are safe to retain.
+func (p *Part) SeriesLabels() []labels.Labels {
+	out := make([]labels.Labels, len(p.series))
+	for i := range p.series {
+		out[i] = p.series[i].lbls
+	}
+	return out
+}
+
 // Series returns every indexed series whose [min_ts,max_ts] overlaps the
 // half-open-ish inclusive window [mintMs,maxtMs] AND whose labels satisfy all
 // matchers, each with its samples decoded. Chunk bodies are decoded lazily —
@@ -426,7 +439,7 @@ func (p *Part) Series(matchers []*labels.Matcher, mintMs, maxtMs int64) ([]Serie
 		if s.minTS > maxtMs || s.maxTS < mintMs {
 			continue
 		}
-		if !matchesAll(s.lbls, matchers) {
+		if !MatchesAll(s.lbls, matchers) {
 			continue
 		}
 		samples, err := p.decodeSeries(s)
@@ -474,8 +487,12 @@ func splitChunks(run []byte, lens []uint64) [][]byte {
 	return chunks
 }
 
-// matchesAll reports whether ls satisfies every matcher (AND semantics).
-func matchesAll(ls labels.Labels, matchers []*labels.Matcher) bool {
+// MatchesAll reports whether ls satisfies every matcher (AND semantics), with a
+// matcher applied against ls's value for its label name (the empty string when
+// absent) so =, !=, =~, !~ behave exactly as Prometheus selectors do. A nil
+// matcher is skipped. It is exported so a part manifest can apply the SAME
+// matcher semantics when pre-filtering whole parts.
+func MatchesAll(ls labels.Labels, matchers []*labels.Matcher) bool {
 	for _, m := range matchers {
 		if m == nil {
 			continue

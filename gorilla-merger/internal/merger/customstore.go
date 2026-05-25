@@ -9,6 +9,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -43,6 +44,11 @@ type customStore struct {
 	db      chunkQueryable
 	extLset labels.Labels
 	logger  kitlog.Logger
+	// cold is the decode-on-read cold-part query path. It is OPTIONAL: when nil
+	// the store serves only the embedded tsdb.DB (open-window) path, exactly as
+	// before. When set, Series unions the cold results in AFTER the tsdb series,
+	// so thanos-query/PromQL merges them just like the store-gateway overlap.
+	cold *ColdQuerier
 	storepb.UnimplementedStoreServer
 }
 
@@ -62,6 +68,10 @@ func newCustomStore(db chunkQueryable, extLset labels.Labels, logger kitlog.Logg
 	}
 	return &customStore{db: db, extLset: extLset, logger: logger}
 }
+
+// setColdQuerier attaches the decode-on-read cold-part query path. Passing nil
+// leaves the store tsdb-only.
+func (s *customStore) setColdQuerier(c *ColdQuerier) { s.cold = c }
 
 // timeRange mirrors TSDBStore.TimeRange: min = head StartTime (the oldest
 // sample currently held), max = +inf so the open window is always queried.
@@ -111,6 +121,26 @@ func zLabelsCopy(lset labels.Labels) []labelpb.ZLabel {
 		out = append(out, labelpb.ZLabel{Name: l.Name, Value: l.Value})
 	})
 	return out
+}
+
+// aggrChunkFromTSDB converts an iterable tsdb/prometheus chunk to a
+// storepb.AggrChunk over [minTime,maxTime], COPYING the chunk bytes (a querier
+// may recycle/mmap-back them). It is shared by the tsdb-series and cold-series
+// streaming paths so both encode chunks identically.
+func aggrChunkFromTSDB(chunk chunkenc.Chunk, minTime, maxTime int64) storepb.AggrChunk {
+	src := chunk.Bytes()
+	data := make([]byte, len(src))
+	copy(data, src)
+	return storepb.AggrChunk{
+		MinTime: minTime,
+		MaxTime: maxTime,
+		Raw: &storepb.Chunk{
+			// storepb chunk encoding is one less than the tsdb one
+			// (tsdb EncXOR=1 -> storepb Chunk_XOR=0).
+			Type: storepb.Chunk_Encoding(chunk.Encoding() - 1),
+			Data: data,
+		},
+	}
 }
 
 // completeLabels appends the merger's external labels to a series' own labels,
@@ -218,20 +248,7 @@ func (s *customStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesS
 			if meta.Chunk == nil {
 				return status.Errorf(codes.Internal, "customStore: unpopulated chunk at ref %v", meta.Ref)
 			}
-			src := meta.Chunk.Bytes()
-			// Copy the chunk bytes: the querier may recycle/mmap-back them.
-			data := make([]byte, len(src))
-			copy(data, src)
-			chks = append(chks, storepb.AggrChunk{
-				MinTime: meta.MinTime,
-				MaxTime: meta.MaxTime,
-				Raw: &storepb.Chunk{
-					// storepb chunk encoding is one less than the tsdb one
-					// (tsdb EncXOR=1 -> storepb Chunk_XOR=0).
-					Type: storepb.Chunk_Encoding(meta.Chunk.Encoding() - 1),
-					Data: data,
-				},
-			})
+			chks = append(chks, aggrChunkFromTSDB(meta.Chunk, meta.MinTime, meta.MaxTime))
 		}
 		if err := chIt.Err(); err != nil {
 			return status.Error(codes.Internal, err.Error())
@@ -244,8 +261,58 @@ func (s *customStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesS
 	if err := set.Err(); err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
+
+	// Union the decode-on-read cold-part path AFTER the open-window tsdb series.
+	// Emitting both as independent series streams lets thanos-query/PromQL merge
+	// the same logical series across tsdb + cold + store-gateway, exactly as it
+	// already merges the open-window and store-gateway overlaps.
+	if err := s.streamColdSeries(ctx, r, finalExt, matchers, srv); err != nil {
+		return err
+	}
+
 	for _, w := range set.Warnings().AsErrors() {
 		if err := srv.Send(storepb.NewWarnSeriesResponse(w)); err != nil {
+			return status.Error(codes.Aborted, err.Error())
+		}
+	}
+	return nil
+}
+
+// streamColdSeries queries the decode-on-read cold path (if attached) and sends
+// each matched cold series as a storepb.Series, reusing the SAME safe label
+// copy/extend path as the tsdb series. It is a no-op when no cold querier is
+// attached. matchers are the querier matchers (external-label matchers already
+// stripped by promMatchers).
+func (s *customStore) streamColdSeries(
+	ctx context.Context,
+	r *storepb.SeriesRequest,
+	finalExt labels.Labels,
+	matchers []*labels.Matcher,
+	srv storepb.Store_SeriesServer,
+) error {
+	if s.cold == nil {
+		return nil
+	}
+	coldSeries, err := s.cold.Series(ctx, matchers, r.MinTime, r.MaxTime)
+	if err != nil {
+		return status.Error(codes.Internal, err.Error())
+	}
+	for _, cs := range coldSeries {
+		full := completeLabels(cs.Labels, finalExt)
+		zls := zLabelsCopy(full)
+
+		if r.SkipChunks {
+			if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: zls})); err != nil {
+				return status.Error(codes.Aborted, err.Error())
+			}
+			continue
+		}
+
+		chks := make([]storepb.AggrChunk, 0, len(cs.Chunks))
+		for _, cc := range cs.Chunks {
+			chks = append(chks, aggrChunkFromTSDB(cc.Chunk, cc.MinTime, cc.MaxTime))
+		}
+		if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: zls, Chunks: chks})); err != nil {
 			return status.Error(codes.Aborted, err.Error())
 		}
 	}
