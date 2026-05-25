@@ -292,7 +292,7 @@ treat as black boxes).
 
 ## Future work (post-paper)
 
-### F1. Phase 4: inter-window compaction
+### F1. Inter-window compaction
 
 Long-running sketchDB needs compaction — merge adjacent small
 windows into larger ones when accuracy can be re-derived, drop

@@ -163,13 +163,13 @@ Key design rules:
   to agents. Agents only need a way to reach the backend for OpAMP
   + OTLP; they don't have their own controller dependency.
 
-## 4. Phased migration plan
+## 4. Migration plan
 
-Each phase is a minimum-merge unit: the system builds and the
-multi-node demo passes after each phase, with progressively more
+Each step is a minimum-merge unit: the system builds and the
+multi-node demo passes after each step, with progressively more
 of the new design landed.
 
-### Phase 1 — Strip metric-name rewrites (1–2 hours)
+### Step 1 — Strip metric-name rewrites (1–2 hours)
 
 Audit every site that suffixes a metric name and remove the suffix.
 Keep the wire-level encoding hint in the OTLP pdata variant.
@@ -191,10 +191,10 @@ Keep the wire-level encoding hint in the OTLP pdata variant.
 or by reading the OTLP wire bytes.
 
 **Risk:** breaks `backend-inference.yaml` patterns (which are
-keyed on `_quantile`). Phase 2 replaces pattern matching anyway,
+keyed on `_quantile`). Step 2 replaces pattern matching anyway,
 so this is intentional.
 
-### Phase 2 — Backend routing: warm-miss → Thanos (30 min)
+### Step 2 — Backend routing: warm-miss → Thanos (30 min)
 
 `backend-storage-routing.yaml` currently routes by query shape:
 `[count, topk, rate_post_hoc]` to archive, everything else to
@@ -214,7 +214,7 @@ ASAP. ASAP's response carries `data_source: thanos_archive` for
 queries that fall through, `data_source: warm` for those that
 hit a sketch.
 
-### Phase 3 — Reindex SketchStore by `(metric_name, labels, capability)` (2–3 days)
+### Step 3 — Reindex SketchStore by `(metric_name, labels, capability)` (2–3 days)
 
 Today's `SketchStore.get_aggregation(aggregation_id: u64)` becomes
 `SketchStore.get(metric_name: &str, labels: &LabelSet, capability:
@@ -242,7 +242,7 @@ aggregation IDs.
 (`backend-streaming.yaml` no longer needs `aggregationId`). All
 downstream tests under `asap-query-engine/tests/` need updating.
 
-### Phase 4 — Move `controller/` from ASAPCollector to ASAPQuery-backend (3–5 days)
+### Step 4 — Move `controller/` from ASAPCollector to ASAPQuery-backend (3–5 days)
 
 Physically relocate the crate. Both are Rust, both already use
 prost-build for OTel proto compilation, so the build surface is
@@ -274,7 +274,7 @@ query HTTP API (port 9091) and the OpAMP server (port 4320).
 Agent connects to `ws://backend:4320/v1/opamp`, receives plan,
 emits sketches, backend stores them. Same multi-node demo runs.
 
-### Phase 5 — Delete `asap-common` (1–2 days)
+### Step 5 — Delete `asap-common` (1–2 days)
 
 Audit each crate under `asap-common/dependencies/rs/`:
 
@@ -362,7 +362,7 @@ sample_count for CMS). They also repeat sketch-instance config on every
 DP (epsilon/delta on CS, rows/cols on CMS, precision on HLL). Both are
 wasteful and create cache-invalidation bugs.
 
-Phase 1.5 proto patch (metrics.proto):
+Step 1.5 proto patch (metrics.proto):
 
 - **Drop precomputed values from each `*DataPoint` message**: count,
   sum, min, max, cardinality, sample_count. The sketch payload (or its
@@ -469,17 +469,17 @@ This matches stock-OTel and Prometheus semantics for `sum by (zone)`
 
 - **OpAMP origination host**: the runbook's compose currently has
   `controller:4320` and `backend:9091` as distinct services. After
-  Phase 4 they collapse to one container. Do we keep two ports
+  Step 4 they collapse to one container. Do we keep two ports
   (4320 OpAMP + 9091 query) or unify?
 - **Stale `_quantile` patterns in `backend-inference.yaml`**: do
-  we keep this file at all after Phase 3 (no more pattern
+  we keep this file at all after Step 3 (no more pattern
   matching), or repurpose as the controller's bootstrap plan?
 - **Edge-runtime parity**: `asap-precompute-rs` (used by the
   Rust edge agent path) currently uses some `asap-common` types.
-  Phase 5 needs to leave a thin wire-types crate accessible to
+  Step 5 needs to leave a thin wire-types crate accessible to
   edge runtimes — name it `asap-wire-types` and put it in
   ASAPCollector? Or in a third repo?
-- **`_topk` and similar suffixes**: Phase 1 removes `_quantile`.
+- **`_topk` and similar suffixes**: Step 1 removes `_quantile`.
   Are there other suffixes (`_topk`, `_uniques`, `_count`) added
   by other processors? Need to grep more thoroughly.
 
@@ -497,7 +497,7 @@ gateway→backend) and the namespaces don't share meaning.
 
 **New design — centralize series_id minting at asap-query-backend:**
 
-- The backend (which now also hosts the controller — Phase 4) is the
+- The backend (which now also hosts the controller — Step 4) is the
   single authoritative minter of series_ids.
 - Agents and gateway DO NOT mint their own series_ids. They forward
   the original Export upstream, propagate the SeriesAssignment
@@ -727,7 +727,7 @@ layer handles this with a per-(sid, window) merge step using
 (DDSketch.merge, HLL.union, CMS row-add, etc.). Same problem with
 or without centralized sids — sids don't worsen it.
 
-## 5.5 Future-work — Phase 6: multi-window batching per ScopeMetrics
+## 5.5 Future-work — Step 6: multi-window batching per ScopeMetrics
 
 Today each agent emit produces one `Metric` with one window's worth of
 `DataPoint`s (the sketch state at window-close). Wire framing per
@@ -746,7 +746,7 @@ N=4 with window=30s, agent buffers up to 2 minutes of state before
 emit — affects criterion ⑥ freshness but not correctness or query
 results. Operators choose N per their freshness budget.
 
-Tracked as Phase 6.
+Tracked as Step 6.
 
 ## 6. What does NOT change
 
