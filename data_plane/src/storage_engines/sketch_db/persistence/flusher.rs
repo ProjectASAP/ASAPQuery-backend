@@ -39,6 +39,10 @@ pub struct FlusherHandle {
 pub(crate) struct FlusherShared {
     pub cfg: SketchStorePersistenceConfig,
     pub manifest: Arc<Manifest>,
+    /// Per-sid metadata sidecar — upserted on every flush so recovery can
+    /// re-register disk-resident sids as queryable instances. See
+    /// [`super::metadata`].
+    pub sid_metadata: super::metadata::SidMetadataStore,
     pub next_part_id: AtomicU64,
     pub shutdown: AtomicBool,
     /// Woken by the insert path when it hits `hard_cap_bytes` and by
@@ -75,9 +79,12 @@ impl FlusherHandle {
             .map(|m| m + 1)
             .unwrap_or(1);
 
+        let sid_metadata = super::metadata::SidMetadataStore::new(&cfg.disk_path);
+
         let shared = Arc::new(FlusherShared {
             cfg: cfg.clone(),
             manifest: manifest.clone(),
+            sid_metadata,
             next_part_id: AtomicU64::new(next_id),
             shutdown: AtomicBool::new(false),
             pressure_cv: Condvar::new(),
@@ -357,6 +364,32 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
                 max_ts: report.max_ts,
                 size_bytes: report.data_len + report.index_len + size_bytes_estimate,
             })?;
+
+            // Persist the per-sid metadata sidecar for every sid this part
+            // makes durable, BEFORE eviction. The on-disk part carries only
+            // label VALUES + sketch_type_name; the sidecar carries the
+            // metric name, group-by KEYS, and structured `AggKind` that the
+            // query path's `instances_matching` / disk-union need to serve
+            // the series after a restart. Done before evict so the metadata
+            // is durable whenever the part it describes is. A sidecar write
+            // failure must NOT abort the flush (the part is already durable)
+            // — log and continue; recovery degrades to live-ingest re-register.
+            let sid_meta: Vec<super::metadata::SidMetaRecord> = {
+                let mut seen = std::collections::HashSet::new();
+                snapshots
+                    .iter()
+                    .filter(|s| seen.insert(s.agg_id))
+                    .filter_map(|s| source.instance_metadata_for_persist(s.agg_id))
+                    .collect()
+            };
+            if let Err(e) = shared.sid_metadata.upsert_all(&sid_meta) {
+                warn!(
+                    part_id,
+                    error = %e,
+                    "flusher: sid-metadata sidecar upsert failed; recovered series \
+                     for these sids may need a live DataPoint to become queryable"
+                );
+            }
 
             // Now that the part is durable and referenced, evict the
             // source epochs.

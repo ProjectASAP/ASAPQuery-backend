@@ -1667,6 +1667,23 @@ impl SketchStore {
             "SketchStore persistence recovery complete"
         );
 
+        // Re-register every disk-resident sid from the metadata sidecar so
+        // the query path can find and serve recovered series. Without this
+        // a freshly-reopened store recovers the parts manifest/cache but
+        // has an EMPTY `instances` registry (registration only happens on
+        // the live ingest path), so `instances_matching` enumerates nothing
+        // for the recovered metrics and `query_range`'s disk-union
+        // early-returns on the missing `sid_group_by_keys` → "No result"
+        // cluster-wide even though the data is durable on disk. Idempotent:
+        // sids already registered (e.g. by an in-flight DataPoint) are kept.
+        let recovered = self.register_recovered_disk_series(&cfg.disk_path);
+        if recovered > 0 {
+            tracing::info!(
+                recovered_sids = recovered,
+                "SketchStore: re-registered disk-resident sids from metadata sidecar"
+            );
+        }
+
         let manifest = Arc::new(Manifest::open_or_init(&cfg.disk_path)?);
         let parts_root = crate::storage_engines::sketch_db::index::persistence::flusher::parts_root(
             &cfg.disk_path,
@@ -1694,6 +1711,66 @@ impl SketchStore {
             flusher,
             parts_root,
         })
+    }
+
+    /// Replay the per-sid metadata sidecar at `disk_path` and register
+    /// each disk-resident sid as a queryable instance, UNLESS the sid is
+    /// already registered (a live DataPoint won the race — its in-memory
+    /// metadata is authoritative, so we don't clobber it). Returns the
+    /// number of sids freshly registered from disk.
+    ///
+    /// `capability` / `accuracy` are re-derived from the persisted
+    /// `agg_kind` exactly as the ingest path derives them. The sidecar is
+    /// missing only for parts written before this feature landed (or a
+    /// fresh dir) — those sids stay invisible until a live DataPoint
+    /// re-registers them, the same as pre-fix behavior.
+    pub fn register_recovered_disk_series(&self, disk_path: &std::path::Path) -> usize {
+        use crate::storage_engines::sketch_db::index::persistence::metadata::SidMetadataStore;
+
+        let store = SidMetadataStore::new(disk_path);
+        let records = match store.load() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to load sid metadata sidecar on recovery");
+                return 0;
+            }
+        };
+
+        let mut registered = 0usize;
+        for rec in records {
+            // Don't clobber a live-registered instance.
+            if self.instance(rec.sid).is_some() {
+                continue;
+            }
+            let Some(agg_kind) = rec.agg_kind() else {
+                tracing::warn!(
+                    sid = rec.sid,
+                    "skipping recovered sid: unrecognized agg_kind in sidecar"
+                );
+                continue;
+            };
+            let capability = rec.capability();
+            let accuracy = rec.accuracy();
+            self.register(SketchInstanceMetadata {
+                sid: rec.sid,
+                metric_name: rec.metric_name,
+                group_by_keys: rec.group_by_keys.into_iter().collect(),
+                capability,
+                agg_kind,
+                accuracy,
+                first_seen_unix_ms: rec.first_seen_unix_ms,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                // The sidecar doesn't carry the policy fingerprint; the
+                // recovered sid is reachable through the
+                // `instances_matching(metric, gbk)` walk regardless (the
+                // policy_fp reverse index is an optimization, not a
+                // correctness requirement for the query path).
+                policy_fp: PolicyFingerprint::UNSET,
+            });
+            registered += 1;
+        }
+        registered
     }
 
     /// Switch the store into durable-tier mode: install the read handle
@@ -1755,6 +1832,23 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
             }
         }
         out
+    }
+
+    fn instance_metadata_for_persist(
+        &self,
+        sid: u64,
+    ) -> Option<crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord> {
+        let g = self.instances.read().ok()?;
+        let m = g.get(&sid)?;
+        Some(
+            crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord::new(
+                m.sid,
+                m.metric_name.clone(),
+                m.group_by_keys.iter().cloned().collect(),
+                &m.agg_kind,
+                m.first_seen_unix_ms,
+            ),
+        )
     }
 
     fn snapshot_sealed_epoch(
@@ -2861,6 +2955,212 @@ mod tests {
         assert!(
             s.samples.contains_key(&30_000),
             "recovered disk window missing after restart"
+        );
+        drop(p2);
+    }
+
+    // ── query-from-recovered-disk (fix/query-from-recovered-disk) ───────
+    //
+    // The #330 tests `restart_recovery_makes_flushed_data_queryable` and
+    // `live_aged_unsealed_panes_flush_and_survive_restart` both call
+    // `idx2.register(...)` on the FRESH store BEFORE querying (they even
+    // comment "here we re-register to model that"). That masks the real
+    // restart bug: in production NOBODY calls `SketchStore::register` on
+    // restart — registration only happens on the LIVE INGEST path when a
+    // fresh DataPoint arrives. The SeriesIdResolver WAL recovers
+    // `(metric, attrs_fp, agg_kind) → sid` but does NOT push identities
+    // into the SketchStore's `instances` registry. So after a true restart
+    // the `instances` map is EMPTY for the recovered metrics:
+    //   * `instances_matching(metric, gbk)` enumerates nothing → the engine
+    //     returns "No result" before reading any window, and
+    //   * even if a sid were enumerated, `query_range`'s `union_disk_parts_into`
+    //     early-returns on the missing `sid_group_by_keys(sid)`.
+    // → the cluster-wide "No result" + collapsed-SketchStore symptom.
+    //
+    // These two tests do a GENUINE fresh reopen (no `register`) for BOTH
+    // the sketch (KLL quantile) and exact-agg (Sum) shapes. On origin/main
+    // they FAIL ("No result"); with the metadata-sidecar fix they pass
+    // because recovery re-registers the disk-resident sids.
+
+    fn meta_kll_host(sid: u64) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::Kll { k: 200 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: "http_latency".into(),
+            group_by_keys: ["host".to_string()].into_iter().collect(),
+            capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+            agg_kind: AggKind::Sketch {
+                kind: SketchKindHandle::Kll,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    #[test]
+    fn recovered_sketch_series_queryable_after_fresh_reopen_without_register() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = tmp.path().to_path_buf();
+        // ---- session 1: ingest → seal → flush → EVICT (disk-only) ----
+        {
+            let idx = Arc::new(SketchStore::new());
+            idx.register(meta_kll_host(7100));
+            let p = idx.start_persistence(durable_cfg(disk.clone())).unwrap();
+            for i in 0..10u64 {
+                let s = i * 30_000;
+                idx.append_sample(7100, lv_host("a"), (s, s + 30_000), sample((i + 1) as u8));
+            }
+            assert!(
+                wait_until(
+                    || !p.manifest.live_parts().is_empty()
+                        && idx.approx_memory_bytes() == 0
+                        && idx.list_sealed_epochs_len() == 0,
+                    std::time::Duration::from_secs(5),
+                ),
+                "data never flushed+evicted before restart"
+            );
+            let mut p = p;
+            p.shutdown();
+        }
+
+        // ---- session 2: TRUE fresh reopen — NO register() ----
+        let idx2 = Arc::new(SketchStore::new());
+        // Sanity: before recovery the registry is empty (mirrors prod).
+        assert_eq!(idx2.instance_count(), 0, "precondition: empty registry");
+        let p2 = idx2.start_persistence(durable_cfg(disk.clone())).unwrap();
+        assert!(
+            !p2.manifest.live_parts().is_empty(),
+            "recovery did not reload any parts"
+        );
+
+        // (a) instances_matching must find the recovered series WITHOUT a
+        //     re-register. On origin/main this is empty → "No result".
+        let gbk = ["host".to_string()].into_iter().collect();
+        let sids = idx2.instances_matching("http_latency", &gbk);
+        assert_eq!(
+            sids,
+            vec![7100],
+            "instances_matching blind to disk-only series after fresh reopen \
+             (registry={})",
+            idx2.instance_count(),
+        );
+        // The recovered sid's metadata must be query-routable.
+        let meta = idx2.instance(7100).expect("recovered sid metadata present");
+        assert_eq!(meta.metric_name, "http_latency");
+        assert!(matches!(
+            meta.capability,
+            Some(Capability::QuantileApprox(SketchKindHandle::Kll))
+        ));
+
+        // (b) a range query over the EVICTED window returns the data.
+        let series = idx2.query_range(7100, 0, 150_000);
+        assert_eq!(series.len(), 1, "recovered KLL series not queryable");
+        let s = &series[0];
+        assert_eq!(
+            s.series_label_values,
+            lv_host("a"),
+            "label map rebuilt from recovered group_by_keys + disk values"
+        );
+        assert!(
+            s.samples.contains_key(&30_000),
+            "recovered disk window (0,30000) missing: {:?}",
+            s.samples.keys().collect::<Vec<_>>()
+        );
+        drop(p2);
+    }
+
+    #[test]
+    fn recovered_exact_agg_series_queryable_after_fresh_reopen_without_register() {
+        use crate::storage_engines::types::AggregationType;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = tmp.path().to_path_buf();
+
+        let lv_zone = |v: &str| {
+            let mut x = BTreeMap::new();
+            x.insert("zone".to_string(), v.to_string());
+            x
+        };
+
+        // ---- session 1: ExactAgg(Sum) by (zone), flush+evict ----
+        {
+            let idx = Arc::new(SketchStore::new());
+            let mut m = meta(8100);
+            m.metric_name = "http_requests_total".into();
+            m.group_by_keys = ["zone".to_string()].into_iter().collect();
+            m.capability = Some(Capability::ExactAgg(AggregationType::Sum));
+            m.agg_kind = AggKind::ExactAgg {
+                agg_type: AggregationType::Sum,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            };
+            m.accuracy = None;
+            idx.register(m);
+            let p = idx.start_persistence(durable_cfg(disk.clone())).unwrap();
+            for i in 0..10u64 {
+                let s = i * 30_000;
+                idx.append_precompute(
+                    8100,
+                    lv_zone("z0"),
+                    (s, s + 30_000),
+                    Box::new(
+                        crate::precompute_engine::operators::SumAccumulator::with_sum(
+                            (i + 1) as f64,
+                        ),
+                    ),
+                );
+            }
+            assert!(
+                wait_until(
+                    || !p.manifest.live_parts().is_empty()
+                        && idx.approx_memory_bytes() == 0
+                        && idx.list_sealed_epochs_len() == 0,
+                    std::time::Duration::from_secs(5),
+                ),
+                "exact-agg windows never flushed+evicted"
+            );
+            let mut p = p;
+            p.shutdown();
+        }
+
+        // ---- session 2: TRUE fresh reopen — NO register() ----
+        let idx2 = Arc::new(SketchStore::new());
+        assert_eq!(idx2.instance_count(), 0, "precondition: empty registry");
+        let p2 = idx2.start_persistence(durable_cfg(disk.clone())).unwrap();
+
+        // instances_matching must surface the exact-agg sid.
+        let gbk = ["zone".to_string()].into_iter().collect();
+        assert_eq!(
+            idx2.instances_matching("http_requests_total", &gbk),
+            vec![8100],
+            "exact-agg sid blind to instances_matching after fresh reopen"
+        );
+        let meta = idx2.instance(8100).expect("recovered exact-agg metadata");
+        assert!(matches!(
+            meta.agg_kind,
+            AggKind::ExactAgg { agg_type: AggregationType::Sum, .. }
+        ));
+
+        // The Sum exact-agg range query must resolve from disk.
+        let series = idx2.query_exact_agg_range(8100, 0, 150_000);
+        assert!(
+            !series.is_empty(),
+            "recovered exact-agg query returned No result after fresh reopen"
+        );
+        let (label, samples) = &series[0];
+        assert_eq!(label.get("zone").map(String::as_str), Some("z0"));
+        assert!(
+            samples.contains_key(&30_000),
+            "recovered exact-agg window (0,30000) missing from disk read-back"
+        );
+        // Rate divisor helper must also see the recovered disk windows.
+        assert!(
+            idx2.exact_agg_coverage_bounds(8100, 0, 150_000).is_some(),
+            "exact_agg_coverage_bounds blind to recovered disk after fresh reopen"
         );
         drop(p2);
     }

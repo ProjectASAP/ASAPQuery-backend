@@ -125,4 +125,22 @@ pub trait EpochSource: Send + Sync {
     fn evict_sealed_epoch(&self, agg_id: u64, epoch_id: u64);
 
     fn approx_memory_bytes(&self) -> usize;
+
+    /// Persistable instance metadata for `sid` — the pieces of the store's
+    /// `SketchInstanceMetadata` the QUERY path needs but the on-disk part
+    /// format does NOT carry (metric name, group-by KEYS, structured
+    /// `AggKind`). Called by the flusher right before it makes a part
+    /// durable so recovery can re-register the sid as a queryable instance
+    /// after a restart (otherwise `instances_matching` enumerates nothing
+    /// for disk-only series → "No result" cluster-wide).
+    ///
+    /// Returns `None` when the sid is unknown to the source (e.g. a test
+    /// fake, or a sid whose instance metadata was evicted). Default impl
+    /// returns `None` so existing/test sources need not implement it.
+    fn instance_metadata_for_persist(
+        &self,
+        _sid: u64,
+    ) -> Option<super::metadata::SidMetaRecord> {
+        None
+    }
 }
