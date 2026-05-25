@@ -219,13 +219,13 @@ Now the backend recognises the new wire variant.
 
 #### D.1 Vendored proto regeneration
 
-`asap-common/dependencies/rs/asap_otel_proto/`: regenerate the
+`crates/asap_otel_proto/`: regenerate the
 vendored proto. The tonic build script will produce a new
 `Data::Foosketch` variant on the `Metric.data` oneof automatically.
 
 #### D.2 Ingest router
 
-`asap-query-engine/src/drivers/ingest/otel.rs`:
+`data_plane/src/drivers/ingest/otel.rs`:
 
 ```rust
 enum SketchKind {
@@ -250,7 +250,7 @@ SketchKind::Foo => Ok(Box::new(
 
 #### D.3 Concrete accumulator
 
-`asap-query-engine/src/precompute_operators/foo_sketch_accumulator.rs`:
+`data_plane/src/precompute_engine/operators/foo_sketch_accumulator.rs`:
 
 ```rust
 pub struct FooSketchAccumulator {
@@ -316,7 +316,7 @@ fn foo_params(parameters: &HashMap<String, Value>) -> FooParams {
 
 ### Step E. Type system
 
-`asap-common/dependencies/rs/promql_utilities/src/query_logics/enums.rs`:
+`crates/promql_utilities/src/query_logics/enums.rs`:
 
 ```rust
 pub enum AggregationType {
@@ -352,7 +352,7 @@ After this, `StreamingConfig` YAML files can carry
 
 ### Step F. Capability matching
 
-`asap-common/dependencies/rs/asap_types/src/capability_matching.rs`:
+`crates/asap_types/src/capability_matching.rs`:
 
 ```rust
 fn compatible_agg_types(stat: &Statistic) -> Vec<AggregationType> {

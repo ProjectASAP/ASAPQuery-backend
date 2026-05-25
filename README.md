@@ -126,24 +126,14 @@ intents now live in `control_plane/`'s query-lowering stages.
 
 ## Quick start
 
-The simplest way to see ASAPQuery-backend in action is the
-quickstart in [`asap-quickstart/`](asap-quickstart/), which spins up
-ASAPCollector + ASAPQuery-backend + Grafana side-by-side with a
-minimal workload:
+ASAPQuery-backend is the query backend; the runnable demos — which
+spin up ASAPCollector + ASAPQuery-backend + Grafana together — live in
+[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector). The
+full multi-stage MVP demo (10 producers / 2 agents / 1 gateway / 1
+backend / Thanos store-gateway / MinIO) is documented in its
+[`docs/mvp-demo-runbook.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/mvp-demo-runbook.md).
 
-```bash
-cd asap-quickstart
-docker compose up -d
-```
-
-Open `http://localhost:3000` for the Grafana dashboard. See
-[`asap-quickstart/README.md`](asap-quickstart/README.md) for the
-walkthrough.
-
-For the full multi-stage MVP demo (10 producers / 2 agents / 1
-gateway / 1 backend / Thanos store-gateway / MinIO), see
-`docs/mvp-demo-runbook.md` in
-[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/mvp-demo-runbook.md).
+To build and run just this backend, see **Building from source** below.
 
 ## Building from source
 
@@ -201,7 +191,7 @@ sketch parameters and an accuracy envelope `(ε, δ, kind)` that the
 backend surfaces in every response's `infos` field.
 
 The wire format is documented in
-[`asap_otel_proto`](asap-common/dependencies/rs/asap_otel_proto/) and
+[`asap_otel_proto`](crates/asap_otel_proto/) and
 the cross-language byte-parity gate is described in
 [ASAPCollector's edge-framework design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design-asap-edge-framework.md).
 

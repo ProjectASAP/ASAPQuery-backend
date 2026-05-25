@@ -179,26 +179,20 @@ graph LR
    - Configures deserialization logic
    - Sets up query routing
 
-## Component Overview
+## Components
 
-| Component | Purpose | Technology | Location |
-|-----------|---------|------------|----------|
-| **asap-query-engine** | Answers PromQL queries using sketches | Rust | `asap-query-engine/` |
-| **Arroyo** | Stream processing for building sketches | Rust (forked) | [github.com/ProjectASAP/arroyo](https://github.com/ProjectASAP/arroyo) |
-| **asap-summary-ingest** | Configures Arroyo pipelines from config | Python | `asap-summary-ingest/` |
-| **Planner** (Rust) | Auto-determines sketch parameters | Rust | [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller) — moved out of this repo in Phase γ |
-| **Kafka** | Message broker for sketch distribution | Apache Kafka | (external) |
-| **Prometheus** | Time-series database (existing) | Go | (external) |
-| **Exporters** | Generate synthetic metrics for testing | Rust/Python | `asap-tools/data-sources/prometheus-exporters/` |
-| **asap-tools** | Experimental harness that uses Cloudlab | Python | `asap-tools/` |
+ASAPQuery-backend is a Cargo workspace of two binaries plus shared
+crates (see the repository tree above):
 
-**Links to detailed documentation:**
-- [QueryEngineRust](../02-components/query-engine.md)
-- [Arroyo](../02-components/arroyo.md)
-- [ArroyoSketch](../02-components/arroyosketch.md)
-- [Controller](../02-components/controller.md)
-- [Exporters](../02-components/exporters.md)
-- [Utilities](../02-components/utilities.md)
+| Component | Purpose | Location |
+|-----------|---------|----------|
+| **data plane** | Query backend: OTLP ingest, warm-tier `ASAPQueryEngine` over `SketchStore`, archive-tier `ThanosQueryEngine` forwarder | `data_plane/` |
+| **control plane** | Planner: lowers PromQL/SQL to an intent algebra, plans sketches, pushes per-runtime config to agents over OpAMP | `control_plane/` |
+| **shared crates** | `asap_types`, `promql_utilities`, `asap_otel_proto` | `crates/` |
+
+The edge side (agents, gateway, sketch processors, exporters) lives in
+[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector); the
+archive tier uses external Thanos + object storage.
 
 ## Key Design Decisions
 
@@ -222,16 +216,11 @@ graph LR
 ## Technology Stack
 
 ### Core Languages
-- **Rust** - asap-query-engine, Arroyo, some exporters
+- **Rust** — `data_plane` and `control_plane` (this repo)
   - Tokio for async runtime
   - Axum for HTTP server
   - Serde for serialization
   - DataSketches (dsrs) for sketch algorithms
-
-- **Python** - asap-summary-ingest, experiment framework
-  - PyYAML for config parsing
-  - Jinja2 for SQL templates
-  - Requests for HTTP clients
   - Hydra for experiment config composition
 
 ### Infrastructure

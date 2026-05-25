@@ -66,7 +66,7 @@ For scalar-vector arithmetic (`rate(errors[5m]) * 100`): the scalar literal is n
 
 **The planner does not emit a combined config for the binary expression itself.** The engine detects the arithmetic operator at query time from the PromQL AST and handles the combination.
 
-### Engine (`asap-query-engine`)
+### Engine (`data_plane`)
 
 #### Config lookup: structural PromQL matching
 

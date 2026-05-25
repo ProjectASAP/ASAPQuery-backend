@@ -2,7 +2,7 @@
 
 ## Problem
 
-`SketchStore` (`asap-query-engine/src/stores/simple_map_store/`) is currently an
+`SketchStore` (`data_plane/src/storage_engines/simple_map_store/`) is currently an
 in-memory-only store. Under long-running ingest it grows unboundedly: every sealed
 window for every `(aggregation_id, group_key)` is held in `DashMap<u64, RwLock<StoreKeyData>>`
 until one of the three existing `CleanupPolicy` variants (`CircularBuffer`,

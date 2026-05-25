@@ -18,7 +18,7 @@ shims, Telegraf input) consumes it, and so does this backend.
 Before this change, the backend's ingest path inlined that shared
 logic:
 
-- `precompute_operators/{ddsketch,kll,hll,countsketch,countmin}_accumulator.rs`
+- `precompute_engine/operators/{ddsketch,kll,hll,countsketch,countmin}_accumulator.rs`
   each had a `from_sketchlib_proto_bytes` that decoded
   `SketchEnvelope` proto and dispatched the
   `sketch_state` oneof by hand (the same dispatch was duplicated five
@@ -56,12 +56,12 @@ backend-internal)
   (`engines/{logical,physical}`), storage (`stores/`), query
   planning (`asap-planner-rs`), DataFusion bridge (`tests/datafusion`).
 - **Per-accumulator query-side surface**:
-  `precompute_operators/*_accumulator.rs` keeps the `AggregateCore`,
+  `precompute_engine/operators/*_accumulator.rs` keeps the `AggregateCore`,
   `query_statistic`, `MergeableAccumulator`,
   `SerializableToSink` impls, and the per-sketch JSON output. These
   are query-side, not ingest-side.
 - **Sparse-delta application**:
-  `precompute_operators/*::apply_proto_delta_bytes` and
+  `precompute_engine/operators/*::apply_proto_delta_bytes` and
   `drivers/ingest/otel.rs::apply_modified_otlp_delta_bytes` stay
   because `asap_sketchlib` doesn't yet expose the `compute_delta`
   family upstream — `asap-precompute-rs`'s wrappers fall back to
@@ -76,7 +76,7 @@ backend-internal)
 
 ### Bridge module
 
-`asap-query-engine/src/precompute_operators/edge_runtime_adapter.rs`:
+`data_plane/src/precompute_engine/operators/edge_runtime_adapter.rs`:
 
 - Re-exports the asap-precompute-rs runtime view types (one canonical
   `SketchEnvelope`, `Encoding`, `SketchType`, `Sketch`,
@@ -124,7 +124,7 @@ lands.
 
 ## Acceptance tests
 
-`asap-query-engine/tests/edge_runtime_consumes_precompute_rs.rs`:
+`data_plane/tests/edge_runtime_consumes_precompute_rs.rs`:
 
 - **DDSketch round-trip** through asap-precompute-rs runtime is
   byte-identical with the input envelope.

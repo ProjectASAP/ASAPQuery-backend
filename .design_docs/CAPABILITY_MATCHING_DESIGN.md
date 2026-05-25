@@ -109,7 +109,7 @@ components can eventually reuse it.
 `AggregationIdInfo` (previously defined in `simple_engine.rs`) was moved to `asap_types` as
 a prerequisite, since the common function needs to return it.
 
-`StreamingConfig` (in `asap-query-engine`) gets a thin wrapper method that delegates to the
+`StreamingConfig` (in `data_plane`) gets a thin wrapper method that delegates to the
 common function, so call sites inside the engine don't need to reach into common directly.
 
 ### Q10: `aggregation_sub_type` — does it matter for matching?

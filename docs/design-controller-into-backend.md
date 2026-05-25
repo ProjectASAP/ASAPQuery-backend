@@ -52,7 +52,7 @@ not a name suffix.
 ┌──────────────────────────────────────────────────────────────────┐
 │ ASAPQuery-backend repo                                          │
 │                                                                  │
-│  asap-query-engine                                              │
+│  data_plane                                                     │
 │    SketchStore                                                  │
 │      indexed by aggregation_id (integer assigned by             │
 │        StreamingConfig::from_yaml_data on ingest)               │
@@ -114,7 +114,7 @@ Three structural problems:
 │    capability map: (metric_name, query_shape) → sketch_kind     │
 │    OpAMP server (originating from this host, pushes to agents)  │
 │                                                                  │
-│  asap-query-engine                                              │
+│  data_plane                                                     │
 │    PrecomputeEngine                                             │
 │      receives OTLP (sketch payloads w/ raw metric names)        │
 │      may merge sketches across agents — otherwise pass-through  │
@@ -169,6 +169,13 @@ Each step is a minimum-merge unit: the system builds and the
 multi-node demo passes after each step, with progressively more
 of the new design landed.
 
+> **Status (2026-05):** Steps 1–5 have all landed — the system now
+> runs on this design (the controller is in-repo as `control_plane/`,
+> `asap-common` has collapsed into `crates/`, `SketchStore` is
+> reindexed, and warm-miss → Thanos routing is live). The per-step
+> detail below is kept as the original plan of record; only Step 6
+> remains future work.
+
 ### Step 1 — Strip metric-name rewrites (1–2 hours)
 
 Audit every site that suffixes a metric name and remove the suffix.
@@ -203,9 +210,9 @@ matches the metric+labels+capability), fall through to Thanos.
 
 **Files:**
 
-- `asap-query-engine/src/routing/backend_storage_routing.rs` —
+- `data_plane/src/query_engines/routing/backend_storage_routing.rs` —
   swap "shape allow-list" for "warm-first, archive-fallthrough".
-- `asap-query-engine/src/routing/query_engine_routing.rs` (EngineRouter) — add
+- `data_plane/src/query_engines/routing/query_engine_routing.rs` (EngineRouter) — add
   a `query_with_fallthrough` path.
 
 **Acceptance test:** Same PromQL `count(http_requests_total)` and
@@ -223,9 +230,9 @@ IDs; it stores under the natural tuple.
 
 **Files:**
 
-- `asap-query-engine/src/stores/sketch_db/simple_map_store/{mod,
+- `data_plane/src/storage_engines/sketch_db/simple_map_store/{mod,
   per_key,common_state}.rs` — refactor key type.
-- `asap-query-engine/src/streaming_engine.rs` — ingest path: when
+- `data_plane/src/streaming_engine.rs` — ingest path: when
   an OTLP sketch sample arrives with `(metric_name, labels)`, look
   up its capability from the in-process controller's plan and
   store under that triple.
@@ -240,7 +247,7 @@ aggregation IDs.
 
 **Migration risk:** Streaming-config YAML format changes
 (`backend-streaming.yaml` no longer needs `aggregationId`). All
-downstream tests under `asap-query-engine/tests/` need updating.
+downstream tests under `data_plane/tests/` need updating.
 
 ### Step 4 — Move `controller/` from ASAPCollector to ASAPQuery-backend (3–5 days)
 
@@ -253,7 +260,7 @@ compatible.
 1. Copy `ASAPCollector/controller/` → `ASAPQuery-backend/controller/`.
 2. Add `controller` to ASAPQuery-backend's Cargo workspace; remove
    from ASAPCollector's.
-3. ASAPQuery-backend's `asap-query-engine` Cargo.toml gets `controller
+3. ASAPQuery-backend's `data_plane` Cargo.toml gets `controller
    = { path = "../controller" }`.
 4. Backend binary embeds the controller's L4 `sketch_algebra` as a
    library call (no more HTTP capability-miss notifications between
@@ -276,14 +283,14 @@ emits sketches, backend stores them. Same multi-node demo runs.
 
 ### Step 5 — Delete `asap-common` (1–2 days)
 
-Audit each crate under `asap-common/dependencies/rs/`:
+Audit each crate under `crates/`:
 
 - `asap_types`: most types are backend-internal — move into
-  `asap-query-engine/src/types/`. The wire types (`SketchEnvelope`,
+  `data_plane/src/types/`. The wire types (`SketchEnvelope`,
   `Statistic`) are shared with edge processors via OTLP proto, so
   no Rust-to-Go path-dep needed.
 - `promql_utilities`: backend-only — move into
-  `asap-query-engine/src/promql/`.
+  `data_plane/src/promql/`.
 - `datafusion_summary_library`: backend-only — same.
 - Anything Go-side actually used by edge processors (e.g.
   sketchlib-go interop) is already in `sketchlib-go` itself, not
@@ -291,9 +298,9 @@ Audit each crate under `asap-common/dependencies/rs/`:
 
 **Steps:**
 
-1. List every Rust file under `asap-common/dependencies/rs/`.
+1. List every Rust file under `crates/`.
    Bucket into "backend internal" vs "wire shared".
-2. Move "backend internal" files into `asap-query-engine` or
+2. Move "backend internal" files into `data_plane` or
    `asap-types` (a renamed minimal types-only crate kept inside
    ASAPQuery-backend).
 3. Delete `asap-common/`.

@@ -16,7 +16,7 @@ production path. Concretely:
   `data_plane/src/drivers/ingest/otel.rs:526,591,615,1049,1062`.
 - Query path emits `aggregation_id_for_key` / `aggregation_id_for_value`
   on the wire response (asap_query_engine/engine.rs:1019,1064).
-- `data_plane/src/stores/sketch_db/store/{global,per_key}.rs` still
+- `data_plane/src/storage_engines/sketch_db/store/{global,per_key}.rs` still
   use the non-generic legacy `MutableEpoch` / `SealedEpoch` from
   `store/common.rs`. The generic `MutableEpoch<P>` in
   `index/epoch_columnar.rs` is used only by `SketchIndex`.

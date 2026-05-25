@@ -3,13 +3,13 @@
 Paper-seed document for the ASAPQuery-backend sketch DB. The §theory
 chapter of the VLDB / SIGMOD paper draws directly from the three
 proofs in §§2–4. This file is reviewer-facing: every claim is bound
-to a runtime function in `asap-query-engine/src/`, and every
+to a runtime function in `data_plane/src/`, and every
 invariant the proof rests on is anchored to where the code enforces
 it.
 
 §1 collects the per-sketch-family accuracy bounds the proofs cite.
 The numerical $\varepsilon$ / $\delta$ formulas come from
-`asap-query-engine/src/stores/sketch_db/accuracy.rs`
+`data_plane/src/storage_engines/sketch_db/accuracy.rs`
 (`AccuracyProfile::derive`); the proofs treat the bounds as black
 boxes (per-segment input).
 
@@ -22,7 +22,7 @@ Cross-links to design docs:
 
 - §1 / §2 reference the schema timeline of
   [`design-sketch-db.md`](./design-sketch-db.md) §7 and the
-  combinability table of `query-engines/timeline_dispatch.rs`.
+  combinability table of `storage_engines/sketch_db/query/timeline_dispatch.rs`.
 - §3 references the §6.3 write barrier of
   [`design-sketch-db-core.md`](./design-sketch-db-core.md).
 - §4 references the §10.5 deterministic-rebuild contract of
@@ -38,7 +38,7 @@ appears in the source today.
 ## 1. Accuracy bounds per sketch family
 
 The following table is reproduced from
-`asap-query-engine/src/stores/sketch_db/accuracy.rs` (§6.4 of the
+`data_plane/src/storage_engines/sketch_db/accuracy.rs` (§6.4 of the
 sketch DB design). It lists every sketch family currently
 materialisable by `AccuracyProfile::derive`.
 
@@ -66,13 +66,13 @@ do not re-derive them.
 ## 2. `combine_statistic` correctness across schema-timeline segments
 
 When a query's time range crosses one or more reconfigure
-boundaries, `SchemaRegistry::timeline_for_metric` partitions the
+boundaries, `timeline_for_metric` partitions the
 range into contiguous half-open segments
 $[t_0, t_1), [t_1, t_2), \dots, [t_{n-1}, t_n)$, each owned by a
-single `AggSchema` with its own sketch parameters. The query
+single `SketchInstanceMetadata` with its own sketch parameters. The query
 engine evaluates the statistic per segment and feeds the per-
 segment scalars to `combine_statistic`
-(`asap-query-engine/src/query-engines/timeline_dispatch.rs`).
+(`data_plane/src/storage_engines/sketch_db/query/timeline_dispatch.rs`).
 
 ### 2.1 Statement
 
@@ -120,12 +120,12 @@ as a single answer."
 
 **L2.1 — Disjoint covering by `timeline_for_metric`.** For any
 metric $m$ and query range $[t_1, t_2]$, the segments returned by
-`SchemaRegistry::timeline_for_metric(m, t1, t2)`
-(`asap-query-engine/src/stores/sketch_db/schema.rs:timeline_for_metric`)
+`timeline_for_metric(m, t1, t2)`
+(`data_plane/src/storage_engines/sketch_db/query/timeline.rs:timeline_for_metric`)
 are pairwise disjoint, sorted by `start_ms`, and each is owned by
 exactly one `agg_id`. The owner's range is
 $[\mathtt{created\_at\_ms},\,\mathtt{own\_end})$ with `own_end`
-defined as `min(next.created_at_ms, retired_at_ms)` (open segment
+defined as `min(next.first_seen_unix_ms, retired_at_ms)` (open segment
 $\to u64::\mathrm{MAX}$ for the currently-Active schema). The
 function clips each segment to the query range and skips segments
 of zero length, so the returned partition is a refinement of the
@@ -147,7 +147,7 @@ Idempotence + associativity together justify the pointwise fold.
 **L2.4 — Triangle inequality on real numbers.** Standard.
 
 **L2.5 — Combiner implementation.** `combine_statistic`
-(`asap-query-engine/src/query-engines/timeline_dispatch.rs:combine_statistic`)
+(`data_plane/src/storage_engines/sketch_db/query/timeline_dispatch.rs:combine_statistic`)
 folds segments via `fold(0.0, +)` for `Count` / `Sum`,
 `fold(None, |a,v| Some(a.map_or(v, |a| a.min(v))))` for `Min` (mut.
 mut. for `Max`), and returns `None` (so a `Partial` wrapper) for
@@ -221,7 +221,7 @@ nothing further to prove.
   each segment's sketch contains every sample the agg actually
   ingested for that range. Sketch parameter changes mid-segment
   cannot occur (an agg's `AggregationConfig` is pinned at creation;
-  `AggSchema::config` is immutable), but a reconfigure that
+  `SketchInstanceMetadata::config` is immutable), but a reconfigure that
   retires one agg and creates another may leave a brief gap if no
   agg is Active at some $t \in [t_i, t_{i+1})$. Such gaps are
   surfaced as `unresolved` segments by the caller and are not
@@ -255,20 +255,20 @@ nothing further to prove.
 
 ### 2.5 Code anchors
 
-- `asap-query-engine/src/query-engines/timeline_dispatch.rs`
+- `data_plane/src/storage_engines/sketch_db/query/timeline_dispatch.rs`
   - `combine_statistic` — the per-statistic fold (additive arm,
     `Min` / `Max` arm, non-combinable arm).
   - `CombinedResult::{Full, Partial}` — the `Full` / `Partial`
     discrimination relied on in §2.3.
   - Module doc-comment — combinability table.
-- `asap-query-engine/src/stores/sketch_db/schema.rs`
-  - `SchemaRegistry::timeline_for_metric` — disjoint covering
+- `data_plane/src/storage_engines/sketch_db/index/mod.rs`
+  - `timeline_for_metric` — disjoint covering
     (L2.1).
-  - `AggSchema::config` — pinned-at-creation invariant (caveat 1).
-- `asap-query-engine/src/query-engines/asap_query/engine.rs`
+  - `SketchInstanceMetadata::config` — pinned-at-creation invariant (caveat 1).
+- `data_plane/src/query_engines/asap_query_engine/engine.rs`
   - `ASAPQueryEngine::try_handle_query_promql_via_timeline` — caller
     that wires per-segment evaluation into `combine_statistic`.
-- `asap-query-engine/src/stores/sketch_db/accuracy.rs`
+- `data_plane/src/storage_engines/sketch_db/accuracy.rs`
   - `AccuracyProfile::derive` — source of $B_i$ (L2.6).
 
 ---
@@ -282,7 +282,7 @@ schema has been forced to expire. This proof formalises that.
 ### 3.1 Statement
 
 Let $a$ be an `agg_id`, let $t^\ast$ be the wall-clock time at which
-`SchemaRegistry::force_expire(a)` is invoked and returns
+`SketchStore::force_expire(a)` is invoked and returns
 `Some(_)`, and let $s$ be any sample submitted to the ingest path
 targeting $a$ at wall-clock time $t > t^\ast$. Then for every
 query $Q$ executed at any wall-clock time $t_Q \ge t^\ast$ whose
@@ -296,22 +296,22 @@ does not appear in $Q$'s result.
 the schema's `retired_at_ms` and `expires_at_ms` are both set to
 the value of `now_ms()` captured atomically inside the function
 body, under the registry's `RwLock` write guard
-(`asap-query-engine/src/stores/sketch_db/schema.rs:force_expire`).
+(`data_plane/src/storage_engines/sketch_db/index/mod.rs:force_expire`).
 
 **L3.2 — Status is a pure function of timestamps.**
-`AggSchema::status` (`schema.rs:status`) is a pure function of
+`SketchInstanceMetadata::status` (`index/mod.rs:status`) is a pure function of
 `(retired_at_ms, expires_at_ms, now_ms())`. With both fields set
 to $t^\ast$, the match arm
 `(Some(_), Some(exp)) if now >= exp` fires for every subsequent
 `now >= t^\ast`, returning `AggStatus::Expired`. The arm returning
 `AggStatus::Active` requires `retired_at_ms.is_none()`, which is
 unreachable after L3.1 (no code path clears `retired_at_ms`;
-`AggSchema::retire` is idempotent, `force_expire` only advances).
+`SketchInstanceMetadata::retire` is idempotent, `force_expire` only advances).
 
 **L3.3 — Barrier is in the ingest hot path.** Every sample that
 reaches the ingest router passes through
 `route_decoded_samples` in
-`asap-query-engine/src/precompute_engine/ingest_handler.rs`, which
+`data_plane/src/precompute_engine/ingest_handler.rs`, which
 unconditionally calls `state.schemas.is_writable(config.aggregation_id)`
 (see the loop body around the `!state.schemas.is_writable(…)`
 guard) before adding the sample to its `by_group` map. Samples
@@ -320,9 +320,9 @@ that fail this check are routed to the
 into `by_group`, so they are not forwarded to any worker.
 
 **L3.4 — `is_writable` rejects non-Active.**
-`SchemaRegistry::is_writable(agg_id)`
-(`schema.rs:is_writable` on the registry, delegating to
-`AggSchema::is_writable` on the schema) returns `true` iff
+`SketchStore::is_writable(agg_id)`
+(`index/mod.rs:is_writable` on the store, delegating to
+`SketchInstanceMetadata::is_writable` on the metadata) returns `true` iff
 `status() == AggStatus::Active`, by direct match
 (`matches!(self.status(), AggStatus::Active)`).
 
@@ -333,7 +333,7 @@ the payload from `by_group`; samples blocked at L3.3 are not in
 `by_group`). Workers have no other ingest channel.
 
 **L3.6 — Queries read only what workers wrote.** The store
-(`SketchStore` and friends, `asap-query-engine/src/stores/`)
+(`SketchStore` and friends, `data_plane/src/storage_engines/`)
 exposes no API that returns samples not previously written through
 `insert_precomputed_output_batch`. Queries flow through
 `ASAPQueryEngine::query_*`, which read the same store the workers
@@ -404,24 +404,24 @@ result that does not contain $s$. $\blacksquare$
 
 ### 3.5 Code anchors
 
-- `asap-query-engine/src/stores/sketch_db/schema.rs`
-  - `SchemaRegistry::force_expire` — sets `retired_at_ms` and
+- `data_plane/src/storage_engines/sketch_db/index/mod.rs`
+  - `SketchStore::force_expire` — sets `retired_at_ms` and
     `expires_at_ms` to `now_ms()` (L3.1).
-  - `AggSchema::status` — pure function of timestamps (L3.2).
-  - `AggSchema::is_writable` — `status() == Active` check (L3.4).
-  - `SchemaRegistry::is_writable` — registry-level wrapper (L3.4).
+  - `SketchInstanceMetadata::status` — pure function of timestamps (L3.2).
+  - `SketchInstanceMetadata::is_writable` — `status() == Active` check (L3.4).
+  - `SketchStore::is_writable` — registry-level wrapper (L3.4).
   - `AggStatus` — the three-state enum.
   - `now_ms` (file-private helper).
-- `asap-query-engine/src/precompute_engine/ingest_handler.rs`
+- `data_plane/src/precompute_engine/ingest_handler.rs`
   - `route_decoded_samples` — calls `is_writable` per sample,
     drops on `false`, bumps counter (L3.3).
   - `samples_blocked_by_schema_barrier` (atomic on
     `IngestState`).
-- `asap-query-engine/src/stores/sketch_db/metrics.rs`
+- `data_plane/src/storage_engines/sketch_db/metrics.rs`
   - `SAMPLES_BLOCKED_BY_SCHEMA_BARRIER` — Prometheus counter
     (`queryengine_ingest_samples_blocked_by_schema_barrier_total`).
 - Tests:
-  `asap-query-engine/src/precompute_engine/ingest_handler.rs::tests::barrier_counter_increments_after_force_expire`
+  `data_plane/src/precompute_engine/ingest_handler.rs::tests::barrier_counter_increments_after_force_expire`
   exercises the path end-to-end.
 
 ---
@@ -437,7 +437,7 @@ creation.
 ### 4.1 Statement
 
 Let `agg_id` $a$ be known to the schema registry with
-`AggSchema` $\Sigma$, and let
+`SketchInstanceMetadata` $\Sigma$, and let
 `BackfillRegistry::create_checked(_, a, (s, e), _, _, retention)`
 return `Ok(job_id)`. By construction (see L4.1 below), the job
 satisfies:
@@ -465,11 +465,11 @@ $$
 
 **L4.1 — Invariants enforced by `create_checked`.**
 `BackfillRegistry::create_checked`
-(`asap-query-engine/src/stores/sketch_db/backfill.rs:create_checked`)
+(`data_plane/src/storage_engines/sketch_db/backfill/mod.rs:create_checked`)
 returns `Ok` only after:
 
 - `schemas.get(agg_id) = Some(_)` (else `CreateError::UnknownAgg`),
-- `time_range.1 <= schema.created_at_ms` (else
+- `time_range.1 <= schema.first_seen_unix_ms` (else
   `CreateError::Overlap`),
 - if `data_retention_ms = Some(R)`,
   `time_range.0 >= now_ms().saturating_sub(R)` (else
@@ -481,19 +481,19 @@ These are the three §10.5 invariants verbatim.
 accumulator via the same factory:
 
 - Live: `create_accumulator_updater(config)` in
-  `asap-query-engine/src/precompute_engine/accumulator_factory.rs`,
+  `data_plane/src/precompute_engine/accumulator_factory.rs`,
   then `update_single` / `update_keyed` in ingest order.
 - Backfill: `build_backfilled_accumulator(config, samples)` in
-  `asap-query-engine/src/stores/sketch_db/backfill_window_builder.rs`,
+  `data_plane/src/storage_engines/sketch_db/backfill/window_builder.rs`,
   whose body is exactly
   `let mut updater = create_accumulator_updater(config); for s in samples { updater.update_*(...) } updater.take_accumulator()`.
 
 The two paths therefore differ only in (i) where the samples
 come from and (ii) the wall-clock time at which each call happens.
 
-**L4.3 — Pinned config.** `AggSchema::config: AggregationConfig` is
-set on `AggSchema::new_active` and never mutated thereafter
-(`schema.rs`); the comment on the field says verbatim *"Pinned at
+**L4.3 — Pinned config.** `SketchInstanceMetadata::config: AggregationConfig` is
+set when the `SketchInstanceMetadata` is registered and never mutated thereafter
+(`index/mod.rs`); the comment on the field says verbatim *"Pinned at
 schema creation; never mutated."* So the `config` argument both
 paths feed into `create_accumulator_updater` is bit-identical for
 the same `agg_id`.
@@ -515,14 +515,14 @@ Backfill paths"* is exactly this lemma.
 the accumulator's internal state (no embedded wall-clock,
 allocator-address, or HashMap-iteration-order fields). The pinning
 test
-`asap-query-engine/src/stores/sketch_db/backfill_processor.rs::tests::backfill_builds_bit_identical_sum_accumulator_to_live`
+`data_plane/src/storage_engines/sketch_db/backfill/processor.rs::tests::backfill_builds_bit_identical_sum_accumulator_to_live`
 locks this invariant for `SumAccumulator` and is the canary for
 the rest of the family.
 
 **L4.6 — Time-disjointness eliminates ordering ambiguity.** L4.1
 gives $e \le \Sigma.\mathtt{created\_at\_ms}$. Live ingest writes
 exactly $[\Sigma.\mathtt{created\_at\_ms}, \infty)$ (the §6 schema
-lifecycle says `is_writable = false` before `created_at_ms`,
+lifecycle says `is_writable = false` before `first_seen_unix_ms`,
 because the schema doesn't exist yet, and `is_writable = true`
 afterwards while `Active`). Backfill writes
 $[s, e) \subseteq [0, \Sigma.\mathtt{created\_at\_ms})$. The two
@@ -643,19 +643,19 @@ $\sigma_B.\mathrm{serialize\_to\_bytes}() =
 
 ### 4.5 Code anchors
 
-- `asap-query-engine/src/stores/sketch_db/backfill.rs`
+- `data_plane/src/storage_engines/sketch_db/backfill/mod.rs`
   - `BackfillRegistry::create_checked` — enforces the three
     §10.5 invariants (L4.1).
   - `CreateError::{UnknownAgg, Overlap, OutOfRetention}` — the
     three failure modes.
-- `asap-query-engine/src/stores/sketch_db/backfill_window_builder.rs`
+- `data_plane/src/storage_engines/sketch_db/backfill/window_builder.rs`
   - `build_backfilled_accumulator` — the backfill-side
     construction used in §4.1 and L4.2.
   - `extract_aggregated_key` — keyed-grouping function shared
     semantically with the live worker.
-- `asap-query-engine/src/precompute_engine/accumulator_factory.rs`
+- `data_plane/src/precompute_engine/accumulator_factory.rs`
   - `create_accumulator_updater` — the shared factory (L4.2).
-- `asap-query-engine/src/stores/sketch_db/backfill_processor.rs`
+- `data_plane/src/storage_engines/sketch_db/backfill/processor.rs`
   - `BackfillWindowProcessor::process_window` — calls
     `build_backfilled_accumulator` per group, writes via
     `Store::insert_precomputed_output_batch`.
@@ -664,12 +664,12 @@ $\sigma_B.\mathrm{serialize\_to\_bytes}() =
   - test
     `tests::backfill_builds_bit_identical_sum_accumulator_to_live` —
     runtime canary for L4.4 + L4.5 on `SumAccumulator`.
-- `asap-query-engine/src/stores/sketch_db/raw_sample_reader.rs`
+- `data_plane/src/storage_engines/sketch_db/backfill/raw_sample_reader.rs`
   - `RawSampleReader::read_samples` — ingest-order contract
     (L4.8).
-- `asap-query-engine/src/stores/sketch_db/schema.rs`
-  - `AggSchema::config` — pinned-at-creation invariant (L4.3).
-  - `AggSchema::new_active` — `created_at_ms` capture used by
+- `data_plane/src/storage_engines/sketch_db/index/mod.rs`
+  - `SketchInstanceMetadata::config` — pinned-at-creation invariant (L4.3).
+  - `SketchInstanceMetadata` registration — `first_seen_unix_ms` capture used by
     L4.6.
 
 ---
@@ -680,18 +680,18 @@ Each theorem anchors to a single module; this section exists so
 the paper's §theory chapter can cite both at once.
 
 - **Accuracy bounds (§1)** →
-  `asap-query-engine/src/stores/sketch_db/accuracy.rs`
+  `data_plane/src/storage_engines/sketch_db/accuracy.rs`
   (`AccuracyProfile::derive`).
 - **`combine_statistic` correctness (§2)** →
-  `asap-query-engine/src/query-engines/timeline_dispatch.rs`
+  `data_plane/src/storage_engines/sketch_db/query/timeline_dispatch.rs`
   (`CombinedResult`, `combine_statistic`).
 - **Write-barrier safety (§3)** →
-  `asap-query-engine/src/stores/sketch_db/schema.rs`
+  `data_plane/src/storage_engines/sketch_db/index/mod.rs`
   (`is_writable`, `status`, `retire`, `force_expire`); barrier
   counter `SAMPLES_BLOCKED_BY_SCHEMA_BARRIER` in
-  `asap-query-engine/src/stores/sketch_db/metrics.rs`.
+  `data_plane/src/storage_engines/sketch_db/metrics.rs`.
 - **Backfill determinism (§4)** →
-  `asap-query-engine/src/stores/sketch_db/backfill.rs`
+  `data_plane/src/storage_engines/sketch_db/backfill/mod.rs`
   (`BackfillRegistry::create_checked`); construction parity in
   `backfill_window_builder.rs::build_backfilled_accumulator`;
   pinning test in
