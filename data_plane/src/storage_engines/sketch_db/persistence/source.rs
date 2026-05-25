@@ -67,6 +67,14 @@ pub struct EpochSnapshotEntry {
     /// so a future read-back path can dispatch to the right
     /// deserializer once the SketchStore-backed snapshot lands.
     pub sketch_type_name: String,
+    /// Wire-encoding tag for sketch payloads — see
+    /// [`encoding_tag`](crate::storage_engines::sketch_db::index::persistence::part::encoding_tag).
+    /// Carries the `SketchEncoding` (Full vs Delta) of the payload so
+    /// the disk read-back path can preserve the delta-stitching
+    /// carry-in semantics across the in-mem/on-disk boundary. `0`
+    /// (the default) means "unknown / treat as Full" — exact-agg
+    /// payloads use `0`.
+    pub encoding_tag: u8,
     /// Serialized sketch payload (opaque to the persistence layer).
     pub sketch_bytes: Vec<u8>,
 }

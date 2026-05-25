@@ -48,6 +48,22 @@ pub struct SketchStorePersistenceConfig {
     /// query pays disk I/O). Default is `min(10% * memory_limit_bytes,
     /// 512 MiB)` — scale it with the write budget, not a fixed number.
     pub part_cache_bytes: u64,
+
+    /// Seal cadence in DISTINCT WINDOWS. The per-sid hot `current_epoch`
+    /// is sealed into the (in-memory, pending-flush) sealed-epoch ring
+    /// once it accumulates this many distinct windows; the background
+    /// flusher then turns sealed epochs into durable disk parts and
+    /// evicts them. This is what makes sealing fire in production — the
+    /// in-memory-only deployment never seals (`epoch_capacity == None`).
+    ///
+    /// Sizing: the agent emits ~30s tumbling panes, so `20` windows is
+    /// ~10 min of one series per part — large enough to amortize the
+    /// per-part header/index overhead, small enough that the most-recent
+    /// fully-behind-`hot_window` data is actually sealed (and thus
+    /// flushable) rather than stuck un-sealed in `current_epoch`.
+    /// `0` disables cadence sealing (no durable tier even if a disk_path
+    /// is set).
+    pub seal_window_count: usize,
 }
 
 impl SketchStorePersistenceConfig {
@@ -65,6 +81,7 @@ impl SketchStorePersistenceConfig {
             flush_interval: Duration::from_secs(1),
             disk_path,
             part_cache_bytes: cache,
+            seal_window_count: 20, // ~10 min of 30s panes per part
         }
     }
 }

@@ -506,6 +506,7 @@ mod tests {
                 end_ts: max_ts,
                 label: Some(KeyByLabelValues::new_with_labels(vec!["host".into()])),
                 sketch_type_name: "SumAccumulator".into(),
+                encoding_tag: 0,
                 sketch_bytes: b"dummy-payload".to_vec(),
             }],
         }
@@ -521,6 +522,7 @@ mod tests {
             flush_interval: Duration::from_millis(10),
             disk_path,
             part_cache_bytes: 0,
+            seal_window_count: 20,
         }
     }
 
