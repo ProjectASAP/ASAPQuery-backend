@@ -257,13 +257,33 @@ silently degrading) without ever overflowing. Until then **v1 needs no tuning**.
 
 ---
 
-## 4. Shared per-series offset from parse-once
+## 4. Shared per-series value stats from parse-once (NOT a shared offset constant)
 
-Compute the per-series reference once in the single parse pass (running
-min/last-value + the decimal scale exponent), reuse for BOTH the cold chunk and
-the warm sketch. If values are quantized once to fixed-point, both gorilla-cold
-and KLL store the quantized form ⇒ consistent + no recompute. CPU note: offset
-does NOT reduce sketch-build cost (hashing/compaction is fixed); the CPU wins
+What is shared between the cold path and the warm sketches is the **parse-once
+computation**, not a single offset constant:
+
+- **Shared (compute once, both consume):** the per-series **decimal scale
+  exponent** — which MUST be identical (one series has one natural precision, so
+  cold INT_FOR and KLL fixed-point land in the same integer domain and stay
+  mutually consistent) — plus the per-series value stats (running min/range).
+- **NOT shared — the actual FOR base differs by cadence.** Cold re-bases the
+  base **per block** (each chunk takes its own min/first for the tightest
+  per-block residual width); warm sketches re-base **per Full-epoch** (the base
+  must stay stable so a run of Deltas remains mergeable, §3). These cadences
+  conflict — forcing one shared base would hurt whichever tier it's wrong for —
+  so the actual subtracted constant generally differs even though both derive
+  from the same parse-once stats.
+- **Scope — only the raw-value-offset families:** cold INT_* values ↔ KLL ↔ SUM
+  (all subtract a reference from the same raw values). DDSketch (FOR on bucket
+  *indices*), HLL (hash), and CMS/CountSketch (counters) have **no shared
+  raw-value offset** — their compression uses their own structure (§2.1).
+- **Kind matches per shape, not as a constant:** VM uses min-FOR for *gauges*
+  (same kind as KLL's value-offset) but delta-of-delta for *counters* (base =
+  first value), which aligns with the warm side's SUM-as-delta — so the
+  correspondence is gauge→FOR / counter→delta, not one shared number.
+
+CPU note: the offset does NOT reduce sketch-build cost (hashing/compaction is
+fixed) — **sampling (§6) is what closes that CPU gap**. Compression's CPU wins
 come from parse-once (done) + decode-on-read (cold decode off the ingest hot
 path) + VM's cheaper decode.
 
