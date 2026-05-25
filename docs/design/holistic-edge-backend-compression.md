@@ -282,3 +282,59 @@ path) + VM's cheaper decode.
 Explicitly OUT of scope (decided): no zstd-wrapped variants, and no lossy/Serf
 option — cold stays purely lossless with the {Gorilla-XOR, INT_FOR_DELTA,
 INT_FOR_DOD} best-of-N.
+
+---
+
+## 6. Sampling × compression composition
+
+Sampling-enhanced sketches (inverse-probability bucket/counter updates,
+hash-threshold key sampling, weighted KLL insertion — each with its own derived
+error bound) compose with the compression scheme above. They sit on ORTHOGONAL
+cost axes and are COMPLEMENTARY:
+- **Compression** (FOR / delta / sparse / shared-ts) cuts BYTES — wire,
+  sketch_db memory, disk parts.
+- **Sampling** cuts INGEST CPU + update rate — each item triggers a sketch
+  update only with probability `p`. This is the axis compression structurally
+  CANNOT touch: offset/FOR don't reduce the hashing/compaction build cost;
+  sampling does. (§4's note "offset doesn't reduce sketch-build CPU" — sampling
+  is what closes that gap.)
+
+**Scope**: sampling applies to the WARM sketch path only. The cold raw archive
+is NOT sampled (it is the lossless backup; sampling would lose data).
+
+### 6.1 The composition rule
+> Store the RAW SAMPLED integer state + one global `p` per frame; apply the
+> `×1/p` rescale at QUERY, not at store.
+
+Storing the `1/p`-rescaled (inflated, often fractional) state would break
+varint/FOR and bloat. Storing the raw sampled accumulation — e.g. DDSketch
+`m_b = Σ Z_i` (≈ `p·n_b`, a SMALLER integer) + `p`, rescaled `m_b/p` at query —
+keeps counts as small integers, so FOR/delta/varint (and the common-bits idea)
+keep working. It is also numerically cleaner (integer accumulation, no per-update
+fraction). `p` rides in the Full-epoch frame header alongside the offset.
+
+### 6.2 Per-family interaction
+| family | sampling (CPU↓) | compression | interaction |
+|---|---|---|---|
+| HLL | hash-threshold (also thins registers) | sparse full-state (P1) | **strong synergy**: sampling zeroes more registers → sparser → sparse encoding wins more AND stays sparse up to ~`1/p`× higher true cardinality before the dense crossover. Query `n̂/p`. |
+| DDSketch | bucket-update (writes→`p`) | index FOR+varint (done) | orthogonal; bucket SET ≈ unchanged so index encoding unchanged; store sampled counts (smaller int) + `p` → count varint smaller. |
+| KLL | weighted insert (inserts→`p`) | value-offset/quantize (P2) | orthogonal; state still `k` items → offset-encode them; weight = global `(1/p)·2^h` (no per-item cost). |
+| CMS / CountSketch (Nitro) | sampled counter update (writes→`pd` or fixed `s`) | zigzag-varint (done) | synergy: store sampled small-int counts + `p` → varint smaller; writes cut to `pd`. |
+
+### 6.3 Cross-cutting
+- **Delta transmission**: sampling → fewer updates/window → fewer changed cells
+  → smaller delta frames. Merging sampled windows is benign — sampling error
+  `ε_s ∝ 1/√(pN)` shrinks as more windows merge (larger N).
+- **Full-epoch frame**: `p` is a frame-level constant in the Full header (like
+  the offset); deltas inherit it.
+
+### 6.4 Cautions
+- **Error budgets ADD**: `ε_total = sketch error + sampling ε_s (+ KLL value-
+  offset quantization)`, and must fit the metric's accuracy SLA. Family bounds
+  (derived separately): DDSketch `ε_s = O(√(log(B/δ)/pN))`; KLL `ε_total ≈
+  ε_k + ε_s` with the design balance `pN ≳ k²`; HLL `RSE ≈ √((1−p)/(pn) +
+  1.04²/m)`; Nitro adds variance `((1−p)/p)·Σ a_t²`.
+- **`p` is a per-metric control-plane knob**: chosen per metric from the
+  expected N (rate/cardinality) + accuracy SLA. Fits the existing
+  controller-driven model exactly — the controller already annotates each
+  metric's tier + sketch type; it adds `p` the same way.
