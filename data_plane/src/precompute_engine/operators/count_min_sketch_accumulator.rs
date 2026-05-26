@@ -393,6 +393,13 @@ impl AggregateCore for CountMinSketchAccumulator {
         "CountMinSketchAccumulator"
     }
 
+    /// Per-window base rotation: rebuild an empty counter matrix with
+    /// the same (rows, cols) so the next window's additive cell deltas
+    /// align to the identical hash geometry.
+    fn reset_to_empty(&mut self) {
+        self.inner = CountMinSketch::new(self.inner.rows(), self.inner.cols());
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

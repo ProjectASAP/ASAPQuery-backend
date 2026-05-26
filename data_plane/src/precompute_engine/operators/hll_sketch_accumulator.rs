@@ -165,6 +165,15 @@ impl AggregateCore for HllSketchAccumulator {
         "HllSketchAccumulator"
     }
 
+    /// Per-window base rotation: zero the registers but keep the variant
+    /// and precision. Critical for HLL — its register-wise `max` merge
+    /// has no inverse, so a never-reset base accumulates the all-time-max
+    /// across windows (`docs/delta-baseline-contract.md` §1.5); rotating
+    /// to an empty register array makes per-window cardinality correct.
+    fn reset_to_empty(&mut self) {
+        self.inner = HllSketch::new(self.inner.variant, self.inner.precision);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

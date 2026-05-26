@@ -83,6 +83,24 @@ pub trait AggregateCore: SerializableToSink + Send + Sync {
     fn aux_stats(&self) -> AuxStats {
         AuxStats::empty()
     }
+
+    /// Reset the sketch state to empty **in place**, preserving its
+    /// shape / configuration (dimensions, relative accuracy, register
+    /// width, …) so a subsequent delta-apply lands on a clean,
+    /// same-shape base.
+    ///
+    /// Used by the OTLP ingest path's per-window base rotation: when a
+    /// delta frame opens a new tumbling window for a series, the cached
+    /// base is reset here before the new window's delta is applied, so
+    /// the reconstructed state reflects that window only rather than an
+    /// all-time accumulation across windows (see
+    /// `docs/delta-baseline-contract.md` §3).
+    ///
+    /// The default is a no-op: only the delta-capable, additive families
+    /// (DDSketch, CMS, CountSketch, HLL) ever reach the rotation path and
+    /// override this. KLL never deltas, and the non-sketch accumulators
+    /// are never cached as a delta base.
+    fn reset_to_empty(&mut self) {}
 }
 
 /// Four typed auxiliary scalars tracked alongside every sketch entry:

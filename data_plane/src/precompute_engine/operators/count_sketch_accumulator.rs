@@ -232,6 +232,13 @@ impl AggregateCore for CountSketchAccumulator {
         "CountSketchAccumulator"
     }
 
+    /// Per-window base rotation: rebuild an empty signed-counter matrix
+    /// with the same (rows, cols) so the next window's additive cell
+    /// deltas align to the identical hash geometry.
+    fn reset_to_empty(&mut self) {
+        self.inner = CountSketch::new(self.inner.rows, self.inner.cols);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
