@@ -751,23 +751,13 @@ fn make_dd_sketch_agg_config(
     )
 }
 
-fn build_dd_sketch_state(
-    alpha: f64,
-    store_counts: Vec<u64>,
-    store_offset: i32,
-    count: u64,
-    sum: f64,
-    min: f64,
-    max: f64,
-) -> DdSketchState {
+fn build_dd_sketch_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) -> DdSketchState {
+    // The DataPoint-level scalars (count/sum/min/max) were dropped from
+    // `DDSketchState` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
     DdSketchState {
         alpha,
         store_counts,
         store_offset,
-        count,
-        sum,
-        min,
-        max,
     }
 }
 
@@ -861,14 +851,14 @@ async fn e2e_dd_sketch_modified_otlp_path() {
     tokio::time::sleep(tokio::time::Duration::from_millis(400)).await;
 
     let store_counts = vec![5u64, 10, 15, 20];
-    let dd_state = build_dd_sketch_state(alpha, store_counts.clone(), -1, 50, 150.0, 0.25, 8.0);
+    let dd_state = build_dd_sketch_state(alpha, store_counts.clone(), -1);
     let sketch_bytes = dd_state.encode_to_vec();
 
     let client = reqwest::Client::new();
     let req = build_dd_sketch_export_request(metric_name, service_label, 100_000_000, sketch_bytes);
     post_otlp_http(&client, otlp_http_port, req).await;
 
-    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0, 0, 0.0, 0.0, 0.0);
+    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0);
     let watermark_req = build_dd_sketch_export_request(
         metric_name,
         service_label,
@@ -896,8 +886,10 @@ async fn e2e_dd_sketch_modified_otlp_path() {
 
     assert_eq!(dd_acc.inner.store_counts, store_counts);
     assert_eq!(dd_acc.inner.store_offset, -1);
-    assert_eq!(dd_acc.inner.count, 50);
-    assert_eq!(dd_acc.inner.sum, 150.0);
+    // `count` is recovered from the bucket store (5 + 10 + 15 + 20 = 50);
+    // sum/min/max were dropped from the wire format
+    // (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
+    assert_eq!(dd_acc.inner.total_count(), 50);
     assert!((dd_acc.inner.alpha - alpha).abs() < f64::EPSILON);
 }
 

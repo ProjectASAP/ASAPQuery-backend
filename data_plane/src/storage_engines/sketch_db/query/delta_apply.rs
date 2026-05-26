@@ -323,14 +323,14 @@ fn dd_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
             state.alpha
         ));
     }
+    // The DataPoint-level scalars (count/sum/min/max) were dropped from
+    // `DDSketchState` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57);
+    // `DdSketch::from_raw` takes only (alpha, store_counts, store_offset)
+    // and recovers `count` from the bucket store.
     Ok(DdSketch::from_raw(
         state.alpha,
         state.store_counts.clone(),
         state.store_offset,
-        state.count,
-        state.sum,
-        state.min,
-        state.max,
     ))
 }
 

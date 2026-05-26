@@ -184,13 +184,15 @@ mod tests {
         // so we're not racing any earlier tests.
         let series_key = "__name__=latency_ms,inst=a";
         let base = DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0),
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
         };
         state
             .sketch_snapshots
             .insert(series_key.to_string(), Box::new(base.clone()));
 
-        // First delta adds to bucket 0 and bucket 2.
+        // First delta adds to bucket 0 and bucket 2. The wire delta now
+        // carries only bucket deltas (the count/sum/min/max scalar fields
+        // were dropped, ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
         let d1 = PbDelta {
             buckets: vec![
                 DdSketchBucketDelta {
@@ -202,11 +204,6 @@ mod tests {
                     d_count: 20,
                 },
             ],
-            d_count: 30,
-            d_sum: 70.0,
-            new_max: 5.0,
-            max_changed: true,
-            ..Default::default()
         }
         .encode_to_vec();
         let mut acc1 = state
@@ -227,11 +224,6 @@ mod tests {
                 index: 1,
                 d_count: 5,
             }],
-            d_count: 5,
-            d_sum: 10.0,
-            new_max: 6.0,
-            max_changed: true,
-            ..Default::default()
         }
         .encode_to_vec();
         let mut acc2 = state
@@ -246,12 +238,10 @@ mod tests {
         // Base [1,2,3] + d1 [+10 on 0, +20 on 2] = [11,2,23];
         // + d2 [+5 on 1] = [11,7,23].
         assert_eq!(final_dd.inner.store_counts, vec![11, 7, 23]);
-        // Counts add: 6 + 30 + 5 = 41.
-        assert_eq!(final_dd.inner.count, 41);
-        // Sum: 12 + 70 + 10 = 92.
-        assert_eq!(final_dd.inner.sum, 92.0);
-        // Max updated to 6.0 via d2's max_changed flag.
-        assert_eq!(final_dd.inner.max, 6.0);
+        // `count` recomputed from the merged buckets: 11 + 7 + 23 = 41.
+        // (sum/min/max were dropped from the wire format,
+        // ProjectASAP/sketchlib-go#243 / asap_sketchlib#57.)
+        assert_eq!(final_dd.inner.total_count(), 41);
 
         drop(state);
         let _ = drain.await;

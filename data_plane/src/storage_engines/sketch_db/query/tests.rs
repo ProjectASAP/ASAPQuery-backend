@@ -35,10 +35,6 @@ fn encode_ddsketch(sk: &DdSketch) -> Vec<u8> {
         alpha: sk.alpha,
         store_counts: sk.store_counts.clone(),
         store_offset: sk.store_offset,
-        count: sk.count,
-        sum: sk.sum,
-        min: sk.min,
-        max: sk.max,
     };
     let env = SketchEnvelope {
         sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
