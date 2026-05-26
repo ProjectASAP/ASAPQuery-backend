@@ -208,6 +208,12 @@ impl CountMinSketchAccumulator {
             cells,
             l1: pb.l1,
             l2: pb.l2,
+            // The Go-side CountMinDelta proto now carries an hh_keys field
+            // (heavy-hitter candidates), mirrored on asap_sketchlib's
+            // CountMinSketchDelta. The vendored Rust proto bindings here don't
+            // decode it yet, and CountMin has no TopK to rebuild, so pass an
+            // empty set — same handling as CountSketch's hh_keys.
+            hh_keys: Vec::new(),
         };
         self.inner
             .apply_delta(&delta)
@@ -890,7 +896,7 @@ mod tests {
 
         let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("zero dims"));
+        assert!(result.unwrap_err().to_string().contains("degenerate dims"));
     }
 
     #[test]

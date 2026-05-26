@@ -495,7 +495,7 @@ mod tests {
         let bytes = state.encode_to_vec();
         let result = CountSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("zero dims"));
+        assert!(result.unwrap_err().to_string().contains("degenerate dims"));
     }
 
     #[test]

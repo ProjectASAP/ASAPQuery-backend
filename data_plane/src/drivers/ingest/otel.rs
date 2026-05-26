@@ -2663,7 +2663,7 @@ mod dispatcher_tests {
 
     #[test]
     fn apply_modified_otlp_delta_bytes_hll_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{HllDelta as PbDelta, HllRegisterUpdate};
+        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 
         let mut acc: Box<dyn AggregateCore> =
@@ -2674,11 +2674,9 @@ mod dispatcher_tests {
             .inner
             .registers = vec![1, 5, 3, 7];
 
+        // Packed (index_delta, value) blob for updates {0:4, 2:6}.
         let bytes = PbDelta {
-            updates: vec![
-                HllRegisterUpdate { index: 0, value: 4 },
-                HllRegisterUpdate { index: 2, value: 6 },
-            ],
+            packed_updates: vec![0, 4, 2, 6],
         }
         .encode_to_vec();
 

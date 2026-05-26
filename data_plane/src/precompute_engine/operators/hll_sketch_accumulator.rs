@@ -12,7 +12,7 @@
 //! store round-trip works end-to-end without that richer query surface.
 
 use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
-use asap_sketchlib::{HllSketch, HllSketchDelta, HllVariant, MessagePackCodec};
+use asap_sketchlib::{HllSketch, HllVariant, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -121,19 +121,11 @@ impl HllSketchAccumulator {
         &mut self,
         buffer: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
-        use prost::Message;
-
-        let pb = PbDelta::decode(buffer).map_err(|e| format!("decode HLLDelta: {e}"))?;
-
-        let updates = pb
-            .updates
-            .into_iter()
-            .map(|u| (u.index, u.value as u8))
-            .collect();
-        let delta = HllSketchDelta { updates };
+        // The HLLDelta wire format is a varint-packed (index_delta, value) blob;
+        // decode + apply (register-wise max) via the shared sketch library so
+        // the unpacking stays a single source of truth.
         self.inner
-            .apply_delta(&delta)
+            .apply_delta_bytes(buffer)
             .map_err(|e| format!("apply HLLDelta: {e}"))?;
         Ok(())
     }
@@ -468,17 +460,16 @@ mod tests {
 
     #[test]
     fn test_apply_proto_delta_bytes_round_trip() {
-        use asap_otel_proto::sketchlib::v1::{HllDelta as PbDelta, HllRegisterUpdate};
+        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 
         let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 2);
         acc.inner.registers = vec![1, 5, 3, 7];
 
+        // Packed (index_delta, value) blob for updates {0:4, 2:6}:
+        // varint(0),varint(4),varint(2),varint(6).
         let delta_bytes = PbDelta {
-            updates: vec![
-                HllRegisterUpdate { index: 0, value: 4 },
-                HllRegisterUpdate { index: 2, value: 6 },
-            ],
+            packed_updates: vec![0, 4, 2, 6],
         }
         .encode_to_vec();
 
