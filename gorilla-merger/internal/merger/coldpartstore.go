@@ -201,6 +201,28 @@ func (s *ColdPartStore) NumParts() int {
 	return len(s.man.entries)
 }
 
+// MinBlockStart returns the smallest block_start_ms across all tracked parts
+// and true, or (0,false) when the manifest is empty. The StoreAPI uses it to
+// lower its advertised MinTime to the oldest cold data, so thanos-query routes
+// queries for old (cold-only) windows to the merger instead of pruning it. The
+// per-series [min_ts,max_ts] index entries (not the block range) remain the
+// authoritative time filter inside the query path; this is only the advertised
+// floor of what the merger MIGHT serve.
+func (s *ColdPartStore) MinBlockStart() (int64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.man.entries) == 0 {
+		return 0, false
+	}
+	min := s.man.entries[0].BlockStartMs
+	for _, e := range s.man.entries[1:] {
+		if e.BlockStartMs < min {
+			min = e.BlockStartMs
+		}
+	}
+	return min, true
+}
+
 // Bucket exposes the underlying bucket (used by the query path and tests).
 func (s *ColdPartStore) Bucket() objstore.Bucket { return s.bkt }
 

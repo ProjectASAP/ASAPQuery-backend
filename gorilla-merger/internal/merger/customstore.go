@@ -75,10 +75,23 @@ func (s *customStore) setColdQuerier(c *ColdQuerier) { s.cold = c }
 
 // timeRange mirrors TSDBStore.TimeRange: min = head StartTime (the oldest
 // sample currently held), max = +inf so the open window is always queried.
+//
+// When a cold querier is attached, the advertised min is LOWERED to the oldest
+// cold part's block start when that is earlier than the tsdb StartTime. This is
+// load-bearing: thanos-query prunes a store from a query's fan-out when the
+// query window falls entirely below the store's advertised MinTime. The cold
+// path serves raw samples OLDER than the tsdb head's StartTime, so without this
+// floor a query for old (cold-only) data is never routed to the merger and
+// streamColdSeries is never invoked — the parts are stored but served empty.
 func (s *customStore) timeRange() (int64, int64) {
 	var minTime int64 = math.MinInt64
 	if st, err := s.db.StartTime(); err == nil {
 		minTime = st
+	}
+	if s.cold != nil {
+		if coldMin, ok := s.cold.MinBlockStart(); ok && coldMin < minTime {
+			minTime = coldMin
+		}
 	}
 	return minTime, math.MaxInt64
 }
@@ -293,10 +306,14 @@ func (s *customStore) streamColdSeries(
 	if s.cold == nil {
 		return nil
 	}
+	level.Debug(s.logger).Log("msg", "streamColdSeries: querying cold parts",
+		"mint", r.MinTime, "maxt", r.MaxTime, "matchers", len(matchers), "skip_chunks", r.SkipChunks)
 	coldSeries, err := s.cold.Series(ctx, matchers, r.MinTime, r.MaxTime)
 	if err != nil {
 		return status.Error(codes.Internal, err.Error())
 	}
+	level.Debug(s.logger).Log("msg", "streamColdSeries: emitting cold series",
+		"cold_series", len(coldSeries), "mint", r.MinTime, "maxt", r.MaxTime)
 	for _, cs := range coldSeries {
 		full := completeLabels(cs.Labels, finalExt)
 		zls := zLabelsCopy(full)

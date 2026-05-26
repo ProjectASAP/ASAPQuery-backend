@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/ProjectASAP/asap-gorilla-go/coldpart"
 	"github.com/prometheus/prometheus/model/labels"
@@ -493,5 +494,144 @@ func TestStoreAPIUnionsColdAndTSDB(t *testing.T) {
 	}
 	if !sawHot || !sawCold {
 		t.Fatalf("union missing a tier: sawHot=%v sawCold=%v", sawHot, sawCold)
+	}
+}
+
+// TestColdPartStoreMinBlockStart asserts MinBlockStart reports the earliest
+// block start across all parts (and false for an empty store / nil querier).
+func TestColdPartStoreMinBlockStart(t *testing.T) {
+	store := NewColdPartStore(objstore.NewInMemBucket(), nil)
+	if _, ok := store.MinBlockStart(); ok {
+		t.Fatalf("empty store MinBlockStart ok = true, want false")
+	}
+
+	// Insert parts out of block-start order; MinBlockStart must find the min.
+	mustPut(t, store, writePartBytes(t, 5000, 6000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "a"), 5000, 1, 2),
+	}))
+	mustPut(t, store, writePartBytes(t, 1000, 2000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "b"), 1000, 3, 4),
+	}))
+	mustPut(t, store, writePartBytes(t, 9000, 10000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "c"), 9000, 5, 6),
+	}))
+	got, ok := store.MinBlockStart()
+	if !ok || got != 1000 {
+		t.Fatalf("MinBlockStart = (%d,%v), want (1000,true)", got, ok)
+	}
+
+	// Through the querier wrapper, and the nil-querier guard.
+	if qmin, ok := NewColdQuerier(store).MinBlockStart(); !ok || qmin != 1000 {
+		t.Fatalf("ColdQuerier.MinBlockStart = (%d,%v), want (1000,true)", qmin, ok)
+	}
+	var nilQ *ColdQuerier
+	if _, ok := nilQ.MinBlockStart(); ok {
+		t.Fatalf("nil querier MinBlockStart ok = true, want false")
+	}
+}
+
+// TestCustomStoreTimeRangeIncludesCold is the regression proof for the
+// served-empty bug: with a cold querier attached, the customStore's advertised
+// timeRange().min must drop to the oldest cold part's block start (which is far
+// older than the tsdb head's StartTime). thanos-query uses this advertised
+// MinTime to decide whether to route a query to the merger; if it stays at the
+// recent tsdb StartTime, queries for old (cold-only) windows are pruned and
+// streamColdSeries never runs — the parts are stored but served empty.
+func TestCustomStoreTimeRangeIncludesCold(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStorage(StorageOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// The tsdb head's StartTime is roughly "now" (no old data ingested).
+	tsdbStart, err := st.DB.StartTime()
+	if err != nil {
+		t.Fatalf("StartTime: %v", err)
+	}
+
+	// A cold part whose block starts well BEFORE the tsdb StartTime — exactly
+	// the cold-only window thanos-query would otherwise prune.
+	coldStart := tsdbStart - int64(24*time.Hour/time.Millisecond)
+	bkt := objstore.NewInMemBucket()
+	coldStore := NewColdPartStore(bkt, nil)
+	mustPut(t, coldStore, writePartBytes(t, coldStart, coldStart+1000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "old_metric"), coldStart, 1, 2),
+	}))
+
+	cs := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+
+	// Without the cold querier the advertised min is the (recent) tsdb StartTime.
+	if min, _ := cs.timeRange(); min != tsdbStart {
+		t.Fatalf("tsdb-only timeRange min = %d, want tsdb StartTime %d", min, tsdbStart)
+	}
+
+	// With the cold querier attached the advertised min drops to the cold floor.
+	cs.setColdQuerier(NewColdQuerier(coldStore))
+	min, max := cs.timeRange()
+	if min != coldStart {
+		t.Fatalf("with-cold timeRange min = %d, want cold block start %d", min, coldStart)
+	}
+	if max <= min {
+		t.Fatalf("timeRange max = %d not > min = %d", max, min)
+	}
+}
+
+// TestCustomStoreSeriesServesOldColdWindow drives the full Series RPC over a
+// window that covers ONLY the cold part (older than the tsdb head) and asserts
+// the cold series + its samples are returned. This is the end-to-end read-path
+// proof that decode-on-read serves stored parts for an old-only window.
+func TestCustomStoreSeriesServesOldColdWindow(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStorage(StorageOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	const base = int64(1_600_000_000_000) // well in the past
+	bkt := objstore.NewInMemBucket()
+	coldStore := NewColdPartStore(bkt, nil)
+	mustPut(t, coldStore, writePartBytes(t, base, base+1000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "http_requests_total", "job", "api"), base, 11, 22),
+	}))
+
+	cs := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	cs.setColdQuerier(NewColdQuerier(coldStore))
+
+	// The advertised min must cover this old window (else thanos-query prunes us).
+	if min, _ := cs.timeRange(); min > base {
+		t.Fatalf("advertised min %d > query window start %d: store would be pruned", min, base)
+	}
+
+	req := &storepb.SeriesRequest{
+		MinTime: base - 60_000,
+		MaxTime: base + 60_000,
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: labels.MetricName, Value: "http_requests_total"},
+		},
+	}
+	fss := &fakeSeriesServer{ctx: context.Background()}
+	if err := cs.Series(req, fss); err != nil {
+		t.Fatalf("Series: %v", err)
+	}
+
+	var results int
+	for _, r := range fss.responses {
+		series := r.GetSeries()
+		if series == nil {
+			continue
+		}
+		results++
+		want := labels.FromStrings(labels.MetricName, "http_requests_total", "job", "api")
+		if labels.Compare(labelsOf(t, series.Labels), want) != 0 {
+			t.Fatalf("cold series labels:\n got  %s\n want %s", labelsOf(t, series.Labels).String(), want.String())
+		}
+		assertSamples(t, "old-cold", samplesFromChunks(t, series.Chunks),
+			[]sample{{base, 11}, {base + 1000, 22}})
+	}
+	if results != 1 {
+		t.Fatalf("old-cold window: got %d series, want 1", results)
 	}
 }
