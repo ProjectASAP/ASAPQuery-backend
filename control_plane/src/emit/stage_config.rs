@@ -1687,10 +1687,16 @@ fn emit_edge_yaml_asap_edge(
     // no-op check.
     let window_secs = clamp_window_secs(cfg.window_secs).unwrap_or(MAX_WINDOW_SECS);
 
-    // shard_count: fixed at 4 (the fused contract's default — key-hash
-    // sharding for multi-core decode). No `EdgeStageConfig` field plumbs
-    // a per-deploy override yet; 4 matches the hand-written config.
-    let shard_count: u64 = 4;
+    // shard_count: key-hash sharding for multi-core decode AND flush
+    // staggering — flushLoop phase-shifts one shard per (WindowDuration/
+    // shard_count) tick, so a higher count spreads the per-flush CPU+memory
+    // burst into more, smaller bursts (smoother under the dense raw-buffer
+    // workload). Default 12; env-overridable via ASAP_SHARD_COUNT.
+    let shard_count: u64 = std::env::var("ASAP_SHARD_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(12);
 
     let mut metric_entries: Vec<Value> = Vec::new();
 
@@ -5514,7 +5520,7 @@ mod tests {
             .expect("asap_edge processor present");
         assert_eq!(
             asap_edge.get("shard_count").and_then(|v| v.as_u64()),
-            Some(4),
+            Some(12),
             "shard_count\n{yaml}"
         );
         assert_eq!(
