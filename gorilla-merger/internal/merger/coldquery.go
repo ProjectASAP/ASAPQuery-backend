@@ -43,6 +43,18 @@ func NewColdQuerier(store *ColdPartStore) *ColdQuerier {
 	return &ColdQuerier{store: store}
 }
 
+// MinBlockStart returns the smallest block_start_ms across the cold store's
+// tracked parts and true, or (0,false) when there is no cold data (or no
+// store). The customStore folds this into its advertised StoreAPI MinTime so
+// thanos-query does not prune the merger from a query whose window only covers
+// old cold data.
+func (q *ColdQuerier) MinBlockStart() (int64, bool) {
+	if q == nil || q.store == nil {
+		return 0, false
+	}
+	return q.store.MinBlockStart()
+}
+
 // Series returns every cold series matching all matchers with at least one
 // sample in the inclusive window [mintMs,maxtMs], each as XOR chunk(s) over the
 // CLIPPED in-window samples (coldpart.Part.Series returns the WHOLE matched
