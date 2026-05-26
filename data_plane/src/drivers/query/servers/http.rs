@@ -1662,28 +1662,58 @@ async fn process_range_query_request(
         parsed_request.query, parsed_request.start, parsed_request.end, parsed_request.step
     );
 
-    // B7.5 retirement — legacy `handle_range_query_promql` is gone.
-    // Route directly through the modern warm-tier path
-    // (`execute_range_promql_modern`), which classifies via the
-    // analyzer + ASAP-tier reducer and returns Matrix shape per the
-    // `/api/v1/query_range` wire-format requirement.
+    // ASAP-first centralization refactor — the range path is now a
+    // thin transport layer. All engine-selection / failover lives in
+    // `EngineRouter::execute_range`, which walks the shared
+    // `compatible_storage_backends` policy table:
+    //   * `accuracy == Exact`  → archive only (thanos_query)
+    //   * otherwise            → ASAP-tier (asap_query) first, fall
+    //                            back to the archive on CapabilityMiss.
+    // The handler no longer reaches into `query_engine` /
+    // `engine_by_id` to do its own Thanos lookup; it just resolves the
+    // metric's storage axis and hands the range request to the router.
     let start_ms = (parsed_request.start * 1000.0) as u64;
     let end_ms = (parsed_request.end * 1000.0) as u64;
     let step_ms = (parsed_request.step * 1000.0) as u64;
-    let modern_result = state
-        .query_engine
-        .execute_range_promql_modern(
+
+    // Range handlers don't read the `X-ASAP-Tenant` header, so resolve
+    // the metric's storage axis against the `default` tenant's routing
+    // table — the same resolution the instant path applies when no
+    // tenant header is present.
+    let metric_storage = resolve_metric_storage(state, &parsed_request.query, "default");
+
+    // Match the instant path's hardcoding of `(Sum, Approximate)`.
+    // TODO: derive `accuracy` (and `stat`) from the request rather than
+    // pinning Approximate — once the request carries an accuracy hint,
+    // an `Exact` range query will route straight to the archive via the
+    // shared policy table.
+    let stat = Statistic::Sum;
+    let accuracy = AccuracyTarget::Approximate;
+
+    debug!(
+        "Dispatching range query via EngineRouter: query='{}' metric_storage={:?} \
+         stat={:?} accuracy={:?}",
+        parsed_request.query, metric_storage, stat, accuracy,
+    );
+
+    let router_result = state
+        .query_router
+        .execute_range(
             &parsed_request.query,
+            stat,
+            accuracy,
+            metric_storage,
             start_ms,
             end_ms,
             step_ms,
         )
         .await;
-    match modern_result {
+
+    match router_result {
         Ok(query_result) => {
             let query_duration = query_start_time.elapsed();
             debug!(
-                "Modern range execute took: {:.2}ms",
+                "EngineRouter range dispatch took: {:.2}ms",
                 query_duration.as_secs_f64() * 1000.0
             );
             let total_duration = start_time.elapsed();
@@ -1703,15 +1733,52 @@ async fn process_range_query_request(
                 Err(status) => status.into_response(),
             }
         }
-        Err(_) => {
-            debug!(
-                "Modern range-query path returned CapabilityMiss for query='{}', \
-                 falling through to unsupported",
-                parsed_request.query
+        Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
+            warn!(
+                tried = ?tried,
+                registered = ?registered,
+                "EngineRouter (range): no engine registered for any compatible backend",
             );
-            match state.adapter.format_unsupported_query_response().await {
-                Ok(json) => json.into_response(),
-                Err(status) => status.into_response()}
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errorType": "internal",
+                    "error": format!(
+                        "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
+                    )})),
+            )
+                .into_response()
+        }
+        Err(EngineRouterError::AllFailed { last }) => {
+            use crate::query_engines::EngineError;
+            warn!(error = %last, "EngineRouter (range): all compatible engines failed");
+            // A terminal CapabilityMiss means no tier could serve the
+            // range query — surface the adapter's "unsupported query"
+            // response (the wire shape browsers / dashboards expect),
+            // matching the pre-refactor fall-through. A Backend error
+            // is a real upstream failure → 5xx.
+            match &last {
+                EngineError::CapabilityMiss { .. } => {
+                    debug!(
+                        "Range query CapabilityMiss across all tiers for query='{}', \
+                         falling through to unsupported",
+                        parsed_request.query
+                    );
+                    match state.adapter.format_unsupported_query_response().await {
+                        Ok(json) => json.into_response(),
+                        Err(status) => status.into_response(),
+                    }
+                }
+                EngineError::Backend { .. } => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "errorType": "internal",
+                        "error": last.to_string()})),
+                )
+                    .into_response(),
+            }
         }
     }
 }
@@ -3252,16 +3319,24 @@ aggregations:
 
     #[tokio::test]
     async fn http_returns_503_when_no_engines_registered() {
-        // Pin `storage_backend = GorillaObjectStore` but register no
-        // archive engine (only `ASAPQueryEngine` is registered under
-        // `asap_query`). The router walks
-        // `compatible_storage_backends = [GorillaObjectStore]` and
-        // bails out with `NoEngineRegistered`, which the HTTP layer
-        // surfaces as 503. Step-1 of the JSONL deprecation removed
-        // the `ColdJsonlFallback` failover slot, so this is the
-        // canonical "engine missing" path now.
+        // Pin `storage_backend = PrometheusRemote` but register no
+        // Prometheus forwarder (only `ASAPQueryEngine` is registered
+        // under `asap_query`). The router walks
+        // `compatible_storage_backends = [PrometheusRemote]` and bails
+        // out with `NoEngineRegistered`, which the HTTP layer surfaces
+        // as 503.
+        //
+        // ASAP-first refactor note: this test used to pin
+        // `GorillaObjectStore` and rely on the old archive-only
+        // `[GorillaObjectStore]` sequence. Under the ASAP-first policy
+        // a `GorillaObjectStore` metric now resolves to
+        // `[SketchStore, GorillaObjectStore]` — the registered
+        // ASAP engine is tried first and CapabilityMisses, yielding a
+        // 404 (`AllFailed`) rather than a 503. `PrometheusRemote` keeps
+        // its single-backend slot, so it remains the canonical "engine
+        // missing → 503" path.
         let server_port =
-            setup_test_server_with_empty_router(StorageBackend::GorillaObjectStore).await;
+            setup_test_server_with_empty_router(StorageBackend::PrometheusRemote).await;
         let client = Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
@@ -4252,6 +4327,70 @@ aggregations:
         assert!(
             body_str.contains("thanos_unreachable"),
             "5xx body must carry thanos_unreachable marker; got {body_str}",
+        );
+    }
+
+    // ── Path A2 range-query e2e test ────────────────────────────────────
+
+    /// GET /api/v1/query_range returns success when the ASAP sketch
+    /// tier misses and the `ThanosQueryEngine` is registered. Covers
+    /// the full centralized HTTP path:
+    ///   browser → ASAP backend → EngineRouter::execute_range
+    ///           → asap_query (CapabilityMiss) → thanos_query
+    ///           → mock thanos → matrix response
+    #[tokio::test]
+    async fn http_query_range_forwards_to_thanos_when_asap_misses() {
+        use crate::query_engines::thanos_query_engine::forward::test_support::spawn_mock_thanos_capture_range;
+        use crate::query_engines::thanos_query_engine::forward::test_support::CANNED_MATRIX_BODY;
+        use crate::query_engines::thanos_query_engine::{ThanosQueryConfig, ThanosQueryEngine};
+
+        let (mock_url, _captured, _mock_handle) =
+            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
+        let cfg = ThanosQueryConfig {
+            base_url: mock_url,
+            request_timeout: std::time::Duration::from_secs(5),
+        };
+        let engine = ThanosQueryEngine::new(cfg).expect("engine");
+        let arc_engine: Arc<dyn QueryEngine> = Arc::new(engine);
+
+        // GorillaObjectStore metric → `Approximate` policy yields
+        // `[SketchStore, GorillaObjectStore]`: the ASAP tier misses
+        // (no sketch index for the query) and the router falls over to
+        // the registered thanos_query engine.
+        let server_port = setup_test_server_with_named_router(
+            StorageBackend::GorillaObjectStore,
+            vec![arc_engine],
+        )
+        .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+            .query(&[
+                ("query", "rate(http_requests_total[1m])"),
+                ("start", "1700000000"),
+                ("end", "1700003600"),
+                ("step", "15"),
+            ])
+            .send()
+            .await
+            .expect("request");
+
+        assert!(
+            resp.status().is_success(),
+            "expected 2xx from range query forwarded to Thanos; got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["status"].as_str().unwrap_or(""),
+            "success",
+            "wire response must carry status=success; got {body}"
+        );
+        assert_eq!(
+            body["data"]["resultType"].as_str().unwrap_or(""),
+            "matrix",
+            "wire response must carry resultType=matrix; got {body}"
         );
     }
 

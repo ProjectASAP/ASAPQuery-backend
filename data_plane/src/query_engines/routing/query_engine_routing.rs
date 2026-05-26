@@ -69,6 +69,25 @@ pub trait QueryEngine: Send + Sync {
     /// Answer `query` against this engine's storage tier.
     async fn execute(&self, query: &str) -> Result<QueryResult, EngineError>;
 
+    /// Forward a range query to this engine's storage tier.
+    ///
+    /// Params are milliseconds since epoch. The default returns `CapabilityMiss`
+    /// so existing impls need not change; override when the engine has native
+    /// range-query support (e.g. Thanos, or the ASAP-tier reducer).
+    async fn execute_range(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<QueryResult, EngineError> {
+        let _ = (query, start_ms, end_ms, step_ms);
+        Err(EngineError::capability_miss(
+            self.capabilities().data_source_id,
+            "execute_range not implemented for this engine",
+        ))
+    }
+
     /// What this engine can serve. Cheap; the router calls it on every
     /// `register` and may re-call to refresh cost estimates.
     fn capabilities(&self) -> EngineCapabilities;
@@ -236,6 +255,90 @@ impl EngineRouter {
             last: last_err.expect("at least one engine ran (any_engine_tried=true)"),
         })
     }
+
+    /// Range-query sibling of [`Self::execute`]. Walks the identical
+    /// compatible-backend failover sequence for `(stat, accuracy,
+    /// metric_storage)`, but dispatches to `engine.execute_range(query,
+    /// start_ms, end_ms, step_ms)` instead of `engine.execute(query)`.
+    ///
+    /// The decision tree is centralized here (not in `http.rs`): the
+    /// shared [`compatible_storage_backends`] policy table decides the
+    /// order — `accuracy == Exact` yields archive-only
+    /// `[GorillaObjectStore]`, otherwise the ASAP-first
+    /// `[SketchStore, GorillaObjectStore]` sequence. On
+    /// [`EngineError::CapabilityMiss`] or [`EngineError::Backend`] the
+    /// router falls through to the next compatible backend; the
+    /// `thanos_query` archive engine answers the matrix natively.
+    ///
+    /// On exhaustion returns the same [`EngineRouterError`] variants as
+    /// [`Self::execute`].
+    pub async fn execute_range(
+        &self,
+        query: &str,
+        stat: Statistic,
+        accuracy: AccuracyTarget,
+        metric_storage: StorageBackend,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<QueryResult, EngineRouterError> {
+        let backends = compatible_storage_backends(stat, accuracy, metric_storage);
+        debug!(
+            query = query,
+            stat = ?stat,
+            accuracy = ?accuracy,
+            metric_storage = ?metric_storage,
+            backends = ?backends,
+            start_ms,
+            end_ms,
+            step_ms,
+            "router: dispatching range query",
+        );
+
+        let mut last_err: Option<EngineError> = None;
+        let mut any_engine_tried = false;
+
+        for backend in &backends {
+            let id = backend.data_source_id();
+            let Some(engine) = self.engines.get(id) else {
+                debug!(
+                    backend = ?backend,
+                    data_source_id = id,
+                    "router: no engine registered, trying next failover (range)",
+                );
+                continue;
+            };
+            any_engine_tried = true;
+            match engine.execute_range(query, start_ms, end_ms, step_ms).await {
+                Ok(result) => {
+                    debug!(
+                        backend = ?backend,
+                        "router: range dispatch succeeded",
+                    );
+                    return Ok(result);
+                }
+                Err(e) => {
+                    warn!(
+                        backend = ?backend,
+                        error = %e,
+                        "router: engine failed on range query, falling through to next backend",
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        if !any_engine_tried {
+            return Err(EngineRouterError::NoEngineRegistered {
+                tried: backends,
+                registered: self.engines.keys().copied().collect(),
+            });
+        }
+
+        Err(EngineRouterError::AllFailed {
+            last: last_err.expect("at least one engine ran (any_engine_tried=true)"),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +395,29 @@ mod tests {
                 Outcome::CapabilityMiss => Err(EngineError::capability_miss(
                     self.caps.data_source_id,
                     "no compatible aggregation",
+                )),
+            }
+        }
+        // Mirror `execute`'s outcome so the router's range failover loop
+        // can be exercised hermetically (the trait default would always
+        // CapabilityMiss, which wouldn't test Ok / Backend dispatch).
+        async fn execute_range(
+            &self,
+            _query: &str,
+            _start_ms: u64,
+            _end_ms: u64,
+            _step_ms: u64,
+        ) -> Result<QueryResult, EngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                Outcome::Ok => Ok(QueryResult::matrix(Vec::new())),
+                Outcome::Backend => Err(EngineError::backend(
+                    self.caps.data_source_id,
+                    "simulated backend failure (range)",
+                )),
+                Outcome::CapabilityMiss => Err(EngineError::capability_miss(
+                    self.caps.data_source_id,
+                    "no compatible aggregation (range)",
                 )),
             }
         }
@@ -353,31 +479,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_falls_back_to_warm_when_archive_fails_on_double_write() {
-        // Double-write deploy with `Exact` head: archive head fails,
-        // router falls through to the ASAP-tier sketch (the only
-        // remaining failover after Step-1 deleted JSONL).
+    async fn router_falls_back_to_archive_when_asap_misses_on_double_write() {
+        // ASAP-first refactor: an `Approximate` double-write query
+        // tries the ASAP-tier sketch first; on a CapabilityMiss the
+        // router falls through to the Thanos archive (the
+        // `[SketchStore, GorillaObjectStore]` failover sequence).
         let mut router = EngineRouter::new();
+        let (warm, warm_calls) =
+            StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
         let (gorilla, gorilla_calls) =
-            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Backend);
-        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
-        router.register(gorilla);
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
         router.register(warm);
+        router.register(gorilla);
 
         let result = router
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Exact,
+                AccuracyTarget::Approximate,
                 StorageBackend::DoubleWrite,
             )
             .await;
         assert!(
             result.is_ok(),
-            "router must reach ASAP-tier when the archive head fails",
+            "router must reach the archive when the ASAP-tier head misses",
         );
-        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
         assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gorilla_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -393,9 +521,15 @@ mod tests {
             .await;
         match result {
             Err(EngineRouterError::NoEngineRegistered { tried, registered }) => {
-                // Step-1 deleted the JSONL failover slot, so the
-                // SketchStore failover sequence is just itself.
-                assert_eq!(tried, vec![StorageBackend::SketchStore]);
+                // ASAP-first refactor: an `Approximate` query walks the
+                // `[SketchStore, GorillaObjectStore]` failover sequence.
+                assert_eq!(
+                    tried,
+                    vec![
+                        StorageBackend::SketchStore,
+                        StorageBackend::GorillaObjectStore,
+                    ]
+                );
                 assert!(registered.is_empty());
             }
             other => panic!("expected NoEngineRegistered, got {other:?}"),
@@ -540,5 +674,101 @@ mod tests {
             }
             other => panic!("expected NoEngineRegistered, got {other:?}"),
         }
+    }
+
+    // ── range-query dispatch (`EngineRouter::execute_range`) ────────────
+
+    /// ASAP-first refactor: an `Approximate` range query tries the
+    /// ASAP-tier sketch first and answers there when it can.
+    #[tokio::test]
+    async fn router_range_dispatches_to_asap_tier_first() {
+        let mut router = EngineRouter::new();
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range(
+                "rate(http_requests_total[1m])",
+                Statistic::Sum,
+                AccuracyTarget::Approximate,
+                StorageBackend::SketchStore,
+                1_700_000_000_000,
+                1_700_003_600_000,
+                15_000,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            0,
+            "archive must not run when the ASAP-tier answers the range query",
+        );
+    }
+
+    /// ASAP-first refactor: on a CapabilityMiss in the ASAP tier the
+    /// range query fails over to the Thanos archive.
+    #[tokio::test]
+    async fn router_range_falls_over_to_archive_on_capability_miss() {
+        let mut router = EngineRouter::new();
+        let (warm, warm_calls) =
+            StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range(
+                "rate(http_requests_total[1m])",
+                Statistic::Sum,
+                AccuracyTarget::Approximate,
+                StorageBackend::SketchStore,
+                0,
+                1_000,
+                1_000,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            1,
+            "range query must fail over to the archive on ASAP-tier CapabilityMiss",
+        );
+    }
+
+    /// ASAP-first refactor: an `Exact` range query routes straight to
+    /// the archive — the ASAP-tier sketch is never consulted.
+    #[tokio::test]
+    async fn router_range_exact_goes_straight_to_archive() {
+        let mut router = EngineRouter::new();
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range(
+                "audit_events",
+                Statistic::Sum,
+                AccuracyTarget::Exact,
+                StorageBackend::DoubleWrite,
+                0,
+                1_000,
+                1_000,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(archive_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            0,
+            "Exact range query must skip the ASAP-tier and archive only",
+        );
     }
 }
