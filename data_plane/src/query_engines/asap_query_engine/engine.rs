@@ -1641,6 +1641,26 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         ))
     }
 
+    /// Range-query entry point for the [`EngineRouter`] failover loop.
+    ///
+    /// Delegates to the inherent `execute_range_promql_modern`, which
+    /// runs the ASAP-tier reducer over `[start_ms, end_ms]` and returns
+    /// a `matrix` result. Without this override the router would hit the
+    /// trait default (`CapabilityMiss`) and never reach the ASAP-tier
+    /// range path, so every range query would fall straight through to
+    /// the archive even when the warm sketches can answer it.
+    async fn execute_range(
+        &self,
+        query: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        self.execute_range_promql_modern(query, start_ms, end_ms, step_ms)
+            .await
+    }
+
     fn capabilities(&self) -> crate::query_engines::routing::query_engine_routing::EngineCapabilities {
         crate::query_engines::routing::query_engine_routing::EngineCapabilities {
             data_source_id: asap_types::StorageBackend::SketchStore.data_source_id(),
