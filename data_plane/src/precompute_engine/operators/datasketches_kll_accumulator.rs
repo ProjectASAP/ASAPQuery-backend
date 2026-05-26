@@ -134,6 +134,22 @@ impl DatasketchesKLLAccumulator {
             }
         }
         let k = state.k as u16;
+        // Direct, bit-exact reconstruction from the portable state (no per-item
+        // `update()` replay) whenever the producer supplied the `levels[]`
+        // boundary array — which it does for any non-empty sketch. Falls back to
+        // the statistical replay only when `levels` is absent (empty sketch).
+        if !state.levels.is_empty() {
+            let levels: Vec<usize> = state.levels.iter().map(|&l| l as usize).collect();
+            return Ok(Self {
+                inner: KllSketch::from_portable_state(
+                    k,
+                    &state.items,
+                    &levels,
+                    state.num_levels as usize,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+            });
+        }
         let mut acc = Self::new(k);
         for item in &state.items {
             acc.update(*item);
