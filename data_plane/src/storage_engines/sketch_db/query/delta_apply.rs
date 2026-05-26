@@ -412,22 +412,12 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
     ))
 }
 
-/// Apply a proto-encoded `HllDelta` frame onto the HLL register vector
-/// — mirrors `HllSketchAccumulator::apply_proto_delta_bytes` (sparse
-/// `(index, value)` updates, `register = max(register, value)`).
+/// Apply a proto-encoded `HllDelta` frame onto the HLL register vector — the
+/// delta is a varint-packed (index_delta, value) blob; decode + apply
+/// (register-wise max) via the shared sketch library so the unpacking stays a
+/// single source of truth.
 fn apply_hll_proto_delta(sk: &mut HllSketch, buffer: &[u8]) -> Result<(), String> {
-    use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
-    use asap_sketchlib::HllSketchDelta;
-    use prost::Message;
-
-    let pb = PbDelta::decode(buffer).map_err(|e| format!("decode HLLDelta: {e}"))?;
-    let updates = pb
-        .updates
-        .into_iter()
-        .map(|u| (u.index, u.value as u8))
-        .collect();
-    let delta = HllSketchDelta { updates };
-    sk.apply_delta(&delta)
+    sk.apply_delta_bytes(buffer)
         .map_err(|e| format!("apply HLLDelta: {e}"))?;
     Ok(())
 }
