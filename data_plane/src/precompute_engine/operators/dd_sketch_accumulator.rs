@@ -6,10 +6,13 @@
 //! MessagePack for the sink, and decode from the sketchlib
 //! `DDSketchState` proto.
 //!
-//! Query semantics (quantile estimation via log-bucket indices) are
-//! intentionally deferred — the wire format carries the bucket counts,
-//! offset, and aggregates losslessly, so the merge + store round-trip
-//! works end-to-end without that richer query surface.
+//! Query semantics follow the STRICT policy after the DataPoint-level
+//! METRIC scalars were dropped from the wire format
+//! (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57): the sketch serves
+//! Quantile (log-bucket estimation) and Count (sum of bucket counts).
+//! Sum/Min/Max are no longer derivable from the wire bytes and are
+//! served by controller-provisioned exact aggregations — `query_statistic`
+//! returns the unavailable-statistic error for them.
 
 use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
 use asap_sketchlib::{DdSketch, DdSketchDelta, MessagePackCodec};
@@ -80,15 +83,13 @@ impl DDSketchAccumulator {
             )
             .into());
         }
-        let inner = DdSketch::from_raw(
-            state.alpha,
-            state.store_counts.clone(),
-            state.store_offset,
-            state.count,
-            state.sum,
-            state.min,
-            state.max,
-        );
+        // The DataPoint-level METRIC scalars (count/sum/min/max) were
+        // dropped from `DDSketchState` (ProjectASAP/sketchlib-go#243 /
+        // asap_sketchlib#57). Reconstruct from the bucket store only:
+        // `DdSketch::from_raw` now takes just (alpha, store_counts,
+        // store_offset) and recovers `count` by summing the bucket
+        // counts via `total_count()`.
+        let inner = DdSketch::from_raw(state.alpha, state.store_counts.clone(), state.store_offset);
         Ok(Self { inner })
     }
 
@@ -109,6 +110,10 @@ impl DDSketchAccumulator {
 
         let pb = PbDelta::decode(buffer).map_err(|e| format!("decode DDSketchDelta: {e}"))?;
 
+        // The delta no longer carries d_count/d_sum/min/max
+        // (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57). Apply the
+        // bucket deltas only; `DdSketch` recomputes its total count from
+        // the merged bucket counts (`total_count()`).
         let buckets = pb
             .buckets
             .into_iter()
@@ -116,12 +121,7 @@ impl DDSketchAccumulator {
             .collect();
         let delta = DdSketchDelta {
             buckets,
-            d_count: pb.d_count,
-            d_sum: pb.d_sum,
-            min_changed: pb.min_changed,
-            new_min: pb.new_min,
-            max_changed: pb.max_changed,
-            new_max: pb.new_max,
+            ..Default::default()
         };
         self.inner.apply_delta(&delta);
         Ok(())
@@ -130,14 +130,14 @@ impl DDSketchAccumulator {
 
 impl SerializableToSink for DDSketchAccumulator {
     fn serialize_to_json(&self) -> Value {
+        // The DataPoint-level scalars (sum/min/max) are no longer carried
+        // by `DdSketch` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
+        // `count` is the bucket-derived total via `total_count()`.
         serde_json::json!({
             "alpha": self.inner.alpha,
             "store_offset": self.inner.store_offset,
             "bucket_count": self.inner.store_counts.len(),
-            "count": self.inner.count,
-            "sum": self.inner.sum,
-            "min": self.inner.min,
-            "max": self.inner.max,
+            "count": self.inner.total_count(),
         })
     }
 
@@ -219,14 +219,30 @@ impl AggregateCore for DDSketchAccumulator {
                     "DDSketchAccumulator: quantile() returned None (sketch empty?)".into()
                 })
             }
-            Statistic::Sum => Ok(self.inner.sum),
-            Statistic::Count => Ok(self.inner.count as f64),
-            Statistic::Min => Ok(self.inner.min),
-            Statistic::Max => Ok(self.inner.max),
+            // Count is exact, derived by summing the bucket store
+            // counts — the only DataPoint-level scalar that survives
+            // the wire-format trim (ProjectASAP/sketchlib-go#243 /
+            // asap_sketchlib#57).
+            Statistic::Count => Ok(self.inner.total_count() as f64),
+            // STRICT policy: the Sum/Min/Max scalars were removed from
+            // the DDSketch wire format. They are now served by the
+            // controller-provisioned exact aggregations (an exact `Sum`
+            // and an exact `MinMax`), NOT estimated from the buckets.
+            // Surface the unavailable-statistic error so the query path
+            // routes to those aggregations instead of returning a wrong
+            // (0 / panicked) value.
+            Statistic::Sum => Err(
+                "DDSketchAccumulator: Sum not available from DDSketch wire format \
+                 (ProjectASAP/sketchlib-go#243); use an exact Sum aggregation"
+                    .into(),
+            ),
+            Statistic::Min | Statistic::Max => Err(format!(
+                "DDSketchAccumulator: {statistic:?} not available from DDSketch wire format \
+                 (ProjectASAP/sketchlib-go#243); use an exact MinMax aggregation",
+            )
+            .into()),
             other => Err(format!(
-                "DDSketchAccumulator: statistic {:?} not supported (only Quantile / Sum / \
-                 Count / Min / Max)",
-                other,
+                "DDSketchAccumulator: statistic {other:?} not supported (only Quantile / Count)",
             )
             .into()),
         }
@@ -237,45 +253,35 @@ impl AggregateCore for DDSketchAccumulator {
 mod tests {
     use super::*;
 
-    fn encode_state(
-        alpha: f64,
-        store_counts: Vec<u64>,
-        store_offset: i32,
-        count: u64,
-        sum: f64,
-        min: f64,
-        max: f64,
-    ) -> Vec<u8> {
+    // The DataPoint-level METRIC scalars (count/sum/min/max) were dropped
+    // from `DdSketchState` (ProjectASAP/sketchlib-go#243 /
+    // asap_sketchlib#57); the proto now carries only
+    // `alpha`/`store_counts`/`store_offset`.
+    fn encode_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) -> Vec<u8> {
         use asap_sketchlib::proto::sketchlib::DdSketchState;
         use prost::Message;
         let state = DdSketchState {
             alpha,
             store_counts,
             store_offset,
-            count,
-            sum,
-            min,
-            max,
         };
         state.encode_to_vec()
     }
 
     #[test]
     fn test_from_sketchlib_proto_bytes_round_trip() {
-        let bytes = encode_state(0.01, vec![1, 2, 3, 4], -2, 10, 50.0, 1.0, 4.0);
+        let bytes = encode_state(0.01, vec![1, 2, 3, 4], -2);
         let acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.alpha, 0.01);
         assert_eq!(acc.inner.store_counts, vec![1, 2, 3, 4]);
         assert_eq!(acc.inner.store_offset, -2);
-        assert_eq!(acc.inner.count, 10);
-        assert_eq!(acc.inner.sum, 50.0);
-        assert_eq!(acc.inner.min, 1.0);
-        assert_eq!(acc.inner.max, 4.0);
+        // `count` is recovered by summing the bucket store counts.
+        assert_eq!(acc.inner.total_count(), 10);
     }
 
     #[test]
     fn test_from_sketchlib_proto_bytes_rejects_invalid_alpha() {
-        let bytes = encode_state(0.0, vec![1], 0, 1, 1.0, 1.0, 1.0);
+        let bytes = encode_state(0.0, vec![1], 0);
         let result = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("alpha"));
@@ -293,10 +299,6 @@ mod tests {
             alpha: 0.01,
             store_counts: vec![1, 2, 3, 4],
             store_offset: -2,
-            count: 10,
-            sum: 50.0,
-            min: 1.0,
-            max: 4.0,
         };
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
@@ -307,7 +309,7 @@ mod tests {
         let acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
             .expect("envelope-wrapped decode should succeed");
         assert_eq!(acc.inner.alpha, 0.01);
-        assert_eq!(acc.inner.count, 10);
+        assert_eq!(acc.inner.total_count(), 10);
     }
 
     #[test]
@@ -328,10 +330,10 @@ mod tests {
     #[test]
     fn test_aggregate_core_merge_aligns_buckets() {
         let a = DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![1, 1, 1], -1, 3, 3.0, 1.0, 3.0),
+            inner: DdSketch::from_raw(0.01, vec![1, 1, 1], -1),
         };
         let b = DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![10, 10, 10], 0, 30, 30.0, 1.0, 3.0),
+            inner: DdSketch::from_raw(0.01, vec![10, 10, 10], 0),
         };
         let merged_box = a.merge_with(&b).expect("merge ok");
         let merged = merged_box
@@ -340,7 +342,7 @@ mod tests {
             .expect("downcast ok");
         assert_eq!(merged.inner.store_counts, vec![1, 11, 11, 10]);
         assert_eq!(merged.inner.store_offset, -1);
-        assert_eq!(merged.inner.count, 33);
+        assert_eq!(merged.inner.total_count(), 33);
     }
 
     #[test]
@@ -353,14 +355,14 @@ mod tests {
 
     #[test]
     fn test_from_msgpack_bytes_round_trip() {
-        let original = DdSketch::from_raw(0.01, vec![5, 10, 15, 20], -2, 50, 150.0, 0.25, 8.0);
+        let original = DdSketch::from_raw(0.01, vec![5, 10, 15, 20], -2);
         let bytes = original.to_msgpack().unwrap();
         let acc = DDSketchAccumulator::from_msgpack_bytes(&bytes).expect("decode ok");
         assert_eq!(acc.inner.alpha, 0.01);
         assert_eq!(acc.inner.store_counts, vec![5, 10, 15, 20]);
         assert_eq!(acc.inner.store_offset, -2);
-        assert_eq!(acc.inner.count, 50);
-        assert_eq!(acc.inner.sum, 150.0);
+        // `count` is recovered by summing the bucket store counts.
+        assert_eq!(acc.inner.total_count(), 50);
     }
 
     #[test]
@@ -375,8 +377,10 @@ mod tests {
         use prost::Message;
 
         let mut acc = DDSketchAccumulator::new(0.01);
-        acc.inner = DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0);
+        acc.inner = DdSketch::from_raw(0.01, vec![1, 2, 3], 0);
 
+        // The wire delta now carries only bucket deltas (tags 2-7
+        // reserved); `DdSketchBucketDelta` has just `index` + `d_count`.
         let bytes = PbDelta {
             buckets: vec![
                 DdSketchBucketDelta {
@@ -388,26 +392,77 @@ mod tests {
                     d_count: 20,
                 },
             ],
-            d_count: 30,
-            d_sum: 70.0,
-            new_min: 0.5,
-            new_max: 5.0,
-            min_changed: true,
-            max_changed: true,
         }
         .encode_to_vec();
 
         acc.apply_proto_delta_bytes(&bytes).expect("apply ok");
         assert_eq!(acc.inner.store_counts, vec![11, 2, 23]);
-        assert_eq!(acc.inner.count, 36);
-        assert_eq!(acc.inner.sum, 82.0);
-        assert_eq!(acc.inner.min, 0.5);
-        assert_eq!(acc.inner.max, 5.0);
+        // `count` recomputed from the merged buckets: 11 + 2 + 23 = 36.
+        assert_eq!(acc.inner.total_count(), 36);
     }
 
     #[test]
     fn test_apply_proto_delta_bytes_rejects_garbage() {
         let mut acc = DDSketchAccumulator::new(0.01);
         assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
+    }
+
+    // ----- query_statistic STRICT policy -----
+    //
+    // After the DataPoint-level METRIC scalars were dropped from the
+    // DDSketch wire format (ProjectASAP/sketchlib-go#243 /
+    // asap_sketchlib#57), DDSketch serves only quantiles and Count.
+    // Sum/Min/Max move to controller-provisioned exact aggregations and
+    // MUST surface the unavailable-statistic error (never a panic / 0).
+
+    fn sample_accumulator() -> DDSketchAccumulator {
+        // Build the in-memory sketch from bucket counts only — no scalars.
+        DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
+        }
+    }
+
+    #[test]
+    fn test_query_statistic_quantile_is_sketch_derived() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let acc = sample_accumulator();
+        let mut kwargs = HashMap::new();
+        kwargs.insert("quantile".to_string(), "0.5".to_string());
+        let v = acc
+            .query_statistic(Statistic::Quantile, &None, &kwargs)
+            .expect("quantile should be served from the sketch buckets");
+        assert!(
+            v.is_finite() && v > 0.0,
+            "quantile estimate should be positive finite, got {v}"
+        );
+    }
+
+    #[test]
+    fn test_query_statistic_count_is_bucket_derived() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let acc = sample_accumulator();
+        let v = acc
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count should be derivable from the bucket store");
+        // 1 + 2 + 3 + 4 = 10.
+        assert_eq!(v, 10.0);
+    }
+
+    #[test]
+    fn test_query_statistic_sum_min_max_return_unavailable_error() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let acc = sample_accumulator();
+        for stat in [Statistic::Sum, Statistic::Min, Statistic::Max] {
+            let result = acc.query_statistic(stat, &None, &HashMap::new());
+            assert!(
+                result.is_err(),
+                "{stat:?} must return the unavailable-statistic error (not a panic / 0)"
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("not available"),
+                "{stat:?} error should explain the statistic is unavailable, got: {msg}"
+            );
+        }
     }
 }

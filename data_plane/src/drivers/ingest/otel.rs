@@ -2580,9 +2580,11 @@ mod dispatcher_tests {
 
         // Base sketch represents the last full snapshot the agent sent.
         let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator {
-            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0, 6, 12.0, 1.0, 3.0),
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
         });
 
+        // The wire delta now carries only bucket deltas (tags 2-7
+        // reserved post ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
         let bytes = PbDelta {
             buckets: vec![
                 DdSketchBucketDelta {
@@ -2594,12 +2596,6 @@ mod dispatcher_tests {
                     d_count: 20,
                 },
             ],
-            d_count: 30,
-            d_sum: 70.0,
-            new_min: 0.5,
-            new_max: 5.0,
-            min_changed: true,
-            max_changed: true,
         }
         .encode_to_vec();
 
@@ -2613,9 +2609,8 @@ mod dispatcher_tests {
 
         let dd = acc.as_any().downcast_ref::<DDSketchAccumulator>().unwrap();
         assert_eq!(dd.inner.store_counts, vec![11, 2, 23]);
-        assert_eq!(dd.inner.count, 36);
-        assert_eq!(dd.inner.min, 0.5);
-        assert_eq!(dd.inner.max, 5.0);
+        // `count` recomputed from the merged buckets: 11 + 2 + 23 = 36.
+        assert_eq!(dd.inner.total_count(), 36);
     }
 
     #[test]

@@ -2378,7 +2378,8 @@ aggregations:
             .downcast_ref::<DDSketchAccumulator>()
             .expect("must downcast back to DDSketchAccumulator");
         assert_eq!(
-            dd.inner.count, 30,
+            dd.inner.total_count(),
+            30,
             "all 10 first-batch sketches must merge into the persisted output (3 values × 10)"
         );
     }
@@ -2470,12 +2471,13 @@ aggregations:
                 .as_ref()
                 .and_then(|k| k.labels.first().cloned())
                 .unwrap_or_default();
-            let expected_count = match zone.as_str() {
+            let expected_count: u64 = match zone.as_str() {
                 "us-east" => 3,
                 "us-west" => 2,
                 other => panic!("unexpected zone {other}")};
             assert_eq!(
-                dd.inner.count, expected_count,
+                dd.inner.total_count(),
+                expected_count,
                 "zone {zone} must roll up exactly {expected_count} per-tuple sketches"
             );
         }
@@ -2619,7 +2621,8 @@ aggregations:
             .downcast_ref::<DDSketchAccumulator>()
             .expect("must downcast back to DDSketchAccumulator");
         assert_eq!(
-            dd.inner.count, 10,
+            dd.inner.total_count(),
+            10,
             "all 10 frozen-time sketches must merge into the single emitted output"
         );
 

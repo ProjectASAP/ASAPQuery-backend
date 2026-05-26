@@ -337,24 +337,14 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     }
 }
 
-/// Build a `DdSketchState` proto from raw values.
-fn build_dd_sketch_state(
-    alpha: f64,
-    store_counts: Vec<u64>,
-    store_offset: i32,
-    count: u64,
-    sum: f64,
-    min: f64,
-    max: f64,
-) -> DdSketchState {
+/// Build a `DdSketchState` proto from raw values. The DataPoint-level
+/// scalars (count/sum/min/max) were dropped from the wire format
+/// (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
+fn build_dd_sketch_state(alpha: f64, store_counts: Vec<u64>, store_offset: i32) -> DdSketchState {
     DdSketchState {
         alpha,
         store_counts,
         store_offset,
-        count,
-        sum,
-        min,
-        max,
     }
 }
 
@@ -923,7 +913,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     // test uses so we know it's representable.
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
-    let dd_state = build_dd_sketch_state(alpha, store_counts, -1, 50, 150.0, 0.25, 8.0);
+    let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
     let sketch_bytes = dd_state.encode_to_vec();
 
     // ── 3. POST the sketch DP via OTLP HTTP ────────────────────────────
@@ -962,7 +952,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     // 1-second tumbling window W. This DP at `now - 1s` is at least
     // 2 seconds past the start of W, so it moves the engine's
     // watermark past W's close boundary and triggers the flush.
-    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0, 0, 0.0, 0.0, 0.0);
+    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0);
     let watermark_req = build_dd_sketch_export(
         "http_latency_ms",
         &[("service", "e2e-test")],

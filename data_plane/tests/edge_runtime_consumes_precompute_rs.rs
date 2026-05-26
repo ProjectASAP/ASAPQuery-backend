@@ -63,7 +63,13 @@ fn ddsketch_envelope_round_trip_through_backend_adapter() {
         ReconstructedSketch::DdSketch(d) => d,
         _ => panic!("expected DDSketch reconstruction"),
     };
-    assert_eq!(dd.count, 200, "count preserved through runtime adapter");
+    // `count` is recovered from the bucket store now that the scalar was
+    // dropped (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57).
+    assert_eq!(
+        dd.total_count(),
+        200,
+        "count preserved through runtime adapter"
+    );
 
     let re_encoded = encode_ddsketch_envelope(&dd);
     assert_eq!(
@@ -91,7 +97,10 @@ fn ddsketch_envelope_structural_assertions() {
         .expect("state");
     match state {
         SketchState::Ddsketch(s) => {
-            assert_eq!(s.count, 3, "structural count");
+            // `count` was dropped from `DdSketchState`
+            // (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57); it is
+            // recovered by summing the bucket store counts.
+            assert_eq!(s.store_counts.iter().sum::<u64>(), 3, "structural count");
             assert!(
                 s.alpha > 0.0 && s.alpha < 1.0,
                 "alpha within (0,1): got {}",

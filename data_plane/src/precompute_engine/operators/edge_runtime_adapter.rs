@@ -215,7 +215,7 @@ pub fn snapshot_ddsketch_via_runtime(
     // We can't move-construct the wrapper from a non-empty `DdSketch`,
     // but `Sketch::apply_delta` against the existing snapshot bytes
     // is equivalent.
-    if sk.count > 0 {
+    if sk.total_count() > 0 {
         // Re-encode the source's state into the canonical envelope
         // shape that asap-precompute-rs's wrapper recognizes, then
         // round-trip through `apply_delta`. Mirrors the agent runtime's
@@ -249,14 +249,9 @@ pub fn encode_ddsketch_envelope(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
         alpha: sk.wire_alpha(),
         store_counts: sk.store_counts.clone(),
         store_offset: sk.store_offset,
-        count: sk.count,
-        sum: sk.sum,
-        min: if sk.count == 0 { f64::INFINITY } else { sk.min },
-        max: if sk.count == 0 {
-            f64::NEG_INFINITY
-        } else {
-            sk.max
-        },
+        // The DataPoint-level scalars (count/sum/min/max) were dropped from
+        // `DDSketchState` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57);
+        // the bucket counts carry all reconstructable state.
     };
     let env = ProtoEnvelope {
         format_version: 1,
@@ -291,14 +286,14 @@ pub fn merge_ddsketches_via_runtime(
         .into());
     }
     let mut wrapper_a = DDSketchWrapper::new(a.alpha);
-    if a.count > 0 {
+    if a.total_count() > 0 {
         let bridge = encode_ddsketch_envelope(a);
         wrapper_a
             .apply_delta(&bridge)
             .map_err(|e| format!("merge_ddsketches_via_runtime/a: {e}"))?;
     }
     let mut wrapper_b = DDSketchWrapper::new(b.alpha);
-    if b.count > 0 {
+    if b.total_count() > 0 {
         let bridge = encode_ddsketch_envelope(b);
         wrapper_b
             .apply_delta(&bridge)
@@ -329,7 +324,10 @@ mod tests {
         let state = unwrap_envelope_state(&bytes).expect("decode ok");
         match state {
             Some(SketchState::Ddsketch(s)) => {
-                assert!(s.count > 0);
+                // `count` was dropped from `DdSketchState`
+                // (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57);
+                // a non-empty sketch carries it in the bucket store.
+                assert!(s.store_counts.iter().sum::<u64>() > 0);
                 assert!(s.alpha > 0.0 && s.alpha < 1.0);
             }
             other => panic!("expected DDSketch state, got {other:?}"),
@@ -354,7 +352,7 @@ mod tests {
             ReconstructedSketch::DdSketch(d) => d,
             ReconstructedSketch::Kll { .. } => panic!("got KLL, expected DDSketch"),
         };
-        assert_eq!(dd.count, 100);
+        assert_eq!(dd.total_count(), 100);
         let re_encoded = encode_ddsketch_envelope(&dd);
         assert_eq!(
             re_encoded, original_bytes,
@@ -387,6 +385,6 @@ mod tests {
                 _ => panic!(),
             };
         let merged = merge_ddsketches_via_runtime(&a_inner, &b_inner).expect("merge ok");
-        assert_eq!(merged.count, 20);
+        assert_eq!(merged.total_count(), 20);
     }
 }
