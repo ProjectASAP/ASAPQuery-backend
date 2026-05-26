@@ -3,6 +3,7 @@ package merger
 import (
 	"bytes"
 	"context"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -545,15 +546,11 @@ func TestCustomStoreTimeRangeIncludesCold(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	// The tsdb head's StartTime is roughly "now" (no old data ingested).
-	tsdbStart, err := st.DB.StartTime()
-	if err != nil {
-		t.Fatalf("StartTime: %v", err)
-	}
-
-	// A cold part whose block starts well BEFORE the tsdb StartTime — exactly
-	// the cold-only window thanos-query would otherwise prune.
-	coldStart := tsdbStart - int64(24*time.Hour/time.Millisecond)
+	// The fresh tsdb head holds no samples, so StartTime() reports the empty-head
+	// sentinel math.MaxInt64 (see TestCustomStoreTimeRangeEmptyHead). A cold part
+	// older than "now" stands in for the cold-only window thanos-query would
+	// otherwise prune.
+	coldStart := time.Now().UnixMilli() - int64(24*time.Hour/time.Millisecond)
 	bkt := objstore.NewInMemBucket()
 	coldStore := NewColdPartStore(bkt, nil)
 	mustPut(t, coldStore, writePartBytes(t, coldStart, coldStart+1000, []coldpart.Series{
@@ -562,12 +559,8 @@ func TestCustomStoreTimeRangeIncludesCold(t *testing.T) {
 
 	cs := newCustomStore(st.DB, labels.EmptyLabels(), nil)
 
-	// Without the cold querier the advertised min is the (recent) tsdb StartTime.
-	if min, _ := cs.timeRange(); min != tsdbStart {
-		t.Fatalf("tsdb-only timeRange min = %d, want tsdb StartTime %d", min, tsdbStart)
-	}
-
-	// With the cold querier attached the advertised min drops to the cold floor.
+	// With the cold querier attached the advertised min drops to the cold floor
+	// (NOT the empty-head MaxInt64 sentinel, which would prune the merger).
 	cs.setColdQuerier(NewColdQuerier(coldStore))
 	min, max := cs.timeRange()
 	if min != coldStart {
@@ -575,6 +568,54 @@ func TestCustomStoreTimeRangeIncludesCold(t *testing.T) {
 	}
 	if max <= min {
 		t.Fatalf("timeRange max = %d not > min = %d", max, min)
+	}
+}
+
+// TestCustomStoreTimeRangeEmptyHead is the regression proof for the
+// served-empty-after-restart bug: a fresh/empty tsdb head reports StartTime ==
+// math.MaxInt64, and if that leaks into the advertised StoreAPI MinTime,
+// thanos-query prunes the merger from EVERY query (no window can be >=
+// MaxInt64) — even the cold parts already reloaded from S3 become unreachable,
+// served empty with no streamColdSeries activity. The advertised MinTime must
+// therefore be:
+//   - the cold floor when cold parts exist (empty head must not win), and
+//   - math.MinInt64 (never MaxInt64) when the store is genuinely empty, so the
+//     merger stays discoverable and is not pruned while it waits for data.
+func TestCustomStoreTimeRangeEmptyHead(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStorage(StorageOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Sanity: a fresh head really does report the MaxInt64 sentinel.
+	if got, err := st.DB.StartTime(); err != nil {
+		t.Fatalf("StartTime: %v", err)
+	} else if got != math.MaxInt64 {
+		t.Logf("note: empty-head StartTime = %d (expected MaxInt64); test still asserts no MaxInt64 leak", got)
+	}
+
+	// (1) Empty head, NO cold querier: must advertise MinInt64, not MaxInt64.
+	csBare := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	if min, _ := csBare.timeRange(); min == math.MaxInt64 {
+		t.Fatalf("empty head (no cold) advertised MinTime = MaxInt64; merger would be pruned from every query")
+	} else if min != math.MinInt64 {
+		t.Fatalf("empty head (no cold) timeRange min = %d, want MinInt64", min)
+	}
+
+	// (2) Empty head WITH cold parts already in the store (the post-restart
+	// reload case): MinTime must drop to the cold floor, not the empty-head
+	// MaxInt64 sentinel.
+	coldStart := time.Now().UnixMilli() - int64(48*time.Hour/time.Millisecond)
+	coldStore := NewColdPartStore(objstore.NewInMemBucket(), nil)
+	mustPut(t, coldStore, writePartBytes(t, coldStart, coldStart+1000, []coldpart.Series{
+		coldSeries(labels.FromStrings(labels.MetricName, "reloaded_cold"), coldStart, 1, 2),
+	}))
+	csCold := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	csCold.setColdQuerier(NewColdQuerier(coldStore))
+	if min, _ := csCold.timeRange(); min != coldStart {
+		t.Fatalf("empty head + cold parts: timeRange min = %d, want cold floor %d (MaxInt64 sentinel must not win)", min, coldStart)
 	}
 }
 

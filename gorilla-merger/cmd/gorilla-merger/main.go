@@ -118,10 +118,24 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		coldBucket = bkt
 		defer func() { _ = coldBucket.Close() }()
 		coldStore = merger.NewColdPartStore(bkt, kitLogger)
-		// Rediscover any parts already in the bucket (header/index only).
-		if rerr := coldStore.Reload(context.Background()); rerr != nil {
-			logger.Warn("cold manifest reload failed (continuing empty)", "err", rerr)
-		}
+		// Rediscover any parts already in the bucket (header/index only) in the
+		// BACKGROUND. Reload fetches + OpenParts every stored part, so with a large
+		// accumulated cold tier (thousands of parts) it takes tens of seconds and
+		// is memory-heavy. Running it synchronously here BLOCKS the StoreAPI and
+		// HTTP frontend from starting (they launch below), so for the whole reload
+		// window after a restart thanos-query sees the gRPC endpoint as down and a
+		// cold (or warm) query returns empty with no streamColdSeries activity —
+		// the served-empty symptom. The manifest is mutex-guarded and queried under
+		// RLock, so a concurrent reload is safe: cold queries simply see a smaller
+		// (growing) manifest until it completes, then the full set. New parts POSTed
+		// during the reload still register live via Put; Reload's atomic manifest
+		// swap may briefly drop a part POSTed mid-reload, but the next restart's
+		// reload (or a re-POST) re-registers it, and the warm/open path is unaffected.
+		go func() {
+			if rerr := coldStore.Reload(context.Background()); rerr != nil {
+				logger.Warn("cold manifest reload failed (continuing empty)", "err", rerr)
+			}
+		}()
 	} else {
 		logger.Warn("no objstore config provided; cold-part store disabled (decode-on-read unavailable)")
 	}

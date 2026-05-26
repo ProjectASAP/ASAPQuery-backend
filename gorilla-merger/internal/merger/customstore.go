@@ -76,15 +76,30 @@ func (s *customStore) setColdQuerier(c *ColdQuerier) { s.cold = c }
 // timeRange mirrors TSDBStore.TimeRange: min = head StartTime (the oldest
 // sample currently held), max = +inf so the open window is always queried.
 //
-// When a cold querier is attached, the advertised min is LOWERED to the oldest
-// cold part's block start when that is earlier than the tsdb StartTime. This is
-// load-bearing: thanos-query prunes a store from a query's fan-out when the
-// query window falls entirely below the store's advertised MinTime. The cold
-// path serves raw samples OLDER than the tsdb head's StartTime, so without this
-// floor a query for old (cold-only) data is never routed to the merger and
-// streamColdSeries is never invoked — the parts are stored but served empty.
+// The advertised MinTime is the MINIMUM of two lower bounds, whichever exist:
+// the tsdb head StartTime and (when a cold querier is attached and tracks parts)
+// the oldest cold part's block start. This is load-bearing: thanos-query prunes
+// a store from a query's fan-out when the query window falls entirely below the
+// store's advertised MinTime.
+//
+// Two failure modes this guards against, both of which leave stored cold parts
+// served EMPTY with no streamColdSeries activity:
+//
+//   - Cold data OLDER than the head: a query for that old (cold-only) window is
+//     pruned unless the cold floor lowers MinTime to cover it.
+//
+//   - An EMPTY tsdb head: tsdb.DB.StartTime() returns math.MaxInt64 for a head
+//     holding no samples (e.g. right after a restart, before the first warm
+//     fragment lands, while cold parts already exist in S3 and were reloaded).
+//     Advertising MaxInt64 prunes the merger from EVERY query — no window can be
+//     >= MaxInt64 — so even the cold parts are unreachable. We must NOT let the
+//     empty-head sentinel win over the cold floor (or survive as the advertised
+//     MinTime at all), hence taking the min of the two bounds rather than only
+//     lowering when cold < head.
 func (s *customStore) timeRange() (int64, int64) {
-	var minTime int64 = math.MinInt64
+	// math.MaxInt64 means "no lower bound from this source": an empty tsdb head
+	// reports StartTime == MaxInt64, which must NOT become the advertised floor.
+	minTime := int64(math.MaxInt64)
 	if st, err := s.db.StartTime(); err == nil {
 		minTime = st
 	}
@@ -92,6 +107,13 @@ func (s *customStore) timeRange() (int64, int64) {
 		if coldMin, ok := s.cold.MinBlockStart(); ok && coldMin < minTime {
 			minTime = coldMin
 		}
+	}
+	// If neither source supplied a real lower bound (empty head, no cold parts),
+	// the store currently holds nothing; advertise MinInt64 so thanos-query does
+	// not prune it (it simply returns no series for any window, which is correct
+	// and cheap) and so it stays discoverable for when data arrives.
+	if minTime == math.MaxInt64 {
+		minTime = math.MinInt64
 	}
 	return minTime, math.MaxInt64
 }
