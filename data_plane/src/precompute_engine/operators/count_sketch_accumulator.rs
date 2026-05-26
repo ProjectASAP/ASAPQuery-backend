@@ -91,11 +91,17 @@ impl CountSketchAccumulator {
         };
         let rows = state.rows as usize;
         let cols = state.cols as usize;
-        if rows == 0 || cols == 0 {
-            return Err(
-                format!("CountSketchState has zero dims (rows={rows}, cols={cols})").into(),
-            );
-        }
+        // Defensive dim validation BEFORE reconstructing the matrix:
+        // reject degenerate / narrow-hash-budget-violating / absurdly
+        // oversized dims so a malformed payload fails gracefully (the
+        // ingest caller skips the data point) instead of building a
+        // degenerate or huge matrix. Shares the CMS validator since the
+        // CountSketch matrix uses the same packed-hash column layout.
+        crate::precompute_engine::operators::count_min_sketch_accumulator::validate_sketch_dims(
+            "CountSketchState",
+            rows,
+            cols,
+        )?;
         let expected_len = rows * cols;
         let counter_type = CounterType::try_from(state.counter_type).map_err(|_| {
             format!(
@@ -565,5 +571,64 @@ mod tests {
     fn test_apply_proto_delta_bytes_rejects_garbage() {
         let mut acc = CountSketchAccumulator::new(2, 3);
         assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
+    }
+
+    // ----------------------------------------------------------------
+    // Defensive inbound-dimension validation (harden/sketch-dim-validation).
+    // Malformed / narrow-hash-budget-violating CountSketch dims must be
+    // rejected gracefully (Err, never a panic); valid configs the backend
+    // actually uses (5x2048, 5x4096, 5x2000) must still decode.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_rejects_bad_dims_no_panic() {
+        use asap_sketchlib::proto::sketchlib::CounterType;
+        // 5 * ceil(log2(8192))=5*13=65 > 64 — narrow-hash-budget violation.
+        // counts sized to rows*cols so rejection is on dims, not length.
+        let n = 5usize * 8192usize;
+        let bytes = encode_state(
+            5,
+            8192,
+            CounterType::Int64 as i32,
+            vec![0i64; n],
+            Vec::new(),
+        );
+        let result = CountSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "budget-violating dims should be rejected");
+        assert!(result.unwrap_err().to_string().contains("rejecting"));
+
+        // A valid neighbour (5x4096) on the same path still decodes fine.
+        let n_ok = 5usize * 4096usize;
+        let ok_bytes = encode_state(
+            5,
+            4096,
+            CounterType::Int64 as i32,
+            vec![0i64; n_ok],
+            Vec::new(),
+        );
+        let acc = CountSketchAccumulator::from_sketchlib_proto_bytes(&ok_bytes)
+            .expect("valid 5x4096 CountSketch should still decode");
+        assert_eq!(acc.inner.rows, 5);
+        assert_eq!(acc.inner.cols, 4096);
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_rejects_oversized_dims() {
+        use asap_sketchlib::proto::sketchlib::CounterType;
+        // Declare 1 x 16,777,216 = 16M cells (> 8M cap) but send an empty
+        // counts vector: validation must reject on the dim cap BEFORE the
+        // decoder tries to allocate/reshape a 16M-entry matrix. (1 row keeps
+        // the hash budget tiny so the cap check, not the budget check, fires.)
+        let bytes = encode_state(
+            1,
+            16_777_216,
+            CounterType::Int64 as i32,
+            Vec::new(),
+            Vec::new(),
+        );
+        let result = CountSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "oversized dims should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("cap"), "expected cell-cap error, got: {msg}");
     }
 }
