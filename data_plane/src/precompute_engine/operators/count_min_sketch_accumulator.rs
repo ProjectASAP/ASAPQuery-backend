@@ -117,9 +117,12 @@ impl CountMinSketchAccumulator {
         };
         let rows = state.rows as usize;
         let cols = state.cols as usize;
-        if rows == 0 || cols == 0 {
-            return Err(format!("CountMinState has zero dims (rows={rows}, cols={cols})").into());
-        }
+        // Defensive dim validation BEFORE reconstructing the matrix:
+        // reject degenerate / narrow-hash-budget-violating / absurdly
+        // oversized dims so a malformed payload fails gracefully (the
+        // ingest caller skips the data point) instead of building a
+        // degenerate or huge matrix.
+        validate_sketch_dims("CountMinState", rows, cols)?;
         let expected_len = rows * cols;
         let counter_type = CounterType::try_from(state.counter_type).map_err(|_| {
             format!(
@@ -297,6 +300,74 @@ impl CountMinSketchAccumulator {
             inner: merged_inner,
         })
     }
+}
+
+/// Defensive upper bound on the number of matrix cells (`rows * cols`)
+/// we'll reconstruct from an inbound wire-declared CMS / CountSketch
+/// dimension pair. A malformed / hostile payload could declare absurd
+/// dims (e.g. `rows = cols = u32::MAX`) and trick the decoder into a
+/// huge `Vec` allocation before the `counts_*.len() != rows*cols`
+/// check ever runs. Realistic sketches are at most a few hundred rows
+/// by tens-of-thousands of columns, so 8M cells (~64 MiB of f64) is a
+/// generous ceiling that no legitimate producer reaches.
+pub(crate) const MAX_SKETCH_CELLS: usize = 8 * 1024 * 1024;
+
+/// Validate an inbound, wire-declared `(rows, cols)` pair for a
+/// matrix-backed frequency sketch (CMS / CountSketch) BEFORE any matrix
+/// is reconstructed from it. Returns `Ok(())` for dimensions a
+/// legitimate producer could have emitted, and an `Err` (never a panic)
+/// for malformed / degenerate ones so the ingest path can skip the data
+/// point and fall through to its existing decode-failure accounting.
+///
+/// Rejections:
+/// 1. `rows < 1` or `cols < 1` — a zero-dim matrix has no cells.
+/// 2. Narrow-hash-budget violation. The cross-language wire hasher
+///    (`sketchlib`'s `MatrixHashType::Packed64`) derives every row's
+///    column index from disjoint bit-fields of a single 64-bit hash
+///    word: row `r` reads `mask_bits = ceil(log2(cols))` bits at offset
+///    `r * mask_bits`. Once `rows * mask_bits > 64` the per-row column
+///    slices overflow / alias the 64-bit word and the matrix-cell
+///    layout is no longer the one the producer hashed into — the sketch
+///    is internally degenerate. This mirrors sketchlib's own
+///    `MatrixFastHash::assert_compatible` budget (`rows * (mask_bits +
+///    1) <= 64`); we check the column-index bits alone so realistic
+///    configs (5x2048, 5x4096, 5x2000) — for which the sign bits share
+///    the top of the word without affecting the cell layout — still
+///    pass.
+/// 3. Obviously-oversized dims: `rows * cols > MAX_SKETCH_CELLS`,
+///    guarding against a huge allocation from a malformed payload.
+///
+/// `what` names the wire struct for the error message (e.g.
+/// `"CountMinState"`).
+pub(crate) fn validate_sketch_dims(what: &str, rows: usize, cols: usize) -> Result<(), String> {
+    if rows < 1 || cols < 1 {
+        return Err(format!(
+            "{what} has degenerate dims (rows={rows}, cols={cols}); rejecting"
+        ));
+    }
+    // mask_bits = ceil(log2(cols)); cols >= 1 here. ilog2 is floor(log2).
+    let mask_bits = if cols.is_power_of_two() {
+        cols.ilog2() as usize
+    } else {
+        cols.ilog2() as usize + 1
+    };
+    if rows.saturating_mul(mask_bits) > 64 {
+        return Err(format!(
+            "{what} dims (rows={rows}, cols={cols}) exceed the 64-bit \
+             packed-hash column budget (rows * ceil(log2(cols)) = {} > 64); \
+             the sketch's matrix-cell layout is degenerate, rejecting",
+            rows.saturating_mul(mask_bits)
+        ));
+    }
+    if rows.saturating_mul(cols) > MAX_SKETCH_CELLS {
+        return Err(format!(
+            "{what} dims (rows={rows}, cols={cols}) declare {} cells, \
+             exceeding the {MAX_SKETCH_CELLS}-cell ingest cap; rejecting to \
+             avoid a huge allocation from a malformed payload",
+            rows.saturating_mul(cols)
+        ));
+    }
+    Ok(())
 }
 
 impl SerializableToSink for CountMinSketchAccumulator {
@@ -914,6 +985,81 @@ mod tests {
             .expect("Increase is supported");
         // min-row-sum: row0 = 12, row1 = 12, min = 12.
         assert_eq!(v, 12.0);
+    }
+
+    // ----------------------------------------------------------------
+    // Defensive inbound-dimension validation (harden/sketch-dim-validation).
+    // Malformed / degenerate / narrow-hash-budget-violating CMS dims must
+    // be rejected gracefully (Err, never a panic); valid configs the
+    // backend actually uses (5x2048, 5x4096, 5x2000) must still decode.
+    // ----------------------------------------------------------------
+
+    /// Build a bare `CountMinState` proto carrying the given dims and a
+    /// row-major INT64 counts vector sized to `rows*cols` so that, IF the
+    /// dims pass validation, the reshape also succeeds. Used to prove a
+    /// malformed-dim payload is rejected at the dim gate, not later.
+    fn cms_state_bytes(rows: u32, cols: u32) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{CountMinState, CounterType};
+        use prost::Message;
+        let n = (rows as usize).saturating_mul(cols as usize);
+        let state = CountMinState {
+            rows,
+            cols,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: vec![0i64; n],
+            counts_float: Vec::new(),
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        state.encode_to_vec()
+    }
+
+    #[test]
+    fn test_validate_sketch_dims_accepts_valid_configs() {
+        // The realistic configs the backend uses must pass unchanged.
+        for (r, c) in [(5usize, 2048usize), (5, 4096), (5, 2000), (4, 1000), (2, 3)] {
+            assert!(
+                validate_sketch_dims("CountMinState", r, c).is_ok(),
+                "valid config {r}x{c} was wrongly rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_sketch_dims_rejects_malformed() {
+        // Zero dims.
+        assert!(validate_sketch_dims("CountMinState", 0, 2048).is_err());
+        assert!(validate_sketch_dims("CountMinState", 5, 0).is_err());
+        // Narrow-hash-budget violation: 5 * ceil(log2(8192))=5*13=65 > 64.
+        let err = validate_sketch_dims("CountMinState", 5, 8192).unwrap_err();
+        assert!(err.contains("budget"), "expected budget error, got: {err}");
+        // Absurdly oversized: 1 x 16,777,216 = 16M cells > 8M cap. (1 row
+        // keeps the hash budget tiny — 1*24=24 — so the cap check, not the
+        // budget check, is what fires here.)
+        let err = validate_sketch_dims("CountMinState", 1, 16_777_216).unwrap_err();
+        assert!(err.contains("cap"), "expected cell-cap error, got: {err}");
+        // No panic on extreme dims (saturating_mul guards the products).
+        assert!(validate_sketch_dims("CountMinState", usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_rejects_bad_dims_no_panic() {
+        // A data point declaring narrow-hash-budget-violating dims must be
+        // skipped (Err returned, NOT a panic). The ingest caller turns
+        // this Err into a dropped data point + WARN log.
+        let bytes = cms_state_bytes(5, 8192);
+        let result = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes);
+        assert!(result.is_err(), "budget-violating dims should be rejected");
+        assert!(result.unwrap_err().to_string().contains("rejecting"));
+
+        // A valid neighbour (5x4096) on the same path still decodes fine.
+        let ok_bytes = cms_state_bytes(5, 4096);
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&ok_bytes)
+            .expect("valid 5x4096 CMS should still decode");
+        assert_eq!(acc.inner.rows(), 5);
+        assert_eq!(acc.inner.cols(), 4096);
     }
 
     #[test]

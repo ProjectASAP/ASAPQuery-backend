@@ -1340,17 +1340,37 @@ async fn route_modified_otlp_sketches_to_precompute(
                             }
                             Err(e) => {
                                 decoded_failed += 1;
-                                debug!(
-                                    "OTLP modified-proto sketch decode failed \
-                                     (metric={}, kind={:?}, encoding={}, \
-                                     bytes={}): {} — falling through to §5.2 \
-                                     fallback",
-                                    metric.name,
-                                    dp.kind,
-                                    dp.encoding,
-                                    dp.sketch.len(),
-                                    e
-                                );
+                                let msg = e.to_string();
+                                // Defensive dim-validation rejections
+                                // (malformed / degenerate CMS / CountSketch
+                                // dims — see `validate_sketch_dims`) signal a
+                                // misbehaving producer, so surface them at
+                                // WARN; ordinary decode fallbacks stay at
+                                // DEBUG to avoid log spam.
+                                if msg.contains("rejecting") {
+                                    warn!(
+                                        "OTLP modified-proto sketch dropped on dim \
+                                         validation (metric={}, kind={:?}, \
+                                         encoding={}, bytes={}): {}",
+                                        metric.name,
+                                        dp.kind,
+                                        dp.encoding,
+                                        dp.sketch.len(),
+                                        msg
+                                    );
+                                } else {
+                                    debug!(
+                                        "OTLP modified-proto sketch decode failed \
+                                         (metric={}, kind={:?}, encoding={}, \
+                                         bytes={}): {} — falling through to §5.2 \
+                                         fallback",
+                                        metric.name,
+                                        dp.kind,
+                                        dp.encoding,
+                                        dp.sketch.len(),
+                                        msg
+                                    );
+                                }
                                 continue;
                             }
                         }
