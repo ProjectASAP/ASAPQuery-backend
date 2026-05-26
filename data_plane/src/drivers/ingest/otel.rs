@@ -1287,14 +1287,38 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // one in-flight delta per (metric, labels) so
                     // the next full snapshot replaces the current
                     // cache entry cleanly.
+                    //
+                    // Per-window base rotation
+                    // (`docs/delta-baseline-contract.md` §3): the edge
+                    // tumbling window resets per-series sketch state
+                    // every window, so each window's delta is that
+                    // window's marginal against an empty base. The
+                    // backend therefore must NOT accumulate forever
+                    // (`state(N) = state(N-1) ⊕ delta(N)`), which would
+                    // over-count across windows. Instead we detect a
+                    // window boundary per series — a change in the data
+                    // point's window start (`start_time_unix_nano`)
+                    // versus the `window_start` stored with the cached
+                    // base — and reset the cached base to empty before
+                    // applying the new window's delta. Within a window
+                    // deltas still accumulate; at a new window the base
+                    // starts fresh, so the reconstructed `state(N)` is
+                    // window N only. Sketch-agnostic: the reset is the
+                    // additive families' (DDSketch / CMS / CountSketch /
+                    // HLL) `AggregateCore::reset_to_empty`; KLL never
+                    // deltas. Full frames keep REPLACE semantics and set
+                    // the stored `window_start`.
                     let accumulator: Box<dyn AggregateCore> = if dp.encoding == ENCODING_PROTO_DELTA
                         || dp.encoding == ENCODING_MSGPACK_DELTA
                     {
-                        let Some(base) = ingest_state
+                        let Some((mut merged, base_window_start)) = ingest_state
                             .sketch_snapshots
                             .get(&series_key)
-                            .map(|e| e.clone_boxed_core())
+                            .map(|e| (e.core.clone_boxed_core(), e.window_start))
                         else {
+                            // No base yet → drop the delta (agent must
+                            // resend the next full frame). Unchanged
+                            // guard.
                             decoded_failed += 1;
                             debug!(
                                 "OTLP delta-sketch arrived before any base \
@@ -1305,7 +1329,23 @@ async fn route_modified_otlp_sketches_to_precompute(
                             );
                             continue;
                         };
-                        let mut merged = base;
+                        // Window boundary: the incoming delta opens a new
+                        // window for this series. Rotate the base to empty
+                        // so the new window starts fresh (state == this
+                        // window only), keeping the sketch's shape/config
+                        // intact for the additive apply below.
+                        if dp.start_time_unix_nano != base_window_start {
+                            debug!(
+                                "OTLP delta-sketch window boundary (metric={}, \
+                                 series_key={}, prev_window_start={}, \
+                                 new_window_start={}); rotating per-series base",
+                                metric.name,
+                                series_key,
+                                base_window_start,
+                                dp.start_time_unix_nano
+                            );
+                            merged.reset_to_empty();
+                        }
                         if let Err(e) = apply_modified_otlp_delta_bytes(
                             dp.kind,
                             dp.encoding,
@@ -1326,16 +1366,24 @@ async fn route_modified_otlp_sketches_to_precompute(
                             );
                             continue;
                         }
-                        ingest_state
-                            .sketch_snapshots
-                            .insert(series_key.clone(), merged.clone_boxed_core());
+                        ingest_state.sketch_snapshots.insert(
+                            series_key.clone(),
+                            crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                                core: merged.clone_boxed_core(),
+                                window_start: dp.start_time_unix_nano,
+                            },
+                        );
                         merged
                     } else {
                         match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
                             Ok(acc) => {
-                                ingest_state
-                                    .sketch_snapshots
-                                    .insert(series_key.clone(), acc.clone_boxed_core());
+                                ingest_state.sketch_snapshots.insert(
+                                    series_key.clone(),
+                                    crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                                        core: acc.clone_boxed_core(),
+                                        window_start: dp.start_time_unix_nano,
+                                    },
+                                );
                                 acc
                             }
                             Err(e) => {
@@ -2889,6 +2937,186 @@ mod sid_resolution_tests {
         // The assigned sid stays registered — the second DP routed to
         // it via the resolver's cache hit.
         assert!(state.sketch_index.instance(assigned_sid).is_some());
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// Per-window base rotation (`docs/delta-baseline-contract.md` §3):
+    /// the backend must NOT accumulate deltas across windows. For one
+    /// series, a full frame opens window 1, a delta in window 1 (same
+    /// `start_time_unix_nano`) accumulates onto it, then a delta in
+    /// window 2 (a NEW `start_time_unix_nano`) must reset the cached base
+    /// to empty first — so the reconstructed state is window 2's delta
+    /// only, NOT window1 + window2.
+    ///
+    /// Uses DDSketch (an additive family) so accumulation vs. reset is
+    /// directly observable on the bucket counts.
+    #[tokio::test]
+    async fn delta_apply_rotates_per_series_base_at_window_boundary() {
+        use crate::precompute_engine::operators::DDSketchAccumulator;
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use prost::Message;
+
+        let (state, drain) = make_state().await;
+
+        const WIN1_START: u64 = 1_000_000;
+        const WIN2_START: u64 = 2_000_000;
+
+        // Build a DDSketch DataPoint with explicit encoding / window-start
+        // / payload so we can stage a full frame then per-window deltas.
+        let make_dp = |start: u64, ts: u64, encoding: i32, sketch: Vec<u8>| DdSketchDataPoint {
+            attributes: vec![kv("zone", "z0")],
+            start_time_unix_nano: start,
+            time_unix_nano: ts,
+            sketch,
+            encoding,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 0,
+        };
+
+        // The cache key (series_key) is derived from the canonical metric
+        // name + attrs; recompute it the same way the ingest loop does so
+        // we can read the reconstructed base back out.
+        let mut attrs = HashMap::new();
+        attrs.insert("zone".to_string(), "z0".to_string());
+        let series_key = format_series_key(
+            canonical_sketch_metric_name("http_latency_ms", SketchKind::DdSketch),
+            &attrs,
+        );
+
+        // ── Window 1: full frame. Base buckets [10, 0, 5]. ──
+        let full_w1 = DdSketchState {
+            alpha: 0.01,
+            store_counts: vec![10, 0, 5],
+            store_offset: 0,
+        }
+        .encode_to_vec();
+        route_modified_otlp_sketches_to_precompute(
+            &build_request(
+                "http_latency_ms",
+                make_dp(WIN1_START, 11_000_000, 1, full_w1),
+            ),
+            &state,
+        )
+        .await;
+
+        // ── Window 1: delta (SAME window_start). Adds +3 to bucket 0,
+        // +7 to bucket 1. Within the window this accumulates onto the
+        // full frame → [13, 7, 5]. ──
+        let delta_w1 = PbDelta {
+            buckets: vec![
+                DdSketchBucketDelta {
+                    index: 0,
+                    d_count: 3,
+                },
+                DdSketchBucketDelta {
+                    index: 1,
+                    d_count: 7,
+                },
+            ],
+        }
+        .encode_to_vec();
+        route_modified_otlp_sketches_to_precompute(
+            &build_request(
+                "http_latency_ms",
+                make_dp(WIN1_START, 12_000_000, 2, delta_w1),
+            ),
+            &state,
+        )
+        .await;
+
+        {
+            let entry = state
+                .sketch_snapshots
+                .get(&series_key)
+                .expect("base cached after full + delta in window 1");
+            let dd = entry
+                .core
+                .as_any()
+                .downcast_ref::<DDSketchAccumulator>()
+                .expect("DDSketch base");
+            assert_eq!(
+                dd.inner.store_counts,
+                vec![13, 7, 5],
+                "within window 1 the delta accumulates onto the full frame"
+            );
+            assert_eq!(
+                entry.window_start, WIN1_START,
+                "cached window_start tracks window 1"
+            );
+        }
+
+        // ── Window 2: delta with a NEW window_start. Adds +20 to bucket
+        // 2. With per-window base rotation the base is reset to empty
+        // BEFORE this delta is applied, so the reconstructed state is
+        // window 2 ONLY: count 20 — NOT window1 + window2 (count 45).
+        let delta_w2 = PbDelta {
+            buckets: vec![DdSketchBucketDelta {
+                index: 2,
+                d_count: 20,
+            }],
+        }
+        .encode_to_vec();
+        route_modified_otlp_sketches_to_precompute(
+            &build_request(
+                "http_latency_ms",
+                make_dp(WIN2_START, 21_000_000, 2, delta_w2),
+            ),
+            &state,
+        )
+        .await;
+
+        {
+            let entry = state
+                .sketch_snapshots
+                .get(&series_key)
+                .expect("base still cached after window 2 delta");
+            let dd = entry
+                .core
+                .as_any()
+                .downcast_ref::<DDSketchAccumulator>()
+                .expect("DDSketch base");
+            // The base was rotated to empty before the window-2 delta, so
+            // it holds window 2 ONLY: total count 20 (the +20 on bucket 2),
+            // NOT window1 + window2 (which would be 13 + 7 + 5 + 20 = 45).
+            // Asserting on `total_count` keeps the check independent of the
+            // empty-sketch's store offset/layout (a fresh sketch re-bases
+            // its store offset around the first touched bucket).
+            assert_eq!(
+                dd.inner.total_count(),
+                20,
+                "new window_start rotates the base to empty: state == window 2 only \
+                 (count 20), NOT the all-time accumulation (45)"
+            );
+            // Only bucket 2 carries mass; the window-1 buckets (0 and 1)
+            // were dropped by the rotation.
+            let bucket_count = |abs_idx: i32| -> u64 {
+                let i = abs_idx - dd.inner.store_offset;
+                if i >= 0 && (i as usize) < dd.inner.store_counts.len() {
+                    dd.inner.store_counts[i as usize]
+                } else {
+                    0
+                }
+            };
+            assert_eq!(bucket_count(2), 20, "window 2's +20 lands on bucket 2");
+            assert_eq!(
+                bucket_count(0),
+                0,
+                "window 1's bucket 0 mass was rotated away"
+            );
+            assert_eq!(
+                bucket_count(1),
+                0,
+                "window 1's bucket 1 mass was rotated away"
+            );
+            assert_eq!(
+                entry.window_start, WIN2_START,
+                "cached window_start advanced to window 2"
+            );
+        }
 
         drop(state);
         let _ = drain.await;

@@ -155,6 +155,13 @@ impl AggregateCore for DDSketchAccumulator {
         "DDSketchAccumulator"
     }
 
+    /// Per-window base rotation: drop all bucket counts but keep the
+    /// relative-accuracy parameter so the next window's bucket deltas
+    /// index into the same log-bucket layout.
+    fn reset_to_empty(&mut self) {
+        self.inner = DdSketch::new(self.inner.alpha);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

@@ -4,6 +4,25 @@ use crate::precompute_engine::worker::parse_labels_from_series_key;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::Arc;
 
+/// One per-series entry in the delta-reconstitution snapshot cache.
+///
+/// Carries the reconstructed accumulator base **plus** the start of the
+/// tumbling window that base belongs to. The ingest path uses
+/// `window_start` to drive per-window base rotation: when a delta frame
+/// arrives whose data-point window start differs from the cached
+/// `window_start`, the cached `core` is reset to empty before the new
+/// window's delta is applied, so the reconstructed state reflects that
+/// window only rather than an all-time accumulation across windows (see
+/// `docs/delta-baseline-contract.md` §3).
+pub struct SnapshotCacheEntry {
+    /// Reconstructed per-series accumulator base.
+    pub core: Box<dyn crate::storage_engines::types::AggregateCore>,
+    /// `start_time_unix_nano` of the window this base was built for.
+    /// Full frames set it from their own data point; delta frames
+    /// compare against it to detect a window boundary.
+    pub window_start: u64,
+}
+
 /// Shared state for the ingest path.
 ///
 /// Holds the worker router plus the aggregation configs needed for group-key
@@ -43,7 +62,11 @@ pub struct IngestState {
     /// follow-up will add TTL-based eviction keyed by last-seen
     /// timestamp so long-running deployments don't leak memory
     /// on retired series.
-    pub sketch_snapshots: dashmap::DashMap<String, Box<dyn crate::storage_engines::types::AggregateCore>>,
+    ///
+    /// The value is a [`SnapshotCacheEntry`] — the reconstructed base
+    /// plus the window start it belongs to — so the delta-apply path can
+    /// rotate (reset) the base at a per-series window boundary.
+    pub sketch_snapshots: dashmap::DashMap<String, SnapshotCacheEntry>,
     /// Phase 4 — centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
     /// the `ResolveSeriesIDs` RPC (eager batch resolution from the agent's
@@ -186,9 +209,13 @@ mod tests {
         let base = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
         };
-        state
-            .sketch_snapshots
-            .insert(series_key.to_string(), Box::new(base.clone()));
+        state.sketch_snapshots.insert(
+            series_key.to_string(),
+            SnapshotCacheEntry {
+                core: Box::new(base.clone()),
+                window_start: 0,
+            },
+        );
 
         // First delta adds to bucket 0 and bucket 2. The wire delta now
         // carries only bucket deltas (the count/sum/min/max scalar fields
@@ -210,12 +237,17 @@ mod tests {
             .sketch_snapshots
             .get(series_key)
             .unwrap()
+            .core
             .clone_boxed_core();
         apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc1, &d1)
             .expect("apply first delta");
-        state
-            .sketch_snapshots
-            .insert(series_key.to_string(), acc1.clone_boxed_core());
+        state.sketch_snapshots.insert(
+            series_key.to_string(),
+            SnapshotCacheEntry {
+                core: acc1.clone_boxed_core(),
+                window_start: 0,
+            },
+        );
 
         // Second delta — picks up on top of the first, proving the
         // cache refresh is transitive.
@@ -230,6 +262,7 @@ mod tests {
             .sketch_snapshots
             .get(series_key)
             .unwrap()
+            .core
             .clone_boxed_core();
         apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc2, &d2)
             .expect("apply second delta");
