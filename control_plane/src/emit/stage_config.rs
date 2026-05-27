@@ -1581,6 +1581,42 @@ fn sketch_kind_to_asap_edge_family(kind: &SketchKind) -> &'static str {
     }
 }
 
+/// Derive the heap-bearing CountSketch `item_label` (the data-point
+/// attribute whose VALUE is the heavy-hitter item the top-k heap ranks)
+/// from a metric name.
+///
+/// The control plane does not (yet) thread a per-metric item dimension
+/// onto [`EdgeStageConfig`], so we recover it from the metric-name
+/// convention the workload uses: a top-K counter is named
+/// `<verb>_<dim>_<unit>` (e.g. `top_endpoint_qps`). We strip a leading
+/// `top_` / `topk_` verb and a trailing `_qps` / `_count` / `_total` /
+/// `_freq` / `_per_min` unit, leaving the item dimension (`endpoint`).
+/// This yields `endpoint` for the demo's `top_endpoint_qps` and
+/// generalises (`top_user_qps` → `user`). When nothing strips, we default
+/// to `endpoint` (the canonical top-K item dimension for this workload)
+/// rather than the degenerate metric-NAME keying — the heap is useless if
+/// every observation lands in one cell.
+fn countsketch_item_label_for(metric: &str) -> String {
+    let mut s = metric;
+    for prefix in ["topk_", "top_"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest;
+            break;
+        }
+    }
+    for suffix in ["_per_min", "_per_sec", "_qps", "_count", "_total", "_freq", "_rate"] {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            s = rest;
+            break;
+        }
+    }
+    if s.is_empty() {
+        "endpoint".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Issue #46 — emit the FUSED single-pipeline `asap_edge` edge agent
 /// wire shape.
 ///
@@ -1811,6 +1847,12 @@ fn emit_edge_yaml_asap_edge(
             // `build_edge_processor_block`. The fused processor's
             // per-entry surface uses `relative_accuracy` / `k` /
             // `rows` / `cols` (cols = sketch width, rows = depth).
+            //
+            // `countsketch_with_heap` tracks the planner's `with_heap`
+            // flag (set by `BindCountSketchOnTopK` when the family is
+            // CountSketch picked for a `topk(...)` query). It drives the
+            // warm-topk heap keys emitted below for the CountSketch family.
+            let mut countsketch_with_heap = false;
             match family_to_proc.get(kind).map(|sp| &sp.sketch_params) {
                 Some(SketchParams::DDSketch(p)) => {
                     e.insert("relative_accuracy".into(), Value::Number(p.alpha.into()));
@@ -1822,6 +1864,7 @@ fn emit_edge_yaml_asap_edge(
                 Some(SketchParams::CountSketch(p)) => {
                     e.insert("rows".into(), Value::Number((p.d as u64).into()));
                     e.insert("cols".into(), Value::Number((p.w as u64).into()));
+                    countsketch_with_heap = p.with_heap;
                 }
                 Some(SketchParams::Cms(p)) => {
                     e.insert("rows".into(), Value::Number((p.d as u64).into()));
@@ -1841,6 +1884,12 @@ fn emit_edge_yaml_asap_edge(
                         SketchKind::CountSketch => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
                             e.insert("cols".into(), Value::Number(2048u64.into()));
+                            // No enumerated processor → no planner heap flag;
+                            // a TopK query that reaches here without a bound
+                            // processor still wants the heap (the fused
+                            // CountSketch family is only ever planned for
+                            // top-K in this workload), so default it on.
+                            countsketch_with_heap = true;
                         }
                         SketchKind::Cms => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
@@ -1856,6 +1905,67 @@ fn emit_edge_yaml_asap_edge(
             if matches!(kind, SketchKind::Cms | SketchKind::Hll) {
                 insert_sample_p(&mut e, cfg.metric_to_sample_p.get(*metric).copied());
             }
+
+            // ── Per-metric delta_transmission (Foundation flag) ─────────────
+            //
+            // Mirrors the routing path's `build_edge_processor_block`: the
+            // four delta-capable families (DDSketch / HLL / CountSketch /
+            // Count-Min) emit `delta_transmission: true` (sparse delta
+            // frames against the prior window's snapshot — large bandwidth
+            // savings on slowly-changing sketches; the first window per
+            // series still ships full state). KLL is deliberately OMITTED:
+            // it has no delta variant (randomised compaction is not
+            // additively mergeable), and the kllprocessor / asapedge KLL
+            // path forces it off (`effectiveDelta`), so the key is ignored
+            // there — we never emit it for KLL. The processor's per-entry
+            // default is the top-level `Config.DeltaTransmission`, so an
+            // explicit per-metric value here keeps the wire shape from
+            // depending on that default.
+            if matches!(
+                kind,
+                SketchKind::DDSketch
+                    | SketchKind::Hll
+                    | SketchKind::CountSketch
+                    | SketchKind::Cms
+            ) {
+                e.insert("delta_transmission".into(), Value::Bool(true));
+            }
+
+            // ── CountSketch warm-topk heap keys (cross-repo dependency) ─────
+            //
+            // When the CountSketch family was planned with a heavy-hitter
+            // heap (`with_heap`, set by `BindCountSketchOnTopK` for a
+            // `topk(...)` query), emit the heap-bearing CountSketch wire
+            // variant so the agent ships the `{sketch, topk_heap, heap_size}`
+            // payload the backend detects as `CountSketchWithHeap`
+            // (Capability::FrequencyTopk) and a warm `topk(metric)` query
+            // routes to it instead of returning "No result".
+            //
+            //   * emit_heap: true   — select the heap-bearing variant.
+            //   * heap_size: 100    — sketchlib-go's CountSketch TOPK_SIZE.
+            //   * item_label: <dim> — the data-point attribute whose VALUE
+            //     is the heavy-hitter "item" the heap ranks (e.g.
+            //     `endpoint` for `top_endpoint_qps`); without it every
+            //     observation keys by the metric NAME (degenerate single
+            //     key). Derived from the metric name (see
+            //     `countsketch_item_label_for`).
+            //
+            // CROSS-REPO DEPENDENCY: these keys (`emit_heap` / `heap_size` /
+            // `item_label`) are being added to the asapedge processor's
+            // `MetricFamily` config (a parallel ASAPCollector change). They
+            // are pure YAML text here, so emitting them is safe even before
+            // that lands — `mapstructure` ignores unknown keys by default —
+            // but the warm-topk behaviour only activates once the asapedge
+            // build carries the fields. See the report's cross-repo note.
+            if matches!(kind, SketchKind::CountSketch) && countsketch_with_heap {
+                e.insert("emit_heap".into(), Value::Bool(true));
+                e.insert("heap_size".into(), Value::Number(100u64.into()));
+                e.insert(
+                    "item_label".into(),
+                    Value::String(countsketch_item_label_for(metric)),
+                );
+            }
+
             // Sketch family IS a warm entry → warm signal = true.
             e.insert(
                 "tier".into(),
@@ -5592,6 +5702,63 @@ mod tests {
         assert_eq!(cms.get("rows").and_then(|v| v.as_u64()), Some(5));
         assert_eq!(cms.get("cols").and_then(|v| v.as_u64()), Some(2048));
 
+        // ── Per-metric delta_transmission (Foundation flag) ─────────────
+        // The four delta-capable families carry `delta_transmission: true`;
+        // KLL OMITS the key (no delta variant — the agent's KLL path forces
+        // it off and ignores the key, but we never emit it to keep the wire
+        // shape clean and match `build_edge_processor_block`).
+        for delta_family in [
+            "http_requests_total_latency_ms",
+            "unique_users_per_min",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+        ] {
+            assert_eq!(
+                entry_for(delta_family)
+                    .get("delta_transmission")
+                    .and_then(|v| v.as_bool()),
+                Some(true),
+                "delta-capable family {delta_family} must emit delta_transmission: true\n{yaml}"
+            );
+        }
+        assert!(
+            kll.get("delta_transmission").is_none(),
+            "KLL must NOT carry delta_transmission (no delta variant)\n{yaml}"
+        );
+        // The sum entry is not a sketch and gets no delta_transmission.
+        assert!(
+            sum_e.get("delta_transmission").is_none(),
+            "sum family must NOT carry delta_transmission\n{yaml}"
+        );
+
+        // ── CountSketch warm-topk heap keys (cross-repo dependency) ─────
+        // The CountSketch family (`top_endpoint_qps`, planned with_heap)
+        // carries the heap-bearing wire variant keys so a warm topk query
+        // routes to the heap-bearing CountSketch once the asapedge build
+        // gains these fields.
+        assert_eq!(
+            cs.get("emit_heap").and_then(|v| v.as_bool()),
+            Some(true),
+            "CountSketch family must emit emit_heap: true\n{yaml}"
+        );
+        assert_eq!(
+            cs.get("heap_size").and_then(|v| v.as_u64()),
+            Some(100),
+            "CountSketch family must emit heap_size: 100\n{yaml}"
+        );
+        assert_eq!(
+            cs.get("item_label").and_then(|v| v.as_str()),
+            Some("endpoint"),
+            "CountSketch family must emit item_label: endpoint (the heap item dim)\n{yaml}"
+        );
+        // The Count-Min family (no heap) must NOT carry the heap keys.
+        assert!(
+            cms.get("emit_heap").is_none()
+                && cms.get("heap_size").is_none()
+                && cms.get("item_label").is_none(),
+            "Count-Min (no heap) must NOT carry the CountSketch heap keys\n{yaml}"
+        );
+
         // tier=warm: the five sketch-only metrics are NOT in
         // `archive_tier_metrics` (no exact/archive query), so the agent
         // builds their warm sketch ONLY and does NOT cold-archive them —
@@ -5855,6 +6022,207 @@ mod tests {
             Some("both"),
             "sketched + archived metric must be tier=both\n{yaml}"
         );
+    }
+
+    #[test]
+    fn fused_asap_edge_honours_workload_family_override_for_latency() {
+        // ── Family-mapping canonical decision: the WORKLOAD OVERRIDE wins ──
+        //
+        // The static reference (asap-otel-agent-asapedge.yaml) authored
+        // `http_requests_total_latency_ms → ddsketch`, but the controller's
+        // workload input (mvp-workload.yaml) pins
+        // `sketch_family_override: KLL` for that metric (the KLL accuracy
+        // experiment). The controller is the planner — `metric_to_family`
+        // is populated FROM the workload, so when the override is KLL the
+        // emit MUST produce a `kll` family entry for latency (and, being
+        // KLL, must NOT carry delta_transmission). The static file is the
+        // side that needs reconciling to KLL, not the emit.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        // Start from the canonical 6-family fixture and flip ONLY the
+        // latency family to KLL (the workload override), as the planner
+        // would have populated `metric_to_family` from mvp-workload.yaml.
+        let mut cfg = fused_asap_edge_cfg();
+        cfg.metric_to_family
+            .insert("http_requests_total_latency_ms".into(), one(SketchKind::Kll));
+
+        let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse");
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|a| a.get("metrics"))
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        let latency = metrics
+            .iter()
+            .find(|e| {
+                e.get("metric").and_then(|m| m.as_str())
+                    == Some("http_requests_total_latency_ms")
+            })
+            .expect("latency entry present");
+        assert_eq!(
+            latency.get("family").and_then(|v| v.as_str()),
+            Some("kll"),
+            "workload override (KLL) is canonical — latency must emit family: kll\n{yaml}"
+        );
+        // KLL has no delta variant — the override entry must omit the key.
+        assert!(
+            latency.get("delta_transmission").is_none(),
+            "KLL-overridden latency must NOT carry delta_transmission\n{yaml}"
+        );
+        // It is now sketch-only (no archive routing) ⇒ tier=warm.
+        assert_eq!(
+            latency.get("tier").and_then(|v| v.as_str()),
+            Some("warm"),
+            "latency (warm sketch only) must emit tier=warm\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn fused_asap_edge_keys_are_a_subset_of_asapedgeprocessor_config_go() {
+        // Cross-check every emitted key against the asapedgeprocessor
+        // `Config` / `MetricFamily` / `ColdConfig` / `ControlChannelConfig`
+        // mapstructure tags from
+        // `opentelemetry-collector-contrib-patch/processor/asapedgeprocessor/config.go`.
+        // Hardcoded here (per the task) so the test fails loudly if the emit
+        // ever grows a key the processor can't load.
+        //
+        // NOTE: `emit_heap` / `heap_size` / `item_label` are the parallel
+        // ASAPCollector change (warm-topk heap on the CountSketch family).
+        // They are listed in the allowed MetricFamily set BELOW because the
+        // emit intentionally ships them ahead of that processor change
+        // landing (the cross-repo dependency flagged in the report). If a
+        // reviewer wants to assert the gap, drop them from the set and the
+        // test will pinpoint exactly which keys depend on the merge.
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let cfg = fused_asap_edge_cfg();
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse");
+
+        let asap_edge = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|v| v.as_mapping())
+            .expect("asap_edge mapping");
+
+        // Top-level Config mapstructure tags.
+        let allowed_top: std::collections::BTreeSet<&str> = [
+            "shard_count",
+            "window_duration",
+            "metrics",
+            "cold",
+            "control_channel",
+            "max_series",
+            "delta_transmission",
+            "drop_original",
+        ]
+        .into_iter()
+        .collect();
+        for k in asap_edge.keys() {
+            let k = k.as_str().expect("string key");
+            assert!(
+                allowed_top.contains(k),
+                "asap_edge top-level key `{k}` not in asapedgeprocessor Config\n{yaml}"
+            );
+        }
+
+        // MetricFamily mapstructure tags (incl. the parallel heap keys).
+        let allowed_metric: std::collections::BTreeSet<&str> = [
+            "metric",
+            "family",
+            "aggregate_by",
+            "tier",
+            "relative_accuracy",
+            "k",
+            "rows",
+            "cols",
+            "sample_p",
+            "max_series",
+            "delta_transmission",
+            "delta_threshold",
+            // Parallel ASAPCollector warm-topk change (see note above).
+            "emit_heap",
+            "heap_size",
+            "item_label",
+        ]
+        .into_iter()
+        .collect();
+        let metrics = asap_edge
+            .get(serde_yaml::Value::String("metrics".into()))
+            .and_then(|v| v.as_sequence())
+            .expect("metrics seq");
+        assert_eq!(metrics.len(), 6, "expected 6 metric families\n{yaml}");
+        for entry in metrics {
+            let m = entry.as_mapping().expect("metric entry mapping");
+            for k in m.keys() {
+                let k = k.as_str().expect("string key");
+                assert!(
+                    allowed_metric.contains(k),
+                    "metrics[] key `{k}` not in asapedgeprocessor MetricFamily\n{yaml}"
+                );
+            }
+        }
+
+        // ColdConfig mapstructure tags.
+        let allowed_cold: std::collections::BTreeSet<&str> = [
+            "enabled",
+            "ship_endpoint",
+            "format",
+            "coldpart_endpoint",
+            "block_duration",
+            "reorder_grace",
+            "external_labels",
+            "spool_dir",
+            "spool_max_bytes",
+            "ship_queue_depth",
+            "spool_retry_interval",
+            "endpoint",
+            "tsdb_bucket",
+            "tenant",
+            "region",
+            "access_key_id",
+            "secret_access_key",
+            "use_ssl",
+        ]
+        .into_iter()
+        .collect();
+        let cold = asap_edge
+            .get(serde_yaml::Value::String("cold".into()))
+            .and_then(|v| v.as_mapping())
+            .expect("cold mapping");
+        for k in cold.keys() {
+            let k = k.as_str().expect("string key");
+            assert!(
+                allowed_cold.contains(k),
+                "cold.* key `{k}` not in asapedgeprocessor ColdConfig\n{yaml}"
+            );
+        }
+        // cold.ship_endpoint is the gorilla-merger HTTP ingest, control_channel
+        // stays disabled (no controller poll route) — this emit is the live
+        // OpAMP push path.
+        assert_eq!(
+            cold.get(serde_yaml::Value::String("ship_endpoint".into()))
+                .and_then(|v| v.as_str()),
+            Some("http://gorilla-merger:10908/ingest/gorilla"),
+            "cold.ship_endpoint must be the gorilla-merger ingest\n{yaml}"
+        );
+        // No control_channel is emitted (the fused emit relies on the
+        // processor's zero-value default, which is disabled — the live path
+        // is THIS OpAMP push, not an HTTP poll). If a control_channel block
+        // is ever emitted it must keep enabled: false.
+        if let Some(cc) = asap_edge
+            .get(serde_yaml::Value::String("control_channel".into()))
+            .and_then(|v| v.as_mapping())
+        {
+            assert_eq!(
+                cc.get(serde_yaml::Value::String("enabled".into()))
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "control_channel, if present, must stay disabled\n{yaml}"
+            );
+        }
     }
 
     #[test]
