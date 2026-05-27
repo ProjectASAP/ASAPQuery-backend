@@ -132,7 +132,10 @@ fn ddsketch_envelope_ends_up_in_backend_accumulator() {
         ReconstructedSketch::DdSketch(d) => d,
         _ => panic!(),
     };
-    let acc = DDSketchAccumulator { inner: dd };
+    let acc = DDSketchAccumulator {
+        inner: dd,
+        sample_p: 1.0,
+    };
 
     let q = acc
         .query_statistic(

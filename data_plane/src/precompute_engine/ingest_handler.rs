@@ -208,6 +208,7 @@ mod tests {
         let series_key = "__name__=latency_ms,inst=a";
         let base = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
+            sample_p: 1.0,
         };
         state.sketch_snapshots.insert(
             series_key.to_string(),

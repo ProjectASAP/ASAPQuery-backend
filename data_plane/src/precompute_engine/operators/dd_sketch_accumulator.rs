@@ -23,13 +23,49 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct DDSketchAccumulator {
     pub inner: DdSketch,
+    /// Edge sampling probability `p ∈ (0,1]` carried on the producer's
+    /// `SketchEnvelope.sample_p`. The edge admits each value with probability
+    /// `p` (NitroSketch geometric skip), so `inner.total_count()` is ~`p`× the
+    /// true count and a `Count` query must rescale by `1/p`. Quantiles are
+    /// rank-preserving and need NO rescale. `1.0` (and the proto3 default `0.0`,
+    /// dual-read as `1.0`) means no sampling, so the rescale is a no-op and the
+    /// behaviour is identical to before. The factor is a per-series config
+    /// constant: it is set from the first (always-full, otel.rs ingest
+    /// contract) frame and preserved across delta applies, window-boundary
+    /// `reset_to_empty`, and `merge_with`.
+    pub sample_p: f64,
+}
+
+/// Normalize a wire `sample_p` to a usable rescale denominator. `0.0` (proto3
+/// default), `>= 1.0`, and non-finite all collapse to `1.0` (no sampling), so a
+/// `Count` rescale by `1/p` is a no-op on unsampled / legacy frames.
+pub(crate) fn normalize_sample_p(p: f64) -> f64 {
+    if p.is_finite() && p > 0.0 && p < 1.0 {
+        p
+    } else {
+        1.0
+    }
 }
 
 impl DDSketchAccumulator {
     pub fn new(alpha: f64) -> Self {
         Self {
             inner: DdSketch::new(alpha),
+            sample_p: 1.0,
         }
+    }
+
+    /// Read the normalized edge sampling probability from a full-frame
+    /// `SketchEnvelope`'s `sample_p`. Returns `1.0` (no sampling) for bare
+    /// `DdSketchState` bytes or any decode failure — the primary production
+    /// decode path (`reconstruct_via_runtime`) discards the envelope's
+    /// `sample_p`, so the ingest call site re-reads it from the same bytes.
+    pub fn sample_p_from_envelope_bytes(buffer: &[u8]) -> f64 {
+        use asap_sketchlib::proto::sketchlib::SketchEnvelope;
+        use prost::Message;
+        SketchEnvelope::decode(buffer)
+            .map(|env| normalize_sample_p(env.sample_p))
+            .unwrap_or(1.0)
     }
 
     /// Decode from the modified OTLP wire format's
@@ -41,6 +77,9 @@ impl DDSketchAccumulator {
         Ok(Self {
             inner: DdSketch::from_msgpack(buffer)
                 .map_err(|e| format!("deserialize DdSketch msgpack: {e}"))?,
+            // The msgpack DdSketch struct carries no envelope/sample_p; the
+            // msgpack path is parity/test-only and is never edge-sampled.
+            sample_p: 1.0,
         })
     }
 
@@ -59,22 +98,33 @@ impl DDSketchAccumulator {
         // fall back to bare `DdSketchState` for callers (e.g. unit
         // tests) that encode the state directly. Mirrors the PR #14
         // fix on `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
-        let state = match SketchEnvelope::decode(buffer) {
-            Ok(env) => match env.sketch_state {
-                Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
-                Some(other) => {
-                    return Err(format!(
-                        "SketchEnvelope contains non-DDSketch sketch: {:?}",
-                        std::mem::discriminant(&other)
-                    )
-                    .into());
+        // Capture the envelope's `sample_p` alongside the state so a `Count`
+        // query can rescale by `1/p`. Bare `DdSketchState` bytes (no envelope)
+        // carry no sampling info → `sample_p` 1.0 (no rescale).
+        let (state, sample_p) = match SketchEnvelope::decode(buffer) {
+            Ok(env) => {
+                let sp = env.sample_p;
+                match env.sketch_state {
+                    Some(sketch_envelope::SketchState::Ddsketch(st)) => (st, sp),
+                    Some(other) => {
+                        return Err(format!(
+                            "SketchEnvelope contains non-DDSketch sketch: {:?}",
+                            std::mem::discriminant(&other)
+                        )
+                        .into());
+                    }
+                    None => (
+                        DdSketchState::decode(buffer)
+                            .map_err(|e| format!("decode DDSketchState: {e}"))?,
+                        1.0,
+                    ),
                 }
-                None => DdSketchState::decode(buffer)
-                    .map_err(|e| format!("decode DDSketchState: {e}"))?,
-            },
-            Err(_) => {
-                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
             }
+            Err(_) => (
+                DdSketchState::decode(buffer)
+                    .map_err(|e| format!("decode DDSketchState: {e}"))?,
+                1.0,
+            ),
         };
         if !(state.alpha > 0.0 && state.alpha < 1.0) {
             return Err(format!(
@@ -90,7 +140,10 @@ impl DDSketchAccumulator {
         // store_offset) and recovers `count` by summing the bucket
         // counts via `total_count()`.
         let inner = DdSketch::from_raw(state.alpha, state.store_counts.clone(), state.store_offset);
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            sample_p: normalize_sample_p(sample_p),
+        })
     }
 
     /// Apply a proto-encoded `DDSketchDelta` frame to this
@@ -137,7 +190,11 @@ impl SerializableToSink for DDSketchAccumulator {
             "alpha": self.inner.alpha,
             "store_offset": self.inner.store_offset,
             "bucket_count": self.inner.store_counts.len(),
+            // Raw bucket-derived count (admitted samples). `sample_p` is the
+            // scale factor a consumer applies (count / sample_p) to estimate
+            // the true count; `query_statistic(Count)` already does this.
             "count": self.inner.total_count(),
+            "sample_p": self.sample_p,
         })
     }
 
@@ -157,7 +214,10 @@ impl AggregateCore for DDSketchAccumulator {
 
     /// Per-window base rotation: drop all bucket counts but keep the
     /// relative-accuracy parameter so the next window's bucket deltas
-    /// index into the same log-bucket layout.
+    /// index into the same log-bucket layout. `sample_p` is a per-series
+    /// config constant (not per-window data), so it is intentionally
+    /// preserved across the rotation — the next window's deltas are sampled
+    /// at the same rate and must rescale identically.
     fn reset_to_empty(&mut self) {
         self.inner = DdSketch::new(self.inner.alpha);
     }
@@ -186,8 +246,18 @@ impl AggregateCore for DDSketchAccumulator {
             .downcast_ref::<DDSketchAccumulator>()
             .ok_or("Failed to downcast to DDSketchAccumulator")?;
         let merged_inner = DdSketch::merge_refs(&[&self.inner, &other_dd.inner])?;
+        // sample_p is a per-series config constant, so both operands carry the
+        // same value in practice. Prefer a sampled factor over the no-sampling
+        // default so a merge with a freshly-reset (1.0) base keeps the series'
+        // sampling rate.
+        let sample_p = if self.sample_p < 1.0 {
+            self.sample_p
+        } else {
+            other_dd.sample_p
+        };
         Ok(Box::new(Self {
             inner: merged_inner,
+            sample_p,
         }))
     }
 
@@ -226,11 +296,13 @@ impl AggregateCore for DDSketchAccumulator {
                     "DDSketchAccumulator: quantile() returned None (sketch empty?)".into()
                 })
             }
-            // Count is exact, derived by summing the bucket store
-            // counts — the only DataPoint-level scalar that survives
-            // the wire-format trim (ProjectASAP/sketchlib-go#243 /
-            // asap_sketchlib#57).
-            Statistic::Count => Ok(self.inner.total_count() as f64),
+            // Count is derived by summing the bucket store counts — the only
+            // DataPoint-level scalar that survives the wire-format trim
+            // (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57). When the edge
+            // sampled this series (sample_p < 1.0), the stored count is ~p× the
+            // true count, so rescale by 1/sample_p to recover an unbiased
+            // estimate. sample_p == 1.0 (unsampled / legacy) makes this a no-op.
+            Statistic::Count => Ok(self.inner.total_count() as f64 / self.sample_p),
             // STRICT policy: the Sum/Min/Max scalars were removed from
             // the DDSketch wire format. They are now served by the
             // controller-provisioned exact aggregations (an exact `Sum`
@@ -338,9 +410,11 @@ mod tests {
     fn test_aggregate_core_merge_aligns_buckets() {
         let a = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 1, 1], -1),
+            sample_p: 1.0,
         };
         let b = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![10, 10, 10], 0),
+            sample_p: 1.0,
         };
         let merged_box = a.merge_with(&b).expect("merge ok");
         let merged = merged_box
@@ -426,6 +500,7 @@ mod tests {
         // Build the in-memory sketch from bucket counts only — no scalars.
         DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
+            sample_p: 1.0,
         }
     }
 
@@ -471,5 +546,131 @@ mod tests {
                 "{stat:?} error should explain the statistic is unavailable, got: {msg}"
             );
         }
+    }
+
+    // ----- sample_p count rescale -----
+    //
+    // When the edge sampled a DDSketch (sample_p < 1.0), the stored count is
+    // ~p× the true count, so Count rescales by 1/p. Quantiles are
+    // rank-preserving and must NOT be rescaled.
+
+    #[test]
+    fn test_count_is_rescaled_by_sample_p() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let acc = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
+            sample_p: 0.1,
+        };
+        let c = acc
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count ok");
+        // Raw bucket sum 10, rescaled by 1/0.1 = 100.
+        assert!((c - 100.0).abs() < 1e-9, "expected rescaled 100, got {c}");
+    }
+
+    #[test]
+    fn test_quantile_ignores_sample_p() {
+        use promql_utilities::query_logics::enums::Statistic;
+        let mut kwargs = HashMap::new();
+        kwargs.insert("quantile".to_string(), "0.5".to_string());
+        let unsampled = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
+            sample_p: 1.0,
+        };
+        let sampled = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
+            sample_p: 0.1,
+        };
+        let qu = unsampled
+            .query_statistic(Statistic::Quantile, &None, &kwargs)
+            .expect("q ok");
+        let qs = sampled
+            .query_statistic(Statistic::Quantile, &None, &kwargs)
+            .expect("q ok");
+        assert_eq!(qu, qs, "quantile must be sample_p-invariant");
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_reads_envelope_sample_p() {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
+        use promql_utilities::query_logics::enums::Statistic;
+        use prost::Message;
+
+        let env = SketchEnvelope {
+            sample_p: 0.25,
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(DdSketchState {
+                alpha: 0.01,
+                store_counts: vec![2, 4, 6, 8],
+                store_offset: -2,
+            })),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+        let acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.sample_p, 0.25);
+        // Raw 20, rescaled 20 / 0.25 = 80.
+        let c = acc
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count ok");
+        assert!((c - 80.0).abs() < 1e-9, "expected rescaled 80, got {c}");
+    }
+
+    #[test]
+    fn test_sample_p_normalization() {
+        // proto3 default (0.0), >=1.0, and non-finite all mean no sampling.
+        assert_eq!(normalize_sample_p(0.0), 1.0);
+        assert_eq!(normalize_sample_p(1.0), 1.0);
+        assert_eq!(normalize_sample_p(1.5), 1.0);
+        assert_eq!(normalize_sample_p(f64::NAN), 1.0);
+        assert_eq!(normalize_sample_p(-0.1), 1.0);
+        assert_eq!(normalize_sample_p(0.5), 0.5);
+    }
+
+    #[test]
+    fn test_sample_p_from_envelope_bytes_defaults_to_one() {
+        use asap_sketchlib::proto::sketchlib::DdSketchState;
+        use prost::Message;
+        // Bare DdSketchState bytes (no envelope) → no sampling info → 1.0.
+        let bare = DdSketchState {
+            alpha: 0.01,
+            store_counts: vec![1, 2, 3],
+            store_offset: 0,
+        }
+        .encode_to_vec();
+        assert_eq!(
+            DDSketchAccumulator::sample_p_from_envelope_bytes(&bare),
+            1.0
+        );
+    }
+
+    #[test]
+    fn test_reset_to_empty_preserves_sample_p() {
+        let mut acc = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
+            sample_p: 0.2,
+        };
+        acc.reset_to_empty();
+        assert_eq!(acc.sample_p, 0.2, "window rotation must keep sample_p");
+        assert_eq!(acc.inner.total_count(), 0, "buckets cleared");
+    }
+
+    #[test]
+    fn test_merge_prefers_sampled_factor() {
+        // A sampled base merged with a freshly-reset (1.0) operand keeps the
+        // series' sampling rate.
+        let a = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 1, 1], 0),
+            sample_p: 0.1,
+        };
+        let b = DDSketchAccumulator {
+            inner: DdSketch::from_raw(0.01, vec![1, 1, 1], 0),
+            sample_p: 1.0,
+        };
+        let merged = a.merge_with(&b).expect("merge ok");
+        let merged = merged
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .expect("downcast ok");
+        assert_eq!(merged.sample_p, 0.1);
     }
 }
