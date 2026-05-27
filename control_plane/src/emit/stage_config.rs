@@ -1843,6 +1843,25 @@ fn emit_edge_yaml_asap_edge(
                 "family".into(),
                 Value::String(sketch_kind_to_asap_edge_family(kind).to_string()),
             );
+            // aggregate_by: emit this metric's workload grouping_labels so each
+            // sketch is one-per-group (e.g. per zone), mirroring the Sum path
+            // above. CRITICAL for the heap-bearing CountSketch (warm topk): with
+            // an empty aggregate_by the edge factory falls into
+            // GlobalAggregation (it collapses the series grouping to a single
+            // attr-less sketch), and the backend's registry-sid ingest cannot
+            // mint a sid for an attr-less series — so the sketch is never
+            // registered and `topk(...)` capability-misses to archive. KLL
+            // metrics carry no grouping_labels (per-series quantile) and
+            // correctly receive no aggregate_by here.
+            let grouping = cfg
+                .metric_to_grouping_labels
+                .get(*metric)
+                .cloned()
+                .unwrap_or_default();
+            if !grouping.is_empty() {
+                let by: Vec<Value> = grouping.into_iter().map(Value::String).collect();
+                e.insert("aggregate_by".into(), Value::Sequence(by));
+            }
             // Family-specific params — mirror the reads in
             // `build_edge_processor_block`. The fused processor's
             // per-entry surface uses `relative_accuracy` / `k` /
@@ -1960,10 +1979,53 @@ fn emit_edge_yaml_asap_edge(
             if matches!(kind, SketchKind::CountSketch) && countsketch_with_heap {
                 e.insert("emit_heap".into(), Value::Bool(true));
                 e.insert("heap_size".into(), Value::Number(100u64.into()));
-                e.insert(
-                    "item_label".into(),
-                    Value::String(countsketch_item_label_for(metric)),
-                );
+                // Prefer the workload-declared inner dimension
+                // (`metric_to_item_label`, from `WorkloadEntry::item_label`)
+                // — the same generic source the HLL/CMS families read below.
+                // Fall back to the metric-name convention
+                // (`countsketch_item_label_for`) when a deployment's workload
+                // omits the field, preserving the prior CountSketch behaviour.
+                let item_label = cfg
+                    .metric_to_item_label
+                    .get(*metric)
+                    .cloned()
+                    .unwrap_or_else(|| countsketch_item_label_for(metric));
+                e.insert("item_label".into(), Value::String(item_label));
+            }
+
+            // ── HLL / Count-Min inner item dimension (runtime-validation
+            // bug fix) ──────────────────────────────────────────────────────
+            //
+            // The HLL (`unique_users_per_min` → counts distinct `user_id`)
+            // and Count-Min (`endpoint_request_freq` → frequency over
+            // `endpoint`) families also have a high-cardinality INNER
+            // dimension that is NOT a grouping key. Without an `item_label`
+            // that attribute (`user_id` / `endpoint`) stays in the sketch's
+            // series key, so the agent mints one cardinality-1 HLL per
+            // distinct `user_id` instead of one HLL per zone — the warm
+            // HLL/CMS queries then return semantically wrong / empty results.
+            //
+            // We emit `item_label` for these families from the SAME generic
+            // source the CountSketch family reads (`metric_to_item_label`,
+            // populated from each workload entry's `item_label`). Unlike
+            // CountSketch there is no metric-name fallback: the HLL/CMS inner
+            // dimension (`user_id`) is not recoverable from the metric name
+            // (`unique_users_per_min`), so when a workload declares no
+            // `item_label` we emit none — byte-identical to before, and the
+            // agent keeps its prior keying (no regression for metrics that
+            // genuinely have no inner dimension).
+            //
+            // CROSS-REPO DEPENDENCY: HLL/CMS consumption of `item_label` is a
+            // parallel ASAPCollector asapedgeprocessor change. The key is
+            // pure YAML text here (`mapstructure` ignores unknown keys), so
+            // emitting it is safe even before that lands; the corrected
+            // keying only activates once the asapedge build carries it.
+            if matches!(kind, SketchKind::Hll | SketchKind::Cms) {
+                if let Some(item_label) = cfg.metric_to_item_label.get(*metric) {
+                    if !item_label.is_empty() {
+                        e.insert("item_label".into(), Value::String(item_label.clone()));
+                    }
+                }
             }
 
             // Sketch family IS a warm entry → warm signal = true.
@@ -2713,6 +2775,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         }
@@ -3697,6 +3760,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };
@@ -4047,6 +4111,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         }
@@ -4399,6 +4464,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         }
@@ -5532,6 +5598,17 @@ mod tests {
         let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
         metric_to_grouping_labels.insert("http_requests_total".into(), vec!["zone".into()]);
 
+        // Inner item dimensions for the item-counting families, mirroring
+        // `mvp-workload.yaml`'s per-metric inner attribute (the high-
+        // cardinality data-point attribute the sketch counts/ranks):
+        //   * unique_users_per_min (HLL) → user_id
+        //   * top_endpoint_qps     (CS)  → endpoint
+        //   * endpoint_request_freq (CMS)→ endpoint
+        let mut metric_to_item_label: HashMap<String, String> = HashMap::new();
+        metric_to_item_label.insert("unique_users_per_min".into(), "user_id".into());
+        metric_to_item_label.insert("top_endpoint_qps".into(), "endpoint".into());
+        metric_to_item_label.insert("endpoint_request_freq".into(), "endpoint".into());
+
         EdgeStageConfig {
             source_metric: None,
             label_filters: Vec::new(),
@@ -5562,6 +5639,7 @@ mod tests {
             ),
             cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label,
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         }
@@ -5751,12 +5829,34 @@ mod tests {
             Some("endpoint"),
             "CountSketch family must emit item_label: endpoint (the heap item dim)\n{yaml}"
         );
-        // The Count-Min family (no heap) must NOT carry the heap keys.
+        // The Count-Min family (no heap) must NOT carry the heap-only keys
+        // (emit_heap / heap_size) but MUST carry item_label so its inner
+        // dimension (`endpoint`) is folded into the sketch instead of the
+        // series key.
         assert!(
-            cms.get("emit_heap").is_none()
-                && cms.get("heap_size").is_none()
-                && cms.get("item_label").is_none(),
-            "Count-Min (no heap) must NOT carry the CountSketch heap keys\n{yaml}"
+            cms.get("emit_heap").is_none() && cms.get("heap_size").is_none(),
+            "Count-Min (no heap) must NOT carry the CountSketch heap-only keys\n{yaml}"
+        );
+        assert_eq!(
+            cms.get("item_label").and_then(|v| v.as_str()),
+            Some("endpoint"),
+            "Count-Min family must emit item_label: endpoint (its inner dimension)\n{yaml}"
+        );
+        // The HLL family must carry item_label (its distinct-count dimension,
+        // `user_id`) but NONE of the CountSketch heap-only keys.
+        assert_eq!(
+            hll.get("item_label").and_then(|v| v.as_str()),
+            Some("user_id"),
+            "HLL family must emit item_label: user_id (its distinct-count dimension)\n{yaml}"
+        );
+        assert!(
+            hll.get("emit_heap").is_none() && hll.get("heap_size").is_none(),
+            "HLL must NOT carry the CountSketch heap-only keys\n{yaml}"
+        );
+        // DDSketch / KLL have no inner item dimension → no item_label.
+        assert!(
+            dd.get("item_label").is_none() && kll.get("item_label").is_none(),
+            "DDSketch / KLL must NOT carry item_label (no inner item dimension)\n{yaml}"
         );
 
         // tier=warm: the five sketch-only metrics are NOT in
@@ -5991,6 +6091,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };

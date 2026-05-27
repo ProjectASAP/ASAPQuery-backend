@@ -466,6 +466,58 @@ pub fn collect_metric_to_sample_p(
     out
 }
 
+/// Sibling of [`collect_metric_to_sample_p`]: walk every registry entry and
+/// return a map from metric name → its declarative **inner item dimension**
+/// (`WorkloadEntry::item_label`) that the L5 edge emitter drops into
+/// [`crate::physical::colored_dag::emitter::EdgeStageConfig::metric_to_item_label`].
+///
+/// `item_label` is the data-point attribute whose VALUE is the "item" the
+/// item-counting sketch families (HLL / CountSketch / CountMinSketch) count
+/// or rank — e.g. `user_id` for `unique_users_per_min` (HLL), `endpoint`
+/// for `top_endpoint_qps` (CountSketch) and `endpoint_request_freq` (CMS).
+/// The emitter writes it onto the per-metric sketch entry as `item_label`
+/// so the agent folds that high-cardinality attribute INTO the sketch
+/// instead of leaving it in the sketch's series key (one cardinality-1 HLL
+/// per `user_id` rather than one HLL per zone).
+///
+/// Only metrics whose workload declares a non-empty `item_label` are
+/// included; a metric that omits it (or sets it empty) is skipped, so the
+/// map stays empty for workloads that declare no inner dimension and the
+/// emitted config is byte-identical to before (the CountSketch family still
+/// falls back to its metric-name convention in that case).
+///
+/// As with the sibling collectors, an entry is only honoured when its
+/// metric was successfully pre-populated into the workload store. When a
+/// metric carries multiple roles the FIRST registered entry's `item_label`
+/// wins (in practice all share it, since the field lives on the
+/// `WorkloadEntry`).
+pub fn collect_metric_to_item_label(
+    registry: &WorkloadRegistry,
+    workload_store: &WorkloadStore,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for entry in registry.entries() {
+        if workload_store
+            .get_all_for_metric(&entry.metric_name)
+            .into_iter()
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        let Some(label) = entry.item_label.as_deref() else {
+            continue;
+        };
+        let label = label.trim();
+        if label.is_empty() {
+            continue;
+        }
+        out.entry(entry.metric_name.clone())
+            .or_insert_with(|| label.to_string());
+    }
+    out
+}
+
 /// Issue #298 — sibling of [`collect_metric_to_family`] /
 /// [`collect_metric_to_grouping_labels`]: walk every registry entry and
 /// return the deduped list of metrics whose workload(s) classify as
@@ -586,6 +638,7 @@ mod runtime_tests {
                 cold_ship_endpoint: Some(default_cold_ship_endpoint()),
                 cold_external_labels: Vec::new(),
                 metric_to_sample_p: std::collections::HashMap::new(),
+                metric_to_item_label: std::collections::HashMap::new(),
                 cold_format: ColdFormat::default(),
                 cold_coldpart_endpoint: None,
             }
@@ -653,6 +706,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };
@@ -693,6 +747,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };
@@ -731,6 +786,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };
@@ -886,6 +942,49 @@ mod runtime_tests {
             5,
             "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}"
         );
+    }
+
+    #[test]
+    fn collect_metric_to_item_label_reads_workload_inner_dimension() {
+        // Mirrors deploy/configs/mvp-workload.yaml's item-counting entries:
+        // the HLL/CountSketch/CMS metrics declare an `item_label` (their
+        // inner high-cardinality data-point attribute); the quantile metrics
+        // declare none. The collector must surface exactly the declared
+        // labels and skip metrics without one (byte-identical emit otherwise).
+        let yaml = r#"
+- metric_name: http_requests_total_latency_ms
+  query_string: "quantile_over_time(0.99, http_requests_total_latency_ms[30s])"
+  sketch_family_override: KLL
+- metric_name: unique_users_per_min
+  query_string: "count(unique_users_per_min)"
+  grouping_labels: [zone]
+  sketch_family_override: HLL
+  item_label: user_id
+- metric_name: top_endpoint_qps
+  query_string: "topk(5, top_endpoint_qps)"
+  grouping_labels: [zone]
+  sketch_family_override: CountSketch
+  item_label: endpoint
+- metric_name: endpoint_request_freq
+  query_string: "rate(endpoint_request_freq[5m])"
+  grouping_labels: [zone]
+  sketch_family_override: CountMinSketch
+  item_label: endpoint
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        let map = collect_metric_to_item_label(&registry, &store);
+
+        assert_eq!(map.get("unique_users_per_min").map(String::as_str), Some("user_id"));
+        assert_eq!(map.get("top_endpoint_qps").map(String::as_str), Some("endpoint"));
+        assert_eq!(map.get("endpoint_request_freq").map(String::as_str), Some("endpoint"));
+        // The quantile metric declares no inner dimension → absent.
+        assert!(!map.contains_key("http_requests_total_latency_ms"));
+        assert_eq!(map.len(), 3, "only the item-counting metrics carry item_label: {map:?}");
     }
 
     /// ASAPCollector#400 — SET semantics at the resolution layer: a
@@ -1072,6 +1171,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };

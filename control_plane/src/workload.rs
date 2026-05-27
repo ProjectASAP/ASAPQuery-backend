@@ -236,6 +236,34 @@ pub struct WorkloadEntry {
     /// sketch-processor block (`sample_p`) only when `< 1.0`.
     #[serde(default = "default_sample_p")]
     pub sample_p: f64,
+    /// Optional **inner high-cardinality dimension** for the item-counting
+    /// sketch families (HLL / CountSketch / CountMinSketch): the data-point
+    /// attribute whose VALUE is the "item" the sketch counts/ranks, as
+    /// opposed to a [`grouping_labels`](Self::grouping_labels) key that
+    /// splits the sketch into per-group series.
+    ///
+    /// Why this is a separate declarative field (not derivable from the
+    /// metric name or `query_string`): the inner dimension is a producer
+    /// data-point attribute name (`user_id` for the HLL metric
+    /// `unique_users_per_min`, `endpoint` for the CountSketch metric
+    /// `top_endpoint_qps` and the Count-Min metric `endpoint_request_freq`).
+    /// Neither the metric NAME nor the PromQL carries it — `count(...)` /
+    /// `topk(...)` / `rate(...)` name no attribute. Without a declarative
+    /// field the high-cardinality inner attribute stays in the sketch's
+    /// series key (one cardinality-1 HLL per `user_id` instead of one HLL
+    /// per zone), so the HLL/CMS warm queries return semantically wrong /
+    /// empty results.
+    ///
+    /// Threaded into `EdgeStageConfig::metric_to_item_label` by the registry
+    /// pre-pop loop in `main` (and the replan companion stitch), which the
+    /// L5 edge emitter reads in `emit_edge_yaml_asap_edge` and writes onto
+    /// the per-metric sketch entry as `item_label`. For CountSketch the
+    /// emitter falls back to the metric-name convention
+    /// (`countsketch_item_label_for`) when this field is unset, preserving
+    /// the prior behaviour. `None` / missing ⇒ no `item_label` is emitted
+    /// for HLL/CMS (backward-compatible).
+    #[serde(default)]
+    pub item_label: Option<String>,
 }
 
 fn default_accuracy_sla() -> f64 {
@@ -391,6 +419,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    item_label: None,
                 },
                 WorkloadEntry {
                     metric_name: "b".into(),
@@ -401,6 +430,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    item_label: None,
                 },
                 WorkloadEntry {
                     metric_name: "c".into(),
@@ -411,6 +441,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    item_label: None,
                 },
             ],
         };
@@ -440,6 +471,32 @@ mod tests {
         assert!((entries[1].sample_p - 0.25).abs() < 1e-12);
         // Unset ⇒ default 1.0 (sampling disabled / byte-identical).
         assert!((entries[2].sample_p - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn deserialize_item_label_default_and_explicit() {
+        // item_label is optional (None by default) and round-trips when
+        // declared. It names the inner high-cardinality data-point
+        // attribute the HLL/CountSketch/CMS family counts or ranks
+        // (e.g. user_id / endpoint), as opposed to a grouping_labels key.
+        let yaml = r#"
+- metric_name: unique_users_per_min
+  sketch_family_override: HLL
+  grouping_labels: [zone]
+  item_label: user_id
+- metric_name: endpoint_request_freq
+  sketch_family_override: CountMinSketch
+  grouping_labels: [zone]
+  item_label: endpoint
+- metric_name: http_requests_total_latency_ms
+  sketch_family_override: KLL
+"#;
+        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].item_label.as_deref(), Some("user_id"));
+        assert_eq!(entries[1].item_label.as_deref(), Some("endpoint"));
+        // Unset ⇒ None (no inner item dimension; byte-identical to before).
+        assert_eq!(entries[2].item_label, None);
     }
 
     #[test]
@@ -493,6 +550,7 @@ mod tests {
             target_path: None,
             grouping_labels: vec![],
             sample_p: 1.0,
+            item_label: None,
         }
     }
 

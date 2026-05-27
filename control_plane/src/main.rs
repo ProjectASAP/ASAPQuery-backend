@@ -617,6 +617,8 @@ async fn handle_plan(
             grouping_labels: workload.group_by_labels.clone(),
             // Role derivation does not depend on sampling; default 1.0.
             sample_p: 1.0,
+            // Role derivation does not depend on the inner item dimension.
+            item_label: None,
         };
         control_plane::workload::derive_agg_role(&entry)
     };
@@ -1288,6 +1290,18 @@ async fn emit_bootstrap_typed(
     // CMS / HLL sketch-processor block. Empty when nothing is sampled
     // (the default) ⇒ byte-identical agent config.
     edge_cfg.metric_to_sample_p = emit::collect_metric_to_sample_p(
+        &st.workload_registry,
+        &st.workload_store,
+    );
+    // Per-metric inner item dimension — companion stitch: maps each metric
+    // whose workload declares an `item_label` (the high-cardinality
+    // data-point attribute the HLL/CountSketch/CMS family counts or ranks,
+    // e.g. `user_id` / `endpoint`) to that attribute name, so the fused
+    // `asap_edge` emitter writes an `item_label` onto the metric's sketch
+    // entry. Without it the inner attribute lands in the sketch's series key
+    // (one cardinality-1 HLL per value instead of one per zone). Empty when
+    // no metric declares one ⇒ byte-identical agent config.
+    edge_cfg.metric_to_item_label = emit::collect_metric_to_item_label(
         &st.workload_registry,
         &st.workload_store,
     );

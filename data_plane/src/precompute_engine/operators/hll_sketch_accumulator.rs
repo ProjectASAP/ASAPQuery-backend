@@ -16,6 +16,64 @@ use asap_sketchlib::{HllSketch, HllVariant, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Decode one protobuf base-128 varint (LEB128) from the front of `buf`.
+/// Returns `(value, bytes_consumed)`, or `None` if the buffer is truncated
+/// or the varint overflows u64.
+pub(crate) fn read_uvarint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if shift >= 64 {
+            return None;
+        }
+        result |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some((result, i + 1));
+        }
+        shift += 7;
+    }
+    None
+}
+
+/// Expand sketchlib-go's sparse HLL register encoding
+/// (`HLLSparseRegisters.packed`) into the dense `num_registers`-byte array.
+///
+/// Layout (sketchlib-go `proto/hll/hll.proto`): varint-packed
+/// `(index_delta, value)` pairs in ascending index order; `prev_index`
+/// starts at 0, so each register's absolute index is the running sum of the
+/// deltas. Mirrors the Go encoder in `sketches/HLL/sparse.go`
+/// (`encodeSparseRegisters`). The reconstructed array is byte-identical to
+/// the dense `registers` field a high-cardinality producer would have sent.
+pub(crate) fn expand_sparse_hll_registers(
+    packed: &[u8],
+    num_registers: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut regs = vec![0u8; num_registers];
+    let mut prev: u64 = 0;
+    let mut pos = 0usize;
+    while pos < packed.len() {
+        let (delta, n1) = read_uvarint(&packed[pos..])
+            .ok_or("HLLSparseRegisters.packed: truncated index_delta varint")?;
+        pos += n1;
+        let (value, n2) = read_uvarint(&packed[pos..])
+            .ok_or("HLLSparseRegisters.packed: truncated value varint")?;
+        pos += n2;
+        let idx = prev + delta;
+        let i = usize::try_from(idx)
+            .map_err(|_| format!("HLLSparseRegisters: index {idx} overflows usize"))?;
+        if i >= num_registers {
+            return Err(format!(
+                "HLLSparseRegisters: register index {i} >= num_registers {num_registers}"
+            )
+            .into());
+        }
+        regs[i] = u8::try_from(value)
+            .map_err(|_| format!("HLLSparseRegisters: register value {value} > 255"))?;
+        prev = idx;
+    }
+    Ok(regs)
+}
+
 /// HLL accumulator — inner register array + variant metadata.
 #[derive(Debug, Clone)]
 pub struct HllSketchAccumulator {
@@ -82,14 +140,32 @@ impl HllSketchAccumulator {
             .into());
         }
         let expected_len = 1usize << state.precision;
-        if state.registers.len() != expected_len {
+        // Register resolution. sketchlib-go emits the SPARSE
+        // `registers_sparse` (proto tag 7) form below its dense/sparse
+        // crossover (~6000 non-zero registers — see
+        // sketchlib-go/sketches/HLL/sparse.go); low-cardinality producers
+        // (the common case) therefore leave the dense `registers` (tag 3)
+        // field empty. The proto contract (hll.proto) is: read whichever of
+        // `registers` / `registers_sparse` is present; if both are empty the
+        // sketch is all-zero. Reconstruct the dense 2^precision array in all
+        // three cases so the inner `HllSketch` always gets a full register
+        // vector.
+        let dense_registers: Vec<u8> = if state.registers.len() == expected_len {
+            state.registers.clone()
+        } else if !state.registers.is_empty() {
+            // A non-empty dense field of the wrong length is a malformed frame.
             return Err(format!(
                 "HyperLogLogState registers has {} bytes, expected 2^precision = {}",
                 state.registers.len(),
                 expected_len
             )
             .into());
-        }
+        } else if let Some(sparse) = state.registers_sparse.as_ref() {
+            expand_sparse_hll_registers(&sparse.packed, expected_len)?
+        } else {
+            // Neither representation populated → all-zero register array.
+            vec![0u8; expected_len]
+        };
         let proto_variant = ProtoVariant::try_from(state.variant)
             .map_err(|_| format!("HyperLogLogState has unknown variant tag {}", state.variant))?;
         let variant = match proto_variant {
@@ -101,7 +177,7 @@ impl HllSketchAccumulator {
         let inner = HllSketch::from_raw(
             variant,
             state.precision,
-            state.registers.clone(),
+            dense_registers,
             state.hip_kxq0,
             state.hip_kxq1,
             state.hip_est,

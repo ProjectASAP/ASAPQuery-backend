@@ -241,6 +241,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                item_label: None,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -251,6 +252,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                item_label: None,
             },
             WorkloadEntry {
                 metric_name: "http_requests_total".into(),
@@ -261,6 +263,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                item_label: None,
             },
         ];
 
