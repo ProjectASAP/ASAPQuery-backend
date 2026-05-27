@@ -1908,21 +1908,27 @@ fn emit_edge_yaml_asap_edge(
                         SketchKind::CountSketch => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
                             e.insert("cols".into(), Value::Number(2048u64.into()));
-                            // P1-4: NO enumerated processor → the planner did
-                            // not bind a CountSketch heap for this metric, so
-                            // we must NOT assume top-k. Defaulting `with_heap`
-                            // to `true` here emitted `emit_heap: true` + a
-                            // guessed `item_label` for a plain
-                            // `FrequencyEstimate` plan, registering a
-                            // `FrequencyTopk` sid that a frequency/count query
-                            // can't satisfy (capability mismatch → archive
-                            // fallback / "No result"). The heap is emitted
-                            // ONLY when a bound `EdgeSketchProcessor` carries
-                            // `with_heap = true` (the
-                            // `Some(SketchParams::CountSketch)` arm above sets
-                            // it from the planner's decision). Absent that,
-                            // keep it OFF.
-                            countsketch_with_heap = false;
+                            // P1-4: NO enumerated EdgeSketchProcessor for this
+                            // metric, so we can't read the planner's `with_heap`
+                            // from `sketch_params` here. We must NOT blanket-
+                            // default `with_heap = true` (that emitted a heap +
+                            // guessed item_label for a plain `FrequencyEstimate`
+                            // CountSketch, registering a `FrequencyTopk` sid a
+                            // frequency/count query can't satisfy). But blanket-
+                            // FALSE wrongly drops the heap for an actual top-k
+                            // CountSketch that simply wasn't enumerated as a
+                            // processor (the backend streaming-config still
+                            // registers it `with_heap`, so the agent must emit
+                            // the heap or the warm `topk(...)` capability-misses
+                            // to archive). The reliable signal available here is
+                            // the metric's `item_label`: a CountSketch carrying a
+                            // heavy-hitter dimension (item_label, set by the
+                            // top-k binding / workload) IS a top-k sketch and
+                            // needs the heap; a plain frequency CountSketch has
+                            // none → no heap. This keeps the agent emit in lock-
+                            // step with the backend `with_heap` registration.
+                            countsketch_with_heap =
+                                cfg.metric_to_item_label.contains_key(*metric);
                         }
                         SketchKind::Cms => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
