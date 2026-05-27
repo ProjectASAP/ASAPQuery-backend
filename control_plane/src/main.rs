@@ -463,6 +463,22 @@ async fn main() {
             .unwrap_or(300u64), // re-check plan expiry every 5 minutes
     );
 
+    // P0-1: bounded low-frequency full re-POST of the cumulative backend
+    // streaming-config + storage-routing. The data_plane backend is a plain
+    // HTTP POST receiver (not an OpAMP agent), so its restart fires none of
+    // the controller's re-push triggers; without this periodic idempotent
+    // refresh a backend that restarted runs without the cumulative config
+    // (only the static startup DDSketch shape) until a plan expires, so a
+    // `sum by (zone) (…)` / Sum / ExactAgg query capability-misses to
+    // archive. Default 60s: one coupled POST/minute that the data plane
+    // no-ops when its config already matches.
+    let backend_repost_interval = Duration::from_secs(
+        std::env::var("CONTROLLER_BACKEND_REPOST_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60u64),
+    );
+
     let runtime_samples_store = runtime_samples::RuntimeSamplesStore::new(1024);
     let state = AppState {
         analyzer:          Arc::new(Analyzer::new()),
@@ -483,6 +499,11 @@ async fn main() {
     // ── Background tasks ──────────────────────────────────────────────────────
     tokio::spawn(Arc::clone(&scraper).run());
     tokio::spawn(Arc::clone(&replanner).run_expiry_ticker(replan_interval));
+    // P0-1: periodic idempotent full re-POST so a silent backend restart can't
+    // leave the cumulative streaming-config missing until a plan expires.
+    tokio::spawn(
+        Arc::clone(&replanner).run_backend_repost_ticker(backend_repost_interval),
+    );
 
     // ── OpAMP WebSocket listener ──────────────────────────────────────────────
     let opamp_router = Router::new()

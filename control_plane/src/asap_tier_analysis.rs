@@ -51,7 +51,7 @@ use promql_parser::parser::{self, Expr, VectorSelector};
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::QueryExpr;
-use crate::query_parser::{parse_query, parse_query_expr_canonical};
+use crate::query_parser::{parse_query_expr_canonical, parsed_query_from_canonical};
 
 pub use crate::sketch_algebra::capability::{
     capability_for, Capability, OuterAgg, OuterFn, SketchKindHandle,
@@ -161,32 +161,30 @@ pub enum UnsupportedReason {
 /// mean; this function just consumes the lowered `AggIntent`s and
 /// dispatches via [`capability_for`].
 pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
-    // Step 1: parse via the control plane's existing PromQL → ParsedQuery
-    // chain. `parse_query` already understands the full PromQL surface
-    // we care about.
-    let parsed = match parse_query(metricsql) {
-        Ok(p) => p,
-        Err(e) => {
-            return ASAPTierAnalysis {
-                candidates: Vec::new(),
-                unsupported: Some(UnsupportedReason::UnparseableMetricsql(e.to_string())),
-            };
-        }
-    };
+    // P2-1: parse ONCE per representation, not three times.
+    //
+    // Two genuinely-distinct parses are unavoidable here:
+    //   (a) the raw `promql_parser` AST — needed by `trace_from_promql`
+    //       to recover the function-name string / scalar args /
+    //       range-seconds / outer-fn / outer-agg that the lowered
+    //       `AggIntent` does not carry. This is the ONLY place that
+    //       touches raw PromQL function names.
+    //   (b) the canonical L3 `QueryExpr` — the lowered tree the analysis
+    //       walks for `AggIntent`s.
+    //
+    // Previously the function ALSO called `parse_query(metricsql)`, which
+    // re-ran the *same* PromQL → legacy → canonical pipeline as (b) a
+    // second time just to obtain the flat `ParsedQuery` summary. We now
+    // derive that summary from the SAME canonical tree (b) via
+    // `parsed_query_from_canonical`, collapsing three parses to two.
 
-    // Capture the function-name string + scalar args + range_seconds for
-    // telemetry. These come from a side-channel walk of the AST — the
-    // lowered `AggIntent` doesn't carry them. We use the same
-    // `promql_parser` AST that `query_parser::promql` already parses
-    // internally; this is the ONLY remaining place that touches raw
-    // PromQL function names.
+    // Step 1: parse the raw AST once and build the trace from it. The
+    // walker tolerates a parse failure (returns a default trace); the
+    // canonical parse below is the authoritative parse-error gate.
     let trace = trace_from_promql(metricsql);
 
-    // Step 2: lower to the canonical L3 `QueryExpr` via the real parse
-    // path. `parse_query` (above) already ran this conversion internally
-    // to build its flat summary; we re-run it here to get the *tree*
-    // itself, which the flat `ParsedQuery` doesn't carry. The walk below
-    // only inspects `AggIntent` kinds + accuracy; the converter pins
+    // Step 2: lower to the canonical L3 `QueryExpr`. The walk below only
+    // inspects `AggIntent` kinds + accuracy; the converter pins
     // sketch-eligible intents at a non-exact epsilon, which is all
     // warm-tier analysis needs (the real per-query accuracy bound comes
     // from QueryWorkload further downstream).
@@ -199,6 +197,11 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
             };
         }
     };
+
+    // Derive the flat `ParsedQuery` summary from the SAME canonical tree —
+    // identical to what `parse_query(metricsql)` would return, but without
+    // re-parsing.
+    let parsed = parsed_query_from_canonical(&expr);
 
     // Step 3: walk the lowered tree, looking for `Aggregate` nodes.
     // If there's no Aggregate the query is either:
@@ -795,6 +798,59 @@ mod tests {
 
     fn keys(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── P2-1: parse-once equivalence ─────────────────────────────────────
+
+    /// The parse-once refactor derives the flat `ParsedQuery` summary from
+    /// the SAME canonical tree the analysis walks, instead of re-running
+    /// `parse_query`. This pins that the derived summary is byte-for-byte
+    /// identical to the standalone `parse_query` path it replaced — across
+    /// the full shape catalogue the analyzer cares about (the
+    /// `metric_name`, `group_by_labels`, `label_filters`, `time_window`,
+    /// `exact_required`, `quantiles`, `aggregations` the rest of
+    /// `analyze_promql_for_asap_tier` reads off `parsed`).
+    #[test]
+    fn parse_once_matches_parse_query_for_all_shapes() {
+        use crate::query_parser::parse_query;
+        let queries = [
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+            "sum by (zone) (http_requests_total)",
+            "rate(http_requests_total[5m])",
+            "count(unique_users_per_min)",
+            "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))",
+            "max by (zone) (quantile_over_time(0.99, latency[5m]))",
+            "avg_over_time(cpu_seconds_total[10m])",
+            "increase(errors_total[2m])",
+        ];
+        for q in queries {
+            let canonical = parse_query_expr_canonical(q).unwrap_or_else(|e| {
+                panic!("canonical parse failed for {q:?}: {e}")
+            });
+            let derived = parsed_query_from_canonical(&canonical);
+            let direct = parse_query(q)
+                .unwrap_or_else(|e| panic!("parse_query failed for {q:?}: {e}"));
+
+            assert_eq!(derived.metric_name, direct.metric_name, "metric_name for {q:?}");
+            assert_eq!(
+                derived.group_by_labels, direct.group_by_labels,
+                "group_by_labels for {q:?}"
+            );
+            assert_eq!(
+                derived.label_filters, direct.label_filters,
+                "label_filters for {q:?}"
+            );
+            assert_eq!(derived.time_window, direct.time_window, "time_window for {q:?}");
+            assert_eq!(
+                derived.exact_required, direct.exact_required,
+                "exact_required for {q:?}"
+            );
+            assert_eq!(derived.quantiles, direct.quantiles, "quantiles for {q:?}");
+            assert_eq!(
+                derived.aggregations, direct.aggregations,
+                "aggregations for {q:?}"
+            );
+        }
     }
 
     // ── Supported shapes ─────────────────────────────────────────────────

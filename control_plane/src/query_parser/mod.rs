@@ -126,6 +126,20 @@ pub fn parse_query(query: &str) -> anyhow::Result<ParsedQuery> {
     Ok(qe_to_parsed_query(&qe))
 }
 
+/// Extract a flat [`ParsedQuery`] from an ALREADY-parsed canonical
+/// [`QueryExpr`].
+///
+/// This is the parse-once seam (P2-1): callers that already hold a
+/// canonical tree (e.g. `asap_tier_analysis::analyze_promql_for_asap_tier`,
+/// which needs both the tree AND the flat summary) derive the
+/// [`ParsedQuery`] from it directly instead of re-running the full
+/// PromQL → legacy → canonical pipeline a second time. The output is
+/// byte-for-byte identical to `parse_query(src)` for the `src` that
+/// produced `qe`.
+pub(crate) fn parsed_query_from_canonical(qe: &QueryExpr) -> ParsedQuery {
+    qe_to_parsed_query(qe)
+}
+
 /// Extract a flat [`ParsedQuery`] by walking a canonical [`QueryExpr`] tree.
 ///
 /// Step γ7: the collector walks the canonical IR. `Aggregate` carries

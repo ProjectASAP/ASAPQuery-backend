@@ -25,7 +25,10 @@ pub mod telegraf;
 pub mod trait_def;
 
 pub use agent::generate_agent_collector_config;
-pub use backend_push::{post_typed_backend_for_role, BackendRoutingCache};
+pub use backend_push::{
+    post_typed_backend_for_role, repost_cumulative_backend_config, BackendRoutingCache,
+    PushOutcome,
+};
 pub use otap::emit_otap_dag_yaml;
 pub use precompute::{build_precompute_engine_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{

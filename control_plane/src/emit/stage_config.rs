@@ -54,10 +54,15 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::physical::colored_dag::emitter::{
     coldpart_endpoint_from_ship, default_cold_external_labels, default_cold_ship_endpoint,
-    AggregationInput, ArchiveTierMetric, BackendAggregation, BackendReadout, BackendStageConfig,
+    AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
     ColdFormat, EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor,
-    GatewayStageConfig, PrometheusArchiveMetric,
+    GatewayStageConfig,
 };
+// `ArchiveTierMetric` / `PrometheusArchiveMetric` are referenced ONLY by the
+// `#[cfg(test)]` module below (test fixtures construct edge configs with
+// archive-tier metric lists). Importing them at module scope produced an
+// unused-import warning on every non-test build, so they're scoped into the
+// test module's `use super::*` instead (P2-5).
 use crate::physical::colored_dag::stage_id::StageId;
 use crate::sketch_algebra::params::{SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::EstimateOp;
@@ -1903,12 +1908,27 @@ fn emit_edge_yaml_asap_edge(
                         SketchKind::CountSketch => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
                             e.insert("cols".into(), Value::Number(2048u64.into()));
-                            // No enumerated processor → no planner heap flag;
-                            // a TopK query that reaches here without a bound
-                            // processor still wants the heap (the fused
-                            // CountSketch family is only ever planned for
-                            // top-K in this workload), so default it on.
-                            countsketch_with_heap = true;
+                            // P1-4: NO enumerated EdgeSketchProcessor for this
+                            // metric, so we can't read the planner's `with_heap`
+                            // from `sketch_params` here. We must NOT blanket-
+                            // default `with_heap = true` (that emitted a heap +
+                            // guessed item_label for a plain `FrequencyEstimate`
+                            // CountSketch, registering a `FrequencyTopk` sid a
+                            // frequency/count query can't satisfy). But blanket-
+                            // FALSE wrongly drops the heap for an actual top-k
+                            // CountSketch that simply wasn't enumerated as a
+                            // processor (the backend streaming-config still
+                            // registers it `with_heap`, so the agent must emit
+                            // the heap or the warm `topk(...)` capability-misses
+                            // to archive). The reliable signal available here is
+                            // the metric's `item_label`: a CountSketch carrying a
+                            // heavy-hitter dimension (item_label, set by the
+                            // top-k binding / workload) IS a top-k sketch and
+                            // needs the heap; a plain frequency CountSketch has
+                            // none → no heap. This keeps the agent emit in lock-
+                            // step with the backend `with_heap` registration.
+                            countsketch_with_heap =
+                                cfg.metric_to_item_label.contains_key(*metric);
                         }
                         SketchKind::Cms => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
@@ -2437,6 +2457,42 @@ fn build_otlp_exporter(default_host: &str, target: &ExportTarget) -> (String, Va
 /// surface of `crate::config::agent::build_processor_block` but reads
 /// from the typed `EdgeSketchProcessor` + ambient `EdgeStageConfig`
 /// fields rather than the legacy `AgentCollectorConfig`.
+/// Compute the `(epsilon, delta)` pair the standalone `countsketchprocessor`
+/// must receive so its internal `configDimensions` re-derivation produces
+/// EXACTLY `cols == w` and `rows == d` — the same dimensions the fused
+/// asapedge path emits as `{rows, cols}` and the backend serialises as
+/// `{w, d}` in `sketch_params_to_json`.
+///
+/// The processor recomputes (see `countsketchprocessor/config_translate.go`):
+///   cols = nextPowerOfTwo(ceil(1 / epsilon^2))   (clamped to >= 2)
+///   rows = ceil(ln(1 / delta))                    (clamped to >= 1)
+///
+/// Inverting (with float-robust targets — see below):
+///   epsilon = 1/sqrt(w - 0.5) so 1/epsilon^2 == w - 0.5, whose ceil is `w`.
+///     Targeting the half-integer `w - 0.5` (rather than exactly `w`) keeps
+///     `ceil(1/epsilon^2)` pinned to `w` even after sqrt/square float error
+///     nudges the value a few ULPs in either direction. For any planner
+///     width `w >= 2`, `w - 0.5 > w/2`, so `nextPowerOfTwo(w) == w` whenever
+///     the planner sizes `w` as a power of two (it does), and otherwise
+///     rounds up to the next power of two consistently for both the agent
+///     and any width-derived fingerprint.
+///   delta = e^-(d - 0.5) so ln(1/delta) == d - 0.5, whose ceil is `d`. Same
+///     half-integer trick guards `ceil(ln(1/delta))` against float drift.
+///
+/// Returns `(epsilon, delta)`. Both are strictly in `(0, 1)` for `w >= 2`
+/// and `d >= 1` (the processor's `Config.Validate` requires that open
+/// interval), which the planner always satisfies.
+fn countsketch_epsilon_delta_for(w: u32, d: u32) -> (f64, f64) {
+    // Guard against degenerate planner output: a width of 0/1 or depth of 0
+    // would make the processor clamp anyway; pick the smallest legal sketch
+    // (w=2, d=1) so epsilon/delta stay inside the validator's open interval.
+    let w = w.max(2);
+    let d = d.max(1);
+    let epsilon = 1.0 / (w as f64 - 0.5).sqrt();
+    let delta = (-(d as f64 - 0.5)).exp();
+    (epsilon, delta)
+}
+
 fn build_edge_processor_block(
     sp: &EdgeSketchProcessor,
     window_secs: Option<u64>,
@@ -2524,11 +2580,27 @@ fn build_edge_processor_block(
             insert_sample_p(&mut m, sample_p);
         }
         SketchParams::CountSketch(p) => {
-            // Translate (w, d) to the legacy (epsilon, delta) surface
-            // that the patched countsketch processor's Config accepts —
-            // matches `crate::sketch_algebra::params::SketchParams::to_legacy`.
-            let epsilon = std::f64::consts::E / (p.w as f64);
-            let delta = 2f64.powi(-(p.d as i32));
+            // P1-3: the standalone `countsketchprocessor` Config exposes ONLY
+            // `epsilon` / `delta` (no `rows` / `cols` mapstructure keys), and
+            // it RE-DERIVES the sketch dimensions internally via
+            // `configDimensions`:
+            //   cols = nextPowerOfTwo(ceil(1 / epsilon^2))
+            //   rows = ceil(ln(1 / delta))
+            // The old `epsilon = e/w`, `delta = 2^-d` translation fed that
+            // formula a width of `nextPow2(ceil(w^2/e^2))` — wildly larger
+            // than `w` — so the agent's CountSketch width never matched the
+            // backend's `parameters["w"]` (= `p.w`, see `sketch_params_to_json`).
+            // A content-addressed PolicyFingerprint keys off that width, so
+            // the agent sketch never bound to the backend sid.
+            //
+            // We instead invert `configDimensions` so the processor's own
+            // formula reproduces EXACTLY `cols == p.w` and `rows == p.d`
+            // (matching the fused asapedge path's `{rows, cols}` and the
+            // backend JSON `{w, d}`):
+            //   epsilon = 1/sqrt(w)  ⇒ ceil(1/epsilon^2) = ceil(w) = w
+            //                          ⇒ nextPow2(w) = w   (w is a power of 2)
+            //   delta   = e^-d       ⇒ ceil(ln(1/delta)) = ceil(d) = d
+            let (epsilon, delta) = countsketch_epsilon_delta_for(p.w, p.d);
             m.insert("epsilon".into(), Value::Number(epsilon.into()));
             m.insert("delta".into(), Value::Number(delta.into()));
             m.insert("encoding".into(), Value::String("msgpack".into()));
@@ -2750,6 +2822,10 @@ fn sketch_params_to_json(p: &SketchParams) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // P2-5: these two emitter types are used only by the test fixtures in this
+    // module; gating them here keeps the non-test build free of the
+    // unused-import warning they previously triggered at module scope.
+    use crate::physical::colored_dag::emitter::{ArchiveTierMetric, PrometheusArchiveMetric};
     use crate::sketch_algebra::params::{
         CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams,
     };
@@ -6337,6 +6413,185 @@ mod tests {
         assert!(
             yaml.contains("connectors:") && !yaml.contains("asap_edge:"),
             "gate-off must keep the routing-connector shape\n{yaml}"
+        );
+    }
+
+    // ── P1-3: CountSketch param round-trip (routing path width == backend w) ──
+
+    /// Faithful Rust port of the standalone `countsketchprocessor`'s
+    /// `configDimensions` (config_translate.go) so the test can assert the
+    /// dimensions the agent would actually build from the emitted
+    /// `epsilon` / `delta`.
+    ///
+    ///   cols = nextPowerOfTwo(ceil(1 / epsilon^2))   (clamped to >= 2)
+    ///   rows = ceil(ln(1 / delta))                    (clamped to >= 1)
+    ///
+    /// (We don't replicate the `clampRowsForHashBits` budget clamp — the
+    /// test's representative params stay inside the 64-bit row-hash budget,
+    /// and the backend `w` we compare against is the WIDTH, which the row
+    /// clamp never touches.)
+    fn processor_config_dimensions(epsilon: f64, delta: f64) -> (u64, u64) {
+        let mut rows = (1.0 / delta).ln().ceil() as i64;
+        if rows < 1 {
+            rows = 1;
+        }
+        let mut cols = (1.0 / (epsilon * epsilon)).ceil() as i64;
+        if cols < 2 {
+            cols = 2;
+        }
+        let mut p: i64 = 1;
+        while p < cols {
+            p <<= 1;
+        }
+        (p as u64, rows as u64)
+    }
+
+    /// The routing path's emitted CountSketch `epsilon`/`delta` must make
+    /// the agent processor re-derive a width EXACTLY equal to the backend's
+    /// `parameters["w"]` (and depth equal to `d`). Before P1-3 the routing
+    /// path emitted `epsilon = e/w`, `delta = 2^-d`, which the processor
+    /// expanded to a width of `nextPow2(ceil(w^2/e^2))` — a different,
+    /// off-by-orders-of-magnitude width — so the content-addressed
+    /// PolicyFingerprint never matched and the agent sketch failed to bind
+    /// to its backend sid.
+    #[test]
+    fn countsketch_routing_path_width_matches_backend_w() {
+        // A range of representative widths/depths the planner emits. Widths
+        // are powers of two (the planner sizes them that way); the helper's
+        // half-integer targeting keeps the round-trip exact regardless.
+        for &(w, d) in &[(2048u32, 5u32), (1024, 4), (4096, 6), (2, 1), (256, 3)] {
+            let sp = EdgeSketchProcessor {
+                processor_name: "countsketch".into(),
+                sketch_kind: SketchKind::CountSketch,
+                sketch_params: SketchParams::CountSketch(CountSketchParams {
+                    w,
+                    d,
+                    with_heap: false,
+                }),
+                aggregation_id: "agg-cs".into(),
+            };
+            let block = build_edge_processor_block(&sp, Some(60), &[], Some("top_endpoint_qps"), None);
+            let map = block.as_mapping().expect("processor block is a mapping");
+
+            // The routing path no longer emits raw rows/cols — it emits the
+            // epsilon/delta the standalone processor accepts.
+            let epsilon = map
+                .get(Value::String("epsilon".into()))
+                .and_then(Value::as_f64)
+                .expect("epsilon present");
+            let delta = map
+                .get(Value::String("delta".into()))
+                .and_then(Value::as_f64)
+                .expect("delta present");
+
+            let (agent_cols, agent_rows) = processor_config_dimensions(epsilon, delta);
+
+            // Backend side: `sketch_params_to_json` serialises CountSketch
+            // params as `{ "w", "d", "with_heap" }`. The fingerprint keys off
+            // `parameters["w"]`, which must equal the agent-derived width.
+            let backend_json = sketch_params_to_json(&SketchParams::CountSketch(CountSketchParams {
+                w,
+                d,
+                with_heap: false,
+            }));
+            let backend_w = backend_json["w"].as_u64().expect("backend w present");
+            let backend_d = backend_json["d"].as_u64().expect("backend d present");
+
+            assert_eq!(
+                agent_cols, backend_w,
+                "agent CountSketch width (cols={agent_cols}) must equal backend parameters[\"w\"]={backend_w} for (w={w}, d={d})"
+            );
+            assert_eq!(
+                agent_rows, backend_d,
+                "agent CountSketch depth (rows={agent_rows}) must equal backend parameters[\"d\"]={backend_d} for (w={w}, d={d})"
+            );
+        }
+    }
+
+    // ── P1-4: unenumerated CountSketch must NOT default to a top-k heap ──────
+
+    /// Build a fused edge config that maps a CountSketch metric in
+    /// `metric_to_family` but provides NO matching `EdgeSketchProcessor`,
+    /// driving the fused emit into the catalog-default (`None`) arm.
+    fn fused_cfg_countsketch_no_processor() -> EdgeStageConfig {
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        // CountSketch family declared, but `sketch_processors` is EMPTY for
+        // it — the `family_to_proc.get(kind)` lookup returns None.
+        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::CountSketch));
+
+        EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: Vec::new(),
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
+        }
+    }
+
+    /// A CountSketch family mapped without an enumerated processor (a plain
+    /// `FrequencyEstimate` plan) must NOT emit the top-k heap keys. Before
+    /// P1-4 the catalog-default arm hardcoded `with_heap = true`, so the
+    /// fused YAML carried `emit_heap: true` + a guessed `item_label`,
+    /// registering a `FrequencyTopk` sid that a frequency/count query
+    /// can't match.
+    #[test]
+    fn fused_unenumerated_countsketch_omits_heap() {
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let cfg = fused_cfg_countsketch_no_processor();
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
+            .expect("fused emit ok");
+
+        // The CountSketch entry must still be present (cols/rows defaults)...
+        assert!(
+            yaml.contains("countsketch") || yaml.contains("count_sketch"),
+            "fused YAML should still carry the CountSketch family entry:\n{yaml}"
+        );
+        // ...but WITHOUT the heap keys that mark a FrequencyTopk plan.
+        assert!(
+            !yaml.contains("emit_heap"),
+            "unenumerated CountSketch (no bound heap) must not emit emit_heap:\n{yaml}"
+        );
+    }
+
+    /// Companion positive case: when the planner DID bind a CountSketch
+    /// processor with `with_heap = true` (an actual top-k plan), the fused
+    /// emit MUST carry `emit_heap: true`. This pins the heap-decision to the
+    /// planner's flag rather than a hardcoded default.
+    #[test]
+    fn fused_enumerated_countsketch_with_heap_emits_heap() {
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let mut cfg = fused_cfg_countsketch_no_processor();
+        cfg.metric_to_family.clear();
+        cfg.metric_to_family
+            .insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
+        cfg.sketch_processors = vec![EdgeSketchProcessor {
+            processor_name: "countsketch".into(),
+            sketch_kind: SketchKind::CountSketch,
+            sketch_params: SketchParams::CountSketch(CountSketchParams {
+                w: 2048,
+                d: 5,
+                with_heap: true,
+            }),
+            aggregation_id: "agg-cs".into(),
+        }];
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
+            .expect("fused emit ok");
+        assert!(
+            yaml.contains("emit_heap"),
+            "an enumerated CountSketch with with_heap=true must emit emit_heap:\n{yaml}"
         );
     }
 }

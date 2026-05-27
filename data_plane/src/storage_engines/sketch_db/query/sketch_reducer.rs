@@ -54,10 +54,6 @@ use std::sync::Arc;
 
 use asap_sketchlib::CountMinSketch;
 use asap_sketchlib::CountSketch;
-use asap_sketchlib::DdSketch;
-use asap_sketchlib::HllSketch;
-use asap_sketchlib::KllSketch;
-use asap_sketchlib::MessagePackCodec;
 
 use crate::storage_engines::sketch_db::query::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
@@ -347,7 +343,66 @@ impl<'a> SketchReducer<'a> {
             function_name,
             "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
         );
+        self.evaluate_core(sids, family, is_cumulative, function_name, function_args, t0_ms, t1_ms)
+    }
 
+    /// Typed-dispatch sister of [`Self::evaluate`] (P2-4). Picks the
+    /// [`QueryFamily`] directly from the analyzer's typed [`Capability`]
+    /// via [`Self::capability_to_family`] — NO round-trip through a
+    /// PromQL function-name string that the reducer then re-parses. The
+    /// engine calls this with the candidate's `required_capability`
+    /// instead of the `effective_sketch_function(candidate)` string
+    /// detour.
+    ///
+    /// `is_cumulative` is the only genuinely function-name-derived
+    /// signal (per-window vs `*_over_time` rollup), so the engine — which
+    /// knows the original outer function — passes it explicitly. The
+    /// string [`Self::evaluate`] entry is retained for legacy callers.
+    ///
+    /// Returns `UnsupportedCapability` for `Capability::ExactAgg(_)`
+    /// (served by the exact-agg dispatch path, not the sketch reducer)
+    /// so a stray ExactAgg fails over to archive rather than mis-routing.
+    pub fn evaluate_for_capability(
+        &self,
+        cap: &Capability,
+        sids: &[u64],
+        function_args: &[f64],
+        is_cumulative: bool,
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
+        let Some(family) = Self::capability_to_family(cap) else {
+            return Err(ASAPTierError::UnsupportedCapability {
+                function: "evaluate_for_capability".to_string(),
+                capability: cap.clone(),
+            });
+        };
+        // A stable label for the (rare) error paths, derived from the
+        // family rather than re-introducing a function-name string.
+        let function_label = match family {
+            QueryFamily::Quantile => "quantile",
+            QueryFamily::Cardinality => "cardinality_estimate",
+            QueryFamily::FrequencyTopk => "topk",
+            QueryFamily::FrequencyEstimate => "frequency",
+        };
+        self.evaluate_core(sids, family, is_cumulative, function_label, function_args, t0_ms, t1_ms)
+    }
+
+    /// Shared evaluation core for the string ([`Self::evaluate`]) and
+    /// typed ([`Self::evaluate_for_capability`]) entry points. `family`
+    /// + `is_cumulative` are already resolved by the caller;
+    /// `function_label` is used only for diagnostic error messages.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_core(
+        &self,
+        sids: &[u64],
+        family: QueryFamily,
+        is_cumulative: bool,
+        function_name: &str,
+        function_args: &[f64],
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
         // Per-(sid, label-values) → time-stamped scalar values.
         let mut out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = Vec::new();
         let mut metric_name_for_err = String::new();
@@ -1054,331 +1109,133 @@ impl<'a> SketchReducer<'a> {
         })
     }
 
-    /// Decode one window's sketch state and run the family-appropriate
-    /// reduction.
+    /// P1-1 — rate over a FrequencyEstimate (CMS / CountSketch) sid.
     ///
-    /// Retained as `#[allow(dead_code)]` after the delta-stitching
-    /// follow-up moved the per-window decode-then-evaluate flow into
-    /// [`super::delta_apply`]. Callers that want a one-shot evaluate
-    /// without delta-state plumbing can still reach this entry point;
-    /// the ASAP-tier reducer's main loop now goes through
-    /// [`per_window_evaluate`] / [`cumulative_evaluate`].
-    #[allow(dead_code)]
-    fn evaluate_one_state(
+    /// `rate(cms_metric[r])` lowers to `ExactAgg(Sum)+rate`, but the MVP
+    /// demo registers CMS sids as `FrequencyEstimate`, not `ExactAgg`.
+    /// When no ExactAgg sid matches the metric but a FrequencyEstimate
+    /// sid does, the engine falls back here. We decode each window's
+    /// per-window frequency total (the same `decode_frequency_total`
+    /// summary the `count_over_time` path uses — sum of all items'
+    /// inserts in that window), sum the totals across `[t0,t1]` per
+    /// series, and divide by the coverage-clamped range to produce a
+    /// per-second rate. This mirrors `evaluate_exact_agg_rate` but
+    /// decodes via the frequency sketch rather than an accumulator.
+    ///
+    /// Caller invariant: every sid in `sids` classified as `Hit` with a
+    /// `FrequencyEstimate` (or heap-bearing `FrequencyTopk`) capability.
+    pub fn evaluate_frequency_rate(
         &self,
-        sid: u64,
-        family: QueryFamily,
-        sketch_kind: SketchKindHandle,
-        function_args: &[f64],
-        state: &SketchSampleState,
-    ) -> Result<f64, ASAPTierError> {
-        match family {
-            QueryFamily::Quantile => {
-                let q = function_args
-                    .first()
-                    .copied()
-                    .filter(|q| (0.0..=1.0).contains(q))
-                    .unwrap_or(0.99);
-                self.evaluate_quantile(sid, sketch_kind, q, state)
-            }
-            QueryFamily::Cardinality => self.evaluate_cardinality(sid, sketch_kind, state),
-            QueryFamily::FrequencyTopk => {
-                // Top-k materialization is handled in-line by the main
-                // `evaluate` loop via `decode_cms_with_heap_from_msgpack`;
-                // this legacy one-shot entry never participates in the
-                // top-k path. Surface as `UnsupportedCapability` so a
-                // stray caller falls over to archive.
-                Err(ASAPTierError::UnsupportedCapability {
-                    function: "topk".to_string(),
-                    capability: Capability::FrequencyTopk(sketch_kind),
-                })
-            }
-            QueryFamily::FrequencyEstimate => {
-                // Bare frequency point query — handled in-line by the
-                // main `evaluate` loop via `decode_frequency_total`.
-                // This legacy one-shot entry doesn't drive the
-                // FrequencyEstimate path; surface as a defensive
-                // `UnsupportedCapability` so a stray caller falls over
-                // to archive rather than silently misroutes.
-                Err(ASAPTierError::UnsupportedCapability {
-                    function: "frequency".to_string(),
-                    capability: Capability::FrequencyEstimate(sketch_kind),
-                })
-            }
+        sids: &[u64],
+        range_seconds: u64,
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
+        if range_seconds == 0 {
+            return Err(ASAPTierError::UnsupportedCapability {
+                function: "frequency_rate_with_zero_range".to_string(),
+                capability: Capability::FrequencyEstimate(SketchKindHandle::CountMin),
+            });
         }
-    }
 
-    #[allow(dead_code)]
-    fn evaluate_quantile(
-        &self,
-        sid: u64,
-        sketch_kind: SketchKindHandle,
-        q: f64,
-        state: &SketchSampleState,
-    ) -> Result<f64, ASAPTierError> {
-        match sketch_kind {
-            SketchKindHandle::DDSketch => {
-                let sk = decode_ddsketch(sid, state)?;
-                Ok(sk.quantile(q).unwrap_or(0.0))
-            }
-            SketchKindHandle::Kll => {
-                let sk = decode_kll(sid, state)?;
-                Ok(sk.quantile(q))
-            }
-            other => Err(ASAPTierError::UnsupportedCapability {
-                function: "quantile".to_string(),
-                capability: Capability::QuantileApprox(other),
-            }),
-        }
-    }
+        // Sum the per-window frequency totals per series (label values),
+        // tracking the covered window span for the coverage-aware divisor
+        // (same clamp policy as `evaluate_exact_agg_rate`).
+        let mut by_series: BTreeMap<BTreeMap<String, String>, f64> = BTreeMap::new();
+        let mut span_lo: u64 = u64::MAX;
+        let mut span_hi: u64 = 0;
+        let mut metric_name_for_err = String::new();
+        let mut cov_lo: u64 = u64::MAX;
+        let mut cov_hi: u64 = 0;
+        let mut any_window = false;
 
-    #[allow(dead_code)]
-    fn evaluate_cardinality(
-        &self,
-        sid: u64,
-        sketch_kind: SketchKindHandle,
-        state: &SketchSampleState,
-    ) -> Result<f64, ASAPTierError> {
-        match sketch_kind {
-            SketchKindHandle::Hll => {
-                let sk = decode_hll(sid, state)?;
-                Ok(sk.estimate())
+        for &sid in sids {
+            let meta = match self.index.instance(sid) {
+                Some(m) => m,
+                None => continue,
+            };
+            metric_name_for_err = meta.metric_name.clone();
+            let sketch_kind = meta.sketch_kind().ok_or_else(|| {
+                ASAPTierError::UnsupportedCapability {
+                    function: "frequency_rate".to_string(),
+                    capability: meta
+                        .capability
+                        .clone()
+                        .unwrap_or(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+                }
+            })?;
+
+            let series_list = self.index.query_range(sid, t0_ms, t1_ms);
+            for ts in series_list {
+                let entry = by_series.entry(ts.series_label_values).or_insert(0.0);
+                for (w_end, state) in ts.samples.iter() {
+                    any_window = true;
+                    let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
+                    cov_lo = cov_lo.min(w);
+                    cov_hi = cov_hi.max(w);
+                    span_lo = span_lo.min(w);
+                    span_hi = span_hi.max(w);
+                    let total = decode_frequency_total(sid, sketch_kind, state)?;
+                    *entry += total;
+                }
             }
-            other => Err(ASAPTierError::UnsupportedCapability {
-                function: "cardinality".to_string(),
-                capability: Capability::QuantileApprox(other),
-            }),
         }
+
+        if !any_window {
+            return Err(ASAPTierError::NoData {
+                metric_name: metric_name_for_err,
+            });
+        }
+
+        let coverage_seconds: u64 = if span_lo <= span_hi {
+            span_hi.saturating_sub(span_lo) / 1000
+        } else {
+            range_seconds
+        };
+        let divisor = range_seconds.min(coverage_seconds).max(1) as f64;
+
+        let sample_ts = if t1_ms <= i64::MAX as u64 {
+            t1_ms as i64
+        } else {
+            i64::MAX
+        };
+        let out_series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)> = by_series
+            .into_iter()
+            .map(|(labels, sum)| (labels, vec![(sample_ts, sum / divisor)]))
+            .collect();
+
+        let coverage = if cov_lo <= cov_hi {
+            Some((cov_lo, cov_hi))
+        } else {
+            None
+        };
+        Ok(ASAPTierResult {
+            series: out_series,
+            coverage,
+        })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Per-sketch-kind decoders. Mirror the precompute_operators/*.rs paths so the
-// behavior matches what the precompute (ingest-side) accumulator would have
-// done for the same bytes — including which encodings round-trip and which
-// surface as decode failure.
+// Per-sketch-kind decoders.
+//
+// P2-3 / P2-4: the dead one-shot decode chain
+// (`evaluate_one_state` → `evaluate_quantile` / `evaluate_cardinality` →
+// `decode_ddsketch` / `decode_kll` / `decode_hll` →
+// `*_from_sketchlib_proto_bytes`) was DELETED. It had no live caller (the
+// ASAP-tier reducer's main loop goes through `delta_apply`'s
+// `per_window_evaluate` / `cumulative_evaluate`), and its private
+// `HllSketch_from_sketchlib_proto_bytes` had drifted — it hard-rejected
+// the SPARSE `registers_sparse` HLL frame that the live decoders now
+// expand. There is now exactly ONE decoder per family:
+//   * DDSketch / KLL / HLL: `delta_apply`'s `dd_from_proto` /
+//     `kll_from_proto` / `hll_from_proto`, which delegate to the
+//     `precompute_engine::operators::*_accumulator::from_sketchlib_proto_bytes`
+//     single source of truth (so the sparse-register handling can never
+//     drift again).
+//   * CMS / CountSketch / CMS-with-heap: `query::decoders`.
+//   * Per-window frequency total: `decode_frequency_total` below.
 // ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-fn decode_ddsketch(sid: u64, state: &SketchSampleState) -> Result<DdSketch, ASAPTierError> {
-    match state.encoding {
-        SketchEncoding::ProtoFull => {
-            DdSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                ASAPTierError::DeserializeFailure {
-                    sid,
-                    encoding: state.encoding,
-                    reason: e.to_string(),
-                }
-            })
-        }
-        SketchEncoding::MsgpackFull => DdSketch::from_msgpack(&state.bytes).map_err(|e| {
-            ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
-        SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: "delta encodings require base sketch state \
-                         (ASAP-tier reducer doesn't yet stitch delta + base \
-                         within query_range)"
-                    .to_string(),
-            })
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn decode_kll(sid: u64, state: &SketchSampleState) -> Result<KllSketch, ASAPTierError> {
-    match state.encoding {
-        SketchEncoding::ProtoFull => {
-            KllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                ASAPTierError::DeserializeFailure {
-                    sid,
-                    encoding: state.encoding,
-                    reason: e.to_string(),
-                }
-            })
-        }
-        SketchEncoding::MsgpackFull => KllSketch::from_msgpack(&state.bytes).map_err(|e| {
-            ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
-        SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: "KLL delta encodings not implemented in ASAP-tier reducer".to_string(),
-            })
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn decode_hll(sid: u64, state: &SketchSampleState) -> Result<HllSketch, ASAPTierError> {
-    match state.encoding {
-        SketchEncoding::ProtoFull => {
-            HllSketch_from_sketchlib_proto_bytes(&state.bytes).map_err(|e| {
-                ASAPTierError::DeserializeFailure {
-                    sid,
-                    encoding: state.encoding,
-                    reason: e.to_string(),
-                }
-            })
-        }
-        SketchEncoding::MsgpackFull => HllSketch::from_msgpack(&state.bytes).map_err(|e| {
-            ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: e.to_string(),
-            }
-        }),
-        SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-            Err(ASAPTierError::DeserializeFailure {
-                sid,
-                encoding: state.encoding,
-                reason: "HLL delta encodings not implemented in ASAP-tier reducer".to_string(),
-            })
-        }
-    }
-}
-
-// Decoders inlined from `precompute_operators/*_accumulator.rs`. They
-// don't live as methods on the sketchlib types directly because the
-// proto envelope wrapping (from DataCollector's `*processor`) is a
-// product of the OTLP wire layer, not the sketch library.
-
-#[allow(non_snake_case, dead_code)]
-fn DdSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<DdSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-DDSketch sketch".to_string()),
-            None => {
-                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
-            }
-        },
-        Err(_) => {
-            DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
-        }
-    };
-    if !(state.alpha > 0.0 && state.alpha < 1.0) {
-        return Err(format!(
-            "DDSketchState alpha {} out of range (expected 0 < alpha < 1)",
-            state.alpha
-        ));
-    }
-    // The DataPoint-level scalars (count/sum/min/max) were dropped from
-    // `DDSketchState` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57);
-    // `DdSketch::from_raw` takes only (alpha, store_counts, store_offset)
-    // and recovers `count` from the bucket store.
-    Ok(DdSketch::from_raw(
-        state.alpha,
-        state.store_counts.clone(),
-        state.store_offset,
-    ))
-}
-
-#[allow(non_snake_case, dead_code)]
-fn KllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<KllSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Kll(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-KLL sketch".to_string()),
-            None => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-        },
-        Err(_) => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-    };
-    if state.k < 8 {
-        return Err(format!("KllState.k must be >= 8 (got {})", state.k));
-    }
-    if state.k > u16::MAX as u32 {
-        return Err(format!(
-            "KllState.k does not fit in u16 (got {}, max {})",
-            state.k,
-            u16::MAX
-        ));
-    }
-    let k = state.k as u16;
-    let mut sk = KllSketch::new(k);
-    for item in &state.items {
-        sk.update(*item);
-    }
-    Ok(sk)
-}
-
-#[allow(non_snake_case, dead_code)]
-fn HllSketch_from_sketchlib_proto_bytes(buffer: &[u8]) -> Result<HllSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{
-        sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
-    };
-    use asap_sketchlib::HllVariant;
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Hll(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-HLL sketch".to_string()),
-            None => HyperLogLogState::decode(buffer)
-                .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
-        },
-        Err(_) => {
-            HyperLogLogState::decode(buffer).map_err(|e| format!("decode HyperLogLogState: {e}"))?
-        }
-    };
-    if state.precision == 0 || state.precision > 20 {
-        return Err(format!(
-            "HyperLogLogState precision {} out of range (expected 1..=20)",
-            state.precision
-        ));
-    }
-    let expected_len = 1usize << state.precision;
-    if state.registers.len() != expected_len {
-        return Err(format!(
-            "HyperLogLogState registers has {} bytes, expected 2^precision = {}",
-            state.registers.len(),
-            expected_len
-        ));
-    }
-    let proto_variant = ProtoVariant::try_from(state.variant)
-        .map_err(|_| format!("HyperLogLogState has unknown variant tag {}", state.variant))?;
-    let variant = match proto_variant {
-        ProtoVariant::Unspecified => HllVariant::Unspecified,
-        ProtoVariant::Regular => HllVariant::Regular,
-        ProtoVariant::ErtlMle => HllVariant::Datafusion,
-        ProtoVariant::Hip => HllVariant::Hip,
-    };
-    Ok(HllSketch::from_raw(
-        variant,
-        state.precision,
-        state.registers.clone(),
-        state.hip_kxq0,
-        state.hip_kxq1,
-        state.hip_est,
-    ))
-}
-
-// CMS / CountSketch decoders are wired through the reducer's
-// `FrequencyEstimate` dispatch arm (bare-frequency point queries).
-// `FrequencyTopk` continues to require a heap-bearing variant (handled
-// inline in the FrequencyTopk branch via `decode_cms_with_heap_from_msgpack`).
-#[allow(dead_code)]
-fn _unused_cms_kept_for_future_topk(buffer: &[u8]) -> Option<CountMinSketch> {
-    CountMinSketch::from_msgpack(buffer).ok()
-}
-#[allow(dead_code)]
-fn _unused_count_sketch_kept_for_future_topk(buffer: &[u8]) -> Option<CountSketch> {
-    CountSketch::from_msgpack(buffer).ok()
-}
 
 /// Decode a sid's per-window frequency sketch and emit a per-window
 /// total-count summary. The CMS / CountSketch matrix sums row 0 (the

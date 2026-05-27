@@ -298,7 +298,31 @@ pub struct SketchStore {
     /// sentinel means "no source config"); legacy callers that mint
     /// sids without a fingerprint reach those sids through
     /// `instances_matching(metric, gbk)`.
+    ///
+    /// ## Cross-index atomicity invariant (P2-1)
+    ///
+    /// `instances`, `policy_to_sids`, and `metric_to_sids` form ONE
+    /// logical index whose three maps must agree: every sid present in
+    /// `instances` must also be present in `metric_to_sids` (keyed by
+    /// its metric_name) and — when its `policy_fp` is non-UNSET — in
+    /// `policy_to_sids`. A concurrent reader must never observe a sid in
+    /// `instances` that is missing from the secondary indexes (or vice
+    /// versa). To preserve this, every writer ([`Self::register`],
+    /// [`Self::remove_instance`]) acquires ALL THREE write guards
+    /// together in the fixed order `instances → policy_to_sids →
+    /// metric_to_sids` BEFORE mutating any of them, so the update is
+    /// atomic with respect to any reader that takes the `instances` lock.
+    /// The fixed acquisition order is also the deadlock-avoidance order:
+    /// no code path takes these locks in a different order.
     policy_to_sids: RwLock<HashMap<PolicyFingerprint, BTreeSet<u64>>>,
+    /// Secondary index: `metric_name → {sids}` (P2-2). Lets
+    /// [`Self::instances_matching`] do a keyed lookup of the sids for a
+    /// metric instead of an O(N) full scan of `instances`. Maintained in
+    /// lock-step with `instances` under the same write-lock domain (see
+    /// the atomicity invariant on `policy_to_sids`). Holds every
+    /// registered sid (UNSET-policy sids included), since the query path
+    /// keys candidate selection on metric name, not policy.
+    metric_to_sids: RwLock<HashMap<String, BTreeSet<u64>>>,
     /// Pointer (as `usize`) of the `Arc<StreamingConfig>` this store
     /// last reconciled against. `reconcile_from_streaming_config` runs
     /// on every ingest batch, but the config is a lock-free
@@ -377,21 +401,34 @@ impl SketchStore {
         }
     }
 
-    /// Insert metadata for a freshly-resolved sid. Also records the
-    /// sid in the `policy_fp → {sids}` reverse index when the metadata
-    /// carries a non-UNSET fingerprint.
+    /// Insert metadata for a freshly-resolved sid. Also records the sid
+    /// in the `policy_fp → {sids}` reverse index (when the metadata
+    /// carries a non-UNSET fingerprint) and in the `metric_name →
+    /// {sids}` secondary index.
+    ///
+    /// ## Atomicity (P2-1)
+    ///
+    /// All three index write guards are acquired together, in the fixed
+    /// order `instances → policy_to_sids → metric_to_sids`, BEFORE any
+    /// map is mutated. This makes the three updates atomic with respect
+    /// to a concurrent reader that takes the `instances` lock: such a
+    /// reader can never see the sid in `instances` while it is still
+    /// absent from `policy_to_sids` / `metric_to_sids` (the pre-fix race
+    /// where the two indexes were written under separate sequential
+    /// locks). See the index-field doc comments for the full invariant.
     pub fn register(&self, meta: SketchInstanceMetadata) {
         let sid = meta.sid;
         let policy_fp = meta.policy_fp;
-        self.instances.write().unwrap().insert(sid, meta);
+        let metric_name = meta.metric_name.clone();
+        // Fixed lock order: instances → policy_to_sids → metric_to_sids.
+        let mut instances = self.instances.write().unwrap();
+        let mut policy_idx = self.policy_to_sids.write().unwrap();
+        let mut metric_idx = self.metric_to_sids.write().unwrap();
+        instances.insert(sid, meta);
         if !policy_fp.is_unset() {
-            self.policy_to_sids
-                .write()
-                .unwrap()
-                .entry(policy_fp)
-                .or_default()
-                .insert(sid);
+            policy_idx.entry(policy_fp).or_default().insert(sid);
         }
+        metric_idx.entry(metric_name).or_default().insert(sid);
     }
 
     /// Resolve a policy fingerprint to the set of sids it has minted.
@@ -423,6 +460,28 @@ impl SketchStore {
     /// release the index lock before working with it).
     pub fn instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
         self.instances.read().unwrap().get(&sid).cloned()
+    }
+
+    /// Borrow-style metadata accessor (P2-2). Runs `f(&meta)` while
+    /// holding the `instances` read lock and returns its result, WITHOUT
+    /// cloning the (allocation-heavy: `String` + `BTreeSet<String>` +
+    /// `AggKind`) metadata. Returns `None` (without invoking `f`) when
+    /// the sid is unknown.
+    ///
+    /// Prefer this over [`Self::instance`] on hot per-candidate paths
+    /// (the engine's capability check + the topk-over-rate fallback)
+    /// that only need to *read* a field or two from the metadata. `f`
+    /// runs under the read lock, so it must not call back into the store
+    /// (which would deadlock) and should stay allocation-light — extract
+    /// the small data you need (a `Capability` clone, a `bool`) and act
+    /// after this returns.
+    pub fn with_instance<R, F: FnOnce(&SketchInstanceMetadata) -> R>(
+        &self,
+        sid: u64,
+        f: F,
+    ) -> Option<R> {
+        let g = self.instances.read().ok()?;
+        g.get(&sid).map(f)
     }
 
     /// Append a window's sketch state under `sid`. Caller is responsible
@@ -1256,17 +1315,35 @@ impl SketchStore {
     /// the read lock immediately. The `instances` map is read-mostly
     /// (one write per first-seen sid), so taking the lock per query is
     /// inexpensive.
+    ///
+    /// P2-2: uses the `metric_to_sids` secondary index for a keyed
+    /// lookup of the candidate sids for `metric_name` instead of an O(N)
+    /// full scan of `instances`; only that metric's (typically small)
+    /// sid set is then filtered on the `group_by_keys` superset test.
+    /// The two locks are taken in a read-only, non-overlapping fashion
+    /// (metric index first, then a brief `instances` read per matched
+    /// sid through the held guard) so the keyed path observes a
+    /// consistent snapshot of the same write domain `register` /
+    /// `remove_instance` maintain atomically.
     pub fn instances_matching(
         &self,
         metric_name: &str,
         required_keys: &BTreeSet<String>,
     ) -> Vec<u64> {
-        let g = self.instances.read().unwrap();
-        g.iter()
-            .filter(|(_, m)| {
-                m.metric_name == metric_name && required_keys.is_subset(&m.group_by_keys)
+        let metric_idx = self.metric_to_sids.read().unwrap();
+        let Some(candidate_sids) = metric_idx.get(metric_name) else {
+            return Vec::new();
+        };
+        let instances = self.instances.read().unwrap();
+        candidate_sids
+            .iter()
+            .filter(|sid| {
+                instances
+                    .get(sid)
+                    .map(|m| required_keys.is_subset(&m.group_by_keys))
+                    .unwrap_or(false)
             })
-            .map(|(sid, _)| *sid)
+            .copied()
             .collect()
     }
 
@@ -1407,23 +1484,48 @@ impl SketchStore {
         Some(meta.clone())
     }
 
-    /// Drop a sid's metadata + its series state + the reverse-index
-    /// entry. Mirrors `SchemaRegistry::remove_schema` for the eviction
-    /// path's post-data-drop cleanup. Returns the removed metadata, or
-    /// `None` if the sid was absent.
+    /// Drop a sid's metadata + its series state + both secondary-index
+    /// entries (`policy_to_sids` and `metric_to_sids`). Mirrors
+    /// `SchemaRegistry::remove_schema` for the eviction path's
+    /// post-data-drop cleanup. Returns the removed metadata, or `None`
+    /// if the sid was absent.
+    ///
+    /// ## Atomicity (P2-1)
+    ///
+    /// Takes all three index write guards together in the fixed order
+    /// `instances → policy_to_sids → metric_to_sids` so the removal is
+    /// atomic with respect to a concurrent reader — the sid never
+    /// lingers in a secondary index after it has left `instances`. The
+    /// `series` DashMap is touched after the index guards are released
+    /// (it is independently keyed and not part of the metadata-index
+    /// invariant).
     pub fn remove_instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
-        let removed = self.instances.write().ok()?.remove(&sid);
-        if let Some(meta) = &removed {
-            self.series.remove(&sid);
-            if !meta.policy_fp.is_unset() {
-                let mut idx = self.policy_to_sids.write().unwrap();
-                if let Some(set) = idx.get_mut(&meta.policy_fp) {
+        let removed = {
+            // Fixed lock order: instances → policy_to_sids → metric_to_sids.
+            let mut instances = self.instances.write().ok()?;
+            let mut policy_idx = self.policy_to_sids.write().unwrap();
+            let mut metric_idx = self.metric_to_sids.write().unwrap();
+            let removed = instances.remove(&sid);
+            if let Some(meta) = &removed {
+                if !meta.policy_fp.is_unset() {
+                    if let Some(set) = policy_idx.get_mut(&meta.policy_fp) {
+                        set.remove(&sid);
+                        if set.is_empty() {
+                            policy_idx.remove(&meta.policy_fp);
+                        }
+                    }
+                }
+                if let Some(set) = metric_idx.get_mut(&meta.metric_name) {
                     set.remove(&sid);
                     if set.is_empty() {
-                        idx.remove(&meta.policy_fp);
+                        metric_idx.remove(&meta.metric_name);
                     }
                 }
             }
+            removed
+        };
+        if removed.is_some() {
+            self.series.remove(&sid);
         }
         removed
     }
@@ -2723,6 +2825,114 @@ mod tests {
         assert!(idx.sids_for_policy(fp).is_empty());
         // Empty entry collapses — policy_count drops to 0.
         assert_eq!(idx.policy_count(), 0);
+    }
+
+    // ── metric_to_sids secondary-index tests (P2-2) ──────────────────
+
+    /// Metadata with a chosen metric name + group-by key set, so the
+    /// secondary-index tests can register several metrics/keys.
+    fn meta_metric_keys(sid: u64, metric: &str, keys: &[&str]) -> SketchInstanceMetadata {
+        let mut m = meta(sid);
+        m.metric_name = metric.to_string();
+        m.group_by_keys = keys.iter().map(|k| k.to_string()).collect();
+        m
+    }
+
+    #[test]
+    fn instances_matching_keyed_lookup_filters_by_metric_and_keys() {
+        let idx = SketchStore::new();
+        // Two metrics; sid 1/2 on metric_a (different key coverage),
+        // sid 3 on metric_b.
+        idx.register(meta_metric_keys(1, "metric_a", &["zone", "rack"]));
+        idx.register(meta_metric_keys(2, "metric_a", &["zone"]));
+        idx.register(meta_metric_keys(3, "metric_b", &["zone"]));
+
+        // Keyed lookup returns ONLY the requested metric's sids, and only
+        // those whose group_by_keys ⊇ required_keys.
+        let req_zone: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+        let mut a = idx.instances_matching("metric_a", &req_zone);
+        a.sort_unstable();
+        assert_eq!(a, vec![1, 2], "both metric_a sids cover {{zone}}");
+
+        let req_zone_rack: BTreeSet<String> =
+            ["zone".to_string(), "rack".to_string()].into_iter().collect();
+        assert_eq!(
+            idx.instances_matching("metric_a", &req_zone_rack),
+            vec![1],
+            "only sid 1 covers {{zone,rack}}"
+        );
+
+        assert_eq!(idx.instances_matching("metric_b", &req_zone), vec![3]);
+        // A metric with no registered sids → empty (no full scan, no panic).
+        assert!(idx
+            .instances_matching("metric_absent", &BTreeSet::new())
+            .is_empty());
+    }
+
+    #[test]
+    fn instances_matching_secondary_index_updated_on_retire_and_remove() {
+        let idx = SketchStore::new();
+        idx.register(meta_metric_keys(1, "metric_a", &["zone"]));
+        idx.register(meta_metric_keys(2, "metric_a", &["zone"]));
+        let req: BTreeSet<String> = ["zone".to_string()].into_iter().collect();
+        let mut got = idx.instances_matching("metric_a", &req);
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2]);
+
+        // Retire (force_retire) does NOT remove the sid from the index —
+        // it stays queryable so an in-flight query can still read its
+        // pre-expiry state; the eviction sweep calls remove_instance
+        // later. Confirm the index still surfaces both.
+        idx.force_retire(1, Duration::from_secs(3600));
+        let mut still = idx.instances_matching("metric_a", &req);
+        still.sort_unstable();
+        assert_eq!(still, vec![1, 2], "retire keeps the sid in the metric index");
+
+        // remove_instance (the post-eviction cleanup) drops it from the
+        // secondary index too.
+        idx.remove_instance(1);
+        assert_eq!(
+            idx.instances_matching("metric_a", &req),
+            vec![2],
+            "removed sid leaves the metric index"
+        );
+        idx.remove_instance(2);
+        assert!(
+            idx.instances_matching("metric_a", &req).is_empty(),
+            "last sid gone → metric key collapses, keyed lookup empty"
+        );
+    }
+
+    #[test]
+    fn metric_index_agrees_with_instances_after_mixed_churn() {
+        // Cross-check the P2-1 atomicity invariant statically: after a
+        // sequence of register/remove the metric index's union must equal
+        // the set of sids in `instances`.
+        let idx = SketchStore::new();
+        idx.register(meta_metric_keys(10, "m1", &["a"]));
+        idx.register(meta_metric_keys(11, "m1", &["a", "b"]));
+        idx.register(meta_metric_keys(12, "m2", &["a"]));
+        idx.remove_instance(10);
+        idx.register(meta_metric_keys(13, "m2", &["a"]));
+
+        let from_instances: BTreeSet<u64> =
+            idx.instances.read().unwrap().keys().copied().collect();
+        let from_metric_idx: BTreeSet<u64> = idx
+            .metric_to_sids
+            .read()
+            .unwrap()
+            .values()
+            .flat_map(|s| s.iter().copied())
+            .collect();
+        assert_eq!(
+            from_instances, from_metric_idx,
+            "metric_to_sids union must equal the instances key set (P2-1 invariant)"
+        );
+        // And the cleared metric key must be gone, not lingering empty.
+        assert_eq!(
+            idx.instances_matching("m1", &["a".to_string()].into_iter().collect::<BTreeSet<_>>()),
+            vec![11]
+        );
     }
 
     // ── Durable disk-backed tier (feat/sketch-durable-tier) ─────────────
