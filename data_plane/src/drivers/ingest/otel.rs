@@ -1839,7 +1839,11 @@ fn decode_modified_otlp_sketch_bytes(
                 // accepts both shapes.
                 match reconstruct_via_runtime(RtSketchType::DDSketch, bytes) {
                     Ok(ReconstructedSketch::DdSketch(inner)) => {
-                        Ok(Box::new(DDSketchAccumulator { inner }))
+                        // The runtime reconstruction discards the envelope's
+                        // sample_p; re-read it from the same full-frame bytes
+                        // so a sampled series rescales its Count by 1/p.
+                        let sample_p = DDSketchAccumulator::sample_p_from_envelope_bytes(bytes);
+                        Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
                     }
                     Ok(_) => Err(
                         "edge_runtime_adapter returned non-DDSketch reconstruction".into(),
@@ -2629,6 +2633,7 @@ mod dispatcher_tests {
         // Base sketch represents the last full snapshot the agent sent.
         let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3], 0),
+            sample_p: 1.0,
         });
 
         // The wire delta now carries only bucket deltas (tags 2-7

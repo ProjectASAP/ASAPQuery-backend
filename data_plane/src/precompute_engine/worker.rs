@@ -2295,7 +2295,10 @@ aggregations:
             // positive-only is the realistic shape.
             s.update(*v);
         }
-        DDSketchAccumulator { inner: s }
+        DDSketchAccumulator {
+            inner: s,
+            sample_p: 1.0,
+        }
     }
 
     /// Pinning test: a single-group, single-window sketch ingest must
