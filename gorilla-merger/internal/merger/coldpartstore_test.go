@@ -444,7 +444,7 @@ func TestStoreAPIUnionsColdAndTSDB(t *testing.T) {
 		coldSeries(labels.FromStrings(labels.MetricName, "metric", "src", "cold"), base, 100, 200),
 	}))
 
-	cs := newCustomStore(st.DB, ext, nil)
+	cs := newCustomStore(st.BlockStore(), ext, nil)
 	cs.setColdQuerier(NewColdQuerier(coldStore))
 
 	req := &storepb.SeriesRequest{
@@ -557,7 +557,7 @@ func TestCustomStoreTimeRangeIncludesCold(t *testing.T) {
 		coldSeries(labels.FromStrings(labels.MetricName, "old_metric"), coldStart, 1, 2),
 	}))
 
-	cs := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	cs := newCustomStore(st.BlockStore(), labels.EmptyLabels(), nil)
 
 	// With the cold querier attached the advertised min drops to the cold floor
 	// (NOT the empty-head MaxInt64 sentinel, which would prune the merger).
@@ -590,14 +590,14 @@ func TestCustomStoreTimeRangeEmptyHead(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	// Sanity: a fresh head really does report the MaxInt64 sentinel.
-	if got, err := st.DB.StartTime(); err != nil {
+	if got, err := st.BlockStore().StartTime(); err != nil {
 		t.Fatalf("StartTime: %v", err)
 	} else if got != math.MaxInt64 {
 		t.Logf("note: empty-head StartTime = %d (expected MaxInt64); test still asserts no MaxInt64 leak", got)
 	}
 
 	// (1) Empty head, NO cold querier: must advertise MinInt64, not MaxInt64.
-	csBare := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	csBare := newCustomStore(st.BlockStore(), labels.EmptyLabels(), nil)
 	if min, _ := csBare.timeRange(); min == math.MaxInt64 {
 		t.Fatalf("empty head (no cold) advertised MinTime = MaxInt64; merger would be pruned from every query")
 	} else if min != math.MinInt64 {
@@ -612,7 +612,7 @@ func TestCustomStoreTimeRangeEmptyHead(t *testing.T) {
 	mustPut(t, coldStore, writePartBytes(t, coldStart, coldStart+1000, []coldpart.Series{
 		coldSeries(labels.FromStrings(labels.MetricName, "reloaded_cold"), coldStart, 1, 2),
 	}))
-	csCold := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	csCold := newCustomStore(st.BlockStore(), labels.EmptyLabels(), nil)
 	csCold.setColdQuerier(NewColdQuerier(coldStore))
 	if min, _ := csCold.timeRange(); min != coldStart {
 		t.Fatalf("empty head + cold parts: timeRange min = %d, want cold floor %d (MaxInt64 sentinel must not win)", min, coldStart)
@@ -638,7 +638,7 @@ func TestCustomStoreSeriesServesOldColdWindow(t *testing.T) {
 		coldSeries(labels.FromStrings(labels.MetricName, "http_requests_total", "job", "api"), base, 11, 22),
 	}))
 
-	cs := newCustomStore(st.DB, labels.EmptyLabels(), nil)
+	cs := newCustomStore(st.BlockStore(), labels.EmptyLabels(), nil)
 	cs.setColdQuerier(NewColdQuerier(coldStore))
 
 	// The advertised min must cover this old window (else thanos-query prunes us).

@@ -51,13 +51,24 @@ func makeFragment(t *testing.T, metric string, attrs map[string]string, source s
 	}
 }
 
-// readBack queries the tsdb.DB for one series and returns its samples in time
-// order.
+// flushNow flushes every buffered window into a block immediately (ignoring the
+// reorder grace) and reloads the store so the data is queryable. Tests use this
+// to make ingested fragments visible without waiting for the window clock.
+func flushNow(t *testing.T, s *Storage) {
+	t.Helper()
+	if _, err := s.Manager.FlushAll(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
+// readBack queries the BlockStore for one series and returns its samples in time
+// order. It flushes first so freshly-ingested fragments are visible.
 func readBack(t *testing.T, s *Storage, want labels.Labels) []sample {
 	t.Helper()
-	q, err := s.DB.Querier(math.MinInt64, math.MaxInt64)
+	flushNow(t, s)
+	q, err := s.BlockStore().ChunkQuerier(math.MinInt64, math.MaxInt64)
 	if err != nil {
-		t.Fatalf("querier: %v", err)
+		t.Fatalf("chunk querier: %v", err)
 	}
 	defer q.Close()
 
@@ -73,9 +84,16 @@ func readBack(t *testing.T, s *Storage, want labels.Labels) []sample {
 		count++
 		series := ss.At()
 		it := series.Iterator(nil)
-		for it.Next() == chunkenc.ValFloat {
-			tt, vv := it.At()
-			out = append(out, sample{t: tt, v: vv})
+		for it.Next() {
+			chk := it.At()
+			cit := chk.Chunk.Iterator(nil)
+			for cit.Next() == chunkenc.ValFloat {
+				tt, vv := cit.At()
+				out = append(out, sample{t: tt, v: vv})
+			}
+			if cit.Err() != nil {
+				t.Fatalf("chunk iterator: %v", cit.Err())
+			}
 		}
 		if it.Err() != nil {
 			t.Fatalf("series iterator: %v", it.Err())
@@ -101,7 +119,6 @@ func TestIngestRoundTrip(t *testing.T) {
 	ext := labels.FromStrings("merger", "test-merger")
 	storage.SetExternalLabels(ext)
 
-	// Use timestamps near "now" so they fall inside the writable head window.
 	base := time.Now().UnixMilli()
 	fragA := makeFragment(t, "http_requests_total",
 		map[string]string{"job": "api", "instance": "a"}, "agent-1",
@@ -114,7 +131,7 @@ func TestIngestRoundTrip(t *testing.T) {
 
 	// POST through the real HTTP handler (gzip-encoded body to exercise the
 	// gunzip path).
-	ingester := NewIngester(storage, nil)
+	ingester := NewIngester(storage.Manager, nil)
 	srv := httptest.NewServer(http.HandlerFunc(ingester.HandleIngest))
 	t.Cleanup(srv.Close)
 
@@ -139,7 +156,7 @@ func TestIngestRoundTrip(t *testing.T) {
 	}
 
 	// Series A: __name__ + its attrs only (external labels are added by the
-	// TSDBStore at query time, NOT stamped into the stored series).
+	// store at query time, NOT stamped into the stored series).
 	wantA := labels.FromStrings(
 		labels.MetricName, "http_requests_total",
 		"job", "api", "instance", "a")
@@ -156,6 +173,57 @@ func TestIngestRoundTrip(t *testing.T) {
 	assertSamples(t, "B", gotB, wantSamplesB)
 }
 
+// TestIngestDecodeFreeChunkBytesPreserved is the core proof of the decode-free
+// design: for a single fragment flushed into a single (no-compaction) block, the
+// raw XOR chunk bytes that land in the block index/chunks file are BYTE-FOR-BYTE
+// the input fragment's chunk bytes. There is NO decode + re-encode on the hot
+// path — the agent's Gorilla-XOR chunk is stitched in verbatim.
+func TestIngestDecodeFreeChunkBytesPreserved(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := OpenStorage(StorageOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("open storage: %v", err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	base := time.Now().UnixMilli()
+	frag := makeFragment(t, "m", map[string]string{"k": "v"}, "agent-1",
+		[]sample{{base, 1}, {base + 1000, 2}, {base + 2000, 3}})
+	wantBytes := append([]byte(nil), frag.Data...)
+
+	if _, err := storage.Manager.Append(gorilla.EncodeFragmentBatch([]gorilla.Fragment{frag})); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	flushNow(t, storage)
+
+	q, err := storage.BlockStore().ChunkQuerier(math.MinInt64, math.MaxInt64)
+	if err != nil {
+		t.Fatalf("chunk querier: %v", err)
+	}
+	defer q.Close()
+	ss := q.Select(context.Background(), false, nil,
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "m"))
+	var gotChunks [][]byte
+	for ss.Next() {
+		it := ss.At().Iterator(nil)
+		for it.Next() {
+			gotChunks = append(gotChunks, append([]byte(nil), it.At().Chunk.Bytes()...))
+		}
+		if it.Err() != nil {
+			t.Fatalf("chunk iter: %v", it.Err())
+		}
+	}
+	if err := ss.Err(); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if len(gotChunks) != 1 {
+		t.Fatalf("expected exactly 1 chunk in the no-compaction block, got %d", len(gotChunks))
+	}
+	if !bytes.Equal(gotChunks[0], wantBytes) {
+		t.Fatalf("chunk bytes changed on the hot path:\n got  %x\n want %x", gotChunks[0], wantBytes)
+	}
+}
+
 func TestIngestBadBodyReturns400(t *testing.T) {
 	dir := t.TempDir()
 	storage, err := OpenStorage(StorageOptions{Dir: dir})
@@ -164,7 +232,7 @@ func TestIngestBadBodyReturns400(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
-	ingester := NewIngester(storage, nil)
+	ingester := NewIngester(storage.Manager, nil)
 	srv := httptest.NewServer(http.HandlerFunc(ingester.HandleIngest))
 	t.Cleanup(srv.Close)
 
@@ -181,8 +249,8 @@ func TestIngestBadBodyReturns400(t *testing.T) {
 
 func TestLabelsForNoExternalStamping(t *testing.T) {
 	// External labels (cluster/merger) must NOT be stamped at ingest — the
-	// Thanos TSDBStore appends them at query time. Stamping them here too
-	// produced duplicate labels and crashed TSDBStore.Series.
+	// Thanos store appends them at query time. Stamping them here too produced
+	// duplicate labels and crashed the label decode path.
 	got := labelsFor("metric", map[string]string{"shared": "frag", "job": "x"})
 	want := labels.FromStrings(
 		labels.MetricName, "metric",

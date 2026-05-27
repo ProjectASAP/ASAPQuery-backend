@@ -47,7 +47,7 @@ func ingestFragments(t *testing.T, s *Storage, frags ...gorilla.Fragment) {
 	t.Helper()
 	frame := gorilla.EncodeFragmentBatch(frags)
 
-	ingester := NewIngester(s, nil)
+	ingester := NewIngester(s.Manager, nil)
 	srv := httptest.NewServer(http.HandlerFunc(ingester.HandleIngest))
 	t.Cleanup(srv.Close)
 
@@ -69,6 +69,11 @@ func ingestFragments(t *testing.T, s *Storage, frags ...gorilla.Fragment) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("ingest: expected 200, got %d", resp.StatusCode)
+	}
+	// Decode-free path buffers per-window; flush so the data lands in a block
+	// and becomes queryable through the BlockStore-backed StoreAPI.
+	if _, ferr := s.Manager.FlushAll(); ferr != nil {
+		t.Fatalf("flush: %v", ferr)
 	}
 }
 
@@ -135,7 +140,7 @@ func TestCustomStoreSeriesRoundTrip(t *testing.T) {
 		[]sample{{base, 10}, {base + 1000, 20}})
 	ingestFragments(t, st, fragA, fragB)
 
-	cs := newCustomStore(st.DB, ext, nil)
+	cs := newCustomStore(st.BlockStore(), ext, nil)
 
 	req := &storepb.SeriesRequest{
 		MinTime: base - 60_000,
@@ -226,7 +231,7 @@ func TestCustomStoreSeriesSkipChunks(t *testing.T) {
 		map[string]string{"job": "api"}, "agent-1",
 		[]sample{{base, 1}, {base + 1000, 1}}))
 
-	cs := newCustomStore(st.DB, ext, nil)
+	cs := newCustomStore(st.BlockStore(), ext, nil)
 	req := &storepb.SeriesRequest{
 		MinTime:    base - 60_000,
 		MaxTime:    base + 60_000,
@@ -278,7 +283,7 @@ func TestCustomStoreSeriesExternalLabelGate(t *testing.T) {
 	ingestFragments(t, st, makeFragment(t, "up", map[string]string{"job": "api"}, "agent-1",
 		[]sample{{base, 1}}))
 
-	cs := newCustomStore(st.DB, ext, nil)
+	cs := newCustomStore(st.BlockStore(), ext, nil)
 
 	// Non-matching external value -> 0 series.
 	reqMiss := &storepb.SeriesRequest{
@@ -331,7 +336,7 @@ func TestCustomStoreLabelNamesValues(t *testing.T) {
 		makeFragment(t, "up", map[string]string{"job": "api"}, "a", []sample{{base, 1}}),
 		makeFragment(t, "up", map[string]string{"job": "web"}, "b", []sample{{base, 1}}))
 
-	cs := newCustomStore(st.DB, ext, nil)
+	cs := newCustomStore(st.BlockStore(), ext, nil)
 	ctx := context.Background()
 
 	ln, err := cs.LabelNames(ctx, &storepb.LabelNamesRequest{Start: base - 60_000, End: base + 60_000})

@@ -3,13 +3,22 @@
 A Thanos-Receive-style component for ASAP edge agents. It:
 
 1. **Ingests** Gorilla XOR-chunk fragments (the `asap-gorilla-go` `ASAPFRG1`
-   wire codec) over HTTP `POST /ingest/gorilla` (gzip-aware).
-2. **Appends** the decoded samples to an embedded Prometheus `tsdb.DB`
-   (2h block range + WAL).
-3. **Serves** a Thanos **StoreAPI** (gRPC) over the open (`<2h` pending)
-   window so `thanos-query` can union recent data with the `>=2h` S3 blocks
-   that `thanos-store-gateway` serves.
-4. **Ships** completed 2h blocks to object storage via the Thanos shipper
+   wire codec) over HTTP `POST /ingest/gorilla` (gzip-aware), **decode-free**:
+   it durably logs each raw frame to a block-level WAL (fsync before ack) and
+   buffers the raw XOR chunks per time window — NO sample decode/re-encode on
+   the hot path.
+2. **Builds blocks directly.** On window close it sorts each series' buffered
+   chunks by time and stitches them straight into a Prometheus TSDB block via
+   the low-level `chunks`/`index` writers (still no sample decode). The agent's
+   Gorilla-XOR chunk bytes land in the block verbatim.
+3. **Serves** a Thanos **StoreAPI** (gRPC) over the recent, un-shipped on-disk
+   blocks so `thanos-query` can union recent data with the S3 blocks that
+   `thanos-store-gateway` serves.
+4. **Compacts for ratio.** A background job merges the small per-window blocks
+   and re-chunks them to Prometheus's ~120 samples/chunk target (the
+   resource-limited agents cannot emit large chunks, so the merger does the
+   re-chunking offline/amortized, OFF the ingest path).
+5. **Ships** the compacted blocks to object storage via the Thanos shipper
    (one PUT set per block), into the same bucket the store-gateway watches.
 
 ## Ports / flags
@@ -18,11 +27,17 @@ A Thanos-Receive-style component for ASAP edge agents. It:
 |------|-----|---------|---------|
 | `-http-address` | `MERGER_HTTP_ADDRESS` | `:10908` | `/ingest/gorilla`, `/metrics`, `/-/healthy`, `/-/ready` |
 | `-grpc-address` | `MERGER_GRPC_ADDRESS` | `:10907` | Thanos StoreAPI (the query surface `thanos-query --store=` points at) |
-| `-tsdb.path` | `MERGER_TSDB_PATH` | `./data` | embedded tsdb dir (WAL + unshipped blocks) |
+| `-tsdb.path` | `MERGER_TSDB_PATH` | `./data` | data dir (directly-built + compacted blocks; the shipper watches it) |
 | `-objstore.config-file` | `MERGER_OBJSTORE_CONFIG_FILE` | _empty_ | Thanos objstore YAML; empty disables the shipper |
-| `-external-labels` | `MERGER_EXTERNAL_LABELS` | _empty_ | `k=v,k=v` applied to every series + uploaded block; distinct mergers MUST carry a distinguishing label |
+| `-external-labels` | `MERGER_EXTERNAL_LABELS` | _empty_ | `k=v,k=v` applied to every uploaded block; distinct mergers MUST carry a distinguishing label |
 | `-shipper.interval` | `MERGER_SHIPPER_INTERVAL` | `1m` | block-scan / upload cadence |
 | `-tsdb.retention` | `MERGER_TSDB_RETENTION` | `6h` | local on-disk retention (blocks live in S3 once shipped) |
+| `-merge.window` | `MERGER_MERGE_WINDOW` | `2h` | buffering/close window; one closed window → one directly-built block |
+| `-merge.reorder-grace` | `MERGER_MERGE_REORDER_GRACE` | `1m` | grace after a window's end for late/out-of-order fragments before flushing |
+| `-merge.wal-dir` | `MERGER_MERGE_WAL_DIR` | `<tsdb.path>/wal` | block-level fragment WAL directory |
+| `-merge.flush-interval` | `MERGER_MERGE_FLUSH_INTERVAL` | `1m` | how often closable windows are flushed into blocks |
+| `-merge.compact-interval` | `MERGER_MERGE_COMPACT_INTERVAL` | `5m` | background merge + re-chunk cadence |
+| `-merge.compact-min-blocks` | `MERGER_MERGE_COMPACT_MIN_BLOCKS` | `2` | min source blocks in a run before compaction |
 
 ## Building the container
 

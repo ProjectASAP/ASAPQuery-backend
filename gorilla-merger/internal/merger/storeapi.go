@@ -14,9 +14,10 @@ import (
 	"google.golang.org/grpc"
 )
 
-// StoreAPI serves the Thanos StoreAPI (gRPC) over the embedded tsdb.DB. This is
-// the open-window (<2h pending) query surface; thanos-query fans out to it
-// alongside the store-gateway (which serves the >=2h S3 blocks), then unions.
+// StoreAPI serves the Thanos StoreAPI (gRPC) over the BlockStore (directly-built
+// + compacted, un-shipped blocks). This is the recent/un-shipped query surface;
+// thanos-query fans out to it alongside the store-gateway (which serves the S3
+// blocks), then unions.
 //
 // It registers a CUSTOM storepb.StoreServer (customStore) rather than thanos's
 // store.TSDBStore. store.TSDBStore.Series fatally OOMs under Prometheus's
@@ -39,8 +40,10 @@ func NewStoreAPI(s *Storage, extLset labels.Labels, logger kitlog.Logger, addr s
 		logger = kitlog.NewNopLogger()
 	}
 	// The custom store requires the external label set to be sorted; labels.New
-	// / labels.Builder already returns sorted labels.
-	cs := newCustomStore(s.DB, extLset, logger)
+	// / labels.Builder already returns sorted labels. The query backend is the
+	// BlockStore (directly-built + compacted blocks), which implements the same
+	// chunkQueryable interface the embedded tsdb.DB used to.
+	cs := newCustomStore(s.BlockStore(), extLset, logger)
 	if coldStore != nil {
 		cs.setColdQuerier(NewColdQuerier(coldStore))
 	}

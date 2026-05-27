@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,14 @@ type config struct {
 	externalLabels string
 	shipInterval   time.Duration
 	retention      time.Duration
+
+	// Decode-free merge knobs.
+	mergeWindow      time.Duration
+	mergeGrace       time.Duration
+	mergeWALDir      string
+	mergeFlushIntvl  time.Duration
+	compactInterval  time.Duration
+	compactMinBlocks int
 }
 
 func main() {
@@ -68,6 +77,21 @@ func parseConfig() config {
 		"How often the shipper scans for and uploads new blocks.")
 	fs.DurationVar(&cfg.retention, "tsdb.retention", envDurationOr("MERGER_TSDB_RETENTION", 6*time.Hour),
 		"Local on-disk retention. Kept short since blocks live in object storage once shipped.")
+
+	// Decode-free merge knobs.
+	fs.DurationVar(&cfg.mergeWindow, "merge.window", envDurationOr("MERGER_MERGE_WINDOW", 2*time.Hour),
+		"Buffering/close window for the decode-free path; one closed window -> one directly-built block. 2h aligns with the Prometheus/Thanos block base.")
+	fs.DurationVar(&cfg.mergeGrace, "merge.reorder-grace", envDurationOr("MERGER_MERGE_REORDER_GRACE", time.Minute),
+		"How long after a window's end to keep accepting late/out-of-order fragments before flushing it.")
+	fs.StringVar(&cfg.mergeWALDir, "merge.wal-dir", envOr("MERGER_MERGE_WAL_DIR", ""),
+		"Directory for the block-level fragment WAL. Defaults to <tsdb.path>/wal.")
+	fs.DurationVar(&cfg.mergeFlushIntvl, "merge.flush-interval", envDurationOr("MERGER_MERGE_FLUSH_INTERVAL", time.Minute),
+		"How often to check for closable windows and flush them into blocks.")
+	fs.DurationVar(&cfg.compactInterval, "merge.compact-interval", envDurationOr("MERGER_MERGE_COMPACT_INTERVAL", 5*time.Minute),
+		"How often the background compactor merges small per-window blocks and re-chunks them to ~120 samples/chunk for ratio.")
+	fs.IntVar(&cfg.compactMinBlocks, "merge.compact-min-blocks", envIntOr("MERGER_MERGE_COMPACT_MIN_BLOCKS", 2),
+		"Minimum number of source blocks in a run before the compactor merges them.")
+
 	_ = fs.Parse(os.Args[1:])
 	return cfg
 }
@@ -80,11 +104,15 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 
 	reg := prometheus.NewRegistry()
 
-	// 1. Storage: embedded tsdb.DB, 2h block range + WAL.
+	// 1. Storage: decode-free ingest Manager (window buffer + block WAL +
+	// directly-built blocks) + BlockStore that serves them. No embedded
+	// sample-appending tsdb.DB on the gorilla path.
 	storage, err := merger.OpenStorage(merger.StorageOptions{
 		Dir:               cfg.tsdbDir,
+		WALDir:            cfg.mergeWALDir,
+		WindowMs:          cfg.mergeWindow.Milliseconds(),
+		ReorderGraceMs:    cfg.mergeGrace.Milliseconds(),
 		Logger:            logger,
-		Registerer:        reg,
 		RetentionDuration: cfg.retention.Milliseconds(),
 	})
 	if err != nil {
@@ -140,8 +168,8 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		logger.Warn("no objstore config provided; cold-part store disabled (decode-on-read unavailable)")
 	}
 
-	// 3. Ingest HTTP frontend.
-	ingester := merger.NewIngester(storage, logger)
+	// 3. Ingest HTTP frontend (decode-free: WAL + buffer, no sample append).
+	ingester := merger.NewIngester(storage.Manager, logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/gorilla", ingester.HandleIngest)
 	if coldStore != nil {
@@ -184,7 +212,39 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		logger.Warn("no objstore config provided; shipper disabled (write path + StoreAPI only)")
 	}
 
-	errCh := make(chan error, 3)
+	// 6. Background compactor: merge small per-window blocks + re-chunk to ~120
+	// samples/chunk for a better compression ratio (offline/amortized, OFF the
+	// ingest hot path).
+	compactor, err := merger.NewCompactor(merger.CompactorOptions{
+		Store:      storage.BlockStore(),
+		Interval:   cfg.compactInterval,
+		MinBlocks:  cfg.compactMinBlocks,
+		MaxSpanMs:  cfg.mergeWindow.Milliseconds(),
+		Registerer: reg,
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	errCh := make(chan error, 5)
+
+	// Flush loop: close windows + build blocks on a ticker (flush everything on
+	// shutdown).
+	go func() {
+		logger.Info("starting flush loop", "interval", cfg.mergeFlushIntvl,
+			"window", cfg.mergeWindow, "grace", cfg.mergeGrace)
+		if serr := storage.Manager.RunFlush(ctx, cfg.mergeFlushIntvl); serr != nil && serr != context.Canceled {
+			errCh <- fmt.Errorf("flush loop: %w", serr)
+		}
+	}()
+
+	go func() {
+		logger.Info("starting compactor", "interval", cfg.compactInterval, "min_blocks", cfg.compactMinBlocks)
+		if serr := compactor.Run(ctx); serr != nil && serr != context.Canceled {
+			errCh <- fmt.Errorf("compactor: %w", serr)
+		}
+	}()
 
 	go func() {
 		logger.Info("starting HTTP ingest frontend", "addr", cfg.httpAddr)
@@ -267,6 +327,15 @@ func envDurationOr(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def
