@@ -294,6 +294,11 @@ impl Replanner {
             // same `sample_p` knob the first-connect bootstrap YAML did.
             edge_cfg.metric_to_sample_p =
                 crate::emit::collect_metric_to_sample_p(registry, &self.workload_store);
+            // Per-metric inner item dimension — companion stitch, mirrors the
+            // bootstrap path so OpAMP-pushed re-plans carry the same
+            // `item_label` the first-connect bootstrap YAML did.
+            edge_cfg.metric_to_item_label =
+                crate::emit::collect_metric_to_item_label(registry, &self.workload_store);
         }
 
         // OpAMP `on_connect` doesn't expose the agent's runtime

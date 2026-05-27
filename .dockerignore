@@ -15,5 +15,11 @@ target/
 .vscode/
 *.swp
 
+# Claude agent worktrees (~125 GB; source minus target/.git still ~230 MB).
+# The image build never needs the agent worktrees — keep them out of the
+# BuildKit context entirely.
+.claude/
+**/.claude/
+
 # CI / eval artifacts that occasionally land in subdirs
 **/eval-results/

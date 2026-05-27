@@ -387,13 +387,30 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
         ));
     }
     let expected_len = 1usize << state.precision;
-    if state.registers.len() != expected_len {
+    // Register resolution mirrors the ingest decoder
+    // (hll_sketch_accumulator::from_sketchlib_proto_bytes): sketchlib-go emits
+    // the SPARSE `registers_sparse` (tag 7) form below its dense/sparse
+    // crossover, leaving the dense `registers` (tag 3) field empty for
+    // low-cardinality producers — the common case. Expand it here too so the
+    // READ path reconstructs the same dense array; without this, warm HLL
+    // reads of sparse frames fail with "registers has 0 bytes".
+    let dense_registers: Vec<u8> = if state.registers.len() == expected_len {
+        state.registers.clone()
+    } else if !state.registers.is_empty() {
         return Err(format!(
             "HyperLogLogState registers has {} bytes, expected 2^precision = {}",
             state.registers.len(),
             expected_len
         ));
-    }
+    } else if let Some(sparse) = state.registers_sparse.as_ref() {
+        crate::precompute_engine::operators::hll_sketch_accumulator::expand_sparse_hll_registers(
+            &sparse.packed,
+            expected_len,
+        )
+        .map_err(|e| format!("expand sparse HLL registers: {e}"))?
+    } else {
+        vec![0u8; expected_len]
+    };
     let proto_variant = ProtoVariant::try_from(state.variant)
         .map_err(|_| format!("HyperLogLogState has unknown variant tag {}", state.variant))?;
     let variant = match proto_variant {
@@ -405,7 +422,7 @@ fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
     Ok(HllSketch::from_raw(
         variant,
         state.precision,
-        state.registers.clone(),
+        dense_registers,
         state.hip_kxq0,
         state.hip_kxq1,
         state.hip_est,

@@ -1485,3 +1485,180 @@ fn kll_wide_window_quantile_over_time_unchanged() {
     assert_eq!(samples.len(), 1);
     assert!((samples[0].1 - 25.5).abs() <= 5.0);
 }
+
+// ---------------------------------------------------------------------------
+// CS / CMS DELTA reconstruction (FIX B). Cross-language end-to-end: a frame
+// produced by the EDGE encoders (sketchlib-go) is (a) tagged with the right
+// delta encoding (proved by the Go-side `encode.go` tests) and (b)
+// reconstructed byte-correctly by the reducer's fixed delta path here. The
+// golden bytes below are the exact output of the Go encoders (captured via a
+// throw-away Go print test, identical methodology to the heap-delta golden in
+// `count_min_sketch_with_heap_accumulator.rs`), so a drift in either runtime
+// fails loudly.
+// ---------------------------------------------------------------------------
+
+fn cs_freq_meta(sid: u64, rows: i32, cols: i32) -> SketchInstanceMetadata {
+    let cfg = SketchConfig::CountSketch { rows, cols };
+    SketchInstanceMetadata {
+        sid,
+        metric_name: "endpoint_hits".to_string(),
+        group_by_keys: BTreeSet::new(),
+        capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountSketch)),
+        agg_kind: AggKind::Sketch {
+            kind: SketchKindHandle::CountSketch,
+            config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
+        },
+        accuracy: Some(AccuracyBound::from_config(&cfg)),
+        first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
+    }
+}
+
+fn cs_heap_topk_meta(sid: u64, rows: i32, cols: i32) -> SketchInstanceMetadata {
+    let cfg = SketchConfig::CountSketch { rows, cols };
+    SketchInstanceMetadata {
+        sid,
+        metric_name: "endpoint_hits".to_string(),
+        group_by_keys: BTreeSet::new(),
+        capability: Some(Capability::FrequencyTopk(
+            SketchKindHandle::CountSketchWithHeap,
+        )),
+        agg_kind: AggKind::Sketch {
+            kind: SketchKindHandle::CountSketchWithHeap,
+            config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
+        },
+        accuracy: Some(AccuracyBound::from_config(&cfg)),
+        first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
+    }
+}
+
+/// Go-produced golden: sketchlib-go `countsketch.SerializeDelta` for a
+/// CountSketch PROTO_DELTA frame with rows=3, cols=5,
+/// cells=[(0,1,50),(1,3,-4),(2,4,1_000_000)] (captured via a throw-away
+/// Go print test). The packed cell_rows/cell_cols/d_counts (sint64
+/// zigzag) encoding is byte-identical between the Go producer and the
+/// Rust `asap_sketchlib::proto::sketchlib::CountSketchDelta` consumer.
+const GO_CS_PROTO_DELTA_GOLDEN_HEX: &str = "080310054a0300010252030103045a05640780897a";
+
+#[test]
+fn count_sketch_proto_delta_reconstructs_matrix_from_edge_golden() {
+    use crate::storage_engines::sketch_db::query::decoders::decode_cs_from_proto_delta;
+
+    let bytes = hex::decode(GO_CS_PROTO_DELTA_GOLDEN_HEX).expect("hex");
+
+    // (a) The reducer decodes the edge-tagged PROTO_DELTA frame.
+    let idx = SketchStore::new();
+    let sid = 9400;
+    idx.register(cs_freq_meta(sid, 3, 5));
+    idx.append_sample(
+        sid,
+        BTreeMap::new(),
+        (1000, 1010),
+        proto_delta(bytes.clone()),
+    );
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "frequency", &[], 1000, 1010)
+        .expect("frequency over a PROTO_DELTA CountSketch should reconstruct");
+    assert_eq!(result.series.len(), 1);
+    let (_lv, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1);
+    let reducer_row0 = samples[0].1;
+
+    // (b) From-scratch reference: apply the same delta onto an empty base
+    // and read row-0 sum directly. The reducer's answer must match.
+    let cs_ref = decode_cs_from_proto_delta(&bytes).expect("decode reference");
+    let ref_matrix = cs_ref.sketch();
+    assert_eq!(ref_matrix.len(), 3);
+    assert_eq!(ref_matrix[0].len(), 5);
+    // The three sparse cells landed exactly onto the empty base.
+    assert_eq!(ref_matrix[0][1], 50.0, "cell (0,1)");
+    assert_eq!(ref_matrix[1][3], -4.0, "cell (1,3)");
+    assert_eq!(ref_matrix[2][4], 1_000_000.0, "cell (2,4)");
+    assert_eq!(ref_matrix[0][0], 0.0, "untouched cell stays zero");
+    let ref_row0: f64 = ref_matrix[0].iter().copied().sum();
+    assert_eq!(ref_row0, 50.0, "row-0 sum reference");
+    assert_eq!(
+        reducer_row0, ref_row0,
+        "reducer's PROTO_DELTA reconstruction must match from-scratch reference"
+    );
+}
+
+/// Go-produced golden (REUSED from the delta-heap accumulator test): the
+/// exact output of sketchlib-go's `MarshalCountSketchWithHeapDelta(5, 1024,
+/// cells=[(0,1,50),(1,3,-4),(4,1023,1_000_000)],
+/// heap=[("/checkout",50),("/cart",20)], heap_size=20)`. Encoding
+/// MSGPACK_DELTA — the delta-heap wire form a CountSketchWithHeap sid
+/// produces under DeltaTransmission.
+const GO_DELTA_HEAP_GOLDEN_HEX: &str = "94c39305cd04009393000132930103fc9304cd03ffce000f42409292a92f636865636b6f7574cb404900000000000092a52f63617274cb403400000000000014";
+
+#[test]
+fn count_sketch_with_heap_msgpack_delta_topk_from_edge_golden() {
+    let bytes = hex::decode(GO_DELTA_HEAP_GOLDEN_HEX).expect("hex");
+
+    // (a) The reducer decodes the edge-tagged MSGPACK_DELTA heap frame in
+    // the FrequencyTopk path.
+    let idx = SketchStore::new();
+    let sid = 9401;
+    idx.register(cs_heap_topk_meta(sid, 5, 1024));
+    let delta_sample = SketchSampleState {
+        bytes: bytes.clone(),
+        encoding: SketchEncoding::MsgpackDelta,
+    };
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), delta_sample);
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "topk", &[5.0], 1000, 1010)
+        .expect("topk over a MSGPACK_DELTA heap frame should reconstruct");
+    assert_eq!(result.coverage, Some((1010, 1010)));
+
+    // (b) Reference: reconstruct the heap from scratch via the same
+    // delta-heap apply logic and assert the reducer's top-k items match
+    // (the heap is the FULL window heap, ranked /checkout > /cart).
+    let mut sorted = result.series.clone();
+    sorted.sort_by(|a, b| {
+        let va = a.1.first().map(|s| s.1).unwrap_or(0.0);
+        let vb = b.1.first().map(|s| s.1).unwrap_or(0.0);
+        vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    assert_eq!(sorted.len(), 2, "frame heap has exactly two items");
+    assert_eq!(sorted[0].0.get("item").map(String::as_str), Some("/checkout"));
+    assert_eq!(sorted[0].1.first().map(|s| s.1), Some(50.0));
+    assert_eq!(sorted[1].0.get("item").map(String::as_str), Some("/cart"));
+    assert_eq!(sorted[1].1.first().map(|s| s.1), Some(20.0));
+}
+
+#[test]
+fn count_sketch_with_heap_msgpack_delta_frequency_from_edge_golden() {
+    // The same MSGPACK_DELTA heap frame also answers the bare-frequency
+    // (FrequencyEstimate) path: a CountSketchWithHeap sid can answer
+    // point frequency from its underlying matrix. Row-0 of the frame's
+    // matrix has a single non-zero cell (0,1)=50, so the row-0 sum is 50.
+    let bytes = hex::decode(GO_DELTA_HEAP_GOLDEN_HEX).expect("hex");
+    let idx = SketchStore::new();
+    let sid = 9402;
+    idx.register(cs_heap_topk_meta(sid, 5, 1024));
+    let delta_sample = SketchSampleState {
+        bytes,
+        encoding: SketchEncoding::MsgpackDelta,
+    };
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), delta_sample);
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate(&[sid], "frequency", &[], 1000, 1010)
+        .expect("frequency over a MSGPACK_DELTA heap frame should reconstruct");
+    assert_eq!(result.series.len(), 1);
+    let (_lv, samples) = &result.series[0];
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].1, 50.0, "row-0 sum of the reconstructed matrix");
+}

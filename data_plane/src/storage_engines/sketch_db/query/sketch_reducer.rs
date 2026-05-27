@@ -60,8 +60,9 @@ use asap_sketchlib::KllSketch;
 use asap_sketchlib::MessagePackCodec;
 
 use crate::storage_engines::sketch_db::query::decoders::{
-    decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_with_heap_from_msgpack,
-    decode_cs_from_msgpack, decode_cs_from_proto,
+    decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
+    decode_cms_with_heap_from_msgpack, decode_cms_with_heap_from_msgpack_delta,
+    decode_cs_from_msgpack, decode_cs_from_proto, decode_cs_from_proto_delta,
 };
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
@@ -430,13 +431,22 @@ impl<'a> SketchReducer<'a> {
                             // outer `CountMinSketchWithHeap` envelope via
                             // msgpack (`CountSketchWithHeap` reuses the
                             // same wire shape since the heap is the
-                            // distinguishing payload).
-                            decode_cms_with_heap_from_msgpack(&state.bytes).map_err(|e| {
-                                ASAPTierError::DeserializeFailure {
-                                    sid,
-                                    encoding: state.encoding,
-                                    reason: e,
+                            // distinguishing payload). A FULL frame
+                            // deserializes directly; a MSGPACK_DELTA frame
+                            // (the delta-heap wire form produced by the
+                            // delta-heap ingest path) is reconstructed by
+                            // applying its sparse matrix delta + full heap
+                            // onto an empty base (per-window-reset).
+                            let decoded = match state.encoding {
+                                SketchEncoding::MsgpackDelta => {
+                                    decode_cms_with_heap_from_msgpack_delta(&state.bytes)
                                 }
+                                _ => decode_cms_with_heap_from_msgpack(&state.bytes),
+                            };
+                            decoded.map_err(|e| ASAPTierError::DeserializeFailure {
+                                sid,
+                                encoding: state.encoding,
+                                reason: e,
                             })?
                         }
                         SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
@@ -1402,9 +1412,18 @@ fn decode_frequency_total(
                         .map_err(|e| to_err(e, state.encoding))?,
                     SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
                         .map_err(|e| to_err(e, state.encoding))?,
-                    SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                    // PROTO_DELTA: reconstruct the window's full state by
+                    // applying the sparse cell delta onto an empty base
+                    // (per-window-reset contract — see decoders.rs).
+                    SketchEncoding::ProtoDelta => decode_cms_from_proto_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    // MSGPACK_DELTA is the heap-bearing wire form; a
+                    // heap-LESS CountMin sid never carries it.
+                    SketchEncoding::MsgpackDelta => {
                         return Err(to_err(
-                            "CMS delta encodings not implemented in ASAP-tier reducer".to_string(),
+                            "CountMin (heap-less) MSGPACK_DELTA is not a valid producer encoding \
+                             (msgpack-delta is the heap-bearing form)"
+                                .to_string(),
                             state.encoding,
                         ));
                     }
@@ -1419,9 +1438,15 @@ fn decode_frequency_total(
                 SketchEncoding::MsgpackFull => {
                     decode_cs_from_msgpack(&state.bytes).map_err(|e| to_err(e, state.encoding))?
                 }
-                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                // PROTO_DELTA: reconstruct the window's full state by
+                // applying the sparse cell delta onto an empty base.
+                SketchEncoding::ProtoDelta => {
+                    decode_cs_from_proto_delta(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
+                SketchEncoding::MsgpackDelta => {
                     return Err(to_err(
-                        "CountSketch delta encodings not implemented in ASAP-tier reducer"
+                        "CountSketch (heap-less) MSGPACK_DELTA is not a valid producer encoding \
+                         (msgpack-delta is the heap-bearing form)"
                             .to_string(),
                         state.encoding,
                     ));
@@ -1430,10 +1455,19 @@ fn decode_frequency_total(
             Ok(row0_sum_cs(&cs))
         }
         // Heap-bearing variants: decode via the CMS-with-heap envelope
-        // and read the underlying CMS matrix the same way.
+        // and read the underlying CMS matrix the same way. A FULL frame
+        // (MSGPACK / PROTO) deserializes directly; a MSGPACK_DELTA frame
+        // (the delta-heap wire form) is reconstructed by applying the
+        // sparse matrix delta + full heap onto an empty base.
         SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
-            let heap = decode_cms_with_heap_from_msgpack(&state.bytes)
-                .map_err(|e| to_err(e, state.encoding))?;
+            let heap = match state.encoding {
+                SketchEncoding::MsgpackDelta => {
+                    decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?
+                }
+                _ => decode_cms_with_heap_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+            };
             let matrix = heap.sketch_matrix();
             Ok(row0_sum_from_matrix(&matrix))
         }

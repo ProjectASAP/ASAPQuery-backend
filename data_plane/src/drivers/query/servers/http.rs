@@ -756,6 +756,48 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                         backend = StorageBackend::SketchStore;
                     }
 
+                    // ── Archive override for topk with no heap-bearing sid ──
+                    // Finding P1: a `topk(...)` query requires a
+                    // `FrequencyTopk` capability, which only a heap-BEARING
+                    // warm sid (`CountMinSketchWithHeap` /
+                    // `CountSketchWithHeap`) can satisfy. When the control
+                    // plane plans a heap-LESS `CountSketch` for the metric,
+                    // `build_routing_entry` leaves the `Topk` shape on the
+                    // warm tier (`SketchStore`) on the assumption that the
+                    // sketch can answer it — but a heap-less sketch
+                    // capability-misses on `FrequencyTopk`. Because the
+                    // `SketchStore` axis dispatches the ASAP engine
+                    // *directly* (`process_via_simple_engine`, no router),
+                    // that miss never reaches the archive failover the
+                    // `EngineRouter` would otherwise perform, so the caller
+                    // got `data_source: asap_query` "No result" instead of
+                    // an exact answer from raw data.
+                    //
+                    // Push such queries to the archive so they dispatch
+                    // through `process_via_router` (which fails over the
+                    // `[SketchStore, GorillaObjectStore]` sequence and
+                    // answers from Thanos). Only do this when the warm tier
+                    // genuinely cannot serve the topk: NO heap-bearing
+                    // `FrequencyTopk` sid AND no `ExactAgg(Sum)` sid (the
+                    // latter is handled by `try_topk_over_rate_fallback`
+                    // for `topk(K, sum by (..) (rate(..)))` shapes, already
+                    // pulled back to `SketchStore` by the override above).
+                    if matches!(backend, StorageBackend::SketchStore)
+                        && matches!(shape, crate::storage_engines::types::QueryShape::Topk)
+                        && !metric_has_frequency_topk_sid(&state.sketch_index, &metric_name)
+                        && !metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                    {
+                        debug!(
+                            "resolve_metric_storage: overriding SketchStore → \
+                             GorillaObjectStore for metric={} shape={:?} (no \
+                             heap-bearing FrequencyTopk sid and no ExactAgg(Sum) \
+                             sid; warm tier cannot answer topk, routing to \
+                             archive for an exact answer)",
+                            metric_name, shape,
+                        );
+                        backend = StorageBackend::GorillaObjectStore;
+                    }
+
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
                         tenant, metric_name, shape, backend,
@@ -811,6 +853,42 @@ fn metric_has_exact_agg_sum_sid(
                             | AggregationType::MultipleIncrease
                     )
                 ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True when the sketch index carries at least one heap-BEARING
+/// `FrequencyTopk` sid (`CountMinSketchWithHeap` / `CountSketchWithHeap`)
+/// for `metric_name`. Used by [`resolve_metric_storage`] to decide
+/// whether a `topk(...)` shape left on the warm tier can actually be
+/// answered there: only a heap-bearing sid can enumerate top-k items.
+/// A heap-less `CountMinSketch` / `CountSketch` sid (registered under
+/// `Capability::FrequencyEstimate`) does NOT count — it capability-misses
+/// on `FrequencyTopk`, so the query must route to the archive instead.
+///
+/// Mirrors `metric_has_exact_agg_sum_sid`'s any-sid (group-by-agnostic)
+/// scan — we only care whether the metric has ANY heap-bearing topk sid;
+/// the engine's per-candidate dispatch handles the per-group-by match.
+fn metric_has_frequency_topk_sid(
+    idx: &crate::storage_engines::sketch_db::index::SketchStore,
+    metric_name: &str,
+) -> bool {
+    use crate::storage_engines::sketch_db::index::Capability;
+    let sids = idx.instances_matching(metric_name, &std::collections::BTreeSet::new());
+    for sid in sids {
+        if let Some(meta) = idx.instance(sid) {
+            if let Some(cap) = meta.capability.as_ref() {
+                // `FrequencyTopk(_)` is only ever registered for
+                // heap-bearing handles (see `policy_capability` /
+                // ingest's `CountMinSketchWithHeap` /
+                // `CountSketchWithHeap` arms). Heap-less variants are
+                // registered under `FrequencyEstimate`, so matching the
+                // variant alone is the correct heap-bearing predicate.
+                if matches!(cap, Capability::FrequencyTopk(_)) {
                     return true;
                 }
             }
@@ -3691,6 +3769,56 @@ aggregations:
             gorilla_calls.load(Ordering::SeqCst),
             0,
             "v7 dual-routing: quantile must NOT hit the archive engine",
+        );
+    }
+
+    #[tokio::test]
+    async fn http_topk_with_no_heap_sid_routes_to_archive() {
+        // Finding P1: the control plane plans a heap-LESS `CountSketch`
+        // for `top_endpoint_qps`, so its routing table leaves the `Topk`
+        // shape on the warm tier (`SketchStore`). But a heap-less sketch
+        // capability-misses on `FrequencyTopk`, and the `SketchStore`
+        // axis dispatches the ASAP engine directly — so the miss never
+        // reaches the archive failover and the caller got
+        // `data_source: asap_query` "No result". `resolve_metric_storage`
+        // now detects that the metric has no heap-bearing `FrequencyTopk`
+        // sid (here: an empty warm index) and reroutes the topk to the
+        // archive, which answers exactly via `process_via_router`.
+        use crate::storage_engines::types::{BackendStorageRouting, RoutingTarget};
+        let mut metrics = std::collections::HashMap::new();
+        metrics.insert(
+            "top_endpoint_qps".to_string(),
+            // Single always-target on the warm tier — mirrors the
+            // control plane's CountSketch plan, which keeps Topk on
+            // SketchStore rather than claiming it for the archive.
+            vec![RoutingTarget::always(StorageBackend::SketchStore)],
+        );
+        let routing = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
+
+        let (gorilla, gorilla_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port =
+            setup_test_server_with_routing_table(routing, vec![gorilla as Arc<dyn QueryEngine>])
+                .await;
+
+        let client = Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .query(&[("query", "topk(5, top_endpoint_qps)"), ("time", "1700000000")])
+            .send()
+            .await
+            .expect("Failed to send request");
+        assert!(
+            resp.status().is_success(),
+            "topk with no heap-bearing sid must fail over to the archive (2xx); got {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_data_source(&body, "thanos_query");
+        assert_eq!(
+            gorilla_calls.load(Ordering::SeqCst),
+            1,
+            "topk(top_endpoint_qps) must reach the archive engine exactly once",
         );
     }
 

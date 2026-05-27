@@ -290,6 +290,30 @@ pub struct EdgeStageConfig {
     /// Empty map (default) ⇒ no metric carries sampling — backward-compat.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_sample_p: HashMap<String, f64>,
+    /// Per-metric **inner item dimension** for the item-counting sketch
+    /// families (HLL / CountSketch / CountMinSketch): the data-point
+    /// attribute whose VALUE is the "item" the sketch counts or ranks (e.g.
+    /// `user_id` for `unique_users_per_min`, `endpoint` for
+    /// `top_endpoint_qps` / `endpoint_request_freq`), populated by the
+    /// planner from each workload entry's
+    /// [`crate::workload::WorkloadEntry::item_label`] via
+    /// [`crate::emit::collect_metric_to_item_label`].
+    ///
+    /// The fused `asap_edge` emitter (`emit_edge_yaml_asap_edge`) writes this
+    /// onto the per-metric sketch entry as `item_label`, telling the agent
+    /// to fold the named high-cardinality attribute INTO the sketch instead
+    /// of leaving it in the sketch's series key. Without it the inner
+    /// attribute (`user_id` / `endpoint`) lands in the series key, minting
+    /// one cardinality-1 HLL per distinct value instead of one HLL per
+    /// grouping (zone) — the HLL/CMS warm queries then return semantically
+    /// wrong / empty results.
+    ///
+    /// For the CountSketch family the emitter falls back to the metric-name
+    /// convention (`countsketch_item_label_for`) when a metric is absent
+    /// from this map, preserving the prior behaviour. Empty map (default) ⇒
+    /// no metric carries an explicit item dimension — backward-compat.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metric_to_item_label: HashMap<String, String>,
     /// Cold-archive **wire format** the agent's `asapedgeprocessor` ships
     /// its cold tier in. Two formats are merged in the agent:
     ///
@@ -677,6 +701,7 @@ impl Emitter for ThreeStageEmitter {
             // intchunk format (and its coldpart endpoint) is opted into by
             // a deploy-info-bearing layer post-emit (same pattern as the
             // cold endpoint above), keeping this layer deployment-agnostic.
+            metric_to_item_label: std::collections::HashMap::new(),
             cold_format: ColdFormat::default(),
             cold_coldpart_endpoint: None,
         };
