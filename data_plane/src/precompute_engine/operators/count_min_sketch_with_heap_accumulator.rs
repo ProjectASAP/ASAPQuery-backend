@@ -3,10 +3,69 @@ use crate::storage_engines::types::{
     MultipleSubpopulationAggregate, SerializableToSink,
 };
 use asap_sketchlib::{CmsHeapItem, CountMinSketchWithHeap, MessagePackCodec};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
 use promql_utilities::query_logics::enums::Statistic;
+
+/// Local serde view of the DELTA-HEAP wire frame produced by sketchlib-go's
+/// `CountSketch.SerializeMsgpackWithHeapDelta` (encoding `MSGPACK_DELTA`).
+/// Decoded with `rmp_serde` directly in the backend so NO delta API needs to
+/// be added to the public `asap_sketchlib`.
+///
+/// rmp_serde compact layout — a 4-element positional array:
+///
+///   [
+///     is_delta: bool (always true),
+///     matrix_delta: ( rows:u32, cols:u32, cells: Vec<(u32,u32,i64)> ),
+///     topk_heap: Vec<(String, f64)>,   // FULL heap, [key, value] pairs
+///     heap_size: u64,
+///   ]
+///
+/// Tuple structs deserialize from msgpack fixed arrays positionally, so this
+/// matches the Go encoder's byte layout exactly (no field names on the wire).
+#[derive(Debug, Deserialize)]
+struct HeapDeltaWire {
+    is_delta: bool,
+    matrix_delta: MatrixDeltaWire,
+    topk_heap: Vec<(String, f64)>,
+    #[allow(dead_code)]
+    heap_size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MatrixDeltaWire {
+    rows: u32,
+    cols: u32,
+    cells: Vec<(u32, u32, i64)>,
+}
+
+/// Validated/flattened view of a decoded DELTA-HEAP frame.
+struct HeapDeltaFrame {
+    rows: u32,
+    cols: u32,
+    heap_size: u64,
+    cells: Vec<(u32, u32, i64)>,
+    heap: Vec<(String, f64)>,
+}
+
+impl HeapDeltaFrame {
+    fn from_msgpack(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        let wire: HeapDeltaWire = rmp_serde::from_slice(buffer)
+            .map_err(|e| format!("decode CountSketchWithHeap delta msgpack: {e}"))?;
+        if !wire.is_delta {
+            return Err("CountSketchWithHeap delta frame has is_delta=false".into());
+        }
+        Ok(Self {
+            rows: wire.matrix_delta.rows,
+            cols: wire.matrix_delta.cols,
+            heap_size: wire.heap_size,
+            cells: wire.matrix_delta.cells,
+            heap: wire.topk_heap,
+        })
+    }
+}
 
 /// Count-Min Sketch with Heap accumulator — wraps `asap_sketchlib::CountMinSketchWithHeap`.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::message_pack_format::portable::countminsketch_topk`.
@@ -29,6 +88,110 @@ impl CountMinSketchWithHeapAccumulator {
     pub fn query_key(&self, key: &KeyByLabelValues) -> f64 {
         let key_string = key.labels.join(";");
         self.inner.estimate(&key_string)
+    }
+
+    /// Decode a heap-bearing CountSketch FULL msgpack frame
+    /// (`{sketch:[matrix,rows,cols], topk_heap, heap_size}`) into a heap
+    /// accumulator. This is the window-1 / full-frame base for the
+    /// DELTA-HEAP delta path: the backend caches THIS accumulator as the
+    /// per-series base so a later `MSGPACK_DELTA` frame applies its sparse
+    /// matrix delta onto a heap accumulator (not a plain CountSketch).
+    ///
+    /// Delegates to the PUBLIC `asap_sketchlib::CountMinSketchWithHeap::
+    /// from_msgpack` (both heap-bearing frequency variants share the wire
+    /// shape; the CountSketch-with-heap promotion is decided by the ingest
+    /// router, not the bytes).
+    pub fn from_msgpack_with_heap_bytes(
+        buffer: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            inner: CountMinSketchWithHeap::from_msgpack(buffer)
+                .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))?,
+        })
+    }
+
+    /// Apply a DELTA-HEAP msgpack frame (encoding `MSGPACK_DELTA`) onto this
+    /// accumulator IN PLACE, WITHOUT any change to the public
+    /// `asap_sketchlib`: the frame is decoded generically with `rmp_serde`
+    /// into local serde structs, the sparse signed cell deltas are added to
+    /// the stored matrix (read back via the public `sketch_matrix()`), and
+    /// the top-k heap is REPLACED with the frame's full heap. The rebuilt
+    /// inner is produced via the public `from_legacy_matrix`, which rounds
+    /// cells to the i64 storage and re-seeds the heap.
+    ///
+    /// Under the per-window-reset model (`docs/delta-baseline-contract.md`
+    /// §3) the ingest caller resets this accumulator to empty at a window
+    /// boundary before applying, so the delta — which is the window's own
+    /// matrix against an empty base — reconstructs the window's state.
+    pub fn apply_msgpack_heap_delta_bytes(
+        &mut self,
+        buffer: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let frame = HeapDeltaFrame::from_msgpack(buffer)?;
+
+        let rows = self.inner.rows();
+        let cols = self.inner.cols();
+        let heap_size = self.inner.heap_size;
+
+        // Read the current (post-reset, possibly empty) matrix and apply the
+        // sparse signed deltas additively. Cells outside the stored
+        // dimensions are skipped defensively (mirrors the plain-CountSketch
+        // delta apply).
+        let mut matrix = self.inner.sketch_matrix();
+        for (r, c, dc) in &frame.cells {
+            let (r, c) = (*r as usize, *c as usize);
+            if r >= rows || c >= cols {
+                continue;
+            }
+            matrix[r][c] += *dc as f64;
+        }
+
+        // Replace the heap with the frame's full heap. `from_legacy_matrix`
+        // re-seeds both the matrix and the heap from these inputs.
+        let heap: Vec<CmsHeapItem> = frame
+            .heap
+            .into_iter()
+            .map(|(key, value)| CmsHeapItem { key, value })
+            .collect();
+
+        self.inner =
+            CountMinSketchWithHeap::from_legacy_matrix(matrix, heap, rows, cols, heap_size);
+        Ok(())
+    }
+
+    /// Reconstruct a heap accumulator STANDALONE from a single DELTA-HEAP
+    /// msgpack frame (encoding `MSGPACK_DELTA`), with NO cached per-series
+    /// base. Used by the read-side reducer's `FrequencyTopk` path, where —
+    /// unlike the ingest accumulator — there is no rolling base to apply
+    /// onto: under the per-window-reset contract
+    /// (`docs/delta-baseline-contract.md` §3) each window's delta encodes
+    /// that window's own state against an EMPTY base, so reconstruction is
+    /// "empty(dims) + apply(delta)".
+    ///
+    /// Reuses the exact ingest-side apply logic: read the (rows, cols,
+    /// heap_size) the frame declares, build an empty accumulator of those
+    /// dims (equivalent to `reset_to_empty` on a same-shape base), then
+    /// fold the frame in via `apply_msgpack_heap_delta_bytes`. No
+    /// `asap_sketchlib` change — the frame is decoded generically with
+    /// `rmp_serde`.
+    pub fn from_msgpack_heap_delta_bytes(
+        buffer: &[u8],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let frame = HeapDeltaFrame::from_msgpack(buffer)?;
+        if frame.rows == 0 || frame.cols == 0 {
+            return Err(format!(
+                "CountSketchWithHeap delta frame has zero dims (rows={}, cols={})",
+                frame.rows, frame.cols
+            )
+            .into());
+        }
+        let mut acc = Self::new(
+            frame.rows as usize,
+            frame.cols as usize,
+            frame.heap_size as usize,
+        );
+        acc.apply_msgpack_heap_delta_bytes(buffer)?;
+        Ok(acc)
     }
 
     /// This function seems will never be used anymore. Keep it for possible future use.
@@ -134,6 +297,20 @@ impl AggregateCore for CountMinSketchWithHeapAccumulator {
 
     fn type_name(&self) -> &'static str {
         "CountMinSketchWithHeapAccumulator"
+    }
+
+    /// Per-window base rotation (`docs/delta-baseline-contract.md` §3):
+    /// rebuild an empty heap accumulator with the same (rows, cols,
+    /// heap_size) so the next window's DELTA-HEAP frame applies onto a clean,
+    /// same-shape base. Without this override the trait default is a no-op,
+    /// which would let the additive matrix delta accumulate across windows
+    /// (over-counting). Mirrors `CountSketchAccumulator::reset_to_empty`.
+    fn reset_to_empty(&mut self) {
+        self.inner = CountMinSketchWithHeap::new(
+            self.inner.rows(),
+            self.inner.cols(),
+            self.inner.heap_size,
+        );
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -342,5 +519,165 @@ mod tests {
         let keys = multi_trait.get_keys();
         assert!(keys.is_some());
         assert_eq!(keys.unwrap().len(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // DELTA-HEAP wire form (encoding MSGPACK_DELTA): apply a sparse matrix
+    // delta + replace the heap, decoded generically (rmp_serde) WITHOUT any
+    // asap_sketchlib delta API. The first test feeds a frame produced by the
+    // Go encoder (sketchlib-go `MarshalCountSketchWithHeapDelta`) to prove
+    // cross-language byte parity — mirrors how the full-heap parity is
+    // proven. The second proves PWR full -> delta -> delta reconstruction.
+    // ----------------------------------------------------------------
+
+    /// Cross-language byte-parity: this hex is the exact output of
+    /// sketchlib-go's `asapmsgpack.MarshalCountSketchWithHeapDelta(5, 1024,
+    /// cells=[(0,1,50),(1,3,-4),(4,1023,1_000_000)],
+    /// heap=[("/checkout",50),("/cart",20)], heap_size=20)` (captured via a
+    /// throw-away Go print test, identical methodology to the full-heap
+    /// golden in `sketchlib-go/.../count_sketch_with_heap_test.go`). If the
+    /// Go encoder or the rmp_serde layout ever shifts, this decode fails
+    /// loudly.
+    const GO_DELTA_HEAP_GOLDEN_HEX: &str = "94c39305cd04009393000132930103fc9304cd03ffce000f42409292a92f636865636b6f7574cb404900000000000092a52f63617274cb403400000000000014";
+
+    #[test]
+    fn test_apply_go_produced_delta_heap_frame_matrix_and_heap() {
+        let bytes = hex::decode(GO_DELTA_HEAP_GOLDEN_HEX).expect("hex");
+
+        // Base = empty heap accumulator with the frame's dims (what the
+        // ingest caller holds after the per-window base rotation).
+        let mut acc = CountMinSketchWithHeapAccumulator::new(5, 1024, 20);
+        acc.apply_msgpack_heap_delta_bytes(&bytes)
+            .expect("apply Go delta-heap frame");
+
+        // Matrix: the three sparse cells landed onto the empty base.
+        let m = acc.inner.sketch_matrix();
+        assert_eq!(m.len(), 5);
+        assert_eq!(m[0].len(), 1024);
+        assert_eq!(m[0][1], 50.0, "cell (0,1)");
+        assert_eq!(m[1][3], -4.0, "cell (1,3)");
+        assert_eq!(m[4][1023], 1_000_000.0, "cell (4,1023)");
+        // Everything else stays zero.
+        assert_eq!(m[2][2], 0.0);
+        assert_eq!(m[0][0], 0.0);
+
+        // Heap: the frame's full heap, with /checkout ranked above /cart.
+        let mut items = acc.inner.topk_heap_items();
+        items.sort_by(|a, b| b.value.partial_cmp(&a.value).unwrap());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "/checkout");
+        assert_eq!(items[0].value, 50.0);
+        assert_eq!(items[1].key, "/cart");
+        assert_eq!(items[1].value, 20.0);
+    }
+
+    #[test]
+    fn test_pwr_full_then_delta_then_delta_reconstructs_per_window() {
+        use asap_sketchlib::MessagePackCodec;
+
+        // Window 1 (full frame): build a heap-bearing CountSketch with mass
+        // and serialize the FULL `{sketch,topk_heap,heap_size}` frame, then
+        // decode it into a heap accumulator (the cached per-series base).
+        let w1 = CountMinSketchWithHeap::from_legacy_matrix(
+            vec![vec![300.0; 4]; 5],
+            vec![CmsHeapItem { key: "k".into(), value: 300.0 }],
+            5,
+            4,
+            20,
+        );
+        let w1_bytes = w1.to_msgpack().expect("w1 full msgpack");
+        let mut base =
+            CountMinSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(&w1_bytes)
+                .expect("decode w1 full frame as heap accumulator");
+        assert_eq!(base.inner.sketch_matrix()[0][0], 300.0);
+
+        // Window 2 delta: this window's own state is matrix cells of value 50
+        // against an EMPTY base + heap {k:50}. The DELTA-HEAP frame is encoded
+        // the same way the Go producer does (4-array, is_delta, sparse cells).
+        let w2_frame = encode_delta_heap(
+            5,
+            4,
+            &[(0, 0, 50), (1, 1, 50)],
+            &[("k", 50.0)],
+            20,
+        );
+        // PWR: rotate base to empty at the window boundary, then apply.
+        base.reset_to_empty();
+        assert_eq!(base.inner.sketch_matrix()[0][0], 0.0, "reset_to_empty cleared matrix");
+        base.apply_msgpack_heap_delta_bytes(&w2_frame)
+            .expect("apply w2 delta");
+        assert_eq!(base.inner.sketch_matrix()[0][0], 50.0, "window-2 cell");
+        assert_eq!(base.inner.sketch_matrix()[1][1], 50.0);
+        // No cross-window leakage from window 1's 300s.
+        assert_eq!(base.inner.sketch_matrix()[2][2], 0.0);
+        let h2: Vec<_> = base.inner.topk_heap_items();
+        assert_eq!(h2.len(), 1);
+        assert_eq!(h2[0].key, "k");
+        assert_eq!(h2[0].value, 50.0);
+
+        // Window 3 delta: 80s against empty + heap {k:80}.
+        let w3_frame = encode_delta_heap(5, 4, &[(0, 0, 80)], &[("k", 80.0)], 20);
+        base.reset_to_empty();
+        base.apply_msgpack_heap_delta_bytes(&w3_frame)
+            .expect("apply w3 delta");
+        assert_eq!(base.inner.sketch_matrix()[0][0], 80.0, "window-3 cell");
+        assert_eq!(base.inner.sketch_matrix()[1][1], 0.0, "no window-2 leakage");
+        let h3 = base.inner.topk_heap_items();
+        assert_eq!(h3.len(), 1);
+        assert_eq!(h3[0].value, 80.0);
+    }
+
+    #[test]
+    fn test_rmp_serde_layout_is_byte_identical_to_go_encoder() {
+        // The rmp_serde positional encoding of the delta-heap frame must be
+        // BYTE-IDENTICAL to sketchlib-go's hand-rolled
+        // `MarshalCountSketchWithHeapDelta`. This hex is the Go encoder's
+        // output for (5, 4, cells=[(0,0,50),(1,1,50)], heap=[("k",50)],
+        // heap_size=20) — the same inputs `encode_delta_heap` uses below.
+        // Equality here proves both encode AND decode are cross-language
+        // byte-compatible (the decode path is exercised by the Go-golden
+        // test above).
+        const GO_PARITY_HEX: &str =
+            "94c39305049293000032930101329192a16bcb404900000000000014";
+        let rust_bytes = encode_delta_heap(5, 4, &[(0, 0, 50), (1, 1, 50)], &[("k", 50.0)], 20);
+        assert_eq!(hex::encode(&rust_bytes), GO_PARITY_HEX);
+    }
+
+    #[test]
+    fn test_apply_delta_rejects_full_frame_and_garbage() {
+        use asap_sketchlib::MessagePackCodec;
+        let mut acc = CountMinSketchWithHeapAccumulator::new(2, 4, 5);
+        // A FULL frame (3-array, no is_delta marker) must NOT decode as a
+        // delta — the routing relies on the two shapes being distinct.
+        let full = CountMinSketchWithHeap::from_legacy_matrix(
+            vec![vec![1.0; 4]; 2],
+            vec![CmsHeapItem { key: "a".into(), value: 1.0 }],
+            2,
+            4,
+            5,
+        )
+        .to_msgpack()
+        .unwrap();
+        assert!(acc.apply_msgpack_heap_delta_bytes(&full).is_err());
+        assert!(acc.apply_msgpack_heap_delta_bytes(b"not msgpack").is_err());
+    }
+
+    /// Encode a DELTA-HEAP frame the same way sketchlib-go's
+    /// `MarshalCountSketchWithHeapDelta` does (rmp_serde positional layout),
+    /// so the test exercises the real decode path. Tuple structs serialize
+    /// as msgpack fixed arrays — byte-identical to the Go hand-rolled writer.
+    fn encode_delta_heap(
+        rows: u32,
+        cols: u32,
+        cells: &[(u32, u32, i64)],
+        heap: &[(&str, f64)],
+        heap_size: u64,
+    ) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct W<'a>(bool, (u32, u32, &'a [(u32, u32, i64)]), Vec<(String, f64)>, u64);
+        let heap_owned: Vec<(String, f64)> =
+            heap.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let w = W(true, (rows, cols, cells), heap_owned, heap_size);
+        rmp_serde::to_vec(&w).expect("encode delta-heap")
     }
 }

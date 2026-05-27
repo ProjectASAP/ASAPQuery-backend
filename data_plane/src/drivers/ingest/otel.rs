@@ -1895,6 +1895,25 @@ fn decode_modified_otlp_sketch_bytes(
                 bytes,
             )?)),
             SketchKind::CountSketch => {
+                // Heap-bearing CountSketch full frame: the bytes are the
+                // `{sketch,topk_heap,heap_size}` envelope (a DIFFERENT inner
+                // field order than the plain CountSketch msgpack), so
+                // `CountSketch::from_msgpack` can't parse it. Try the heap
+                // decode FIRST when the heap is non-empty (the same promotion
+                // gate `sketch_kind_handle_for` uses); cache THAT heap
+                // accumulator as the per-series base so a later MSGPACK_DELTA
+                // frame applies its matrix delta + heap onto a heap
+                // accumulator. Fall back to the plain CountSketch decode for
+                // heap-less msgpack frames (byte-parity path, PR I).
+                use asap_sketchlib::CountMinSketchWithHeap;
+                if let Ok(heap) = CountMinSketchWithHeap::from_msgpack(bytes) {
+                    if !heap.topk_heap_items().is_empty() {
+                        use crate::precompute_engine::operators::CountMinSketchWithHeapAccumulator;
+                        return Ok(Box::new(
+                            CountMinSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
+                        ));
+                    }
+                }
                 Ok(Box::new(CountSketchAccumulator::from_msgpack_bytes(bytes)?))
             }
             SketchKind::Kll => Ok(Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(
@@ -1951,8 +1970,8 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::precompute_engine::operators::{
-        CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
-        HllSketchAccumulator,
+        CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
+        DDSketchAccumulator, HllSketchAccumulator,
     };
 
     match (encoding, kind) {
@@ -2001,9 +2020,32 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
              DDSketch / HLL / CountSketch / CountMin are wired"
         )
         .into()),
-        (ENCODING_MSGPACK_DELTA, _) => {
-            Err("MSGPACK_DELTA encoding is not yet wired; PR G covers PROTO_DELTA only".into())
+        (ENCODING_MSGPACK_DELTA, SketchKind::CountSketch) => {
+            // DELTA-HEAP frame for the heap-bearing CountSketch: a sparse
+            // signed matrix delta + the full top-k heap. The cached base is
+            // a heap accumulator (window-1 full frame decoded via
+            // `from_msgpack_with_heap_bytes`); under the per-window-reset
+            // model the ingest caller has already reset it to empty at a
+            // window boundary, so applying the delta reconstructs the
+            // window's own matrix and replaces the heap. Decoded generically
+            // in `apply_msgpack_heap_delta_bytes` (rmp_serde, no
+            // `asap_sketchlib` delta API).
+            let heap = existing
+                .as_any_mut()
+                .downcast_mut::<CountMinSketchWithHeapAccumulator>()
+                .ok_or(
+                    "apply_modified_otlp_delta_bytes: existing accumulator is \
+                     not a CountMinSketchWithHeapAccumulator (heap-bearing \
+                     CountSketch delta requires a heap base — the window-1 \
+                     full frame must have promoted the sid)",
+                )?;
+            heap.apply_msgpack_heap_delta_bytes(bytes)
         }
+        (ENCODING_MSGPACK_DELTA, other) => Err(format!(
+            "MSGPACK_DELTA for sketch kind {other:?} is not yet wired; only \
+             the heap-bearing CountSketch DELTA-HEAP frame is supported"
+        )
+        .into()),
         (ENCODING_PROTO, _) | (ENCODING_MSGPACK, _) => Err(format!(
             "encoding {encoding} is a full-state frame — route through \
              `decode_modified_otlp_sketch_bytes` and replace the cached \

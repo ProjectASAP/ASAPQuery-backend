@@ -16,9 +16,13 @@
 //! to archive cleanly.
 
 use asap_sketchlib::CountMinSketch;
+use asap_sketchlib::CountMinSketchDelta;
 use asap_sketchlib::CountMinSketchWithHeap;
 use asap_sketchlib::CountSketch;
+use asap_sketchlib::CountSketchDelta;
 use asap_sketchlib::MessagePackCodec;
+
+use crate::precompute_engine::operators::count_min_sketch_with_heap_accumulator::CountMinSketchWithHeapAccumulator;
 
 /// Decode a `CountMinSketch` from the modified-OTLP wire bytes.
 /// MSGPACK path round-trips `CountMinSketch::deserialize_msgpack`;
@@ -179,4 +183,129 @@ pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
 pub fn decode_cms_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountMinSketchWithHeap, String> {
     CountMinSketchWithHeap::from_msgpack(buffer)
         .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Delta decoders. Under the per-window-reset (PWR) contract
+// (`asap-precompute-go/window.go`: a delta is that window's own state
+// applied onto a freshly-reset per-series sketch), each stored *Delta
+// frame reconstructs into the FULL window state when applied onto an
+// EMPTY base of the frame's declared dimensions. The reducer's
+// `FrequencyEstimate` / `FrequencyTopk` paths are per-window evaluations,
+// so "empty + apply(this window's delta)" yields exactly the window's
+// matrix/heap — no cross-window stitching needed (mirrors how the ingest
+// accumulators reset_to_empty per window before applying).
+//
+// The proto path reuses the PUBLIC `asap_sketchlib::{CountSketch,
+// CountMinSketch}::apply_delta`; the proto `*Delta` message is decoded via
+// `asap_sketchlib::proto::sketchlib::{CountSketchDelta, CountMinDelta}`,
+// exactly as `precompute_operators::{count_sketch,
+// count_min_sketch}_accumulator::apply_proto_delta_bytes` does.
+// ---------------------------------------------------------------------------
+
+/// Decode a `CountMinSketch` PROTO_DELTA frame into a FULL sketch by
+/// applying the sparse cell delta onto an empty base of the frame's
+/// declared dimensions. Mirrors
+/// `precompute_operators::count_min_sketch_accumulator::apply_proto_delta_bytes`.
+pub fn decode_cms_from_proto_delta(buffer: &[u8]) -> Result<CountMinSketch, String> {
+    use asap_sketchlib::proto::sketchlib::CountMinDelta as PbDelta;
+    use prost::Message;
+
+    let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountMinDelta: {e}"))?;
+    if pb.cell_rows.len() != pb.cell_cols.len() || pb.cell_rows.len() != pb.d_counts.len() {
+        return Err(format!(
+            "CountMinDelta packed-array length mismatch: cell_rows={}, cell_cols={}, d_counts={}",
+            pb.cell_rows.len(),
+            pb.cell_cols.len(),
+            pb.d_counts.len()
+        ));
+    }
+    let rows = pb.rows as usize;
+    let cols = pb.cols as usize;
+    if rows == 0 || cols == 0 {
+        return Err(format!(
+            "CountMinDelta has zero dims (rows={rows}, cols={cols})"
+        ));
+    }
+    let cells = pb
+        .cell_rows
+        .iter()
+        .zip(pb.cell_cols.iter())
+        .zip(pb.d_counts.iter())
+        .map(|((r, c), dc)| (*r, *c, *dc))
+        .collect();
+    // hh_keys is parsed off the wire by the precompute accumulator but
+    // intentionally dropped (the vendored Go proto bindings don't yet
+    // populate it); match that to keep behavior identical.
+    let delta = CountMinSketchDelta {
+        rows: pb.rows,
+        cols: pb.cols,
+        cells,
+        l1: pb.l1,
+        l2: pb.l2,
+        hh_keys: Vec::new(),
+    };
+    let mut cms = CountMinSketch::from_legacy_matrix(vec![vec![0.0; cols]; rows], rows, cols);
+    cms.apply_delta(&delta)
+        .map_err(|e| format!("apply CountMinDelta onto empty base: {e}"))?;
+    Ok(cms)
+}
+
+/// Decode a `CountSketch` PROTO_DELTA frame into a FULL sketch by applying
+/// the sparse cell delta onto an empty base of the frame's declared
+/// dimensions. Mirrors
+/// `precompute_operators::count_sketch_accumulator::apply_proto_delta_bytes`.
+pub fn decode_cs_from_proto_delta(buffer: &[u8]) -> Result<CountSketch, String> {
+    use asap_sketchlib::proto::sketchlib::CountSketchDelta as PbDelta;
+    use prost::Message;
+
+    let pb = PbDelta::decode(buffer).map_err(|e| format!("decode CountSketchDelta: {e}"))?;
+    if pb.cell_rows.len() != pb.cell_cols.len() || pb.cell_rows.len() != pb.d_counts.len() {
+        return Err(format!(
+            "CountSketchDelta packed-array length mismatch: cell_rows={}, cell_cols={}, d_counts={}",
+            pb.cell_rows.len(),
+            pb.cell_cols.len(),
+            pb.d_counts.len()
+        ));
+    }
+    let rows = pb.rows as usize;
+    let cols = pb.cols as usize;
+    if rows == 0 || cols == 0 {
+        return Err(format!(
+            "CountSketchDelta has zero dims (rows={rows}, cols={cols})"
+        ));
+    }
+    let cells = pb
+        .cell_rows
+        .iter()
+        .zip(pb.cell_cols.iter())
+        .zip(pb.d_counts.iter())
+        .map(|((r, c), dc)| (*r, *c, *dc))
+        .collect();
+    let delta = CountSketchDelta {
+        rows: pb.rows,
+        cols: pb.cols,
+        cells,
+        l2: pb.l2,
+        hh_keys: Vec::new(),
+    };
+    let mut cs = CountSketch::from_legacy_matrix(vec![vec![0.0; cols]; rows], rows, cols);
+    cs.apply_delta(&delta)
+        .map_err(|e| format!("apply CountSketchDelta onto empty base: {e}"))?;
+    Ok(cs)
+}
+
+/// Decode a heap-bearing CountSketch MSGPACK_DELTA frame into a FULL
+/// `CountMinSketchWithHeap` by applying the sparse matrix delta + full
+/// heap onto an empty base of the frame's declared dimensions. This
+/// REUSES the ingest-side delta-heap apply logic
+/// (`CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes` →
+/// `apply_msgpack_heap_delta_bytes`), which decodes the frame generically
+/// with `rmp_serde` — no `asap_sketchlib` delta API is added.
+pub fn decode_cms_with_heap_from_msgpack_delta(
+    buffer: &[u8],
+) -> Result<CountMinSketchWithHeap, String> {
+    let acc = CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(buffer)
+        .map_err(|e| format!("reconstruct CountMinSketchWithHeap from delta: {e}"))?;
+    Ok(acc.inner)
 }
