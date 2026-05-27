@@ -436,42 +436,42 @@ impl ASAPQueryEngine {
         // for the same metric should fall back to the analyzer's
         // FrequencyTopk path (which will rightly capability-miss
         // until CMS-with-heap is wired).
+        // P2-2: borrow each candidate's metadata under the read lock to
+        // test the ExactAgg(Sum-family) capability — no per-candidate
+        // metadata clone. Capture the agg_type of the first matching sid
+        // in the same pass so we don't re-look-up (and re-clone) it
+        // afterward.
         let mut hit_sids: Vec<u64> = Vec::new();
+        let mut first_agg_type: Option<crate::storage_engines::sketch_db::data::AggregationType> =
+            None;
         for sid in &candidate_sids {
-            let Some(meta) = idx.instance(*sid) else { continue };
-            if let Some(cap) = meta.capability.as_ref() {
-                use crate::storage_engines::sketch_db::data::AggregationType;
-                use crate::storage_engines::sketch_db::index::Capability;
-                if matches!(
-                    cap,
-                    Capability::ExactAgg(
-                        AggregationType::Sum
-                            | AggregationType::MultipleSum
-                            | AggregationType::Increase
-                            | AggregationType::MultipleIncrease
-                    )
-                ) {
-                    hit_sids.push(*sid);
+            use crate::storage_engines::sketch_db::data::AggregationType;
+            use crate::storage_engines::sketch_db::index::Capability;
+            let agg_type = idx.with_instance(*sid, |m| match m.capability.as_ref() {
+                Some(Capability::ExactAgg(
+                    t @ (AggregationType::Sum
+                    | AggregationType::MultipleSum
+                    | AggregationType::Increase
+                    | AggregationType::MultipleIncrease),
+                )) => Some(*t),
+                _ => None,
+            });
+            if let Some(Some(t)) = agg_type {
+                if first_agg_type.is_none() {
+                    first_agg_type = Some(t);
                 }
+                hit_sids.push(*sid);
             }
         }
         if hit_sids.is_empty() {
             return Ok(None);
         }
 
-        // Pick the agg_type from the first sid; all hits share the
-        // same family by construction (Sum / Increase variants are
-        // accumulator-compatible via `merge_with` / `Statistic::Sum`).
-        let agg_type = {
-            use crate::storage_engines::sketch_db::data::AggregationType;
-            let first = idx.instance(hit_sids[0]).and_then(|m| {
-                match m.capability.as_ref()? {
-                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(t) => Some(*t),
-                    _ => None,
-                }
-            });
-            first.unwrap_or(AggregationType::Sum)
-        };
+        // All hits share the same family by construction (Sum / Increase
+        // variants are accumulator-compatible via `merge_with` /
+        // `Statistic::Sum`); use the first matching sid's agg_type.
+        let agg_type = first_agg_type
+            .unwrap_or(crate::storage_engines::sketch_db::data::AggregationType::Sum);
 
         let lookback_ms = shape.range_seconds.saturating_mul(1000);
         let t0_ms = now_ms.saturating_sub(lookback_ms);
@@ -537,6 +537,69 @@ impl ASAPQueryEngine {
         // value per series in the slice.
         let qr = asap_tier_result_to_query_result(sliced_result, now_ms, false);
         Ok(Some(qr))
+    }
+
+    /// P1-1 — `rate(cms_metric[r])` over a warm FrequencyEstimate sid.
+    ///
+    /// The analyzer lowers `rate(...)` over any metric to
+    /// `Capability::ExactAgg(Sum) + OuterFn::Rate`. For a CMS / CountSketch
+    /// metric the registered sid carries `Capability::FrequencyEstimate`,
+    /// not `ExactAgg`, so the analyzer-driven capability match yields no
+    /// hit sids and the engine would fail over to archive. This fallback
+    /// (analogous to [`Self::try_topk_over_rate_fallback`]) resolves the
+    /// metric's FrequencyEstimate (or heap-bearing FrequencyTopk) sids and
+    /// runs [`SketchReducer::evaluate_frequency_rate`] — Σ per-window
+    /// frequency totals ÷ coverage-clamped range — to produce a per-second
+    /// rate.
+    ///
+    /// Returns `Some(result)` when at least one warm FrequencyEstimate sid
+    /// answered; `None` when none exists (caller falls over to archive) or
+    /// when the reducer produced no in-window data. Errors from the
+    /// reducer also collapse to `None` (fail over) so this never
+    /// destabilizes the working ExactAgg / count_over_time paths.
+    fn try_rate_over_frequency_fallback(
+        &self,
+        candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
+        idx: &crate::storage_engines::sketch_db::index::SketchStore,
+        reducer: &crate::storage_engines::sketch_db::query::SketchReducer<'_>,
+        now_ms: u64,
+    ) -> Option<crate::storage_engines::sketch_db::query::ASAPTierResult> {
+        use crate::storage_engines::sketch_db::index::{Capability, SidLookup};
+
+        // Resolve the metric's candidate sids and keep only warm
+        // FrequencyEstimate-answerable Hits. A heap-bearing FrequencyTopk
+        // sid also answers bare frequency (the heap is layered over the
+        // matrix), so accept either.
+        let candidate_sids =
+            idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys);
+        let mut hit_sids: Vec<u64> = Vec::new();
+        for sid in &candidate_sids {
+            if idx.classify(*sid) != SidLookup::Hit {
+                continue;
+            }
+            let is_freq = idx
+                .with_instance(*sid, |m| {
+                    matches!(
+                        m.capability.as_ref(),
+                        Some(Capability::FrequencyEstimate(_)) | Some(Capability::FrequencyTopk(_))
+                    )
+                })
+                .unwrap_or(false);
+            if is_freq {
+                hit_sids.push(*sid);
+            }
+        }
+        if hit_sids.is_empty() {
+            return None;
+        }
+
+        let lookback_ms = candidate.range_seconds.saturating_mul(1000);
+        let t0_ms = now_ms.saturating_sub(lookback_ms);
+        match reducer.evaluate_frequency_rate(&hit_sids, candidate.range_seconds, t0_ms, now_ms) {
+            Ok(res) if !res.series.is_empty() => Some(res),
+            // NoData / empty / any reducer error → fail over to archive.
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -685,14 +748,20 @@ impl ASAPQueryEngine {
                 candidate.required_capability.clone();
             let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
             for sid in &sids {
-                let meta = match idx.instance(*sid) {
-                    Some(m) => m,
-                    None => continue,
-                };
-                if let Some(cap) = meta.capability.as_ref() {
-                    if required.is_satisfied_by(cap) {
-                        hit_sids.push(*sid);
-                    }
+                // P2-2: borrow the metadata under the read lock to test
+                // capability satisfaction — no per-candidate deep clone
+                // of `SketchInstanceMetadata` (String + BTreeSet<String>
+                // + AggKind) just to inspect one field.
+                let satisfied = idx
+                    .with_instance(*sid, |m| {
+                        m.capability
+                            .as_ref()
+                            .map(|cap| required.is_satisfied_by(cap))
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if satisfied {
+                    hit_sids.push(*sid);
                 }
             }
             if hit_sids.is_empty() {
@@ -786,11 +855,16 @@ impl ASAPQueryEngine {
                             })?
                     }
                 }
+                // P2-4 (typed dispatch): route off the analyzer's typed
+                // `required_capability` via `evaluate_for_capability`
+                // instead of round-tripping it through a function-name
+                // string the reducer re-parses.
                 _ => reducer
-                    .evaluate(
+                    .evaluate_for_capability(
+                        &candidate.required_capability,
                         &hit_sids,
-                        effective_sketch_function(candidate),
                         &candidate.function_args,
+                        effective_is_cumulative(candidate),
                         start_ms,
                         end_ms,
                     )
@@ -909,6 +983,23 @@ fn effective_sketch_function(
         // than silently mis-dispatching.
         Capability::ExactAgg(_) => "",
     }
+}
+
+/// Whether the reducer should evaluate the candidate in CUMULATIVE
+/// (`*_over_time` rollup → one scalar over `[t0,t1]`) vs per-window mode.
+/// This is the only genuinely function-name-derived signal the typed
+/// [`SketchReducer::evaluate_for_capability`] dispatch needs (the family
+/// itself comes from the typed `required_capability`), so the engine
+/// computes it here from the candidate's original PromQL function name —
+/// matching exactly what the legacy `evaluate(function_name)` string
+/// entry derived from the same name.
+fn effective_is_cumulative(
+    candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
+) -> bool {
+    matches!(
+        effective_sketch_function(candidate),
+        "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
+    )
 }
 
 /// Whether the analyzer's `outer_agg` should still be folded over the
@@ -1342,32 +1433,131 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             continue;
                         }
                     }
-                    let meta = match idx.instance(*sid) {
-                        Some(m) => m,
-                        None => continue};
+                    // P2-2: borrow under the read lock to test capability
+                    // satisfaction instead of deep-cloning the metadata.
                     // Precompute-backed sids (M2.3) have `capability: None`
                     // — the analyzer doesn't route them through this path,
                     // but skip defensively if one slips in.
-                    if let Some(cap) = meta.capability.as_ref() {
-                        if required.is_satisfied_by(cap) {
-                            hit_sids.push(*sid);
-                        }
+                    let satisfied = idx
+                        .with_instance(*sid, |m| {
+                            m.capability
+                                .as_ref()
+                                .map(|cap| required.is_satisfied_by(cap))
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if satisfied {
+                        hit_sids.push(*sid);
                     }
                 }
+                // P1-1: rate over a FrequencyEstimate sid. `rate(cms_metric[r])`
+                // lowers to `ExactAgg(Sum)+Rate`, but CMS sids are registered as
+                // `FrequencyEstimate`, so no ExactAgg sid matched above and
+                // `hit_sids` is empty. Before failing over to archive, check for
+                // a warm FrequencyEstimate sid on this (metric, group_by_keys)
+                // and, if one exists, evaluate the rate via the frequency reducer
+                // path (Σ per-window frequency totals ÷ coverage-clamped range);
+                // the result joins the per-candidate accumulation below exactly
+                // like an ExactAgg-rate result. Only fires for the Rate outer-fn
+                // with a matrix range — the working ExactAgg / count_over_time
+                // paths never reach here (they match an ExactAgg sid).
+                let mut freq_rate_override: Option<
+                    crate::storage_engines::sketch_db::query::ASAPTierResult,
+                > = None;
                 if hit_sids.is_empty() {
-                    let req = Self::requirements_from_candidate(candidate);
-                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                        &self.control_plane_client,
-                        &req,
-                    );
-                    return Err(crate::query_engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchStore.data_source_id(),
-                        format!(
-                            "SketchStore has no sid satisfying capability \
-                             {:?} for metric `{}` — failing over to archive",
-                            candidate.required_capability, candidate.metric_name
-                        ),
-                    ));
+                    use control_plane::asap_tier_analysis::OuterFn;
+                    let is_exact_sum_rate = matches!(
+                        &candidate.required_capability,
+                        crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                            crate::storage_engines::sketch_db::data::AggregationType::Sum
+                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
+                                | crate::storage_engines::sketch_db::data::AggregationType::Increase
+                                | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
+                        )
+                    ) && candidate.outer_fn == OuterFn::Rate
+                        && candidate.range_seconds > 0;
+                    if is_exact_sum_rate {
+                        if let Some(res) =
+                            self.try_rate_over_frequency_fallback(candidate, idx, &reducer, now_ms)
+                        {
+                            // Bring `combined_t0` down to this rate window so
+                            // the outer time domain covers the fallback result.
+                            let lookback = candidate.range_seconds.saturating_mul(1000);
+                            let t0 = now_ms.saturating_sub(lookback);
+                            if t0 < combined_t0 {
+                                combined_t0 = t0;
+                            }
+                            freq_rate_override = Some(res);
+                        }
+                    }
+                    if freq_rate_override.is_none() {
+                        let req = Self::requirements_from_candidate(candidate);
+                        crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                            &self.control_plane_client,
+                            &req,
+                        );
+                        return Err(crate::query_engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            format!(
+                                "SketchStore has no sid satisfying capability \
+                                 {:?} for metric `{}` — failing over to archive",
+                                candidate.required_capability, candidate.metric_name
+                            ),
+                        ));
+                    }
+                }
+
+                // P2-6 (safe-miss for keyed CMS frequency). A
+                // `FrequencyEstimate` sid (CMS / CountSketch) answers only
+                // the per-window TOTAL across all items — it has no
+                // string-keyed point estimate yet. So a KEYED query like
+                // `cms_metric{item="X"}` would silently get the bucket
+                // TOTAL (every item's inserts), not item X's frequency —
+                // a wrong answer that never fails over. Detect the case
+                // and capability-miss to archive instead (which CAN answer
+                // the per-item query). The trigger is a NON-EMPTY
+                // candidate spatial filter that is NOT already baked into
+                // any matched sid's registered filter: a filter-distinct
+                // CMS policy registers its sid WITH that filter (the sketch
+                // is pre-filtered, so the total IS correct for it) and is
+                // left alone; the bare `count_over_time(cms[r])` demo has
+                // an empty filter and is unaffected. Full string-keyed
+                // estimate is a larger follow-up; the safe-miss is enough.
+                if freq_rate_override.is_none()
+                    && matches!(
+                        &candidate.required_capability,
+                        crate::storage_engines::sketch_db::index::Capability::FrequencyEstimate(_)
+                    )
+                    && !candidate.spatial_filter_canonical.is_empty()
+                {
+                    let filter_baked_into_a_hit = hit_sids.iter().any(|sid| {
+                        idx.with_instance(*sid, |m| match &m.agg_kind {
+                            crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                                spatial_filter_canonical,
+                                ..
+                            } => *spatial_filter_canonical == candidate.spatial_filter_canonical,
+                            _ => false,
+                        })
+                        .unwrap_or(false)
+                    });
+                    if !filter_baked_into_a_hit {
+                        let req = Self::requirements_from_candidate(candidate);
+                        crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                            &self.control_plane_client,
+                            &req,
+                        );
+                        return Err(crate::query_engines::EngineError::capability_miss(
+                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            format!(
+                                "SketchStore FrequencyEstimate sid for metric `{}` cannot \
+                                 answer the per-item selector `{}` (CMS/CountSketch return \
+                                 the per-window bucket TOTAL, not a string-keyed estimate) — \
+                                 failing over to archive rather than returning a misleading \
+                                 total",
+                                candidate.metric_name, candidate.spatial_filter_canonical
+                            ),
+                        ));
+                    }
                 }
 
                 // Counter-function dispatch (issue #301). The four
@@ -1476,16 +1666,27 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         now_ms,
                         accumulate_windows,
                     ),
-                    _ => reducer.evaluate(
+                    // P2-4 (typed dispatch): route off the typed
+                    // `required_capability` rather than the
+                    // function-name-string detour.
+                    _ => reducer.evaluate_for_capability(
+                        &candidate.required_capability,
                         &hit_sids,
-                        effective_sketch_function(candidate),
                         &candidate.function_args,
+                        effective_is_cumulative(candidate),
                         t0_ms,
                         now_ms,
                     ),
                 };
 
-                let result = match reducer_result {
+                // P1-1: if the frequency-rate fallback produced a result
+                // (hit_sids was empty for an ExactAgg(Sum)+Rate candidate
+                // but a warm FrequencyEstimate sid answered), use it
+                // directly; the ExactAgg dispatch above ran against an
+                // empty `hit_sids` and is moot.
+                let result = if let Some(r) = freq_rate_override {
+                    r
+                } else { match reducer_result {
                     Ok(r) => r,
                     Err(
                         crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedFunction(
@@ -1546,7 +1747,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                };
+                } };
                 // Apply the analyzer's typed outer-aggregation operator
                 // (issue #296). The inner reducer (sketch / accumulator)
                 // emits one row per natural series; if the original
@@ -3485,6 +3686,171 @@ mod asap_tier_classify_tests {
             })
             .collect();
         assert_eq!(zones, vec!["z3".to_string(), "z2".to_string()]);
+    }
+
+    // ── P1-1 / P2-6 — rate over FrequencyEstimate (CMS) + keyed safe-miss ──
+
+    /// A FrequencyEstimate (CountMin) sid with `total` inserts in its
+    /// matrix row 0, registered for `metric` / `group_by_keys`, carrying
+    /// one PROTO_FULL window anchored just before `now`.
+    fn register_cms_freq_sid(
+        idx: &SketchStore,
+        sid: u64,
+        metric: &str,
+        group_by: &[&str],
+        spatial_filter: &str,
+        total_inserts: i64,
+        now_ms: u64,
+    ) {
+        let cfg = SketchConfig::CountMin { rows: 2, cols: 4 };
+        idx.register(SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: group_by.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::CountMin,
+                config: cfg.clone(),
+                spatial_filter_canonical: spatial_filter.to_string(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        });
+        // Build a CountMinState PROTO_FULL frame whose row 0 sums to
+        // `total_inserts` (decode_frequency_total reads row 0's sum).
+        let bytes = encode_cms_state_proto(2, 4, total_inserts);
+        let window_start = now_ms.saturating_sub(60_000);
+        let window_end = now_ms.saturating_sub(30_000);
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (window_start, window_end),
+            SketchSampleState {
+                bytes,
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+    }
+
+    /// Encode a `CountMinState` with `rows`×`cols` int matrix where row 0
+    /// holds `row0_total` in its first cell (rest zero). Mirrors the wire
+    /// form `decoders::decode_cms_from_proto` reads.
+    fn encode_cms_state_proto(rows: u32, cols: u32, row0_total: i64) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
+        use prost::Message;
+        let mut counts_int = vec![0i64; (rows * cols) as usize];
+        counts_int[0] = row0_total; // row 0, col 0
+        let state = CountMinState {
+            rows,
+            cols,
+            counter_type: CounterType::Int64 as i32,
+            counts_int,
+            ..Default::default()
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn now_ms_for_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn rate_over_cms_frequency_dispatches_via_fallback() {
+        use crate::query_engines::query_result::QueryResult;
+        // P1-1: `rate(cms_metric[5m])` lowers to ExactAgg(Sum)+Rate, but
+        // the sid is FrequencyEstimate — no ExactAgg sid matches. The
+        // engine's frequency-rate fallback must answer it (Σ per-window
+        // frequency total ÷ coverage-clamped range) instead of failing
+        // over to archive.
+        let now = now_ms_for_test();
+        let idx = Arc::new(SketchStore::new());
+        register_cms_freq_sid(&idx, 7000, "cms_metric", &[], "", 600, now);
+
+        let engine = build_engine_with_index(idx);
+        let result = engine.execute("rate(cms_metric[5m])").await;
+        match result {
+            Ok(QueryResult::Vector(v)) => {
+                assert_eq!(v.values.len(), 1, "one rate series");
+                // 600 inserts over a ~5m coverage-clamped window → a
+                // positive per-second rate.
+                let val = v.values[0].value;
+                assert!(val > 0.0, "rate must be positive, got {val}");
+            }
+            other => panic!(
+                "expected a Vector rate result from the frequency-rate fallback, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_over_cms_frequency_misses_when_no_freq_sid() {
+        // No CMS sid registered → the fallback finds nothing and the
+        // query fails over to archive (CapabilityMiss), unchanged.
+        let idx = Arc::new(SketchStore::new());
+        let engine = build_engine_with_index(idx);
+        let err = engine
+            .execute("rate(cms_metric[5m])")
+            .await
+            .expect_err("no freq sid → capability-miss to archive");
+        assert!(matches!(err, EngineError::CapabilityMiss { .. }));
+    }
+
+    #[tokio::test]
+    async fn keyed_cms_frequency_fails_over_instead_of_misleading_total() {
+        // P2-6: a per-item selector `cms_metric{item="X"}` against a
+        // FrequencyEstimate sid would silently get the per-window bucket
+        // TOTAL (all items), not item X's count. The engine must
+        // capability-miss to archive rather than return that misleading
+        // total. The sid here is registered with an EMPTY spatial filter,
+        // so the `{item="X"}` matcher is an additional per-item selector
+        // not baked into the sketch.
+        let now = now_ms_for_test();
+        let idx = Arc::new(SketchStore::new());
+        register_cms_freq_sid(&idx, 7100, "cms_metric", &[], "", 600, now);
+
+        let engine = build_engine_with_index(idx);
+        let result = engine.execute("count_over_time(cms_metric{item=\"X\"}[5m])").await;
+        match result {
+            Err(EngineError::CapabilityMiss { detail, .. }) => {
+                assert!(
+                    detail.contains("per-item") || detail.contains("string-keyed"),
+                    "expected the P2-6 per-item safe-miss detail, got: {detail}"
+                );
+            }
+            other => panic!(
+                "keyed CMS frequency must fail over to archive (P2-6), got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_cms_frequency_still_answers_after_p2_6() {
+        use crate::query_engines::query_result::QueryResult;
+        // Regression guard: the working `count_over_time(cms_metric[5m])`
+        // demo (NO item key, empty spatial filter) must still be answered
+        // by the warm tier after the P2-6 safe-miss was added.
+        let now = now_ms_for_test();
+        let idx = Arc::new(SketchStore::new());
+        register_cms_freq_sid(&idx, 7200, "cms_metric", &[], "", 600, now);
+
+        let engine = build_engine_with_index(idx);
+        let result = engine.execute("count_over_time(cms_metric[5m])").await;
+        assert!(
+            matches!(result, Ok(QueryResult::Vector(_)) | Ok(QueryResult::Matrix(_))),
+            "bare count_over_time over CMS must still be answered warm, got {result:?}"
+        );
     }
 }
 

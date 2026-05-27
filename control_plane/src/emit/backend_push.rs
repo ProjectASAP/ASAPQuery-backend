@@ -39,6 +39,10 @@
 //! plan.
 
 use std::collections::{BTreeMap, HashMap};
+// `Future` is only referenced by the now-test-only `retry_transient`
+// retry primitive (the production path is `push_documents_coupled`), so the
+// import is gated to keep the non-test build warning-free.
+#[cfg(test)]
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -107,6 +111,15 @@ fn backoff_delay(attempt: u32, start: Instant) -> Duration {
 /// Type parameters allow the closure to capture per-attempt context
 /// (clones of the JSON body, the endpoint label) without forcing the
 /// caller to box the future.
+///
+/// Now test-only: the production push path is [`push_documents_coupled`]
+/// (P2-3), which couples the two document POSTs into one retried unit so
+/// they can't land out of sync. `retry_transient` is retained as the
+/// single-operation retry primitive whose backoff schedule
+/// ([`backoff_delay`]) `push_documents_coupled` reuses, and its tests pin
+/// the transient/permanent/exhaustion contract that the coupled push
+/// relies on.
+#[cfg(test)]
 async fn retry_transient<F, Fut>(
     label: &str,
     mut op: F,
@@ -159,6 +172,116 @@ where
 /// same cumulative state.
 pub type BackendRoutingCache = Mutex<HashMap<(String, AggRole), BackendStageConfig>>;
 
+/// Combined outcome of one cumulative push cycle (P2-3).
+///
+/// The streaming-config and storage-routing documents are TWO independent
+/// HTTP POSTs to the backend. Before P2-3 they were retried separately and
+/// the function returned `()`, so a cycle where one POST succeeded and the
+/// other exhausted its retries left the backend running a streaming-config
+/// that disagreed with its storage-routing table until the next replan
+/// re-pushed both. This enum surfaces the coupled result so callers (and
+/// tests) can observe a partial-failure desync rather than silently
+/// proceeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// No backend client configured — nothing was POSTed. Cache was still
+    /// updated.
+    Skipped,
+    /// A document failed to even serialise; nothing was POSTed.
+    EmitFailed,
+    /// Both documents were accepted by the backend (each on a 2xx). The
+    /// backend's streaming-config and storage-routing are consistent.
+    BothApplied,
+    /// At least one document failed to land after retries. The two
+    /// documents may now disagree on the backend; the next replan cycle
+    /// re-POSTs both cumulatively (idempotent swap) to restore
+    /// consistency. The carried flags say which succeeded so logs / tests
+    /// can tell which side is stale.
+    Desynced {
+        streaming_ok: bool,
+        routing_ok: bool,
+    },
+}
+
+/// POST the streaming-config and storage-routing documents as a COUPLED
+/// unit (P2-3): the pair is retried together so a transient failure on
+/// EITHER document re-attempts BOTH within the same backoff schedule,
+/// rather than letting one land while the other is dropped for a whole
+/// replan interval.
+///
+/// The backend applies each document via an idempotent `handle.swap`, so
+/// re-POSTing a document that already succeeded on a prior attempt is
+/// harmless — we therefore skip re-POSTing whichever side already returned
+/// 2xx and only retry the side(s) still outstanding. The cycle is
+/// considered successful only when BOTH sides are confirmed applied; a
+/// permanent failure on either side stops the retry of that side
+/// immediately (a malformed body won't get better with retries).
+///
+/// Returns the per-side success flags and the total attempts spent.
+async fn push_documents_coupled(
+    client: &Arc<BackendClient>,
+    streaming_body: String,
+    routing_body: String,
+) -> (bool, bool, u32) {
+    let start = Instant::now();
+    let mut streaming_ok = false;
+    let mut routing_ok = false;
+    // A permanent failure on a side disables further attempts on that side
+    // (retrying a 400 just floods the logs).
+    let mut streaming_permanent = false;
+    let mut routing_permanent = false;
+
+    for attempt in 1..=RETRY_MAX_ATTEMPTS {
+        // POST whichever side is still outstanding (not yet ok, not
+        // permanently failed). Re-POSTing an already-applied side is safe
+        // (idempotent swap) but wasteful, so we skip it.
+        if !streaming_ok && !streaming_permanent {
+            match client
+                .post_streaming_config_json_typed(streaming_body.clone())
+                .await
+            {
+                Ok(()) => streaming_ok = true,
+                Err(BackendPostError::Permanent(e)) => {
+                    streaming_permanent = true;
+                    warn!(op = "streaming-config", error = %e, "permanent backend POST failure; will not retry this side");
+                }
+                Err(BackendPostError::Transient(e)) => {
+                    warn!(op = "streaming-config", attempt, error = %e, "transient backend POST failure (coupled)");
+                }
+            }
+        }
+        if !routing_ok && !routing_permanent {
+            match client
+                .post_storage_routing_json_typed(routing_body.clone())
+                .await
+            {
+                Ok(()) => routing_ok = true,
+                Err(BackendPostError::Permanent(e)) => {
+                    routing_permanent = true;
+                    warn!(op = "storage-routing", error = %e, "permanent backend POST failure; will not retry this side");
+                }
+                Err(BackendPostError::Transient(e)) => {
+                    warn!(op = "storage-routing", attempt, error = %e, "transient backend POST failure (coupled)");
+                }
+            }
+        }
+
+        // Both confirmed → done. Both terminal (ok or permanent) → no point
+        // sleeping. Otherwise back off and retry the outstanding side(s).
+        let streaming_done = streaming_ok || streaming_permanent;
+        let routing_done = routing_ok || routing_permanent;
+        if streaming_done && routing_done {
+            return (streaming_ok, routing_ok, attempt);
+        }
+        if attempt < RETRY_MAX_ATTEMPTS {
+            let delay = backoff_delay(attempt, start);
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    (streaming_ok, routing_ok, RETRY_MAX_ATTEMPTS)
+}
+
 /// Update the cumulative cache with `be` for `(metric, role)` and
 /// POST the cumulative streaming-config + storage-routing JSON
 /// documents to the backend.
@@ -167,15 +290,21 @@ pub type BackendRoutingCache = Mutex<HashMap<(String, AggRole), BackendStageConf
 /// signal — the function still logs the would-have-emitted shape and
 /// returns. This preserves the fire-and-forget contract from PR #287.
 ///
-/// Errors at any step are logged at WARN and returned — never
-/// propagated.
+/// Errors at any step are logged at WARN and surfaced via the returned
+/// [`PushOutcome`] — never propagated (the fire-and-forget contract is
+/// preserved; existing call sites simply ignore the return value).
+///
+/// P2-3: the streaming-config and storage-routing documents are POSTed as
+/// a COUPLED pair (see [`push_documents_coupled`]) so a transient failure
+/// on one re-attempts both, rather than letting them land out of sync for
+/// a whole replan interval.
 pub async fn post_typed_backend_for_role(
     backend_client: Option<&Arc<BackendClient>>,
     cache: &BackendRoutingCache,
     metric: &str,
     role: AggRole,
     be: BackendStageConfig,
-) {
+) -> PushOutcome {
     // ── 1. Update cache and collect cumulative entries ───────────────────
     //
     // Snapshot the cache under a single lock so concurrent calls don't
@@ -200,12 +329,81 @@ pub async fn post_typed_backend_for_role(
         v
     };
 
-    // ── 2. Cumulative streaming-config ───────────────────────────────────
+    push_cumulative_entries(backend_client, &cumulative_entries, metric, Some(role)).await
+}
+
+/// Re-POST the FULL cumulative streaming-config + storage-routing derived
+/// from the CURRENT cache, WITHOUT re-planning or mutating the cache (P0-1).
+///
+/// This exists because the data_plane backend is a plain HTTP service that
+/// receives POSTs — it is NOT an OpAMP agent — so its restart fires none of
+/// the controller's re-push triggers (startup `replan_all`, OpAMP
+/// on-connect). After a backend restart its in-memory streaming-config is
+/// gone, and the expiry ticker only re-POSTs `(metric, role)` pairs whose
+/// plan `valid_until` elapsed; a query needing a non-default aggregation
+/// (Sum / ExactAgg) then capability-misses to archive until something
+/// expires.
+///
+/// The controller calls this on a bounded low-frequency cadence (see
+/// `Replanner::run_backend_repost_ticker`). Each call is idempotent: the
+/// data plane installs the cumulative config via an idempotent
+/// `handle.swap`, so re-POSTing the SAME shape is a no-op on a backend that
+/// already has it, and a full refresh on one that lost it. The push is
+/// coupled (P2-3) so streaming-config + storage-routing never land split.
+///
+/// Returns [`PushOutcome::Skipped`] when no backend client is configured or
+/// the cache is empty (nothing to refresh).
+pub async fn repost_cumulative_backend_config(
+    backend_client: Option<&Arc<BackendClient>>,
+    cache: &BackendRoutingCache,
+) -> PushOutcome {
+    let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
+        let cache = cache.lock().await;
+        if cache.is_empty() {
+            // Nothing planned yet — a re-POST would emit an empty config.
+            // Skip so a fresh controller that hasn't planned anything doesn't
+            // wipe a backend that an out-of-band path populated.
+            return PushOutcome::Skipped;
+        }
+        let mut v: Vec<((String, AggRole), BackendStageConfig)> = cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        v.sort_by(|(a_k, _), (b_k, _)| {
+            a_k.0
+                .cmp(&b_k.0)
+                .then_with(|| a_k.1.as_str().cmp(b_k.1.as_str()))
+        });
+        v
+    };
+    push_cumulative_entries(backend_client, &cumulative_entries, "<periodic-refresh>", None).await
+}
+
+/// Shared push body for [`post_typed_backend_for_role`] and
+/// [`repost_cumulative_backend_config`]: build BOTH cumulative documents
+/// from the already-snapshotted `cumulative_entries`, then coupled-push
+/// them (P2-3).
+///
+/// `role` is `Some` for a single-role replan emit and `None` for a
+/// periodic full refresh; it only flavours the log line.
+async fn push_cumulative_entries(
+    backend_client: Option<&Arc<BackendClient>>,
+    cumulative_entries: &[((String, AggRole), BackendStageConfig)],
+    metric: &str,
+    role: Option<AggRole>,
+) -> PushOutcome {
+    // ── Build BOTH cumulative documents up front (P2-3) ───────────────────
     //
-    // One `BackendStageConfig` whose `aggregations` + `readouts` are the
-    // concatenation of every cache entry's. The data plane's swap
-    // installs this single multi-aggregation config atomically, so ALL
-    // roles for ALL metrics survive.
+    // Serialise the streaming-config AND the storage-routing JSON before
+    // POSTing either one, so a serialise failure on the routing side never
+    // leaves a streaming-config already POSTed (and vice versa). Both
+    // documents derive from the SAME `cumulative_entries` snapshot, so
+    // they describe one consistent generation of the cumulative state.
+
+    // Streaming-config: one `BackendStageConfig` whose `aggregations` +
+    // `readouts` are the concatenation of every cache entry's. The data
+    // plane's swap installs this single multi-aggregation config
+    // atomically, so ALL roles for ALL metrics survive.
     let cumulative_be = BackendStageConfig {
         aggregations: cumulative_entries
             .iter()
@@ -216,132 +414,93 @@ pub async fn post_typed_backend_for_role(
             .flat_map(|(_, c)| c.readouts.iter().cloned())
             .collect(),
     };
-
-    match emit_backend_streaming_config_json(&cumulative_be) {
-        Ok(json_doc) => {
-            info!(
-                stage = "backend",
-                metric = %metric,
-                role = %role,
-                aggregations = cumulative_be.aggregations.len(),
-                readouts = cumulative_be.readouts.len(),
-                cumulative_pairs = cumulative_entries.len(),
-                "[USE_TYPED_STAGE_SPLIT] posting typed backend JSON"
-            );
-            if let Some(client) = backend_client {
-                let body = json_doc.to_string();
-                // Retry-with-backoff for transient errors (404
-                // route-not-bound, 5xx, connection refused, connect
-                // timeout) so the controller's startup `replan_all()`
-                // tick can outwait the backend's HTTP-server bind +
-                // route-registration window. See PR for the multinode
-                // race we're patching here.
-                let (attempts, outcome) = retry_transient("streaming-config", || {
-                    let body = body.clone();
-                    async move { client.post_streaming_config_json_typed(body).await }
-                })
-                .await;
-                match outcome {
-                    Ok(()) => info!(
-                        stage = "backend",
-                        endpoint = %client.endpoint(),
-                        attempts,
-                        "[USE_TYPED_STAGE_SPLIT] typed backend JSON push succeeded"
-                    ),
-                    Err(e) => warn!(
-                        stage = "backend",
-                        endpoint = %client.endpoint(),
-                        attempts,
-                        error = %e,
-                        "[USE_TYPED_STAGE_SPLIT] typed backend JSON push failed after retries; \
-                         next replan cycle will retry"
-                    ),
-                }
-            } else {
-                info!(
-                    stage = "backend",
-                    "[USE_TYPED_STAGE_SPLIT] no backend client configured; \
-                     skipping JSON push (set CONTROLLER_BACKEND_ENDPOINT to enable)"
-                );
-            }
+    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be) {
+        Ok(doc) => doc.to_string(),
+        Err(e) => {
+            warn!(error = %e, "emit_backend_streaming_config_json failed; skipping coupled push");
+            return PushOutcome::EmitFailed;
         }
-        Err(e) => warn!(error = %e, "emit_backend_streaming_config_json failed"),
-    }
+    };
 
-    // ── 3. Cumulative storage-routing ────────────────────────────────────
-    //
-    // The routing classifier (`build_routing_entry` in
+    // Storage-routing: the routing classifier (`build_routing_entry` in
     // `emit/stage_config.rs`) reads `cfg.aggregations` to derive shape
-    // routing, so we MUST merge every role's aggregations for one
-    // metric into a single `BackendStageConfig` before passing it
-    // through — otherwise a metric with both DDSketch (Quantile) and
-    // ExactAgg (Sum) would emit only the last-cached role's shape
-    // classifications and route the siblings to archive.
+    // routing, so we MUST merge every role's aggregations for one metric
+    // into a single `BackendStageConfig` before passing it through —
+    // otherwise a metric with both DDSketch (Quantile) and ExactAgg (Sum)
+    // would emit only the last-cached role's shape classifications and
+    // route the siblings to archive.
     //
     // `emit_backend_storage_routing`'s signature is
     // `&[(String, &BackendStageConfig)]` — per-metric, NOT per-(metric,
     // role) — so the merge happens here.
     let mut by_metric: BTreeMap<String, BackendStageConfig> = BTreeMap::new();
-    for ((m, _r), cfg) in &cumulative_entries {
-        let entry = by_metric.entry(m.clone()).or_insert_with(|| {
-            BackendStageConfig {
-                aggregations: Vec::new(),
-                readouts: Vec::new(),
-            }
+    for ((m, _r), cfg) in cumulative_entries.iter() {
+        let entry = by_metric.entry(m.clone()).or_insert_with(|| BackendStageConfig {
+            aggregations: Vec::new(),
+            readouts: Vec::new(),
         });
         entry.aggregations.extend(cfg.aggregations.iter().cloned());
         entry.readouts.extend(cfg.readouts.iter().cloned());
     }
     let routing_owned: Vec<(String, BackendStageConfig)> = by_metric.into_iter().collect();
-    let routing_input: Vec<(String, &BackendStageConfig)> = routing_owned
-        .iter()
-        .map(|(k, v)| (k.clone(), v))
-        .collect();
-    match emit_backend_storage_routing(&routing_input) {
-        Ok(routing_doc) => {
-            info!(
-                stage = "backend",
-                metric = %metric,
-                cumulative_metrics = routing_owned.len(),
-                cumulative_pairs = cumulative_entries.len(),
-                "[USE_TYPED_STAGE_SPLIT] posting cumulative storage-routing JSON"
-            );
-            if let Some(client) = backend_client {
-                let body = routing_doc.to_string();
-                // Same retry policy as the streaming-config POST
-                // above — the storage-routing endpoint lives on the
-                // same backend HTTP server and binds at the same time,
-                // so it shares the same startup-race window.
-                let (attempts, outcome) = retry_transient("storage-routing", || {
-                    let body = body.clone();
-                    async move { client.post_storage_routing_json_typed(body).await }
-                })
-                .await;
-                match outcome {
-                    Ok(()) => info!(
-                        stage = "backend",
-                        metric = %metric,
-                        attempts,
-                        "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push succeeded"
-                    ),
-                    Err(e) => warn!(
-                        stage = "backend",
-                        metric = %metric,
-                        attempts,
-                        error = %e,
-                        "[USE_TYPED_STAGE_SPLIT] storage-routing JSON push failed after retries; \
-                         next replan cycle will retry"
-                    ),
-                }
-            } else {
-                info!(
-                    stage = "backend",
-                    "[USE_TYPED_STAGE_SPLIT] no backend client configured; \
-                     skipping storage-routing JSON push"
-                );
-            }
+    let routing_input: Vec<(String, &BackendStageConfig)> =
+        routing_owned.iter().map(|(k, v)| (k.clone(), v)).collect();
+    let routing_body = match emit_backend_storage_routing(&routing_input) {
+        Ok(doc) => doc.to_string(),
+        Err(e) => {
+            warn!(error = %e, "emit_backend_storage_routing failed; skipping coupled push");
+            return PushOutcome::EmitFailed;
         }
-        Err(e) => warn!(error = %e, "emit_backend_storage_routing failed"),
+    };
+
+    let role_label = role.map(|r| r.as_str().to_string()).unwrap_or_else(|| "*".to_string());
+    info!(
+        stage = "backend",
+        metric = %metric,
+        role = %role_label,
+        aggregations = cumulative_be.aggregations.len(),
+        readouts = cumulative_be.readouts.len(),
+        cumulative_pairs = cumulative_entries.len(),
+        cumulative_metrics = routing_owned.len(),
+        "[USE_TYPED_STAGE_SPLIT] posting coupled streaming-config + storage-routing JSON"
+    );
+
+    // ── 3. Coupled push ───────────────────────────────────────────────────
+    let Some(client) = backend_client else {
+        info!(
+            stage = "backend",
+            "[USE_TYPED_STAGE_SPLIT] no backend client configured; \
+             skipping JSON push (set CONTROLLER_BACKEND_ENDPOINT to enable)"
+        );
+        return PushOutcome::Skipped;
+    };
+
+    let (streaming_ok, routing_ok, attempts) =
+        push_documents_coupled(client, streaming_body, routing_body).await;
+
+    if streaming_ok && routing_ok {
+        info!(
+            stage = "backend",
+            endpoint = %client.endpoint(),
+            attempts,
+            "[USE_TYPED_STAGE_SPLIT] coupled backend JSON push succeeded (both documents applied)"
+        );
+        PushOutcome::BothApplied
+    } else {
+        warn!(
+            stage = "backend",
+            endpoint = %client.endpoint(),
+            attempts,
+            streaming_ok,
+            routing_ok,
+            "[USE_TYPED_STAGE_SPLIT] coupled backend JSON push DESYNCED after retries \
+             (one document landed, the other did not); next replan cycle re-POSTs both \
+             cumulatively to restore consistency"
+        );
+        PushOutcome::Desynced {
+            streaming_ok,
+            routing_ok,
+        }
     }
 }
 
@@ -547,5 +706,190 @@ mod tests {
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&("m".to_string(), AggRole::Quantile)).unwrap();
         assert_eq!(entry.aggregations[0].aggregation_id, "v2");
+    }
+
+    // ── P2-3 / P0-1: coupled push + periodic re-POST against a mock backend ──
+
+    use axum::extract::State;
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicU32 as StdAtomicU32, Ordering as StdOrdering};
+    use std::sync::Arc as StdArc;
+
+    /// Mock backend exposing BOTH the streaming-config and storage-routing
+    /// endpoints. Counts hits per endpoint and lets each endpoint be
+    /// configured to return a fixed status, so a test can make one side fail
+    /// while the other succeeds (the P2-3 desync scenario).
+    #[derive(Clone)]
+    struct DualMock {
+        streaming_hits: StdArc<StdAtomicU32>,
+        routing_hits: StdArc<StdAtomicU32>,
+        streaming_status: axum::http::StatusCode,
+        routing_status: axum::http::StatusCode,
+    }
+
+    async fn start_dual_mock(
+        streaming_status: axum::http::StatusCode,
+        routing_status: axum::http::StatusCode,
+    ) -> (String, DualMock) {
+        let mock = DualMock {
+            streaming_hits: StdArc::new(StdAtomicU32::new(0)),
+            routing_hits: StdArc::new(StdAtomicU32::new(0)),
+            streaming_status,
+            routing_status,
+        };
+        let app = Router::new()
+            .route(
+                "/api/v1/streaming-config",
+                post(|State(m): State<DualMock>, _body: axum::body::Bytes| async move {
+                    m.streaming_hits.fetch_add(1, StdOrdering::SeqCst);
+                    m.streaming_status
+                }),
+            )
+            .route(
+                "/api/v1/storage_routing",
+                post(|State(m): State<DualMock>, _body: axum::body::Bytes| async move {
+                    m.routing_hits.fetch_add(1, StdOrdering::SeqCst);
+                    m.routing_status
+                }),
+            )
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (format!("http://{addr}/api/v1/streaming-config"), mock)
+    }
+
+    /// Happy path: both endpoints return 2xx → `BothApplied`, and each
+    /// endpoint is hit exactly once (no wasteful re-POST of an
+    /// already-applied side).
+    #[tokio::test]
+    async fn coupled_push_both_ok_hits_each_endpoint_once() {
+        let (url, mock) =
+            start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
+        let client = StdArc::new(BackendClient::new(url));
+        let cache = Mutex::new(HashMap::new());
+        let outcome = post_typed_backend_for_role(
+            Some(&client),
+            &cache,
+            "latency",
+            AggRole::Quantile,
+            make_be("latency", "q"),
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 1);
+        assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
+    }
+
+    /// P2-3: streaming-config succeeds (200) but storage-routing always
+    /// returns a PERMANENT 400. The coupled push surfaces
+    /// `Desynced { streaming_ok: true, routing_ok: false }` rather than a
+    /// silent success, and — because 400 is permanent — the routing side is
+    /// NOT retried (hit exactly once), while the already-applied streaming
+    /// side is also not re-POSTed.
+    #[tokio::test]
+    async fn coupled_push_surfaces_desync_when_one_side_permanently_fails() {
+        let (url, mock) = start_dual_mock(
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+        let client = StdArc::new(BackendClient::new(url));
+        let cache = Mutex::new(HashMap::new());
+        let outcome = post_typed_backend_for_role(
+            Some(&client),
+            &cache,
+            "latency",
+            AggRole::Quantile,
+            make_be("latency", "q"),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PushOutcome::Desynced {
+                streaming_ok: true,
+                routing_ok: false
+            },
+            "one-sided failure must surface as Desynced, not silent success"
+        );
+        // Streaming applied once; routing's permanent 400 stops further
+        // attempts after the first.
+        assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 1);
+        assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
+    }
+
+    /// P0-1: a simulated backend RESET. The controller plans a (metric,
+    /// role) (populating the shared cache), then the backend "restarts"
+    /// (a fresh mock with zero hits). The periodic re-POST
+    /// (`repost_cumulative_backend_config`) must re-send the FULL cumulative
+    /// streaming-config + storage-routing from the cache WITHOUT any
+    /// re-plan, so the restarted backend recovers its config.
+    #[tokio::test]
+    async fn repost_after_simulated_backend_reset_re_pushes_full_config() {
+        // Phase 1: initial plan lands on the first backend instance.
+        let (url1, mock1) =
+            start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
+        let client1 = StdArc::new(BackendClient::new(url1));
+        let cache = Mutex::new(HashMap::new());
+        post_typed_backend_for_role(
+            Some(&client1),
+            &cache,
+            "http_requests_total",
+            AggRole::Sum,
+            make_be("http_requests_total", "s"),
+        )
+        .await;
+        assert_eq!(mock1.streaming_hits.load(StdOrdering::SeqCst), 1);
+        assert_eq!(mock1.routing_hits.load(StdOrdering::SeqCst), 1);
+
+        // Phase 2: the backend silently restarts — model it as a brand-new
+        // mock with zero recorded hits. NOTHING expires, NO replan fires.
+        let (url2, mock2) =
+            start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
+        let client2 = StdArc::new(BackendClient::new(url2));
+        assert_eq!(mock2.streaming_hits.load(StdOrdering::SeqCst), 0);
+
+        // The periodic re-POST reads the SAME cache and re-pushes everything.
+        let outcome = repost_cumulative_backend_config(Some(&client2), &cache).await;
+        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(
+            mock2.streaming_hits.load(StdOrdering::SeqCst),
+            1,
+            "restarted backend must receive the cumulative streaming-config again"
+        );
+        assert_eq!(
+            mock2.routing_hits.load(StdOrdering::SeqCst),
+            1,
+            "restarted backend must receive the cumulative storage-routing again"
+        );
+    }
+
+    /// P0-1 guard: re-POST on an EMPTY cache (controller hasn't planned
+    /// anything yet) is a no-op `Skipped`, so a fresh controller never wipes
+    /// a backend with an empty cumulative config.
+    #[tokio::test]
+    async fn repost_empty_cache_is_skipped() {
+        let (url, mock) =
+            start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
+        let client = StdArc::new(BackendClient::new(url));
+        let cache = Mutex::new(HashMap::new());
+        let outcome = repost_cumulative_backend_config(Some(&client), &cache).await;
+        assert_eq!(outcome, PushOutcome::Skipped);
+        assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 0);
+        assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 0);
+    }
+
+    /// P0-1: no backend client → `Skipped` (the periodic ticker is a no-op
+    /// when `CONTROLLER_BACKEND_ENDPOINT` isn't set).
+    #[tokio::test]
+    async fn repost_no_client_is_skipped() {
+        let cache = Mutex::new(HashMap::new());
+        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "q")).await;
+        let outcome = repost_cumulative_backend_config(None, &cache).await;
+        assert_eq!(outcome, PushOutcome::Skipped);
     }
 }

@@ -1,9 +1,26 @@
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+use crate::precompute_engine::ingest_handler::IngestObservability;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::types::hot_reload_config::HotReloadStreamingConfig;
 use crate::storage_engines::types::{AggregateCore, PrecomputedOutput};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{debug_span, warn};
+
+/// CQ-6 — process-global fallback for the output-sink policy-miss
+/// counter, used when a `SketchStoreSink` was constructed without an
+/// `IngestObservability` handle wired in (e.g. the legacy
+/// `SketchStoreSink::new` call site that predates the handle). Keeps the
+/// count observable even before the handle is threaded through, so a
+/// /metrics scrape never silently loses policy-miss drops.
+static GLOBAL_DROPPED_POLICY_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the process-global output-sink policy-miss drop count. Exposed
+/// so the /metrics surface can fold it in for sinks not yet wired to an
+/// `IngestObservability`.
+pub fn global_dropped_policy_miss() -> u64 {
+    GLOBAL_DROPPED_POLICY_MISS.load(Ordering::Relaxed)
+}
 
 /// Trait for emitting completed window outputs.
 pub trait OutputSink: Send + Sync {
@@ -36,6 +53,14 @@ pub struct SketchStoreSink {
     /// even when the same `(metric, attrs)` carries both a sketch and an
     /// exact precompute.
     series_resolver: Arc<SeriesIdResolver>,
+    /// CQ-6 — optional handle to the shared `IngestObservability` so
+    /// policy-miss drops land in the same counter the OTLP ingest path
+    /// surfaces to /metrics. `None` when the sink was constructed via the
+    /// legacy `new()` call site (main.rs) that doesn't thread the handle;
+    /// in that case drops are counted in the process-global fallback
+    /// (`GLOBAL_DROPPED_POLICY_MISS`). Wire it post-construction with
+    /// [`SketchStoreSink::with_observability`].
+    observability: Option<Arc<IngestObservability>>,
 }
 
 impl SketchStoreSink {
@@ -48,6 +73,30 @@ impl SketchStoreSink {
             sketch_index,
             hot_reload,
             series_resolver,
+            observability: None,
+        }
+    }
+
+    /// CQ-6 — attach a shared `IngestObservability` so this sink's
+    /// policy-miss drops increment the same counter the ingest path
+    /// reports. Builder-style (returns `self`) so the `new()` signature
+    /// stays stable for existing call sites; wire it where the sink and
+    /// `IngestState` are constructed together.
+    pub fn with_observability(mut self, observability: Arc<IngestObservability>) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// CQ-6 — increment the policy-miss drop counter (shared handle if
+    /// wired, process-global fallback otherwise).
+    fn record_policy_miss(&self) {
+        match &self.observability {
+            Some(obs) => {
+                obs.dropped_policy_miss.fetch_add(1, Ordering::Relaxed);
+            }
+            None => {
+                GLOBAL_DROPPED_POLICY_MISS.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -81,6 +130,11 @@ impl SketchStoreSink {
         let agg_cfg = match registry.get(output.policy_fp) {
             Some(c) => c.clone(),
             None => {
+                // CQ-6 — policy-miss drop: a content-addressed policy_fp
+                // that the running streaming-config registry doesn't know
+                // (config lag / retired policy). Count it so /metrics can
+                // surface the silent skip.
+                self.record_policy_miss();
                 warn!(
                     policy_fp = %output.policy_fp,
                     "SketchStoreSink: policy_fp missing from registry; skipping write"
@@ -298,5 +352,45 @@ mod tests {
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
         assert_eq!(sketch_index.instance_count(), 0);
+    }
+
+    /// CQ-6 — a registry-miss (policy_fp not in the running streaming
+    /// config) is a silent write-skip; with an `IngestObservability`
+    /// handle wired in, the `dropped_policy_miss` counter must tick.
+    #[test]
+    fn sink_increments_policy_miss_counter_on_registry_miss() {
+        let streaming = StreamingConfig::new(HashMap::new());
+        let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
+        let sketch_index = Arc::new(SketchStore::new());
+        let obs = Arc::new(IngestObservability::new());
+        let sink = SketchStoreSink::new(
+            sketch_index.clone(),
+            hot_reload,
+            Arc::new(SeriesIdResolver::new()),
+        )
+        .with_observability(obs.clone());
+
+        // policy_fp=42 is absent from the empty registry → registry miss.
+        let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(42));
+        let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
+        sink.emit_batch(vec![(output, acc)]).expect("emit ok");
+
+        assert_eq!(sketch_index.instance_count(), 0, "no write on registry miss");
+        assert_eq!(
+            obs.dropped_policy_miss.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "policy-miss drop counted on the wired observability handle"
+        );
+
+        // The UNSET sentinel is an expected raw-mode skip, NOT a policy
+        // miss — it must not bump the counter.
+        let unset = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint::UNSET);
+        let acc2: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
+        sink.emit_batch(vec![(unset, acc2)]).expect("emit ok");
+        assert_eq!(
+            obs.dropped_policy_miss.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "UNSET skip is not a policy miss"
+        );
     }
 }

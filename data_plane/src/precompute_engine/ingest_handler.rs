@@ -2,7 +2,82 @@ use crate::storage_engines::types::HotReloadStreamingConfig;
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use asap_types::aggregation_config::AggregationConfig;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// CQ-6 — per-reason atomic counters for silently-dropped ingest
+/// samples, plus the §RES-1 sketch-snapshot eviction configuration.
+///
+/// Grouped into a single `Default`-constructible sub-struct so the
+/// counters/config can be added to [`IngestState`] without changing the
+/// (explicit, field-by-field) struct-literal call sites that construct
+/// it — they only need a single `observability: IngestObservability::new()`
+/// (or `..Default` style) line.
+///
+/// Counters are `AtomicU64` (relaxed ordering — these are monotonic
+/// observability counters, not synchronization primitives), incremented
+/// at the corresponding drop sites in the OTLP ingest path
+/// (`route_modified_otlp_sketches_to_precompute`) and the output-sink
+/// policy-miss path. Surfaced wherever `IngestState` stats reach
+/// `/metrics`.
+#[derive(Debug)]
+pub struct IngestObservability {
+    /// Delta frame arrived but the additive family could not be
+    /// reconstructed from a bare delta (DD/KLL with no cached base).
+    pub dropped_no_base: AtomicU64,
+    /// A full / delta frame failed to decode (or a delta failed to
+    /// apply) and was dropped.
+    pub dropped_decode_fail: AtomicU64,
+    /// A decoded sketch matched no `AggregationConfig` in the running
+    /// streaming config (legacy routing-side bucketing miss).
+    pub dropped_unconfigured: AtomicU64,
+    /// The output sink could not resolve a `policy_fp` to an
+    /// `AggregationConfig` (registry miss) and skipped the write.
+    pub dropped_policy_miss: AtomicU64,
+    /// RES-1 — max number of distinct tumbling windows a per-series
+    /// snapshot base may lag behind the newest observed `window_start`
+    /// before it is swept out of `sketch_snapshots`. Stored as a
+    /// nanosecond span (windows are keyed by `start_time_unix_nano`),
+    /// so "N windows" is expressed as `N * window_span_nanos`. A value
+    /// of 0 disables age-based eviction.
+    pub snapshot_max_window_lag_nanos: AtomicU64,
+    /// RES-1 — the newest `window_start` (nanos) observed across all
+    /// series, used as the eviction sweep's reference point. Advanced
+    /// monotonically on each cached base insert.
+    pub snapshot_newest_window_start: AtomicU64,
+}
+
+impl IngestObservability {
+    /// Default eviction lag: keep ~4 windows of per-series base behind
+    /// the newest observed window. Picked to tolerate a couple of late /
+    /// out-of-order windows while still bounding memory for churning
+    /// high-cardinality series. The span is in nanoseconds; the default
+    /// assumes a 60s tumbling window (4 * 60s = 240s), and is
+    /// overridable via the `ASAP_SNAPSHOT_MAX_WINDOW_LAG_SECS` env var.
+    pub const DEFAULT_MAX_WINDOW_LAG_NANOS: u64 = 4 * 60 * 1_000_000_000;
+
+    pub fn new() -> Self {
+        let lag = std::env::var("ASAP_SNAPSHOT_MAX_WINDOW_LAG_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| secs.saturating_mul(1_000_000_000))
+            .unwrap_or(Self::DEFAULT_MAX_WINDOW_LAG_NANOS);
+        Self {
+            dropped_no_base: AtomicU64::new(0),
+            dropped_decode_fail: AtomicU64::new(0),
+            dropped_unconfigured: AtomicU64::new(0),
+            dropped_policy_miss: AtomicU64::new(0),
+            snapshot_max_window_lag_nanos: AtomicU64::new(lag),
+            snapshot_newest_window_start: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for IngestObservability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// One per-series entry in the delta-reconstitution snapshot cache.
 ///
@@ -66,6 +141,12 @@ pub struct IngestState {
     /// The value is a [`SnapshotCacheEntry`] — the reconstructed base
     /// plus the window start it belongs to — so the delta-apply path can
     /// rotate (reset) the base at a per-series window boundary.
+    ///
+    /// RES-1 — growth is now bounded by [`IngestState::note_window_and_sweep`],
+    /// which opportunistically evicts entries whose `window_start` lags
+    /// more than `IngestObservability::snapshot_max_window_lag_nanos`
+    /// behind the newest observed window. Called on every cached-base
+    /// insert from the OTLP ingest path.
     pub sketch_snapshots: dashmap::DashMap<String, SnapshotCacheEntry>,
     /// Phase 4 — centralized series_id resolver. Shared across the OTLP
     /// receive path (sid resolution + `unknown_series_ids` population) and
@@ -79,6 +160,11 @@ pub struct IngestState {
     /// the `ASAPQueryEngine` query path (ASAP-tier hit / ghost / unknown
     /// classification drives the Phase 6 archive failover).
     pub sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
+    /// CQ-6 / RES-1 — per-reason silent-drop counters plus the
+    /// `sketch_snapshots` eviction configuration. Grouped into one
+    /// `Default`-constructible field so the counters can live on
+    /// `IngestState` without churning every struct-literal call site.
+    pub observability: IngestObservability,
 }
 
 impl IngestState {
@@ -93,6 +179,74 @@ impl IngestState {
     pub fn config_snapshot(&self) -> Arc<crate::storage_engines::types::StreamingConfig> {
         self.hot_reload_config.snapshot()
     }
+
+    /// RES-1 — record that a per-series snapshot base for `window_start`
+    /// was just (re)inserted, then opportunistically sweep stale entries.
+    ///
+    /// Advances the observed `snapshot_newest_window_start` monotonically
+    /// and, when age-based eviction is enabled
+    /// (`snapshot_max_window_lag_nanos != 0`), removes every
+    /// `sketch_snapshots` entry whose `window_start` lags more than the
+    /// configured span behind the newest observed window. This bounds
+    /// memory for churning / high-cardinality series whose keys would
+    /// otherwise accumulate forever (the cache previously had no
+    /// eviction at all).
+    ///
+    /// "Opportunistic" — the sweep runs inline on insert. The DashMap
+    /// `retain` walk is O(n) in the live key count, but it only fires
+    /// when the newest window actually advances (so steady-state inserts
+    /// within one window pay nothing), keeping amortized cost low. A
+    /// future refactor can move this to a periodic background sweep if
+    /// the inline walk shows up in profiles.
+    ///
+    /// Returns the number of entries evicted (0 when eviction is
+    /// disabled or nothing was stale) — used by tests.
+    pub fn note_window_and_sweep(&self, window_start: u64) -> usize {
+        // Monotonically advance the newest-observed window.
+        let mut newest = self
+            .observability
+            .snapshot_newest_window_start
+            .load(Ordering::Relaxed);
+        loop {
+            if window_start <= newest {
+                break;
+            }
+            match self
+                .observability
+                .snapshot_newest_window_start
+                .compare_exchange_weak(
+                    newest,
+                    window_start,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                Ok(_) => {
+                    newest = window_start;
+                    break;
+                }
+                Err(observed) => newest = observed,
+            }
+        }
+
+        let lag = self
+            .observability
+            .snapshot_max_window_lag_nanos
+            .load(Ordering::Relaxed);
+        if lag == 0 {
+            return 0;
+        }
+        // Evict entries strictly older than (newest - lag). Saturating
+        // sub so an early small `newest` never underflows into a huge
+        // cutoff that would evict everything.
+        let cutoff = newest.saturating_sub(lag);
+        if cutoff == 0 {
+            return 0;
+        }
+        let before = self.sketch_snapshots.len();
+        self.sketch_snapshots
+            .retain(|_key, entry| entry.window_start >= cutoff);
+        before.saturating_sub(self.sketch_snapshots.len())
+    }
 }
 
 impl IngestState {
@@ -101,6 +255,24 @@ impl IngestState {
     /// ingest sources (e.g. OTLP) can reuse it.
     pub fn extract_group_key_for(series_key: &str, config: &AggregationConfig) -> String {
         extract_group_key(series_key, config)
+    }
+
+    /// PERF-4 — extract the group key directly from a parsed label map,
+    /// avoiding the `format_series_key` → `parse_labels_from_series_key`
+    /// round-trip when the caller already holds the labels (e.g. the OTLP
+    /// modified-sketch path, which carries `dp.attrs` as a
+    /// `HashMap<String, String>`). Produces the identical
+    /// grouping-label-value join (`;`-separated, "" for absent labels) as
+    /// [`Self::extract_group_key_for`] does after the round-trip.
+    pub fn extract_group_key_from_labels(
+        labels: &std::collections::HashMap<String, String>,
+        config: &AggregationConfig,
+    ) -> String {
+        let mut values = Vec::with_capacity(config.grouping_labels.labels.len());
+        for label_name in &config.grouping_labels.labels {
+            values.push(labels.get(label_name.as_str()).map(|s| s.as_str()).unwrap_or(""));
+        }
+        values.join(";")
     }
 }
 
@@ -179,6 +351,7 @@ mod tests {
                 crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
             ),
             sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            observability: IngestObservability::default(),
         });
 
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -276,6 +449,77 @@ mod tests {
         // (sum/min/max were dropped from the wire format,
         // ProjectASAP/sketchlib-go#243 / asap_sketchlib#57.)
         assert_eq!(final_dd.inner.total_count(), 41);
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// RES-1 — `note_window_and_sweep` evicts per-series snapshot bases
+    /// whose `window_start` lags more than the configured span behind the
+    /// newest observed window, bounding `sketch_snapshots` for churning
+    /// high-cardinality series. A fresh entry in the current window must
+    /// survive; a stale entry from far in the past must be swept.
+    #[tokio::test]
+    async fn stale_snapshot_entry_is_evicted_by_sweep() {
+        use crate::precompute_engine::operators::SumAccumulator;
+
+        let (state, drain) = setup_state(7, "evict_metric").await;
+
+        // Pin a deterministic lag of 100ns so the test doesn't depend on
+        // the env default (240s). Entries older than (newest - 100) go.
+        state
+            .observability
+            .snapshot_max_window_lag_nanos
+            .store(100, std::sync::atomic::Ordering::Relaxed);
+
+        // A stale entry from window_start=10 and a fresh entry from
+        // window_start=1000. Cores are arbitrary — the sweep only reads
+        // `window_start`.
+        state.sketch_snapshots.insert(
+            "stale".to_string(),
+            SnapshotCacheEntry {
+                core: Box::new(SumAccumulator::with_sum(1.0)),
+                window_start: 10,
+            },
+        );
+        state.sketch_snapshots.insert(
+            "fresh".to_string(),
+            SnapshotCacheEntry {
+                core: Box::new(SumAccumulator::with_sum(2.0)),
+                window_start: 1000,
+            },
+        );
+        assert_eq!(state.sketch_snapshots.len(), 2);
+
+        // Insert/observe the newest window (1000). cutoff = 1000 - 100 =
+        // 900; the stale entry (10 < 900) is evicted, fresh (1000) stays.
+        let evicted = state.note_window_and_sweep(1000);
+        assert_eq!(evicted, 1, "exactly the stale entry is swept");
+        assert!(
+            state.sketch_snapshots.get("stale").is_none(),
+            "stale entry evicted"
+        );
+        assert!(
+            state.sketch_snapshots.get("fresh").is_some(),
+            "fresh entry within the lag window survives"
+        );
+
+        // A lag of 0 disables eviction — nothing is swept even when an
+        // ancient entry is present.
+        state
+            .observability
+            .snapshot_max_window_lag_nanos
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        state.sketch_snapshots.insert(
+            "ancient".to_string(),
+            SnapshotCacheEntry {
+                core: Box::new(SumAccumulator::with_sum(3.0)),
+                window_start: 1,
+            },
+        );
+        let evicted2 = state.note_window_and_sweep(5000);
+        assert_eq!(evicted2, 0, "lag=0 disables age-based eviction");
+        assert!(state.sketch_snapshots.get("ancient").is_some());
 
         drop(state);
         let _ = drain.await;

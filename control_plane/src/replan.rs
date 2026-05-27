@@ -24,7 +24,8 @@ use crate::backend_client::BackendClient;
 use crate::emit::{
     build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
     extend_edge_with_demo_plumbing, generate_agent_collector_config,
-    post_typed_backend_for_role, AgentRuntime, WorkloadRegistry,
+    post_typed_backend_for_role, repost_cumulative_backend_config, AgentRuntime, PushOutcome,
+    WorkloadRegistry,
 };
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
@@ -729,6 +730,76 @@ impl Replanner {
             self.replan_expired().await;
         }
     }
+
+    /// P0-1: re-POST the FULL cumulative streaming-config + storage-routing
+    /// to the backend from the current shared cache, WITHOUT re-planning.
+    ///
+    /// The data_plane backend is a plain HTTP service receiving POSTs — NOT
+    /// an OpAMP agent — so a backend restart triggers none of the
+    /// controller's re-push paths (startup `replan_all`, OpAMP on-connect).
+    /// After a restart the backend's in-memory streaming-config is gone, and
+    /// the expiry ticker only re-POSTs `(metric, role)` pairs whose plan
+    /// `valid_until` elapsed; until then a query needing a non-default
+    /// aggregation (Sum / ExactAgg) capability-misses to archive.
+    ///
+    /// This method re-POSTs everything idempotently (the data plane installs
+    /// the cumulative config via an idempotent `handle.swap`, so re-POSTing
+    /// the same shape is a no-op on a backend that already has it, and a full
+    /// recovery on one that lost it). It reads the SAME shared
+    /// `backend_routing_cache` `handle_plan` / `replan_metric_role` write to,
+    /// so it always reflects the controller's latest cumulative state.
+    ///
+    /// Returns the [`PushOutcome`] so callers/tests can assert a refresh
+    /// actually fired. `Skipped` when no backend client or routing cache is
+    /// wired, or the cache is empty (nothing planned yet).
+    pub async fn repost_cumulative_backend_config(&self) -> PushOutcome {
+        let Some(cache) = self.backend_routing_cache.as_ref() else {
+            // No shared cache → the Replanner has no cumulative state to
+            // refresh from (this is a test fixture or a deployment that never
+            // wired the cache). Nothing to do.
+            return PushOutcome::Skipped;
+        };
+        repost_cumulative_backend_config(self.backend_client.as_ref(), cache.as_ref()).await
+    }
+
+    /// P0-1: background loop that periodically re-POSTs the full cumulative
+    /// backend config so a silent data_plane restart can't leave the
+    /// streaming-config missing until a plan expires.
+    ///
+    /// Runs on a BOUNDED, low-frequency cadence (`interval`) independent of
+    /// the expiry ticker so the refresh isn't chatty — each tick is one
+    /// coupled streaming-config + storage-routing POST, and the data plane
+    /// no-ops when its config already matches. A no-op-on-match backend means
+    /// the only cost on the steady-state path is one pair of idempotent
+    /// HTTP POSTs per `interval`.
+    pub async fn run_backend_repost_ticker(self: Arc<Self>, interval: Duration) {
+        // A zero/sub-second interval would busy-loop; clamp to a sane floor.
+        let interval = interval.max(Duration::from_secs(1));
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first `interval.tick()` fires immediately; skip that initial
+        // tick so we don't double up with the startup `replan_all()` POST
+        // that already primed the backend before the HTTP server bound.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let outcome = self.repost_cumulative_backend_config().await;
+            match outcome {
+                PushOutcome::BothApplied => info!(
+                    "periodic backend re-POST applied cumulative streaming-config + storage-routing"
+                ),
+                PushOutcome::Skipped => { /* no backend / empty cache — nothing logged each tick */ }
+                PushOutcome::EmitFailed => warn!(
+                    "periodic backend re-POST: failed to serialise cumulative config"
+                ),
+                PushOutcome::Desynced { streaming_ok, routing_ok } => warn!(
+                    streaming_ok,
+                    routing_ok,
+                    "periodic backend re-POST desynced after retries; will retry next tick"
+                ),
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1084,5 +1155,132 @@ mod tests {
         );
 
         // `_env` restores the prior `USE_TYPED_STAGE_SPLIT` value on drop.
+    }
+
+    // ── P0-1: backend-restart re-POST ─────────────────────────────────────────
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Start a mock backend serving both the streaming-config and
+    /// storage-routing endpoints, returning the streaming-config URL and a
+    /// shared hit-counter for the streaming endpoint.
+    async fn start_repost_mock() -> (String, StdArc<AtomicU32>) {
+        use axum::extract::State;
+        use axum::routing::post;
+        use axum::Router;
+        let hits = StdArc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/api/v1/streaming-config",
+                post(|State(h): State<StdArc<AtomicU32>>, _b: axum::body::Bytes| async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }),
+            )
+            .route(
+                "/api/v1/storage_routing",
+                post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
+            )
+            .with_state(StdArc::clone(&hits));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (format!("http://{addr}/api/v1/streaming-config"), hits)
+    }
+
+    /// A wired Replanner (backend client + shared routing cache) re-POSTs
+    /// the FULL cumulative backend config from the cache when
+    /// `repost_cumulative_backend_config` fires — the periodic refresh the
+    /// background ticker drives. This is the P0-1 recovery path: a silent
+    /// backend restart fires no replan, but the periodic re-POST re-sends
+    /// the cumulative config so a Sum/ExactAgg query stops capability-missing
+    /// to archive.
+    #[tokio::test]
+    async fn wired_replanner_reposts_cumulative_config_from_cache() {
+        use crate::backend_client::BackendClient;
+        use crate::physical::colored_dag::emitter::{
+            AggregationInput, BackendAggregation, BackendStageConfig,
+        };
+        use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
+
+        let (url, hits) = start_repost_mock().await;
+        let client = StdArc::new(BackendClient::new(url));
+        let cache: StdArc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>> =
+            StdArc::new(Mutex::new(HashMap::new()));
+
+        // Build a Replanner wired to the mock backend + the shared cache.
+        let plan_store = Arc::new(PlanStore::new());
+        let workload_store = Arc::new(WorkloadStore::new());
+        let planner = Arc::new(BaselinePlanner::new(CostModelPlanner::new()));
+        let opamp = Arc::new(crate::opamp::OpampServer::new());
+        let scraper = Arc::new(crate::monitor::Scraper::new(
+            vec![],
+            crate::monitor::Thresholds::default(),
+            Arc::new(|_| {}),
+            Duration::from_secs(60),
+        ));
+        let r = Arc::new(
+            Replanner::new(planner, plan_store, workload_store, opamp, scraper, "ws://c/")
+                .with_backend_client(StdArc::clone(&client))
+                .with_backend_routing_cache(StdArc::clone(&cache)),
+        );
+
+        // Empty cache → re-POST is a no-op (nothing planned yet), backend
+        // untouched.
+        assert_eq!(r.repost_cumulative_backend_config().await, PushOutcome::Skipped);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // Seed the SHARED cache as if a prior plan emit had populated it
+        // (a Sum/ExactAgg aggregation the static startup config lacks).
+        {
+            let mut c = cache.lock().await;
+            c.insert(
+                ("http_requests_total".to_string(), AggRole::Sum),
+                BackendStageConfig {
+                    aggregations: vec![BackendAggregation {
+                        aggregation_id: "exact-http_requests_total-sum".to_string(),
+                        metric_name: "http_requests_total".to_string(),
+                        sketch_kind: SketchKind::DDSketch,
+                        sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                        grouping: vec!["zone".to_string()],
+                        spatial_filter: String::new(),
+                        window_secs: 60,
+                        aggregation_input: AggregationInput::Raw,
+                        agg_type_override: Some("Sum".to_string()),
+                    }],
+                    readouts: Vec::new(),
+                },
+            );
+        }
+
+        // Simulated backend restart: the periodic ticker fires and re-POSTs
+        // the full cumulative config WITHOUT any replan. The (now-restarted)
+        // backend receives the streaming-config again.
+        let outcome = r.repost_cumulative_backend_config().await;
+        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "periodic re-POST must re-send the cumulative streaming-config to the backend"
+        );
+
+        // Idempotent: a second tick re-POSTs again (the data plane no-ops on
+        // a matching config; the controller still re-sends each cycle).
+        let outcome2 = r.repost_cumulative_backend_config().await;
+        assert_eq!(outcome2, PushOutcome::BothApplied);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A Replanner with NO shared cache (the test/default fixture) treats
+    /// the re-POST as a no-op `Skipped` — it has no cumulative state to
+    /// refresh from.
+    #[tokio::test]
+    async fn unwired_replanner_repost_is_skipped() {
+        let r = make_replanner();
+        assert_eq!(r.repost_cumulative_backend_config().await, PushOutcome::Skipped);
     }
 }

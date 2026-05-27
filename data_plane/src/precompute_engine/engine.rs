@@ -82,6 +82,7 @@ impl PrecomputeEngine {
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver,
             sketch_index,
+            observability: crate::precompute_engine::ingest_handler::IngestObservability::new(),
         });
 
         Self {

@@ -196,13 +196,21 @@ impl MetricsService for MetricsServiceImpl {
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         debug!("OTLP received request via gRPC");
         let req = request.into_inner();
-        process_otlp_request(&req, "gRPC");
+        // PERF-1 — parse the OTLP request ONCE here and hand the parsed
+        // points/sketches to the raw-path consumers
+        // (process_otlp_request / capture_freshness / route_otlp_to_precompute)
+        // instead of each re-walking the protobuf. The first-class
+        // sketch path (`route_modified_otlp_sketches_to_precompute`)
+        // still walks the raw request because it reads the sketch
+        // DataPoint variants this parse intentionally skips.
+        let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(&req);
+        process_otlp_request(&req, &points, &sketch_payloads, "gRPC");
         if let Some(cache) = &self.shared.probe_cache {
-            capture_freshness_probe_samples(&req, cache);
+            capture_freshness_probe_samples(&points, cache);
         }
         let mut outcome = IngestOutcome::default();
         if let Some(state) = &self.shared.ingest_state {
-            route_otlp_to_precompute(&req, state).await;
+            route_otlp_to_precompute(&points, &sketch_payloads, state).await;
             outcome = route_modified_otlp_sketches_to_precompute(&req, state).await;
         }
         debug!("OTLP sending response via gRPC");
@@ -300,13 +308,16 @@ async fn handle_otlp_http(
             format!("Protobuf decode error: {}", e),
         )
     })?;
-    process_otlp_request(&req, "HTTP");
+    // PERF-1 — parse once, share the result across the raw-path
+    // consumers (see the gRPC `export` path for the rationale).
+    let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(&req);
+    process_otlp_request(&req, &points, &sketch_payloads, "HTTP");
     if let Some(cache) = &shared.probe_cache {
-        capture_freshness_probe_samples(&req, cache);
+        capture_freshness_probe_samples(&points, cache);
     }
     let mut outcome = IngestOutcome::default();
     if let Some(state) = &shared.ingest_state {
-        route_otlp_to_precompute(&req, state).await;
+        route_otlp_to_precompute(&points, &sketch_payloads, state).await;
         outcome = route_modified_otlp_sketches_to_precompute(&req, state).await;
     }
     debug!("OTLP sending response via HTTP");
@@ -464,12 +475,11 @@ fn log_sketch_envelope_type(attr_name: &str, payload: &[u8], metric_name: &str) 
 /// run. The cache lets the HTTP query handler answer the same query
 /// from RAM with sub-second freshness.
 fn capture_freshness_probe_samples(
-    request: &ExportMetricsServiceRequest,
+    points: &[MetricPoint],
     cache: &FreshnessProbeCache,
 ) {
-    let (points, _sketches) = otlp_to_metric_points_and_sketches(request);
     let mut updated = 0usize;
-    for point in &points {
+    for point in points {
         // The cache filters by metric-name prefix internally; calling
         // `record` for every point is fine — non-probes are cheap
         // string-prefix rejections and do not touch the lock.
@@ -487,7 +497,12 @@ fn capture_freshness_probe_samples(
     }
 }
 
-fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) {
+fn process_otlp_request(
+    request: &ExportMetricsServiceRequest,
+    points: &[MetricPoint],
+    sketch_payloads: &[SketchPoint],
+    transport: &str,
+) {
     let resource_count = request.resource_metrics.len();
     let total_points = otlp_to_record_count(request);
     if resource_count > 0 || total_points > 0 {
@@ -497,9 +512,7 @@ fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) 
         );
     }
 
-    let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(request);
-
-    for sketch in &sketch_payloads {
+    for sketch in sketch_payloads {
         log_sketch_envelope_type(&sketch.attr_name, &sketch.payload, &sketch.name);
     }
     if !sketch_payloads.is_empty() {
@@ -510,7 +523,7 @@ fn process_otlp_request(request: &ExportMetricsServiceRequest, transport: &str) 
     }
 
     let mut by_series: HashMap<String, usize> = HashMap::new();
-    for point in &points {
+    for point in points {
         let key = format_series_key(&point.name, &point.labels);
         *by_series.entry(key).or_insert(0) += 1;
     }
@@ -618,11 +631,11 @@ fn resolve_bucket_sid_for_agg_config(
 }
 
 async fn route_otlp_to_precompute(
-    request: &ExportMetricsServiceRequest,
+    points: &[MetricPoint],
+    sketch_payloads: &[SketchPoint],
     ingest_state: &Arc<IngestState>,
 ) {
     let ingest_received_at = Instant::now();
-    let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(request);
 
     // Snapshot the latest agg_configs from the hot-reload handle so
     // new aggregations are visible without restart.
@@ -668,7 +681,7 @@ async fn route_otlp_to_precompute(
     // the counter moves to sid-level wiring.
     let raw_barrier_drops: HashMap<u64, u64> = HashMap::new();
 
-    for point in &points {
+    for point in points {
         let series_key = format_series_key(&point.name, &point.labels);
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
         let mut matched = false;
@@ -737,7 +750,7 @@ async fn route_otlp_to_precompute(
     // sid-level barrier in `SketchStore` enforces §6.3 going
     // forward.
     let sketch_barrier_drops: HashMap<u64, u64> = HashMap::new();
-    for point in &sketch_payloads {
+    for point in sketch_payloads {
         let series_key = format_series_key(&point.name, &point.labels);
         let ts_ms = (point.timestamp_nanos / 1_000_000) as i64;
         let sketch_type = identify_sketch_type(&point.payload);
@@ -877,6 +890,20 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
+    // CQ-2 — the legacy routing-side WorkerMessage push (the DEPRECATED
+    // dual-write that clones the accumulator into the worker under a
+    // bucket-sid, in tandem with the Phase-5 SketchStore append above) is
+    // gated OFF by default. The SketchStore `append_sample` path is the
+    // live write; the worker push only matters until the ASAP-tier query
+    // reducer is validated end-to-end, so re-enable it with
+    // `ASAP_LEGACY_DUAL_WRITE=1` rather than paying the clone + double
+    // store on the default path. Read once per Export (cheap), not per DP.
+    let legacy_dual_write = std::env::var("ASAP_LEGACY_DUAL_WRITE")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false);
     // Schema-keyed barrier dropped (see `raw_barrier_drops` above);
     // sid-level barrier in `SketchStore` carries §6.3 going forward.
     let barrier_drops: HashMap<u64, u64> = HashMap::new();
@@ -1091,23 +1118,30 @@ async fn route_modified_otlp_sketches_to_precompute(
                     //   (sid=0, no attrs)     → invalid wire shape, drop
                     let attrs_pairs: Vec<(&str, &str)> =
                         dp.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    // `canonical_attrs_fingerprint(&[])` is `""` — a valid,
+                    // stable key. The empty-attrs case is therefore NOT a
+                    // reason to skip the resolver (P1-5): a globally-
+                    // aggregated sketch (no resource/scope/DP attrs at all)
+                    // resolves to the stable `(metric, "", agg_kind)` sid
+                    // just like any other series.
                     let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&attrs_pairs);
-                    let resolved_sid: Option<u64> = if attrs_pairs.is_empty() {
-                        // No attrs on the wire — can't consult the
-                        // resolver (it keys on `(metric, fp)`). Accept
-                        // the sid iff the SketchStore has registered it
-                        // (i.e. a prior Export with this same sid + attrs
-                        // already landed and registered metadata).
-                        match dp.series_id {
-                            0 => None,
-                            sid => {
-                                if ingest_state.sketch_index.instance(sid).is_some() {
-                                    Some(sid)
-                                } else {
-                                    unknown_sids.push(sid);
-                                    None
-                                }
-                            }
+                    // Store-lookup-ONLY path is reserved for the bandwidth-
+                    // saving case: the sender already holds a cached sid and
+                    // deliberately omits attrs on this emit. We cannot
+                    // re-derive its identity (no attrs to fingerprint AND a
+                    // non-zero sid the sender expects us to honor), so we
+                    // accept the sid iff the SketchStore has it registered.
+                    //
+                    // Every OTHER case — including (sid=0, empty attrs),
+                    // i.e. global aggregation — goes through the resolver,
+                    // because `fp=""` is a perfectly good mint/lookup key.
+                    let resolved_sid: Option<u64> = if dp.series_id != 0 && attrs_pairs.is_empty() {
+                        let sid = dp.series_id;
+                        if ingest_state.sketch_index.instance(sid).is_some() {
+                            Some(sid)
+                        } else {
+                            unknown_sids.push(sid);
+                            None
                         }
                     } else {
                         // Build the canonical AggKind string for this DP so
@@ -1116,8 +1150,22 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // sketch kinds/configs (e.g. DDSketch vs Kll, or two
                         // DDSketches at different relative_accuracy) get
                         // SEPARATE sids — matching the identity model the
-                        // retired `compute_sketch_sid` hashed over.
-                        let kind_for_sid = sketch_kind_handle_for(&dp);
+                        // retired `compute_sketch_sid` hashed over. For the
+                        // empty-attrs global-aggregation case `fp` is `""`,
+                        // so the resolver mints a single stable sid for
+                        // `(metric, "", agg_kind)`.
+                        //
+                        // P1-4 — sid identity uses the BASE (heap-less)
+                        // family so a heap-bearing frame and a heap-LESS
+                        // frame for the same series share ONE sid. The heap
+                        // is an additive enrichment on the same sketch
+                        // substrate, not a different series; the capability
+                        // UPGRADE below promotes that shared sid's metadata
+                        // when a heap arrives. Without this collapse the two
+                        // frames would mint distinct sids and the upgrade
+                        // could never fire (the analyzer would also see two
+                        // candidates for one logical series).
+                        let kind_for_sid = base_sketch_kind_handle(sketch_kind_handle_for(&dp));
                         let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
                             kind: kind_for_sid,
                             config: dp.container_config.clone(),
@@ -1147,7 +1195,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // `(attributes_fingerprint, series_id)` are
                         // optional today — the patched OTel-Go exporter
                         // keys its local cache on the fingerprint, not on
-                        // the dictionary metadata.
+                        // the dictionary metadata. The empty-attrs global
+                        // series echoes an assignment with an empty
+                        // `attributes_fingerprint`, which the exporter
+                        // caches like any other binding.
                         new_assignments.push(
                             asap_otel_proto::tonic::collector::metrics::v1::SeriesAssignment {
                                 attributes_fingerprint: fp.as_bytes().to_vec(),
@@ -1254,6 +1305,58 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 expires_at_ms: None,
                                 policy_fp,
                             });
+                        } else if let Some(existing) = ingest_state.sketch_index.instance(sid) {
+                            // P1-4 (a) — one-way capability UPGRADE. The sid
+                            // was first registered from a non-heap frame
+                            // (PROTO, a delta, or a heap-LESS MSGPACK), so it
+                            // carries `FrequencyEstimate(CountMin|CountSketch)`
+                            // and can never answer `topk(...)`. If a later
+                            // heap-bearing frame arrives for the SAME sid,
+                            // promote it to `FrequencyTopk(*WithHeap)` and
+                            // upgrade its kind handle so the analyzer routes
+                            // top-k queries here. Never downgrades: we only
+                            // act when the current cap is heap-LESS frequency
+                            // and the incoming frame actually carries a heap.
+                            let incoming_kind = sketch_kind_handle_for(&dp);
+                            let upgrade_to = match (&existing.capability, incoming_kind) {
+                                (
+                                    Some(Capability::FrequencyEstimate(
+                                        SketchKindHandle::CountMin,
+                                    )),
+                                    SketchKindHandle::CmsWithHeap,
+                                ) => Some(SketchKindHandle::CmsWithHeap),
+                                (
+                                    Some(Capability::FrequencyEstimate(
+                                        SketchKindHandle::CountSketch,
+                                    )),
+                                    SketchKindHandle::CountSketchWithHeap,
+                                ) => Some(SketchKindHandle::CountSketchWithHeap),
+                                _ => None,
+                            };
+                            if let Some(new_kind) = upgrade_to {
+                                let mut upgraded = existing;
+                                upgraded.capability = Some(Capability::FrequencyTopk(new_kind));
+                                upgraded.agg_kind =
+                                    crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                                        kind: new_kind,
+                                        config: dp.container_config.clone(),
+                                        spatial_filter_canonical: String::new(),
+                                    };
+                                // `register` overwrites the sid-keyed entry
+                                // in place (same sid → same policy/metric
+                                // index slots), so this is an atomic swap to
+                                // the stronger capability.
+                                ingest_state.sketch_index.register(upgraded);
+                                debug!(
+                                    "OTLP sketch sid {} upgraded {:?} -> FrequencyTopk({:?}) \
+                                     on heap-bearing frame (metric={}, encoding={})",
+                                    sid,
+                                    SketchKindHandle::CountMin,
+                                    new_kind,
+                                    metric.name,
+                                    dp.encoding
+                                );
+                            }
                         }
 
                         let label_values: BTreeMap<String, String> = dp
@@ -1311,23 +1414,70 @@ async fn route_modified_otlp_sketches_to_precompute(
                     let accumulator: Box<dyn AggregateCore> = if dp.encoding == ENCODING_PROTO_DELTA
                         || dp.encoding == ENCODING_MSGPACK_DELTA
                     {
-                        let Some((mut merged, base_window_start)) = ingest_state
+                        let (mut merged, base_window_start) = match ingest_state
                             .sketch_snapshots
                             .get(&series_key)
                             .map(|e| (e.core.clone_boxed_core(), e.window_start))
-                        else {
-                            // No base yet → drop the delta (agent must
-                            // resend the next full frame). Unchanged
-                            // guard.
-                            decoded_failed += 1;
-                            debug!(
-                                "OTLP delta-sketch arrived before any base \
-                                 snapshot (metric={}, series_key={}); \
-                                 dropping — agent must resend the next full \
-                                 frame",
-                                metric.name, series_key
-                            );
-                            continue;
+                        {
+                            Some(pair) => pair,
+                            None => {
+                                // P1-1/P1-2 — no cached base. Under the
+                                // per-window-reset contract each delta
+                                // reconstructs onto an EMPTY base, so for the
+                                // ADDITIVE families (CMS / CountSketch / HLL)
+                                // we bootstrap an empty accumulator of the
+                                // frame's (kind, config) and apply the delta
+                                // onto it — mirroring the warm-read tier so
+                                // the worker tier agrees and recovers after a
+                                // backend restart (which drops this in-memory
+                                // cache). DDSketch / KLL can't reconstruct
+                                // from a bare delta, so they keep the
+                                // unchanged "drop until the next full frame"
+                                // behavior.
+                                match empty_accumulator_for_delta_bootstrap(
+                                    dp.kind,
+                                    &dp.container_config,
+                                    dp.encoding,
+                                ) {
+                                    Some(empty) => {
+                                        debug!(
+                                            "OTLP delta-sketch with no base \
+                                             bootstrapped onto an empty \
+                                             accumulator (metric={}, \
+                                             series_key={}, kind={:?}, \
+                                             encoding={})",
+                                            metric.name,
+                                            series_key,
+                                            dp.kind,
+                                            dp.encoding
+                                        );
+                                        // Treat the freshly-minted empty base
+                                        // as belonging to THIS delta's window
+                                        // so the window-boundary reset below
+                                        // is a no-op (the base is already
+                                        // empty for this window).
+                                        (empty, dp.start_time_unix_nano)
+                                    }
+                                    None => {
+                                        // DD/KLL — unchanged drop. Count as a
+                                        // distinct "no base" drop reason.
+                                        ingest_state
+                                            .observability
+                                            .dropped_no_base
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        decoded_failed += 1;
+                                        debug!(
+                                            "OTLP delta-sketch arrived before any base \
+                                             snapshot and is not bootstrappable \
+                                             (metric={}, series_key={}, kind={:?}); \
+                                             dropping — agent must resend the next full \
+                                             frame",
+                                            metric.name, series_key, dp.kind
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
                         };
                         // Window boundary: the incoming delta opens a new
                         // window for this series. Rotate the base to empty
@@ -1352,6 +1502,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                             &mut merged,
                             &dp.sketch,
                         ) {
+                            ingest_state
+                                .observability
+                                .dropped_decode_fail
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             decoded_failed += 1;
                             debug!(
                                 "OTLP delta-sketch apply failed \
@@ -1373,6 +1527,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 window_start: dp.start_time_unix_nano,
                             },
                         );
+                        // RES-1 — opportunistic eviction sweep keyed by the
+                        // entry's window_start, bounding cache growth for
+                        // churning high-cardinality series.
+                        ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
                         merged
                     } else {
                         match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
@@ -1384,9 +1542,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                                         window_start: dp.start_time_unix_nano,
                                     },
                                 );
+                                // RES-1 — sweep stale per-series bases on the
+                                // full-frame insert too.
+                                ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
                                 acc
                             }
                             Err(e) => {
+                                ingest_state
+                                    .observability
+                                    .dropped_decode_fail
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 decoded_failed += 1;
                                 let msg = e.to_string();
                                 // Defensive dim-validation rejections
@@ -1424,55 +1589,94 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     };
 
-                    let mut matched_any = false;
-                    for config in agg_configs.values() {
-                        if config.metric != canonical_name
-                            && config.spatial_filter_normalized != canonical_name
-                            && config.spatial_filter != canonical_name
-                        {
-                            continue;
-                        }
-                        let group_key = IngestState::extract_group_key_for(&series_key, config);
+                    // Collect the configs whose metric matches this DP.
+                    // Detection is independent of the legacy dual-write
+                    // (it only drives the routed/unconfigured accounting),
+                    // so we walk it whether or not the worker push fires.
+                    let matching_configs: Vec<&asap_types::aggregation_config::AggregationConfig> =
+                        agg_configs
+                        .values()
+                        .filter(|config| {
+                            config.metric == canonical_name
+                                || config.spatial_filter_normalized == canonical_name
+                                || config.spatial_filter == canonical_name
+                        })
+                        .collect();
+                    let matched_any = !matching_configs.is_empty();
+
+                    // CQ-2 — only pay the worker push (and the per-config
+                    // sid resolution + accumulator clone) when the legacy
+                    // dual-write is explicitly enabled. The SketchStore
+                    // `append_sample` above is the live write either way.
+                    if legacy_dual_write {
                         // B7.6 — bucket key is the per-config bucket sid
                         // (folds in `(metric, grouping-label-values,
                         // ExactAgg-of-config)`), NOT the per-DP `sid`
                         // resolved above. The per-DP `sid` keys the
                         // `SketchStore::register/append_sample` lane
                         // (which uses `AggKind::Sketch` to distinguish
-                        // sketch shapes); the worker's
-                        // group_states are keyed per-aggregation-policy
-                        // bucket, which matches what
-                        // `reconcile_from_streaming_config` derives
-                        // from the same config (so retirement / orphan
-                        // eviction stays consistent).
+                        // sketch shapes); the worker's group_states are
+                        // keyed per-aggregation-policy bucket, which
+                        // matches what `reconcile_from_streaming_config`
+                        // derives from the same config (so retirement /
+                        // orphan eviction stays consistent).
                         //
-                        // DEPRECATED routing-side write — remove after
-                        // ASAP-tier validation. The Phase 5 SketchStore
-                        // above is the new write path; this legacy
-                        // router push stays in tandem until the query
-                        // path's ASAP-tier reducer is wired end-to-end
-                        // and the streaming-config / SketchStore call
-                        // sites can be deleted.
-                        let attrs_map: HashMap<String, String> = dp
-                            .attrs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        let (bucket_sid, policy_fp) =
-                            resolve_bucket_sid_for_agg_config(ingest_state, config, &attrs_map);
-                        messages.push(WorkerMessage::AccumulatorInput {
-                            sid: bucket_sid,
-                            policy_fp,
-                            group_key,
-                            timestamp_ms: ts_ms,
-                            accumulator: accumulator.clone_boxed_core(),
-                            ingest_received_at,
-                        });
-                        matched_any = true;
+                        // DEPRECATED routing-side write — kept behind the
+                        // `ASAP_LEGACY_DUAL_WRITE` gate until the ASAP-tier
+                        // query reducer is validated end-to-end.
+                        let n = matching_configs.len();
+                        // PERF-2 — carry the owned accumulator so the LAST
+                        // matching config can MOVE it into its message
+                        // instead of cloning. `Some` until consumed; the
+                        // common single-match case pays zero clones.
+                        let mut owned_acc: Option<Box<dyn AggregateCore>> = Some(accumulator);
+                        for (i, config) in matching_configs.iter().enumerate() {
+                            // PERF-4 — group key straight from `dp.attrs`
+                            // (no format_series_key → parse round-trip).
+                            let group_key =
+                                IngestState::extract_group_key_from_labels(&dp.attrs, config);
+                            // PERF-3 — `dp.attrs` is already a
+                            // `HashMap<String, String>`; pass it directly
+                            // instead of rebuilding `attrs_map` per config.
+                            let (bucket_sid, policy_fp) = resolve_bucket_sid_for_agg_config(
+                                ingest_state,
+                                config,
+                                &dp.attrs,
+                            );
+                            let acc_for_msg = if i + 1 == n {
+                                // Last (or only) match — move the owned
+                                // accumulator out, no clone.
+                                owned_acc.take().expect("owned_acc present on last match")
+                            } else {
+                                // 2nd..Nth match — clone from the still-owned
+                                // accumulator (cloning a sketch is a msgpack
+                                // round-trip, so we only pay it when a DP
+                                // genuinely fans out to multiple policies).
+                                owned_acc
+                                    .as_ref()
+                                    .expect("owned_acc present before last match")
+                                    .clone_boxed_core()
+                            };
+                            messages.push(WorkerMessage::AccumulatorInput {
+                                sid: bucket_sid,
+                                policy_fp,
+                                group_key,
+                                timestamp_ms: ts_ms,
+                                accumulator: acc_for_msg,
+                                ingest_received_at,
+                            });
+                        }
                     }
+
                     if matched_any {
                         routed += 1;
                     } else {
+                        // CQ-6 — a decoded sketch that matched no
+                        // AggregationConfig in the running streaming config.
+                        ingest_state
+                            .observability
+                            .dropped_unconfigured
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         unconfigured += 1;
                     }
                 }
@@ -1681,6 +1885,56 @@ fn canonical_sketch_metric_name<'a>(name: &'a str, kind: SketchKind) -> &'a str 
     }
 }
 
+/// P1-4 — does this frequency-sketch DataPoint carry a non-empty top-k
+/// heap? Detects the heap on BOTH heap-bearing wire encodings:
+///
+///   * `ENCODING_MSGPACK` — full heap-bearing frame
+///     (`{sketch, topk_heap, heap_size}`); decoded with
+///     `CountMinSketchWithHeap::from_msgpack`.
+///   * `ENCODING_MSGPACK_DELTA` — DELTA-HEAP frame (sparse matrix delta +
+///     the FULL top-k heap); decoded via the heap accumulator's
+///     `from_msgpack_heap_delta_bytes` (the same generic `rmp_serde`
+///     reader the apply path uses). This lets a sid whose FIRST frame is
+///     a delta still be detected as heap-bearing and registered/upgraded
+///     to a top-k capability — part (b) of P1-4.
+///
+/// PROTO / PROTO_DELTA frequency frames don't carry a heap on the wire,
+/// so they always read as heap-LESS here.
+fn dp_carries_heap(dp: &ModifiedOtlpSketchDp) -> bool {
+    match dp.encoding {
+        ENCODING_MSGPACK => {
+            use asap_sketchlib::CountMinSketchWithHeap;
+            CountMinSketchWithHeap::from_msgpack(&dp.sketch)
+                .map(|cms| !cms.topk_heap_items().is_empty())
+                .unwrap_or(false)
+        }
+        ENCODING_MSGPACK_DELTA => {
+            use crate::precompute_engine::operators::CountMinSketchWithHeapAccumulator;
+            CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(&dp.sketch)
+                .map(|acc| !acc.inner.topk_heap_items().is_empty())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// P1-4 — collapse a heap-BEARING frequency handle to its heap-LESS base
+/// family. Used for SID IDENTITY so a heap-bearing frame and a heap-less
+/// frame for the same `(metric, attrs, config)` resolve to ONE sid (the
+/// heap is enrichment on the same substrate, not a different series). The
+/// CAPABILITY still tracks the heap via the metadata upgrade path. All
+/// other handles pass through unchanged.
+fn base_sketch_kind_handle(
+    kind: crate::storage_engines::sketch_db::index::SketchKindHandle,
+) -> crate::storage_engines::sketch_db::index::SketchKindHandle {
+    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+    match kind {
+        SketchKindHandle::CmsWithHeap => SketchKindHandle::CountMin,
+        SketchKindHandle::CountSketchWithHeap => SketchKindHandle::CountSketch,
+        other => other,
+    }
+}
+
 fn sketch_kind_handle_for(
     dp: &ModifiedOtlpSketchDp,
 ) -> crate::storage_engines::sketch_db::index::SketchKindHandle {
@@ -1699,13 +1953,8 @@ fn sketch_kind_handle_for(
             // Auto-promote to `CountSketchWithHeap` when the bytes
             // decode AND the heap is non-empty; otherwise stay with
             // vanilla `CountSketch`.
-            if dp.encoding == ENCODING_MSGPACK {
-                use asap_sketchlib::CountMinSketchWithHeap;
-                if let Ok(cms) = CountMinSketchWithHeap::from_msgpack(&dp.sketch) {
-                    if !cms.topk_heap_items().is_empty() {
-                        return SketchKindHandle::CountSketchWithHeap;
-                    }
-                }
+            if dp_carries_heap(dp) {
+                return SketchKindHandle::CountSketchWithHeap;
             }
             SketchKindHandle::CountSketch
         }
@@ -1717,13 +1966,8 @@ fn sketch_kind_handle_for(
             // resulting heap is non-empty, treat the sid as
             // CmsWithHeap so ASAP-tier `topk` can read the heap.
             // Otherwise stay with vanilla `CountMin`.
-            if dp.encoding == ENCODING_MSGPACK {
-                use asap_sketchlib::CountMinSketchWithHeap;
-                if let Ok(cms) = CountMinSketchWithHeap::from_msgpack(&dp.sketch) {
-                    if !cms.topk_heap_items().is_empty() {
-                        return SketchKindHandle::CmsWithHeap;
-                    }
-                }
+            if dp_carries_heap(dp) {
+                return SketchKindHandle::CmsWithHeap;
             }
             SketchKindHandle::CountMin
         }
@@ -1940,6 +2184,78 @@ fn decode_modified_otlp_sketch_bytes(
              (expected 1 / 2 / 3 / 4)"
         )
         .into()),
+    }
+}
+
+/// P1-1/P1-2 — construct an EMPTY accumulator matching a sketch
+/// DataPoint's `(kind, container_config)`, for bootstrapping a delta
+/// frame that arrives with no cached base.
+///
+/// Under the per-window-reset contract (`docs/delta-baseline-contract.md`
+/// §3) each window's delta encodes that window's own state against an
+/// EMPTY base. So a leading delta (no prior full frame — e.g. the very
+/// first frame for a sid, or the first frame after a backend restart
+/// dropped the in-memory snapshot cache) is reconstructable for the
+/// ADDITIVE families by `empty(dims) + apply(delta)`. This mirrors the
+/// warm-read tier's standalone delta reconstruction so the worker tier
+/// agrees with it and recovers after restart, instead of dropping the
+/// delta.
+///
+/// Returns `None` for families that CANNOT reconstruct from a bare delta
+/// (DDSketch and KLL): DDSketch deltas are bucket-index diffs whose
+/// absolute store layout depends on the base's offset, and KLL never
+/// deltas. Those keep the unchanged "drop until the next full frame"
+/// behavior.
+fn empty_accumulator_for_delta_bootstrap(
+    kind: SketchKind,
+    config: &crate::storage_engines::sketch_db::index::SketchConfig,
+    encoding: i32,
+) -> Option<Box<dyn AggregateCore>> {
+    use crate::precompute_engine::operators::{
+        CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
+        HllSketchAccumulator,
+    };
+    use crate::storage_engines::sketch_db::index::SketchConfig;
+
+    match (kind, config) {
+        (SketchKind::Hll, SketchConfig::Hll { precision }) => {
+            use asap_sketchlib::HllVariant;
+            // Regular is the default agent variant; HLL's additive delta
+            // merge tolerates an empty same-precision base.
+            Some(Box::new(HllSketchAccumulator::new(
+                HllVariant::Regular,
+                *precision,
+            )))
+        }
+        (SketchKind::CountMin, SketchConfig::CountMin { rows, cols }) => Some(Box::new(
+            CountMinSketchAccumulator::new(*rows as usize, *cols as usize),
+        )),
+        (SketchKind::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
+            // A heap-bearing DELTA-HEAP frame must reconstruct onto a heap
+            // accumulator (the apply path downcasts to
+            // `CountMinSketchWithHeapAccumulator`); a plain matrix delta
+            // reconstructs onto a vanilla CountSketch. Pick the base shape
+            // from the encoding so the subsequent
+            // `apply_modified_otlp_delta_bytes` downcast succeeds.
+            if encoding == ENCODING_MSGPACK_DELTA {
+                // heap_size 0 is fine — the DELTA-HEAP apply REPLACES the
+                // heap wholesale from the frame's full heap.
+                Some(Box::new(CountMinSketchWithHeapAccumulator::new(
+                    *rows as usize,
+                    *cols as usize,
+                    0,
+                )))
+            } else {
+                Some(Box::new(CountSketchAccumulator::new(
+                    *rows as usize,
+                    *cols as usize,
+                )))
+            }
+        }
+        // DDSketch / KLL (and any config/kind mismatch) — not
+        // reconstructable from a bare delta. Caller keeps the unchanged
+        // drop behavior.
+        _ => None,
     }
 }
 
@@ -2297,47 +2613,15 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             });
                         }
                     }
-                    // Modified-OTLP first-class sketch metric variants. PR A
-                    // vendors the proto and surfaces the new arms; PR B will
-                    // populate them with per-variant decoders that route via
-                    // WorkerMessage::AccumulatorInput. For now, drop with a
-                    // debug log so the metric is visible in the ingest path.
-                    Some(Data::Ddsketch(d)) => {
-                        debug!(
-                            "OTLP modified-proto Ddsketch received (metric={}, dps={}); decoder is PR B",
-                            metric.name,
-                            d.data_points.len()
-                        );
-                    }
-                    Some(Data::Kllsketch(k)) => {
-                        debug!(
-                            "OTLP modified-proto Kllsketch received (metric={}, dps={}); decoder is PR B",
-                            metric.name,
-                            k.data_points.len()
-                        );
-                    }
-                    Some(Data::Countsketch(c)) => {
-                        debug!(
-                            "OTLP modified-proto Countsketch received (metric={}, dps={}); decoder is PR B",
-                            metric.name,
-                            c.data_points.len()
-                        );
-                    }
-                    Some(Data::Countminsketch(c)) => {
-                        debug!(
-                            "OTLP modified-proto Countminsketch received (metric={}, dps={}); decoder is PR B",
-                            metric.name,
-                            c.data_points.len()
-                        );
-                    }
-                    Some(Data::Hllsketch(h)) => {
-                        debug!(
-                            "OTLP modified-proto Hllsketch received (metric={}, dps={}); decoder is PR B",
-                            metric.name,
-                            h.data_points.len()
-                        );
-                    }
-                    None => {}
+                    // Modified-OTLP first-class sketch metric variants
+                    // (Ddsketch / Kllsketch / Countsketch / Countminsketch /
+                    // Hllsketch) and `None` are not handled here: this
+                    // function only parses raw scalar metric points and
+                    // attribute-embedded `SketchEnvelope` payloads. The
+                    // first-class sketch DataPoints are decoded + routed by
+                    // `route_modified_otlp_sketches_to_precompute`, so we
+                    // intentionally ignore them in this parse pass.
+                    _ => {}
                 }
             }
         }
@@ -2808,6 +3092,7 @@ mod sid_resolution_tests {
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(SeriesIdResolver::new()),
             sketch_index: Arc::new(SketchStore::new()),
+            observability: crate::precompute_engine::ingest_handler::IngestObservability::default(),
         });
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         (state, drain)
@@ -3222,6 +3507,447 @@ mod sid_resolution_tests {
         drop(state);
         let _ = drain.await;
     }
+
+    // ── P1-1/P1-2: leading delta (no prior full) for additive families ──
+
+    /// Build an export request carrying one `CountMinSketch` DataPoint.
+    fn build_cms_request(
+        metric: &str,
+        rows: i32,
+        cols: i32,
+        encoding: i32,
+        sketch: Vec<u8>,
+        start_ns: u64,
+        ts_ns: u64,
+    ) -> ExportMetricsServiceRequest {
+        use asap_otel_proto::tonic::metrics::v1::{
+            CountMinSketch as PbCms, CountMinSketchDataPoint as PbCmsDp,
+        };
+        let dp = PbCmsDp {
+            attributes: vec![kv("svc", "auth")],
+            start_time_unix_nano: start_ns,
+            time_unix_nano: ts_ns,
+            sketch,
+            encoding,
+            flags: 0,
+            series_id: 0,
+        };
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![PbMetric {
+                        name: metric.to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Countminsketch(PbCms {
+                            data_points: vec![dp],
+                            aggregation_temporality: 0,
+                            rows,
+                            cols,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// Build an export request carrying one `HllSketch` DataPoint.
+    fn build_hll_request(
+        metric: &str,
+        precision: u32,
+        encoding: i32,
+        sketch: Vec<u8>,
+        start_ns: u64,
+        ts_ns: u64,
+    ) -> ExportMetricsServiceRequest {
+        use asap_otel_proto::tonic::metrics::v1::{
+            HllSketch as PbHll, HllSketchDataPoint as PbHllDp,
+        };
+        let dp = PbHllDp {
+            attributes: vec![kv("svc", "auth")],
+            start_time_unix_nano: start_ns,
+            time_unix_nano: ts_ns,
+            sketch,
+            encoding,
+            flags: 0,
+            series_id: 0,
+        };
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![PbMetric {
+                        name: metric.to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: Vec::new(),
+                        data: Some(Data::Hllsketch(PbHll {
+                            data_points: vec![dp],
+                            aggregation_temporality: 0,
+                            precision,
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    /// P1-1/P1-2 — a CMS PROTO_DELTA frame that is the FIRST frame for its
+    /// series (no prior full snapshot) must NOT be dropped: the ingest
+    /// path bootstraps an empty CMS of the frame's (rows, cols) and
+    /// applies the delta onto it, recovering the window's state. This is
+    /// what makes the worker tier agree with the warm-read tier and
+    /// recover after a backend restart.
+    #[tokio::test]
+    async fn leading_cms_delta_bootstraps_onto_empty_base() {
+        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
+        use crate::precompute_engine::operators::CountMinSketchAccumulator;
+        use prost::Message;
+
+        let (state, drain) = make_state().await;
+
+        const ROWS: i32 = 4;
+        const COLS: i32 = 8;
+        const WIN_START: u64 = 1_000_000;
+
+        // Sparse delta: +5 at (0,1), +9 at (2,3). All cells within 4x8.
+        let delta = PbDelta {
+            rows: ROWS as u32,
+            cols: COLS as u32,
+            cell_rows: vec![0u32, 2u32],
+            cell_cols: vec![1u32, 3u32],
+            d_counts: vec![5i64, 9i64],
+            l1: vec![5.0, 0.0, 9.0, 0.0],
+            l2: vec![25.0, 0.0, 81.0, 0.0],
+        }
+        .encode_to_vec();
+
+        let req = build_cms_request(
+            "frequency_metric",
+            ROWS,
+            COLS,
+            ENCODING_PROTO_DELTA,
+            delta,
+            WIN_START,
+            11_000_000,
+        );
+        // No prior full frame for this series — pre-fix this DP was
+        // dropped (decoded_failed). Post-fix it bootstraps + applies.
+        route_modified_otlp_sketches_to_precompute(&req, &state).await;
+
+        // The per-series base is now cached, holding the window's
+        // reconstructed matrix.
+        let mut attrs = HashMap::new();
+        attrs.insert("svc".to_string(), "auth".to_string());
+        let series_key = format_series_key(
+            canonical_sketch_metric_name("frequency_metric", SketchKind::CountMin),
+            &attrs,
+        );
+        {
+            let entry = state
+                .sketch_snapshots
+                .get(&series_key)
+                .expect("leading CMS delta bootstrapped + cached a base");
+            let cms = entry
+                .core
+                .as_any()
+                .downcast_ref::<CountMinSketchAccumulator>()
+                .expect("base is a CountMinSketchAccumulator");
+            let matrix = cms.inner.sketch();
+            assert_eq!(matrix[0][1], 5.0, "delta cell (0,1) applied onto empty base");
+            assert_eq!(matrix[2][3], 9.0, "delta cell (2,3) applied onto empty base");
+            assert_eq!(matrix[0][0], 0.0, "untouched cell stays empty");
+        }
+        // The DD/KLL "no base" drop counter must NOT have ticked — CMS is
+        // bootstrappable.
+        assert_eq!(
+            state
+                .observability
+                .dropped_no_base
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "CMS leading delta is bootstrapped, not dropped as no-base"
+        );
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// P1-1/P1-2 — same as above but for HLL: a leading PROTO_DELTA frame
+    /// bootstraps onto an empty HLL of the frame's precision and applies
+    /// the register-max updates.
+    #[tokio::test]
+    async fn leading_hll_delta_bootstraps_onto_empty_base() {
+        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
+        use crate::precompute_engine::operators::HllSketchAccumulator;
+        use prost::Message;
+
+        let (state, drain) = make_state().await;
+
+        const PRECISION: u32 = 2; // 2^2 = 4 registers
+        const WIN_START: u64 = 1_000_000;
+
+        // Packed (index, value) updates: set register 0 -> 4, register 2 -> 6.
+        let delta = PbDelta {
+            packed_updates: vec![0, 4, 2, 6],
+        }
+        .encode_to_vec();
+
+        let req = build_hll_request(
+            "cardinality_metric",
+            PRECISION,
+            ENCODING_PROTO_DELTA,
+            delta,
+            WIN_START,
+            11_000_000,
+        );
+        route_modified_otlp_sketches_to_precompute(&req, &state).await;
+
+        let mut attrs = HashMap::new();
+        attrs.insert("svc".to_string(), "auth".to_string());
+        let series_key = format_series_key(
+            canonical_sketch_metric_name("cardinality_metric", SketchKind::Hll),
+            &attrs,
+        );
+        {
+            let entry = state
+                .sketch_snapshots
+                .get(&series_key)
+                .expect("leading HLL delta bootstrapped + cached a base");
+            let hll = entry
+                .core
+                .as_any()
+                .downcast_ref::<HllSketchAccumulator>()
+                .expect("base is an HllSketchAccumulator");
+            // Empty base registers are all 0; the delta sets max(0,4)=4 and
+            // max(0,6)=6 on registers 0 and 2.
+            assert_eq!(hll.inner.registers[0], 4, "register 0 set to 4");
+            assert_eq!(hll.inner.registers[2], 6, "register 2 set to 6");
+        }
+        assert_eq!(
+            state
+                .observability
+                .dropped_no_base
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "HLL leading delta is bootstrapped, not dropped as no-base"
+        );
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    /// P1-1/P1-2 — DDSketch is NOT bootstrappable from a bare delta, so a
+    /// leading DDSketch delta is still dropped and counted under
+    /// `dropped_no_base`. Confirms the fix is scoped to the additive
+    /// families and leaves DD/KLL behavior unchanged.
+    #[tokio::test]
+    async fn leading_ddsketch_delta_still_dropped_as_no_base() {
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use prost::Message;
+
+        let (state, drain) = make_state().await;
+        let delta = PbDelta {
+            buckets: vec![DdSketchBucketDelta {
+                index: 0,
+                d_count: 10,
+            }],
+        }
+        .encode_to_vec();
+        let dp = DdSketchDataPoint {
+            attributes: vec![kv("zone", "z0")],
+            start_time_unix_nano: 1_000_000,
+            time_unix_nano: 11_000_000,
+            sketch: delta,
+            encoding: ENCODING_PROTO_DELTA,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 0,
+        };
+        route_modified_otlp_sketches_to_precompute(
+            &build_request("dd_latency_ms", dp),
+            &state,
+        )
+        .await;
+
+        let mut attrs = HashMap::new();
+        attrs.insert("zone".to_string(), "z0".to_string());
+        let series_key = format_series_key(
+            canonical_sketch_metric_name("dd_latency_ms", SketchKind::DdSketch),
+            &attrs,
+        );
+        assert!(
+            state.sketch_snapshots.get(&series_key).is_none(),
+            "DDSketch leading delta is dropped (no bootstrap), so nothing cached"
+        );
+        assert_eq!(
+            state
+                .observability
+                .dropped_no_base
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "DDSketch leading delta counted as a no-base drop"
+        );
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    // ── P1-4: heap capability upgrade ──
+
+    /// P1-4 (a) — a CMS sid first registered from a heap-LESS frame
+    /// (`FrequencyEstimate(CountMin)`) must UPGRADE to
+    /// `FrequencyTopk(CmsWithHeap)` when a later heap-bearing MSGPACK
+    /// frame arrives for the same sid. One-way; never downgrades.
+    #[tokio::test]
+    async fn heap_bearing_frame_upgrades_cms_sid_capability() {
+        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
+        use crate::storage_engines::sketch_db::index::{Capability, SketchKindHandle};
+
+        let (state, drain) = make_state().await;
+
+        const ROWS: i32 = 4;
+        const COLS: i32 = 8;
+
+        // ── Frame 1: heap-LESS plain CMS msgpack. Registers the sid as
+        // FrequencyEstimate(CountMin). ──
+        let plain = asap_sketchlib::CountMinSketch::new(ROWS as usize, COLS as usize);
+        let plain_bytes = plain.to_msgpack().expect("serialize plain CMS msgpack");
+        let req1 = build_cms_request(
+            "topk_metric",
+            ROWS,
+            COLS,
+            ENCODING_MSGPACK,
+            plain_bytes,
+            1_000_000,
+            11_000_000,
+        );
+        let out1 = route_modified_otlp_sketches_to_precompute(&req1, &state).await;
+        let sid = out1.series_assignments[0].series_id;
+        let meta1 = state.sketch_index.instance(sid).expect("sid registered");
+        assert_eq!(
+            meta1.capability,
+            Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            "heap-less first frame registers FrequencyEstimate(CountMin)"
+        );
+
+        // ── Frame 2: heap-BEARING CMS-with-heap msgpack for the SAME
+        // (metric, attrs) → same sid. Must upgrade the capability. ──
+        let mut heap = CountMinSketchWithHeap::new(ROWS as usize, COLS as usize, 4);
+        heap.update("hot_key", 100.0);
+        heap.update("hot_key", 50.0);
+        assert!(
+            !heap.topk_heap_items().is_empty(),
+            "heap frame carries a non-empty top-k heap"
+        );
+        let heap_bytes = heap.to_msgpack().expect("serialize CMS-with-heap msgpack");
+        let req2 = build_cms_request(
+            "topk_metric",
+            ROWS,
+            COLS,
+            ENCODING_MSGPACK,
+            heap_bytes,
+            1_000_000,
+            12_000_000,
+        );
+        route_modified_otlp_sketches_to_precompute(&req2, &state).await;
+
+        let meta2 = state.sketch_index.instance(sid).expect("sid still registered");
+        assert_eq!(
+            meta2.capability,
+            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            "heap-bearing frame upgrades the sid to FrequencyTopk(CmsWithHeap)"
+        );
+        // Still one instance — the upgrade is an in-place overwrite, not a
+        // new sid.
+        assert_eq!(state.sketch_index.instance_count(), 1);
+
+        // ── Frame 3: a later heap-LESS frame must NOT downgrade. ──
+        let plain2 = asap_sketchlib::CountMinSketch::new(ROWS as usize, COLS as usize);
+        let plain2_bytes = plain2.to_msgpack().expect("serialize plain CMS msgpack");
+        let req3 = build_cms_request(
+            "topk_metric",
+            ROWS,
+            COLS,
+            ENCODING_MSGPACK,
+            plain2_bytes,
+            1_000_000,
+            13_000_000,
+        );
+        route_modified_otlp_sketches_to_precompute(&req3, &state).await;
+        let meta3 = state.sketch_index.instance(sid).expect("sid still registered");
+        assert_eq!(
+            meta3.capability,
+            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            "a later heap-less frame never downgrades the capability"
+        );
+
+        drop(state);
+        let _ = drain.await;
+    }
+
+    // ── P1-5: empty-attrs (global-aggregation) series can mint a sid ──
+
+    /// P1-5 — a sketch DataPoint with NO attributes (global aggregation,
+    /// no resource/scope/DP attrs) must still resolve to a sid via the
+    /// resolver (fingerprint `""`) and register a SketchStore instance,
+    /// instead of being dropped by the store-lookup-only branch.
+    #[tokio::test]
+    async fn attr_less_sketch_dp_mints_a_sid() {
+        let (state, drain) = make_state().await;
+
+        let dp = DdSketchDataPoint {
+            attributes: Vec::new(), // global aggregation — no attrs at all
+            start_time_unix_nano: 1_000_000,
+            time_unix_nano: 11_000_000,
+            sketch: vec![1, 2, 3],
+            encoding: ENCODING_PROTO,
+            exemplars: Vec::new(),
+            flags: 0,
+            series_id: 0, // first emit, no cached sid
+        };
+        let out = route_modified_otlp_sketches_to_precompute(
+            &build_request("global_latency_ms", dp),
+            &state,
+        )
+        .await;
+
+        // Pre-fix: dropped (sid=0 + no attrs → None). Post-fix: resolver
+        // mints a stable sid for (metric, "", agg_kind) and echoes an
+        // assignment with an empty fingerprint.
+        assert_eq!(
+            out.series_assignments.len(),
+            1,
+            "attr-less DP resolves and echoes one assignment"
+        );
+        let assigned = &out.series_assignments[0];
+        assert_ne!(assigned.series_id, 0, "resolver mints a non-zero sid");
+        assert!(
+            assigned.attributes_fingerprint.is_empty(),
+            "global series carries the empty fingerprint"
+        );
+        assert!(
+            out.unknown_series_ids.is_empty(),
+            "no unknown sids — the DP was ingestable, not dropped"
+        );
+        assert_eq!(
+            state.sketch_index.instance_count(),
+            1,
+            "SketchStore registered the global-aggregation instance"
+        );
+        assert!(state.sketch_index.instance(assigned.series_id).is_some());
+
+        drop(state);
+        let _ = drain.await;
+    }
 }
 
 // ── B7.6 regression: ingest bucketing is keyed by sid, not (agg_id, group_key) ──
@@ -3369,6 +4095,7 @@ mod sid_bucketing_tests {
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: resolver.clone(),
             sketch_index: Arc::new(SketchStore::new()),
+            observability: crate::precompute_engine::ingest_handler::IngestObservability::default(),
         });
 
         // Two zones × two DPs each. The two zones must produce two
@@ -3379,7 +4106,10 @@ mod sid_bucketing_tests {
             &[("z0", 1.0), ("z0", 2.0), ("z1", 10.0), ("z1", 20.0)],
         );
 
-        route_otlp_to_precompute(&req, &state).await;
+        // PERF-1 — parse once and pass the slices, matching the receiver
+        // path's new shape.
+        let (points, sketch_payloads) = otlp_to_metric_points_and_sketches(&req);
+        route_otlp_to_precompute(&points, &sketch_payloads, &state).await;
 
         // Drain the messages the dispatcher emitted (one per bucket).
         let mut messages: Vec<WorkerMessage> = Vec::new();

@@ -297,136 +297,38 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Proto-envelope decoders — duplicated minimally from the inline forms
-// in `sketch_reducer.rs` so this module can decode "delta as full
-// fragment" without re-entering the reducer's private functions.
+// Proto-envelope decoders — P2-4: ONE decoder per family.
+//
+// These delegate to the precompute-side accumulators'
+// `from_sketchlib_proto_bytes`, which are the single source of truth for
+// the modified-OTLP proto wire format (envelope unwrapping, alpha/k/
+// precision validation, and — critically for HLL — SPARSE
+// `registers_sparse` expansion). Folding the warm read path onto the
+// same decoder the ingest path uses means the sparse-register fix (and
+// any future format change) can never drift between the two copies again
+// — the bug class P2-3 / P2-4 closed. We extract the accumulator's
+// public `inner` sketch for the rolling-state merge.
 // ---------------------------------------------------------------------------
 
 fn dd_from_proto(buffer: &[u8]) -> Result<DdSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Ddsketch(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-DDSketch sketch".to_string()),
-            None => {
-                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
-            }
-        },
-        Err(_) => {
-            DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?
-        }
-    };
-    if !(state.alpha > 0.0 && state.alpha < 1.0) {
-        return Err(format!(
-            "DDSketchState alpha {} out of range (expected 0 < alpha < 1)",
-            state.alpha
-        ));
-    }
-    // The DataPoint-level scalars (count/sum/min/max) were dropped from
-    // `DDSketchState` (ProjectASAP/sketchlib-go#243 / asap_sketchlib#57);
-    // `DdSketch::from_raw` takes only (alpha, store_counts, store_offset)
-    // and recovers `count` from the bucket store.
-    Ok(DdSketch::from_raw(
-        state.alpha,
-        state.store_counts.clone(),
-        state.store_offset,
-    ))
+    use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+    DDSketchAccumulator::from_sketchlib_proto_bytes(buffer)
+        .map(|acc| acc.inner)
+        .map_err(|e| e.to_string())
 }
 
 fn kll_from_proto(buffer: &[u8]) -> Result<KllSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Kll(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-KLL sketch".to_string()),
-            None => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-        },
-        Err(_) => KllState::decode(buffer).map_err(|e| format!("decode KllState: {e}"))?,
-    };
-    if state.k < 8 {
-        return Err(format!("KllState.k must be >= 8 (got {})", state.k));
-    }
-    if state.k > u16::MAX as u32 {
-        return Err(format!(
-            "KllState.k does not fit in u16 (got {}, max {})",
-            state.k,
-            u16::MAX
-        ));
-    }
-    let k = state.k as u16;
-    let mut sk = KllSketch::new(k);
-    for item in &state.items {
-        sk.update(*item);
-    }
-    Ok(sk)
+    use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+    DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(buffer)
+        .map(|acc| acc.inner)
+        .map_err(|e| e.to_string())
 }
 
 fn hll_from_proto(buffer: &[u8]) -> Result<HllSketch, String> {
-    use asap_sketchlib::proto::sketchlib::{
-        sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
-    };
-    use asap_sketchlib::HllVariant;
-    use prost::Message;
-    let state = match SketchEnvelope::decode(buffer) {
-        Ok(env) => match env.sketch_state {
-            Some(sketch_envelope::SketchState::Hll(st)) => st,
-            Some(_) => return Err("SketchEnvelope contains non-HLL sketch".to_string()),
-            None => HyperLogLogState::decode(buffer)
-                .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
-        },
-        Err(_) => {
-            HyperLogLogState::decode(buffer).map_err(|e| format!("decode HyperLogLogState: {e}"))?
-        }
-    };
-    if state.precision == 0 || state.precision > 20 {
-        return Err(format!(
-            "HyperLogLogState precision {} out of range (expected 1..=20)",
-            state.precision
-        ));
-    }
-    let expected_len = 1usize << state.precision;
-    // Register resolution mirrors the ingest decoder
-    // (hll_sketch_accumulator::from_sketchlib_proto_bytes): sketchlib-go emits
-    // the SPARSE `registers_sparse` (tag 7) form below its dense/sparse
-    // crossover, leaving the dense `registers` (tag 3) field empty for
-    // low-cardinality producers — the common case. Expand it here too so the
-    // READ path reconstructs the same dense array; without this, warm HLL
-    // reads of sparse frames fail with "registers has 0 bytes".
-    let dense_registers: Vec<u8> = if state.registers.len() == expected_len {
-        state.registers.clone()
-    } else if !state.registers.is_empty() {
-        return Err(format!(
-            "HyperLogLogState registers has {} bytes, expected 2^precision = {}",
-            state.registers.len(),
-            expected_len
-        ));
-    } else if let Some(sparse) = state.registers_sparse.as_ref() {
-        crate::precompute_engine::operators::hll_sketch_accumulator::expand_sparse_hll_registers(
-            &sparse.packed,
-            expected_len,
-        )
-        .map_err(|e| format!("expand sparse HLL registers: {e}"))?
-    } else {
-        vec![0u8; expected_len]
-    };
-    let proto_variant = ProtoVariant::try_from(state.variant)
-        .map_err(|_| format!("HyperLogLogState has unknown variant tag {}", state.variant))?;
-    let variant = match proto_variant {
-        ProtoVariant::Unspecified => HllVariant::Unspecified,
-        ProtoVariant::Regular => HllVariant::Regular,
-        ProtoVariant::ErtlMle => HllVariant::Datafusion,
-        ProtoVariant::Hip => HllVariant::Hip,
-    };
-    Ok(HllSketch::from_raw(
-        variant,
-        state.precision,
-        dense_registers,
-        state.hip_kxq0,
-        state.hip_kxq1,
-        state.hip_est,
-    ))
+    use crate::precompute_engine::operators::hll_sketch_accumulator::HllSketchAccumulator;
+    HllSketchAccumulator::from_sketchlib_proto_bytes(buffer)
+        .map(|acc| acc.inner)
+        .map_err(|e| e.to_string())
 }
 
 /// Apply a proto-encoded `HllDelta` frame onto the HLL register vector — the
@@ -437,4 +339,193 @@ fn apply_hll_proto_delta(sk: &mut HllSketch, buffer: &[u8]) -> Result<(), String
     sk.apply_delta_bytes(buffer)
         .map_err(|e| format!("apply HLLDelta: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! P2-3 / P2-4 regression tests for the consolidated single-decoder
+    //! path. These exercise the family proto decoders that now delegate
+    //! to the precompute accumulators (the single source of truth), so a
+    //! divergence between the warm read path and the ingest path —
+    //! notably the SPARSE-register HLL handling the deleted dead decoder
+    //! got wrong — fails the build.
+    use super::*;
+    use asap_sketchlib::HllVariant;
+
+    fn encode_dd(sk: &DdSketch) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
+        use prost::Message;
+        let state = DdSketchState {
+            alpha: sk.alpha,
+            store_counts: sk.store_counts.clone(),
+            store_offset: sk.store_offset,
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_kll(k: u16, items: &[f64]) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{sketch_envelope, KllState, SketchEnvelope};
+        use prost::Message;
+        let state = KllState {
+            k: k as u32,
+            items: items.to_vec(),
+            levels: vec![],
+            num_levels: 0,
+            ..Default::default()
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Kll(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    fn encode_hll_dense(sk: &HllSketch) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use prost::Message;
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: sk.precision,
+            registers: sk.registers.clone(),
+            hip_kxq0: sk.hip_kxq0,
+            hip_kxq1: sk.hip_kxq1,
+            hip_est: sk.hip_est,
+            registers_sparse: None,
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// Build a SPARSE HLL proto frame: dense `registers` left empty,
+    /// `registers_sparse.packed` = varint (index_delta, value) pairs.
+    /// This is exactly the wire form a low-cardinality producer emits
+    /// (sketchlib-go below its dense/sparse crossover) — the frame the
+    /// DELETED `HllSketch_from_sketchlib_proto_bytes` hard-rejected with
+    /// "registers has 0 bytes".
+    fn encode_hll_sparse(precision: u32, nonzero: &[(u64, u8)]) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllSparseRegisters, HllVariant as ProtoVariant, HyperLogLogState,
+            SketchEnvelope,
+        };
+        use prost::Message;
+        // Varint-pack (index_delta, value), ascending index order.
+        let mut packed: Vec<u8> = Vec::new();
+        let mut prev: u64 = 0;
+        let mut put_uvarint = |buf: &mut Vec<u8>, mut v: u64| {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v != 0 {
+                    buf.push(b | 0x80);
+                } else {
+                    buf.push(b);
+                    break;
+                }
+            }
+        };
+        let mut sorted = nonzero.to_vec();
+        sorted.sort_by_key(|(i, _)| *i);
+        for (idx, val) in &sorted {
+            put_uvarint(&mut packed, idx - prev);
+            put_uvarint(&mut packed, *val as u64);
+            prev = *idx;
+        }
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision,
+            registers: Vec::new(), // dense field empty → sparse path
+            hip_kxq0: 0.0,
+            hip_kxq1: 0.0,
+            hip_est: 0.0,
+            // `num_registers` is informational — the decoder expands
+            // against `expected_len` from precision, not this field.
+            registers_sparse: Some(HllSparseRegisters {
+                num_registers: 1u32 << precision,
+                packed,
+            }),
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn hll_from_proto_accepts_sparse_frame() {
+        // The consolidated decoder must accept the sparse wire form (the
+        // deleted dead decoder rejected it). Build a sparse frame setting
+        // a handful of registers, decode it, and confirm those register
+        // slots came back set in the dense array.
+        let precision = 12u32;
+        let nonzero = [(3u64, 5u8), (100, 2), (4000, 7)];
+        let bytes = encode_hll_sparse(precision, &nonzero);
+        let sk = hll_from_proto(&bytes).expect("sparse HLL frame must decode (P2-3 regression)");
+        assert_eq!(sk.registers.len(), 1usize << precision);
+        for (idx, val) in nonzero {
+            assert_eq!(
+                sk.registers[idx as usize], val,
+                "sparse register {idx} expanded to wrong value"
+            );
+        }
+    }
+
+    #[test]
+    fn hll_from_proto_matches_accumulator_decoder() {
+        // P2-4: the warm read path and the ingest accumulator must decode
+        // the SAME bytes to the SAME sketch (one source of truth).
+        use crate::precompute_engine::operators::hll_sketch_accumulator::HllSketchAccumulator;
+        let mut sk = HllSketch::new(HllVariant::Regular, 12);
+        for i in 0..500u64 {
+            sk.update(format!("item-{i}").as_bytes());
+        }
+        let bytes = encode_hll_dense(&sk);
+        let via_delta = hll_from_proto(&bytes).expect("delta_apply hll decode");
+        let via_acc = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("accumulator hll decode")
+            .inner;
+        assert_eq!(
+            via_delta.registers, via_acc.registers,
+            "delta_apply and accumulator must produce identical HLL registers"
+        );
+        assert!((via_delta.estimate() - via_acc.estimate()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dd_from_proto_matches_accumulator_decoder() {
+        use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+        let mut sk = DdSketch::new(0.01);
+        for v in [1.0, 2.0, 5.0, 5.0, 9.0, 42.0] {
+            sk.update(v);
+        }
+        let bytes = encode_dd(&sk);
+        let via_delta = dd_from_proto(&bytes).expect("delta_apply dd decode");
+        let via_acc = DDSketchAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("accumulator dd decode")
+            .inner;
+        // Same quantile answers from the same bytes through both paths.
+        assert_eq!(via_delta.quantile(0.5), via_acc.quantile(0.5));
+        assert_eq!(via_delta.quantile(0.99), via_acc.quantile(0.99));
+    }
+
+    #[test]
+    fn kll_from_proto_matches_accumulator_decoder() {
+        use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
+        let items: Vec<f64> = (0..200).map(|i| i as f64).collect();
+        let bytes = encode_kll(256, &items);
+        let via_delta = kll_from_proto(&bytes).expect("delta_apply kll decode");
+        let via_acc = DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&bytes)
+            .expect("accumulator kll decode")
+            .inner;
+        assert_eq!(via_delta.quantile(0.5), via_acc.quantile(0.5));
+    }
 }
