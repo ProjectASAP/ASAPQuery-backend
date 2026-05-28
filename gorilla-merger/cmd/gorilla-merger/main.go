@@ -1,10 +1,19 @@
 // Command gorilla-merger is a Thanos-Receive-style merger for ASAP edge agents.
 //
-// It ingests Gorilla XOR-chunk fragments over HTTP (POST /ingest/gorilla),
-// appends their samples to an embedded Prometheus tsdb.DB with a 2h block
-// range, ships completed 2h blocks to object storage via the Thanos shipper
-// (one PUT set per block), and exposes a Thanos StoreAPI (gRPC) over the open
-// (<2h pending) window so thanos-query can union recent + S3 data.
+// The hot path is DECODE-FREE. It ingests Gorilla XOR-chunk fragments over HTTP
+// (POST /ingest/gorilla), durably logs each raw ASAPFRG1 frame to a block-level
+// WAL (fsync before the 200 ack) and buffers the raw XOR chunks per SMALL window
+// (no sample decode/re-encode). On a window's close it stitches the buffered
+// chunks DIRECTLY into a Prometheus TSDB block under <tsdb.path>/pending/, where
+// it becomes queryable within ~window+grace (the freshest data is NOT hidden for
+// a full block range). A background compactor merges the small pending blocks
+// (up to a DECOUPLED, larger --merge.compact-max-span) and re-chunks them to
+// ~120 samples/chunk for ratio, writing the result into <tsdb.path>/shipped/.
+// The Thanos shipper watches ONLY <tsdb.path>/shipped/, so exactly the
+// compacted, ratio-optimized blocks reach object storage (one PUT set each). The
+// Thanos StoreAPI (gRPC) serves the UNION of pending + shipped (plus the
+// separate decode-on-read cold-part store) so thanos-query can union recent +
+// S3 data with no gap across the pending->shipped promotion.
 package main
 
 import (
@@ -16,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +46,15 @@ type config struct {
 	externalLabels string
 	shipInterval   time.Duration
 	retention      time.Duration
+
+	// Decode-free merge knobs.
+	mergeWindow      time.Duration
+	mergeGrace       time.Duration
+	mergeWALDir      string
+	mergeFlushIntvl  time.Duration
+	compactInterval  time.Duration
+	compactMinBlocks int
+	compactMaxSpan   time.Duration
 }
 
 func main() {
@@ -59,7 +78,7 @@ func parseConfig() config {
 	fs.StringVar(&cfg.grpcAddr, "grpc-address", envOr("MERGER_GRPC_ADDRESS", ":10907"),
 		"gRPC listen address for the Thanos StoreAPI (the open-window query surface).")
 	fs.StringVar(&cfg.tsdbDir, "tsdb.path", envOr("MERGER_TSDB_PATH", "./data"),
-		"Local directory for the embedded tsdb.DB (WAL + pending/unshipped blocks).")
+		"Local data dir root. Layout: <path>/pending (per-window L1 blocks, served not shipped), <path>/shipped (compacted L2 blocks, served AND shipped), <path>/wal (fragment WAL).")
 	fs.StringVar(&cfg.objstoreFile, "objstore.config-file", envOr("MERGER_OBJSTORE_CONFIG_FILE", ""),
 		"Path to a Thanos objstore bucket config YAML. Same bucket that thanos-store-gateway watches. If empty, the shipper is disabled (write path + StoreAPI only).")
 	fs.StringVar(&cfg.externalLabels, "external-labels", envOr("MERGER_EXTERNAL_LABELS", ""),
@@ -68,6 +87,23 @@ func parseConfig() config {
 		"How often the shipper scans for and uploads new blocks.")
 	fs.DurationVar(&cfg.retention, "tsdb.retention", envDurationOr("MERGER_TSDB_RETENTION", 6*time.Hour),
 		"Local on-disk retention. Kept short since blocks live in object storage once shipped.")
+
+	// Decode-free merge knobs.
+	fs.DurationVar(&cfg.mergeWindow, "merge.window", envDurationOr("MERGER_MERGE_WINDOW", 2*time.Minute),
+		"Buffering/close window for the decode-free path; one closed window -> one directly-built PENDING block, queryable within ~window+grace+flush-tick. Kept small (2m) so recent data is NOT hidden for a full block range; compaction span (--merge.compact-max-span) controls how wide compacted blocks grow, NOT this.")
+	fs.DurationVar(&cfg.mergeGrace, "merge.reorder-grace", envDurationOr("MERGER_MERGE_REORDER_GRACE", time.Minute),
+		"How long after a window's end to keep accepting late/out-of-order fragments before flushing it.")
+	fs.StringVar(&cfg.mergeWALDir, "merge.wal-dir", envOr("MERGER_MERGE_WAL_DIR", ""),
+		"Directory for the block-level fragment WAL. Defaults to <tsdb.path>/wal.")
+	fs.DurationVar(&cfg.mergeFlushIntvl, "merge.flush-interval", envDurationOr("MERGER_MERGE_FLUSH_INTERVAL", 30*time.Second),
+		"How often to check for closable windows and flush them into pending blocks. 30s keeps recent-data visibility latency low (window+grace+this tick).")
+	fs.DurationVar(&cfg.compactInterval, "merge.compact-interval", envDurationOr("MERGER_MERGE_COMPACT_INTERVAL", 5*time.Minute),
+		"How often the background compactor merges small per-window pending blocks and re-chunks them to ~120 samples/chunk for ratio, promoting them into the shipped dir.")
+	fs.IntVar(&cfg.compactMinBlocks, "merge.compact-min-blocks", envIntOr("MERGER_MERGE_COMPACT_MIN_BLOCKS", 1),
+		"Minimum number of pending source blocks in a run before the compactor promotes them. 1 so even a lone pending block is re-chunked + promoted to shipped (and thus shipped); multiple pending blocks in a span still merge into one.")
+	fs.DurationVar(&cfg.compactMaxSpan, "merge.compact-max-span", envDurationOr("MERGER_MERGE_COMPACT_MAX_SPAN", 2*time.Hour),
+		"Max time span a single compacted (shipped) block may cover, DECOUPLED from --merge.window. 2h aligns with the Prometheus/Thanos block base. Pending blocks within one span fuse into one shipped block.")
+
 	_ = fs.Parse(os.Args[1:])
 	return cfg
 }
@@ -80,11 +116,15 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 
 	reg := prometheus.NewRegistry()
 
-	// 1. Storage: embedded tsdb.DB, 2h block range + WAL.
+	// 1. Storage: decode-free ingest Manager (window buffer + block WAL +
+	// directly-built blocks) + BlockStore that serves them. No embedded
+	// sample-appending tsdb.DB on the gorilla path.
 	storage, err := merger.OpenStorage(merger.StorageOptions{
 		Dir:               cfg.tsdbDir,
+		WALDir:            cfg.mergeWALDir,
+		WindowMs:          cfg.mergeWindow.Milliseconds(),
+		ReorderGraceMs:    cfg.mergeGrace.Milliseconds(),
 		Logger:            logger,
-		Registerer:        reg,
 		RetentionDuration: cfg.retention.Milliseconds(),
 	})
 	if err != nil {
@@ -140,8 +180,8 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		logger.Warn("no objstore config provided; cold-part store disabled (decode-on-read unavailable)")
 	}
 
-	// 3. Ingest HTTP frontend.
-	ingester := merger.NewIngester(storage, logger)
+	// 3. Ingest HTTP frontend (decode-free: WAL + buffer, no sample append).
+	ingester := merger.NewIngester(storage.Manager, logger)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest/gorilla", ingester.HandleIngest)
 	if coldStore != nil {
@@ -169,7 +209,10 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 			return fmt.Errorf("read objstore config %q: %w", cfg.objstoreFile, rerr)
 		}
 		shipperRunner, err = merger.NewShipperRunner(merger.ShipperOptions{
-			Dir:                cfg.tsdbDir,
+			// Watch ONLY the shipped dir (compacted L2 blocks). The pending dir
+			// (per-window L1 blocks) is a sibling the shipper never sees, so only
+			// re-chunked, ratio-optimized blocks reach object storage.
+			Dir:                storage.ShippedDir(),
 			ObjstoreConfigYAML: objYAML,
 			ExternalLabels:     extLset,
 			Interval:           cfg.shipInterval,
@@ -184,7 +227,39 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 		logger.Warn("no objstore config provided; shipper disabled (write path + StoreAPI only)")
 	}
 
-	errCh := make(chan error, 3)
+	// 6. Background compactor: merge small per-window blocks + re-chunk to ~120
+	// samples/chunk for a better compression ratio (offline/amortized, OFF the
+	// ingest hot path).
+	compactor, err := merger.NewCompactor(merger.CompactorOptions{
+		Store:      storage.BlockStore(),
+		Interval:   cfg.compactInterval,
+		MinBlocks:  cfg.compactMinBlocks,
+		MaxSpanMs:  cfg.compactMaxSpan.Milliseconds(),
+		Registerer: reg,
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+
+	errCh := make(chan error, 5)
+
+	// Flush loop: close windows + build blocks on a ticker (flush everything on
+	// shutdown).
+	go func() {
+		logger.Info("starting flush loop", "interval", cfg.mergeFlushIntvl,
+			"window", cfg.mergeWindow, "grace", cfg.mergeGrace)
+		if serr := storage.Manager.RunFlush(ctx, cfg.mergeFlushIntvl); serr != nil && serr != context.Canceled {
+			errCh <- fmt.Errorf("flush loop: %w", serr)
+		}
+	}()
+
+	go func() {
+		logger.Info("starting compactor", "interval", cfg.compactInterval, "min_blocks", cfg.compactMinBlocks)
+		if serr := compactor.Run(ctx); serr != nil && serr != context.Canceled {
+			errCh <- fmt.Errorf("compactor: %w", serr)
+		}
+	}()
 
 	go func() {
 		logger.Info("starting HTTP ingest frontend", "addr", cfg.httpAddr)
@@ -202,7 +277,7 @@ func run(cfg config, logger *slog.Logger, kitLogger kitslog.Logger) error {
 
 	if shipperRunner != nil {
 		go func() {
-			logger.Info("starting shipper", "interval", cfg.shipInterval, "dir", cfg.tsdbDir)
+			logger.Info("starting shipper", "interval", cfg.shipInterval, "dir", storage.ShippedDir())
 			if serr := shipperRunner.Run(ctx); serr != nil && serr != context.Canceled {
 				errCh <- fmt.Errorf("shipper: %w", serr)
 			}
@@ -267,6 +342,15 @@ func envDurationOr(key string, def time.Duration) time.Duration {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envIntOr(key string, def int) int {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
 	return def

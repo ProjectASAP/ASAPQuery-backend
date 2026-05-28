@@ -11,10 +11,11 @@ import (
 	"github.com/thanos-io/objstore"
 )
 
-// TestShipperUploadsBlock drives the full write path: ingest fragments ->
-// tsdb.DB -> force a 2h block cut on disk -> shipper Sync -> assert exactly one
-// block (chunks + index + meta.json with the Thanos thanos{} section) lands in
-// the (in-memory) bucket.
+// TestShipperUploadsBlock drives the full write path: ingest fragments (decode-
+// free) -> flush a closed window into a directly-built PENDING block on disk ->
+// compactor promotes it (re-chunked) into the SHIPPED dir -> shipper (watching
+// ONLY the shipped dir) Sync -> assert exactly one block (chunks + index +
+// meta.json with the Thanos thanos{} section) lands in the (in-memory) bucket.
 func TestShipperUploadsBlock(t *testing.T) {
 	dir := t.TempDir()
 	storage, err := OpenStorage(StorageOptions{Dir: dir})
@@ -26,11 +27,9 @@ func TestShipperUploadsBlock(t *testing.T) {
 	ext := labels.FromStrings("merger", "ship-test")
 	storage.SetExternalLabels(ext)
 
-	// Lay down samples across two adjacent 2h windows, all in the past, so that
-	// db.Compact cuts the older, now-immutable window into an on-disk block.
+	// Lay down samples in a window well in the past so it is clearly closable.
 	const twoHoursMs = int64(2 * 60 * 60 * 1000)
 	now := time.Now().UnixMilli()
-	// Align to a 2h boundary well in the past (4 windows back).
 	oldBase := (now/twoHoursMs - 4) * twoHoursMs
 
 	var frags []gorilla.Fragment
@@ -40,30 +39,43 @@ func TestShipperUploadsBlock(t *testing.T) {
 			map[string]string{"core": "0"}, "agent-1",
 			[]sample{{ts, float64(i)}}))
 	}
-	// A couple of samples in the *current* window keep the head non-empty so
-	// the older window is clearly compactable.
-	frags = append(frags, makeFragment(t, "cpu_seconds_total",
-		map[string]string{"core": "0"}, "agent-1",
-		[]sample{{now, 999}}))
 
 	frame := gorilla.EncodeFragmentBatch(frags)
-	ingester := NewIngester(storage, nil)
+	ingester := NewIngester(storage.Manager, nil)
 	if _, ierr := ingester.IngestBatch(context.Background(), frame); ierr != nil {
 		t.Fatalf("ingest: %v", ierr)
 	}
 
-	// Force the head to cut the old window into a persistent block.
-	if cerr := storage.DB.Compact(context.Background()); cerr != nil {
-		t.Fatalf("compact: %v", cerr)
+	// Flush the closed window into a directly-built PENDING block on disk.
+	built, ferr := storage.Manager.FlushAll()
+	if ferr != nil {
+		t.Fatalf("flush: %v", ferr)
 	}
-	if len(storage.DB.Blocks()) == 0 {
-		t.Fatalf("expected at least one on-disk block after compaction, got 0")
+	if built == 0 {
+		t.Fatalf("expected at least one block built from the closed window, got 0")
+	}
+	if len(storage.BlockStore().pendingBlockDirs()) == 0 {
+		t.Fatalf("expected at least one on-disk pending block, got 0")
 	}
 
-	// Wire a shipper against an in-memory bucket and sync once.
+	// Promote the pending block into the shipped dir (re-chunked). With
+	// MinBlocks=1 even a lone pending block is promoted so it ships.
+	comp, err := NewCompactor(CompactorOptions{Store: storage.BlockStore(), MinBlocks: 1})
+	if err != nil {
+		t.Fatalf("new compactor: %v", err)
+	}
+	if err := comp.CompactOnce(context.Background()); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if len(ulidDirs(t, storage.ShippedDir())) == 0 {
+		t.Fatalf("expected at least one shipped block after compaction, got 0")
+	}
+
+	// Wire a shipper against an in-memory bucket and sync once. It watches ONLY
+	// the shipped dir, so it uploads exactly the compacted block.
 	bkt := objstore.NewInMemBucket()
 	runner, err := newShipperRunnerWithBucket(bkt, ShipperOptions{
-		Dir:            dir,
+		Dir:            storage.ShippedDir(),
 		ExternalLabels: ext,
 	})
 	if err != nil {

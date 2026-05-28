@@ -15,10 +15,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/shipper"
 )
 
-// ShipperRunner watches the tsdb data dir for newly cut 2h blocks and uploads
-// each one to the configured object-storage bucket as a single PUT set
-// (chunks + index + meta.json with the Thanos thanos{} meta section). The
-// bucket must be the same one thanos-store-gateway watches.
+// ShipperRunner watches the SHIPPED block dir (the compacted, re-chunked
+// Level-2 blocks the merger's compactor promotes from pending) for new blocks
+// and uploads each one to the configured object-storage bucket as a single PUT
+// set (chunks + index + meta.json with the Thanos thanos{} meta section). It is
+// pointed at the shipped dir ONLY (never the sibling pending dir), so exactly
+// the ratio-optimized compacted blocks reach storage. The bucket must be the
+// same one thanos-store-gateway watches.
 type ShipperRunner struct {
 	shipper  *shipper.Shipper
 	bucket   objstore.Bucket
@@ -28,7 +31,9 @@ type ShipperRunner struct {
 
 // ShipperOptions configures the shipper.
 type ShipperOptions struct {
-	// Dir is the tsdb data dir (same dir passed to OpenStorage).
+	// Dir is the SHIPPED block dir (Storage.ShippedDir()), NOT the data-dir root:
+	// it must contain only the compacted Level-2 blocks, so the shipper never
+	// sees the unshipped pending Level-1 blocks.
 	Dir string
 	// ObjstoreConfigYAML is a Thanos/objstore bucket config (the same YAML
 	// format thanos components consume, e.g. type: S3 with a config: block).
@@ -84,6 +89,17 @@ func newShipperRunnerWithBucket(bkt objstore.Bucket, opts ShipperOptions) (*Ship
 		shipper.WithRegisterer(opts.Registerer),
 		shipper.WithSource(metadata.ReceiveSource),
 		shipper.WithLabels(func() labels.Labels { return extLset }),
+		// The blocks in opts.Dir (the shipped dir) are the COMPACTED, re-chunked
+		// Level-2 blocks the merger's compactor promotes from pending. The shipper
+		// skips Level>1 blocks unless this is set, so without it nothing would
+		// ship (the per-window Level-1 blocks live in the sibling pending dir,
+		// which the shipper never sees). uploadCompacted=true is what lets the
+		// merger's ratio-optimized blocks reach object storage.
+		shipper.WithUploadCompacted(true),
+		// Receive-style: a late fragment can re-form a pending block inside an
+		// already-shipped span, so two compacted blocks may overlap in time.
+		// Allow it (matching Thanos Receive); downstream thanos-compact dedups.
+		shipper.WithAllowOutOfOrderUploads(true),
 	)
 
 	return &ShipperRunner{
