@@ -213,6 +213,9 @@ message Metric {
     CountSketch countsketch = 15;
     CountMinSketch countminsketch = 16;
     HLLSketch hllsketch = 17;
+    // Scalar Sum aggregate (AggregationKind = Sum); field 18 mirrors the
+    // collector pdata SumAgg oneof tag. Decoded into ExactAgg(Sum).
+    SumAgg sum_agg = 18;
   }
 
   // Additional metadata attributes that describe the metric. [Optional].
@@ -296,6 +299,37 @@ message DDSketch {
   // mutable state. Backend reads this into
   // SketchInstanceMetadata.sketch_config on first sight and caches.
   double relative_accuracy = 3;
+}
+
+// SumAgg represents a first-class scalar Sum aggregate (AggregationKind = Sum),
+// carried as a portable {sum,count} envelope in the sketch bytes. Not a sketch;
+// shares the modified-OTLP metric data oneof so the backend decodes it via the
+// same envelope path (into the ExactAgg(Sum) accumulator).
+message SumAgg {
+  repeated SumAggDataPoint data_points = 1;
+  AggregationTemporality aggregation_temporality = 2;
+}
+
+// SumAggDataPoint carries a scalar Sum aggregate as a {sum,count} envelope.
+message SumAggDataPoint {
+  repeated opentelemetry.proto.common.v1.KeyValue attributes = 9;
+  fixed64 start_time_unix_nano = 2;
+  fixed64 time_unix_nano = 3;
+  // Serialized SumState envelope (sketchlib SketchEnvelope{sum:SumState}).
+  bytes sketch = 8;
+  SumAggEncoding encoding = 10;
+  repeated Exemplar exemplars = 11;
+  uint32 flags = 15;
+  uint64 series_id = 16;
+}
+
+// SumAggEncoding identifies how the SumAgg payload bytes are encoded.
+enum SumAggEncoding {
+  SUM_AGG_ENCODING_UNSPECIFIED = 0;
+  SUM_AGG_ENCODING_PROTO = 1;
+  SUM_AGG_ENCODING_PROTO_DELTA = 2;
+  SUM_AGG_ENCODING_MSGPACK = 3;
+  SUM_AGG_ENCODING_MSGPACK_DELTA = 4;
 }
 
 // Summary metric data are used to convey quantile summaries,

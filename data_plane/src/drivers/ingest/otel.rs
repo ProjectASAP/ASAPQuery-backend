@@ -2433,6 +2433,7 @@ fn otlp_to_record_count(request: &ExportMetricsServiceRequest) -> usize {
                     Some(Data::Countsketch(c)) => count += c.data_points.len(),
                     Some(Data::Countminsketch(c)) => count += c.data_points.len(),
                     Some(Data::Hllsketch(h)) => count += h.data_points.len(),
+                    Some(Data::SumAgg(sa)) => count += sa.data_points.len(),
                     None => {}
                 }
             }
@@ -2514,6 +2515,29 @@ fn otlp_to_metric_points_and_sketches(request: &ExportMetricsServiceRequest) -> 
                             }
                             let labels = merge_point_attributes(&base_labels, &dp.attributes);
                             let value = number_value_to_f64(&dp.value);
+                            points.push(MetricPoint {
+                                name: metric.name.clone(),
+                                labels,
+                                timestamp_nanos: dp.time_unix_nano,
+                                value,
+                            });
+                        }
+                    }
+                    Some(Data::SumAgg(sa)) => {
+                        // First-class Sum AggregationType: each data point carries
+                        // a SumState envelope ({sum,count}) in `sketch`. Decode it
+                        // and feed the sum as a MetricPoint into the SAME
+                        // ExactAgg(Sum) path as a plain delta Sum — the backend sums
+                        // the per-window/per-shard partials for the same sid.
+                        for dp in &sa.data_points {
+                            let value = match crate::precompute_engine::operators::sum_accumulator::SumAccumulator::from_sum_bytes(&dp.sketch) {
+                                Ok(acc) => acc.sum,
+                                Err(e) => {
+                                    debug!("asap_edge: SumAgg data point decode failed (skipping): {e}");
+                                    continue;
+                                }
+                            };
+                            let labels = merge_point_attributes(&base_labels, &dp.attributes);
                             points.push(MetricPoint {
                                 name: metric.name.clone(),
                                 labels,
