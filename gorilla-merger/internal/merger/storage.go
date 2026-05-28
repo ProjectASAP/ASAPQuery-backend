@@ -2,18 +2,24 @@
 // component that ingests Gorilla XOR-chunk fragments from edge agents over
 // HTTP. The hot path is DECODE-FREE: it durably logs each raw ASAPFRG1 frame to
 // a block-level WAL and buffers the raw XOR chunks per window (no sample decode
-// / re-encode). On window close it stitches the buffered chunks DIRECTLY into a
-// Prometheus TSDB block (low-level chunks/index writers — still no decode). A
-// background compactor later merges the small per-window blocks and re-chunks
-// them to Prometheus's ~120 samples/chunk target for a better compression
-// ratio (the "merger adjusts chunk size for ratio" step), and the Thanos
-// shipper uploads the compacted blocks to object storage. The Thanos StoreAPI
-// (gRPC) serves the on-disk blocks so thanos-query can union recent + S3 data.
+// / re-encode). On a SMALL window's close it stitches the buffered chunks
+// DIRECTLY into a Prometheus TSDB block (low-level chunks/index writers — still
+// no decode) under <Dir>/pending/, where it is queryable within ~window+grace
+// (recent data is NOT hidden for a full block range). A background compactor
+// later merges the small per-window pending blocks (up to a DECOUPLED, larger
+// compaction span) and re-chunks them to Prometheus's ~120 samples/chunk target
+// for a better compression ratio (the "merger adjusts chunk size for ratio"
+// step), writing the result into <Dir>/shipped/. The Thanos shipper watches
+// ONLY <Dir>/shipped/, so exactly the compacted, ratio-optimized blocks reach
+// object storage. The Thanos StoreAPI (gRPC) serves the UNION of pending +
+// shipped so thanos-query can union recent + S3 data with no gap across the
+// pending->shipped promotion.
 package merger
 
 import (
 	"fmt"
 	"log/slog"
+	"path/filepath"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
@@ -30,13 +36,15 @@ type Storage struct {
 
 // StorageOptions configures the local gorilla storage.
 type StorageOptions struct {
-	// Dir is the data directory; directly-built + compacted blocks live here
-	// (this is the dir the shipper watches and the compactor writes into).
+	// Dir is the data directory root. The layout under it is:
+	//   <Dir>/pending/ — per-window L1 blocks (served, NOT shipped)
+	//   <Dir>/shipped/ — compacted + re-chunked L2 blocks (served AND shipped)
+	//   <Dir>/wal/     — block-level fragment WAL (unless WALDir overrides)
 	Dir string
 	// WALDir is where the block-level fragment WAL lives. Defaults to
 	// <Dir>/wal when empty.
 	WALDir string
-	// WindowMs is the buffering/close window size in ms (defaults to 2h).
+	// WindowMs is the buffering/close window size in ms (defaults to 2m).
 	WindowMs int64
 	// ReorderGraceMs is the post-window grace for late fragments (defaults 60s).
 	ReorderGraceMs int64
@@ -58,11 +66,14 @@ func OpenStorage(opts StorageOptions) (*Storage, error) {
 	}
 	walDir := opts.WALDir
 	if walDir == "" {
-		walDir = opts.Dir + "/wal"
+		walDir = filepath.Join(opts.Dir, "wal")
 	}
+	pendingDir := filepath.Join(opts.Dir, "pending")
+	shippedDir := filepath.Join(opts.Dir, "shipped")
 
 	mgr, err := NewManager(ManagerOptions{
-		BlocksDir:      opts.Dir,
+		PendingDir:     pendingDir,
+		ShippedDir:     shippedDir,
 		WALDir:         walDir,
 		WindowMs:       opts.WindowMs,
 		ReorderGraceMs: opts.ReorderGraceMs,
@@ -77,6 +88,10 @@ func OpenStorage(opts StorageOptions) (*Storage, error) {
 
 // BlockStore returns the query-serving block store (the StoreAPI backend).
 func (s *Storage) BlockStore() *BlockStore { return s.Manager.Store() }
+
+// ShippedDir returns the dir the shipper must watch (compacted L2 blocks only),
+// so the shipper never sees the unshipped pending L1 blocks.
+func (s *Storage) ShippedDir() string { return s.Manager.Store().ShippedDir() }
 
 // SetExternalLabels records the merger's external labels. They are applied to
 // every uploaded block and advertised by the StoreAPI; they are NOT stamped

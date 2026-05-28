@@ -25,9 +25,11 @@ import (
 // chunk every 120 samples — see storage.seriesToChunkEncoderSplit), which is
 // acceptable precisely because it runs in the background, not per-fragment.
 //
-// After a successful compaction the source per-window block dirs are removed and
-// the BlockStore is reloaded so the new (larger, re-chunked) block becomes the
-// served + shipped artifact.
+// After a successful compaction the source per-window block dirs (in the
+// pending dir) are removed and the BlockStore is reloaded so the new (larger,
+// re-chunked) block in the shipped dir becomes the served + shipped artifact.
+// This pending->shipped split is what makes the shipper upload ONLY the
+// compacted, ratio-optimized blocks (it watches the shipped dir only).
 type Compactor struct {
 	store     *BlockStore
 	compactor *tsdb.LeveledCompactor
@@ -115,12 +117,14 @@ func (c *Compactor) Run(ctx context.Context) error {
 	}
 }
 
-// CompactOnce groups the current open blocks into runs that each span at most
-// maxSpanMs and compacts every run that has >= minBlocks members. It returns the
-// number of compacted runs. Compaction merges + re-chunks; sources are removed
-// and the store reloaded so the new block is served.
+// CompactOnce groups the current PENDING blocks into runs that each span at
+// most maxSpanMs and compacts every run that has >= minBlocks members. It
+// returns the number of compacted runs. Compaction merges + re-chunks the
+// pending sources into the shipped dir; the pending sources are then removed and
+// the store reloaded so the promoted (re-chunked, shippable) block is served.
+// With minBlocks=1 even a lone pending block is promoted to shipped so it ships.
 func (c *Compactor) CompactOnce(ctx context.Context) (err error) {
-	dirs := c.store.blockDirs()
+	dirs := c.store.pendingBlockDirs()
 	if len(dirs) < c.minBlocks {
 		return nil
 	}
@@ -184,10 +188,13 @@ func alignDown(t, span int64) int64 {
 	return w * span
 }
 
-// compactGroup compacts one run of block dirs into a single re-chunked block in
-// the same directory, removes the sources, and reloads the store.
+// compactGroup compacts one run of PENDING block dirs into a single re-chunked
+// block in the SHIPPED dir, removes the pending sources, and reloads the store.
+// Ordering is write-dest -> Reload -> remove-sources -> Reload: during the brief
+// overlap the chained merge querier dedups the duplicated samples, so there is
+// no query gap and no double-count across the pending->shipped promotion.
 func (c *Compactor) compactGroup(ctx context.Context, group []string) error {
-	dest := c.store.Dir()
+	dest := c.store.ShippedDir()
 	// Use the re-chunking populator so the merged block's chunks are re-encoded
 	// to ~120 samples/chunk (the ratio step), not just concatenated.
 	uids, err := c.compactor.CompactWithBlockPopulator(dest, group, nil, rechunkPopulator{})

@@ -11,10 +11,12 @@ import (
 
 const (
 	// defaultWindowMs is the buffering/close window for the decode-free path. A
-	// closed window becomes one directly-built block; the compactor later fuses
-	// adjacent windows. 2h matches the Prometheus/Thanos block base so blocks
-	// line up with the shipper/store-gateway expectations even before compaction.
-	defaultWindowMs = int64(2 * 60 * 60 * 1000)
+	// closed window becomes one directly-built (pending) block, queryable within
+	// ~window+grace+flush-tick — NOT the 2h block base, because a 2h window would
+	// hide the freshest ~2h of data from the StoreAPI. The background compactor
+	// later fuses adjacent windows up to the (decoupled) 2h compaction span and
+	// re-chunks for ratio before they ship. 2m keeps recent data visible fast.
+	defaultWindowMs = int64(2 * 60 * 1000)
 	// defaultReorderGraceMs is how long after a window's end we keep accepting
 	// late/out-of-order fragments for it before flushing.
 	defaultReorderGraceMs = int64(60 * 1000)
@@ -36,12 +38,16 @@ type Manager struct {
 
 // ManagerOptions configures the Manager.
 type ManagerOptions struct {
-	// BlocksDir is where directly-built + compacted blocks live (also the dir the
-	// shipper watches and the compactor writes into).
-	BlocksDir string
+	// PendingDir is where the per-window L1 blocks are directly built. Served by
+	// the BlockStore but NOT watched by the shipper; the compactor reads its
+	// sources from here.
+	PendingDir string
+	// ShippedDir is where the compactor writes merged + re-chunked L2 blocks.
+	// Served by the BlockStore AND watched by the shipper.
+	ShippedDir string
 	// WALDir is where the block-level fragment WAL lives.
 	WALDir string
-	// WindowMs is the window/close size in ms (defaults to 2h).
+	// WindowMs is the window/close size in ms (defaults to 2m).
 	WindowMs int64
 	// ReorderGraceMs is the post-window grace for late fragments (defaults 60s).
 	ReorderGraceMs int64
@@ -63,14 +69,14 @@ func NewManager(opts ManagerOptions) (*Manager, error) {
 	if graceMs < 0 {
 		graceMs = defaultReorderGraceMs
 	}
-	if opts.BlocksDir == "" {
-		return nil, fmt.Errorf("manager: BlocksDir is required")
+	if opts.PendingDir == "" || opts.ShippedDir == "" {
+		return nil, fmt.Errorf("manager: PendingDir and ShippedDir are required")
 	}
 	if opts.WALDir == "" {
 		return nil, fmt.Errorf("manager: WALDir is required")
 	}
 
-	store, err := NewBlockStore(opts.BlocksDir, logger)
+	store, err := NewBlockStore(opts.PendingDir, opts.ShippedDir, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -242,11 +248,14 @@ func (m *Manager) flushWindow(wStart int64) (bool, error) {
 	if len(series) == 0 {
 		return false, nil
 	}
-	dir, err := buildBlock(m.store.Dir(), series)
+	// Per-window L1 blocks land in the pending dir: served immediately by the
+	// BlockStore (so recent data is queryable fast) but NOT shipped — the
+	// compactor merges + re-chunks them into the shipped dir later.
+	dir, err := buildBlock(m.store.PendingDir(), series)
 	if err != nil {
 		return false, fmt.Errorf("flush window %d: build block: %w", wStart, err)
 	}
-	m.logger.Info("built block from closed window",
+	m.logger.Info("built pending block from closed window",
 		"window_start", wStart, "series", len(series), "dir", dir)
 	return true, nil
 }

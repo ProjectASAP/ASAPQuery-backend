@@ -17,16 +17,19 @@ import (
 
 // fixedWindowStorage opens a Storage whose window is small enough that adjacent
 // fragment batches close into distinct blocks, and whose grace is zero so
-// FlushClosed flushes them at a known "now". Used by the compaction test.
-func fixedWindowStorage(t *testing.T, windowMs, graceMs int64) (*Storage, string) {
+// FlushClosed flushes them at a known "now". It returns the Storage plus the
+// pending and shipped block dirs (per the pending/shipped split): per-window L1
+// blocks land in pending; the compactor promotes them to shipped. Used by the
+// compaction test.
+func fixedWindowStorage(t *testing.T, windowMs, graceMs int64) (st *Storage, pendingDir, shippedDir string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := OpenStorage(StorageOptions{Dir: dir, WindowMs: windowMs, ReorderGraceMs: graceMs})
+	s, err := OpenStorage(StorageOptions{Dir: dir, WindowMs: windowMs, ReorderGraceMs: graceMs})
 	if err != nil {
 		t.Fatalf("open storage: %v", err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	return st, dir
+	t.Cleanup(func() { _ = s.Close() })
+	return s, s.BlockStore().PendingDir(), s.BlockStore().ShippedDir()
 }
 
 // countChunksAndSamples opens a block dir and returns, per series, the chunk
@@ -71,6 +74,22 @@ func countChunksAndSamples(t *testing.T, blockDir string) (chunkCounts []int, sa
 	return chunkCounts, sampleCounts
 }
 
+// managerOpts builds ManagerOptions with the pending/shipped split rooted under
+// dir (pending blocks in <dir>/pending, shipped in <dir>/shipped). pendingDir
+// is returned for the on-disk assertions the WAL tests make.
+func managerOpts(t *testing.T, dir, walDir string, windowMs, graceMs int64) (ManagerOptions, string) {
+	t.Helper()
+	pendingDir := filepath.Join(dir, "pending")
+	shippedDir := filepath.Join(dir, "shipped")
+	return ManagerOptions{
+		PendingDir:     pendingDir,
+		ShippedDir:     shippedDir,
+		WALDir:         walDir,
+		WindowMs:       windowMs,
+		ReorderGraceMs: graceMs,
+	}, pendingDir
+}
+
 func ulidDirs(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -95,7 +114,7 @@ func ulidDirs(t *testing.T, dir string) []string {
 // in time order, and (b) the per-window block has one chunk per fragment (no
 // re-chunk yet — that is the compactor's job).
 func TestBlockBuildIndexQueryable(t *testing.T) {
-	st, dir := fixedWindowStorage(t, defaultWindowMs, 0)
+	st, pendingDir, _ := fixedWindowStorage(t, defaultWindowMs, 0)
 
 	// Two series, each fed by two fragments in the SAME window. With no
 	// compaction the block should keep each fragment as its own chunk.
@@ -111,9 +130,9 @@ func TestBlockBuildIndexQueryable(t *testing.T) {
 		t.Fatalf("flush: %v", err)
 	}
 
-	blocks := ulidDirs(t, dir)
+	blocks := ulidDirs(t, pendingDir)
 	if len(blocks) != 1 {
-		t.Fatalf("expected exactly 1 block, got %d (%v)", len(blocks), blocks)
+		t.Fatalf("expected exactly 1 pending block, got %d (%v)", len(blocks), blocks)
 	}
 
 	// Series A read back through the BlockStore: 4 samples in order.
@@ -146,7 +165,7 @@ func TestBlockBuildIndexQueryable(t *testing.T) {
 func TestCompactionMergesAndRechunks(t *testing.T) {
 	// Small window + zero grace so each batch closes into its own block.
 	const windowMs = int64(1000)
-	st, dir := fixedWindowStorage(t, windowMs, 0)
+	st, pendingDir, shippedDir := fixedWindowStorage(t, windowMs, 0)
 
 	// The compactor groups blocks onto a fixed grid of width maxSpan (so
 	// compacted blocks align to block boundaries, like Prometheus). Align base
@@ -166,9 +185,9 @@ func TestCompactionMergesAndRechunks(t *testing.T) {
 	if _, err := st.Manager.FlushAll(); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	preBlocks := ulidDirs(t, dir)
+	preBlocks := ulidDirs(t, pendingDir)
 	if len(preBlocks) < nSamples/2 {
-		t.Fatalf("expected many small per-window blocks before compaction, got %d", len(preBlocks))
+		t.Fatalf("expected many small per-window pending blocks before compaction, got %d", len(preBlocks))
 	}
 
 	// Pre-compaction: every block has a single 1-sample chunk for the series.
@@ -196,9 +215,13 @@ func TestCompactionMergesAndRechunks(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	postBlocks := ulidDirs(t, dir)
+	postBlocks := ulidDirs(t, shippedDir)
 	if len(postBlocks) != 1 {
-		t.Fatalf("expected exactly 1 block after compaction, got %d", len(postBlocks))
+		t.Fatalf("expected exactly 1 shipped block after compaction, got %d", len(postBlocks))
+	}
+	// The pending sources must have been removed after promotion.
+	if rem := ulidDirs(t, pendingDir); len(rem) != 0 {
+		t.Fatalf("expected pending dir empty after compaction, got %d", len(rem))
 	}
 
 	// Post-compaction: the 300 single-sample chunks must collapse into far
@@ -246,6 +269,7 @@ func TestCompactionMergesAndRechunks(t *testing.T) {
 func TestWALReplayReconstructsUnflushedWindows(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
+	opts, pendingDir := managerOpts(t, dir, walDir, defaultWindowMs, 0)
 
 	base := time.Now().UnixMilli()
 	frag := makeFragment(t, "wal_metric", map[string]string{"k": "v"}, "ag",
@@ -257,7 +281,7 @@ func TestWALReplayReconstructsUnflushedWindows(t *testing.T) {
 	// close the WAL + store handles directly, bypassing Manager.Close which
 	// would flush).
 	{
-		mgr, err := NewManager(ManagerOptions{BlocksDir: dir, WALDir: walDir, WindowMs: defaultWindowMs, ReorderGraceMs: 0})
+		mgr, err := NewManager(opts)
 		if err != nil {
 			t.Fatalf("manager 1: %v", err)
 		}
@@ -270,13 +294,13 @@ func TestWALReplayReconstructsUnflushedWindows(t *testing.T) {
 	}
 
 	// No block should have been written.
-	if dirs := ulidDirs(t, dir); len(dirs) != 0 {
+	if dirs := ulidDirs(t, pendingDir); len(dirs) != 0 {
 		t.Fatalf("expected no blocks before flush (crash before flush), got %d", len(dirs))
 	}
 
 	// (2) Reopen: WAL replay must re-buffer the un-flushed fragment. Flushing
 	// then reconstructs the window into a block.
-	mgr2, err := NewManager(ManagerOptions{BlocksDir: dir, WALDir: walDir, WindowMs: defaultWindowMs, ReorderGraceMs: 0})
+	mgr2, err := NewManager(opts)
 	if err != nil {
 		t.Fatalf("manager 2 (replay): %v", err)
 	}
@@ -286,8 +310,8 @@ func TestWALReplayReconstructsUnflushedWindows(t *testing.T) {
 	if _, err := mgr2.FlushAll(); err != nil {
 		t.Fatalf("flush after replay: %v", err)
 	}
-	if dirs := ulidDirs(t, dir); len(dirs) != 1 {
-		t.Fatalf("expected exactly 1 block after replay+flush, got %d", len(dirs))
+	if dirs := ulidDirs(t, pendingDir); len(dirs) != 1 {
+		t.Fatalf("expected exactly 1 pending block after replay+flush, got %d", len(dirs))
 	}
 
 	got := readBack(t, st, labels.FromStrings(labels.MetricName, "wal_metric", "k", "v"))
@@ -302,6 +326,7 @@ func TestWALReplayReconstructsUnflushedWindows(t *testing.T) {
 func TestWALReplayIdempotentAgainstPersistedBlocks(t *testing.T) {
 	dir := t.TempDir()
 	walDir := filepath.Join(dir, "wal")
+	opts, pendingDir := managerOpts(t, dir, walDir, defaultWindowMs, 0)
 
 	base := time.Now().UnixMilli()
 	frag := makeFragment(t, "idem_metric", map[string]string{"k": "v"}, "ag",
@@ -312,7 +337,7 @@ func TestWALReplayIdempotentAgainstPersistedBlocks(t *testing.T) {
 	// WAL checkpoint (simulated crash after flush, before checkpoint), so the
 	// WAL still contains the already-persisted frame.
 	{
-		mgr, err := NewManager(ManagerOptions{BlocksDir: dir, WALDir: walDir, WindowMs: defaultWindowMs, ReorderGraceMs: 0})
+		mgr, err := NewManager(opts)
 		if err != nil {
 			t.Fatalf("manager 1: %v", err)
 		}
@@ -332,14 +357,14 @@ func TestWALReplayIdempotentAgainstPersistedBlocks(t *testing.T) {
 		_ = mgr.Store().Close()
 	}
 
-	preDirs := ulidDirs(t, dir)
+	preDirs := ulidDirs(t, pendingDir)
 	if len(preDirs) != 1 {
-		t.Fatalf("expected exactly 1 block before restart, got %d", len(preDirs))
+		t.Fatalf("expected exactly 1 pending block before restart, got %d", len(preDirs))
 	}
 
 	// (2) Reopen: replay sees the frame in the WAL but the block already covers
 	// the window, so it must be skipped. A subsequent flush builds nothing new.
-	mgr2, err := NewManager(ManagerOptions{BlocksDir: dir, WALDir: walDir, WindowMs: defaultWindowMs, ReorderGraceMs: 0})
+	mgr2, err := NewManager(opts)
 	if err != nil {
 		t.Fatalf("manager 2 (replay): %v", err)
 	}
@@ -352,7 +377,7 @@ func TestWALReplayIdempotentAgainstPersistedBlocks(t *testing.T) {
 	if built != 0 {
 		t.Fatalf("replay rebuilt %d blocks for an already-persisted window (want 0)", built)
 	}
-	if dirs := ulidDirs(t, dir); len(dirs) != 1 {
-		t.Fatalf("expected exactly 1 block after idempotent replay, got %d (duplicate built)", len(dirs))
+	if dirs := ulidDirs(t, pendingDir); len(dirs) != 1 {
+		t.Fatalf("expected exactly 1 pending block after idempotent replay, got %d (duplicate built)", len(dirs))
 	}
 }

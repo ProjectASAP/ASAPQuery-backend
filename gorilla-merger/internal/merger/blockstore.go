@@ -21,6 +21,19 @@ import (
 // StartTime), fanning each query out across all currently-open blocks and
 // merging the per-block series streams.
 //
+// It serves the UNION of two on-disk dirs:
+//   - pendingDir: the small per-window Level-1 blocks the Manager builds on
+//     window close. These are served immediately (so recent data is queryable
+//     within ~window+grace, not stuck for a full block range) but are NOT
+//     watched by the shipper.
+//   - shippedDir: the larger, re-chunked Level-2 blocks the background
+//     compactor writes by merging the pending blocks. These are served AND
+//     watched by the shipper (so ONLY compacted, ratio-optimized blocks reach
+//     object storage).
+//
+// Both dirs feed the queriers / StartTime / CoversTime, so the StoreAPI answers
+// seamlessly across a block's pending->shipped transition with no query gap.
+//
 // WHY a BlockStore rather than feeding the blocks back into the embedded
 // tsdb.DB: tsdb.DB.reloadBlocks (the method that picks up externally-placed
 // block dirs) is UNEXPORTED, and db.Compact only reloads when its planner
@@ -31,31 +44,44 @@ import (
 // fan-out store reuses all the Prometheus block-read + merge machinery while
 // keeping full control over which blocks are visible.
 type BlockStore struct {
-	dir    string
-	logger *slog.Logger
+	pendingDir string
+	shippedDir string
+	logger     *slog.Logger
 
 	mu     sync.RWMutex
-	blocks map[ulid.ULID]*tsdb.Block
+	blocks map[ulid.ULID]*openBlock
 }
 
-// NewBlockStore opens (or creates) the blocks directory and loads any blocks
-// already present (e.g. from a previous run, or compacted blocks not yet
-// shipped). dir is the SAME directory the shipper watches and the compactor
-// writes into, so blocks built here are shipped + compacted without copying.
-func NewBlockStore(dir string, logger *slog.Logger) (*BlockStore, error) {
-	if dir == "" {
-		return nil, fmt.Errorf("blockstore: dir is required")
+// openBlock pairs an open tsdb.Block with the dir it was loaded from, so the
+// compactor can tell pending sources from shipped blocks and the reconciler can
+// rebuild the on-disk path.
+type openBlock struct {
+	block *tsdb.Block
+	dir   string // either pendingDir or shippedDir
+}
+
+// NewBlockStore opens (or creates) the pending + shipped blocks directories and
+// loads any blocks already present in either (e.g. from a previous run, or
+// compacted blocks not yet shipped). The pending dir holds per-window L1 blocks
+// (served, not shipped); the shipped dir holds compacted L2 blocks (served AND
+// watched by the shipper).
+func NewBlockStore(pendingDir, shippedDir string, logger *slog.Logger) (*BlockStore, error) {
+	if pendingDir == "" || shippedDir == "" {
+		return nil, fmt.Errorf("blockstore: pendingDir and shippedDir are required")
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if err := os.MkdirAll(dir, 0o777); err != nil {
-		return nil, fmt.Errorf("blockstore: mkdir %q: %w", dir, err)
+	for _, d := range []string{pendingDir, shippedDir} {
+		if err := os.MkdirAll(d, 0o777); err != nil {
+			return nil, fmt.Errorf("blockstore: mkdir %q: %w", d, err)
+		}
 	}
 	bs := &BlockStore{
-		dir:    dir,
-		logger: logger,
-		blocks: make(map[ulid.ULID]*tsdb.Block),
+		pendingDir: pendingDir,
+		shippedDir: shippedDir,
+		logger:     logger,
+		blocks:     make(map[ulid.ULID]*openBlock),
 	}
 	if err := bs.Reload(); err != nil {
 		return nil, err
@@ -63,58 +89,66 @@ func NewBlockStore(dir string, logger *slog.Logger) (*BlockStore, error) {
 	return bs, nil
 }
 
-// Dir returns the blocks directory (used by the shipper and compactor).
-func (bs *BlockStore) Dir() string { return bs.dir }
+// PendingDir returns the dir where the Manager builds per-window L1 blocks and
+// where the compactor reads its sources from. NOT watched by the shipper.
+func (bs *BlockStore) PendingDir() string { return bs.pendingDir }
 
-// Reload scans the directory and reconciles the open-block set with what is on
-// disk: it opens any block dir not yet open and closes/forgets any open block
-// whose dir disappeared (e.g. removed by the shipper after upload, or replaced
-// by compaction). It is safe to call concurrently with queries.
+// ShippedDir returns the dir where the compactor writes merged L2 blocks; it is
+// both served by the store AND watched by the shipper.
+func (bs *BlockStore) ShippedDir() string { return bs.shippedDir }
+
+// Reload scans BOTH the pending and shipped directories and reconciles the
+// open-block set with what is on disk: it opens any block dir not yet open and
+// closes/forgets any open block whose dir disappeared (e.g. removed by the
+// shipper after upload, or replaced/promoted by compaction). It is safe to call
+// concurrently with queries.
 func (bs *BlockStore) Reload() error {
-	entries, err := os.ReadDir(bs.dir)
-	if err != nil {
-		return fmt.Errorf("blockstore: read dir %q: %w", bs.dir, err)
-	}
-
-	onDisk := make(map[ulid.ULID]struct{})
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
+	// dir -> set of ULIDs currently on disk there.
+	onDisk := make(map[ulid.ULID]string)
+	for _, root := range []string{bs.pendingDir, bs.shippedDir} {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			return fmt.Errorf("blockstore: read dir %q: %w", root, err)
 		}
-		id, perr := ulid.Parse(e.Name())
-		if perr != nil {
-			// Not a block dir (e.g. a ".tmp" staging dir or wal dir); skip.
-			continue
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			id, perr := ulid.Parse(e.Name())
+			if perr != nil {
+				// Not a block dir (e.g. a ".tmp" staging dir); skip.
+				continue
+			}
+			// A block dir without a meta.json is incomplete (mid-build); skip it.
+			if _, serr := os.Stat(filepath.Join(root, e.Name(), metaFilenameConst)); serr != nil {
+				continue
+			}
+			onDisk[id] = root
 		}
-		// A block dir without a meta.json is incomplete (mid-build); skip it.
-		if _, serr := os.Stat(filepath.Join(bs.dir, e.Name(), metaFilenameConst)); serr != nil {
-			continue
-		}
-		onDisk[id] = struct{}{}
 	}
 
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
 	// Open newly-appeared blocks.
-	for id := range onDisk {
+	for id, root := range onDisk {
 		if _, ok := bs.blocks[id]; ok {
 			continue
 		}
-		b, oerr := tsdb.OpenBlock(bs.logger, filepath.Join(bs.dir, id.String()), nil, nil)
+		b, oerr := tsdb.OpenBlock(bs.logger, filepath.Join(root, id.String()), nil, nil)
 		if oerr != nil {
 			bs.logger.Warn("blockstore: open block failed (skipping)", "block", id.String(), "err", oerr)
 			continue
 		}
-		bs.blocks[id] = b
+		bs.blocks[id] = &openBlock{block: b, dir: root}
 	}
 
 	// Close + forget blocks whose dir is gone.
-	for id, b := range bs.blocks {
+	for id, ob := range bs.blocks {
 		if _, ok := onDisk[id]; ok {
 			continue
 		}
-		if cerr := b.Close(); cerr != nil {
+		if cerr := ob.block.Close(); cerr != nil {
 			bs.logger.Warn("blockstore: close retired block", "block", id.String(), "err", cerr)
 		}
 		delete(bs.blocks, id)
@@ -122,13 +156,14 @@ func (bs *BlockStore) Reload() error {
 	return nil
 }
 
-// snapshot returns the currently-open blocks under a read lock.
+// snapshot returns the currently-open blocks (union of pending + shipped) under
+// a read lock.
 func (bs *BlockStore) snapshot() []*tsdb.Block {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 	out := make([]*tsdb.Block, 0, len(bs.blocks))
-	for _, b := range bs.blocks {
-		out = append(out, b)
+	for _, ob := range bs.blocks {
+		out = append(out, ob.block)
 	}
 	return out
 }
@@ -197,26 +232,44 @@ func (bs *BlockStore) StartTime() (int64, error) {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
 	min := int64(math.MaxInt64)
-	for _, b := range bs.blocks {
-		if m := b.Meta().MinTime; m < min {
+	for _, ob := range bs.blocks {
+		if m := ob.block.Meta().MinTime; m < min {
 			min = m
 		}
 	}
 	return min, nil
 }
 
-// blockDirs returns the directories of all open blocks, sorted by MinTime. Used
-// by the compactor to know which blocks to merge.
+// blockDirs returns the directories of ALL open blocks (pending + shipped),
+// sorted by MinTime.
 func (bs *BlockStore) blockDirs() []string {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
+	return bs.dirsLocked(func(*openBlock) bool { return true })
+}
+
+// pendingBlockDirs returns the directories of the open blocks that live in the
+// pending dir, sorted by MinTime. These are the compactor's source set: the
+// per-window L1 blocks to merge + re-chunk into the shipped dir.
+func (bs *BlockStore) pendingBlockDirs() []string {
+	bs.mu.RLock()
+	defer bs.mu.RUnlock()
+	return bs.dirsLocked(func(ob *openBlock) bool { return ob.dir == bs.pendingDir })
+}
+
+// dirsLocked returns the on-disk dirs of the open blocks matching keep, sorted
+// by MinTime. Caller must hold bs.mu (R or W).
+func (bs *BlockStore) dirsLocked(keep func(*openBlock) bool) []string {
 	type bd struct {
 		dir  string
 		mint int64
 	}
 	bds := make([]bd, 0, len(bs.blocks))
-	for id, b := range bs.blocks {
-		bds = append(bds, bd{dir: filepath.Join(bs.dir, id.String()), mint: b.Meta().MinTime})
+	for id, ob := range bs.blocks {
+		if !keep(ob) {
+			continue
+		}
+		bds = append(bds, bd{dir: filepath.Join(ob.dir, id.String()), mint: ob.block.Meta().MinTime})
 	}
 	sort.Slice(bds, func(i, j int) bool { return bds[i].mint < bds[j].mint })
 	out := make([]string, len(bds))
@@ -232,8 +285,8 @@ func (bs *BlockStore) blockDirs() []string {
 func (bs *BlockStore) CoversTime(t int64) bool {
 	bs.mu.RLock()
 	defer bs.mu.RUnlock()
-	for _, b := range bs.blocks {
-		m := b.Meta()
+	for _, ob := range bs.blocks {
+		m := ob.block.Meta()
 		if t >= m.MinTime && t < m.MaxTime {
 			return true
 		}
@@ -247,8 +300,8 @@ func (bs *BlockStore) Close() error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 	var firstErr error
-	for id, b := range bs.blocks {
-		if err := b.Close(); err != nil && firstErr == nil {
+	for id, ob := range bs.blocks {
+		if err := ob.block.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		delete(bs.blocks, id)
