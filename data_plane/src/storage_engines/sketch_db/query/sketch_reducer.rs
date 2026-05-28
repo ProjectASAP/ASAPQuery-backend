@@ -343,7 +343,8 @@ impl<'a> SketchReducer<'a> {
             function_name,
             "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
         );
-        self.evaluate_core(sids, family, is_cumulative, function_name, function_args, t0_ms, t1_ms)
+        // Legacy string entry: no item-key channel — always bucket-total.
+        self.evaluate_core(sids, family, is_cumulative, function_name, function_args, None, t0_ms, t1_ms)
     }
 
     /// Typed-dispatch sister of [`Self::evaluate`] (P2-4). Picks the
@@ -367,6 +368,10 @@ impl<'a> SketchReducer<'a> {
         cap: &Capability,
         sids: &[u64],
         function_args: &[f64],
+        // Per-item point-estimate key for FrequencyEstimate (CMS estimate(key)).
+        // The engine passes `Some` only for an item_label-mode CMS candidate;
+        // `None` for every other capability/candidate.
+        item_key: Option<&str>,
         is_cumulative: bool,
         t0_ms: u64,
         t1_ms: u64,
@@ -385,7 +390,7 @@ impl<'a> SketchReducer<'a> {
             QueryFamily::FrequencyTopk => "topk",
             QueryFamily::FrequencyEstimate => "frequency",
         };
-        self.evaluate_core(sids, family, is_cumulative, function_label, function_args, t0_ms, t1_ms)
+        self.evaluate_core(sids, family, is_cumulative, function_label, function_args, item_key, t0_ms, t1_ms)
     }
 
     /// Shared evaluation core for the string ([`Self::evaluate`]) and
@@ -400,6 +405,10 @@ impl<'a> SketchReducer<'a> {
         is_cumulative: bool,
         function_name: &str,
         function_args: &[f64],
+        // Per-item point-estimate key (the item_label VALUE, e.g. a service
+        // name). `Some` triggers the CMS/CountSketch `estimate(key)` path in
+        // the FrequencyEstimate branch; `None` keeps the bucket-total default.
+        item_key: Option<&str>,
         t0_ms: u64,
         t1_ms: u64,
     ) -> Result<ASAPTierResult, ASAPTierError> {
@@ -436,6 +445,9 @@ impl<'a> SketchReducer<'a> {
             // plumbing a string-keyed `function_arg` through the reducer
             // entry point, which the current `&[f64]` signature can't carry.
             if family == QueryFamily::FrequencyEstimate {
+                let kind = meta
+                    .sketch_kind()
+                    .expect("ASAP-tier reducer only handles sketch-backed sids");
                 for ts in series_list {
                     let mut samples_out: Vec<(i64, f64)> = Vec::with_capacity(ts.samples.len());
                     for (w_end, state) in ts.samples.iter() {
@@ -447,8 +459,14 @@ impl<'a> SketchReducer<'a> {
                         if w > cov_hi {
                             cov_hi = w;
                         }
-                        let total = decode_frequency_total(sid, meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids"), state)?;
-                        samples_out.push((*w_end, total));
+                        // Per-item point estimate when an item key is supplied
+                        // (and the sid is item_label-mode — gated by the engine);
+                        // otherwise the per-window bucket TOTAL (sum of row 0).
+                        let value = match item_key {
+                            Some(key) => decode_frequency_estimate(sid, kind, state, key)?,
+                            None => decode_frequency_total(sid, kind, state)?,
+                        };
+                        samples_out.push((*w_end, value));
                     }
                     out_series.push((ts.series_label_values, samples_out));
                 }
@@ -1332,6 +1350,83 @@ fn decode_frequency_total(
         // should have rejected at `require_capability`. Defensive arm.
         other => Err(ASAPTierError::UnsupportedCapability {
             function: "frequency".to_string(),
+            capability: Capability::FrequencyEstimate(other),
+        }),
+    }
+}
+
+/// Per-item frequency POINT estimate: decode the window's CMS / CountSketch
+/// and return `estimate(key)` — the keyed analogue of
+/// [`decode_frequency_total`]'s row-0 sum (which returns the bucket TOTAL).
+///
+/// CMS `estimate` is min-over-rows (non-negative one-sided over-estimate);
+/// CountSketch `estimate` is median-of-signed-rows, clamped to >= 0 for the
+/// count-frequency surface. Only valid for an item_label-mode sid (the query
+/// engine gates this; a per-attribute-set CMS would hash a different key and
+/// must NOT be served here).
+fn decode_frequency_estimate(
+    sid: u64,
+    sketch_kind: SketchKindHandle,
+    state: &SketchSampleState,
+    key: &str,
+) -> Result<f64, ASAPTierError> {
+    let to_err = |e: String, encoding: SketchEncoding| ASAPTierError::DeserializeFailure {
+        sid,
+        encoding,
+        reason: e,
+    };
+    match sketch_kind {
+        SketchKindHandle::CountMin => {
+            let cms = match state.encoding {
+                SketchEncoding::ProtoFull => decode_cms_from_proto(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::ProtoDelta => decode_cms_from_proto_delta(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackDelta => {
+                    return Err(to_err(
+                        "CountMin (heap-less) MSGPACK_DELTA is not a valid producer encoding"
+                            .to_string(),
+                        state.encoding,
+                    ));
+                }
+            };
+            Ok(cms.estimate(key).max(0.0))
+        }
+        SketchKindHandle::CountSketch => {
+            let cs = match state.encoding {
+                SketchEncoding::ProtoFull => decode_cs_from_proto(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackFull => decode_cs_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::ProtoDelta => decode_cs_from_proto_delta(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackDelta => {
+                    return Err(to_err(
+                        "CountSketch (heap-less) MSGPACK_DELTA is not a valid producer encoding"
+                            .to_string(),
+                        state.encoding,
+                    ));
+                }
+            };
+            Ok(cs.estimate(key).max(0.0))
+        }
+        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
+            let heap = match state.encoding {
+                SketchEncoding::MsgpackDelta => decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+                _ => decode_cms_with_heap_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+            };
+            let matrix = heap.sketch_matrix();
+            let rows = matrix.len();
+            let cols = matrix.first().map(|r| r.len()).unwrap_or(0);
+            let cms = CountMinSketch::from_legacy_matrix(matrix, rows, cols);
+            Ok(cms.estimate(key).max(0.0))
+        }
+        other => Err(ASAPTierError::UnsupportedCapability {
+            function: "frequency_estimate".to_string(),
             capability: Capability::FrequencyEstimate(other),
         }),
     }

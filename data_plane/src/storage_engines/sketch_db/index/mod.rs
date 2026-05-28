@@ -286,6 +286,16 @@ pub struct SketchStore {
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
     instances: RwLock<HashMap<u64, SketchInstanceMetadata>>,
+    /// sid → item_label (the data-point attribute NAME, e.g. "service"
+    /// or "endpoint") for CountMin/CountSketch sids registered in
+    /// per-item mode. Its presence is what makes a CMS sid answerable by
+    /// the per-item `estimate(key)` path (the query engine extracts the
+    /// matching selector value and gates the safe-miss on it). Absent =>
+    /// per-attribute-set CMS (only the bucket total is meaningful).
+    /// Kept as a decoupled side-table so recording item_label does not
+    /// change sid identity (`AggKind` canonical string) or churn the many
+    /// `SketchInstanceMetadata` / `AggKind::Sketch` literals.
+    item_labels: RwLock<HashMap<u64, String>>,
     /// sid → per-sid columnar storage. Empty `SidStoreData` (or absent
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
@@ -429,6 +439,28 @@ impl SketchStore {
             policy_idx.entry(policy_fp).or_default().insert(sid);
         }
         metric_idx.entry(metric_name).or_default().insert(sid);
+    }
+
+    /// Record that `sid` is a per-item (item_label-mode) frequency sketch
+    /// keyed by the data-point attribute `label` (e.g. "service"). The
+    /// query engine consults this to decide whether a keyed selector like
+    /// `cms_metric{service="X"}` can be answered by the per-item
+    /// `estimate(key)` path. A no-op `label` (empty) clears it.
+    pub fn set_item_label(&self, sid: u64, label: &str) {
+        let mut m = self.item_labels.write().unwrap();
+        if label.is_empty() {
+            m.remove(&sid);
+        } else {
+            m.insert(sid, label.to_string());
+        }
+    }
+
+    /// The per-item attribute name recorded for `sid`, if any. `Some`
+    /// means the sketch hashes that label's VALUE (so `estimate(value)`
+    /// is meaningful); `None` means per-attribute-set keying (only the
+    /// bucket total is meaningful — keyed selectors must safe-miss).
+    pub fn item_label_for(&self, sid: u64) -> Option<String> {
+        self.item_labels.read().unwrap().get(&sid).cloned()
     }
 
     /// Resolve a policy fingerprint to the set of sids it has minted.
