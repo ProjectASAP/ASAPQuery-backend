@@ -104,6 +104,37 @@ impl<K: Eq + std::hash::Hash + Clone> Default for InternTable<K> {
     }
 }
 
+impl InternTable<BTreeMap<String, String>> {
+    /// Approximate RESIDENT heap bytes of the interned label maps for the
+    /// concrete `BTreeMap<String, String>` key the SketchStore uses.
+    ///
+    /// Both `id_to_label` (the `Vec`) and `label_to_id` (the `HashMap`)
+    /// retain a clone of every interned key, so each distinct label map is
+    /// counted twice, plus backing-store slot capacity. This is the
+    /// dominant per-sid resident cost once sketch payloads have been
+    /// flushed to disk — and it is exactly the cost the payload-only
+    /// [`crate::storage_engines::sketch_db::index::persistence::EpochSource::approx_memory_bytes`]
+    /// (the flusher's eviction gauge) does NOT see, which is why the memory
+    /// diagnostic read ~0 KB while RSS sat in the hundreds of MB.
+    pub fn approx_heap_bytes(&self) -> usize {
+        let mut key_bytes = 0usize;
+        for m in &self.id_to_label {
+            for (k, v) in m.iter() {
+                // string bytes + the two `String` headers + a BTree node.
+                key_bytes += k.len() + v.len() + 2 * std::mem::size_of::<String>() + 32;
+            }
+            key_bytes += std::mem::size_of::<BTreeMap<String, String>>();
+        }
+        // ×2 for the cloned copy held by `label_to_id`, plus the backing
+        // Vec / HashMap slot capacity.
+        key_bytes * 2
+            + self.id_to_label.capacity() * std::mem::size_of::<BTreeMap<String, String>>()
+            + self.label_to_id.capacity()
+                * (std::mem::size_of::<BTreeMap<String, String>>()
+                    + std::mem::size_of::<LabelValuesId>())
+    }
+}
+
 /// Active (mutable) epoch: append-only insert, O(1) amortized.
 ///
 /// Three parallel columns (Opt 5) — windows / label-id / payload —
@@ -816,6 +847,15 @@ pub struct SidStoreData<K: Eq + std::hash::Hash + Clone, P> {
     /// So when this is `true`, `enforce_retention` is a no-op. When
     /// `false` (the default), #327 retention is the memory bound.
     pub persistence_enabled: bool,
+    /// Wall-clock millis of the most recent write (append) into this sid.
+    /// `0` means "never written" / freshly (re)hydrated. Drives idle-sid
+    /// eviction: a sid with no writes for the idle threshold whose state
+    /// is fully durable on disk can have this whole `SidStoreData` dropped
+    /// from memory while its queryable `SketchInstanceMetadata` is kept
+    /// (the series stays answerable from the disk tier and rehydrates on
+    /// the next write). Updated under the per-sid write lock the append
+    /// path already holds, so it costs nothing extra on the hot path.
+    pub last_write_unix_ms: u64,
 }
 
 /// Default in-memory retention horizon (ms) for the WARM sketch store.
@@ -858,6 +898,7 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
             retention_horizon_ms: default_retention_horizon_ms(),
             seal_window_count: None,
             persistence_enabled: false,
+            last_write_unix_ms: 0,
         }
     }
 
