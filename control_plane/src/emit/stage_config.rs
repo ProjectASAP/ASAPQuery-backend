@@ -2694,13 +2694,23 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
     // synthesizes for non-sketch (Sum-shaped) workloads. The
     // `sketch_kind` / `sketch_params` fields carry sentinel values
     // in this case and are not emitted on the wire.
-    let (aggregation_type, parameters) = match &agg.agg_type_override {
+    let (aggregation_type, mut parameters) = match &agg.agg_type_override {
         Some(s) => (s.clone(), json!({})),
         None => (
             sketch_kind_to_backend_type(&agg.sketch_kind, &agg.sketch_params).to_string(),
             sketch_params_to_json(&agg.sketch_params),
         ),
     };
+    // Carry the per-item dimension (e.g. "endpoint"/"service") into the
+    // policy parameters so the data-plane ingest can record it on the CMS
+    // sid and answer per-item estimate(key). Only set for item_label-mode
+    // frequency sketches; a subset content-match keeps policy resolution
+    // working for sketches that don't carry it.
+    if let Some(label) = &agg.item_label {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert("item_label".to_string(), JsonValue::String(label.clone()));
+        }
+    }
     let aggregation_input = match agg.aggregation_input {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",
@@ -3097,6 +3107,7 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![
                 BackendAggregation {
+            item_label: None,
                     aggregation_id: "agg0".into(),
                     metric_name: "http_latency_ms".into(),
                     sketch_kind: SketchKind::DDSketch,
@@ -3108,6 +3119,7 @@ mod tests {
                     agg_type_override: None,
                 },
                 BackendAggregation {
+            item_label: None,
                     aggregation_id: "agg1".into(),
                     metric_name: "http_requests_total".into(),
                     sketch_kind: SketchKind::Hll,
@@ -3161,6 +3173,7 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![
                 BackendAggregation {
+            item_label: None,
                     aggregation_id: "agg0".into(),
                     metric_name: "endpoint_count".into(),
                     sketch_kind: SketchKind::CountSketch,
@@ -3176,6 +3189,7 @@ mod tests {
                     agg_type_override: None,
                 },
                 BackendAggregation {
+            item_label: None,
                     aggregation_id: "agg1".into(),
                     metric_name: "endpoint_hits".into(),
                     sketch_kind: SketchKind::Cms,
@@ -3247,6 +3261,7 @@ mod tests {
         };
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: kind.clone(),
@@ -3627,6 +3642,7 @@ mod tests {
     fn backend_json_emits_grouping_under_labels() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "http_latency_ms".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -3672,6 +3688,7 @@ mod tests {
     fn phase_b_backend_json_aggregation_readout_alias_snapshot() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "phase_b_agg0".into(),
                 metric_name: "phase_b_metric".into(),
                 sketch_kind: SketchKind::Kll,
@@ -3719,6 +3736,7 @@ mod tests {
     fn phase_eps1_mode1_aggregation_input_is_sketch_envelope() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -3743,6 +3761,7 @@ mod tests {
     fn phase_eps1_mode2_aggregation_input_is_raw() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -5429,6 +5448,7 @@ mod tests {
 
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".to_string(),
                 metric_name: "http_requests_total_latency_ms".to_string(),
                 sketch_kind: SketchKind::DDSketch,

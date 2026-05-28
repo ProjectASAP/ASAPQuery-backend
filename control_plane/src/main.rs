@@ -752,6 +752,10 @@ async fn handle_plan(
                             // `QueryWorkload` carries both unambiguously,
                             // and every aggregation under one workload
                             // shares them — so the patch is uniform.
+                            let item_labels = emit::collect_metric_to_item_label(
+                                &st.workload_registry,
+                                &st.workload_store,
+                            );
                             for agg in &mut be.aggregations {
                                 if agg.metric_name.is_empty() {
                                     agg.metric_name = workload.metric_name.clone();
@@ -760,6 +764,7 @@ async fn handle_plan(
                                     agg.window_secs = workload.time_window.as_secs();
                                 }
                                 agg.grouping = workload.group_by_labels.clone();
+                                agg.item_label = item_labels.get(&agg.metric_name).cloned();
                             }
                             // Option B unification: every typed cumulative
                             // emit (handle_plan here, Replanner triggers

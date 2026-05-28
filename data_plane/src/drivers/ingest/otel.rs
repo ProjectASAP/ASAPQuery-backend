@@ -1289,6 +1289,23 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 &cfg,
                                 &group_by_keys,
                             );
+                            // Per-item dimension (item_label) the controller threaded
+                            // into the matched policy's parameters — recorded on the sid
+                            // below so the query engine can answer per-item estimate(key)
+                            // (the CMS/CountSketch FrequencyEstimate gate consults it).
+                            let item_label_for_sid: Option<String> = {
+                                let snap = ingest_state.config_snapshot();
+                                snap.get_aggregation_config(policy_fp.as_u64())
+                                    .or_else(|| {
+                                        snap.get_all_aggregation_configs()
+                                            .values()
+                                            .find(|c| c.metric == canonical_name)
+                                    })
+                                    .and_then(|c| c.parameters.get("item_label"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string())
+                            };
                             ingest_state.sketch_index.register(SketchInstanceMetadata {
                                 sid,
                                 metric_name: canonical_name.clone(),
@@ -1305,6 +1322,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 expires_at_ms: None,
                                 policy_fp,
                             });
+                            if let Some(label) = &item_label_for_sid {
+                                ingest_state.sketch_index.set_item_label(sid, label);
+                            }
                         } else if let Some(existing) = ingest_state.sketch_index.instance(sid) {
                             // P1-4 (a) — one-way capability UPGRADE. The sid
                             // was first registered from a non-heap frame
