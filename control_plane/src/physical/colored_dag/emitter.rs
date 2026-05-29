@@ -571,6 +571,14 @@ pub struct BackendAggregation {
     /// strings are the only reliable source of the names today.
     #[serde(default)]
     pub grouping: Vec<String>,
+    /// Per-item dimension (the data-point attribute NAME, e.g. "endpoint"
+    /// or "service") for an item_label-mode frequency sketch. Like
+    /// `grouping`, the L5 emitter leaves this `None`; `handle_plan` patches
+    /// it from the workload's `item_label`. Emitted into the aggregation's
+    /// `parameters["item_label"]` so the data-plane ingest records it on the
+    /// CMS sid and can answer per-item `estimate(key)` (FrequencyEstimate).
+    #[serde(default)]
+    pub item_label: Option<String>,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
@@ -786,6 +794,7 @@ impl Emitter for ThreeStageEmitter {
                         aggregation_id: aggregation_id.clone(),
                     });
                     backend_aggregations.push(BackendAggregation {
+            item_label: None,
                         aggregation_id,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: sketch_type.clone(),
@@ -869,6 +878,7 @@ impl Emitter for ThreeStageEmitter {
                     let aid = format!("agg{next_agg_index}");
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
+            item_label: None,
                         aggregation_id: aid,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: family.clone(),

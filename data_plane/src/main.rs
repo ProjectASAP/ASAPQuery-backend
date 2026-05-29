@@ -196,6 +196,18 @@ struct Args {
     #[arg(long)]
     schema_eviction_dry_run: bool,
 
+    /// Idle-sid eviction (memory reclaim). Drop the in-memory state of any
+    /// sketch sid with no writes for this many seconds AND whose state is
+    /// fully flushed to disk, keeping its queryable metadata — the series
+    /// stays answerable from the durable tier and rehydrates on the next
+    /// write. Bounds resident registry memory when series churn / go stale
+    /// (without it, stale sketch sids are pinned in RAM until config-driven
+    /// retirement). 0 disables. Effective horizon is
+    /// max(this, --persistence-hot-window-secs), since eviction waits for
+    /// the sid's windows to seal+flush first.
+    #[arg(long, env = "ASAP_IDLE_SID_EVICT_SECS", default_value = "0")]
+    idle_sid_evict_secs: u64,
+
     // ---- SketchStore persistence ----
     //
     // When --persistence-enabled is set, the store is constructed via
@@ -501,6 +513,36 @@ async fn main() -> Result<()> {
     // Both ingest and query observe the §7 timeline at the sid level
     // via the shared `SketchStore` (already passed in above).
     let engine = Arc::new(engine);
+
+    // Idle-sid eviction sweep (memory reclaim) — opt-in via
+    // --idle-sid-evict-secs. Drops the in-memory `SidStoreData` for
+    // write-idle, fully-flushed sketch sids while keeping their queryable
+    // metadata, bounding resident registry memory under series churn.
+    if args.idle_sid_evict_secs > 0 {
+        let evict_index = sketch_index.clone();
+        let idle_ms = args.idle_sid_evict_secs.saturating_mul(1000);
+        // Sweep a few times per idle horizon, clamped to a sane cadence.
+        let sweep = std::time::Duration::from_secs(args.idle_sid_evict_secs.clamp(10, 60));
+        info!(
+            "Idle-sid eviction enabled: idle threshold {}s, sweep every {}s",
+            args.idle_sid_evict_secs,
+            sweep.as_secs()
+        );
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(sweep);
+            loop {
+                interval.tick().await;
+                let n = evict_index.evict_idle_series(idle_ms);
+                if n > 0 {
+                    info!(
+                        "[IDLE_EVICT] evicted {} idle sid(s) from memory \
+                         (still queryable from disk; rehydrate on next write)",
+                        n
+                    );
+                }
+            }
+        });
+    }
 
     // Setup OTLP receiver (after precompute engine so it can share the ingest state)
     // Issue #46 ⑥ — freshness-probe last-value cache. Shared between
@@ -833,6 +875,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Best-effort process resident-set size (RSS) in bytes, read from
+/// `/proc/self/statm` (field 2 = resident pages × page size). Returns 0 if
+/// unreadable (non-Linux / sandboxed) so the diagnostic degrades gracefully
+/// rather than failing. This is the ground-truth counterpart to the
+/// store's structural estimates in the memory diagnostic.
+fn process_resident_bytes() -> usize {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(resident_pages) = statm.split_whitespace().nth(1) else {
+        return 0;
+    };
+    let pages: usize = resident_pages.parse().unwrap_or(0);
+    // `sysconf(_SC_PAGESIZE)` is 4 KiB on every platform this runs on.
+    pages * 4096
+}
+
 /// Periodic memory diagnostics logger — runs every 30 seconds.
 async fn spawn_memory_diagnostics(
     sketch_index: Arc<data_plane::storage_engines::sketch_db::index::SketchStore>,
@@ -849,12 +908,26 @@ async fn spawn_memory_diagnostics(
         //    pre-M2.3 per-agg_id SketchStore::diagnostic_info).
         let instance_count = sketch_index.instance_count();
         let series_count = sketch_index.series_len();
-        let approx_bytes = sketch_index.approx_memory_bytes();
+        // `approx_memory_bytes` is the flusher's EVICTABLE-payload gauge:
+        // it counts only live sketch payloads (current_epoch + sealed), so
+        // it correctly reads ~0 once everything has been flushed to disk.
+        // On its own it badly misrepresents the store's footprint — the
+        // per-sid registry + intern caches stay resident and are not
+        // flushable. Report all three: evictable payload, the structural
+        // resident estimate, and the process RSS ground truth.
+        let payload_bytes = sketch_index.approx_memory_bytes();
+        let resident_bytes = sketch_index.approx_resident_bytes();
+        let rss_bytes = process_resident_bytes();
         info!(
-            "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, {:.2} KB approx in-memory bytes (hot current_epoch + sealed)",
+            "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, \
+             payload={:.2} KB (evictable, flusher gauge), \
+             registry+intern\u{2248}{:.2} MB (resident, not flushable), \
+             process RSS={:.1} MB",
             instance_count,
             series_count,
-            approx_bytes as f64 / 1024.0,
+            payload_bytes as f64 / 1024.0,
+            resident_bytes as f64 / (1024.0 * 1024.0),
+            rss_bytes as f64 / (1024.0 * 1024.0),
         );
 
         // 2. Worker diagnostics (precompute engine only)

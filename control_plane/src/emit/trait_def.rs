@@ -234,6 +234,7 @@ mod tests {
     fn empty_backend_cfg() -> BackendStageConfig {
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: "agg0".to_string(),
                 metric_name: "test_metric".to_string(),
                 sketch_kind: SketchKind::DDSketch,

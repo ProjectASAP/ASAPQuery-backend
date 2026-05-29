@@ -42,7 +42,27 @@ impl SumAccumulator {
         Ok(Self::with_sum(sum))
     }
 
-
+    /// Decode the fixed Sum payload produced by the first-class Sum
+    /// AggregationType path (asap-precompute-go's SumWrapper): float64 sum
+    /// (little-endian) followed by uint64 count (little-endian), 16 bytes.
+    ///
+    /// Sum is an aggregation, NOT a sketch, so this deliberately does NOT
+    /// depend on the sketchlib sketch-envelope proto — the payload is a small
+    /// self-contained fixed layout. It decodes into the SAME
+    /// `AggregationType::Sum` accumulator as a plain-OTLP Sum, so the SumAgg
+    /// envelope and a plain Sum land on one identity (`exact_agg:Sum`) with no
+    /// new SketchKindHandle. `count` is decoded but not retained
+    /// (SumAccumulator tracks the scalar sum only; Sum is never sample_p-thinned
+    /// so no 1/p rescale is needed).
+    pub fn from_sum_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        if buffer.len() < 16 {
+            return Err(format!("Sum payload too short: {} bytes (want 16)", buffer.len()).into());
+        }
+        let sum = f64::from_le_bytes(buffer[0..8].try_into().unwrap());
+        // count = u64::from_le_bytes(buffer[8..16]) — decoded position documented
+        // but not retained by the scalar-sum accumulator.
+        Ok(Self::with_sum(sum))
+    }
 }
 
 impl Default for SumAccumulator {
@@ -273,6 +293,28 @@ mod tests {
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
 
         assert_eq!(acc.type_name(), "SumAccumulator");
+    }
+
+    #[test]
+    fn from_sum_bytes_decodes_go_sum_payload() {
+        // GOLDEN: the 16-byte payload asap-precompute-go's
+        // SumWrapper{10,20,30,40}.Snapshot() emits — float64 sum (LE) followed
+        // by uint64 count (LE), sum=100, count=4. Proves the Rust backend
+        // decodes the first-class Sum payload the Go agent produces
+        // (cross-language wire parity, no sketchlib proto dependency).
+        let go_bytes: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x59, 0x40, // 100.0 f64 LE
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 4 u64 LE
+        ];
+        let acc = SumAccumulator::from_sum_bytes(go_bytes).expect("decode Go Sum payload");
+        assert_eq!(acc.sum, 100.0, "decoded Go SumWrapper payload sum");
+    }
+
+    #[test]
+    fn from_sum_bytes_rejects_short_payload() {
+        // A short buffer is rejected (the ingest path then skips the point).
+        assert!(SumAccumulator::from_sum_bytes(&[]).is_err());
+        assert!(SumAccumulator::from_sum_bytes(&[0u8; 8]).is_err());
     }
 
     #[test]

@@ -462,6 +462,7 @@ fn multi_series_one_per_label_value() {
 // ---------------------------------------------------------------------------
 
 use asap_sketchlib::CountMinSketchWithHeap;
+use asap_sketchlib::CountMinSketch;
 
 fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
     let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
@@ -591,6 +592,90 @@ fn cms_without_heap_returns_missing_heap() {
         }
         other => panic!("expected MissingHeap, got {other:?}"),
     }
+}
+
+#[test]
+fn cms_per_item_estimate_returns_keyed_count() {
+    let idx = SketchStore::new();
+    let sid = 320;
+    // A FrequencyEstimate-capable plain CountMin sid.
+    let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
+    idx.register(SketchInstanceMetadata {
+        sid,
+        metric_name: "endpoint_request_freq".to_string(),
+        group_by_keys: BTreeSet::new(),
+        capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+        agg_kind: AggKind::Sketch {
+            kind: SketchKindHandle::CountMin,
+            config: cfg.clone(),
+            spatial_filter_canonical: String::new(),
+        },
+        accuracy: Some(AccuracyBound::from_config(&cfg)),
+        first_seen_unix_ms: 0,
+        retired_at_ms: None,
+        expires_at_ms: None,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
+    });
+
+    // One CMS keyed by item value: /checkout x50, /cart x20.
+    let mut cms = CountMinSketch::new(4, 256);
+    for _ in 0..50 {
+        cms.update("/checkout", 1.0);
+    }
+    for _ in 0..20 {
+        cms.update("/cart", 1.0);
+    }
+    let bytes = cms.to_msgpack().expect("serialize cms");
+    idx.append_sample(sid, BTreeMap::new(), (1000, 1010), msgpack_full(bytes));
+
+    let reducer = SketchReducer::new(&idx);
+
+    // Per-item estimate path (Some key): one-sided over-estimate of the
+    // inserted count (50), tight band given 256 cols / 2 keys.
+    let keyed = reducer
+        .evaluate_for_capability(
+            &Capability::FrequencyEstimate(SketchKindHandle::CountMin),
+            &[sid],
+            &[],
+            Some("/checkout"),
+            false,
+            1000,
+            1010,
+        )
+        .expect("keyed frequency estimate should succeed");
+    let est = keyed
+        .series
+        .first()
+        .and_then(|s| s.1.first())
+        .map(|s| s.1)
+        .expect("a keyed estimate sample");
+    assert!(
+        (50.0..=55.0).contains(&est),
+        "per-item estimate(/checkout) = {est}, expected one-sided ~50"
+    );
+
+    // No key: the per-window bucket TOTAL (row-0 sum = all inserts = 70).
+    let total = reducer
+        .evaluate_for_capability(
+            &Capability::FrequencyEstimate(SketchKindHandle::CountMin),
+            &[sid],
+            &[],
+            None,
+            false,
+            1000,
+            1010,
+        )
+        .expect("bucket total should succeed");
+    let tot = total
+        .series
+        .first()
+        .and_then(|s| s.1.first())
+        .map(|s| s.1)
+        .expect("a bucket-total sample");
+    assert!(
+        (tot - 70.0).abs() <= 1.0,
+        "bucket total = {tot}, expected ~70 (50 + 20)"
+    );
 }
 
 // ---------------------------------------------------------------------------

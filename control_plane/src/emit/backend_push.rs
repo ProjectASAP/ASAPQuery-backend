@@ -638,6 +638,7 @@ mod tests {
                 sketch_kind: SketchKind::DDSketch,
                 sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
                 grouping: vec![],
+                item_label: None,
                 spatial_filter: String::new(),
                 window_secs: 60,
                 aggregation_input: AggregationInput::SketchEnvelope,

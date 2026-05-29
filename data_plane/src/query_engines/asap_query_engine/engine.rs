@@ -864,6 +864,12 @@ impl ASAPQueryEngine {
                         &candidate.required_capability,
                         &hit_sids,
                         &candidate.function_args,
+                        // Per-item CMS estimate(key) is wired through the reducer
+                        // but only dispatched once the engine resolves the item
+                        // value against an item_label-mode sid (Phase 2b). Until
+                        // then keyed CMS frequency safe-misses (see below), so the
+                        // bucket-total path is correct here.
+                        None,
                         effective_is_cumulative(candidate),
                         start_ms,
                         end_ms,
@@ -1000,6 +1006,24 @@ fn effective_is_cumulative(
         effective_sketch_function(candidate),
         "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
     )
+}
+
+/// Extract the VALUE of `label` from a canonical spatial-filter string of
+/// the form `{a="1",service="svc-3"}` (the shape produced by
+/// `normalize_spatial_filter`). Used by the per-item CMS `estimate(key)`
+/// gate to pull the item value a keyed selector targets. Returns `None`
+/// when `label` is absent. Exact label match (not substring), so
+/// `service` does not match `myservice`.
+fn extract_filter_value(canonical: &str, label: &str) -> Option<String> {
+    let inner = canonical.trim().trim_start_matches('{').trim_end_matches('}');
+    for part in inner.split(',') {
+        if let Some((k, v)) = part.trim().split_once('=') {
+            if k.trim() == label {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Whether the analyzer's `outer_agg` should still be folded over the
@@ -1523,7 +1547,33 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // left alone; the bare `count_over_time(cms[r])` demo has
                 // an empty filter and is unaffected. Full string-keyed
                 // estimate is a larger follow-up; the safe-miss is enough.
+                // Phase 2b: resolve a per-item estimate key. If a hit sid is
+                // registered in item_label mode (item_labels side-table) and
+                // the candidate's spatial filter selects that exact label, the
+                // per-item `estimate(key)` path CAN answer the keyed selector —
+                // so we extract the value and DON'T safe-miss below.
+                let mut cms_item_key: Option<String> = None;
+                if matches!(
+                    &candidate.required_capability,
+                    crate::storage_engines::sketch_db::index::Capability::FrequencyEstimate(_)
+                ) && !candidate.spatial_filter_canonical.is_empty()
+                {
+                    for sid in &hit_sids {
+                        if let Some(label) = idx.item_label_for(*sid) {
+                            if let Some(val) =
+                                extract_filter_value(&candidate.spatial_filter_canonical, &label)
+                            {
+                                cms_item_key = Some(val);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 if freq_rate_override.is_none()
+                    // A resolved per-item key means the keyed estimate path
+                    // answers this selector — skip the safe-miss.
+                    && cms_item_key.is_none()
                     && matches!(
                         &candidate.required_capability,
                         crate::storage_engines::sketch_db::index::Capability::FrequencyEstimate(_)
@@ -1673,6 +1723,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &candidate.required_capability,
                         &hit_sids,
                         &candidate.function_args,
+                        cms_item_key.as_deref(),
                         effective_is_cumulative(candidate),
                         t0_ms,
                         now_ms,
@@ -2121,6 +2172,28 @@ mod hot_reload_phase2_tests {
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
         StreamingConfig, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+
+    #[test]
+    fn extract_filter_value_pulls_item_value() {
+        // exact-label match, single and multi-matcher canonical forms
+        assert_eq!(
+            super::extract_filter_value("{service=\"svc-000003\"}", "service"),
+            Some("svc-000003".to_string())
+        );
+        assert_eq!(
+            super::extract_filter_value("{zone=\"z1\",service=\"svc-000003\"}", "service"),
+            Some("svc-000003".to_string())
+        );
+        // absent label -> None
+        assert_eq!(super::extract_filter_value("{zone=\"z1\"}", "service"), None);
+        // substring labels must NOT match (service != myservice)
+        assert_eq!(
+            super::extract_filter_value("{myservice=\"x\"}", "service"),
+            None
+        );
+        // empty filter -> None
+        assert_eq!(super::extract_filter_value("", "service"), None);
+    }
 
     fn dummy_agg(_id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
         // `_id` is unused after PR 5 — identity is content-addressed.

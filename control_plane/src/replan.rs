@@ -598,6 +598,14 @@ impl Replanner {
                     // `ColumnId`s with no label-name resolution today). The
                     // `QueryWorkload` carries both unambiguously, and every
                     // aggregation under one workload shares them.
+                    // Per-metric item_label (the high-card dimension a CMS/CountSketch
+                    // hashes): threaded into the policy params so the data-plane ingest
+                    // records it on the sid and can answer per-item estimate(key).
+                    let item_labels = self
+                        .workload_registry
+                        .as_ref()
+                        .map(|reg| crate::emit::collect_metric_to_item_label(reg, &self.workload_store))
+                        .unwrap_or_default();
                     for agg in &mut be.aggregations {
                         if agg.metric_name.is_empty() {
                             agg.metric_name = workload.metric_name.clone();
@@ -606,6 +614,7 @@ impl Replanner {
                             agg.window_secs = workload.time_window.as_secs();
                         }
                         agg.grouping = workload.group_by_labels.clone();
+                        agg.item_label = item_labels.get(&agg.metric_name).cloned();
                     }
                     return Some(be);
                 }
@@ -633,6 +642,7 @@ impl Replanner {
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
+            item_label: None,
                 aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
                 metric_name: workload.metric_name.clone(),
                 // Sentinel sketch_kind / sketch_params — `agg_type_override`
@@ -1242,6 +1252,7 @@ mod tests {
                 ("http_requests_total".to_string(), AggRole::Sum),
                 BackendStageConfig {
                     aggregations: vec![BackendAggregation {
+                item_label: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
                         sketch_kind: SketchKind::DDSketch,
