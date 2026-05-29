@@ -241,9 +241,26 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
     for intent in &intents {
         match capability_for(intent) {
             Some(cap) => {
+                // For a heavy-hitter top-k (`FrequencyTopk`), the inner
+                // `by (item)` labels (e.g. `topk(k, sum by (host) (m))`)
+                // are the heap's RANKED dimension — recorded as the sid's
+                // item_label and projected OUT of the series key into the
+                // top-k heap, NOT a series grouping key. The sketch is
+                // grouped by its OWN grouping_labels (e.g. zone) with the
+                // item in the heap, so requiring the item dimension in the
+                // sid's group_by_keys would never match (item ∉ {zone}) and
+                // the topk query falls through to archive. Match the
+                // metric's FrequencyTopk sids by metric + capability instead
+                // (empty required keys ⊆ any grouping); the reducer reads
+                // each matched sid's heap.
+                let candidate_keys = if matches!(cap, Capability::FrequencyTopk(_)) {
+                    BTreeSet::new()
+                } else {
+                    group_by_keys.clone()
+                };
                 out.candidates.push(ASAPTierCandidate {
                     metric_name: metric_name.clone(),
-                    group_by_keys: group_by_keys.clone(),
+                    group_by_keys: candidate_keys,
                     required_capability: cap,
                     function: trace.function.clone(),
                     function_args: trace.function_args.clone(),

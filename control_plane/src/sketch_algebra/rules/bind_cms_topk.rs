@@ -73,7 +73,13 @@ impl Rule for BindCountSketchOnTopK {
 
         let w = (std::f64::consts::E / eps).ceil() as u32;
         let d = (1.0 / delta).ln().ceil() as u32;
-        let w = w.max(2);
+        // CountSketch columns MUST be a power of two: the agent
+        // (asapedgeprocessor config_validate) rejects non-pow2 cols because
+        // sketchlib bit-slices the hash with a pow2 column mask. Round the
+        // ε-derived width UP to the next power of two — this only tightens
+        // the additive bound (ε ≤ e/w) and prevents an agent-side
+        // "cols must be a power of two" crash on config apply.
+        let w = w.max(2).next_power_of_two();
         let d = d.max(1);
 
         Some(PhysicalExpr::estimate_over_agg(

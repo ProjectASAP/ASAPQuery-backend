@@ -1864,8 +1864,29 @@ fn emit_edge_yaml_asap_edge(
                 .cloned()
                 .unwrap_or_default();
             if !grouping.is_empty() {
-                let by: Vec<Value> = grouping.into_iter().map(Value::String).collect();
-                e.insert("aggregate_by".into(), Value::Sequence(by));
+                // Exclude the item_label (the inner heavy-hitter dimension
+                // for HLL / CMS / heap-bearing CountSketch) from
+                // aggregate_by: it is the sketch SUBJECT — hashed into the
+                // sketch / fed to the top-k heap — NOT a series grouping
+                // key. A query like `topk(10, sum by (host) (m))` lands
+                // `host` in grouping_labels, but for a heap-bearing
+                // CountSketch `host` is the item_label; leaving it in
+                // aggregate_by keys the edge series PER host (one series +
+                // heap per host — a cardinality explosion) instead of one
+                // heap per group. The agent observe path already projects
+                // item_label out of the series key for the item-keyed
+                // families, so the two layers must agree. No-op for metrics
+                // without an item_label or whose item_label isn't a
+                // grouping label.
+                let item_label = cfg.metric_to_item_label.get(*metric);
+                let by: Vec<Value> = grouping
+                    .into_iter()
+                    .filter(|k| item_label.map(|il| il != k).unwrap_or(true))
+                    .map(Value::String)
+                    .collect();
+                if !by.is_empty() {
+                    e.insert("aggregate_by".into(), Value::Sequence(by));
+                }
             }
             // Family-specific params — mirror the reads in
             // `build_edge_processor_block`. The fused processor's
@@ -6612,6 +6633,51 @@ mod tests {
         assert!(
             yaml.contains("emit_heap"),
             "an enumerated CountSketch with with_heap=true must emit emit_heap:\n{yaml}"
+        );
+    }
+
+    /// Regression for the top-k cardinality explosion (#5): the item_label
+    /// (heavy-hitter dimension, e.g. `host` from `topk(.., sum by (host)(m))`)
+    /// must NOT appear in `aggregate_by` — it is the sketch/heap SUBJECT, not
+    /// a series grouping key. Leaving it in keyed the edge series per-host
+    /// (one series + heap per host) instead of one heap per group.
+    #[test]
+    fn fused_emit_excludes_item_label_from_aggregate_by() {
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+        let mut cfg = fused_cfg_countsketch_no_processor();
+        // grouping_labels carries BOTH the real grouping key (zone) AND the
+        // item_label (host) — as a `topk(10, sum by (host)(m))` workload with
+        // grouping_labels:[zone] produces after the query's `by (host)` is
+        // folded in.
+        cfg.metric_to_grouping_labels.insert(
+            "endpoint_request_freq".into(),
+            vec!["host".to_string(), "zone".to_string()],
+        );
+        cfg.metric_to_item_label
+            .insert("endpoint_request_freq".into(), "host".to_string());
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
+            .expect("fused emit ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("metrics"))
+            .and_then(|m| m.as_sequence())
+            .expect("metrics list present");
+        let entry = metrics
+            .iter()
+            .find(|e| e.get("metric").and_then(|v| v.as_str()) == Some("endpoint_request_freq"))
+            .expect("endpoint_request_freq entry present");
+        let by: Vec<&str> = entry
+            .get("aggregate_by")
+            .and_then(|v| v.as_sequence())
+            .map(|s| s.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            by,
+            vec!["zone"],
+            "item_label `host` must be excluded from aggregate_by (got {by:?})\n{yaml}"
         );
     }
 }

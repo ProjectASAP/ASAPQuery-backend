@@ -102,12 +102,39 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // Priority: workload-spec metric-name match → AggType-driven
     // default. The metric-name match owns the demo contract rows; the
     // AggType fallback covers everything else.
-    let (statistic, accuracy_pref) =
+    let (mut statistic, mut accuracy_pref) =
         classify_demo_metric(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
             AggType::Quantile => (StatisticClass::Quantile, AccuracyPreference::RelativeError),
             AggType::Cardinality => (StatisticClass::Cardinality, AccuracyPreference::default()),
             AggType::Frequency => (StatisticClass::Frequency, AccuracyPreference::default()),
         });
+
+    // An explicit `sketch_family_override` is authoritative for the FAMILY
+    // — and therefore for the STATISTIC CLASS it answers. The query-derived
+    // statistic above only covers Quantile/Cardinality/Frequency from
+    // `AggType`; a `count(...)` / `topk(...)` / `count_over_time(...)`
+    // query can classify as the wrong class, so without this an HLL /
+    // CountMinSketch / CountSketch override would mismatch the derived
+    // statistic, be rejected by `is_valid_pair` below, and silently fall
+    // back to the catalog default (DDSketch) — the controller would then
+    // emit `family: ddsketch` for an HLL/CMS/CountSketch metric. Re-derive
+    // the statistic from the override whenever the derived one is
+    // incompatible, so the override drives both family and statistic.
+    if let Some(st) = w.sketch_type_override.as_ref() {
+        let ov = SketchKind::from(st.clone());
+        if !is_valid_pair(ov.clone(), statistic) {
+            let (s, ap) = match ov {
+                SketchKind::DDSketch | SketchKind::Kll => {
+                    (StatisticClass::Quantile, AccuracyPreference::RelativeError)
+                }
+                SketchKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
+                SketchKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
+                SketchKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
+            };
+            statistic = s;
+            accuracy_pref = ap;
+        }
+    }
 
     // SumRateCount → no sketch (raw passthrough). Decline the typed
     // binding so the caller falls back to the legacy raw plan.
@@ -476,6 +503,37 @@ mod tests {
     fn frequency_selects_countsketch() {
         let plan = RulesPlanner::new().plan(&workload(vec![AggType::Frequency]));
         assert_eq!(plan.agent_config.sketch_type, SketchType::CountSketch);
+    }
+
+    /// Regression: an explicit `sketch_family_override` must pin the family
+    /// (and statistic) even when the query's `AggType` classifies as a
+    /// different/incompatible class. Without the override re-deriving the
+    /// statistic, `is_valid_pair` rejected HLL/CMS/CountSketch overrides
+    /// against a Quantile-classified query and fell back to DDSketch, so
+    /// the controller emitted `family: ddsketch` for those metrics.
+    #[test]
+    fn override_pins_nonquantile_family_over_misclassified_query() {
+        use crate::emit::extract_root_sketch_kind;
+        use crate::sketch_algebra::params::SketchKind;
+        for (ov, expect) in [
+            (SketchType::DDSketch, SketchKind::DDSketch),
+            (SketchType::KLL, SketchKind::Kll),
+            (SketchType::HLL, SketchKind::Hll),
+            (SketchType::CountMinSketch, SketchKind::Cms),
+            (SketchType::CountSketch, SketchKind::CountSketch),
+        ] {
+            // Query classifies as Quantile (the mis-derived case observed
+            // live for count()/topk()/count_over_time()); the override must win.
+            let mut w = workload(vec![AggType::Quantile]);
+            w.sketch_type_override = Some(ov.clone());
+            let pe = bind_workload_typed(&w)
+                .unwrap_or_else(|| panic!("bind declined for override {ov:?}"));
+            assert_eq!(
+                extract_root_sketch_kind(&pe),
+                Some(expect.clone()),
+                "override {ov:?} should pin family {expect:?}, not fall back to DDSketch",
+            );
+        }
     }
 
     #[test]
