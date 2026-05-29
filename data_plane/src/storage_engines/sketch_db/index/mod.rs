@@ -536,6 +536,7 @@ impl SketchStore {
             .clone();
         let mut guard = store.write().unwrap();
         guard.insert(window, series_label_values, AggPayload::Sketch(sample));
+        guard.last_write_unix_ms = now_ms();
     }
 
     /// Build a `SidStoreData` pre-configured for the store's current
@@ -577,6 +578,7 @@ impl SketchStore {
             .clone();
         let mut guard = store.write().unwrap();
         guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
+        guard.last_write_unix_ms = now_ms();
     }
 
     /// Range-query the ASAP-tier state for one sid. Window-end-keyed
@@ -1401,6 +1403,140 @@ impl SketchStore {
     /// Number of registered instances (includes ghosts).
     pub fn instance_count(&self) -> usize {
         self.instances.read().unwrap().len()
+    }
+
+    /// True when a sid's in-memory `SidStoreData` may be dropped to reclaim
+    /// resident memory: persistence owns its durability, NOTHING is pending
+    /// in memory (so dropping it loses no un-flushed data), and it has been
+    /// write-idle for at least `idle_threshold_ms`. `last_write_unix_ms == 0`
+    /// (never written / freshly rehydrated) is never evictable.
+    fn is_idle_evictable(
+        data: &SidStoreData<BTreeMap<String, String>, AggPayload>,
+        now: u64,
+        idle_threshold_ms: u64,
+    ) -> bool {
+        data.persistence_enabled
+            && data.sealed_epochs.is_empty()
+            && data.current_epoch.is_empty()
+            && data.last_write_unix_ms != 0
+            && now.saturating_sub(data.last_write_unix_ms) >= idle_threshold_ms
+    }
+
+    /// Idle-sid eviction (memory reclaim). Drops the in-memory
+    /// `SidStoreData` (epoch columns + intern-table label cache + the
+    /// `series` slot) for every sketch sid that has gone write-idle past
+    /// `idle_threshold_ms` AND whose state is fully durable on disk, while
+    /// KEEPING its [`SketchInstanceMetadata`] in `instances`.
+    ///
+    /// Why keep the metadata: the query path's disk union
+    /// ([`Self::query_range`] → `union_disk_parts_into`) needs
+    /// `sid_group_by_keys(sid)` and `instances_matching` needs the
+    /// metric/keys entry — drop those and the series silently stops
+    /// resolving warm and falls through to the archive. So only the heavy,
+    /// reconstructable part is evicted; the series stays queryable from the
+    /// durable tier and the append path
+    /// ([`Self::append_sample`]/[`Self::append_precompute`], both
+    /// `entry(..).or_insert_with(..)`) transparently rehydrates a fresh
+    /// store on the next write.
+    ///
+    /// Returns the number of sids evicted. `idle_threshold_ms == 0` is a
+    /// no-op (feature disabled). O(N sids); meant for a periodic sweep, not
+    /// the hot path. NOTE: because eviction requires `current_epoch` to be
+    /// empty (all windows sealed+flushed), the effective idle horizon is
+    /// `max(idle_threshold_ms, persistence_hot_window)`.
+    pub fn evict_idle_series(&self, idle_threshold_ms: u64) -> usize {
+        if idle_threshold_ms == 0 {
+            return 0;
+        }
+        let now = now_ms();
+
+        // Pass 1: collect candidates under read-only iteration. Removing
+        // during `iter()` can deadlock against our own shard guards, so we
+        // only gather here and remove afterwards.
+        let mut candidates = Vec::new();
+        for entry in self.series.iter() {
+            if let Ok(data) = entry.value().read() {
+                if Self::is_idle_evictable(&data, now, idle_threshold_ms) {
+                    candidates.push(*entry.key());
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        // Pass 2: remove each, RE-CHECKING under the per-sid write lock so a
+        // concurrent write that rehydrated/appended between the two passes
+        // is not dropped. `remove_if` only deletes when the closure returns
+        // true; taking the write lock there serializes with the append
+        // path's `store.write()`. (No lock-order inversion: no path holds a
+        // per-sid lock while acquiring a `series` shard lock.)
+        let mut evicted = 0usize;
+        for sid in candidates {
+            let removed = self.series.remove_if(&sid, |_, store| {
+                store
+                    .write()
+                    .map(|d| Self::is_idle_evictable(&d, now, idle_threshold_ms))
+                    .unwrap_or(false)
+            });
+            if removed.is_some() {
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    /// Approximate TOTAL resident bytes held by the store — the honest
+    /// counterpart to the [`persistence::EpochSource::approx_memory_bytes`]
+    /// payload gauge.
+    ///
+    /// `approx_memory_bytes` (used by the flusher's pressure trigger)
+    /// counts ONLY live sketch payloads in `current_epoch` + `sealed_epochs`
+    /// — which is correct for deciding what to FLUSH, because flushing only
+    /// relieves payload. But once payloads are sealed to disk it reads ~0,
+    /// even while the per-sid registry (`instances` metadata, the secondary
+    /// indexes, and the per-series `InternTable` label caches) keeps
+    /// hundreds of MB resident. That residue is NOT evictable by flushing —
+    /// it is only released by retiring/evicting the sid itself — so it must
+    /// not feed the flush trigger, but the memory DIAGNOSTIC must surface it
+    /// or operators are blind to the real footprint. This method is that
+    /// surface; it is O(N sids) and meant for the 30 s diagnostic tick, not
+    /// the hot path.
+    pub fn approx_resident_bytes(&self) -> usize {
+        let mut total = 0usize;
+
+        // 1. Registry metadata (instances map + its string heaps).
+        if let Ok(insts) = self.instances.read() {
+            for m in insts.values() {
+                total += std::mem::size_of::<SketchInstanceMetadata>();
+                total += m.metric_name.len();
+                for k in &m.group_by_keys {
+                    total += k.len() + std::mem::size_of::<String>();
+                }
+            }
+            total += insts.capacity()
+                * (std::mem::size_of::<u64>() + std::mem::size_of::<SketchInstanceMetadata>());
+        }
+
+        // 2. Per-sid series storage: live payloads + interned label maps +
+        //    the `Arc<RwLock<SidStoreData>>` container slot.
+        for entry in self.series.iter() {
+            let Ok(data) = entry.value().read() else {
+                continue;
+            };
+            for (_, _, payload) in data.current_epoch.iter_entries() {
+                total += payload.approx_bytes();
+            }
+            for epoch in data.sealed_epochs.values() {
+                for (_, _, payload) in &epoch.entries {
+                    total += payload.approx_bytes();
+                }
+            }
+            total += data.intern.approx_heap_bytes();
+            total += std::mem::size_of::<SidStore>();
+        }
+
+        total
     }
 
     /// Clone every registered `SketchInstanceMetadata` into a snapshot
@@ -3617,6 +3753,138 @@ mod tests {
             "LIVE BUG #3: approx_memory_bytes() reports 0 while current_epoch holds 20 \
              windows — the diagnostic under-reports and the flusher's memory trigger is blind"
         );
+    }
+
+    /// The idle under-report this fix targets: once a sid's payload has
+    /// been flushed/evicted to disk, `approx_memory_bytes` (the flusher's
+    /// evictable gauge) reads 0 — but the registered sid still costs
+    /// resident registry/metadata memory. `approx_resident_bytes` must
+    /// surface that so the memory diagnostic isn't blind (the live
+    /// "0.00 KB while 600 MB RSS" symptom).
+    #[test]
+    fn approx_resident_bytes_counts_registry_when_payload_is_zero() {
+        let idx = SketchStore::new();
+        idx.register(meta_with_host_key(9001));
+        // No samples appended → no live payload (models the idle sid whose
+        // epochs were sealed+flushed to disk).
+        assert_eq!(
+            idx.approx_memory_bytes(),
+            0,
+            "precondition: no resident payload"
+        );
+        assert!(
+            idx.approx_resident_bytes() > 0,
+            "approx_resident_bytes must account for the registered sid's \
+             metadata even when no payload is resident"
+        );
+    }
+
+    /// Resident accounting must include the per-series intern-table label
+    /// cache, which grows with the number of distinct label-value maps a
+    /// sid has seen — the dominant per-sid resident cost at scale.
+    #[test]
+    fn approx_resident_bytes_grows_with_interned_label_cardinality() {
+        let idx = SketchStore::new();
+        idx.register(meta_with_host_key(9100));
+        for i in 0..50u64 {
+            let s = i * 30_000;
+            idx.append_sample(
+                9100,
+                lv_host(&format!("host-{i}")),
+                (s, s + 30_000),
+                sample((i + 1) as u8),
+            );
+        }
+        let many = idx.approx_resident_bytes();
+
+        let idx2 = SketchStore::new();
+        idx2.register(meta_with_host_key(9101));
+        idx2.append_sample(9101, lv_host("host-0"), (0, 30_000), sample(1));
+        let few = idx2.approx_resident_bytes();
+
+        assert!(
+            many > few,
+            "resident bytes should grow with interned label cardinality: \
+             many={many} few={few}"
+        );
+    }
+
+    #[test]
+    fn is_idle_evictable_predicate() {
+        let now = now_ms();
+        let mut d = SidStoreData::<BTreeMap<String, String>, AggPayload>::new();
+        d.persistence_enabled = true;
+        d.last_write_unix_ms = now.saturating_sub(120_000);
+        assert!(
+            SketchStore::is_idle_evictable(&d, now, 60_000),
+            "idle 120s past a 60s threshold, durable + empty → evictable"
+        );
+        assert!(
+            !SketchStore::is_idle_evictable(&d, now, 300_000),
+            "idle 120s under a 300s threshold → spared"
+        );
+        d.last_write_unix_ms = 0;
+        assert!(
+            !SketchStore::is_idle_evictable(&d, now, 1),
+            "never-written (0) is never evictable"
+        );
+        // In-memory-only (no persistence) sids are never idle-evicted — there
+        // is no durable copy to serve them from.
+        let mut d2 = SidStoreData::<BTreeMap<String, String>, AggPayload>::new();
+        d2.persistence_enabled = false;
+        d2.last_write_unix_ms = now.saturating_sub(120_000);
+        assert!(!SketchStore::is_idle_evictable(&d2, now, 1));
+    }
+
+    #[test]
+    fn evict_idle_series_drops_state_but_keeps_metadata() {
+        let idx = SketchStore::new();
+        idx.register(meta_with_host_key(7001));
+        // Durable, write-idle, empty-in-memory sid (models a series whose
+        // windows have all sealed+flushed to disk and then gone quiet).
+        let mut d = SidStoreData::<BTreeMap<String, String>, AggPayload>::new();
+        d.persistence_enabled = true;
+        d.last_write_unix_ms = now_ms().saturating_sub(120_000);
+        idx.series.insert(7001, Arc::new(RwLock::new(d)));
+        assert_eq!(idx.series.len(), 1);
+
+        let evicted = idx.evict_idle_series(60_000);
+        assert_eq!(evicted, 1, "the idle sid is evicted");
+        assert_eq!(idx.series.len(), 0, "in-memory state dropped");
+        assert!(
+            idx.instances.read().unwrap().contains_key(&7001),
+            "metadata retained → series stays queryable from disk + rehydrates"
+        );
+
+        // A subsequent append rehydrates the series entry transparently.
+        idx.append_sample(7001, lv_host("h"), (0, 30_000), sample(1));
+        assert_eq!(idx.series.len(), 1, "append rehydrated the evicted sid");
+    }
+
+    #[test]
+    fn evict_idle_series_spares_recent_and_pending_sids() {
+        let idx = SketchStore::new();
+        // Recently written → not idle.
+        idx.register(meta_with_host_key(7101));
+        let mut recent = SidStoreData::<BTreeMap<String, String>, AggPayload>::new();
+        recent.persistence_enabled = true;
+        recent.last_write_unix_ms = now_ms();
+        idx.series.insert(7101, Arc::new(RwLock::new(recent)));
+        // Idle, but still holds un-flushed data in current_epoch → dropping it
+        // would lose data, so it MUST be spared.
+        idx.register(meta_with_host_key(7102));
+        let mut pending = SidStoreData::<BTreeMap<String, String>, AggPayload>::new();
+        pending.persistence_enabled = true;
+        pending.last_write_unix_ms = now_ms().saturating_sub(120_000);
+        pending.insert((0, 30_000), lv_host("h"), AggPayload::Sketch(sample(1)));
+        idx.series.insert(7102, Arc::new(RwLock::new(pending)));
+
+        assert_eq!(
+            idx.evict_idle_series(60_000),
+            0,
+            "recent + pending-data sids are spared"
+        );
+        assert_eq!(idx.series.len(), 2);
     }
 }
 
