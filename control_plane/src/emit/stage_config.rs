@@ -1863,7 +1863,14 @@ fn emit_edge_yaml_asap_edge(
                 .get(*metric)
                 .cloned()
                 .unwrap_or_default();
-            if !grouping.is_empty() {
+            // `effective_by` is the per-group keying actually emitted as
+            // `aggregate_by` (grouping_labels minus the item_label). Hoisted
+            // out of the emit branch so the `mode` decision below can read
+            // whether the edge factory would key per-group (non-empty) or
+            // collapse to a single attr-less sketch (empty).
+            let effective_by: Vec<String> = if grouping.is_empty() {
+                Vec::new()
+            } else {
                 // Exclude the item_label (the inner heavy-hitter dimension
                 // for HLL / CMS / heap-bearing CountSketch) from
                 // aggregate_by: it is the sketch SUBJECT — hashed into the
@@ -1879,14 +1886,96 @@ fn emit_edge_yaml_asap_edge(
                 // without an item_label or whose item_label isn't a
                 // grouping label.
                 let item_label = cfg.metric_to_item_label.get(*metric);
-                let by: Vec<Value> = grouping
+                grouping
                     .into_iter()
                     .filter(|k| item_label.map(|il| il != k).unwrap_or(true))
-                    .map(Value::String)
-                    .collect();
-                if !by.is_empty() {
-                    e.insert("aggregate_by".into(), Value::Sequence(by));
-                }
+                    .collect()
+            };
+            if !effective_by.is_empty() {
+                e.insert(
+                    "aggregate_by".into(),
+                    Value::Sequence(effective_by.iter().cloned().map(Value::String).collect()),
+                );
+            }
+
+            // ── mode (aggregation SCOPE) — ASAPCollector#471 ────────────────
+            //
+            // The edge `MetricFamily.mode` (`per_series` / `whole_stream`,
+            // precompute `PrecomputeConfig.Scope`) decides whether a window
+            // keys ONE sketch per series-group (per_series — the default) or
+            // collapses EVERY matching datapoint into a single attr-less
+            // sketch (whole_stream). #471 folded the legacy `GlobalAggregation`
+            // bool INTO this scope, so `whole_stream` is SEMANTICALLY IDENTICAL
+            // to the empty-`aggregate_by`→GlobalAggregation behaviour the edge
+            // factory has today.
+            //
+            // Signal: a metric whose `effective_by` is EMPTY *and* whose family
+            // is a genuinely cross-series/global aggregate is whole-stream.
+            // The per-series quantile families (DDSketch / KLL) are NEVER
+            // whole-stream here — they reduce within a single series, and an
+            // empty grouping there means "no extra keying", not "collapse the
+            // stream". The item-counting / frequency families (HLL / CMS /
+            // CountSketch) with an empty effective grouping ARE the global
+            // case the planner emits for `count(distinct …)` (no `by`),
+            // global top-k, and global frequency — exactly #471's
+            // `WholeStream` examples (distinct-count / global-top-k / global
+            // frequency over the whole stream).
+            //
+            // Back-compat & the heap-bearing-CountSketch warning above: we
+            // emit `whole_stream` ONLY where the code already produces an
+            // empty `aggregate_by` for one of these global families. A
+            // CountSketch/HLL/CMS that DOES carry per-group keying
+            // (non-empty `effective_by`) keeps per_series, so we never newly
+            // collapse a metric that needs per-group sid minting. `per_series`
+            // is the edge default (empty/omitted `mode` ⇒ ParseAggMode →
+            // ModePerSeries), so we emit NOTHING for the per_series case: the
+            // YAML for every metric that isn't a genuine whole-stream global
+            // aggregate stays byte-identical to today.
+            let whole_stream = effective_by.is_empty()
+                && matches!(
+                    kind,
+                    SketchKind::Hll | SketchKind::Cms | SketchKind::CountSketch
+                );
+            if whole_stream {
+                e.insert("mode".into(), Value::String("whole_stream".to_string()));
+            }
+
+            // ── hll_sparse (in-memory sparse HLL base) — ASAPCollector#472 ──
+            //
+            // `MetricFamily.hll_sparse` (default false = dense) opts the HLL
+            // family into the sketchlib-go sparse base
+            // (`NewHLLWrapperSparse`): low-cardinality warm series hold far
+            // less than the dense ~16 KB/series register array, and the
+            // serialized output is byte-identical to dense for the same inputs
+            // (the sparse base auto-promotes to dense once enough registers
+            // are set), so there is ZERO accuracy or wire risk. Only meaningful
+            // for `family: hll`.
+            //
+            // Rule (scope-driven — see the design note):
+            //   * whole_stream HLL → ONE high-cardinality instance per metric
+            //     (distinct-count over the whole stream). It promotes to dense
+            //     almost immediately, so the sparse base buys nothing and only
+            //     adds promotion churn → emit `hll_sparse: false` (dense).
+            //   * per_series HLL → one HLL per group; most groups are
+            //     low-cardinality (e.g. distinct user_ids per zone), where the
+            //     sparse base is a large memory win and auto-promotes the few
+            //     hot groups → emit `hll_sparse: true`.
+            //
+            // CARDINALITY HINT (follow-up): the ideal signal is a per-metric
+            // `WorkloadCharacteristics.distinct_keys_per_window`
+            // (`control_plane/src/types.rs:45`) — above the dense-crossover
+            // (~4096 non-zero registers ≈ the in-memory promotion point) a
+            // per_series HLL should also go dense. That hint is NOT reachable
+            // at this emit site: `EdgeStageConfig` (the only input to this
+            // emitter) carries no `WorkloadCharacteristics` and no per-metric
+            // cardinality map. Plumbing one is a follow-up; until then we use
+            // the scope-based default above, which is safe (sparse is lossless
+            // and auto-promotes). We emit the flag ONLY when we can cleanly
+            // determine scope for the HLL family; we never make a metric sparse
+            // we're unsure about (default-OFF safety — omitting ⇒ edge dense =
+            // today's behaviour).
+            if matches!(kind, SketchKind::Hll) {
+                e.insert("hll_sparse".into(), Value::Bool(!whole_stream));
             }
             // Family-specific params — mirror the reads in
             // `build_edge_processor_block`. The fused processor's
@@ -5926,6 +6015,65 @@ mod tests {
             "sum family must NOT carry delta_transmission\n{yaml}"
         );
 
+        // ── mode (scope) + hll_sparse — ASAPCollector#471/#472 ──────────
+        //
+        // The fused fixture's item-counting / frequency families
+        // (`unique_users_per_min`→HLL, `top_endpoint_qps`→CountSketch,
+        // `endpoint_request_freq`→CMS) carry an item_label and NO grouping
+        // label, so their effective aggregate_by is empty → genuine
+        // whole-stream global aggregates → `mode: whole_stream`.
+        for ws_family in [
+            "unique_users_per_min",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+        ] {
+            assert_eq!(
+                entry_for(ws_family).get("mode").and_then(|v| v.as_str()),
+                Some("whole_stream"),
+                "global item-counting family {ws_family} must emit mode: whole_stream\n{yaml}"
+            );
+            // whole_stream families never carry an aggregate_by (the scope
+            // collapses grouping).
+            assert!(
+                entry_for(ws_family).get("aggregate_by").is_none(),
+                "whole_stream family {ws_family} must NOT carry aggregate_by\n{yaml}"
+            );
+        }
+        // The per-series quantile families (DDSketch / KLL) are NEVER
+        // whole_stream and emit NO mode (per_series is the edge default —
+        // keeps their YAML byte-stable vs. the pre-#471 emit).
+        for ps_family in ["http_requests_total_latency_ms", "request_size_bytes"] {
+            assert!(
+                entry_for(ps_family).get("mode").is_none(),
+                "per-series quantile family {ps_family} must NOT carry mode (per_series default)\n{yaml}"
+            );
+        }
+        // The sum entry never carries a scope mode.
+        assert!(
+            sum_e.get("mode").is_none(),
+            "sum family must NOT carry mode\n{yaml}"
+        );
+        // hll_sparse: emitted ONLY on the HLL family. The whole-stream HLL
+        // here is a single high-cardinality instance → dense (false).
+        assert_eq!(
+            hll.get("hll_sparse").and_then(|v| v.as_bool()),
+            Some(false),
+            "whole_stream HLL must emit hll_sparse: false (dense)\n{yaml}"
+        );
+        // No non-HLL family carries hll_sparse.
+        for non_hll in [
+            "http_requests_total_latency_ms",
+            "request_size_bytes",
+            "top_endpoint_qps",
+            "endpoint_request_freq",
+            "http_requests_total",
+        ] {
+            assert!(
+                entry_for(non_hll).get("hll_sparse").is_none(),
+                "non-HLL family {non_hll} must NOT carry hll_sparse\n{yaml}"
+            );
+        }
+
         // ── CountSketch warm-topk heap keys (cross-repo dependency) ─────
         // The CountSketch family (`top_endpoint_qps`, planned with_heap)
         // carries the heap-bearing wire variant keys so a warm topk query
@@ -6060,6 +6208,157 @@ mod tests {
             "fused emit must NOT carry an opamp extension (supervisor-managed)\n{yaml}"
         );
         assert!(yaml.contains("otlp/backend:"), "{yaml}");
+    }
+
+    /// ASAPCollector#471/#472 — a `count by (region)(distinct user_id)` style
+    /// query lands a per-GROUP HLL: grouping_labels=[region], item_label=user_id.
+    /// The emit must key the sketch per region (`aggregate_by: [region]`), stay
+    /// `per_series` (NO `mode`, since the scope is not whole-stream), and opt the
+    /// HLL into the sparse base (`hll_sparse: true`) — most regions are
+    /// low-cardinality so the sparse base is a memory win that auto-promotes.
+    #[test]
+    fn fused_asap_edge_per_group_hll_is_per_series_and_sparse() {
+        use crate::sketch_algebra::params::HllParams;
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert("distinct_users_by_region".into(), one(SketchKind::Hll));
+
+        let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
+        metric_to_grouping_labels.insert("distinct_users_by_region".into(), vec!["region".into()]);
+
+        let mut metric_to_item_label: HashMap<String, String> = HashMap::new();
+        metric_to_item_label.insert("distinct_users_by_region".into(), "user_id".into());
+
+        let cfg = EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: vec![EdgeSketchProcessor {
+                processor_name: "HLL".into(),
+                sketch_kind: SketchKind::Hll,
+                sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
+                aggregation_id: "agg0".into(),
+            }],
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels,
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
+            metric_to_item_label,
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
+        };
+
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("metrics"))
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        let hll = metrics
+            .iter()
+            .find(|e| e.get("metric").and_then(|m| m.as_str()) == Some("distinct_users_by_region"))
+            .expect("HLL entry present");
+
+        // Per-group keying: region survives, user_id (item_label) is excluded.
+        let by: Vec<String> = hll
+            .get("aggregate_by")
+            .and_then(|v| v.as_sequence())
+            .expect("aggregate_by seq")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            by,
+            vec!["region".to_string()],
+            "per-group aggregate_by\n{yaml}"
+        );
+        assert_eq!(
+            hll.get("item_label").and_then(|v| v.as_str()),
+            Some("user_id"),
+            "HLL item_label preserved\n{yaml}"
+        );
+        // Per_series (non-empty effective aggregate_by) → NO mode emitted.
+        assert!(
+            hll.get("mode").is_none(),
+            "per-group HLL must NOT carry mode (per_series default)\n{yaml}"
+        );
+        // Per_series HLL opts into the sparse base.
+        assert_eq!(
+            hll.get("hll_sparse").and_then(|v| v.as_bool()),
+            Some(true),
+            "per-series HLL must emit hll_sparse: true\n{yaml}"
+        );
+    }
+
+    /// Byte-stability guard: a metric set whose families are ALL per-series
+    /// quantile (DDSketch / KLL) with no grouping emits NEITHER `mode` nor
+    /// `hll_sparse` anywhere — proving the scope/sparse mapping leaves
+    /// pre-#471/#472 plans byte-identical (per_series is the edge default).
+    #[test]
+    fn fused_asap_edge_quantile_only_omits_mode_and_sparse() {
+        use crate::sketch_algebra::params::{DDSketchParams, KllParams};
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert("latency_ms".into(), one(SketchKind::DDSketch));
+        metric_to_family.insert("payload_bytes".into(), one(SketchKind::Kll));
+
+        let cfg = EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: vec![
+                EdgeSketchProcessor {
+                    processor_name: "ddsketch".into(),
+                    sketch_kind: SketchKind::DDSketch,
+                    sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                    aggregation_id: "agg0".into(),
+                },
+                EdgeSketchProcessor {
+                    processor_name: "KLL".into(),
+                    sketch_kind: SketchKind::Kll,
+                    sketch_params: SketchParams::Kll(KllParams { k: 200 }),
+                    aggregation_id: "agg1".into(),
+                },
+            ],
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
+            metric_to_item_label: HashMap::new(),
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
+        };
+
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+        assert!(
+            !yaml.contains("mode:"),
+            "quantile-only plan must emit no scope `mode:`\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("hll_sparse"),
+            "quantile-only plan (no HLL) must emit no hll_sparse\n{yaml}"
+        );
     }
 
     #[test]
@@ -6364,6 +6663,13 @@ mod tests {
             "emit_heap",
             "heap_size",
             "item_label",
+            // Edge aggregation scope + sparse-HLL (ASAPCollector#471/#472).
+            // `mode` is on MetricFamily (config.go:91); `hll_sparse` is the
+            // documented per-HLL sparse-base knob (warm_sketch.go reads
+            // `fam.HLLSparse`). Both are emitted ahead of / in lock-step with
+            // those edge changes — mapstructure ignores unknown keys.
+            "mode",
+            "hll_sparse",
         ]
         .into_iter()
         .collect();
