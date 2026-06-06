@@ -743,3 +743,12 @@ cheapest that meets the accuracy SLA.
 When an Agent sketch exceeds the memory budget, it is deferred to Backend.
 If it also exceeds the Backend budget, it moves to Precompute.  Every deferral
 is logged in `StagedPlan.deferral_log` for observability.
+
+## 10. Edge Aggregation Scope (`mode`) and Sparse HLL (`hll_sparse`)
+
+Once a sketch family is chosen for a metric, two further per-metric knobs the
+control plane emits into the edge `asap_edge.metrics[]` config control *how* the
+edge aggregates: the aggregation **scope** (`mode`: `per_series` vs
+`whole_stream`) and the in-memory **sparse-HLL** opt-in (`hll_sparse`). See
+[Edge aggregation scope + sparse HLL](query-to-edge-scope-and-sparse.md) for the
+signal-to-config mapping, worked examples, and back-compat reasoning.
