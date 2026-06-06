@@ -295,6 +295,12 @@ impl Replanner {
             // same `sample_p` knob the first-connect bootstrap YAML did.
             edge_cfg.metric_to_sample_p =
                 crate::emit::collect_metric_to_sample_p(registry, &self.workload_store);
+            // Per-metric cardinality hint — companion stitch, mirrors the
+            // bootstrap path so OpAMP-pushed re-plans carry the same
+            // `distinct_keys_per_window` HLL sparse/dense signal the
+            // first-connect bootstrap YAML did.
+            edge_cfg.metric_to_distinct_keys =
+                crate::emit::collect_metric_to_distinct_keys(registry, &self.workload_store);
             // Per-metric inner item dimension — companion stitch, mirrors the
             // bootstrap path so OpAMP-pushed re-plans carry the same
             // `item_label` the first-connect bootstrap YAML did.

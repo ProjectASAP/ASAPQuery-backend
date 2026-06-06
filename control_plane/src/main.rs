@@ -638,6 +638,8 @@ async fn handle_plan(
             grouping_labels: workload.group_by_labels.clone(),
             // Role derivation does not depend on sampling; default 1.0.
             sample_p: 1.0,
+            // Role derivation does not depend on the cardinality hint.
+            distinct_keys_per_window: None,
             // Role derivation does not depend on the inner item dimension.
             item_label: None,
         };
@@ -1319,6 +1321,14 @@ async fn emit_bootstrap_typed(
         &st.workload_registry,
         &st.workload_store,
     );
+    // Per-metric cardinality hint — companion stitch: maps each metric
+    // whose workload declares `distinct_keys_per_window` to that count so
+    // the L5 edge emitter can refine the HLL sparse/dense base selection
+    // (a per-series HLL above the sparse→dense promotion crossover is
+    // emitted dense). Empty when no metric declares one ⇒ byte-identical
+    // agent config (the PR #358 scope-based default applies).
+    edge_cfg.metric_to_distinct_keys =
+        emit::collect_metric_to_distinct_keys(&st.workload_registry, &st.workload_store);
     // Per-metric inner item dimension — companion stitch: maps each metric
     // whose workload declares an `item_label` (the high-cardinality
     // data-point attribute the HLL/CountSketch/CMS family counts or ranks,

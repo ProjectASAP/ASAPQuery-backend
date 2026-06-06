@@ -241,6 +241,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                distinct_keys_per_window: None,
                 item_label: None,
             },
             WorkloadEntry {
@@ -252,6 +253,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                distinct_keys_per_window: None,
                 item_label: None,
             },
             WorkloadEntry {
@@ -263,6 +265,7 @@ mod tests {
                 target_path: None,
                 grouping_labels: vec!["zone".into()],
                 sample_p: 1.0,
+                distinct_keys_per_window: None,
                 item_label: None,
             },
         ];
