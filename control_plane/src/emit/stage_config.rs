@@ -2454,11 +2454,20 @@ fn build_default_edge_processor_block(
 /// explicitly opts in via `default_host`) for symbolic stages — Phase C
 /// plumbs a real `DeploymentConstraints::executors()` resolver.
 fn resolve_export_endpoint(default_host: &str, target: &ExportTarget) -> String {
+    // The backend/gateway OTLP ingest port is normally 4317. Single-host
+    // deployments (e.g. the single-node MVP collapse) run the agent's OTLP
+    // *receiver* and the data_plane's OTLP *ingest* on the same host under
+    // `--network host`, where both default to :4317 and collide. Let the
+    // ingest port be overridden via `ASAP_EDGE_BACKEND_OTLP_PORT` so the
+    // agent exports to a non-colliding data_plane port while its receiver
+    // keeps :4317. Defaults to 4317 → 4-node behavior is unchanged.
+    let backend_port =
+        std::env::var("ASAP_EDGE_BACKEND_OTLP_PORT").unwrap_or_else(|_| "4317".to_string());
     match target {
         ExportTarget::Endpoint(s) => s.clone(),
         ExportTarget::Stage(StageId::Edge) => "edge:4317".to_string(),
-        ExportTarget::Stage(StageId::Gateway) => format!("{default_host}:4317"),
-        ExportTarget::Stage(StageId::Backend) => format!("{default_host}:4317"),
+        ExportTarget::Stage(StageId::Gateway) => format!("{default_host}:{backend_port}"),
+        ExportTarget::Stage(StageId::Backend) => format!("{default_host}:{backend_port}"),
     }
 }
 
