@@ -236,6 +236,25 @@ pub struct WorkloadEntry {
     /// sketch-processor block (`sample_p`) only when `< 1.0`.
     #[serde(default = "default_sample_p")]
     pub sample_p: f64,
+    /// Optional **known distinct key (item) count per flush window** for the
+    /// cardinality / frequency sketch families — the declarative twin of
+    /// [`crate::types::WorkloadCharacteristics::distinct_keys_per_window`].
+    ///
+    /// Today this refines ONLY the HLL sparse-vs-dense base selection at the
+    /// edge: a *per-series* HLL is emitted sparse by default (PR #358), but a
+    /// per-series HLL whose cardinality is known to exceed the in-memory
+    /// sparse→dense promotion point pays only promotion churn from the sparse
+    /// base, so when this hint is `Some(n)` with `n` above that crossover the
+    /// L5 emitter emits it dense instead (completing the #358 follow-up).
+    ///
+    /// Threaded into `EdgeStageConfig::metric_to_distinct_keys` by
+    /// [`crate::emit::collect_metric_to_distinct_keys`] (registry pre-pop loop
+    /// in `main` + the replan companion), which the L5 `asap_edge` emitter
+    /// reads in `emit_edge_yaml_asap_edge`'s HLL branch. `None` / missing ⇒
+    /// the scope-based default of PR #358 (per-series ⇒ sparse), so the
+    /// emitted config stays byte-identical when the hint is absent.
+    #[serde(default)]
+    pub distinct_keys_per_window: Option<u64>,
     /// Optional **inner high-cardinality dimension** for the item-counting
     /// sketch families (HLL / CountSketch / CountMinSketch): the data-point
     /// attribute whose VALUE is the "item" the sketch counts/ranks, as
@@ -419,6 +438,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    distinct_keys_per_window: None,
                     item_label: None,
                 },
                 WorkloadEntry {
@@ -430,6 +450,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    distinct_keys_per_window: None,
                     item_label: None,
                 },
                 WorkloadEntry {
@@ -441,6 +462,7 @@ mod tests {
                     target_path: None,
                     grouping_labels: vec![],
                     sample_p: 1.0,
+                    distinct_keys_per_window: None,
                     item_label: None,
                 },
             ],
@@ -550,6 +572,7 @@ mod tests {
             target_path: None,
             grouping_labels: vec![],
             sample_p: 1.0,
+            distinct_keys_per_window: None,
             item_label: None,
         }
     }

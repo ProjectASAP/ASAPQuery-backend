@@ -290,6 +290,25 @@ pub struct EdgeStageConfig {
     /// Empty map (default) ⇒ no metric carries sampling — backward-compat.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_sample_p: HashMap<String, f64>,
+    /// Per-metric **known distinct-key count per window** (cardinality hint),
+    /// populated by the planner from each workload entry's
+    /// [`crate::workload::WorkloadEntry::distinct_keys_per_window`] via
+    /// [`crate::emit::collect_metric_to_distinct_keys`].
+    ///
+    /// The fused `asap_edge` emitter's HLL branch reads this to refine the
+    /// sparse-vs-dense base selection introduced in PR #358: a per-series HLL
+    /// is sparse by default, but when the hint for the metric is `Some(n)` with
+    /// `n` at or above the in-memory sparse→dense promotion crossover
+    /// (`DENSE_CROSSOVER`) the HLL is emitted DENSE instead — sparse only helps
+    /// low-cardinality series; a high-cardinality per-series HLL would just pay
+    /// promotion churn from the sparse base.
+    ///
+    /// A metric absent from this map keeps the PR #358 scope-based default
+    /// (per-series ⇒ sparse, whole-stream ⇒ dense), so the emitted config stays
+    /// byte-identical when no cardinality hint is declared. Empty map (default)
+    /// ⇒ no metric carries a hint — backward-compat.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metric_to_distinct_keys: HashMap<String, u64>,
     /// Per-metric **inner item dimension** for the item-counting sketch
     /// families (HLL / CountSketch / CountMinSketch): the data-point
     /// attribute whose VALUE is the "item" the sketch counts or ranks (e.g.
@@ -705,6 +724,7 @@ impl Emitter for ThreeStageEmitter {
             cold_ship_endpoint: Some(default_cold_ship_endpoint()),
             cold_external_labels: default_cold_external_labels(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             // Cold-archive format defaults to gorilla-XOR fragments; the
             // intchunk format (and its coldpart endpoint) is opted into by
             // a deploy-info-bearing layer post-emit (same pattern as the

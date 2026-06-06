@@ -147,6 +147,27 @@ pub const MIN_WINDOW_SECS: u64 = 5;
 /// the pre-B4 emitter shipped with.
 pub const MAX_WINDOW_SECS: u64 = 60;
 
+/// Cardinality at which a per-series HLL is emitted DENSE rather than sparse
+/// (ASAPCollector#472 follow-up to PR #358).
+///
+/// The sketchlib-go in-memory sparse HLL base (`NewHLLWrapperSparse`)
+/// auto-promotes to the dense register array once roughly this many registers
+/// become non-zero (the sparse representation stops saving memory past that
+/// point). A per-series HLL whose known distinct-key count
+/// ([`crate::workload::WorkloadEntry::distinct_keys_per_window`]) is at or
+/// above this crossover would promote almost immediately, so starting it sparse
+/// only pays one-time promotion churn — we emit it dense instead.
+///
+/// This is a HEURISTIC: distinct *keys* map to non-zero *registers* only
+/// approximately (hash collisions mean registers < keys at high cardinality),
+/// so the crossover is fuzzy. Being slightly off has NO correctness or accuracy
+/// impact — the sparse base is lossless and serializes byte-identically to
+/// dense for the same inputs; an over- or under-estimate at worst costs (or
+/// saves) a single in-memory sparse→dense promotion. The value tracks the
+/// in-memory promotion threshold (~4096 non-zero registers); the wire-crossover
+/// constant the agent uses elsewhere is larger (~6000).
+pub const DENSE_CROSSOVER: u64 = 4096;
+
 /// Clamp a derived window size to `[MIN_WINDOW_SECS, MAX_WINDOW_SECS]`.
 /// `None` is preserved as `None` so callers can keep the
 /// "no-window / batch-mode" branch distinguishable from a clamped value.
@@ -1961,21 +1982,39 @@ fn emit_edge_yaml_asap_edge(
             //     sparse base is a large memory win and auto-promotes the few
             //     hot groups → emit `hll_sparse: true`.
             //
-            // CARDINALITY HINT (follow-up): the ideal signal is a per-metric
-            // `WorkloadCharacteristics.distinct_keys_per_window`
-            // (`control_plane/src/types.rs:45`) — above the dense-crossover
-            // (~4096 non-zero registers ≈ the in-memory promotion point) a
-            // per_series HLL should also go dense. That hint is NOT reachable
-            // at this emit site: `EdgeStageConfig` (the only input to this
-            // emitter) carries no `WorkloadCharacteristics` and no per-metric
-            // cardinality map. Plumbing one is a follow-up; until then we use
-            // the scope-based default above, which is safe (sparse is lossless
-            // and auto-promotes). We emit the flag ONLY when we can cleanly
-            // determine scope for the HLL family; we never make a metric sparse
-            // we're unsure about (default-OFF safety — omitting ⇒ edge dense =
-            // today's behaviour).
+            // CARDINALITY HINT (ASAPCollector#472 follow-up to PR #358 — now
+            // plumbed): the per-metric `WorkloadEntry::distinct_keys_per_window`
+            // hint rides into this emit site on
+            // `EdgeStageConfig::metric_to_distinct_keys` (populated by
+            // `collect_metric_to_distinct_keys` in main/replan). When a
+            // per_series HLL's known cardinality is at or above the in-memory
+            // sparse→dense promotion point (`DENSE_CROSSOVER`), the sparse base
+            // would promote almost immediately and only pay promotion churn, so
+            // we emit it DENSE instead. Below the crossover (or with NO hint at
+            // all — the common case) we keep the PR #358 scope-based default of
+            // sparse, so metrics without the hint stay byte-identical to #358.
+            // Whole-stream HLL is always dense regardless of the hint (one
+            // high-cardinality instance per metric — see the rule note above).
+            //
+            // The crossover is a heuristic (distinct keys ≈ non-zero registers
+            // only approximately); being off only costs/saves a one-time
+            // promotion, never correctness or accuracy (the sparse base is
+            // lossless and serializes byte-identically to dense). We emit the
+            // flag ONLY for the HLL family; non-HLL families carry no
+            // `hll_sparse` key.
             if matches!(kind, SketchKind::Hll) {
-                e.insert("hll_sparse".into(), Value::Bool(!whole_stream));
+                let hll_sparse = if whole_stream {
+                    false
+                } else {
+                    match cfg.metric_to_distinct_keys.get(*metric) {
+                        // High-cardinality per-series HLL → dense (promotes
+                        // immediately; sparse only adds churn).
+                        Some(n) if *n >= DENSE_CROSSOVER => false,
+                        // Low-cardinality or no hint → sparse (PR #358 default).
+                        _ => true,
+                    }
+                };
+                e.insert("hll_sparse".into(), Value::Bool(hll_sparse));
             }
             // Family-specific params — mirror the reads in
             // `build_edge_processor_block`. The fused processor's
@@ -2971,6 +3010,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -3965,6 +4005,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -4316,6 +4357,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -4669,6 +4711,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -5845,6 +5888,7 @@ mod tests {
             ),
             cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label,
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -6231,6 +6275,11 @@ mod tests {
         let mut metric_to_item_label: HashMap<String, String> = HashMap::new();
         metric_to_item_label.insert("distinct_users_by_region".into(), "user_id".into());
 
+        // A small / below-crossover cardinality hint must NOT flip the
+        // per-series HLL to dense — it stays sparse (the PR #358 default).
+        let mut metric_to_distinct_keys: HashMap<String, u64> = HashMap::new();
+        metric_to_distinct_keys.insert("distinct_users_by_region".into(), DENSE_CROSSOVER - 1);
+
         let cfg = EdgeStageConfig {
             source_metric: None,
             label_filters: Vec::new(),
@@ -6251,6 +6300,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys,
             metric_to_item_label,
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -6294,11 +6344,165 @@ mod tests {
             hll.get("mode").is_none(),
             "per-group HLL must NOT carry mode (per_series default)\n{yaml}"
         );
-        // Per_series HLL opts into the sparse base.
+        // Per_series HLL with a below-crossover cardinality hint opts into the
+        // sparse base.
         assert_eq!(
             hll.get("hll_sparse").and_then(|v| v.as_bool()),
             Some(true),
-            "per-series HLL must emit hll_sparse: true\n{yaml}"
+            "per-series HLL (below-crossover hint) must emit hll_sparse: true\n{yaml}"
+        );
+    }
+
+    /// ASAPCollector#472 follow-up — a per-series HLL whose declared
+    /// `distinct_keys_per_window` is at or above [`DENSE_CROSSOVER`] is emitted
+    /// DENSE (`hll_sparse: false`): the sparse base would promote almost
+    /// immediately, so starting sparse only pays one-time promotion churn.
+    /// Below-crossover / unset hints keep the PR #358 default (sparse) — proven
+    /// by [`fused_asap_edge_per_group_hll_is_per_series_and_sparse`].
+    #[test]
+    fn fused_asap_edge_per_series_hll_high_cardinality_hint_is_dense() {
+        use crate::sketch_algebra::params::HllParams;
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert("distinct_users_by_region".into(), one(SketchKind::Hll));
+
+        let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
+        metric_to_grouping_labels.insert("distinct_users_by_region".into(), vec!["region".into()]);
+
+        let mut metric_to_item_label: HashMap<String, String> = HashMap::new();
+        metric_to_item_label.insert("distinct_users_by_region".into(), "user_id".into());
+
+        // High-cardinality hint (>= crossover) → dense.
+        let mut metric_to_distinct_keys: HashMap<String, u64> = HashMap::new();
+        metric_to_distinct_keys.insert("distinct_users_by_region".into(), DENSE_CROSSOVER * 4);
+
+        let cfg = EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: vec![EdgeSketchProcessor {
+                processor_name: "HLL".into(),
+                sketch_kind: SketchKind::Hll,
+                sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
+                aggregation_id: "agg0".into(),
+            }],
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels,
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys,
+            metric_to_item_label,
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
+        };
+
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("metrics"))
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        let hll = metrics
+            .iter()
+            .find(|e| e.get("metric").and_then(|m| m.as_str()) == Some("distinct_users_by_region"))
+            .expect("HLL entry present");
+
+        // Still per_series (non-empty effective aggregate_by) → no `mode`.
+        assert!(
+            hll.get("mode").is_none(),
+            "per-group HLL must NOT carry mode (per_series default)\n{yaml}"
+        );
+        // High-cardinality hint flips the sparse default to dense.
+        assert_eq!(
+            hll.get("hll_sparse").and_then(|v| v.as_bool()),
+            Some(false),
+            "per-series HLL with high-cardinality hint must emit hll_sparse: false (dense)\n{yaml}"
+        );
+    }
+
+    /// ASAPCollector#472 follow-up — a WHOLE-STREAM HLL is dense regardless of
+    /// the cardinality hint: even a tiny declared cardinality cannot flip the
+    /// single-instance global aggregate to sparse (the scope rule wins).
+    #[test]
+    fn fused_asap_edge_whole_stream_hll_is_dense_regardless_of_hint() {
+        use crate::sketch_algebra::params::HllParams;
+        let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
+
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+            HashMap::new();
+        metric_to_family.insert("distinct_users_global".into(), one(SketchKind::Hll));
+
+        // No grouping label + an item_label ⇒ effective aggregate_by empty ⇒
+        // whole-stream HLL.
+        let mut metric_to_item_label: HashMap<String, String> = HashMap::new();
+        metric_to_item_label.insert("distinct_users_global".into(), "user_id".into());
+
+        // A tiny (below-crossover) hint MUST be ignored for whole-stream.
+        let mut metric_to_distinct_keys: HashMap<String, u64> = HashMap::new();
+        metric_to_distinct_keys.insert("distinct_users_global".into(), 1);
+
+        let cfg = EdgeStageConfig {
+            source_metric: None,
+            label_filters: Vec::new(),
+            window_secs: Some(60),
+            sketch_processors: vec![EdgeSketchProcessor {
+                processor_name: "HLL".into(),
+                sketch_kind: SketchKind::Hll,
+                sketch_params: SketchParams::Hll(HllParams { precision: 14 }),
+                aggregation_id: "agg0".into(),
+            }],
+            exporter_target: ExportTarget::Endpoint("data-plane:4317".into()),
+            prometheus_archive_metrics: Vec::new(),
+            archive_tier_metrics: Vec::new(),
+            warm_passthrough_metrics: Vec::new(),
+            metric_to_family,
+            metric_to_grouping_labels: HashMap::new(),
+            cumulative_counter_metrics: Vec::new(),
+            cold_ship_endpoint: None,
+            cold_external_labels: Vec::new(),
+            metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys,
+            metric_to_item_label,
+            cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
+            cold_coldpart_endpoint: None,
+        };
+
+        let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
+            .expect("emit fused asap_edge ok");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let metrics = doc
+            .get("processors")
+            .and_then(|p| p.get("asap_edge"))
+            .and_then(|p| p.get("metrics"))
+            .and_then(|v| v.as_sequence())
+            .expect("asap_edge.metrics seq");
+        let hll = metrics
+            .iter()
+            .find(|e| e.get("metric").and_then(|m| m.as_str()) == Some("distinct_users_global"))
+            .expect("HLL entry present");
+
+        assert_eq!(
+            hll.get("mode").and_then(|v| v.as_str()),
+            Some("whole_stream"),
+            "global HLL must be whole_stream\n{yaml}"
+        );
+        assert_eq!(
+            hll.get("hll_sparse").and_then(|v| v.as_bool()),
+            Some(false),
+            "whole_stream HLL must emit hll_sparse: false (dense) regardless of hint\n{yaml}"
         );
     }
 
@@ -6344,6 +6548,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -6507,6 +6712,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -6882,6 +7088,7 @@ mod tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: HashMap::new(),
+            metric_to_distinct_keys: HashMap::new(),
             metric_to_item_label: HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,

@@ -470,6 +470,52 @@ pub fn collect_metric_to_sample_p(
 }
 
 /// Sibling of [`collect_metric_to_sample_p`]: walk every registry entry and
+/// return the per-metric **known distinct-key count per window** map the L5
+/// edge emitter drops into
+/// [`crate::physical::colored_dag::emitter::EdgeStageConfig::metric_to_distinct_keys`].
+///
+/// The value is the operator's declarative cardinality hint
+/// ([`crate::workload::WorkloadEntry::distinct_keys_per_window`]) — the count
+/// of distinct items the cardinality / frequency sketch families see per flush
+/// window. The HLL branch of the fused `asap_edge` emitter uses it to refine
+/// the sparse-vs-dense base decision: a per-series HLL above the in-memory
+/// sparse→dense promotion crossover is emitted dense rather than sparse
+/// (completing the PR #358 follow-up).
+///
+/// Only metrics whose workload sets `distinct_keys_per_window = Some(n)` are
+/// included; entries that omit the hint (`None`) are SKIPPED, so the map stays
+/// empty when no metric declares a cardinality and the emitted agent config
+/// (hence the on-wire sketch bytes) is byte-identical to the PR #358 default
+/// (per-series HLL ⇒ sparse).
+///
+/// As with the sibling collectors, an entry is only honoured when its metric
+/// was successfully pre-populated into the workload store, keeping the emit
+/// aligned with what the backend knows about. When a metric carries multiple
+/// roles the FIRST registered entry's hint wins (in practice all share it,
+/// since the field lives on the `WorkloadEntry`).
+pub fn collect_metric_to_distinct_keys(
+    registry: &WorkloadRegistry,
+    workload_store: &WorkloadStore,
+) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for entry in registry.entries() {
+        if workload_store
+            .get_all_for_metric(&entry.metric_name)
+            .into_iter()
+            .next()
+            .is_none()
+        {
+            continue;
+        }
+        let Some(n) = entry.distinct_keys_per_window else {
+            continue;
+        };
+        out.entry(entry.metric_name.clone()).or_insert(n);
+    }
+    out
+}
+
+/// Sibling of [`collect_metric_to_sample_p`]: walk every registry entry and
 /// return a map from metric name → its declarative **inner item dimension**
 /// (`WorkloadEntry::item_label`) that the L5 edge emitter drops into
 /// [`crate::physical::colored_dag::emitter::EdgeStageConfig::metric_to_item_label`].
@@ -641,6 +687,7 @@ mod runtime_tests {
                 cold_ship_endpoint: Some(default_cold_ship_endpoint()),
                 cold_external_labels: Vec::new(),
                 metric_to_sample_p: std::collections::HashMap::new(),
+                metric_to_distinct_keys: std::collections::HashMap::new(),
                 metric_to_item_label: std::collections::HashMap::new(),
                 cold_format: ColdFormat::default(),
                 cold_coldpart_endpoint: None,
@@ -709,6 +756,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_distinct_keys: std::collections::HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -750,6 +798,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_distinct_keys: std::collections::HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -789,6 +838,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_distinct_keys: std::collections::HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
@@ -990,6 +1040,47 @@ mod runtime_tests {
         assert_eq!(map.len(), 3, "only the item-counting metrics carry item_label: {map:?}");
     }
 
+    #[test]
+    fn collect_metric_to_distinct_keys_reads_workload_cardinality_hint() {
+        // Mirrors collect_metric_to_item_label: only metrics that DECLARE a
+        // `distinct_keys_per_window` surface in the map; entries that omit the
+        // hint are skipped so the emit stays byte-identical to the PR #358
+        // scope-based default for them.
+        let yaml = r#"
+- metric_name: distinct_users_high
+  query_string: "count(distinct_users_high)"
+  grouping_labels: [zone]
+  sketch_family_override: HLL
+  distinct_keys_per_window: 1000000
+- metric_name: distinct_users_low
+  query_string: "count(distinct_users_low)"
+  grouping_labels: [zone]
+  sketch_family_override: HLL
+  distinct_keys_per_window: 50
+- metric_name: distinct_users_unset
+  query_string: "count(distinct_users_unset)"
+  grouping_labels: [zone]
+  sketch_family_override: HLL
+"#;
+        let entries: Vec<crate::workload::WorkloadEntry> =
+            serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let registry = crate::workload::WorkloadRegistry::from_entries(entries);
+        let store = WorkloadStore::new();
+        populate_store_from_registry(&registry, &store);
+
+        let map = collect_metric_to_distinct_keys(&registry, &store);
+
+        assert_eq!(map.get("distinct_users_high").copied(), Some(1_000_000));
+        assert_eq!(map.get("distinct_users_low").copied(), Some(50));
+        // The metric that omits the hint is absent (skipped, not zero-filled).
+        assert!(!map.contains_key("distinct_users_unset"));
+        assert_eq!(
+            map.len(),
+            2,
+            "only metrics declaring distinct_keys_per_window surface: {map:?}"
+        );
+    }
+
     /// ASAPCollector#400 — SET semantics at the resolution layer: a
     /// single metric queried by THREE distinct capabilities
     /// (quantile → DDSketch, cardinality → HLL, frequency → CMS) must
@@ -1174,6 +1265,7 @@ mod runtime_tests {
             cold_ship_endpoint: None,
             cold_external_labels: Vec::new(),
             metric_to_sample_p: std::collections::HashMap::new(),
+            metric_to_distinct_keys: std::collections::HashMap::new(),
             metric_to_item_label: std::collections::HashMap::new(),
             cold_format: crate::physical::colored_dag::emitter::ColdFormat::default(),
             cold_coldpart_endpoint: None,
