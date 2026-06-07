@@ -798,6 +798,40 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                         backend = StorageBackend::GorillaObjectStore;
                     }
 
+                    // ── Archive override for sum_over_time over a counter ──
+                    // `sum_over_time(metric[r])` and instant `sum by (..)
+                    // (metric)` BOTH classify as `QueryShape::Sum`, but only
+                    // the range form is the counter-delta case the warm tier
+                    // cannot serve: the ExactAgg(Sum) sids store per-window
+                    // counter *deltas*, and `sum_over_time` wants the
+                    // Σ-of-cumulative-*samples*, which is not reconstructable
+                    // from deltas (issue #301; the engine returns a
+                    // CapabilityMiss for this exact shape). Because the
+                    // `SketchStore` axis dispatches the ASAP engine *directly*
+                    // (`process_via_simple_engine`, no router), that miss never
+                    // reaches the archive failover the `EngineRouter` performs —
+                    // so the caller got `data_source: asap_query` "No result"
+                    // instead of an exact answer from raw data. Push only the
+                    // `sum_over_time` form to the archive so it dispatches
+                    // through `process_via_router` ([SketchStore,
+                    // GorillaObjectStore] → Thanos). Instant `sum by (..)` is
+                    // left on `SketchStore` (it is served warm).
+                    if matches!(backend, StorageBackend::SketchStore)
+                        && matches!(shape, crate::storage_engines::types::QueryShape::Sum)
+                        && query_is_sum_over_time(&expr)
+                        && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
+                    {
+                        debug!(
+                            "resolve_metric_storage: overriding SketchStore → \
+                             GorillaObjectStore for metric={} (sum_over_time over \
+                             counter deltas; warm ExactAgg(Sum) cannot reconstruct \
+                             Σ-of-cumulative-samples — issue #301 — routing to \
+                             archive for an exact answer)",
+                            metric_name,
+                        );
+                        backend = StorageBackend::GorillaObjectStore;
+                    }
+
                     debug!(
                         "resolve_metric_storage: routing-table hit for tenant={} metric={} shape={:?} → {:?}",
                         tenant, metric_name, shape, backend,
@@ -822,6 +856,28 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
         .as_ref()
         .map(|h| h.snapshot().storage_backend())
         .unwrap_or_default()
+}
+
+/// True when the query's effective shape is a `sum_over_time(...)` range
+/// aggregation, as opposed to an instant `sum by (...)`. Both classify as
+/// [`QueryShape::Sum`], so [`resolve_metric_storage`] disambiguates on the
+/// AST: only the range form is the counter-delta case the warm
+/// ExactAgg(Sum) tier cannot reconstruct (issue #301), so only it is
+/// re-routed to the archive. Walks through the wrapping aggregate / paren /
+/// unary / binary / subquery nodes and matches a `sum_over_time` call.
+fn query_is_sum_over_time(expr: &promql_parser::parser::Expr) -> bool {
+    use promql_parser::parser::Expr;
+    match expr {
+        Expr::Call(call) => call.func.name.eq_ignore_ascii_case("sum_over_time"),
+        Expr::Aggregate(agg) => query_is_sum_over_time(&agg.expr),
+        Expr::Paren(p) => query_is_sum_over_time(&p.expr),
+        Expr::Unary(u) => query_is_sum_over_time(&u.expr),
+        Expr::Binary(bin) => {
+            query_is_sum_over_time(&bin.lhs) || query_is_sum_over_time(&bin.rhs)
+        }
+        Expr::Subquery(sq) => query_is_sum_over_time(&sq.expr),
+        _ => false,
+    }
 }
 
 /// True when the sketch index carries at least one ExactAgg(Sum-family)
