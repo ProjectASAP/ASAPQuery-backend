@@ -101,8 +101,16 @@ func NewCompactor(opts CompactorOptions) (*Compactor, error) {
 	}, nil
 }
 
-// Run drives CompactOnce on a ticker until ctx is cancelled.
+// Run drives CompactOnce on a ticker until ctx is cancelled. It runs ONE pass
+// immediately on startup (before the first tick) so a backlog of pending blocks
+// reopened from a previous run is collapsed right away instead of lingering —
+// and inflating memory + cold-query cost — for a full interval. This makes the
+// merger restart-robust: without it, a process that restarts more often than
+// `interval` never compacts, so per-window blocks accumulate unbounded.
 func (c *Compactor) Run(ctx context.Context) error {
+	if err := c.CompactOnce(ctx); err != nil {
+		c.logger.Warn("startup compaction pass failed", "err", err)
+	}
 	t := time.NewTicker(c.interval)
 	defer t.Stop()
 	for {

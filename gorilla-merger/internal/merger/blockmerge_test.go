@@ -162,6 +162,55 @@ func TestBlockBuildIndexQueryable(t *testing.T) {
 // single-sample blocks for one series are compacted into a single block whose
 // chunks are re-chunked toward Prometheus's ~120 samples/chunk target (so the
 // many tiny chunks collapse into far fewer, larger chunks).
+// TestCompactorRunCompactsBacklogOnStartup verifies Run() compacts an existing
+// pending backlog immediately on startup, before the (here: 1h) interval fires —
+// the restart-robustness fix so a merger that restarts more often than its
+// compaction interval can't accumulate per-window blocks unbounded.
+func TestCompactorRunCompactsBacklogOnStartup(t *testing.T) {
+	const windowMs = int64(1000)
+	st, pendingDir, shippedDir := fixedWindowStorage(t, windowMs, 0)
+	const maxSpanMs = int64(1) << 40
+	base := (int64(1_700_000_000_000) / maxSpanMs) * maxSpanMs
+	for i := 0; i < 8; i++ {
+		ts := base + int64(i)*windowMs
+		frag := makeFragment(t, "m", map[string]string{"s": "x"}, "ag", []sample{{ts, float64(i)}})
+		if _, err := st.Manager.Append(gorilla.EncodeFragmentBatch([]gorilla.Fragment{frag})); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if _, err := st.Manager.FlushAll(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if len(ulidDirs(t, pendingDir)) == 0 {
+		t.Fatal("expected a pending backlog before Run")
+	}
+
+	// Hour-long interval: the only compaction that can fire within the test
+	// window is the startup pass.
+	comp, err := NewCompactor(CompactorOptions{
+		Store:     st.BlockStore(),
+		Interval:  time.Hour,
+		MinBlocks: 1,
+		MaxSpanMs: maxSpanMs,
+	})
+	if err != nil {
+		t.Fatalf("new compactor: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = comp.Run(ctx) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(ulidDirs(t, pendingDir)) == 0 && len(ulidDirs(t, shippedDir)) >= 1 {
+			return // startup pass drained the backlog into shipped
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("startup compaction did not drain backlog: pending=%d shipped=%d",
+		len(ulidDirs(t, pendingDir)), len(ulidDirs(t, shippedDir)))
+}
+
 func TestCompactionMergesAndRechunks(t *testing.T) {
 	// Small window + zero grace so each batch closes into its own block.
 	const windowMs = int64(1000)
