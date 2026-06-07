@@ -244,9 +244,18 @@ func (m *Manager) FlushAll() (int, error) {
 // flushWindow takes the buffered series for one window and builds a block.
 // Returns ok=false (no error) when the window had nothing to write.
 func (m *Manager) flushWindow(wStart int64) (bool, error) {
-	series := m.buf.take(wStart)
+	series, stats := m.buf.take(wStart)
 	if len(series) == 0 {
 		return false, nil
+	}
+	if stats.mergedSeries > 0 {
+		m.logger.Info("merged overlapping chunks losslessly before block build",
+			"window_start", wStart, "merged_series", stats.mergedSeries,
+			"merged_samples", stats.mergedSamples, "series", len(series))
+	}
+	if stats.droppedChunks > 0 {
+		m.logger.Warn("dropped overlapping chunks (lossless merge failed)",
+			"window_start", wStart, "dropped_chunks", stats.droppedChunks, "series", len(series))
 	}
 	// Per-window L1 blocks land in the pending dir: served immediately by the
 	// BlockStore (so recent data is queryable fast) but NOT shipped — the
