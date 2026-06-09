@@ -1,8 +1,8 @@
+use crate::precompute_engine::operators::IncreaseAccumulator;
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink, SingleSubpopulationAggregate,
 };
-use crate::precompute_engine::operators::IncreaseAccumulator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

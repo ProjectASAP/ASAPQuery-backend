@@ -34,9 +34,9 @@
 pub mod capability;
 pub mod capability_matching;
 pub mod lower;
+pub mod physical_expr;
 pub mod rules;
 pub mod schema;
-pub mod physical_expr;
 pub mod sketch_params;
 
 // Back-compat alias. External call sites that imported
@@ -57,8 +57,8 @@ pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
 pub use lower::{bind_query_expr, BindingError};
+pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
+pub use schema::{SketchStateMetadata, SketchStateSchema};
 pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
-pub use schema::{SketchStateMetadata, SketchStateSchema};
-pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};

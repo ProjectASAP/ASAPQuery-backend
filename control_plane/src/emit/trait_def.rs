@@ -72,7 +72,9 @@ impl PlanEmitter for OpampEmitter {
     type Input = EdgeStageConfig;
     type Output = String;
 
-    fn name(&self) -> &'static str { "opamp_edge_yaml" }
+    fn name(&self) -> &'static str {
+        "opamp_edge_yaml"
+    }
 
     fn emit(&self, input: &EdgeStageConfig) -> Result<String> {
         super::stage_config::emit_edge_yaml(input, &self.opamp_endpoint, &self.agent_id)
@@ -95,7 +97,9 @@ impl PlanEmitter for OpampGatewayEmitter {
     type Input = GatewayStageConfig;
     type Output = String;
 
-    fn name(&self) -> &'static str { "opamp_gateway_yaml" }
+    fn name(&self) -> &'static str {
+        "opamp_gateway_yaml"
+    }
 
     fn emit(&self, input: &GatewayStageConfig) -> Result<String> {
         super::stage_config::emit_gateway_yaml(input, &self.opamp_endpoint, &self.agent_id)
@@ -114,10 +118,14 @@ impl PlanEmitter for StreamingConfigEmitter {
     type Input = BackendStageConfig;
     type Output = serde_json::Value;
 
-    fn name(&self) -> &'static str { "streaming_config_json" }
+    fn name(&self) -> &'static str {
+        "streaming_config_json"
+    }
 
     fn emit(&self, input: &BackendStageConfig) -> Result<serde_json::Value> {
-        super::stage_config::emit_backend_streaming_config_json(input)
+        // The PlanEmitter trait input carries no monitor specs; the controller's
+        // coupled-push path (post_typed_backend_for_role) injects them instead.
+        super::stage_config::emit_backend_streaming_config_json(input, &[])
     }
 }
 
@@ -156,7 +164,9 @@ impl PlanEmitter for InferenceConfigEmitter {
     type Input = InferenceConfigInput<'static>;
     type Output = serde_json::Value;
 
-    fn name(&self) -> &'static str { "inference_config_json" }
+    fn name(&self) -> &'static str {
+        "inference_config_json"
+    }
 
     /// Note: the `Input` lifetime is `'static` only on the trait surface
     /// — callers construct the `InferenceConfigInput` with borrowed
@@ -174,10 +184,7 @@ impl InferenceConfigEmitter {
     /// Borrowing-friendly variant of [`PlanEmitter::emit`] — accepts an
     /// `InferenceConfigInput` of any lifetime. Used by `replan` /
     /// `main` which build the input from per-call cache scans.
-    pub fn emit_borrowed<'a>(
-        &self,
-        input: &InferenceConfigInput<'a>,
-    ) -> Result<serde_json::Value> {
+    pub fn emit_borrowed<'a>(&self, input: &InferenceConfigInput<'a>) -> Result<serde_json::Value> {
         super::stage_config::emit_backend_storage_routing_with_prometheus_for_tenant(
             &input.tenant,
             &input.metric_plans,
@@ -235,7 +242,7 @@ mod tests {
     fn empty_backend_cfg() -> BackendStageConfig {
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".to_string(),
                 metric_name: "test_metric".to_string(),
                 sketch_kind: SketchKind::DDSketch,
@@ -300,7 +307,7 @@ mod tests {
         let cfg = empty_backend_cfg();
         let emitter = StreamingConfigEmitter::default();
         let trait_out = emitter.emit(&cfg).expect("trait emit");
-        let direct = super::super::stage_config::emit_backend_streaming_config_json(&cfg)
+        let direct = super::super::stage_config::emit_backend_streaming_config_json(&cfg, &[])
             .expect("direct emit");
         assert_eq!(trait_out, direct);
         assert_eq!(emitter.name(), "streaming_config_json");

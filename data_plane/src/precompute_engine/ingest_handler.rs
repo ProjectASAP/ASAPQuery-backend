@@ -1,6 +1,6 @@
-use crate::storage_engines::types::HotReloadStreamingConfig;
 use crate::precompute_engine::series_router::SeriesRouter;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
+use crate::storage_engines::types::HotReloadStreamingConfig;
 use asap_types::aggregation_config::AggregationConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -214,12 +214,8 @@ impl IngestState {
             match self
                 .observability
                 .snapshot_newest_window_start
-                .compare_exchange_weak(
-                    newest,
-                    window_start,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                .compare_exchange_weak(newest, window_start, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => {
                     newest = window_start;
                     break;
@@ -270,7 +266,12 @@ impl IngestState {
     ) -> String {
         let mut values = Vec::with_capacity(config.grouping_labels.labels.len());
         for label_name in &config.grouping_labels.labels {
-            values.push(labels.get(label_name.as_str()).map(|s| s.as_str()).unwrap_or(""));
+            values.push(
+                labels
+                    .get(label_name.as_str())
+                    .map(|s| s.as_str())
+                    .unwrap_or(""),
+            );
         }
         values.join(";")
     }
@@ -294,8 +295,8 @@ fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::StreamingConfig;
     use crate::precompute_engine::series_router::SeriesRouter;
+    use crate::storage_engines::types::StreamingConfig;
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
@@ -338,7 +339,8 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(agg_id, make_config(agg_id, metric));
         let streaming = StreamingConfig::new(map);
-        let hot_reload = crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
+        let hot_reload =
+            crate::storage_engines::types::HotReloadStreamingConfig::new(streaming.clone());
 
         let state = Arc::new(IngestState {
             router,

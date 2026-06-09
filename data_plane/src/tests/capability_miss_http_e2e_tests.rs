@@ -36,13 +36,12 @@
 //! down is the HTTP-boundary behaviour of the feedback loop
 //! (plan-arrival + idempotency on repeat query).
 
-#[cfg(test)]
-use crate::storage_engines::types::{
-    HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
-use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::control_plane_client::{ControlPlaneClient, HttpControlPlaneClient};
+use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
+#[cfg(test)]
+use crate::storage_engines::types::{HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -66,7 +65,8 @@ struct MockControlPlaneState {
     pushed_plan_ts: Arc<Mutex<Option<Instant>>>,
     backend_config_url: Arc<Mutex<Option<String>>>,
     plan_yaml: Arc<String>,
-    http: Client}
+    http: Client,
+}
 
 /// Hand-authored StreamingConfig the mock control plane pushes when
 /// it receives the miss. Shape matches the backend's
@@ -99,8 +99,8 @@ fn canned_plan_yaml(_agg_id: u64, metric: &str) -> String {
 fn expected_fp_for(metric: &str) -> u64 {
     let yaml = canned_plan_yaml(0, metric);
     let data: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml parses");
-    let sc = asap_types::streaming_config::StreamingConfig::from_yaml_data(&data)
-        .expect("yaml decodes");
+    let sc =
+        asap_types::streaming_config::StreamingConfig::from_yaml_data(&data).expect("yaml decodes");
     *sc.aggregation_configs
         .keys()
         .next()
@@ -138,7 +138,10 @@ async fn mock_control_plane_plan_handler(
             axum::http::StatusCode::OK
         }
         Ok(r) => {
-            eprintln!("mock control plane: backend rejected config: {}", r.status());
+            eprintln!(
+                "mock control plane: backend rejected config: {}",
+                r.status()
+            );
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         }
         Err(e) => {
@@ -164,13 +167,9 @@ async fn start_mock_control_plane(state: MockControlPlaneState) -> u16 {
 async fn start_backend(control_plane_url: String, hot_reload: HotReloadStreamingConfig) -> u16 {
     let _streaming_config = hot_reload.snapshot();
     let engine = Arc::new(
-        ASAPQueryEngine::new_with_hot_reload(
-            hot_reload.clone(),
-            15_000,
-        )
-        .with_control_plane_client(
-            Arc::new(HttpControlPlaneClient::new(control_plane_url)) as Arc<dyn ControlPlaneClient>
-        ),
+        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
+            .with_control_plane_client(Arc::new(HttpControlPlaneClient::new(control_plane_url))
+                as Arc<dyn ControlPlaneClient>),
     );
 
     // No fallback — we want engine-miss to be visible to the
@@ -183,7 +182,8 @@ async fn start_backend(control_plane_url: String, hot_reload: HotReloadStreaming
     let config = HttpServerConfig {
         port: 0,
         handle_http_requests: true,
-        adapter_config};
+        adapter_config,
+    };
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let server = HttpServer::new(config, engine, idx).with_hot_reload_config(hot_reload.clone());
     server
@@ -234,7 +234,8 @@ async fn spin_up_loop(
         pushed_plan_ts: Arc::new(Mutex::new(None)),
         backend_config_url: Arc::new(Mutex::new(None)),
         plan_yaml: Arc::new(canned_plan_yaml(expected_agg_id, metric)),
-        http: Client::new()};
+        http: Client::new(),
+    };
 
     // 1. control plane up (no backend URL yet)
     let control_plane_port = start_mock_control_plane(control_plane_state.clone()).await;
@@ -259,7 +260,8 @@ async fn http_capability_miss_feedback_loop_closes_over_http() {
     // canned plan's content; derive it here so the assertions match.
     let expected_agg_id: u64 = expected_fp_for(metric);
 
-    let (backend_url, control_plane_state, _hot_reload) = spin_up_loop(metric, expected_agg_id).await;
+    let (backend_url, control_plane_state, _hot_reload) =
+        spin_up_loop(metric, expected_agg_id).await;
     let client = Client::new();
 
     // 1. Fire the capability-miss query.
@@ -338,7 +340,8 @@ async fn http_capability_miss_repeat_query_is_idempotent_over_http() {
     let metric = "http_e2e_repeat_metric";
     let expected_agg_id: u64 = 4343;
 
-    let (backend_url, control_plane_state, _hot_reload) = spin_up_loop(metric, expected_agg_id).await;
+    let (backend_url, control_plane_state, _hot_reload) =
+        spin_up_loop(metric, expected_agg_id).await;
     let client = Client::new();
 
     // 1. First query — miss, triggers the loop.

@@ -171,8 +171,7 @@ pub fn decode_cs_from_proto(buffer: &[u8]) -> Result<CountSketch, String> {
 
 /// Decode a `CountSketch` from msgpack bytes (sketch-core wire format).
 pub fn decode_cs_from_msgpack(buffer: &[u8]) -> Result<CountSketch, String> {
-    CountSketch::from_msgpack(buffer)
-        .map_err(|e| format!("deserialize CountSketch msgpack: {e}"))
+    CountSketch::from_msgpack(buffer).map_err(|e| format!("deserialize CountSketch msgpack: {e}"))
 }
 
 /// Decode a `CountMinSketchWithHeap` from msgpack bytes — the OTLP

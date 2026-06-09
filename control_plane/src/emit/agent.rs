@@ -145,7 +145,10 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
             let clamped = super::stage_config::clamp_window_secs(Some(wd.as_secs()))
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(wd);
-            m.insert("window_duration".into(), Value::String(format_duration(clamped)));
+            m.insert(
+                "window_duration".into(),
+                Value::String(format_duration(clamped)),
+            );
         }
     }
 
@@ -284,7 +287,8 @@ mod tests {
 
     #[test]
     fn contains_processor_key() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("ddsketch:"),
             "YAML should contain 'ddsketch:'\n{yaml}"
@@ -297,7 +301,8 @@ mod tests {
 
     #[test]
     fn contains_opamp_extension() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("opamp"),
             "YAML should include the opamp extension\n{yaml}"
@@ -310,7 +315,8 @@ mod tests {
 
     #[test]
     fn contains_window_duration() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         // MVP blocker B4: the fixture's 5m window clamps to 60s
         // (`MAX_WINDOW_SECS`). Assert on the clamped form — a window
         // larger than 60s would put the sketch close outside any
@@ -372,7 +378,8 @@ mod tests {
 
     #[test]
     fn contains_aggregate_by() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("host.name"),
             "YAML should contain aggregate_by labels\n{yaml}"
@@ -445,7 +452,8 @@ mod tests {
 
     #[test]
     fn contains_otlp_receiver() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("receivers:"),
             "YAML should have receivers section\n{yaml}"
@@ -460,7 +468,8 @@ mod tests {
 
     #[test]
     fn contains_prometheus_exporter() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         assert!(
             yaml.contains("exporters:"),
             "YAML should have exporters section\n{yaml}"
@@ -477,7 +486,8 @@ mod tests {
 
     #[test]
     fn pipeline_has_receivers_and_exporters() {
-        let yaml = generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
+        let yaml =
+            generate_agent_collector_config(&ddsketch_cfg(), "ws://ctrl:4320/v1/opamp").unwrap();
         // Ensure the pipeline block references both receiver and exporter keys.
         assert!(
             yaml.contains("- otlp"),

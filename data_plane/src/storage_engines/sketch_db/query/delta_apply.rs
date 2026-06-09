@@ -420,16 +420,14 @@ mod tests {
         // Varint-pack (index_delta, value), ascending index order.
         let mut packed: Vec<u8> = Vec::new();
         let mut prev: u64 = 0;
-        let mut put_uvarint = |buf: &mut Vec<u8>, mut v: u64| {
-            loop {
-                let b = (v & 0x7f) as u8;
-                v >>= 7;
-                if v != 0 {
-                    buf.push(b | 0x80);
-                } else {
-                    buf.push(b);
-                    break;
-                }
+        let mut put_uvarint = |buf: &mut Vec<u8>, mut v: u64| loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                buf.push(b | 0x80);
+            } else {
+                buf.push(b);
+                break;
             }
         };
         let mut sorted = nonzero.to_vec();

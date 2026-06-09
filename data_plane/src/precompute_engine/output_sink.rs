@@ -113,11 +113,7 @@ impl SketchStoreSink {
     /// emitted with the `PolicyFingerprint::UNSET` sentinel (e.g.
     /// raw-mode fast-path that has no source config) are skipped
     /// rather than routed by a parallel id.
-    fn append_to_index(
-        &self,
-        output: &PrecomputedOutput,
-        accumulator: &dyn AggregateCore,
-    ) -> bool {
+    fn append_to_index(&self, output: &PrecomputedOutput, accumulator: &dyn AggregateCore) -> bool {
         if output.policy_fp.is_unset() {
             warn!(
                 "SketchStoreSink: PrecomputedOutput carries PolicyFingerprint::UNSET; \
@@ -297,7 +293,8 @@ mod tests {
         );
 
         let key = KeyByLabelValues::new_with_labels(vec!["z0".to_string()]);
-        let output = PrecomputedOutput::new(1000, 2000, Some(key), asap_types::PolicyFingerprint(agg_id));
+        let output =
+            PrecomputedOutput::new(1000, 2000, Some(key), asap_types::PolicyFingerprint(agg_id));
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(42.0));
 
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
@@ -328,9 +325,9 @@ mod tests {
         // them. Previously this field was unconditionally `None`.
         assert_eq!(
             meta.capability,
-            Some(crate::storage_engines::sketch_db::data::Capability::ExactAgg(
-                AggregationType::Sum
-            )),
+            Some(
+                crate::storage_engines::sketch_db::data::Capability::ExactAgg(AggregationType::Sum)
+            ),
             "ExactAgg sids carry an ExactAgg capability"
         );
     }
@@ -375,9 +372,14 @@ mod tests {
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
         sink.emit_batch(vec![(output, acc)]).expect("emit ok");
 
-        assert_eq!(sketch_index.instance_count(), 0, "no write on registry miss");
         assert_eq!(
-            obs.dropped_policy_miss.load(std::sync::atomic::Ordering::Relaxed),
+            sketch_index.instance_count(),
+            0,
+            "no write on registry miss"
+        );
+        assert_eq!(
+            obs.dropped_policy_miss
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "policy-miss drop counted on the wired observability handle"
         );
@@ -388,7 +390,8 @@ mod tests {
         let acc2: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
         sink.emit_batch(vec![(unset, acc2)]).expect("emit ok");
         assert_eq!(
-            obs.dropped_policy_miss.load(std::sync::atomic::Ordering::Relaxed),
+            obs.dropped_policy_miss
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "UNSET skip is not a policy miss"
         );

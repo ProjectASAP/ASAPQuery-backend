@@ -29,8 +29,8 @@ use tracing::info;
 
 use asap_types::StorageBackend;
 
-use crate::query_engines::{EngineError, QueryResult};
 use crate::query_engines::routing::{EngineCapabilities, QueryEngine};
+use crate::query_engines::{EngineError, QueryResult};
 
 /// Stable engine id for the no-data fallback. Reported in
 /// `data_source_id` on the wire response for cold queries when the

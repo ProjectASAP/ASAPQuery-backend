@@ -193,9 +193,7 @@ impl<P> MutableEpoch<P> {
     /// order. Used by the persistence layer's memory accounting so the
     /// un-sealed hot epoch's footprint is visible (mirrors
     /// [`SealedEpoch::entries`]).
-    pub fn iter_entries(
-        &self,
-    ) -> impl Iterator<Item = (TimestampRange, LabelValuesId, &P)> {
+    pub fn iter_entries(&self) -> impl Iterator<Item = (TimestampRange, LabelValuesId, &P)> {
         self.windows_col
             .iter()
             .zip(self.label_ids_col.iter())
@@ -541,10 +539,7 @@ impl<P: Clone> MutableEpoch<P> {
     /// Exact-window query returning OWNED payload clones — for callers
     /// that need to hand the payload out across a lock boundary.
     /// `None` when the window has no entries.
-    pub fn exact_query_owned(
-        &mut self,
-        target: TimestampRange,
-    ) -> Option<Vec<(LabelValuesId, P)>> {
+    pub fn exact_query_owned(&mut self, target: TimestampRange) -> Option<Vec<(LabelValuesId, P)>> {
         let r = self.exact_query(target);
         if r.is_empty() {
             None
@@ -741,8 +736,7 @@ impl<P> SealedEpoch<P> {
     /// Sorted-deduplicated windows. Used by the legacy SketchStore to
     /// surface the windows that were dropped on epoch eviction.
     pub fn unique_windows(&self) -> Vec<TimestampRange> {
-        let mut windows: Vec<TimestampRange> =
-            self.entries.iter().map(|(w, _, _)| *w).collect();
+        let mut windows: Vec<TimestampRange> = self.entries.iter().map(|(w, _, _)| *w).collect();
         windows.dedup();
         windows
     }
@@ -786,10 +780,7 @@ impl<P: Clone> SealedEpoch<P> {
     /// Exact-window query returning OWNED clones — used by callers
     /// that need to release the lock before reading the payloads.
     /// `None` when no entry matches.
-    pub fn exact_query_owned(
-        &self,
-        target: TimestampRange,
-    ) -> Option<Vec<(LabelValuesId, P)>> {
+    pub fn exact_query_owned(&self, target: TimestampRange) -> Option<Vec<(LabelValuesId, P)>> {
         let r = self.exact_query(target);
         if r.is_empty() {
             None
@@ -874,15 +865,13 @@ pub const DEFAULT_SKETCH_RETENTION_MS: u64 = 2 * 60 * 60 * 1000;
 pub fn default_retention_horizon_ms() -> Option<u64> {
     use std::sync::OnceLock;
     static HORIZON: OnceLock<Option<u64>> = OnceLock::new();
-    *HORIZON.get_or_init(|| {
-        match std::env::var("ASAP_SKETCH_RETENTION_MS") {
-            Ok(v) => match v.trim().parse::<u64>() {
-                Ok(0) => None,
-                Ok(ms) => Some(ms),
-                Err(_) => Some(DEFAULT_SKETCH_RETENTION_MS),
-            },
+    *HORIZON.get_or_init(|| match std::env::var("ASAP_SKETCH_RETENTION_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(ms),
             Err(_) => Some(DEFAULT_SKETCH_RETENTION_MS),
-        }
+        },
+        Err(_) => Some(DEFAULT_SKETCH_RETENTION_MS),
     })
 }
 
@@ -1319,7 +1308,7 @@ mod tests {
         let mut s = SidStoreData::<String, u32>::new();
         s.persistence_enabled = true;
         s.retention_horizon_ms = Some(60 * 60 * 1000); // 1h — would normally drop
-        // No seal cadence: everything stays in current_epoch.
+                                                       // No seal cadence: everything stays in current_epoch.
         let window_ms = 30_000u64;
         let mut start = 0u64;
         for i in 0..480u32 {

@@ -54,7 +54,9 @@ pub struct ASAPQueryEngine {
     /// When `None` (no archive engine wired), the engine returns the
     /// warm answer as-is; the existing `EngineRouter` failover handles
     /// the rest of the routing matrix.
-    archive_engine: Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>}
+    archive_engine:
+        Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
+}
 
 /// Lifted shape of a `topk(K, sum by (gbk) (rate(metric[r])))` (or
 /// `bottomk` / `irate`) query. Produced by
@@ -82,11 +84,9 @@ impl ASAPQueryEngine {
     /// `/api/v1/streaming-config` is visible to both. The `_static`
     /// variant stays as the simple entry point for tests, binaries,
     /// and legacy callers that don't own a `HotReloadStreamingConfig`.
-    pub fn new(
-        streaming_config: Arc<StreamingConfig>,
-        prometheus_scrape_interval: u64,
-    ) -> Self {
-        let hot_reload = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config);
+    pub fn new(streaming_config: Arc<StreamingConfig>, prometheus_scrape_interval: u64) -> Self {
+        let hot_reload =
+            crate::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config);
         Self::new_with_hot_reload(hot_reload, prometheus_scrape_interval)
     }
 
@@ -103,7 +103,8 @@ impl ASAPQueryEngine {
             prometheus_scrape_interval,
             control_plane_client: None,
             sketch_index: None,
-            archive_engine: None}
+            archive_engine: None,
+        }
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
@@ -276,9 +277,7 @@ impl ASAPQueryEngine {
     /// `ExactAgg(Sum)` candidate uses the inner `metric` +
     /// `group_by_keys` for `instances_matching` and the inner range
     /// for the rate divisor.
-    fn extract_topk_over_rate_shape(
-        query: &str,
-    ) -> Option<TopkOverRateShape> {
+    fn extract_topk_over_rate_shape(query: &str) -> Option<TopkOverRateShape> {
         use promql_parser::parser::{Expr, LabelModifier};
         let ast = promql_parser::parser::parse(query).ok()?;
         // Strip a leading Paren so `(topk(...))` works.
@@ -470,8 +469,8 @@ impl ASAPQueryEngine {
         // All hits share the same family by construction (Sum / Increase
         // variants are accumulator-compatible via `merge_with` /
         // `Statistic::Sum`); use the first matching sid's agg_type.
-        let agg_type = first_agg_type
-            .unwrap_or(crate::storage_engines::sketch_db::data::AggregationType::Sum);
+        let agg_type =
+            first_agg_type.unwrap_or(crate::storage_engines::sketch_db::data::AggregationType::Sum);
 
         let lookback_ms = shape.range_seconds.saturating_mul(1000);
         let t0_ms = now_ms.saturating_sub(lookback_ms);
@@ -513,13 +512,11 @@ impl ASAPQueryEngine {
             .collect();
         // Sort: topk = descending by value, bottomk = ascending.
         if shape.is_topk {
-            series_with_value.sort_by(|a, b| {
-                b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            series_with_value
+                .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         } else {
-            series_with_value.sort_by(|a, b| {
-                a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            series_with_value
+                .sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         }
         series_with_value.truncate(shape.k);
         let sliced: Vec<(std::collections::BTreeMap<String, String>, Vec<(i64, f64)>)> =
@@ -660,10 +657,8 @@ impl ASAPQueryEngine {
         start_ms: u64,
         end_ms: u64,
         _step_ms: u64,
-    ) -> Result<
-        crate::query_engines::query_result::QueryResult,
-        crate::query_engines::EngineError,
-    > {
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
         let Some(idx) = self.sketch_index.as_ref() else {
             return Err(crate::query_engines::EngineError::capability_miss(
                 asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -671,8 +666,7 @@ impl ASAPQueryEngine {
             ));
         };
 
-        let analysis =
-            control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
+        let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
 
         if let Some(reason) = &analysis.unsupported {
             return Err(crate::query_engines::EngineError::capability_miss(
@@ -696,9 +690,8 @@ impl ASAPQueryEngine {
         let streaming_snap = self.streaming_config_snapshot();
         let policy_registry = streaming_snap.policy_registry();
         let reducer = crate::storage_engines::sketch_db::query::SketchReducer::new(idx);
-        let mut combined_result: Option<
-            crate::storage_engines::sketch_db::query::ASAPTierResult,
-        > = None;
+        let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
+            None;
 
         for candidate in &analysis.candidates {
             // Resolve candidate → {sids} via the sid catalog. Schema-
@@ -724,15 +717,11 @@ impl ASAPQueryEngine {
                 &policy_registry,
                 candidate,
             );
-            let mut sids: std::collections::BTreeSet<u64> =
-                std::collections::BTreeSet::new();
+            let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
             for fp in &policy_fps {
                 sids.extend(idx.sids_for_policy(*fp));
             }
-            sids.extend(idx.instances_matching(
-                &candidate.metric_name,
-                &candidate.group_by_keys,
-            ));
+            sids.extend(idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys));
             if sids.is_empty() {
                 return Err(crate::query_engines::EngineError::capability_miss(
                     asap_types::StorageBackend::SketchStore.data_source_id(),
@@ -888,8 +877,7 @@ impl ASAPQueryEngine {
             // the range-query path too (issue #296) — same identity
             // case + fold semantics as the instant-query trait
             // adapter above.
-            let result = if candidate.outer_agg.is_some()
-                && !outer_fold_already_consumed(candidate)
+            let result = if candidate.outer_agg.is_some() && !outer_fold_already_consumed(candidate)
             {
                 apply_outer_agg_fold(result, &candidate.outer_agg)
             } else {
@@ -908,7 +896,6 @@ impl ASAPQueryEngine {
         // Matrix shape — the range_query wire format requires it.
         Ok(asap_tier_result_to_query_result(result, end_ms, true))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,7 +1002,10 @@ fn effective_is_cumulative(
 /// when `label` is absent. Exact label match (not substring), so
 /// `service` does not match `myservice`.
 fn extract_filter_value(canonical: &str, label: &str) -> Option<String> {
-    let inner = canonical.trim().trim_start_matches('{').trim_end_matches('}');
+    let inner = canonical
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}');
     for part in inner.split(',') {
         if let Some((k, v)) = part.trim().split_once('=') {
             if k.trim() == label {
@@ -1059,10 +1049,7 @@ fn apply_outer_agg_fold(
     let by_labels: &[String] = outer.by_labels();
 
     // group key (projected label map) → per-timestamp value buckets.
-    let mut groups: BTreeMap<
-        BTreeMap<String, String>,
-        BTreeMap<i64, Vec<f64>>,
-    > = BTreeMap::new();
+    let mut groups: BTreeMap<BTreeMap<String, String>, BTreeMap<i64, Vec<f64>>> = BTreeMap::new();
 
     for (row_labels, samples) in inner.series {
         // Project the row's label map onto the by-set. When by_labels
@@ -1129,10 +1116,12 @@ fn stitch_warm_and_archive(
 
     let warm_matrix = match &warm {
         QueryResult::Matrix(m) => m.values.clone(),
-        _ => return archive};
+        _ => return archive,
+    };
     let archive_matrix = match &archive {
         QueryResult::Matrix(m) => m.values.clone(),
-        QueryResult::Vector(_) => return warm};
+        QueryResult::Vector(_) => return warm,
+    };
 
     // Index warm series by labels for fast lookup.
     let mut by_labels: BTreeMap<Vec<String>, RangeVectorElement> = BTreeMap::new();
@@ -1177,10 +1166,10 @@ fn asap_tier_result_to_query_result(
     now_ms: u64,
     is_range_query: bool,
 ) -> crate::query_engines::query_result::QueryResult {
-    use crate::storage_engines::types::KeyByLabelValues;
     use crate::query_engines::query_result::{
         InstantVectorElement, QueryResult, RangeVectorElement,
     };
+    use crate::storage_engines::types::KeyByLabelValues;
 
     // Instant-query result-shape: the Prometheus adapter's
     // `format_success_response` rejects `Matrix` for queries the
@@ -1203,10 +1192,8 @@ fn asap_tier_result_to_query_result(
             // Take the latest sample (the reducer returns one per
             // window_end; for instant readout we want the most recent).
             if let Some((_, value)) = samples.into_iter().last() {
-                elements.push(
-                    InstantVectorElement::new(labels, value)
-                        .with_label_keys_override(keys),
-                );
+                elements
+                    .push(InstantVectorElement::new(labels, value).with_label_keys_override(keys));
             }
         }
         return QueryResult::vector(elements, now_ms);
@@ -1250,7 +1237,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     async fn execute(
         &self,
         query: &str,
-    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError> {
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
         // Phase 9 controller-unification (2026-05) — the ASAP-tier
         // hook is now a thin driver around the control plane's
         // `analyze_promql_for_asap_tier`. The analyzer is the single
@@ -1354,8 +1342,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // hybrid-stitch path below. (When more than one
             // candidate is supported, a follow-up will fold
             // per-candidate ASAPTierResults.)
-            let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
-                None;
+            let mut combined_result: Option<
+                crate::storage_engines::sketch_db::query::ASAPTierResult,
+            > = None;
             let mut combined_t0: u64 = u64::MAX;
             // Track whether ANY candidate is range-vector-shaped
             // (`range_seconds > 0`). Drives the Vector-vs-Matrix
@@ -1393,15 +1382,13 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     &policy_registry,
                     candidate,
                 );
-                let mut sids: std::collections::BTreeSet<u64> =
-                    std::collections::BTreeSet::new();
+                let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
                 for fp in &policy_fps {
                     sids.extend(idx.sids_for_policy(*fp));
                 }
-                sids.extend(idx.instances_matching(
-                    &candidate.metric_name,
-                    &candidate.group_by_keys,
-                ));
+                sids.extend(
+                    idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys),
+                );
                 if sids.is_empty() {
                     // Fire the capability-miss notify so the
                     // control-plane feedback loop closes — replaces
@@ -1667,8 +1654,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     ));
                 }
 
-                let use_rate_path =
-                    is_exact_sum_family && candidate.outer_fn == OuterFn::Rate;
+                let use_rate_path = is_exact_sum_family && candidate.outer_fn == OuterFn::Rate;
                 // Increase + instant Plain sum both accumulate windows
                 // into one cumulative number per group; they differ only
                 // in the time scope (`[t-r,t]` clip vs full storage).
@@ -1695,40 +1681,41 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     combined_t0 = t0_ms;
                 }
 
-                let reducer_result = match &candidate.required_capability {
-                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
-                        agg_type,
-                    ) if use_rate_path => reducer.evaluate_exact_agg_rate(
-                        &hit_sids,
-                        *agg_type,
-                        &candidate.group_by_keys,
-                        candidate.range_seconds,
-                        t0_ms,
-                        now_ms,
-                    ),
-                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
-                        agg_type,
-                    ) => reducer.evaluate_exact_agg(
-                        &hit_sids,
-                        *agg_type,
-                        &candidate.group_by_keys,
-                        t0_ms,
-                        now_ms,
-                        accumulate_windows,
-                    ),
-                    // P2-4 (typed dispatch): route off the typed
-                    // `required_capability` rather than the
-                    // function-name-string detour.
-                    _ => reducer.evaluate_for_capability(
-                        &candidate.required_capability,
-                        &hit_sids,
-                        &candidate.function_args,
-                        cms_item_key.as_deref(),
-                        effective_is_cumulative(candidate),
-                        t0_ms,
-                        now_ms,
-                    ),
-                };
+                let reducer_result =
+                    match &candidate.required_capability {
+                        crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                            agg_type,
+                        ) if use_rate_path => reducer.evaluate_exact_agg_rate(
+                            &hit_sids,
+                            *agg_type,
+                            &candidate.group_by_keys,
+                            candidate.range_seconds,
+                            t0_ms,
+                            now_ms,
+                        ),
+                        crate::storage_engines::sketch_db::index::Capability::ExactAgg(
+                            agg_type,
+                        ) => reducer.evaluate_exact_agg(
+                            &hit_sids,
+                            *agg_type,
+                            &candidate.group_by_keys,
+                            t0_ms,
+                            now_ms,
+                            accumulate_windows,
+                        ),
+                        // P2-4 (typed dispatch): route off the typed
+                        // `required_capability` rather than the
+                        // function-name-string detour.
+                        _ => reducer.evaluate_for_capability(
+                            &candidate.required_capability,
+                            &hit_sids,
+                            &candidate.function_args,
+                            cms_item_key.as_deref(),
+                            effective_is_cumulative(candidate),
+                            t0_ms,
+                            now_ms,
+                        ),
+                    };
 
                 // P1-1: if the frequency-rate fallback produced a result
                 // (hit_sids was empty for an ExactAgg(Sum)+Rate candidate
@@ -1737,7 +1724,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // empty `hit_sids` and is moot.
                 let result = if let Some(r) = freq_rate_override {
                     r
-                } else { match reducer_result {
+                } else {
+                    match reducer_result {
                     Ok(r) => r,
                     Err(
                         crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedFunction(
@@ -1798,7 +1786,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             ),
                         ));
                     }
-                } };
+                }
+                };
                 // Apply the analyzer's typed outer-aggregation operator
                 // (issue #296). The inner reducer (sketch / accumulator)
                 // emits one row per natural series; if the original
@@ -1813,13 +1802,12 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // a single-value group, returning the same value
                 // unchanged. No special case needed; the general fold
                 // handles it.
-                let result = if candidate.outer_agg.is_some()
-                    && !outer_fold_already_consumed(candidate)
-                {
-                    apply_outer_agg_fold(result, &candidate.outer_agg)
-                } else {
-                    result
-                };
+                let result =
+                    if candidate.outer_agg.is_some() && !outer_fold_already_consumed(candidate) {
+                        apply_outer_agg_fold(result, &candidate.outer_agg)
+                    } else {
+                        result
+                    };
                 combined_result = Some(result);
             }
 
@@ -1843,11 +1831,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // adapter's `format_success_response` rejects with
                 // a 500 ”shape mismatch” / empty-body response.
                 let _ = any_range_candidate;
-                let warm_qr = asap_tier_result_to_query_result(
-                    result.clone(),
-                    now_ms,
-                    false,
-                );
+                let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
                 {
@@ -1887,9 +1871,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         }
         Err(crate::query_engines::EngineError::capability_miss(
             asap_types::StorageBackend::SketchStore.data_source_id(),
-            format!(
-                "ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"
-            ),
+            format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
         ))
     }
 
@@ -1913,13 +1895,16 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             .await
     }
 
-    fn capabilities(&self) -> crate::query_engines::routing::query_engine_routing::EngineCapabilities {
+    fn capabilities(
+        &self,
+    ) -> crate::query_engines::routing::query_engine_routing::EngineCapabilities {
         crate::query_engines::routing::query_engine_routing::EngineCapabilities {
             data_source_id: asap_types::StorageBackend::SketchStore.data_source_id(),
             storage_backend: asap_types::StorageBackend::SketchStore,
             // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
             // for buffered ops (KLL with k=200 is well below this).
-            supports_streams_above_bytes: 16 * 1024 * 1024}
+            supports_streams_above_bytes: 16 * 1024 * 1024,
+        }
     }
 }
 
@@ -2169,8 +2154,8 @@ mod sketch_query_tests {
 mod hot_reload_phase2_tests {
     use super::*;
     use crate::storage_engines::types::{
-        AggregationType, CleanupPolicy, HotReloadStreamingConfig, 
-        StreamingConfig, WindowType};
+        AggregationType, CleanupPolicy, HotReloadStreamingConfig, StreamingConfig, WindowType,
+    };
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
 
     #[test]
@@ -2185,7 +2170,10 @@ mod hot_reload_phase2_tests {
             Some("svc-000003".to_string())
         );
         // absent label -> None
-        assert_eq!(super::extract_filter_value("{zone=\"z1\"}", "service"), None);
+        assert_eq!(
+            super::extract_filter_value("{zone=\"z1\"}", "service"),
+            None
+        );
         // substring labels must NOT match (service != myservice)
         assert_eq!(
             super::extract_filter_value("{myservice=\"x\"}", "service"),
@@ -2330,7 +2318,8 @@ mod hot_reload_phase2_tests {
 mod aux_pushdown_tests {
     use super::*;
     use crate::precompute_engine::operators::{
-        min_max_accumulator::MinMaxAccumulator, sum_accumulator::SumAccumulator};
+        min_max_accumulator::MinMaxAccumulator, sum_accumulator::SumAccumulator,
+    };
     use crate::storage_engines::types::AggregationType;
     use promql_utilities::query_logics::enums::Statistic;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2340,7 +2329,8 @@ mod aux_pushdown_tests {
     /// was invoked. Used to verify the aux fast path skips it.
     struct SpyAccumulator {
         inner_sum: f64,
-        query_calls: Arc<AtomicUsize>}
+        query_calls: Arc<AtomicUsize>,
+    }
 
     impl crate::storage_engines::types::SerializableToSink for SpyAccumulator {
         fn serialize_to_bytes(&self) -> Vec<u8> {
@@ -2355,7 +2345,8 @@ mod aux_pushdown_tests {
         fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
             Box::new(SpyAccumulator {
                 inner_sum: self.inner_sum,
-                query_calls: self.query_calls.clone()})
+                query_calls: self.query_calls.clone(),
+            })
         }
         fn type_name(&self) -> &'static str {
             "SpyAccumulator"
@@ -2397,8 +2388,10 @@ mod aux_pushdown_tests {
     }
 
     fn make_engine() -> ASAPQueryEngine {
-        use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig, StreamingConfig};
-    
+        use crate::storage_engines::types::{
+            CleanupPolicy, HotReloadStreamingConfig, StreamingConfig,
+        };
+
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
         let _ = sc;
@@ -2411,7 +2404,8 @@ mod aux_pushdown_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let spy = SpyAccumulator {
             inner_sum: 42.0,
-            query_calls: calls.clone()};
+            query_calls: calls.clone(),
+        };
         let result = engine
             .query_precompute_for_statistic(&spy, &Statistic::Sum, &None, &HashMap::new())
             .expect("query ok");
@@ -2429,7 +2423,8 @@ mod aux_pushdown_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let spy = SpyAccumulator {
             inner_sum: 42.0,
-            query_calls: calls.clone()};
+            query_calls: calls.clone(),
+        };
         // Quantile is not covered by aux → must fall through.
         let result = engine
             .query_precompute_for_statistic(&spy, &Statistic::Quantile, &None, &HashMap::new())
@@ -2451,7 +2446,8 @@ mod aux_pushdown_tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let spy = SpyAccumulator {
             inner_sum: 42.0,
-            query_calls: calls.clone()};
+            query_calls: calls.clone(),
+        };
         let key = Some(KeyByLabelValues::new());
         // Even for Sum (which aux covers), a keyed query must bypass aux
         // — aux is per-accumulator, not per-subpopulation key.
@@ -2500,7 +2496,6 @@ mod aux_pushdown_tests {
 
 // ── build_query_execution_context_promql_for_agg_id (forced-agg) tests ──
 
-
 // ===========================================================================
 // HLL count() — capability matching + accumulator query round-trip.
 //
@@ -2531,12 +2526,13 @@ mod aux_pushdown_tests {
 #[cfg(test)]
 mod asap_tier_classify_tests {
     use super::*;
-    use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
-    use crate::query_engines::EngineError;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
+    use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchStore, SketchInstanceMetadata,
-        SketchKindHandle, SketchSampleState};
+        AccuracyBound, Capability, SketchConfig, SketchInstanceMetadata, SketchKindHandle,
+        SketchSampleState, SketchStore,
+    };
+    use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
@@ -2547,7 +2543,8 @@ mod asap_tier_classify_tests {
 
     fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
         let cfg = SketchConfig::DDSketch {
-            relative_accuracy: 0.01};
+            relative_accuracy: 0.01,
+        };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
@@ -2586,7 +2583,8 @@ mod asap_tier_classify_tests {
                     asap_types::StorageBackend::SketchStore.data_source_id()
                 );
             }
-            other => panic!("expected CapabilityMiss, got {other:?}")}
+            other => panic!("expected CapabilityMiss, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2615,7 +2613,8 @@ mod asap_tier_classify_tests {
                     asap_types::StorageBackend::SketchStore.data_source_id()
                 );
             }
-            other => panic!("expected CapabilityMiss, got {other:?}")}
+            other => panic!("expected CapabilityMiss, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -2638,7 +2637,8 @@ mod asap_tier_classify_tests {
             (1_000, 1_010),
             SketchSampleState {
                 bytes: vec![0],
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
         );
 
         let engine = build_engine_with_index(idx);
@@ -2650,7 +2650,8 @@ mod asap_tier_classify_tests {
                     "expected a capability-miss fall-over to archive: {detail}"
                 );
             }
-            other => panic!("expected CapabilityMiss fall-over to archive, got {other:?}")}
+            other => panic!("expected CapabilityMiss fall-over to archive, got {other:?}"),
+        }
     }
 
     /// Schema-retirement #5 regression: a sketch sid registered with
@@ -2672,7 +2673,11 @@ mod asap_tier_classify_tests {
         // Register with the SUPERSET of attrs the agent would emit:
         // zone, rack, node, pod — none of which the streaming-config
         // would list directly in `grouping_labels=[zone]`.
-        idx.register(dd_meta(42, "http_latency_ms", &["node", "pod", "rack", "zone"]));
+        idx.register(dd_meta(
+            42,
+            "http_latency_ms",
+            &["node", "pod", "rack", "zone"],
+        ));
         idx.append_sample(
             42,
             BTreeMap::from([
@@ -2684,7 +2689,8 @@ mod asap_tier_classify_tests {
             (1_000, 1_010),
             SketchSampleState {
                 bytes: vec![0],
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
         );
 
         let engine = build_engine_with_index(idx);
@@ -2722,8 +2728,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_sum_by_zone_dispatches_to_exact_agg_reducer() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         // Mirror the smoke-test setup: four ExactAgg(Sum) sids, one
@@ -2783,8 +2789,7 @@ mod asap_tier_classify_tests {
         // Per-zone values match what each SumAccumulator carries.
         // KeyByLabelValues stores values only; the override carries
         // the corresponding keys.
-        let mut by_zone: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for el in &vector.values {
             // The element's label keys override + label values together
             // identify the zone.
@@ -2820,12 +2825,14 @@ mod asap_tier_classify_tests {
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                 kind: SketchKindHandle::Kll,
                 config: cfg.clone(),
-                spatial_filter_canonical: String::new()},
+                spatial_filter_canonical: String::new(),
+            },
             accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET}
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
     }
 
     fn encode_kll_items_proto(k: u16, items: &[f64]) -> Vec<u8> {
@@ -2855,12 +2862,14 @@ mod asap_tier_classify_tests {
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                 kind: SketchKindHandle::Hll,
                 config: cfg.clone(),
-                spatial_filter_canonical: String::new()},
+                spatial_filter_canonical: String::new(),
+            },
             accuracy: Some(AccuracyBound::from_config(&cfg)),
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET}
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
     }
 
     fn encode_hll_with_cardinality(precision: u32, distinct: usize) -> Vec<u8> {
@@ -2880,7 +2889,8 @@ mod asap_tier_classify_tests {
             hip_kxq0: sk.hip_kxq0,
             hip_kxq1: sk.hip_kxq1,
             hip_est: sk.hip_est,
-            registers_sparse: None};
+            registers_sparse: None,
+        };
         let env = SketchEnvelope {
             sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
             ..Default::default()
@@ -2916,18 +2926,16 @@ mod asap_tier_classify_tests {
             (now_ms.saturating_sub(3_000), now_ms.saturating_sub(2_000)),
             SketchSampleState {
                 bytes: encode_hll_with_cardinality(10, 500),
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
         );
 
         let engine = build_engine_with_index(idx);
-        let result = engine
-            .execute("count(unique_users_per_min)")
-            .await
-            .expect(
-                "count(hll_metric) must dispatch to the Cardinality family \
+        let result = engine.execute("count(unique_users_per_min)").await.expect(
+            "count(hll_metric) must dispatch to the Cardinality family \
                  via the candidate capability (empty trace function) and \
                  return the HLL distinct-count, NOT capability-miss",
-            );
+        );
         assert!(
             result_nonempty(&result),
             "count(unique_users_per_min) over an HLL sid must return a \
@@ -2978,7 +2986,8 @@ mod asap_tier_classify_tests {
             (window_start, window_end),
             SketchSampleState {
                 bytes,
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
         );
 
         // The sid must classify as Hit (in-memory unsealed state counts).
@@ -3058,7 +3067,8 @@ mod asap_tier_classify_tests {
             (now_ms.saturating_sub(60_000), now_ms.saturating_sub(55_000)),
             SketchSampleState {
                 bytes: encode_kll_items_proto(200, &items),
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
         );
         // Delta at now-15s..now-5s — INSIDE the window.
         idx.append_sample(
@@ -3067,7 +3077,8 @@ mod asap_tier_classify_tests {
             (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
             SketchSampleState {
                 bytes: encode_kll_items_proto(200, &items),
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
+            },
         );
 
         let result = engine_quantile_result(idx, now_ms).await;
@@ -3103,7 +3114,8 @@ mod asap_tier_classify_tests {
             (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
             SketchSampleState {
                 bytes: encode_kll_items_proto(200, &items),
-                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta},
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
+            },
         );
 
         let result = engine_quantile_result(idx, now_ms).await;
@@ -3123,8 +3135,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_rate_dispatches_to_exact_agg_rate_reducer() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         // Two zones, each its own sid, two windows each. The windows
@@ -3188,8 +3200,7 @@ mod asap_tier_classify_tests {
             other => panic!("expected Vector, got {other:?}"),
         };
         assert_eq!(vector.values.len(), 2, "one entry per per-sid series");
-        let mut by_zone: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for el in &vector.values {
             let keys = el
                 .label_keys_override
@@ -3235,9 +3246,7 @@ mod asap_tier_classify_tests {
         let w2_start = w1_end;
         let w2_end = now_ms.saturating_sub(1_000);
 
-        for (i, (zone, per_window)) in
-            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
-        {
+        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 13_000 + i as u64;
             idx.register(SketchInstanceMetadata {
                 sid,
@@ -3276,7 +3285,10 @@ mod asap_tier_classify_tests {
                  (issue #301 decision (a)); it must NOT fabricate a delta-sum",
             );
         assert!(
-            matches!(err, crate::query_engines::EngineError::CapabilityMiss { .. }),
+            matches!(
+                err,
+                crate::query_engines::EngineError::CapabilityMiss { .. }
+            ),
             "expected CapabilityMiss for sum_over_time over counter, got {err:?}"
         );
     }
@@ -3291,8 +3303,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_instant_sum_accumulates_all_windows_not_last() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = std::time::SystemTime::now()
@@ -3304,9 +3316,7 @@ mod asap_tier_classify_tests {
         let w2_start = w1_end;
         let w2_end = now_ms.saturating_sub(1_000);
 
-        for (i, (zone, per_window)) in
-            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
-        {
+        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 14_000 + i as u64;
             idx.register(SketchInstanceMetadata {
                 sid,
@@ -3346,8 +3356,7 @@ mod asap_tier_classify_tests {
             other => panic!("expected Vector, got {other:?}"),
         };
         assert_eq!(vector.values.len(), 2, "one entry per zone");
-        let mut by_zone: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for el in &vector.values {
             let keys = el.label_keys_override.as_ref().expect("keys present");
             let vals = &el.labels.labels;
@@ -3376,8 +3385,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_increase_accumulates_windows_without_divisor() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = std::time::SystemTime::now()
@@ -3389,9 +3398,7 @@ mod asap_tier_classify_tests {
         let w2_start = w1_end;
         let w2_end = now_ms.saturating_sub(1_000);
 
-        for (i, (zone, per_window)) in
-            [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate()
-        {
+        for (i, (zone, per_window)) in [("z0", 600.0_f64), ("z1", 900.0)].iter().enumerate() {
             let sid = 15_000 + i as u64;
             idx.register(SketchInstanceMetadata {
                 sid,
@@ -3433,7 +3440,11 @@ mod asap_tier_classify_tests {
         // No `by` grouping → empty group_by → collapse to one series.
         // Σ of deltas in window = (600+600) + (900+900) = 3000. NOT
         // divided by range (that would be the rate path → 10.0).
-        assert_eq!(vector.values.len(), 1, "no group_by collapses to one series");
+        assert_eq!(
+            vector.values.len(),
+            1,
+            "no group_by collapses to one series"
+        );
         let value = vector.values[0].value;
         assert!(
             (value - 3000.0).abs() < 1e-9,
@@ -3455,23 +3466,16 @@ mod asap_tier_classify_tests {
     /// the first place.
     #[test]
     fn analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time() {
-        use control_plane::asap_tier_analysis::{
-            analyze_promql_for_asap_tier, OuterFn,
-        };
+        use control_plane::asap_tier_analysis::{analyze_promql_for_asap_tier, OuterFn};
         let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
-        let sot = analyze_promql_for_asap_tier(
-            "sum_over_time(http_requests_total[5m])",
-        );
-        let sum_by_rate = analyze_promql_for_asap_tier(
-            "sum by (zone) (rate(http_requests_total[5m]))",
-        );
+        let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
+        let sum_by_rate =
+            analyze_promql_for_asap_tier("sum by (zone) (rate(http_requests_total[5m]))");
         let bare = analyze_promql_for_asap_tier("http_requests_total");
 
         assert!(rate.unsupported.is_none() && !rate.candidates.is_empty());
         assert!(sot.unsupported.is_none() && !sot.candidates.is_empty());
-        assert!(
-            sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty()
-        );
+        assert!(sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty());
         assert!(bare.unsupported.is_none() && !bare.candidates.is_empty());
 
         // Same capability for ALL — the field that disambiguates is
@@ -3512,8 +3516,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_sum_by_zone_rate_dispatches_to_exact_agg_rate_reducer() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         // Four zones. Two windows each spanning `[now-150s, now-30s]` =
@@ -3575,20 +3579,22 @@ mod asap_tier_classify_tests {
             other => panic!("expected Vector, got {other:?}"),
         };
         assert_eq!(vector.values.len(), 4, "one entry per zone");
-        let mut by_zone: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for el in &vector.values {
-            let keys = el
-                .label_keys_override
-                .as_ref()
-                .expect("override populated");
+            let keys = el.label_keys_override.as_ref().expect("override populated");
             let vals = &el.labels.labels;
-            let zone_idx = keys.iter().position(|k| k == "zone").expect("zone key present");
+            let zone_idx = keys
+                .iter()
+                .position(|k| k == "zone")
+                .expect("zone key present");
             by_zone.insert(vals[zone_idx].clone(), el.value);
         }
         for (zone, expected) in [("z0", 5.0_f64), ("z1", 10.0), ("z2", 15.0), ("z3", 20.0)] {
             let got = by_zone.get(zone).copied().unwrap_or(f64::NAN);
-            assert!((got - expected).abs() < 1e-9, "{zone} expected {expected}, got {got}");
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "{zone} expected {expected}, got {got}"
+            );
         }
     }
 
@@ -3605,8 +3611,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_topk_over_sum_by_zone_rate_uses_fallback() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = std::time::SystemTime::now()
@@ -3669,10 +3675,7 @@ mod asap_tier_classify_tests {
         // emit order and pair with their zone label.
         let mut ordered: Vec<(String, f64)> = Vec::new();
         for el in &vector.values {
-            let keys = el
-                .label_keys_override
-                .as_ref()
-                .expect("override populated");
+            let keys = el.label_keys_override.as_ref().expect("override populated");
             let vals = &el.labels.labels;
             let zone_idx = keys
                 .iter()
@@ -3682,8 +3685,7 @@ mod asap_tier_classify_tests {
         }
         // Per-window sums 300,600,900,1200 / 120s coverage = 2.5, 5,
         // 7.5, 10 → topk descending = z3, z2, z1, z0.
-        let labels_in_order: Vec<&str> =
-            ordered.iter().map(|(z, _)| z.as_str()).collect();
+        let labels_in_order: Vec<&str> = ordered.iter().map(|(z, _)| z.as_str()).collect();
         assert_eq!(
             labels_in_order,
             vec!["z3", "z2", "z1", "z0"],
@@ -3698,8 +3700,8 @@ mod asap_tier_classify_tests {
     #[tokio::test]
     async fn execute_topk_2_slices_to_top_2() {
         use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
-        use crate::storage_engines::sketch_db::data::AggregationType;
         use crate::query_engines::query_result::QueryResult;
+        use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
         let now_ms = std::time::SystemTime::now()
@@ -3779,7 +3781,10 @@ mod asap_tier_classify_tests {
         idx.register(SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
-            group_by_keys: group_by.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>(),
+            group_by_keys: group_by
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
             capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
                 kind: SketchKindHandle::CountMin,
@@ -3894,7 +3899,9 @@ mod asap_tier_classify_tests {
         register_cms_freq_sid(&idx, 7100, "cms_metric", &[], "", 600, now);
 
         let engine = build_engine_with_index(idx);
-        let result = engine.execute("count_over_time(cms_metric{item=\"X\"}[5m])").await;
+        let result = engine
+            .execute("count_over_time(cms_metric{item=\"X\"}[5m])")
+            .await;
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
@@ -3902,9 +3909,7 @@ mod asap_tier_classify_tests {
                     "expected the P2-6 per-item safe-miss detail, got: {detail}"
                 );
             }
-            other => panic!(
-                "keyed CMS frequency must fail over to archive (P2-6), got {other:?}"
-            ),
+            other => panic!("keyed CMS frequency must fail over to archive (P2-6), got {other:?}"),
         }
     }
 
@@ -3921,7 +3926,10 @@ mod asap_tier_classify_tests {
         let engine = build_engine_with_index(idx);
         let result = engine.execute("count_over_time(cms_metric[5m])").await;
         assert!(
-            matches!(result, Ok(QueryResult::Vector(_)) | Ok(QueryResult::Matrix(_))),
+            matches!(
+                result,
+                Ok(QueryResult::Vector(_)) | Ok(QueryResult::Matrix(_))
+            ),
             "bare count_over_time over CMS must still be answered warm, got {result:?}"
         );
     }
@@ -3944,7 +3952,10 @@ mod outer_agg_fold_tests {
     use std::collections::BTreeMap;
 
     fn labels(items: &[(&str, &str)]) -> BTreeMap<String, String> {
-        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// Identity-case (issue #296): inner reducer emits one row per
@@ -4073,19 +4084,19 @@ mod outer_agg_fold_tests {
 #[cfg(test)]
 mod outer_agg_integration_tests {
     use super::*;
-    use crate::storage_engines::types::HotReloadStreamingConfig;
     use crate::query_engines::query_result::QueryResult;
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchStore,
-        SketchInstanceMetadata, SketchKindHandle, SketchSampleState};
+        AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
+        SketchKindHandle, SketchSampleState, SketchStore,
+    };
+    use crate::storage_engines::types::HotReloadStreamingConfig;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::MessagePackCodec;
     use std::collections::{BTreeMap, BTreeSet};
 
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
-        let streaming_config =
-            Arc::new(crate::storage_engines::types::StreamingConfig::default());
+        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
         ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
     }
@@ -4102,7 +4113,9 @@ mod outer_agg_integration_tests {
     }
 
     fn dd_meta_for(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+        let cfg = SketchConfig::DDSketch {
+            relative_accuracy: 0.01,
+        };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
@@ -4147,7 +4160,10 @@ mod outer_agg_integration_tests {
         // is observably different — proves the per-zone identity case
         // didn't get accidentally folded across zones.
         for (i, (zone, vals)) in [
-            ("z0", vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+            (
+                "z0",
+                vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            ),
             ("z1", vec![100.0_f64, 200.0, 300.0, 400.0, 500.0]),
         ]
         .iter()
@@ -4169,9 +4185,7 @@ mod outer_agg_integration_tests {
 
         let engine = build_engine_with_index(idx);
         let result = engine
-            .execute(
-                "max by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
-            )
+            .execute("max by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))")
             .await
             .expect(
                 "issue #296: max by (zone) over quantile_over_time must \
@@ -4192,13 +4206,9 @@ mod outer_agg_integration_tests {
         // Per-zone p99 (within DDSketch's relative accuracy bound):
         //   z0 p99 of [1..=10] ≈ 10.0
         //   z1 p99 of [100, 200, 300, 400, 500] ≈ 500.0
-        let mut by_zone: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
+        let mut by_zone: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for el in &vector.values {
-            let keys = el
-                .label_keys_override
-                .as_ref()
-                .expect("override populated");
+            let keys = el.label_keys_override.as_ref().expect("override populated");
             let vals = &el.labels.labels;
             let zone_idx = keys.iter().position(|k| k == "zone").expect("zone key");
             by_zone.insert(vals[zone_idx].clone(), el.value);
@@ -4217,8 +4227,14 @@ mod outer_agg_integration_tests {
         // ordering + ballpark ranges that prove the fold preserved
         // per-zone identity.
         assert!(z0 > 0.0 && z0 < 50.0, "z0 p99 in [1..=10] range, got {z0}");
-        assert!(z1 > 100.0 && z1 < 1000.0, "z1 p99 in [100..=500] range, got {z1}");
-        assert!(z1 > z0, "z1 ({z1}) > z0 ({z0}) — per-zone identity preserved");
+        assert!(
+            z1 > 100.0 && z1 < 1000.0,
+            "z1 p99 in [100..=500] range, got {z1}"
+        );
+        assert!(
+            z1 > z0,
+            "z1 ({z1}) > z0 ({z0}) — per-zone identity preserved"
+        );
     }
 
     /// Regression: a candidate's sid set legitimately contains a MIX of
@@ -4294,7 +4310,10 @@ mod outer_agg_integration_tests {
         let w_end = now_ms.saturating_sub(30_000);
 
         for (i, (zone, vals)) in [
-            ("z0", vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]),
+            (
+                "z0",
+                vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            ),
             ("z1", vec![50.0_f64, 100.0, 150.0, 200.0, 250.0]),
         ]
         .iter()
@@ -4316,9 +4335,7 @@ mod outer_agg_integration_tests {
 
         let engine = build_engine_with_index(idx);
         let result = engine
-            .execute(
-                "avg by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
-            )
+            .execute("avg by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))")
             .await
             .expect("avg-by + quantile_over_time must succeed (issue #296)");
         match result {
@@ -4337,8 +4354,8 @@ mod outer_agg_integration_tests {
 #[cfg(test)]
 mod hybrid_stitch_tests {
     use super::stitch_warm_and_archive;
-    use crate::storage_engines::types::KeyByLabelValues;
     use crate::query_engines::query_result::{QueryResult, RangeVectorElement, Sample};
+    use crate::storage_engines::types::KeyByLabelValues;
 
     fn matrix_with_samples(label: &str, samples: Vec<(u64, f64)>) -> QueryResult {
         let labels = KeyByLabelValues::new_with_labels(vec![label.to_string()]);
@@ -4367,7 +4384,8 @@ mod hybrid_stitch_tests {
         let merged = stitch_warm_and_archive(warm, archive, 100, 200);
         let m = match merged {
             QueryResult::Matrix(m) => m,
-            _ => panic!("expected matrix")};
+            _ => panic!("expected matrix"),
+        };
         assert_eq!(m.values.len(), 1, "one series");
         let samples = &m.values[0].samples;
         // Five distinct timestamps in the merged answer.
@@ -4410,7 +4428,8 @@ mod hybrid_stitch_tests {
         let merged = stitch_warm_and_archive(warm, archive, 150, 150);
         let m = match merged {
             QueryResult::Matrix(m) => m,
-            _ => panic!("expected matrix")};
+            _ => panic!("expected matrix"),
+        };
         assert_eq!(m.values.len(), 2, "two series after merge");
         let by_label: std::collections::HashMap<Vec<String>, &RangeVectorElement> = m
             .values
@@ -4429,4 +4448,3 @@ mod hybrid_stitch_tests {
         assert_eq!(b.samples.len(), 2);
     }
 }
-

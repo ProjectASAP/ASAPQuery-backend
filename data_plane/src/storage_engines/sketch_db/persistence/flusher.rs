@@ -472,10 +472,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::KeyByLabelValues;
     use crate::storage_engines::sketch_db::index::persistence::source::{
         EpochSnapshot, EpochSnapshotEntry,
     };
+    use crate::storage_engines::types::KeyByLabelValues;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -606,7 +606,12 @@ mod tests {
             agg_id: u64,
             epoch_id: u64,
         ) -> PersistResult<Option<EpochSnapshot>> {
-            Ok(self.sealed.lock().unwrap().get(&(agg_id, epoch_id)).cloned())
+            Ok(self
+                .sealed
+                .lock()
+                .unwrap()
+                .get(&(agg_id, epoch_id))
+                .cloned())
         }
 
         fn evict_sealed_epoch(&self, agg_id: u64, epoch_id: u64) {

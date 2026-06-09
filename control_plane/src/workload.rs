@@ -283,6 +283,37 @@ pub struct WorkloadEntry {
     /// for HLL/CMS (backward-compatible).
     #[serde(default)]
     pub item_label: Option<String>,
+
+    /// Optional continuous-monitoring (CDM) declaration: when set, this metric
+    /// becomes a monitored standing query — the controller auto-emits the
+    /// backend coordinator's `monitors:` entry (authoritative τ) and, in
+    /// future, the edge `threshold:` block. `None` / missing ⇒ no monitor.
+    #[serde(default)]
+    pub monitor: Option<MonitorDecl>,
+}
+
+/// User-facing continuous-monitoring declaration on a [`WorkloadEntry`]. τ/ε and
+/// the window are authoritative at the coordinator; this is the controller's
+/// source for emitting them. See `crate::emit::monitor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorDecl {
+    /// Threshold τ the global aggregate is monitored against.
+    pub tau: f64,
+    /// Additive functional: "sum" (default), "cms_point", or "linear_buckets".
+    #[serde(default)]
+    pub functional: String,
+    /// CMS point-frequency key x (functional = cms_point).
+    #[serde(default)]
+    pub key: String,
+    /// Relative tolerance ε (the alert fires at (1−ε)τ).
+    #[serde(default = "default_monitor_epsilon")]
+    pub epsilon: f64,
+    /// Tumbling epoch length in seconds; MUST match the metric's edge window.
+    pub window_secs: u64,
+}
+
+fn default_monitor_epsilon() -> f64 {
+    0.05
 }
 
 fn default_accuracy_sla() -> f64 {
@@ -334,6 +365,34 @@ pub struct WorkloadRegistry {
 }
 
 impl WorkloadRegistry {
+    /// Collect the continuous-monitoring intents declared across all workload
+    /// entries, resolved against the given coordinator endpoint. The controller
+    /// feeds these to the backend `monitors:` emitter (and, later, the edge
+    /// `threshold:` emitter); each carries the content-addressed agg_id derived
+    /// from the metric name so it lines up with the edge's per-window sketch.
+    pub fn monitor_intents(
+        &self,
+        coordinator_url: &str,
+    ) -> Vec<crate::emit::monitor::MonitorIntent> {
+        use crate::emit::monitor::{Functional, MonitorIntent};
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let m = e.monitor.as_ref()?;
+                Some(MonitorIntent {
+                    metric: e.metric_name.clone(),
+                    functional: Functional::from_name(&m.functional),
+                    key: m.key.clone(),
+                    coeffs: Vec::new(),
+                    coordinator_url: coordinator_url.to_string(),
+                    tau: m.tau,
+                    epsilon: m.epsilon,
+                    window_ms: m.window_secs.saturating_mul(1000),
+                })
+            })
+            .collect()
+    }
+
     /// Load from a YAML file. Returns an empty registry on any error.
     pub fn load(path: &str) -> Self {
         match std::fs::read_to_string(path) {
@@ -399,6 +458,43 @@ mod tests {
     }
 
     #[test]
+    fn monitor_intents_collected_from_workload_decls() {
+        // Only the entry carrying a `monitor:` block produces an intent; the
+        // intent's agg_id MUST match the Go edge's fnv64 for the same metric.
+        let yaml = r#"
+- metric_name: bytes_sent
+  accuracy_sla: 0.95
+  assign_to_role: agent
+  monitor:
+    tau: 1000.0
+    functional: sum
+    window_secs: 60
+- metric_name: plain_metric
+  accuracy_sla: 0.95
+  assign_to_role: agent
+"#;
+        let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).expect("parse workload yaml");
+        let reg = WorkloadRegistry { entries };
+        let intents = reg.monitor_intents("data-plane:4319");
+        assert_eq!(intents.len(), 1, "only the entry with a monitor decl");
+        let i = &intents[0];
+        assert_eq!(i.metric, "bytes_sent");
+        assert_eq!(i.tau, 1000.0);
+        assert_eq!(i.window_ms, 60_000);
+        assert_eq!(i.epsilon, 0.05); // serde default
+        assert_eq!(i.coordinator_url, "data-plane:4319");
+        assert!(matches!(
+            i.functional,
+            crate::emit::monitor::Functional::Sum
+        ));
+        let entry = crate::emit::monitor::streaming_config_monitor_entry(i);
+        assert_eq!(
+            entry["agg_id"].as_u64().unwrap(),
+            crate::emit::monitor::agg_id_for_metric("bytes_sent")
+        );
+    }
+
+    #[test]
     fn empty_registry() {
         let reg = WorkloadRegistry::empty();
         assert!(reg.entries().is_empty());
@@ -440,6 +536,7 @@ mod tests {
                     sample_p: 1.0,
                     distinct_keys_per_window: None,
                     item_label: None,
+                    monitor: None,
                 },
                 WorkloadEntry {
                     metric_name: "b".into(),
@@ -452,6 +549,7 @@ mod tests {
                     sample_p: 1.0,
                     distinct_keys_per_window: None,
                     item_label: None,
+                    monitor: None,
                 },
                 WorkloadEntry {
                     metric_name: "c".into(),
@@ -464,6 +562,7 @@ mod tests {
                     sample_p: 1.0,
                     distinct_keys_per_window: None,
                     item_label: None,
+                    monitor: None,
                 },
             ],
         };
@@ -574,6 +673,7 @@ mod tests {
             sample_p: 1.0,
             distinct_keys_per_window: None,
             item_label: None,
+            monitor: None,
         }
     }
 
@@ -677,7 +777,11 @@ mod tests {
     #[test]
     fn agg_role_bare_metric_selector_is_sum() {
         assert_eq!(
-            derive_agg_role(&entry("http_requests_total", Some("http_requests_total"), None)),
+            derive_agg_role(&entry(
+                "http_requests_total",
+                Some("http_requests_total"),
+                None
+            )),
             AggRole::Sum
         );
     }

@@ -605,40 +605,28 @@ impl SketchStore {
         // yet), so the answer can live entirely on disk. We still run the
         // disk union below.
         if let Some(store) = self.series.get(&sid).map(|s| s.clone()) {
-        let guard = store.write().unwrap(); // exact_query may build the lazy index
-        let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
-            HashMap::new();
+            let guard = store.write().unwrap(); // exact_query may build the lazy index
+            let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
+                HashMap::new();
 
-        let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
-        // Sketch read path uses HALF-OPEN OVERLAP, not containment: the
-        // agent emits ~30s tumbling panes, so a short query window (a
-        // `[30s]` range, or an instant query whose freshest pane straddles
-        // `now`) can't FULLY CONTAIN any pane. Containment then returns
-        // zero in-window samples → the carry-in never fires and the
-        // reducer yields an empty series (the live "No result" bug for
-        // `[30s]` + bare-instant selectors). The reducer's own
-        // `w_end >= t0` / `latest_end` filters keep out-of-range values
-        // from leaking into the answer. See
-        // `MutableEpoch::range_query_overlap_into`.
-        guard
-            .current_epoch
-            .range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
-        for (win, label_id, payload) in &buf {
-            // Filter to sketch-variant payloads only; precompute sids
-            // (M2.3) are served via the precompute query path
-            // (M2.3.5).
-            if let Some(s) = payload.as_sketch() {
-                by_label_id
-                    .entry(*label_id)
-                    .or_default()
-                    .insert(win.1 as i64, s.clone());
-            }
-        }
-        buf.clear();
-
-        for sealed in guard.sealed_epochs.values() {
-            sealed.range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
+            let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
+            // Sketch read path uses HALF-OPEN OVERLAP, not containment: the
+            // agent emits ~30s tumbling panes, so a short query window (a
+            // `[30s]` range, or an instant query whose freshest pane straddles
+            // `now`) can't FULLY CONTAIN any pane. Containment then returns
+            // zero in-window samples → the carry-in never fires and the
+            // reducer yields an empty series (the live "No result" bug for
+            // `[30s]` + bare-instant selectors). The reducer's own
+            // `w_end >= t0` / `latest_end` filters keep out-of-range values
+            // from leaking into the answer. See
+            // `MutableEpoch::range_query_overlap_into`.
+            guard
+                .current_epoch
+                .range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
+                // Filter to sketch-variant payloads only; precompute sids
+                // (M2.3) are served via the precompute query path
+                // (M2.3.5).
                 if let Some(s) = payload.as_sketch() {
                     by_label_id
                         .entry(*label_id)
@@ -647,102 +635,117 @@ impl SketchStore {
                 }
             }
             buf.clear();
-        }
 
-        // Delta-stitching carry-in (issue: quantile/HLL "No result"
-        // bug). The agent emits a periodic Full snapshot followed by
-        // many cheap Delta frames. A short query window (e.g. `[30s]`)
-        // routinely contains ONLY deltas — the Full landed earlier,
-        // outside `[start, end]`. The downstream delta-apply reducer
-        // can't establish a rolling base from a leading delta, so it
-        // silently produces an empty result that the engine returns as
-        // `Ok(empty)` (NOT a capability-miss), so the router never
-        // fails over and the caller sees "No result". To fix, for each
-        // label series whose earliest in-window sample is a Delta,
-        // splice in the most-recent Full snapshot ending at or before
-        // `start` as a carry-in base. Its window-end is `< start`, so
-        // it sorts first in the per-label `BTreeMap` and the reducer's
-        // cumulative/per-window walk uses it as the base; the reducer
-        // drops out-of-range output windows so the carry-in never leaks
-        // into the answer's time domain.
-        if start_unix_ms > 0 {
-            // Which labels need a base? Those present in-window whose
-            // earliest sample is a Delta (a leading Full needs nothing).
-            let need_base: Vec<LabelValuesId> = by_label_id
-                .iter()
-                .filter(|(_, samples)| {
-                    samples
-                        .values()
-                        .next()
-                        .map(|s| {
-                            matches!(
+            for sealed in guard.sealed_epochs.values() {
+                sealed.range_query_overlap_into(start_unix_ms, end_unix_ms, &mut buf);
+                for (win, label_id, payload) in &buf {
+                    if let Some(s) = payload.as_sketch() {
+                        by_label_id
+                            .entry(*label_id)
+                            .or_default()
+                            .insert(win.1 as i64, s.clone());
+                    }
+                }
+                buf.clear();
+            }
+
+            // Delta-stitching carry-in (issue: quantile/HLL "No result"
+            // bug). The agent emits a periodic Full snapshot followed by
+            // many cheap Delta frames. A short query window (e.g. `[30s]`)
+            // routinely contains ONLY deltas — the Full landed earlier,
+            // outside `[start, end]`. The downstream delta-apply reducer
+            // can't establish a rolling base from a leading delta, so it
+            // silently produces an empty result that the engine returns as
+            // `Ok(empty)` (NOT a capability-miss), so the router never
+            // fails over and the caller sees "No result". To fix, for each
+            // label series whose earliest in-window sample is a Delta,
+            // splice in the most-recent Full snapshot ending at or before
+            // `start` as a carry-in base. Its window-end is `< start`, so
+            // it sorts first in the per-label `BTreeMap` and the reducer's
+            // cumulative/per-window walk uses it as the base; the reducer
+            // drops out-of-range output windows so the carry-in never leaks
+            // into the answer's time domain.
+            if start_unix_ms > 0 {
+                // Which labels need a base? Those present in-window whose
+                // earliest sample is a Delta (a leading Full needs nothing).
+                let need_base: Vec<LabelValuesId> = by_label_id
+                    .iter()
+                    .filter(|(_, samples)| {
+                        samples
+                            .values()
+                            .next()
+                            .map(|s| {
+                                matches!(
+                                    s.encoding,
+                                    SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
+                                )
+                            })
+                            .unwrap_or(false)
+                    })
+                    .map(|(label_id, _)| *label_id)
+                    .collect();
+
+                if !need_base.is_empty() {
+                    let before = start_unix_ms.saturating_sub(1);
+                    // Track the latest Full per label (by window-end).
+                    let mut latest_full: HashMap<LabelValuesId, (i64, SketchSampleState)> =
+                        HashMap::new();
+                    let mut consider = |buf: &Vec<(TimestampRange, LabelValuesId, &AggPayload)>| {
+                        for (win, label_id, payload) in buf {
+                            if !need_base.contains(label_id) {
+                                continue;
+                            }
+                            let Some(s) = payload.as_sketch() else {
+                                continue;
+                            };
+                            if !matches!(
                                 s.encoding,
-                                SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta
-                            )
-                        })
-                        .unwrap_or(false)
-                })
-                .map(|(label_id, _)| *label_id)
-                .collect();
-
-            if !need_base.is_empty() {
-                let before = start_unix_ms.saturating_sub(1);
-                // Track the latest Full per label (by window-end).
-                let mut latest_full: HashMap<LabelValuesId, (i64, SketchSampleState)> =
-                    HashMap::new();
-                let mut consider = |buf: &Vec<(TimestampRange, LabelValuesId, &AggPayload)>| {
-                    for (win, label_id, payload) in buf {
-                        if !need_base.contains(label_id) {
-                            continue;
-                        }
-                        let Some(s) = payload.as_sketch() else {
-                            continue;
-                        };
-                        if !matches!(
-                            s.encoding,
-                            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                        ) {
-                            continue;
-                        }
-                        let w_end = win.1 as i64;
-                        match latest_full.get(label_id) {
-                            Some((prev_end, _)) if *prev_end >= w_end => {}
-                            _ => {
-                                latest_full.insert(*label_id, (w_end, s.clone()));
+                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                            ) {
+                                continue;
+                            }
+                            let w_end = win.1 as i64;
+                            match latest_full.get(label_id) {
+                                Some((prev_end, _)) if *prev_end >= w_end => {}
+                                _ => {
+                                    latest_full.insert(*label_id, (w_end, s.clone()));
+                                }
                             }
                         }
-                    }
-                };
-                guard
-                    .current_epoch
-                    .collect_ending_at_or_before(before, &mut buf);
-                consider(&buf);
-                buf.clear();
-                for sealed in guard.sealed_epochs.values() {
-                    sealed.collect_ending_at_or_before(before, &mut buf);
+                    };
+                    guard
+                        .current_epoch
+                        .collect_ending_at_or_before(before, &mut buf);
                     consider(&buf);
                     buf.clear();
-                }
-                for (label_id, (w_end, state)) in latest_full {
-                    by_label_id
-                        .entry(label_id)
-                        .or_default()
-                        .entry(w_end)
-                        .or_insert(state);
+                    for sealed in guard.sealed_epochs.values() {
+                        sealed.collect_ending_at_or_before(before, &mut buf);
+                        consider(&buf);
+                        buf.clear();
+                    }
+                    for (label_id, (w_end, state)) in latest_full {
+                        by_label_id
+                            .entry(label_id)
+                            .or_default()
+                            .entry(w_end)
+                            .or_insert(state);
+                    }
                 }
             }
-        }
 
-        // Materialize the in-memory result keyed by the resolved label
-        // MAP so the disk tier (which has its own intern space) can be
-        // unioned by label identity rather than `LabelValuesId`.
-        for (label_id, samples) in by_label_id {
-            let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
-            by_label_map.entry(label_values).or_default().extend(samples);
-        }
-        // Release the per-sid lock before touching disk — disk reads can
-        // mmap/decode and must not hold the hot ingest lock.
-        drop(guard);
+            // Materialize the in-memory result keyed by the resolved label
+            // MAP so the disk tier (which has its own intern space) can be
+            // unioned by label identity rather than `LabelValuesId`.
+            for (label_id, samples) in by_label_id {
+                let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
+                by_label_map
+                    .entry(label_values)
+                    .or_default()
+                    .extend(samples);
+            }
+            // Release the per-sid lock before touching disk — disk reads can
+            // mmap/decode and must not hold the hot ingest lock.
+            drop(guard);
         } // end in-memory tier
 
         // Union the DURABLE DISK TIER for the part of `[start, end)` that
@@ -757,12 +760,10 @@ impl SketchStore {
 
         by_label_map
             .into_iter()
-            .map(|(label_values, samples)| {
-                SketchTimeSeries {
-                    sid,
-                    series_label_values: label_values,
-                    samples,
-                }
+            .map(|(label_values, samples)| SketchTimeSeries {
+                sid,
+                series_label_values: label_values,
+                samples,
             })
             .collect()
     }
@@ -883,15 +884,13 @@ impl SketchStore {
                         )
                     })
                     .unwrap_or(false);
-                let has_base_before = samples
-                    .iter()
-                    .any(|(w_end, s)| {
-                        *w_end < start_unix_ms as i64
-                            && matches!(
-                                s.encoding,
-                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                            )
-                    });
+                let has_base_before = samples.iter().any(|(w_end, s)| {
+                    *w_end < start_unix_ms as i64
+                        && matches!(
+                            s.encoding,
+                            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                        )
+                });
                 earliest_is_delta && !has_base_before
             })
             .map(|(label_map, _)| label_map.clone())
@@ -1028,9 +1027,11 @@ impl SketchStore {
             }
 
             for (label_id, samples) in by_label_id {
-                let label_values_map =
-                    guard.intern.resolve(label_id).cloned().unwrap_or_default();
-                by_label_map.entry(label_values_map).or_default().extend(samples);
+                let label_values_map = guard.intern.resolve(label_id).cloned().unwrap_or_default();
+                by_label_map
+                    .entry(label_values_map)
+                    .or_default()
+                    .extend(samples);
             }
             drop(guard);
         }
@@ -1091,8 +1092,7 @@ impl SketchStore {
                 let Ok(entry) = reader.load_entry(&rec) else {
                     continue;
                 };
-                let Some(acc) =
-                    reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
+                let Some(acc) = reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
                 else {
                     continue;
                 };
@@ -1184,8 +1184,7 @@ impl SketchStore {
                     let Ok(entry) = reader.load_entry(&rec) else {
                         continue;
                     };
-                    if reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
-                        .is_none()
+                    if reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes).is_none()
                     {
                         continue;
                     }
@@ -2107,7 +2106,8 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
     fn instance_metadata_for_persist(
         &self,
         sid: u64,
-    ) -> Option<crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord> {
+    ) -> Option<crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord>
+    {
         let g = self.instances.read().ok()?;
         let m = g.get(&sid)?;
         Some(
@@ -2456,7 +2456,10 @@ mod tests {
             "only the LATEST pre-window Full is carried in, not older ones"
         );
         // The carried-in entry must be a Full (the reducer needs a base).
-        assert_eq!(s.samples.get(&200).unwrap().encoding, SketchEncoding::ProtoFull);
+        assert_eq!(
+            s.samples.get(&200).unwrap().encoding,
+            SketchEncoding::ProtoFull
+        );
     }
 
     #[test]
@@ -2538,7 +2541,10 @@ mod tests {
             retained <= expected + 2,
             "retained {retained} windows; horizon should bound to ~{expected}"
         );
-        assert!(retained < 480, "old windows were not evicted (leak persists)");
+        assert!(
+            retained < 480,
+            "old windows were not evicted (leak persists)"
+        );
 
         // (b) A 30m range query ending at the freshest window still
         // resolves (well within the 1h horizon) AND the carry-in finds a
@@ -3022,8 +3028,9 @@ mod tests {
         a.sort_unstable();
         assert_eq!(a, vec![1, 2], "both metric_a sids cover {{zone}}");
 
-        let req_zone_rack: BTreeSet<String> =
-            ["zone".to_string(), "rack".to_string()].into_iter().collect();
+        let req_zone_rack: BTreeSet<String> = ["zone".to_string(), "rack".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(
             idx.instances_matching("metric_a", &req_zone_rack),
             vec![1],
@@ -3054,7 +3061,11 @@ mod tests {
         idx.force_retire(1, Duration::from_secs(3600));
         let mut still = idx.instances_matching("metric_a", &req);
         still.sort_unstable();
-        assert_eq!(still, vec![1, 2], "retire keeps the sid in the metric index");
+        assert_eq!(
+            still,
+            vec![1, 2],
+            "retire keeps the sid in the metric index"
+        );
 
         // remove_instance (the post-eviction cleanup) drops it from the
         // secondary index too.
@@ -3083,8 +3094,7 @@ mod tests {
         idx.remove_instance(10);
         idx.register(meta_metric_keys(13, "m2", &["a"]));
 
-        let from_instances: BTreeSet<u64> =
-            idx.instances.read().unwrap().keys().copied().collect();
+        let from_instances: BTreeSet<u64> = idx.instances.read().unwrap().keys().copied().collect();
         let from_metric_idx: BTreeSet<u64> = idx
             .metric_to_sids
             .read()
@@ -3098,7 +3108,10 @@ mod tests {
         );
         // And the cleared metric key must be gone, not lingering empty.
         assert_eq!(
-            idx.instances_matching("m1", &["a".to_string()].into_iter().collect::<BTreeSet<_>>()),
+            idx.instances_matching(
+                "m1",
+                &["a".to_string()].into_iter().collect::<BTreeSet<_>>()
+            ),
             vec![11]
         );
     }
@@ -3158,7 +3171,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(SketchStore::new());
         idx.register(meta_with_host_key(101));
-        let _p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+        let _p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
 
         // seal_window_count = 1: each *new distinct window* seals the
         // prior one. Append several distinct windows for one series.
@@ -3170,7 +3185,10 @@ mod tests {
         // the prior current_epoch). The flusher may evict some before we
         // look, so we assert that sealing happened OR a part landed.
         let sealed_now = !idx.list_sealed_epochs().is_empty();
-        let flushed = wait_until(|| !_p.manifest.live_parts().is_empty(), std::time::Duration::from_secs(3));
+        let flushed = wait_until(
+            || !_p.manifest.live_parts().is_empty(),
+            std::time::Duration::from_secs(3),
+        );
         assert!(
             sealed_now || flushed,
             "no epochs sealed and nothing flushed — sealing did not fire under persistence"
@@ -3182,7 +3200,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(SketchStore::new());
         idx.register(meta_with_host_key(202));
-        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+        let p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
 
         for i in 0..10u64 {
             let s = i * 30_000;
@@ -3208,7 +3228,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(SketchStore::new());
         idx.register(meta_with_host_key(303));
-        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+        let p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
 
         // Append windows for series "a" across [0, 300_000).
         for i in 0..10u64 {
@@ -3228,7 +3250,11 @@ mod tests {
         let series = idx.query_range(303, 0, 150_000);
         assert_eq!(series.len(), 1, "expected one series resolved from disk");
         let s = &series[0];
-        assert_eq!(s.series_label_values, lv_host("a"), "label map rebuilt from disk");
+        assert_eq!(
+            s.series_label_values,
+            lv_host("a"),
+            "label map rebuilt from disk"
+        );
         assert!(
             !s.samples.is_empty(),
             "query over evicted range returned no samples from disk"
@@ -3247,13 +3273,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let idx = Arc::new(SketchStore::new());
         idx.register(meta_with_host_key(404));
-        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+        let p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
 
         // A Full snapshot early (end=100_000), then delta windows later.
         idx.append_sample(404, lv_host("a"), (70_000, 100_000), sample(1)); // Full base
         for i in 0..6u64 {
             let s = 100_000 + i * 30_000;
-            idx.append_sample(404, lv_host("a"), (s, s + 30_000), delta_sample((i + 2) as u8));
+            idx.append_sample(
+                404,
+                lv_host("a"),
+                (s, s + 30_000),
+                delta_sample((i + 2) as u8),
+            );
         }
         // Flush+evict everything to disk.
         assert!(
@@ -3520,7 +3553,10 @@ mod tests {
         let meta = idx2.instance(8100).expect("recovered exact-agg metadata");
         assert!(matches!(
             meta.agg_kind,
-            AggKind::ExactAgg { agg_type: AggregationType::Sum, .. }
+            AggKind::ExactAgg {
+                agg_type: AggregationType::Sum,
+                ..
+            }
         ));
 
         // The Sum exact-agg range query must resolve from disk.
@@ -3654,7 +3690,11 @@ mod tests {
             "LIVE BUG #1: recovery found 0 live parts after restart"
         );
         let series = idx2.query_range(7001, base, base + 90_000);
-        assert_eq!(series.len(), 1, "recovered data not queryable after restart");
+        assert_eq!(
+            series.len(),
+            1,
+            "recovered data not queryable after restart"
+        );
         assert!(
             !series[0].samples.is_empty(),
             "restart query returned No result — flushed data lost"
@@ -3682,7 +3722,9 @@ mod tests {
             spatial_filter_canonical: String::new(),
         };
         idx.register(m);
-        let p = idx.start_persistence(durable_cfg(tmp.path().to_path_buf())).unwrap();
+        let p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
 
         let lv_zone = |v: &str| {
             let mut x = BTreeMap::new();
@@ -3695,9 +3737,9 @@ mod tests {
                 8001,
                 lv_zone("z0"),
                 (s, s + 30_000),
-                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(
-                    (i + 1) as f64,
-                )),
+                Box::new(
+                    crate::precompute_engine::operators::SumAccumulator::with_sum((i + 1) as f64),
+                ),
             );
         }
         assert!(

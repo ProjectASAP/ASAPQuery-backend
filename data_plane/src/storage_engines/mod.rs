@@ -23,8 +23,8 @@ pub mod traits;
 pub mod types;
 
 pub use sketch_db::index::{
-    AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchStore,
-    SketchInstanceMetadata, SketchKindHandle, SketchSampleState, SketchTimeSeries,
+    AccuracyBound, Capability, SidLookup, SketchConfig, SketchEncoding, SketchInstanceMetadata,
+    SketchKindHandle, SketchSampleState, SketchStore, SketchTimeSeries,
 };
 pub use sketch_db::AggStatus;
 pub use traits::*;

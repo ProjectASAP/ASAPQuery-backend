@@ -25,12 +25,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use asap_sketchlib::DdSketch;
-use asap_sketchlib::{HllSketch, HllVariant};
 use asap_sketchlib::proto::sketchlib::{
     sketch_envelope, DdSketchState, HllVariant as ProtoVariant, HyperLogLogState, KllState,
     SketchEnvelope,
 };
+use asap_sketchlib::DdSketch;
+use asap_sketchlib::{HllSketch, HllVariant};
 use prost::Message;
 
 use data_plane::precompute_engine::operators::SumAccumulator;
@@ -38,8 +38,8 @@ use data_plane::storage_engines::sketch_db::data::{
     AccuracyBound, AggKind, AggregationType, Capability, SketchConfig, SketchEncoding,
     SketchKindHandle,
 };
-use data_plane::storage_engines::SketchSampleState;
 use data_plane::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
+use data_plane::storage_engines::SketchSampleState;
 
 // ── Payload builders ────────────────────────────────────────────────────────
 
@@ -123,7 +123,7 @@ fn sketch_meta(sid: u64, kind: SketchKindHandle, config: SketchConfig) -> Sketch
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -142,7 +142,7 @@ fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SketchI
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -154,7 +154,9 @@ struct KindCase {
 }
 
 fn dd_small() -> (SketchConfig, Vec<u8>) {
-    let cfg = SketchConfig::DDSketch { relative_accuracy: 0.01 };
+    let cfg = SketchConfig::DDSketch {
+        relative_accuracy: 0.01,
+    };
     let bytes = encode_ddsketch(&(1..=64).map(|i| i as f64).collect::<Vec<_>>(), 0.01);
     (cfg, bytes)
 }
@@ -172,9 +174,21 @@ fn hll_small() -> (SketchConfig, Vec<u8>) {
 }
 
 const KINDS: &[KindCase] = &[
-    KindCase { name: "DDSketch", kind: SketchKindHandle::DDSketch, build: dd_small },
-    KindCase { name: "KLL",      kind: SketchKindHandle::Kll,      build: kll_small },
-    KindCase { name: "HLL",      kind: SketchKindHandle::Hll,      build: hll_small },
+    KindCase {
+        name: "DDSketch",
+        kind: SketchKindHandle::DDSketch,
+        build: dd_small,
+    },
+    KindCase {
+        name: "KLL",
+        kind: SketchKindHandle::Kll,
+        build: kll_small,
+    },
+    KindCase {
+        name: "HLL",
+        kind: SketchKindHandle::Hll,
+        build: hll_small,
+    },
 ];
 
 // ── append_sample ───────────────────────────────────────────────────────────
@@ -235,38 +249,35 @@ fn bench_append_precompute(c: &mut Criterion) {
 
     for num_sids in [1usize, 100, 10_000] {
         g.throughput(Throughput::Elements(1));
-        g.bench_function(
-            BenchmarkId::new("Sum", format!("sids={num_sids}")),
-            |b| {
-                b.iter_batched_ref(
-                    || {
-                        let store = SketchStore::new();
-                        for sid in 0..num_sids as u64 {
-                            store.register(precompute_meta(
-                                sid + 1,
-                                "bench_metric",
-                                AggregationType::Sum,
-                            ));
-                        }
-                        (store, 0u64)
-                    },
-                    |(store, counter)| {
-                        let c = *counter;
-                        *counter = c.wrapping_add(1);
-                        let sid = (c % num_sids as u64) + 1;
-                        let win = (1_000 + c * 10, 1_000 + c * 10 + 10);
-                        store.append_precompute(
-                            sid,
-                            BTreeMap::new(),
-                            win,
-                            Box::new(SumAccumulator::with_sum(c as f64)),
-                        );
-                        black_box(&*store);
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+        g.bench_function(BenchmarkId::new("Sum", format!("sids={num_sids}")), |b| {
+            b.iter_batched_ref(
+                || {
+                    let store = SketchStore::new();
+                    for sid in 0..num_sids as u64 {
+                        store.register(precompute_meta(
+                            sid + 1,
+                            "bench_metric",
+                            AggregationType::Sum,
+                        ));
+                    }
+                    (store, 0u64)
+                },
+                |(store, counter)| {
+                    let c = *counter;
+                    *counter = c.wrapping_add(1);
+                    let sid = (c % num_sids as u64) + 1;
+                    let win = (1_000 + c * 10, 1_000 + c * 10 + 10);
+                    store.append_precompute(
+                        sid,
+                        BTreeMap::new(),
+                        win,
+                        Box::new(SumAccumulator::with_sum(c as f64)),
+                    );
+                    black_box(&*store);
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     g.finish();
 }
@@ -294,24 +305,18 @@ fn bench_query_range(c: &mut Criterion) {
             let store = build_populated_store(depth, *kind, sid);
             let full_end = 1_000 + depth * 10 + 10;
             let cases = [
-                ("w=1",    (1_000u64, 1_010u64)),
+                ("w=1", (1_000u64, 1_010u64)),
                 ("w=half", (1_000u64, 1_000 + (depth / 2) * 10)),
                 ("w=full", (1_000u64, full_end)),
             ];
             for (width_label, (start, end)) in cases {
                 g.throughput(Throughput::Elements(1));
                 g.bench_function(
-                    BenchmarkId::new(
-                        kind.name,
-                        format!("depth={depth}/{width_label}"),
-                    ),
+                    BenchmarkId::new(kind.name, format!("depth={depth}/{width_label}")),
                     |b| {
                         b.iter(|| {
-                            let r = store.query_range(
-                                black_box(sid),
-                                black_box(start),
-                                black_box(end),
-                            );
+                            let r =
+                                store.query_range(black_box(sid), black_box(start), black_box(end));
                             black_box(r);
                         });
                     },
@@ -347,26 +352,18 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
     g.sample_size(15);
 
     let metric = "bench_metric";
-    let cases: &[(usize, u64)] = &[
-        (1, 100),
-        (100, 10),
-        (100, 100),
-        (10_000, 10),
-    ];
+    let cases: &[(usize, u64)] = &[(1, 100), (100, 10), (100, 100), (10_000, 10)];
     for (num_sids, depth) in cases {
         let store = build_precompute_store(*num_sids, *depth, metric);
         let full_end = 1_000 + depth * 10 + 10;
         let widths = [
-            ("w=1",    (1_000u64, 1_010u64)),
+            ("w=1", (1_000u64, 1_010u64)),
             ("w=full", (1_000u64, full_end)),
         ];
         for (width_label, (start, end)) in widths {
             g.throughput(Throughput::Elements(*num_sids as u64));
             g.bench_function(
-                BenchmarkId::new(
-                    format!("sids={num_sids}/depth={depth}"),
-                    width_label,
-                ),
+                BenchmarkId::new(format!("sids={num_sids}/depth={depth}"), width_label),
                 |b| {
                     b.iter(|| {
                         let r = store.query_precomputes_by_agg(

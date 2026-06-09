@@ -152,7 +152,9 @@ impl crate::storage_engines::types::MultipleSubpopulationAggregate for SketchEnv
         )
     }
 
-    fn clone_boxed(&self) -> Box<dyn crate::storage_engines::types::MultipleSubpopulationAggregate> {
+    fn clone_boxed(
+        &self,
+    ) -> Box<dyn crate::storage_engines::types::MultipleSubpopulationAggregate> {
         Box::new(self.clone())
     }
 }

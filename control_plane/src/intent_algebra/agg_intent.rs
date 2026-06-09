@@ -44,9 +44,7 @@ pub enum AggIntent {
     /// COUNT(*) / `count` — number of rows / samples per group.
     /// `accuracy: Exact` selects an exact counter; `Epsilon` / `EpsilonDelta`
     /// unlock CMS / linear-counting sketch families.
-    Count {
-        accuracy: AccuracyTarget,
-    },
+    Count { accuracy: AccuracyTarget },
     /// SUM(col). Always exact at L3 — no approximation intent for `Sum`
     /// in the catalog (`design.md` §6 line ~485).
     Sum,
@@ -59,42 +57,28 @@ pub enum AggIntent {
     Avg,
     /// Compute the φ-th quantile (0 ≤ q ≤ 1) to the given accuracy.
     /// Sketch families: KLL, DDSketch, t-digest.
-    Quantile {
-        q: f64,
-        accuracy: AccuracyTarget,
-    },
+    Quantile { q: f64, accuracy: AccuracyTarget },
     /// Heavy-hitter top-k. Distinct from generic `Sort + Limit` because
     /// a dedicated sketch primitive (SpaceSaving, CMS-with-heap,
     /// Misra-Gries) computes it as a single operation. L1→L2→L3 lowering
     /// produces this when it recognises `topk(k, …)` (PromQL) or
     /// `ORDER BY count DESC LIMIT k` (SQL).
-    TopK {
-        k: usize,
-        accuracy: AccuracyTarget,
-    },
+    TopK { k: usize, accuracy: AccuracyTarget },
     /// COUNT DISTINCT — number of distinct values in the input column,
     /// to the given accuracy. Sketch families: HLL, theta-sketch.
-    Cardinality {
-        accuracy: AccuracyTarget,
-    },
+    Cardinality { accuracy: AccuracyTarget },
     /// Frequency of a key in the input — `count(*) WHERE key = k` modeled
     /// as a sketch query. Sketch families: CMS, count-min-log.
-    Frequency {
-        accuracy: AccuracyTarget,
-    },
+    Frequency { accuracy: AccuracyTarget },
 
     // ── Time-series streaming derivatives ────────────────────────────────
     /// Per-second average derivative with PromQL's counter-reset
     /// adjustment. Specialized — exact `Sum / Count over Window` does
     /// NOT serve this intent.
-    Rate {
-        window: Duration,
-    },
+    Rate { window: Duration },
     /// Cumulative increase over the given window with counter-reset
     /// adjustment. Specialized — see `Rate` above.
-    Increase {
-        window: Duration,
-    },
+    Increase { window: Duration },
 
     // ── Archive-only intents (Phase β migration) ─────────────────────────
     // Intents below have no ASAP-tier sketch family today; the L4 binder
@@ -119,20 +103,13 @@ pub enum AggIntent {
     Present,
     /// `delta(m[range])` — last − first sample within the window, NO
     /// counter-reset adjustment. Distinct from [`AggIntent::Increase`].
-    Delta {
-        window: Duration,
-    },
+    Delta { window: Duration },
     /// `deriv(m[range])` — per-second derivative via simple linear
     /// regression. Archive-routed (no streaming sketch).
-    Deriv {
-        window: Duration,
-    },
+    Deriv { window: Duration },
     /// `predict_linear(m[range], t)` — linear-regression prediction `t`
     /// seconds into the future. Archive-routed.
-    PredictLinear {
-        window: Duration,
-        ahead: Duration,
-    },
+    PredictLinear { window: Duration, ahead: Duration },
     /// `holt_winters(m[range], sf, tf)` — exponential-smoothing forecast.
     /// Archive-routed.
     HoltWinters {
@@ -142,25 +119,17 @@ pub enum AggIntent {
     },
     /// `idelta(m[range])` — `last − second_to_last`, instant delta. No
     /// streaming sketch.
-    Idelta {
-        window: Duration,
-    },
+    Idelta { window: Duration },
     /// `irate(m[range])` — instant per-second rate computed from the last
     /// two samples. Counter-reset adjusted but evaluated point-wise; not
     /// the same as the streaming [`AggIntent::Rate`].
-    Irate {
-        window: Duration,
-    },
+    Irate { window: Duration },
     /// `resets(m[range])` — count of counter resets over the window.
     /// Archive-routed.
-    Resets {
-        window: Duration,
-    },
+    Resets { window: Duration },
     /// `changes(m[range])` — count of value changes over the window.
     /// Archive-routed.
-    Changes {
-        window: Duration,
-    },
+    Changes { window: Duration },
 }
 
 impl AggIntent {
@@ -353,11 +322,7 @@ pub fn agg_is_mergeable(op: &AggIntent) -> bool {
 pub fn agg_is_exact(op: &AggIntent) -> bool {
     matches!(
         op,
-        AggIntent::Sum
-            | AggIntent::Count { .. }
-            | AggIntent::Avg
-            | AggIntent::Min
-            | AggIntent::Max
+        AggIntent::Sum | AggIntent::Count { .. } | AggIntent::Avg | AggIntent::Min | AggIntent::Max
     )
 }
 

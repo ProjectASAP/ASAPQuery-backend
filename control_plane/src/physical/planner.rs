@@ -108,9 +108,7 @@ pub enum PhysicalOp {
 
     // ── Data exchange ─────────────────────────────────────────────
     /// Data transfer between pipeline stages.
-    Exchange {
-        format: ExchangeFormat,
-    },
+    Exchange { format: ExchangeFormat },
 
     // ── Relational / passthrough ──────────────────────────────────
     /// Filter rows.
@@ -559,7 +557,6 @@ impl PhysicalNode {
                 .map(|c| c.exchange_count())
                 .sum::<usize>()
     }
-
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

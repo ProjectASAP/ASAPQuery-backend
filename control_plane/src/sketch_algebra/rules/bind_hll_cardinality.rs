@@ -16,8 +16,8 @@
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{HllParams, SketchKind, SketchParams};
-use crate::sketch_algebra::rules::Rule;
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
+use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
 
 pub struct BindHllOnCardinality;

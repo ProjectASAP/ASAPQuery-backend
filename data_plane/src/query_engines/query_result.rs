@@ -1,5 +1,5 @@
-use crate::storage_engines::types::KeyByLabelValues;
 use crate::storage_engines::sketch_db::AccuracyEnvelope;
+use crate::storage_engines::types::KeyByLabelValues;
 use serde::{Deserialize, Serialize};
 
 use promql_utilities::query_logics::enums::QueryResultType;

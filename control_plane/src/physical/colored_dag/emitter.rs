@@ -814,7 +814,7 @@ impl Emitter for ThreeStageEmitter {
                         aggregation_id: aggregation_id.clone(),
                     });
                     backend_aggregations.push(BackendAggregation {
-            item_label: None,
+                        item_label: None,
                         aggregation_id,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: sketch_type.clone(),
@@ -898,7 +898,7 @@ impl Emitter for ThreeStageEmitter {
                     let aid = format!("agg{next_agg_index}");
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
-            item_label: None,
+                        item_label: None,
                         aggregation_id: aid,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         sketch_kind: family.clone(),
@@ -1018,7 +1018,11 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
         }
         QE::Join { left, right, .. }
         | QE::SetOp { left, right, .. }
-        | QE::BinaryOp { lhs: left, rhs: right, .. } => {
+        | QE::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
             extract_edge_facts(left, edge);
             extract_edge_facts(right, edge);
         }

@@ -18,6 +18,7 @@
 
 pub mod agent;
 pub mod backend_push;
+pub mod monitor;
 pub mod otap;
 pub mod precompute;
 pub mod stage_config;
@@ -26,21 +27,20 @@ pub mod trait_def;
 
 pub use agent::generate_agent_collector_config;
 pub use backend_push::{
-    post_typed_backend_for_role, repost_cumulative_backend_config, BackendRoutingCache,
-    PushOutcome,
+    post_typed_backend_for_role, repost_cumulative_backend_config, BackendRoutingCache, PushOutcome,
 };
 pub use otap::emit_otap_dag_yaml;
 pub use precompute::{build_precompute_engine_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{
-    emit_backend_streaming_config_json, emit_backend_storage_routing,
-    emit_backend_storage_routing_for_tenant, emit_backend_storage_routing_with_prometheus,
-    emit_backend_storage_routing_with_prometheus_for_tenant, emit_edge_yaml, emit_gateway_yaml,
-    DEFAULT_TENANT,
+    emit_backend_storage_routing, emit_backend_storage_routing_for_tenant,
+    emit_backend_storage_routing_with_prometheus,
+    emit_backend_storage_routing_with_prometheus_for_tenant, emit_backend_streaming_config_json,
+    emit_edge_yaml, emit_gateway_yaml, DEFAULT_TENANT,
 };
 pub use telegraf::emit_telegraf_toml;
 pub use trait_def::{
-    InferenceConfigEmitter, InferenceConfigInput, OpampEmitter, OpampGatewayEmitter,
-    PlanEmitter, StreamingConfigEmitter,
+    InferenceConfigEmitter, InferenceConfigInput, OpampEmitter, OpampGatewayEmitter, PlanEmitter,
+    StreamingConfigEmitter,
 };
 
 // Refactor 2026-05: design.md §5 puts `WorkloadRegistry` next to
@@ -359,11 +359,14 @@ pub fn collect_metric_to_family(
         // samples fan into each per-family pipeline at the agent and the
         // backend serves every (metric, capability) the workload needs.
         for (_, workload, _wc) in workload_store.get_all_for_metric(&entry.metric_name) {
-            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload) else {
+            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload)
+            else {
                 continue;
             };
             if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
-                out.entry(entry.metric_name.clone()).or_default().insert(kind);
+                out.entry(entry.metric_name.clone())
+                    .or_default()
+                    .insert(kind);
             }
         }
     }
@@ -664,9 +667,7 @@ mod runtime_tests {
         // the cold format to intchunk and derives the coldpart endpoint
         // from the cold ship endpoint (same merger host:port,
         // `/ingest/coldpart` path). Unset / `fragment` is a no-op.
-        use crate::physical::colored_dag::emitter::{
-            default_cold_ship_endpoint, ColdFormat,
-        };
+        use crate::physical::colored_dag::emitter::{default_cold_ship_endpoint, ColdFormat};
 
         fn fixture() -> EdgeStageConfig {
             EdgeStageConfig {
@@ -674,10 +675,9 @@ mod runtime_tests {
                 label_filters: Vec::new(),
                 window_secs: None,
                 sketch_processors: Vec::new(),
-                exporter_target:
-                    crate::physical::colored_dag::emitter::ExportTarget::Stage(
-                        crate::physical::colored_dag::stage_id::StageId::Backend,
-                    ),
+                exporter_target: crate::physical::colored_dag::emitter::ExportTarget::Stage(
+                    crate::physical::colored_dag::stage_id::StageId::Backend,
+                ),
                 prometheus_archive_metrics: Vec::new(),
                 archive_tier_metrics: Vec::new(),
                 warm_passthrough_metrics: Vec::new(),
@@ -974,12 +974,27 @@ mod runtime_tests {
         // queried by exactly one capability, so each set has size 1.
         use std::collections::BTreeSet;
         let expected: Vec<(&str, Option<BTreeSet<SketchKind>>)> = vec![
-            ("http_latency_ms", Some(BTreeSet::from([SketchKind::DDSketch]))),
+            (
+                "http_latency_ms",
+                Some(BTreeSet::from([SketchKind::DDSketch])),
+            ),
             ("http_requests_total", None), // raw passthrough
-            ("request_size_bytes", Some(BTreeSet::from([SketchKind::Kll]))),
-            ("unique_users_per_min", Some(BTreeSet::from([SketchKind::Hll]))),
-            ("top_endpoint_qps", Some(BTreeSet::from([SketchKind::CountSketch]))),
-            ("endpoint_request_freq", Some(BTreeSet::from([SketchKind::Cms]))),
+            (
+                "request_size_bytes",
+                Some(BTreeSet::from([SketchKind::Kll])),
+            ),
+            (
+                "unique_users_per_min",
+                Some(BTreeSet::from([SketchKind::Hll])),
+            ),
+            (
+                "top_endpoint_qps",
+                Some(BTreeSet::from([SketchKind::CountSketch])),
+            ),
+            (
+                "endpoint_request_freq",
+                Some(BTreeSet::from([SketchKind::Cms])),
+            ),
         ];
         for (metric, want) in &expected {
             let got = map.get(*metric).cloned();
@@ -1032,12 +1047,25 @@ mod runtime_tests {
 
         let map = collect_metric_to_item_label(&registry, &store);
 
-        assert_eq!(map.get("unique_users_per_min").map(String::as_str), Some("user_id"));
-        assert_eq!(map.get("top_endpoint_qps").map(String::as_str), Some("endpoint"));
-        assert_eq!(map.get("endpoint_request_freq").map(String::as_str), Some("endpoint"));
+        assert_eq!(
+            map.get("unique_users_per_min").map(String::as_str),
+            Some("user_id")
+        );
+        assert_eq!(
+            map.get("top_endpoint_qps").map(String::as_str),
+            Some("endpoint")
+        );
+        assert_eq!(
+            map.get("endpoint_request_freq").map(String::as_str),
+            Some("endpoint")
+        );
         // The quantile metric declares no inner dimension → absent.
         assert!(!map.contains_key("http_requests_total_latency_ms"));
-        assert_eq!(map.len(), 3, "only the item-counting metrics carry item_label: {map:?}");
+        assert_eq!(
+            map.len(),
+            3,
+            "only the item-counting metrics carry item_label: {map:?}"
+        );
     }
 
     #[test]
@@ -1272,8 +1300,8 @@ mod runtime_tests {
         };
         edge_cfg.metric_to_grouping_labels = collect_metric_to_grouping_labels(&registry, &store);
 
-        let yaml_out = crate::emit::emit_edge_yaml(&edge_cfg, "ws://c/", "test-agent")
-            .expect("emit ok");
+        let yaml_out =
+            crate::emit::emit_edge_yaml(&edge_cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             yaml_out.contains(
                 "keep_keys(datapoint.attributes, [\"zone\"]) where metric.name == \"http_requests_total_latency_ms\""

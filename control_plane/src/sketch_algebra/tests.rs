@@ -8,10 +8,10 @@ use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
+use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::sketch_algebra::rules::{
     bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_kll_quantile::BindKllOnQuantile, Rule,
 };
-use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -118,7 +118,11 @@ fn physical_expr_serde_roundtrip() {
         },
         PhysicalExpr::SketchAgg {
             sketch_type: SketchKind::Cms,
-            params: SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
+            params: SketchParams::Cms(CmsParams {
+                w: 2048,
+                d: 5,
+                with_heap: false,
+            }),
             child: Box::new(PhysicalExpr::Logical(windowed_scan())),
         },
     ];

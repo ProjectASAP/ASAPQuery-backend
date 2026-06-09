@@ -1,0 +1,115 @@
+// Continuous distributed monitoring (CDM) wire contract — the edge↔coordinator
+// reverse channel for Discipline B (continuous intra-window monitoring) from
+// ASAPCollector docs/continuous-monitoring-tumbling-cost-analysis.md.
+//
+// This is the SOURCE OF TRUTH for the protocol. A byte-identical copy is
+// vendored into the Go edge runtime at
+//   ASAPCollector/asap-precompute-go/monitor/monitorpb/monitor.proto
+// for `protoc --go_out --go-grpc_out` codegen. Keep the two in sync; the
+// message field numbers and the service name are the cross-language contract.
+//
+// Protocol (Cormode–Muthukrishnan–Yi distributed functional monitoring over a
+// tumbling window; one window = one independent monitoring epoch, reset at the
+// boundary). Per monitor (agg_id, key) the coordinator runs rounds:
+//   1. Δ = τ − global_estimate. If Δ ≤ ε·τ → fire GlobalAlert, epoch done.
+//   2. local_slack = Δ/(2k), k = #edges. Broadcast SlackGrant to every edge.
+//   3. An edge sends MonitorReport when local_value − round_baseline ≥ local_slack.
+//   4. When reported mass crosses ~Δ/2 the coordinator closes the round
+//      (PollLocal every edge), sets global_estimate = Σ local_value, round += 1,
+//      and goto 1 with shrinking slack.
+// Every report/grant carries window_start_ms; messages for a non-current epoch
+// are dropped on both sides.
+//
+// NOTE: avoids the proto3 `optional` keyword so host protoc < 3.15 can compile
+// the Go side (same constraint that drives PROTOC=vendored on the Rust side).
+
+syntax = "proto3";
+
+package asap.monitor.v1;
+
+// Go import path for the vendored edge-side copy (ignored by tonic_build). The
+// generated stubs live in a SEPARATE nested Go module (monitor/grpcclient) so
+// the gRPC dependency tree never contaminates the core runtime's module graph.
+option go_package = "github.com/ProjectASAP/asap-precompute-go/monitor/grpcclient/monitorpb;monitorpb";
+
+// edge → coordinator: open-stream registration. Sent on connect and at the
+// start of every new tumbling epoch (after a window boundary).
+message MonitorRegister {
+  string edge_id = 1;          // stable per-edge identity (collector instance id)
+  uint64 agg_id = 2;           // content-addressed aggregation id (matches edge + coordinator)
+  bytes key = 3;               // CMS point-frequency key x; empty for Sum
+  uint64 epoch_window_ms = 4;  // edge's tumbling window size — coordinator alignment guard
+  uint64 window_start_ms = 5;  // edge's current epoch start — avoids coordinator clock skew
+}
+
+// edge → coordinator: the current local additive value for the named monitor,
+// emitted when the edge's local increase since round start crossed its slack,
+// or in response to a PollLocal at round close.
+message MonitorReport {
+  string edge_id = 1;
+  uint64 agg_id = 2;
+  bytes key = 3;
+  uint64 window_start_ms = 4;  // epoch this value belongs to (stale-epoch drop)
+  double local_value = 5;      // current additive local value at report time
+  uint64 round = 6;            // round this report answers
+  uint64 seq = 7;              // per-edge monotonic counter; idempotent-retransmit dedup
+}
+
+// coordinator → edge: this round's per-edge slack budget. The edge reports once
+// its local increase since the grant reaches local_slack.
+message SlackGrant {
+  uint64 agg_id = 1;
+  bytes key = 2;
+  uint64 round = 3;
+  double local_slack = 4;
+  uint64 window_start_ms = 5;
+}
+
+// coordinator → edge: demand the current local value now (round close).
+message PollLocal {
+  uint64 agg_id = 1;
+  bytes key = 2;
+  uint64 round = 3;
+  uint64 window_start_ms = 4;
+}
+
+// coordinator → edge: round closed; edge advances its round baseline.
+message RoundClose {
+  uint64 agg_id = 1;
+  uint64 round = 2;
+  uint64 window_start_ms = 3;
+}
+
+// Out-of-band (NOT carried on the Monitor stream): the coordinator serializes
+// this into the control-plane violation/notifier sink when the global aggregate
+// crosses τ. Defined here so both sides share the shape for logging/tests.
+message GlobalAlert {
+  uint64 agg_id = 1;
+  bytes key = 2;
+  double global_estimate = 3;
+  double tau = 4;
+  uint64 window_start_ms = 5;
+}
+
+// Upstream envelope (edge → coordinator).
+message EdgeToCoord {
+  oneof msg {
+    MonitorRegister reg = 1;
+    MonitorReport report = 2;
+  }
+}
+
+// Downstream envelope (coordinator → edge).
+message CoordToEdge {
+  oneof msg {
+    SlackGrant grant = 1;
+    PollLocal poll = 2;
+    RoundClose close = 3;
+  }
+}
+
+// One bidirectional stream per edge; the coordinator multiplexes every monitor
+// for that edge over the single stream.
+service MonitorService {
+  rpc Monitor(stream EdgeToCoord) returns (stream CoordToEdge);
+}

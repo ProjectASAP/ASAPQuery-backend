@@ -137,10 +137,7 @@ pub trait EpochSource: Send + Sync {
     /// Returns `None` when the sid is unknown to the source (e.g. a test
     /// fake, or a sid whose instance metadata was evicted). Default impl
     /// returns `None` so existing/test sources need not implement it.
-    fn instance_metadata_for_persist(
-        &self,
-        _sid: u64,
-    ) -> Option<super::metadata::SidMetaRecord> {
+    fn instance_metadata_for_persist(&self, _sid: u64) -> Option<super::metadata::SidMetaRecord> {
         None
     }
 }

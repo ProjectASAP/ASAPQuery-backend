@@ -20,8 +20,8 @@
 
 use std::collections::HashMap;
 
-use crate::optimizer::OptimizerRule;
 use crate::optimizer::engine::default_rules_as_optimizer_rules;
+use crate::optimizer::OptimizerRule;
 
 /// Stable identifier for a deployment model — `asaplifecycle`,
 /// `asapquery`, `asapfusion`, etc. The string is the wire identifier
@@ -127,7 +127,10 @@ impl std::fmt::Debug for DeploymentModel {
         f.debug_struct("DeploymentModel")
             .field("id", &self.id)
             .field("rule_count", &self.rules.len())
-            .field("rule_names", &self.rules.iter().map(|r| r.name()).collect::<Vec<_>>())
+            .field(
+                "rule_names",
+                &self.rules.iter().map(|r| r.name()).collect::<Vec<_>>(),
+            )
             .field("emitters", &self.emitters)
             .finish()
     }
@@ -199,7 +202,11 @@ mod tests {
         // The default rule set carries the 11 engine rules. (R6
         // HistogramQuantileFusion was retired in Step γ5 — see
         // `optimizer::engine` module note.)
-        assert_eq!(m.rules.len(), 11, "asaplifecycle should ship the 11 engine rules");
+        assert_eq!(
+            m.rules.len(),
+            11,
+            "asaplifecycle should ship the 11 engine rules"
+        );
         // Emitter set carries the three demo emitters.
         assert!(m.emitters.has("opamp_edge_yaml"));
         assert!(m.emitters.has("streaming_config_json"));

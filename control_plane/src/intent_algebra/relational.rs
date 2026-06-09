@@ -78,7 +78,7 @@ pub use crate::intent_algebra::agg_intent::AggIntent;
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerPartitionWrap {
     pub inner: AggIntent,
-    pub keys:  Vec<String>,
+    pub keys: Vec<String>,
 }
 
 // ── Shared sketch / predicate types ───────────────────────────────────────────
@@ -167,7 +167,7 @@ pub use crate::sketch_algebra::capability::{countmin_accuracy, hll_accuracy};
 #[derive(Debug, Clone)]
 pub struct Predicate {
     pub col: String,
-    pub op:  FilterOp,
+    pub op: FilterOp,
     pub val: FilterVal,
 }
 
@@ -226,7 +226,6 @@ pub enum FilterVal {
 #[derive(Debug, Clone)]
 pub enum QueryExpr {
     // ── Base relations ────────────────────────────────────────────────────
-
     /// A named metric stream or table.  The outermost leaf.
     Source(SourceSpec),
 
@@ -234,40 +233,37 @@ pub enum QueryExpr {
     Ref(String),
 
     // ── Filtering & projection ────────────────────────────────────────────
-
     /// σ — row-level filter (WHERE / PromQL label matchers).
     Filter {
-        pred:  ScalarExpr,
+        pred: ScalarExpr,
         input: Box<QueryExpr>,
     },
 
     /// π — column projection (SELECT list).
     Project {
-        cols:  Vec<ProjectItem>,
+        cols: Vec<ProjectItem>,
         input: Box<QueryExpr>,
     },
 
     // ── Aggregation ───────────────────────────────────────────────────────
-
     /// γ + α — GROUP BY followed by aggregate functions.
     ///
     /// `keys` is the GROUP BY column list (empty → global aggregate).
     /// `aggs` is the list of aggregate expressions to compute.
     /// `having` is an optional post-aggregation predicate.
     Aggregate {
-        keys:   Vec<String>,
-        aggs:   Vec<AggItem>,
+        keys: Vec<String>,
+        aggs: Vec<AggItem>,
         having: Option<ScalarExpr>,
-        input:  Box<QueryExpr>,
+        input: Box<QueryExpr>,
     },
 
     // ── Time / streaming operators ────────────────────────────────────────
-
     /// ψ — time window (PromQL `[5m]`; SQL tumbling/sliding window).
     Window {
         duration: Duration,
-        slide:    Option<Duration>,
-        input:    Box<QueryExpr>,
+        slide: Option<Duration>,
+        input: Box<QueryExpr>,
     },
 
     // The sketch-fused `SketchAgg` / `WindowedAgg` variants were removed:
@@ -277,10 +273,9 @@ pub enum QueryExpr {
     // shapes (`Aggregate { by: [] }` / `Window { Aggregate }`).
 
     // ── Distributed / multi-stage operators ──────────────────────────────
-
     /// Partition the stream by key-tuple (GROUP BY / `by (dims)`).
     Partition {
-        keys:  PartitionKeys,
+        keys: PartitionKeys,
         input: Box<QueryExpr>,
     },
 
@@ -288,59 +283,53 @@ pub enum QueryExpr {
     /// SQL `SELECT DISTINCT` lowers to this; the column set may be empty
     /// (full-row distinct) or multi-column. PromQL has no direct analog.
     Distinct {
-        cols:  Vec<ColumnRef>,
+        cols: Vec<ColumnRef>,
         input: Box<QueryExpr>,
     },
 
     /// τ — retain only the top-K entries (heavy hitters).
     TopK {
-        k:     u64,
-        by:    Vec<String>,
+        k: u64,
+        by: Vec<String>,
         input: Box<QueryExpr>,
     },
 
     /// ⊕ — merge sketches from independent branches (distributed union).
-    Merge {
-        inputs: Vec<QueryExpr>,
-    },
+    Merge { inputs: Vec<QueryExpr> },
 
     // ── Join operators ────────────────────────────────────────────────────
-
     /// Relational join.
     Join {
-        kind:  JoinKind,
-        pred:  Option<ScalarExpr>,
-        left:  Box<QueryExpr>,
+        kind: JoinKind,
+        pred: Option<ScalarExpr>,
+        left: Box<QueryExpr>,
         right: Box<QueryExpr>,
     },
 
     // ── Set operators ─────────────────────────────────────────────────────
-
     /// UNION / INTERSECT / EXCEPT (with or without ALL).
     SetOp {
-        kind:  SetOpKind,
-        all:   bool,
-        left:  Box<QueryExpr>,
+        kind: SetOpKind,
+        all: bool,
+        left: Box<QueryExpr>,
         right: Box<QueryExpr>,
     },
 
     // ── Ordering & limiting ───────────────────────────────────────────────
-
     /// ORDER BY.
     Sort {
-        keys:  Vec<SortKey>,
+        keys: Vec<SortKey>,
         input: Box<QueryExpr>,
     },
 
     /// LIMIT [OFFSET].
     Limit {
-        n:      u64,
+        n: u64,
         offset: u64,
-        input:  Box<QueryExpr>,
+        input: Box<QueryExpr>,
     },
 
     // ── Subquery / CTE ────────────────────────────────────────────────────
-
     /// SQL `WITH name AS (expr) IN body` or PromQL recording rule binding.
     LetBinding {
         name: String,
@@ -355,20 +344,19 @@ pub enum QueryExpr {
     // `Aggregate { Quantile(φ) }` so
     // downstream code (lowerer, optimizer, physical planner) sees a single
     // canonical Quantile intent.
-
     /// PromQL sub-query syntax: `<expr>[range:resolution]`.
     PromQLSubquery {
-        range:      Duration,
+        range: Duration,
         resolution: Option<Duration>,
-        input:      Box<QueryExpr>,
+        input: Box<QueryExpr>,
     },
 
     /// Binary operation between two instant-vector expressions (PromQL `+`, `/`, …).
     /// Also used for SQL arithmetic between sub-relations.
     BinaryOp {
-        op:           BinaryOpKind,
-        lhs:          Box<QueryExpr>,
-        rhs:          Box<QueryExpr>,
+        op: BinaryOpKind,
+        lhs: Box<QueryExpr>,
+        rhs: Box<QueryExpr>,
         vector_match: Option<VectorMatch>,
     },
 }
@@ -389,38 +377,35 @@ pub enum ScalarExpr {
 
     /// Arithmetic / comparison / logical / regex binary operator.
     BinaryOp {
-        op:  BinaryOpKind,
+        op: BinaryOpKind,
         lhs: Box<ScalarExpr>,
         rhs: Box<ScalarExpr>,
     },
 
     /// Named function call (e.g. `ABS(x)`, `DATE_TRUNC('hour', ts)`).
-    FunctionCall {
-        name: String,
-        args: Vec<ScalarExpr>,
-    },
+    FunctionCall { name: String, args: Vec<ScalarExpr> },
 
     /// Scalar sub-query (`SELECT MAX(price) FROM orders`).
     ScalarSubquery(Box<QueryExpr>),
 
     /// `expr IN (v1, v2, …)` or `NOT IN (…)`.
     InList {
-        expr:    Box<ScalarExpr>,
-        list:    Vec<ScalarExpr>,
+        expr: Box<ScalarExpr>,
+        list: Vec<ScalarExpr>,
         negated: bool,
     },
 
     /// `expr BETWEEN low AND high` or `NOT BETWEEN …`.
     Between {
-        expr:    Box<ScalarExpr>,
-        low:     Box<ScalarExpr>,
-        high:    Box<ScalarExpr>,
+        expr: Box<ScalarExpr>,
+        low: Box<ScalarExpr>,
+        high: Box<ScalarExpr>,
         negated: bool,
     },
 
     /// `expr IS NULL` / `IS NOT NULL`.
     IsNull {
-        expr:    Box<ScalarExpr>,
+        expr: Box<ScalarExpr>,
         negated: bool,
     },
 }
@@ -432,18 +417,18 @@ pub enum ScalarExpr {
 pub struct ProjectItem {
     /// Output column name (SQL `AS alias`; None → use expression name).
     pub alias: Option<String>,
-    pub expr:  ScalarExpr,
+    pub expr: ScalarExpr,
 }
 
 /// One aggregate function in a GROUP BY / AGGREGATE node.
 #[derive(Debug, Clone)]
 pub struct AggItem {
     /// Output column name.
-    pub alias:    String,
+    pub alias: String,
     /// The aggregate function.
-    pub func:     AggFunc,
+    pub func: AggFunc,
     /// Column(s) the function operates on.
-    pub col:      ColumnRef,
+    pub col: ColumnRef,
     /// Whether DISTINCT is applied before aggregation.
     pub distinct: bool,
 }
@@ -461,9 +446,13 @@ pub enum AggFunc {
     Min,
     Max,
     /// Sample / population standard deviation.
-    StdDev { population: bool },
+    StdDev {
+        population: bool,
+    },
     /// Sample / population variance.
-    Variance { population: bool },
+    Variance {
+        population: bool,
+    },
     /// Approximate quantile at φ ∈ (0, 1].  Maps to DDSketch.
     Quantile(f64),
     /// COUNT DISTINCT — maps to HLL.
@@ -477,7 +466,9 @@ pub enum AggFunc {
     /// pins to `AggIntent::Count{Exact}`.
     Frequency,
     /// Top-K heavy hitters — maps to CountSketch.
-    HeavyHitters { k: u64 },
+    HeavyHitters {
+        k: u64,
+    },
     /// PromQL `rate()` — per-second increase over a window.
     Rate,
     /// PromQL `increase()` — total increase over a window.
@@ -521,12 +512,14 @@ impl AggFunc {
             AggFunc::CountDistinct => Some(default_cardinality()),
             AggFunc::Frequency => Some(default_frequency()),
             AggFunc::HeavyHitters { .. } => Some(default_frequency()),
-            AggFunc::Count   => Some(AggIntent::Count { accuracy: AccuracyTarget::Exact }),
-            AggFunc::Sum     => Some(AggIntent::Sum),
-            AggFunc::Avg     => Some(AggIntent::Avg),
-            AggFunc::Min     => Some(AggIntent::Min),
-            AggFunc::Max     => Some(AggIntent::Max),
-            _                => None,
+            AggFunc::Count => Some(AggIntent::Count {
+                accuracy: AccuracyTarget::Exact,
+            }),
+            AggFunc::Sum => Some(AggIntent::Sum),
+            AggFunc::Avg => Some(AggIntent::Avg),
+            AggFunc::Min => Some(AggIntent::Min),
+            AggFunc::Max => Some(AggIntent::Max),
+            _ => None,
         }
     }
 }
@@ -573,11 +566,17 @@ impl QueryExpr {
             QueryExpr::Aggregate { input, .. } => input.walk(f),
 
             QueryExpr::Merge { inputs } => {
-                for i in inputs { i.walk(f); }
+                for i in inputs {
+                    i.walk(f);
+                }
             }
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
-            | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+            | QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
                 left.walk(f);
                 right.walk(f);
             }
@@ -639,7 +638,7 @@ fn scalar_from_predicates(preds: &[Predicate]) -> ScalarExpr {
     let mut iter = preds.iter().map(scalar_from_predicate);
     let first = iter.next().unwrap();
     iter.fold(first, |acc, p| ScalarExpr::BinaryOp {
-        op:  BinaryOpKind::And,
+        op: BinaryOpKind::And,
         lhs: Box::new(acc),
         rhs: Box::new(p),
     })
@@ -648,23 +647,29 @@ fn scalar_from_predicates(preds: &[Predicate]) -> ScalarExpr {
 fn scalar_from_predicate(p: &Predicate) -> ScalarExpr {
     let col = ScalarExpr::Column(p.col.clone());
     let val = match &p.val {
-        FilterVal::Str(s)  => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
-        FilterVal::Num(n)  => ScalarExpr::Literal(LiteralValue::Float(*n)),
-        FilterVal::Int(i)  => ScalarExpr::Literal(LiteralValue::Int(*i)),
-        FilterVal::Null    => ScalarExpr::Literal(LiteralValue::Null),
+        FilterVal::Str(s) => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
+        FilterVal::Num(n) => ScalarExpr::Literal(LiteralValue::Float(*n)),
+        FilterVal::Int(i) => ScalarExpr::Literal(LiteralValue::Int(*i)),
+        FilterVal::Null => ScalarExpr::Literal(LiteralValue::Null),
     };
     match &p.op {
-        FilterOp::Eq  => bin(BinaryOpKind::Eq,  col, val),
-        FilterOp::Ne  => bin(BinaryOpKind::Ne,  col, val),
-        FilterOp::Lt  => bin(BinaryOpKind::Lt,  col, val),
-        FilterOp::Le  => bin(BinaryOpKind::Le,  col, val),
-        FilterOp::Gt  => bin(BinaryOpKind::Gt,  col, val),
-        FilterOp::Ge  => bin(BinaryOpKind::Ge,  col, val),
-        FilterOp::Like    => bin(BinaryOpKind::Like,    col, val),
+        FilterOp::Eq => bin(BinaryOpKind::Eq, col, val),
+        FilterOp::Ne => bin(BinaryOpKind::Ne, col, val),
+        FilterOp::Lt => bin(BinaryOpKind::Lt, col, val),
+        FilterOp::Le => bin(BinaryOpKind::Le, col, val),
+        FilterOp::Gt => bin(BinaryOpKind::Gt, col, val),
+        FilterOp::Ge => bin(BinaryOpKind::Ge, col, val),
+        FilterOp::Like => bin(BinaryOpKind::Like, col, val),
         FilterOp::NotLike => bin(BinaryOpKind::NotLike, col, val),
-        FilterOp::IsNull     => ScalarExpr::IsNull { expr: Box::new(col), negated: false },
-        FilterOp::IsNotNull  => ScalarExpr::IsNull { expr: Box::new(col), negated: true  },
-        FilterOp::Regex(r)    => bin(
+        FilterOp::IsNull => ScalarExpr::IsNull {
+            expr: Box::new(col),
+            negated: false,
+        },
+        FilterOp::IsNotNull => ScalarExpr::IsNull {
+            expr: Box::new(col),
+            negated: true,
+        },
+        FilterOp::Regex(r) => bin(
             BinaryOpKind::Regex,
             col,
             ScalarExpr::Literal(LiteralValue::Str(r.clone())),
@@ -678,7 +683,11 @@ fn scalar_from_predicate(p: &Predicate) -> ScalarExpr {
 }
 
 fn bin(op: BinaryOpKind, lhs: ScalarExpr, rhs: ScalarExpr) -> ScalarExpr {
-    ScalarExpr::BinaryOp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+    ScalarExpr::BinaryOp {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
 }
 
 // ── Display helpers ───────────────────────────────────────────────────────────
@@ -686,21 +695,21 @@ fn bin(op: BinaryOpKind, lhs: ScalarExpr, rhs: ScalarExpr) -> ScalarExpr {
 impl std::fmt::Display for AggFunc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AggFunc::Count           => write!(f, "COUNT"),
-            AggFunc::Sum             => write!(f, "SUM"),
-            AggFunc::Avg             => write!(f, "AVG"),
-            AggFunc::Min             => write!(f, "MIN"),
-            AggFunc::Max             => write!(f, "MAX"),
-            AggFunc::StdDev { .. }   => write!(f, "STDDEV"),
+            AggFunc::Count => write!(f, "COUNT"),
+            AggFunc::Sum => write!(f, "SUM"),
+            AggFunc::Avg => write!(f, "AVG"),
+            AggFunc::Min => write!(f, "MIN"),
+            AggFunc::Max => write!(f, "MAX"),
+            AggFunc::StdDev { .. } => write!(f, "STDDEV"),
             AggFunc::Variance { .. } => write!(f, "VARIANCE"),
-            AggFunc::Quantile(p)     => write!(f, "QUANTILE({p})"),
-            AggFunc::CountDistinct   => write!(f, "COUNT_DISTINCT"),
-            AggFunc::Frequency       => write!(f, "FREQUENCY"),
+            AggFunc::Quantile(p) => write!(f, "QUANTILE({p})"),
+            AggFunc::CountDistinct => write!(f, "COUNT_DISTINCT"),
+            AggFunc::Frequency => write!(f, "FREQUENCY"),
             AggFunc::HeavyHitters { k } => write!(f, "HEAVY_HITTERS({k})"),
-            AggFunc::Rate            => write!(f, "rate"),
-            AggFunc::Increase        => write!(f, "increase"),
-            AggFunc::Delta           => write!(f, "delta"),
-            AggFunc::Custom(s)       => write!(f, "{s}"),
+            AggFunc::Rate => write!(f, "rate"),
+            AggFunc::Increase => write!(f, "increase"),
+            AggFunc::Delta => write!(f, "delta"),
+            AggFunc::Custom(s) => write!(f, "{s}"),
         }
     }
 }
@@ -740,9 +749,9 @@ mod tests {
     fn source_name_extracted_through_chain() {
         let qe = QueryExpr::Window {
             duration: Duration::from_secs(60),
-            slide:    None,
+            slide: None,
             input: Box::new(QueryExpr::Filter {
-                pred:  ScalarExpr::Literal(LiteralValue::Bool(true)),
+                pred: ScalarExpr::Literal(LiteralValue::Bool(true)),
                 input: Box::new(src("my_metric")),
             }),
         };
@@ -800,22 +809,36 @@ mod tests {
     #[test]
     fn two_preds_become_and_tree() {
         let preds = vec![
-            Predicate { col: "a".into(), op: FilterOp::Eq, val: FilterVal::Int(1) },
-            Predicate { col: "b".into(), op: FilterOp::Gt, val: FilterVal::Num(2.0) },
+            Predicate {
+                col: "a".into(),
+                op: FilterOp::Eq,
+                val: FilterVal::Int(1),
+            },
+            Predicate {
+                col: "b".into(),
+                op: FilterOp::Gt,
+                val: FilterVal::Num(2.0),
+            },
         ];
         let s = scalar_from_predicates(&preds);
-        assert!(matches!(s, ScalarExpr::BinaryOp { op: BinaryOpKind::And, .. }));
+        assert!(matches!(
+            s,
+            ScalarExpr::BinaryOp {
+                op: BinaryOpKind::And,
+                ..
+            }
+        ));
     }
 
     // ── BinaryOpKind display ──────────────────────────────────────────────────
 
     #[test]
     fn binary_op_kind_display() {
-        assert_eq!(BinaryOpKind::Add.to_string(),       "+");
-        assert_eq!(BinaryOpKind::And.to_string(),       "AND");
-        assert_eq!(BinaryOpKind::Regex.to_string(),     "=~");
-        assert_eq!(BinaryOpKind::NotRegex.to_string(),  "!~");
-        assert_eq!(BinaryOpKind::Unless.to_string(),    "unless");
+        assert_eq!(BinaryOpKind::Add.to_string(), "+");
+        assert_eq!(BinaryOpKind::And.to_string(), "AND");
+        assert_eq!(BinaryOpKind::Regex.to_string(), "=~");
+        assert_eq!(BinaryOpKind::NotRegex.to_string(), "!~");
+        assert_eq!(BinaryOpKind::Unless.to_string(), "unless");
     }
 
     // ── Complex nested tree ───────────────────────────────────────────────────
@@ -827,20 +850,20 @@ mod tests {
             k: 10,
             by: vec![],
             input: Box::new(QueryExpr::Partition {
-                keys:  PartitionKeys::By(vec!["symbol".into()]),
+                keys: PartitionKeys::By(vec!["symbol".into()]),
                 input: Box::new(QueryExpr::Window {
                     duration: Duration::from_secs(300),
-                    slide:    None,
-                    input:    Box::new(QueryExpr::Aggregate {
-                        keys:   vec![],
-                        aggs:   vec![AggItem {
-                            alias:    "c".into(),
-                            func:     AggFunc::Count,
-                            col:      ColumnRef::Wildcard,
+                    slide: None,
+                    input: Box::new(QueryExpr::Aggregate {
+                        keys: vec![],
+                        aggs: vec![AggItem {
+                            alias: "c".into(),
+                            func: AggFunc::Count,
+                            col: ColumnRef::Wildcard,
                             distinct: false,
                         }],
                         having: None,
-                        input:  Box::new(src("price")),
+                        input: Box::new(src("price")),
                     }),
                 }),
             }),
@@ -867,12 +890,14 @@ mod tests {
     #[test]
     fn promql_subquery_node() {
         let expr = QueryExpr::PromQLSubquery {
-            range:      Duration::from_secs(3600),
+            range: Duration::from_secs(3600),
             resolution: Some(Duration::from_secs(60)),
-            input:      Box::new(QueryExpr::Source(SourceSpec { name: "m".into() })),
+            input: Box::new(QueryExpr::Source(SourceSpec { name: "m".into() })),
         };
         match expr {
-            QueryExpr::PromQLSubquery { range, resolution, .. } => {
+            QueryExpr::PromQLSubquery {
+                range, resolution, ..
+            } => {
                 assert_eq!(range, Duration::from_secs(3600));
                 assert_eq!(resolution, Some(Duration::from_secs(60)));
             }
@@ -896,7 +921,7 @@ mod tests {
     fn per_partition_wrap_carries_inner_and_keys() {
         let wrap = PerPartitionWrap {
             inner: default_cardinality(),
-            keys:  vec!["region".into()],
+            keys: vec!["region".into()],
         };
         assert_eq!(wrap.keys, vec!["region".to_string()]);
         assert!(agg_is_mergeable(&wrap.inner));
@@ -916,5 +941,4 @@ mod tests {
         assert!(agg_is_exact(&AggIntent::Max));
         assert!(!agg_is_exact(&default_cardinality()));
     }
-
 }

@@ -585,8 +585,10 @@ impl PartReader {
             None
         } else {
             Some(
-                crate::storage_engines::types::KeyByLabelValues::deserialize_from_bytes(label_bytes)
-                    .map_err(|e| PersistError::Format(format!("label decode: {}", e)))?,
+                crate::storage_engines::types::KeyByLabelValues::deserialize_from_bytes(
+                    label_bytes,
+                )
+                .map_err(|e| PersistError::Format(format!("label decode: {}", e)))?,
             )
         };
         cursor += label_padded;
@@ -620,8 +622,8 @@ fn map_file(path: &Path) -> PersistResult<Mmap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::KeyByLabelValues;
     use crate::storage_engines::sketch_db::index::persistence::source::EpochSnapshotEntry;
+    use crate::storage_engines::types::KeyByLabelValues;
     use tempfile::TempDir;
 
     fn make_snapshot() -> EpochSnapshot {

@@ -538,14 +538,20 @@ fn walk_children_zero_cost_bundled(
         | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
-        | QueryExpr::Limit { child, .. } => subtree_cost_bundled(child, binding_costs, schema_scope),
+        | QueryExpr::Limit { child, .. } => {
+            subtree_cost_bundled(child, binding_costs, schema_scope)
+        }
         QueryExpr::Merge { children } => children
             .iter()
             .map(|c| subtree_cost_bundled(c, binding_costs, schema_scope))
             .sum(),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
-        | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
             let l = subtree_cost_bundled(left, binding_costs, schema_scope)?;
             let r = subtree_cost_bundled(right, binding_costs, schema_scope)?;
             Ok(l + r)
@@ -617,7 +623,11 @@ fn walk_children_zero_cost_standalone(
             .sum(),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
-        | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
             let l = subtree_cost_standalone(left, binding_costs, schema_scope)?;
             let r = subtree_cost_standalone(right, binding_costs, schema_scope)?;
             Ok(l + r)

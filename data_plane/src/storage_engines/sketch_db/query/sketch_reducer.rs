@@ -55,6 +55,10 @@ use std::sync::Arc;
 use asap_sketchlib::CountMinSketch;
 use asap_sketchlib::CountSketch;
 
+use crate::storage_engines::sketch_db::index::{
+    AggregationType, Capability, SketchEncoding, SketchInstanceMetadata, SketchKindHandle,
+    SketchSampleState, SketchStore,
+};
 use crate::storage_engines::sketch_db::query::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
     decode_cms_with_heap_from_msgpack, decode_cms_with_heap_from_msgpack_delta,
@@ -62,10 +66,6 @@ use crate::storage_engines::sketch_db::query::decoders::{
 };
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
-};
-use crate::storage_engines::sketch_db::index::{
-    AggregationType, Capability, SketchEncoding, SketchStore, SketchInstanceMetadata,
-    SketchKindHandle, SketchSampleState,
 };
 use promql_utilities::query_logics::enums::Statistic;
 
@@ -344,7 +344,16 @@ impl<'a> SketchReducer<'a> {
             "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
         );
         // Legacy string entry: no item-key channel — always bucket-total.
-        self.evaluate_core(sids, family, is_cumulative, function_name, function_args, None, t0_ms, t1_ms)
+        self.evaluate_core(
+            sids,
+            family,
+            is_cumulative,
+            function_name,
+            function_args,
+            None,
+            t0_ms,
+            t1_ms,
+        )
     }
 
     /// Typed-dispatch sister of [`Self::evaluate`] (P2-4). Picks the
@@ -390,7 +399,16 @@ impl<'a> SketchReducer<'a> {
             QueryFamily::FrequencyTopk => "topk",
             QueryFamily::FrequencyEstimate => "frequency",
         };
-        self.evaluate_core(sids, family, is_cumulative, function_label, function_args, item_key, t0_ms, t1_ms)
+        self.evaluate_core(
+            sids,
+            family,
+            is_cumulative,
+            function_label,
+            function_args,
+            item_key,
+            t0_ms,
+            t1_ms,
+        )
     }
 
     /// Shared evaluation core for the string ([`Self::evaluate`]) and
@@ -498,7 +516,10 @@ impl<'a> SketchReducer<'a> {
                     if w_end_u64 > cov_hi {
                         cov_hi = w_end_u64;
                     }
-                    let cms_heap = match meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids") {
+                    let cms_heap = match meta
+                        .sketch_kind()
+                        .expect("ASAP-tier reducer only handles sketch-backed sids")
+                    {
                         SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
                             // Both heap-bearing variants serialize the
                             // outer `CountMinSketchWithHeap` envelope via
@@ -528,7 +549,9 @@ impl<'a> SketchReducer<'a> {
                             // routes through QueryFamily::FrequencyEstimate).
                             return Err(ASAPTierError::MissingHeap {
                                 sid,
-                                sketch_kind: meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids"),
+                                sketch_kind: meta
+                                    .sketch_kind()
+                                    .expect("ASAP-tier reducer only handles sketch-backed sids"),
                             });
                         }
                         other => {
@@ -555,7 +578,11 @@ impl<'a> SketchReducer<'a> {
             }
 
             // Quantile / Cardinality with delta stitching.
-            let delta_kind = match (family, meta.sketch_kind().expect("ASAP-tier reducer only handles sketch-backed sids")) {
+            let delta_kind = match (
+                family,
+                meta.sketch_kind()
+                    .expect("ASAP-tier reducer only handles sketch-backed sids"),
+            ) {
                 (QueryFamily::Quantile, SketchKindHandle::DDSketch) => DeltaSketchKind::DDSketch,
                 (QueryFamily::Quantile, SketchKindHandle::Kll) => DeltaSketchKind::Kll,
                 (QueryFamily::Cardinality, SketchKindHandle::Hll) => DeltaSketchKind::Hll,
@@ -775,7 +802,11 @@ impl<'a> SketchReducer<'a> {
 
                 for (window_end, acc) in samples {
                     any_window = true;
-                    let w = if window_end >= 0 { window_end as u64 } else { 0 };
+                    let w = if window_end >= 0 {
+                        window_end as u64
+                    } else {
+                        0
+                    };
                     if w < cov_lo {
                         cov_lo = w;
                     }
@@ -827,11 +858,8 @@ impl<'a> SketchReducer<'a> {
                     }
                 }
             }
-            let value = match merged.query_statistic(
-                stat,
-                &None,
-                &std::collections::HashMap::new(),
-            ) {
+            let value = match merged.query_statistic(stat, &None, &std::collections::HashMap::new())
+            {
                 Ok(v) => v,
                 Err(e) => {
                     return Err(ASAPTierError::DeserializeFailure {
@@ -972,9 +1000,7 @@ impl<'a> SketchReducer<'a> {
         let mut span_lo: u64 = u64::MAX;
         let mut span_hi: u64 = 0;
         for &sid in sids {
-            if let Some((start, end)) =
-                self.index.exact_agg_coverage_bounds(sid, t0_ms, t1_ms)
-            {
+            if let Some((start, end)) = self.index.exact_agg_coverage_bounds(sid, t0_ms, t1_ms) {
                 if start < span_lo {
                     span_lo = start;
                 }
@@ -1027,7 +1053,10 @@ impl<'a> SketchReducer<'a> {
                     // pairs by key for canonical ordering — BTreeMap
                     // iteration is already key-sorted, so collecting
                     // is enough.
-                    label_map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    label_map
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
                 } else {
                     group_by_keys
                         .iter()
@@ -1043,7 +1072,11 @@ impl<'a> SketchReducer<'a> {
 
                 for (window_end, acc) in samples {
                     any_window = true;
-                    let w = if window_end >= 0 { window_end as u64 } else { 0 };
+                    let w = if window_end >= 0 {
+                        window_end as u64
+                    } else {
+                        0
+                    };
                     if w < cov_lo {
                         cov_lo = w;
                     }
@@ -1055,20 +1088,16 @@ impl<'a> SketchReducer<'a> {
                         None => {
                             *slot = Some(acc.clone_boxed_core());
                         }
-                        Some(prev) => {
-                            match prev.merge_with(acc.as_ref()) {
-                                Ok(m) => *slot = Some(m),
-                                Err(e) => {
-                                    return Err(ASAPTierError::DeserializeFailure {
-                                        sid,
-                                        encoding: SketchEncoding::ProtoFull,
-                                        reason: format!(
-                                            "exact-agg rate merge failed: {e}"
-                                        ),
-                                    });
-                                }
+                        Some(prev) => match prev.merge_with(acc.as_ref()) {
+                            Ok(m) => *slot = Some(m),
+                            Err(e) => {
+                                return Err(ASAPTierError::DeserializeFailure {
+                                    sid,
+                                    encoding: SketchEncoding::ProtoFull,
+                                    reason: format!("exact-agg rate merge failed: {e}"),
+                                });
                             }
-                        }
+                        },
                     }
                 }
             }
@@ -1093,19 +1122,13 @@ impl<'a> SketchReducer<'a> {
                 Some(m) => m,
                 None => continue,
             };
-            let raw = match merged.query_statistic(
-                stat,
-                &None,
-                &std::collections::HashMap::new(),
-            ) {
+            let raw = match merged.query_statistic(stat, &None, &std::collections::HashMap::new()) {
                 Ok(v) => v,
                 Err(e) => {
                     return Err(ASAPTierError::DeserializeFailure {
                         sid: 0,
                         encoding: SketchEncoding::ProtoFull,
-                        reason: format!(
-                            "exact-agg rate query_statistic({stat:?}) failed: {e}"
-                        ),
+                        reason: format!("exact-agg rate query_statistic({stat:?}) failed: {e}"),
                     });
                 }
             };
@@ -1173,15 +1196,15 @@ impl<'a> SketchReducer<'a> {
                 None => continue,
             };
             metric_name_for_err = meta.metric_name.clone();
-            let sketch_kind = meta.sketch_kind().ok_or_else(|| {
-                ASAPTierError::UnsupportedCapability {
-                    function: "frequency_rate".to_string(),
-                    capability: meta
-                        .capability
-                        .clone()
-                        .unwrap_or(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
-                }
-            })?;
+            let sketch_kind =
+                meta.sketch_kind()
+                    .ok_or_else(|| ASAPTierError::UnsupportedCapability {
+                        function: "frequency_rate".to_string(),
+                        capability: meta
+                            .capability
+                            .clone()
+                            .unwrap_or(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+                    })?;
 
             let series_list = self.index.query_range(sid, t0_ms, t1_ms);
             for ts in series_list {
@@ -1315,9 +1338,8 @@ fn decode_frequency_total(
                 }
                 // PROTO_DELTA: reconstruct the window's full state by
                 // applying the sparse cell delta onto an empty base.
-                SketchEncoding::ProtoDelta => {
-                    decode_cs_from_proto_delta(&state.bytes).map_err(|e| to_err(e, state.encoding))?
-                }
+                SketchEncoding::ProtoDelta => decode_cs_from_proto_delta(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
                 SketchEncoding::MsgpackDelta => {
                     return Err(to_err(
                         "CountSketch (heap-less) MSGPACK_DELTA is not a valid producer encoding \
@@ -1377,29 +1399,32 @@ fn decode_frequency_estimate(
     };
     match sketch_kind {
         SketchKindHandle::CountMin => {
-            let cms = match state.encoding {
-                SketchEncoding::ProtoFull => decode_cms_from_proto(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
-                SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
-                SketchEncoding::ProtoDelta => decode_cms_from_proto_delta(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
-                SketchEncoding::MsgpackDelta => {
-                    return Err(to_err(
-                        "CountMin (heap-less) MSGPACK_DELTA is not a valid producer encoding"
-                            .to_string(),
-                        state.encoding,
-                    ));
-                }
-            };
+            let cms =
+                match state.encoding {
+                    SketchEncoding::ProtoFull => decode_cms_from_proto(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    SketchEncoding::MsgpackFull => decode_cms_from_msgpack(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    SketchEncoding::ProtoDelta => decode_cms_from_proto_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?,
+                    SketchEncoding::MsgpackDelta => {
+                        return Err(to_err(
+                            "CountMin (heap-less) MSGPACK_DELTA is not a valid producer encoding"
+                                .to_string(),
+                            state.encoding,
+                        ));
+                    }
+                };
             Ok(cms.estimate(key).max(0.0))
         }
         SketchKindHandle::CountSketch => {
             let cs = match state.encoding {
-                SketchEncoding::ProtoFull => decode_cs_from_proto(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
-                SketchEncoding::MsgpackFull => decode_cs_from_msgpack(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::ProtoFull => {
+                    decode_cs_from_proto(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
+                SketchEncoding::MsgpackFull => {
+                    decode_cs_from_msgpack(&state.bytes).map_err(|e| to_err(e, state.encoding))?
+                }
                 SketchEncoding::ProtoDelta => decode_cs_from_proto_delta(&state.bytes)
                     .map_err(|e| to_err(e, state.encoding))?,
                 SketchEncoding::MsgpackDelta => {
@@ -1414,8 +1439,10 @@ fn decode_frequency_estimate(
         }
         SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
             let heap = match state.encoding {
-                SketchEncoding::MsgpackDelta => decode_cms_with_heap_from_msgpack_delta(&state.bytes)
-                    .map_err(|e| to_err(e, state.encoding))?,
+                SketchEncoding::MsgpackDelta => {
+                    decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?
+                }
                 _ => decode_cms_with_heap_from_msgpack(&state.bytes)
                     .map_err(|e| to_err(e, state.encoding))?,
             };

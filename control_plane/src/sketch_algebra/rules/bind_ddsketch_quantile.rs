@@ -22,8 +22,8 @@
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
-use crate::sketch_algebra::rules::Rule;
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
+use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
 
 /// Bind a single-intent `Aggregate{Quantile{q, accuracy}}` to DDSketch.

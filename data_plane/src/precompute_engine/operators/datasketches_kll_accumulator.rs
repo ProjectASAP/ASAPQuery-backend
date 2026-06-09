@@ -34,7 +34,6 @@ impl DatasketchesKLLAccumulator {
         self.inner.quantile(quantile)
     }
 
-
     /// Decode from the modified OTLP wire format's
     /// `KLLSketchDataPoint.sketch` bytes when
     /// `encoding = KLL_SKETCH_ENCODING_MSGPACK`. The bytes are the

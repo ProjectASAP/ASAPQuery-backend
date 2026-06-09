@@ -176,10 +176,7 @@ pub fn resolve_column_refs(
 ///
 /// Used by `lower::convert` to translate a legacy
 /// `Aggregate.keys: Vec<String>` into the canonical `by: Vec<ColumnId>`.
-pub fn resolve_named_keys(
-    keys: &[String],
-    schema: &Schema,
-) -> Result<Vec<ColumnId>, ResolveError> {
+pub fn resolve_named_keys(keys: &[String], schema: &Schema) -> Result<Vec<ColumnId>, ResolveError> {
     keys.iter()
         .map(|name| {
             schema
@@ -246,11 +243,7 @@ pub fn resolve_named_keys(
 /// assert!(output.time_index.is_none());         // time axis stripped
 /// assert!(output.unique_keys.is_empty());       // global agg → no UK
 /// ```
-pub fn output_schema_for_aggregate(
-    input: &Schema,
-    by: &[ColumnId],
-    aggs: &[AggIntent],
-) -> Schema {
+pub fn output_schema_for_aggregate(input: &Schema, by: &[ColumnId], aggs: &[AggIntent]) -> Schema {
     let mut out_cols: Vec<Column> = Vec::with_capacity(by.len() + aggs.len());
     // GROUP BY columns flow through positionally.
     for &id in by {

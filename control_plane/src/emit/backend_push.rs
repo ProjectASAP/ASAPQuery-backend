@@ -92,9 +92,7 @@ fn jitter_ms(start: Instant, cap_ms: u64) -> u64 {
 fn backoff_delay(attempt: u32, start: Instant) -> Duration {
     // Exponential base: 100ms, 300ms, 900ms, 2.7s, 2.7s (capped).
     let exp = 3u64.saturating_pow(attempt.saturating_sub(1));
-    let base_ms = RETRY_BASE_DELAY
-        .as_millis()
-        .saturating_mul(exp as u128) as u64;
+    let base_ms = RETRY_BASE_DELAY.as_millis().saturating_mul(exp as u128) as u64;
     let base_ms = base_ms.min(RETRY_DELAY_CAP.as_millis() as u64);
     // Full jitter: pick a value in [0, base_ms].
     let with_jitter = jitter_ms(start, base_ms);
@@ -304,6 +302,9 @@ pub async fn post_typed_backend_for_role(
     metric: &str,
     role: AggRole,
     be: BackendStageConfig,
+    // CDM monitor specs to embed in the cumulative streaming-config (global, so
+    // included on every coupled push). Empty for non-monitored deployments.
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     // ── 1. Update cache and collect cumulative entries ───────────────────
     //
@@ -314,10 +315,8 @@ pub async fn post_typed_backend_for_role(
     let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
         let mut cache = cache.lock().await;
         cache.insert((metric.to_string(), role), be);
-        let mut v: Vec<((String, AggRole), BackendStageConfig)> = cache
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut v: Vec<((String, AggRole), BackendStageConfig)> =
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         // Deterministic ordering so the emitted JSON body is
         // reproducible across runs (HashMap iteration would otherwise
         // make captured-body regression assertions flaky).
@@ -329,7 +328,14 @@ pub async fn post_typed_backend_for_role(
         v
     };
 
-    push_cumulative_entries(backend_client, &cumulative_entries, metric, Some(role)).await
+    push_cumulative_entries(
+        backend_client,
+        &cumulative_entries,
+        metric,
+        Some(role),
+        monitors,
+    )
+    .await
 }
 
 /// Re-POST the FULL cumulative streaming-config + storage-routing derived
@@ -356,6 +362,7 @@ pub async fn post_typed_backend_for_role(
 pub async fn repost_cumulative_backend_config(
     backend_client: Option<&Arc<BackendClient>>,
     cache: &BackendRoutingCache,
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
         let cache = cache.lock().await;
@@ -365,10 +372,8 @@ pub async fn repost_cumulative_backend_config(
             // wipe a backend that an out-of-band path populated.
             return PushOutcome::Skipped;
         }
-        let mut v: Vec<((String, AggRole), BackendStageConfig)> = cache
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut v: Vec<((String, AggRole), BackendStageConfig)> =
+            cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         v.sort_by(|(a_k, _), (b_k, _)| {
             a_k.0
                 .cmp(&b_k.0)
@@ -376,7 +381,14 @@ pub async fn repost_cumulative_backend_config(
         });
         v
     };
-    push_cumulative_entries(backend_client, &cumulative_entries, "<periodic-refresh>", None).await
+    push_cumulative_entries(
+        backend_client,
+        &cumulative_entries,
+        "<periodic-refresh>",
+        None,
+        monitors,
+    )
+    .await
 }
 
 /// Shared push body for [`post_typed_backend_for_role`] and
@@ -391,6 +403,7 @@ async fn push_cumulative_entries(
     cumulative_entries: &[((String, AggRole), BackendStageConfig)],
     metric: &str,
     role: Option<AggRole>,
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     // ── Build BOTH cumulative documents up front (P2-3) ───────────────────
     //
@@ -414,7 +427,7 @@ async fn push_cumulative_entries(
             .flat_map(|(_, c)| c.readouts.iter().cloned())
             .collect(),
     };
-    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be) {
+    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be, monitors) {
         Ok(doc) => doc.to_string(),
         Err(e) => {
             warn!(error = %e, "emit_backend_streaming_config_json failed; skipping coupled push");
@@ -435,10 +448,12 @@ async fn push_cumulative_entries(
     // role) — so the merge happens here.
     let mut by_metric: BTreeMap<String, BackendStageConfig> = BTreeMap::new();
     for ((m, _r), cfg) in cumulative_entries.iter() {
-        let entry = by_metric.entry(m.clone()).or_insert_with(|| BackendStageConfig {
-            aggregations: Vec::new(),
-            readouts: Vec::new(),
-        });
+        let entry = by_metric
+            .entry(m.clone())
+            .or_insert_with(|| BackendStageConfig {
+                aggregations: Vec::new(),
+                readouts: Vec::new(),
+            });
         entry.aggregations.extend(cfg.aggregations.iter().cloned());
         entry.readouts.extend(cfg.readouts.iter().cloned());
     }
@@ -453,7 +468,9 @@ async fn push_cumulative_entries(
         }
     };
 
-    let role_label = role.map(|r| r.as_str().to_string()).unwrap_or_else(|| "*".to_string());
+    let role_label = role
+        .map(|r| r.as_str().to_string())
+        .unwrap_or_else(|| "*".to_string());
     info!(
         stage = "backend",
         metric = %metric,
@@ -536,7 +553,10 @@ mod tests {
             "expected retry to happen at least once, got {attempts} attempt(s)"
         );
         assert_eq!(attempts, 2, "should succeed on the 2nd attempt");
-        assert!(outcome.is_ok(), "expected Ok after recovery, got {outcome:?}");
+        assert!(
+            outcome.is_ok(),
+            "expected Ok after recovery, got {outcome:?}"
+        );
     }
 
     /// Permanent failures (4xx other than 404) MUST short-circuit on
@@ -555,10 +575,20 @@ mod tests {
         })
         .await;
 
-        assert_eq!(attempts, 1, "permanent error must not retry: got {attempts} attempts");
+        assert_eq!(
+            attempts, 1,
+            "permanent error must not retry: got {attempts} attempts"
+        );
         assert!(outcome.is_err(), "permanent error should surface as Err");
-        assert!(!outcome.unwrap_err().is_transient(), "outcome must remain permanent");
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "closure called exactly once");
+        assert!(
+            !outcome.unwrap_err().is_transient(),
+            "outcome must remain permanent"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "closure called exactly once"
+        );
     }
 
     /// Exhausting all retries returns the final Transient error with
@@ -624,7 +654,6 @@ mod tests {
         }
     }
 
-
     fn make_be(metric: &str, agg_id: &str) -> BackendStageConfig {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendReadout,
@@ -658,7 +687,7 @@ mod tests {
     async fn no_client_still_updates_cache() {
         let cache = Mutex::new(HashMap::new());
         let be = make_be("m", "agg0");
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, be).await;
+        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, be, &[]).await;
         let snap = cache.lock().await;
         assert_eq!(snap.len(), 1);
         assert!(snap.contains_key(&("m".to_string(), AggRole::Quantile)));
@@ -676,6 +705,7 @@ mod tests {
             "http_requests_total",
             AggRole::Quantile,
             make_be("http_requests_total", "q"),
+            &[],
         )
         .await;
         post_typed_backend_for_role(
@@ -684,6 +714,7 @@ mod tests {
             "http_requests_total",
             AggRole::Sum,
             make_be("http_requests_total", "s"),
+            &[],
         )
         .await;
         let snap = cache.lock().await;
@@ -699,10 +730,24 @@ mod tests {
     #[tokio::test]
     async fn same_pair_replaces_not_duplicates() {
         let cache = Mutex::new(HashMap::new());
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "v1"))
-            .await;
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "v2"))
-            .await;
+        post_typed_backend_for_role(
+            None,
+            &cache,
+            "m",
+            AggRole::Quantile,
+            make_be("m", "v1"),
+            &[],
+        )
+        .await;
+        post_typed_backend_for_role(
+            None,
+            &cache,
+            "m",
+            AggRole::Quantile,
+            make_be("m", "v2"),
+            &[],
+        )
+        .await;
         let snap = cache.lock().await;
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&("m".to_string(), AggRole::Quantile)).unwrap();
@@ -742,17 +787,21 @@ mod tests {
         let app = Router::new()
             .route(
                 "/api/v1/streaming-config",
-                post(|State(m): State<DualMock>, _body: axum::body::Bytes| async move {
-                    m.streaming_hits.fetch_add(1, StdOrdering::SeqCst);
-                    m.streaming_status
-                }),
+                post(
+                    |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
+                        m.streaming_hits.fetch_add(1, StdOrdering::SeqCst);
+                        m.streaming_status
+                    },
+                ),
             )
             .route(
                 "/api/v1/storage_routing",
-                post(|State(m): State<DualMock>, _body: axum::body::Bytes| async move {
-                    m.routing_hits.fetch_add(1, StdOrdering::SeqCst);
-                    m.routing_status
-                }),
+                post(
+                    |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
+                        m.routing_hits.fetch_add(1, StdOrdering::SeqCst);
+                        m.routing_status
+                    },
+                ),
             )
             .with_state(mock.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -779,6 +828,7 @@ mod tests {
             "latency",
             AggRole::Quantile,
             make_be("latency", "q"),
+            &[],
         )
         .await;
         assert_eq!(outcome, PushOutcome::BothApplied);
@@ -807,6 +857,7 @@ mod tests {
             "latency",
             AggRole::Quantile,
             make_be("latency", "q"),
+            &[],
         )
         .await;
         assert_eq!(
@@ -842,6 +893,7 @@ mod tests {
             "http_requests_total",
             AggRole::Sum,
             make_be("http_requests_total", "s"),
+            &[],
         )
         .await;
         assert_eq!(mock1.streaming_hits.load(StdOrdering::SeqCst), 1);
@@ -855,7 +907,7 @@ mod tests {
         assert_eq!(mock2.streaming_hits.load(StdOrdering::SeqCst), 0);
 
         // The periodic re-POST reads the SAME cache and re-pushes everything.
-        let outcome = repost_cumulative_backend_config(Some(&client2), &cache).await;
+        let outcome = repost_cumulative_backend_config(Some(&client2), &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::BothApplied);
         assert_eq!(
             mock2.streaming_hits.load(StdOrdering::SeqCst),
@@ -878,7 +930,7 @@ mod tests {
             start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
         let client = StdArc::new(BackendClient::new(url));
         let cache = Mutex::new(HashMap::new());
-        let outcome = repost_cumulative_backend_config(Some(&client), &cache).await;
+        let outcome = repost_cumulative_backend_config(Some(&client), &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::Skipped);
         assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 0);
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 0);
@@ -889,8 +941,9 @@ mod tests {
     #[tokio::test]
     async fn repost_no_client_is_skipped() {
         let cache = Mutex::new(HashMap::new());
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "q")).await;
-        let outcome = repost_cumulative_backend_config(None, &cache).await;
+        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "q"), &[])
+            .await;
+        let outcome = repost_cumulative_backend_config(None, &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::Skipped);
     }
 }

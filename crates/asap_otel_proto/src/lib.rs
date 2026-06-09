@@ -51,3 +51,13 @@ pub mod sketchlib {
         tonic::include_proto!("sketchlib.v1");
     }
 }
+
+/// Continuous distributed monitoring (CDM) edge↔coordinator reverse channel.
+/// Generated from `proto/monitor/monitor.proto` with both server (coordinator,
+/// in `data_plane`) and client (edge sim / tests) stubs. See the .proto header
+/// for the protocol; the Go edge runtime vendors a byte-identical copy.
+pub mod monitor {
+    pub mod v1 {
+        tonic::include_proto!("asap.monitor.v1");
+    }
+}

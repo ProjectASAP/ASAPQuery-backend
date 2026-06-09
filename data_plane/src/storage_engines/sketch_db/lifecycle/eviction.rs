@@ -301,7 +301,12 @@ mod tests {
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
         use std::sync::Arc;
         let acc = SumAccumulator::with_sum(1.0);
-        let output = crate::storage_engines::types::PrecomputedOutput::new(ts, ts + 1000, None, asap_types::PolicyFingerprint(agg_id));
+        let output = crate::storage_engines::types::PrecomputedOutput::new(
+            ts,
+            ts + 1000,
+            None,
+            asap_types::PolicyFingerprint(agg_id),
+        );
         let agg_cfg = streaming_config.get_aggregation_config(agg_id).unwrap();
         // Test-scoped resolver — each call mints fresh. Production
         // shares one resolver across all sinks; tests don't need that

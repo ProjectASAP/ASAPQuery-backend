@@ -117,13 +117,11 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::KeyByLabelValues;
-    use crate::storage_engines::sketch_db::index::persistence::part::{
-        part_dir_path, PartWriter,
-    };
+    use crate::storage_engines::sketch_db::index::persistence::part::{part_dir_path, PartWriter};
     use crate::storage_engines::sketch_db::index::persistence::source::{
         EpochSnapshot, EpochSnapshotEntry,
     };
+    use crate::storage_engines::types::KeyByLabelValues;
     use tempfile::TempDir;
 
     fn dummy_snapshot() -> EpochSnapshot {

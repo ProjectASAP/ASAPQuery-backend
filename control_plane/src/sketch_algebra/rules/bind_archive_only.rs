@@ -27,8 +27,8 @@
 #![allow(dead_code)]
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
-use crate::sketch_algebra::rules::Rule;
 use crate::sketch_algebra::physical_expr::PhysicalExpr;
+use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
 
 /// Route `Aggregate{<archive-only intent>}` to a `Logical` pass-through.

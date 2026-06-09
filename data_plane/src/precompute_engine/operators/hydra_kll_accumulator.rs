@@ -34,7 +34,6 @@ impl HydraKllSketchAccumulator {
         Err("deserialize_from_bytes for HydraKllSketchAccumulator not implemented".into())
     }
 
-
     pub fn query_key(&self, key: &KeyByLabelValues, quantile: f64) -> f64 {
         self.inner.quantile(&key.to_semicolon_str(), quantile)
     }

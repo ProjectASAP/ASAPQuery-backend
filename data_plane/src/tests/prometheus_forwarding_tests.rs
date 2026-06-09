@@ -1,8 +1,8 @@
-#[cfg(test)]
-use crate::storage_engines::types::{QueryLanguage, StreamingConfig};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
+#[cfg(test)]
+use crate::storage_engines::types::{QueryLanguage, StreamingConfig};
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
@@ -69,7 +69,8 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
         adapter_config: AdapterConfig::prometheus_promql(
             format!("http://127.0.0.1:{prometheus_port}"),
             true,
-        )};
+        ),
+    };
 
     let streaming_config = Arc::new(StreamingConfig::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(
@@ -153,7 +154,8 @@ async fn test_forwarding_disabled() {
         adapter_config: AdapterConfig::prometheus_promql(
             "http://127.0.0.1:19093".to_string(),
             false, // Forwarding disabled
-        )};
+        ),
+    };
 
     let streaming_config = Arc::new(StreamingConfig::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(
@@ -199,7 +201,8 @@ async fn test_prometheus_server_unreachable() {
         adapter_config: AdapterConfig::prometheus_promql(
             "http://127.0.0.1:99999".to_string(), // Unreachable port
             true,
-        )};
+        ),
+    };
 
     let streaming_config = Arc::new(StreamingConfig::default());
     let query_engine = Arc::new(ASAPQueryEngine::new(
