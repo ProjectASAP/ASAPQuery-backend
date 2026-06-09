@@ -27,10 +27,7 @@ pub fn should_precompute(w: &QueryWorkload) -> bool {
 /// path took `query_expr` from `StagedPlan.precompute.query_expr` instead —
 /// but that field was never populated, so the template was always the
 /// effective output; the dead path was dropped with the legacy L5.)
-pub fn build_precompute_engine_jobs(
-    w: &QueryWorkload,
-    backend_addr: &str,
-) -> Vec<PrecomputeJob> {
+pub fn build_precompute_engine_jobs(w: &QueryWorkload, backend_addr: &str) -> Vec<PrecomputeJob> {
     if !should_precompute(w) {
         return vec![];
     }

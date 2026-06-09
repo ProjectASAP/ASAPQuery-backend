@@ -64,7 +64,7 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -132,11 +132,11 @@ fn main() {
     );
     println!("{}", "-".repeat(80));
 
-    for (num_sids, iters_a, iters_b, iters_c) in
-        [(1u64, 50_000u64, 200_000u64, 50_000u64),
-         (100,            5_000,       200_000,     5_000),
-         (10_000,         500,         200_000,     500)]
-    {
+    for (num_sids, iters_a, iters_b, iters_c) in [
+        (1u64, 50_000u64, 200_000u64, 50_000u64),
+        (100, 5_000, 200_000, 5_000),
+        (10_000, 500, 200_000, 500),
+    ] {
         let a = bench_a_rebuild_per_iter(num_sids, iters_a, &payload);
         let b = bench_b_isolated_append(num_sids, iters_b, &payload);
         let c = bench_c_isolated_drop(num_sids, iters_c);
@@ -149,7 +149,9 @@ fn main() {
 
     println!();
     println!("Legend:");
-    println!("  (A) per-iter store rebuild + 1 append + drop  (≈ what the criterion bench reported)");
+    println!(
+        "  (A) per-iter store rebuild + 1 append + drop  (≈ what the criterion bench reported)"
+    );
     println!("  (B) pure append_sample on a pre-built store    (the actual per-op cost)");
     println!("  (C) drop of a freshly-built store              (the accounting term we missed)");
     println!("  A - B - C should be ≈ build_store cost (register() x num_sids).");

@@ -400,10 +400,7 @@ fn handles_compatible(required: SketchKindHandle, available: SketchKindHandle) -
 
 /// `Any` required for top-k means "any heap-bearing handle"; concrete
 /// required must match exactly.
-fn handles_compatible_for_topk(
-    required: SketchKindHandle,
-    available: SketchKindHandle,
-) -> bool {
+fn handles_compatible_for_topk(required: SketchKindHandle, available: SketchKindHandle) -> bool {
     matches!(required, SketchKindHandle::Any) || required == available
 }
 
@@ -555,9 +552,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
         // out of the box. No dedicated extrema sketch is needed; route
         // these through the quantile-family handler.
-        AggIntent::Min | AggIntent::Max => {
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
-        }
+        AggIntent::Min | AggIntent::Max => Some(Capability::QuantileApprox(SketchKindHandle::Any)),
         // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
         // These intents previously returned `None` and routed to the
         // archive engine. Now that the data plane carries
@@ -1186,13 +1181,14 @@ mod tests {
         // with QuantileApprox / CardinalityApprox / FrequencyEstimate /
         // FrequencyTopk.
         let required = Capability::ExactAgg(AggregationType::Sum);
-        assert!(!required
-            .is_satisfied_by(&Capability::QuantileApprox(SketchKindHandle::DDSketch)));
+        assert!(!required.is_satisfied_by(&Capability::QuantileApprox(SketchKindHandle::DDSketch)));
         assert!(!required.is_satisfied_by(&Capability::CardinalityApprox));
-        assert!(!required
-            .is_satisfied_by(&Capability::FrequencyEstimate(SketchKindHandle::CountMin)));
-        assert!(!required
-            .is_satisfied_by(&Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)));
+        assert!(
+            !required.is_satisfied_by(&Capability::FrequencyEstimate(SketchKindHandle::CountMin))
+        );
+        assert!(
+            !required.is_satisfied_by(&Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
+        );
 
         // And the reverse — a sketch-family required capability must
         // not match an ExactAgg-backed sid.
@@ -1278,8 +1274,7 @@ mod tests {
         let required = Capability::FrequencyTopk(SketchKindHandle::Any);
         assert!(required.is_satisfied_by(&cap));
         // And the concrete-against-concrete must match exactly.
-        let required_concrete =
-            Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
         assert!(required_concrete.is_satisfied_by(&cap));
         // A different concrete heap-bearing handle must NOT match.
         let required_cms = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
@@ -1339,19 +1334,25 @@ mod tests {
     fn outer_agg_max_fold_single_value_is_identity() {
         // Issue #296 identity case: inner already emits one row per
         // by-group; the outer max fold must return that row unchanged.
-        let v = OuterAgg::Max(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        let v = OuterAgg::Max(vec!["zone".to_string()])
+            .fold(&[42.5])
+            .unwrap();
         assert_eq!(v, 42.5);
     }
 
     #[test]
     fn outer_agg_min_fold_single_value_is_identity() {
-        let v = OuterAgg::Min(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        let v = OuterAgg::Min(vec!["zone".to_string()])
+            .fold(&[42.5])
+            .unwrap();
         assert_eq!(v, 42.5);
     }
 
     #[test]
     fn outer_agg_avg_fold_single_value_is_identity() {
-        let v = OuterAgg::Avg(vec!["zone".to_string()]).fold(&[42.5]).unwrap();
+        let v = OuterAgg::Avg(vec!["zone".to_string()])
+            .fold(&[42.5])
+            .unwrap();
         assert_eq!(v, 42.5);
     }
 
@@ -1388,13 +1389,17 @@ mod tests {
     #[test]
     fn outer_agg_stddev_fold_multi_is_population_stddev() {
         // population stddev of [1,2,3,4,5] is sqrt(2) ≈ 1.4142
-        let v = OuterAgg::Stddev(vec![]).fold(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let v = OuterAgg::Stddev(vec![])
+            .fold(&[1.0, 2.0, 3.0, 4.0, 5.0])
+            .unwrap();
         assert!((v - 2.0_f64.sqrt()).abs() < 1e-9);
     }
 
     #[test]
     fn outer_agg_stdvar_fold_multi_is_population_variance() {
-        let v = OuterAgg::Stdvar(vec![]).fold(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let v = OuterAgg::Stdvar(vec![])
+            .fold(&[1.0, 2.0, 3.0, 4.0, 5.0])
+            .unwrap();
         assert!((v - 2.0).abs() < 1e-9);
     }
 

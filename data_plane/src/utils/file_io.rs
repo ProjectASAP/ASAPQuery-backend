@@ -47,8 +47,7 @@ aggregations:
         let mut streaming_temp_file = NamedTempFile::new().unwrap();
         write!(streaming_temp_file, "{streaming_yaml_content}").unwrap();
 
-        let config =
-            read_streaming_config(streaming_temp_file.path().to_str().unwrap()).unwrap();
+        let config = read_streaming_config(streaming_temp_file.path().to_str().unwrap()).unwrap();
         assert!(!config.aggregation_configs.is_empty());
         let agg = config
             .get_all_aggregation_configs()

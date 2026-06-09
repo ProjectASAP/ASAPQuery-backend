@@ -28,5 +28,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(false)
         .compile_protos(&proto_files, &[proto_root])?;
+
+    // Monitor service (CDM edge↔coordinator reverse channel) — needs BOTH a
+    // server (coordinator) and a client (edge sim / tests), unlike the OTLP
+    // ingest protos above which are server-only.
+    let monitor_proto = "proto/monitor/monitor.proto";
+    println!("cargo:rerun-if-changed={monitor_proto}");
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&[monitor_proto], &[proto_root])?;
     Ok(())
 }

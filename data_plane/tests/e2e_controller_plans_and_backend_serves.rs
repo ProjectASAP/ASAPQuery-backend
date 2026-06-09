@@ -302,10 +302,8 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     });
 
     // HTTP query server sharing the same SketchStore + hot-reload handle.
-    let adapter_config = AdapterConfig::prometheus_promql(
-        "http://127.0.0.1:9999".to_string(),
-        false,
-    );
+    let adapter_config =
+        AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
     let http_config = HttpServerConfig {
         port: 0,
         handle_http_requests: true,
@@ -700,11 +698,7 @@ fn build_count_min_export(
 /// POST a protobuf-encoded `ExportMetricsServiceRequest` to the OTLP HTTP
 /// receiver on `localhost:port/v1/metrics`. Panics with the unexpected
 /// status code on non-2xx.
-async fn post_otlp_http(
-    client: &reqwest::Client,
-    port: u16,
-    req: ExportMetricsServiceRequest,
-) {
+async fn post_otlp_http(client: &reqwest::Client, port: u16, req: ExportMetricsServiceRequest) {
     let body = req.encode_to_vec();
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/metrics"))
@@ -748,7 +742,11 @@ async fn controller_plans_ddsketch_quantile_and_backend_parses_streaming_config(
     let aggs = streaming_config_json["aggregations"]
         .as_array()
         .expect("aggregations array");
-    assert_eq!(aggs.len(), 1, "expected exactly one BackendAggregation\n{streaming_config_json}");
+    assert_eq!(
+        aggs.len(),
+        1,
+        "expected exactly one BackendAggregation\n{streaming_config_json}"
+    );
     let agg = &aggs[0];
     assert!(
         agg.get("aggregationId").is_none(),
@@ -966,16 +964,10 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     // ── 5. Query via PromQL ────────────────────────────────────────────
-    let query_url = format!(
-        "http://127.0.0.1:{}/api/v1/query",
-        stack.backend_port
-    );
+    let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
     let response: JsonValue = client
         .get(&query_url)
-        .query(&[(
-            "query",
-            "quantile_over_time(0.99, http_latency_ms[10s])",
-        )])
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
         .send()
         .await
         .expect("PromQL query failed to send")
@@ -1020,7 +1012,8 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     );
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "PromQL quantile_over_time query against a DDSketch-backed sid \
          did not succeed via the modern execute() trait-dispatch path. \
          Response:\n{}",
@@ -1096,10 +1089,7 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[(
-            "query",
-            "quantile_over_time(0.5, request_size_bytes[10s])",
-        )])
+        .query(&[("query", "quantile_over_time(0.5, request_size_bytes[10s])")])
         .send()
         .await
         .expect("query failed")
@@ -1109,7 +1099,8 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
 
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "KLL quantile query did not succeed:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
@@ -1218,7 +1209,8 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
 
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "HLL cardinality query did not succeed:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
@@ -1274,12 +1266,7 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
     let wire_rows = d as i32;
     let wire_cols = w as i32;
 
-    let items: &[(&str, u64)] = &[
-        ("alpha", 100),
-        ("beta", 50),
-        ("gamma", 200),
-        ("delta", 75),
-    ];
+    let items: &[(&str, u64)] = &[("alpha", 100), ("beta", 50), ("gamma", 200), ("delta", 75)];
     let sketch_bytes = build_heap_bearing_msgpack(rows, cols, 10, items);
 
     let now_ns = std::time::SystemTime::now()
@@ -1325,7 +1312,8 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
         .expect("response not JSON");
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "count_over_time(...) against heap-bearing CountSketch must succeed \
          end-to-end. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
@@ -1430,7 +1418,8 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
         .expect("response not JSON");
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "count_over_time(...) against heap-less CMS must succeed end-to-end. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
@@ -1464,7 +1453,12 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
 /// Build a msgpack-encoded `CountMinSketchWithHeap` payload populated
 /// with the supplied `(key, count)` pairs. Returns the bytes ready
 /// for the OTLP DP's `sketch` field with `encoding=MSGPACK`.
-fn build_heap_bearing_msgpack(rows: usize, cols: usize, top_k: usize, items: &[(&str, u64)]) -> Vec<u8> {
+fn build_heap_bearing_msgpack(
+    rows: usize,
+    cols: usize,
+    top_k: usize,
+    items: &[(&str, u64)],
+) -> Vec<u8> {
     use asap_sketchlib::CountMinSketchWithHeap;
     let mut cms = CountMinSketchWithHeap::new(rows, cols, top_k);
     for (key, count) in items {
@@ -1483,8 +1477,12 @@ fn build_heap_bearing_msgpack(rows: usize, cols: usize, top_k: usize, items: &[(
 /// content match probes `parameters.w` and `parameters.d`).
 fn extract_w_d_from_streaming_config(streaming_config_json: &JsonValue) -> (u32, u32) {
     let params = &streaming_config_json["aggregations"][0]["parameters"];
-    let w = params["w"].as_u64().expect("streaming-config aggregation must carry parameters.w") as u32;
-    let d = params["d"].as_u64().expect("streaming-config aggregation must carry parameters.d") as u32;
+    let w = params["w"]
+        .as_u64()
+        .expect("streaming-config aggregation must carry parameters.w") as u32;
+    let d = params["d"]
+        .as_u64()
+        .expect("streaming-config aggregation must carry parameters.d") as u32;
     (w, d)
 }
 
@@ -1716,7 +1714,8 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
         .expect("response not JSON");
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "topk(...) on CmsWithHeap must succeed end-to-end. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
@@ -1736,11 +1735,7 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
     );
     let mut values: Vec<f64> = arr
         .iter()
-        .filter_map(|e| {
-            e["value"][1]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-        })
+        .filter_map(|e| e["value"][1].as_str().and_then(|s| s.parse::<f64>().ok()))
         .collect();
     values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let mut found_gamma = false;
@@ -1759,7 +1754,10 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
     assert!(
-        values.first().map(|v| (v - 200.0).abs() < 1.0).unwrap_or(false),
+        values
+            .first()
+            .map(|v| (v - 200.0).abs() < 1.0)
+            .unwrap_or(false),
         "topk(3) on heap-bearing CMS must surface `gamma`'s count (200) as \
          the top value (received {values:?}). Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
@@ -1868,7 +1866,8 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch_with_heap_topk() {
         .expect("response not JSON");
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "topk(...) on CountSketchWithHeap must succeed end-to-end. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
@@ -1887,15 +1886,14 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch_with_heap_topk() {
     );
     let mut values: Vec<f64> = arr
         .iter()
-        .filter_map(|e| {
-            e["value"][1]
-                .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
-        })
+        .filter_map(|e| e["value"][1].as_str().and_then(|s| s.parse::<f64>().ok()))
         .collect();
     values.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     assert!(
-        values.first().map(|v| (v - 200.0).abs() < 1.0).unwrap_or(false),
+        values
+            .first()
+            .map(|v| (v - 200.0).abs() < 1.0)
+            .unwrap_or(false),
         "topk(3) on heap-bearing CountSketch must surface `gamma`'s count (200) \
          as the top value (received {values:?}). Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
@@ -1997,14 +1995,16 @@ async fn controller_plan_to_range_query_count_over_time_cms() {
         .expect("response not JSON");
     let status = response["status"].as_str().unwrap_or("(missing)");
     assert_eq!(
-        status, "success",
+        status,
+        "success",
         "count_over_time(...) range-query against heap-less CMS must succeed \
          end-to-end via the modern execute_range_promql_modern fallback. \
          Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
     assert_eq!(
-        response["data"]["resultType"], "matrix",
+        response["data"]["resultType"],
+        "matrix",
         "range-query result must carry resultType=matrix per the Prometheus \
          /api/v1/query_range wire spec. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()

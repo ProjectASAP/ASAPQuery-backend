@@ -272,7 +272,11 @@ impl BackendClient {
             Ok(())
         } else {
             let body = resp.text().await.unwrap_or_default();
-            Err(classify_http_status(status, body, "storage-routing JSON POST"))
+            Err(classify_http_status(
+                status,
+                body,
+                "storage-routing JSON POST",
+            ))
         }
     }
 
@@ -583,10 +587,7 @@ mod tests {
             .post_streaming_config_json_typed("{}".to_string())
             .await
             .expect_err("400 should surface as Err");
-        assert!(
-            !err.is_transient(),
-            "400 must classify as permanent: {err}"
-        );
+        assert!(!err.is_transient(), "400 must classify as permanent: {err}");
     }
 
     /// Typed-variant classification: connection refused (no listener

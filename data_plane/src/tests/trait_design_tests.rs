@@ -1,8 +1,8 @@
+use crate::precompute_engine::operators::{MultipleSumAccumulator, SumAccumulator};
 #[cfg(test)]
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
 };
-use crate::precompute_engine::operators::{MultipleSumAccumulator, SumAccumulator};
 use promql_utilities::Statistic;
 
 #[test]

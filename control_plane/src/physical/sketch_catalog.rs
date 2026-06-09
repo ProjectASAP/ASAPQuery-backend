@@ -10,10 +10,7 @@
 //! All callers now go through this module.
 
 use crate::intent_algebra::relational::{agg_accuracy, AggIntent, PerPartitionWrap};
-use crate::types::{
-    AggType, SketchDefaults,
-    SketchParams, SketchType,
-};
+use crate::types::{AggType, SketchDefaults, SketchParams, SketchType};
 
 // ── AggType → candidate SketchTypes ──────────────────────────────────────────
 
@@ -30,9 +27,9 @@ use crate::types::{
 /// | Frequency   | CountSketch, CountMinSketch  |
 pub fn candidates_for_agg(agg: &AggType) -> &'static [SketchType] {
     match agg {
-        AggType::Quantile    => &[SketchType::DDSketch, SketchType::KLL],
+        AggType::Quantile => &[SketchType::DDSketch, SketchType::KLL],
         AggType::Cardinality => &[SketchType::HLL],
-        AggType::Frequency   => &[SketchType::CountSketch, SketchType::CountMinSketch],
+        AggType::Frequency => &[SketchType::CountSketch, SketchType::CountMinSketch],
     }
 }
 
@@ -108,14 +105,14 @@ pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
             let registers = ((1.04 / acc).powi(2) as u32).next_power_of_two();
             let precision = (registers as f64).log2() as u32;
             SketchParams::HLL { precision }
-        },
+        }
         AggIntent::Frequency { .. } => {
             let acc = agg_accuracy(op);
             SketchParams::CountSketch {
                 epsilon: acc,
                 delta: 0.01,
             }
-        },
+        }
         // Min / Max — preserve the legacy `Extrema` mapping (DDSketch over
         // the 0.0 / 1.0 boundary quantiles).
         AggIntent::Min | AggIntent::Max => SketchParams::DDSketch {
@@ -155,13 +152,13 @@ pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
             // HLL: registers ≈ (1.04/accuracy)^2, memory = registers
             let registers = ((1.04 / acc).powi(2) as u64).next_power_of_two();
             registers.max(16)
-        },
+        }
         AggIntent::Frequency { .. } => {
             let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
             // CMS: width ≈ e/accuracy, depth ≈ 5, memory = width*depth*8
             let width = (std::f64::consts::E / acc) as u64;
             width * 5 * 8
-        },
+        }
         // Legacy `Extrema { .. }` (now canonical Min / Max) — 16 bytes.
         AggIntent::Min | AggIntent::Max => 16,
         // Sum / Count / Avg / TopK / Rate / Increase / archive-only — no
@@ -210,7 +207,11 @@ pub fn build_sketch_params(
         }
         SketchType::HLL => {
             let d = &defaults.hll;
-            let precision = if acc > d.precision_threshold { d.precision_coarse } else { d.precision_fine };
+            let precision = if acc > d.precision_threshold {
+                d.precision_coarse
+            } else {
+                d.precision_fine
+            };
             SketchParams::HLL { precision }
         }
         SketchType::CountSketch => SketchParams::CountSketch {
@@ -238,17 +239,26 @@ mod tests {
 
     #[test]
     fn agg_type_quantile_maps_to_ddsketch() {
-        assert_eq!(sketch_type_for_agg(&[AggType::Quantile]), SketchType::DDSketch);
+        assert_eq!(
+            sketch_type_for_agg(&[AggType::Quantile]),
+            SketchType::DDSketch
+        );
     }
 
     #[test]
     fn agg_type_cardinality_maps_to_hll() {
-        assert_eq!(sketch_type_for_agg(&[AggType::Cardinality]), SketchType::HLL);
+        assert_eq!(
+            sketch_type_for_agg(&[AggType::Cardinality]),
+            SketchType::HLL
+        );
     }
 
     #[test]
     fn agg_type_frequency_maps_to_countsketch() {
-        assert_eq!(sketch_type_for_agg(&[AggType::Frequency]), SketchType::CountSketch);
+        assert_eq!(
+            sketch_type_for_agg(&[AggType::Frequency]),
+            SketchType::CountSketch
+        );
     }
 
     #[test]
@@ -259,7 +269,10 @@ mod tests {
     #[test]
     fn op_quantile_yields_ddsketch_type_and_params() {
         use crate::types_v2::AccuracyTarget;
-        let op = AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) };
+        let op = AggIntent::Quantile {
+            q: 0.5,
+            accuracy: AccuracyTarget::Epsilon(0.01),
+        };
         let (st, p) = sketch_type_and_params(&op);
         assert_eq!(st, SketchType::DDSketch);
         assert!(matches!(p, SketchParams::DDSketch { .. }));
@@ -281,7 +294,7 @@ mod tests {
     fn per_partition_delegates_to_inner() {
         let wrap = PerPartitionWrap {
             inner: crate::intent_algebra::relational::default_cardinality(),
-            keys:  vec!["k".into()],
+            keys: vec!["k".into()],
         };
         assert_eq!(sketch_type_for_per_partition(&wrap), SketchType::HLL);
     }
@@ -289,7 +302,10 @@ mod tests {
     #[test]
     fn memory_quantile() {
         use crate::types_v2::AccuracyTarget;
-        let op = AggIntent::Quantile { q: 0.5, accuracy: AccuracyTarget::Epsilon(0.01) };
+        let op = AggIntent::Quantile {
+            q: 0.5,
+            accuracy: AccuracyTarget::Epsilon(0.01),
+        };
         assert_eq!(estimated_sketch_memory_bytes(&op), 4096);
     }
 
@@ -299,7 +315,7 @@ mod tests {
         let base_mem = estimated_sketch_memory_bytes(&inner);
         let wrap = PerPartitionWrap {
             inner,
-            keys:  vec!["a".into(), "b".into()],
+            keys: vec!["a".into(), "b".into()],
         };
         assert_eq!(estimated_sketch_memory_per_partition(&wrap), base_mem * 4);
     }

@@ -69,9 +69,9 @@ pub trait OptimizerRule: Send + Sync {
 mod tests {
     use super::*;
     use crate::optimizer::engine::{
-        CommonSubexprElim, FilterWindowSwap, HLLDedupElim,
-        HydraConversion, MergeLifting, PartitionElim, PredicatePushDown, SetOpFusion,
-        SubqueryDecorrelation, TopKFusion, WindowMerge,
+        CommonSubexprElim, FilterWindowSwap, HLLDedupElim, HydraConversion, MergeLifting,
+        PartitionElim, PredicatePushDown, SetOpFusion, SubqueryDecorrelation, TopKFusion,
+        WindowMerge,
     };
 
     /// Every concrete `RewriteRule` in the engine surfaces a stable name and
@@ -115,12 +115,9 @@ mod tests {
     #[test]
     fn sketch_algebra_bind_rules_carry_bind_category() {
         use crate::sketch_algebra::rules::{
-            bind_archive_only::BindArchiveOnly,
-            bind_cms_count::BindCmsOnCount,
-            bind_cms_topk::BindCountSketchOnTopK,
-            bind_ddsketch_quantile::BindDDSketchOnQuantile,
-            bind_hll_cardinality::BindHllOnCardinality,
-            bind_kll_quantile::BindKllOnQuantile,
+            bind_archive_only::BindArchiveOnly, bind_cms_count::BindCmsOnCount,
+            bind_cms_topk::BindCountSketchOnTopK, bind_ddsketch_quantile::BindDDSketchOnQuantile,
+            bind_hll_cardinality::BindHllOnCardinality, bind_kll_quantile::BindKllOnQuantile,
         };
         let rules: Vec<Box<dyn OptimizerRule>> = vec![
             Box::new(BindKllOnQuantile),

@@ -334,7 +334,11 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
         }
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
-        | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
             collect_agg_intents(left, out);
             collect_agg_intents(right, out);
         }
@@ -630,12 +634,8 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
         AggregationType::Increase => Some(Capability::ExactAgg(AggregationType::Increase)),
         AggregationType::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
         // Quantile families — DDSketch and KLL answer quantile + min/max.
-        AggregationType::DDSketch => {
-            Some(Capability::QuantileApprox(SketchKindHandle::DDSketch))
-        }
-        AggregationType::DatasketchesKLL => {
-            Some(Capability::QuantileApprox(SketchKindHandle::Kll))
-        }
+        AggregationType::DDSketch => Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+        AggregationType::DatasketchesKLL => Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
         // Cardinality.
         AggregationType::HLL => Some(Capability::CardinalityApprox),
         // Frequency families.
@@ -648,9 +648,9 @@ pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capabili
         AggregationType::CountMinSketchWithHeap => {
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
         }
-        AggregationType::CountSketchWithHeap => {
-            Some(Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap))
-        }
+        AggregationType::CountSketchWithHeap => Some(Capability::FrequencyTopk(
+            SketchKindHandle::CountSketchWithHeap,
+        )),
         // Keyed-multi-population variants. The capability the policy
         // *provides* is the multi-pop variant itself; the matching
         // predicate (`Capability::is_satisfied_by`) recognises that
@@ -722,8 +722,7 @@ pub fn find_policy_by_content(
         if cfg.aggregation_type != agg_type {
             continue;
         }
-        let policy_keys: BTreeSet<String> =
-            cfg.grouping_labels.labels.iter().cloned().collect();
+        let policy_keys: BTreeSet<String> = cfg.grouping_labels.labels.iter().cloned().collect();
         if &policy_keys != group_by_keys {
             continue;
         }
@@ -784,8 +783,7 @@ pub fn find_matching_policies(
         if cfg.metric != candidate.metric_name {
             continue;
         }
-        let policy_keys: BTreeSet<String> =
-            cfg.grouping_labels.labels.iter().cloned().collect();
+        let policy_keys: BTreeSet<String> = cfg.grouping_labels.labels.iter().cloned().collect();
         if !candidate.group_by_keys.is_subset(&policy_keys) {
             continue;
         }
@@ -841,14 +839,16 @@ mod tests {
             "increase(errors_total[2m])",
         ];
         for q in queries {
-            let canonical = parse_query_expr_canonical(q).unwrap_or_else(|e| {
-                panic!("canonical parse failed for {q:?}: {e}")
-            });
+            let canonical = parse_query_expr_canonical(q)
+                .unwrap_or_else(|e| panic!("canonical parse failed for {q:?}: {e}"));
             let derived = parsed_query_from_canonical(&canonical);
-            let direct = parse_query(q)
-                .unwrap_or_else(|e| panic!("parse_query failed for {q:?}: {e}"));
+            let direct =
+                parse_query(q).unwrap_or_else(|e| panic!("parse_query failed for {q:?}: {e}"));
 
-            assert_eq!(derived.metric_name, direct.metric_name, "metric_name for {q:?}");
+            assert_eq!(
+                derived.metric_name, direct.metric_name,
+                "metric_name for {q:?}"
+            );
             assert_eq!(
                 derived.group_by_labels, direct.group_by_labels,
                 "group_by_labels for {q:?}"
@@ -857,7 +857,10 @@ mod tests {
                 derived.label_filters, direct.label_filters,
                 "label_filters for {q:?}"
             );
-            assert_eq!(derived.time_window, direct.time_window, "time_window for {q:?}");
+            assert_eq!(
+                derived.time_window, direct.time_window,
+                "time_window for {q:?}"
+            );
             assert_eq!(
                 derived.exact_required, direct.exact_required,
                 "exact_required for {q:?}"
@@ -1131,9 +1134,7 @@ mod tests {
         // Composed `sum by (zone) (increase(metric[r]))` — inner counter
         // function wins over the outer `sum` (same precedence as the
         // rate case).
-        let a = analyze_promql_for_asap_tier(
-            "sum by (zone) (increase(http_requests_total[5m]))",
-        );
+        let a = analyze_promql_for_asap_tier("sum by (zone) (increase(http_requests_total[5m]))");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(a.candidates[0].outer_fn, OuterFn::Increase, "{a:?}");
         assert_eq!(a.candidates[0].range_seconds, 300, "{a:?}");
@@ -1162,9 +1163,7 @@ mod tests {
         // the case that motivated the original `query_contains_rate_call`
         // walker — now satisfied by walking the AST once in the
         // analyzer and emitting the typed `OuterFn::Rate` flag.
-        let a = analyze_promql_for_asap_tier(
-            "sum by (zone) (rate(http_requests_total[5m]))",
-        );
+        let a = analyze_promql_for_asap_tier("sum by (zone) (rate(http_requests_total[5m]))");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
@@ -1183,17 +1182,13 @@ mod tests {
         // parsing the raw PromQL. This test pins the asymmetry the
         // engine's dispatch reads off.
         let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
-        let sot = analyze_promql_for_asap_tier(
-            "sum_over_time(http_requests_total[5m])",
-        );
+        let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
         assert_eq!(
-            rate.candidates[0].required_capability,
-            sot.candidates[0].required_capability,
+            rate.candidates[0].required_capability, sot.candidates[0].required_capability,
             "rate and sum_over_time should produce the same Capability"
         );
         assert_ne!(
-            rate.candidates[0].outer_fn,
-            sot.candidates[0].outer_fn,
+            rate.candidates[0].outer_fn, sot.candidates[0].outer_fn,
             "rate and sum_over_time MUST differ on outer_fn so the engine \
              can dispatch correctly without re-parsing the raw PromQL"
         );
@@ -1261,9 +1256,7 @@ mod tests {
 
     #[test]
     fn count_by_rate_carries_outer_agg_count() {
-        let a = analyze_promql_for_asap_tier(
-            "count by (zone) (rate(http_requests_total[5m]))",
-        );
+        let a = analyze_promql_for_asap_tier("count by (zone) (rate(http_requests_total[5m]))");
         assert!(a.unsupported.is_none(), "{a:?}");
         match &a.candidates[0].outer_agg {
             OuterAgg::Count(labels) => assert_eq!(labels, &vec!["zone".to_string()]),
@@ -1295,9 +1288,7 @@ mod tests {
 
     #[test]
     fn bare_quantile_over_time_carries_outer_agg_none() {
-        let a = analyze_promql_for_asap_tier(
-            "quantile_over_time(0.99, http_latency_ms[5m])",
-        );
+        let a = analyze_promql_for_asap_tier("quantile_over_time(0.99, http_latency_ms[5m])");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(a.candidates[0].outer_agg, OuterAgg::None);
     }
@@ -1622,13 +1613,7 @@ mod tests {
         fn does_not_match_when_candidate_needs_keys_policy_lacks() {
             // Policy keeps {zone}; candidate asks for {zone, service}.
             // That's NOT covered — policy already projected service away.
-            let policies = vec![cfg(
-                "http_lat",
-                AggregationType::Sum,
-                vec!["zone"],
-                60,
-                "",
-            )];
+            let policies = vec![cfg("http_lat", AggregationType::Sum, vec!["zone"], 60, "")];
             let registry = PolicyRegistry::from_configs(policies);
             let cand = candidate(
                 "http_lat",

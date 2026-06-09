@@ -138,17 +138,32 @@ mod tests {
     #[test]
     fn unknown_role_for_known_metric_returns_none() {
         let s = WorkloadStore::new();
-        s.set("m", AggRole::Quantile, wl("m"), WorkloadCharacteristics::default());
+        s.set(
+            "m",
+            AggRole::Quantile,
+            wl("m"),
+            WorkloadCharacteristics::default(),
+        );
         assert!(s.get("m", AggRole::Sum).is_none());
     }
 
     #[test]
     fn overwrite_same_role_replaces() {
         let s = WorkloadStore::new();
-        s.set("m", AggRole::Quantile, wl("m"), WorkloadCharacteristics::default());
+        s.set(
+            "m",
+            AggRole::Quantile,
+            wl("m"),
+            WorkloadCharacteristics::default(),
+        );
         let mut updated = wl("m");
         updated.accuracy_sla = 0.05;
-        s.set("m", AggRole::Quantile, updated, WorkloadCharacteristics::default());
+        s.set(
+            "m",
+            AggRole::Quantile,
+            updated,
+            WorkloadCharacteristics::default(),
+        );
         let (got, _) = s.get("m", AggRole::Quantile).unwrap();
         assert_eq!(got.accuracy_sla, 0.05);
     }
@@ -214,8 +229,18 @@ mod tests {
     #[test]
     fn remove_clears_only_target_role() {
         let s = WorkloadStore::new();
-        s.set("m", AggRole::Quantile, wl("m"), WorkloadCharacteristics::default());
-        s.set("m", AggRole::Sum, wl("m"), WorkloadCharacteristics::default());
+        s.set(
+            "m",
+            AggRole::Quantile,
+            wl("m"),
+            WorkloadCharacteristics::default(),
+        );
+        s.set(
+            "m",
+            AggRole::Sum,
+            wl("m"),
+            WorkloadCharacteristics::default(),
+        );
         s.remove("m", AggRole::Quantile);
         assert!(s.get("m", AggRole::Quantile).is_none());
         assert!(s.get("m", AggRole::Sum).is_some());
@@ -298,13 +323,26 @@ mod tests {
     #[test]
     fn keys_returns_all_pairs() {
         let s = WorkloadStore::new();
-        s.set("a", AggRole::Quantile, wl("a"), WorkloadCharacteristics::default());
-        s.set("b", AggRole::Sum, wl("b"), WorkloadCharacteristics::default());
+        s.set(
+            "a",
+            AggRole::Quantile,
+            wl("a"),
+            WorkloadCharacteristics::default(),
+        );
+        s.set(
+            "b",
+            AggRole::Sum,
+            wl("b"),
+            WorkloadCharacteristics::default(),
+        );
         let mut keys = s.keys();
         keys.sort();
         assert_eq!(
             keys,
-            vec![("a".to_string(), AggRole::Quantile), ("b".to_string(), AggRole::Sum)]
+            vec![
+                ("a".to_string(), AggRole::Quantile),
+                ("b".to_string(), AggRole::Sum)
+            ]
         );
     }
 }

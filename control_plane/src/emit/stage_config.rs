@@ -54,9 +54,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::physical::colored_dag::emitter::{
     coldpart_endpoint_from_ship, default_cold_external_labels, default_cold_ship_endpoint,
-    AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
-    ColdFormat, EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor,
-    GatewayStageConfig,
+    AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig, ColdFormat,
+    EdgeSketchProcessor, EdgeStageConfig, ExportTarget, GatewayMergeProcessor, GatewayStageConfig,
 };
 // `ArchiveTierMetric` / `PrometheusArchiveMetric` are referenced ONLY by the
 // `#[cfg(test)]` module below (test fixtures construct edge configs with
@@ -326,15 +325,14 @@ pub fn emit_edge_yaml(
     // `transform/keep_for_<sanitized_metric>` OTTL processor in front
     // of the sketch processor so the agent strips wire attrs to the
     // streaming-config's `grouping_labels` BEFORE sketching.
-    let legacy_keep_proc_name: Option<String> =
-        cfg.source_metric.as_deref().and_then(|m| {
-            cfg.metric_to_grouping_labels.get(m).map(|labels| {
-                let name = transform_keep_processor_name(m);
-                let block = build_transform_keep_processor_block(m, labels);
-                processors.insert(name.clone(), block);
-                name
-            })
-        });
+    let legacy_keep_proc_name: Option<String> = cfg.source_metric.as_deref().and_then(|m| {
+        cfg.metric_to_grouping_labels.get(m).map(|labels| {
+            let name = transform_keep_processor_name(m);
+            let block = build_transform_keep_processor_block(m, labels);
+            processors.insert(name.clone(), block);
+            name
+        })
+    });
 
     // Pipeline-processor list for the ASAP-tier path. Order matches
     // `asap-otel-agent-b6-asap-single-sketch.yaml`: gorillas3 runs FIRST
@@ -1204,8 +1202,7 @@ fn emit_edge_yaml_5sketch_routing(
         // on `CollectorYaml`. The agent's opampextension byte-compares
         // pushed configs; an unsorted include list would force an
         // apply+restart on every push of the same semantic plan.
-        let mut sorted_metrics: Vec<&String> =
-            cfg.cumulative_counter_metrics.iter().collect();
+        let mut sorted_metrics: Vec<&String> = cfg.cumulative_counter_metrics.iter().collect();
         sorted_metrics.sort();
         // YAML indentation note: `metrics` and `match_type` are both
         // direct children of `include` (not of each other). The
@@ -1216,9 +1213,8 @@ fn emit_edge_yaml_5sketch_routing(
         for m in &sorted_metrics {
             metrics_yaml.push_str(&format!("    - \"{m}\"\n"));
         }
-        let cumulativetodelta_yaml = format!(
-            "include:\n  metrics:\n{metrics_yaml}  match_type: strict\n"
-        );
+        let cumulativetodelta_yaml =
+            format!("include:\n  metrics:\n{metrics_yaml}  match_type: strict\n");
         let cumulativetodelta_block: Value = serde_yaml::from_str(&cumulativetodelta_yaml)
             .context("parse cumulativetodelta processor block")?;
         processors.insert("cumulativetodelta".to_string(), cumulativetodelta_block);
@@ -1630,7 +1626,9 @@ fn countsketch_item_label_for(metric: &str) -> String {
             break;
         }
     }
-    for suffix in ["_per_min", "_per_sec", "_qps", "_count", "_total", "_freq", "_rate"] {
+    for suffix in [
+        "_per_min", "_per_sec", "_qps", "_count", "_total", "_freq", "_rate",
+    ] {
         if let Some(rest) = s.strip_suffix(suffix) {
             s = rest;
             break;
@@ -1818,8 +1816,7 @@ fn emit_edge_yaml_asap_edge(
         .cumulative_counter_metrics
         .iter()
         .filter(|m| {
-            cfg.metric_to_grouping_labels.contains_key(*m)
-                && !cfg.metric_to_family.contains_key(*m)
+            cfg.metric_to_grouping_labels.contains_key(*m) && !cfg.metric_to_family.contains_key(*m)
         })
         .collect();
     sum_metrics.sort();
@@ -2076,8 +2073,7 @@ fn emit_edge_yaml_asap_edge(
                             // needs the heap; a plain frequency CountSketch has
                             // none → no heap. This keeps the agent emit in lock-
                             // step with the backend `with_heap` registration.
-                            countsketch_with_heap =
-                                cfg.metric_to_item_label.contains_key(*metric);
+                            countsketch_with_heap = cfg.metric_to_item_label.contains_key(*metric);
                         }
                         SketchKind::Cms => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
@@ -2111,10 +2107,7 @@ fn emit_edge_yaml_asap_edge(
             // depending on that default.
             if matches!(
                 kind,
-                SketchKind::DDSketch
-                    | SketchKind::Hll
-                    | SketchKind::CountSketch
-                    | SketchKind::Cms
+                SketchKind::DDSketch | SketchKind::Hll | SketchKind::CountSketch | SketchKind::Cms
             ) {
                 e.insert("delta_transmission".into(), Value::Bool(true));
             }
@@ -2251,10 +2244,7 @@ fn emit_edge_yaml_asap_edge(
         };
         let mut m = Mapping::new();
         m.insert("enabled".into(), Value::Bool(cold_enabled));
-        m.insert(
-            "ship_endpoint".into(),
-            Value::String(ship_endpoint.clone()),
-        );
+        m.insert("ship_endpoint".into(), Value::String(ship_endpoint.clone()));
         // Cold-archive format: when the deploy opted into the lossless
         // intchunk cold-part format, emit `format: intchunk` + the
         // `coldpart_endpoint` so the agent ships to `/ingest/coldpart`
@@ -2270,10 +2260,7 @@ fn emit_edge_yaml_asap_edge(
                 .cold_coldpart_endpoint
                 .clone()
                 .unwrap_or_else(|| coldpart_endpoint_from_ship(&ship_endpoint));
-            m.insert(
-                "coldpart_endpoint".into(),
-                Value::String(coldpart_endpoint),
-            );
+            m.insert("coldpart_endpoint".into(), Value::String(coldpart_endpoint));
         }
         m.insert(
             "block_duration".into(),
@@ -2434,7 +2421,13 @@ fn sketch_kind_to_pipeline_name(kind: &SketchKind) -> &'static str {
 fn transform_keep_processor_name(metric: &str) -> String {
     let sanitised: String = metric
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("transform/keep_for_{sanitised}")
 }
@@ -2445,7 +2438,13 @@ fn transform_keep_processor_name(metric: &str) -> String {
 fn metricstransform_groupby_processor_name(metric: &str) -> String {
     let sanitised: String = metric
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("metricstransform/sumby_{sanitised}")
 }
@@ -2455,7 +2454,13 @@ fn metricstransform_groupby_processor_name(metric: &str) -> String {
 fn sum_aggregate_pipeline_name(metric: &str) -> String {
     let sanitised: String = metric
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("metrics/sum_aggregate_{sanitised}")
 }
@@ -2565,7 +2570,11 @@ fn build_default_edge_processor_block(
             d: 5,
             with_heap: true,
         }),
-        SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+        SketchKind::Cms => SketchParams::Cms(CmsParams {
+            w: 4096,
+            d: 4,
+            with_heap: false,
+        }),
     };
     let synthetic = EdgeSketchProcessor {
         processor_name: sketch_kind_to_processor_name(kind).to_string(),
@@ -2882,8 +2891,8 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
     // `agg.window_secs` is u64 (not Option) here; passing through
     // `clamp_window_secs(Some(_))` and unwrapping keeps the contract
     // explicit.
-    let window_size = clamp_window_secs(Some(agg.window_secs))
-        .expect("clamp_window_secs preserves Some");
+    let window_size =
+        clamp_window_secs(Some(agg.window_secs)).expect("clamp_window_secs preserves Some");
     json!({
         "aggregationType": aggregation_type,
         "aggregationSubType": "",
@@ -3029,8 +3038,12 @@ mod tests {
     #[test]
     fn edge_yaml_contains_processor_and_pipeline_refs() {
         let _env = crate::test_support::env_lock();
-        let yaml = emit_edge_yaml(&ddsketch_edge_cfg(), "ws://ctrl:4320/v1/opamp", "test-agent")
-            .expect("emit_edge_yaml ok");
+        let yaml = emit_edge_yaml(
+            &ddsketch_edge_cfg(),
+            "ws://ctrl:4320/v1/opamp",
+            "test-agent",
+        )
+        .expect("emit_edge_yaml ok");
 
         // Receiver block.
         assert!(
@@ -3142,7 +3155,11 @@ mod tests {
             (
                 SketchKind::Cms,
                 "countmin",
-                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+                SketchParams::Cms(CmsParams {
+                    w: 4096,
+                    d: 4,
+                    with_heap: false,
+                }),
             ),
         ] {
             let mut cfg = ddsketch_edge_cfg();
@@ -3168,7 +3185,11 @@ mod tests {
         cfg.sketch_processors[0] = EdgeSketchProcessor {
             processor_name: "countmin".to_string(),
             sketch_kind: SketchKind::Cms,
-            sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+            sketch_params: SketchParams::Cms(CmsParams {
+                w: 4096,
+                d: 4,
+                with_heap: false,
+            }),
             aggregation_id: "agg-cms".to_string(),
         };
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
@@ -3206,8 +3227,12 @@ mod tests {
 
     #[test]
     fn gateway_yaml_uses_family_specific_merge_name() {
-        let yaml = emit_gateway_yaml(&ddsketch_gateway_cfg(), "ws://ctrl:4320/v1/opamp", "test-agent")
-            .expect("emit_gateway_yaml ok");
+        let yaml = emit_gateway_yaml(
+            &ddsketch_gateway_cfg(),
+            "ws://ctrl:4320/v1/opamp",
+            "test-agent",
+        )
+        .expect("emit_gateway_yaml ok");
 
         // Family-specific merge name (NOT the placeholder).
         assert!(yaml.contains("ddsketchmerge:"), "{yaml}");
@@ -3266,7 +3291,7 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![
                 BackendAggregation {
-            item_label: None,
+                    item_label: None,
                     aggregation_id: "agg0".into(),
                     metric_name: "http_latency_ms".into(),
                     sketch_kind: SketchKind::DDSketch,
@@ -3278,7 +3303,7 @@ mod tests {
                     agg_type_override: None,
                 },
                 BackendAggregation {
-            item_label: None,
+                    item_label: None,
                     aggregation_id: "agg1".into(),
                     metric_name: "http_requests_total".into(),
                     sketch_kind: SketchKind::Hll,
@@ -3332,7 +3357,7 @@ mod tests {
         let cfg = BackendStageConfig {
             aggregations: vec![
                 BackendAggregation {
-            item_label: None,
+                    item_label: None,
                     aggregation_id: "agg0".into(),
                     metric_name: "endpoint_count".into(),
                     sketch_kind: SketchKind::CountSketch,
@@ -3348,11 +3373,15 @@ mod tests {
                     agg_type_override: None,
                 },
                 BackendAggregation {
-            item_label: None,
+                    item_label: None,
                     aggregation_id: "agg1".into(),
                     metric_name: "endpoint_hits".into(),
                     sketch_kind: SketchKind::Cms,
-                    sketch_params: SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+                    sketch_params: SketchParams::Cms(CmsParams {
+                        w: 4096,
+                        d: 4,
+                        with_heap: false,
+                    }),
                     window_secs: 60,
                     spatial_filter: String::new(),
                     grouping: Vec::new(),
@@ -3411,7 +3440,11 @@ mod tests {
             SketchKind::DDSketch => SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
             SketchKind::Kll => SketchParams::Kll(KllParams { k: 200 }),
             SketchKind::Hll => SketchParams::Hll(HllParams { precision: 14 }),
-            SketchKind::Cms => SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+            SketchKind::Cms => SketchParams::Cms(CmsParams {
+                w: 4096,
+                d: 4,
+                with_heap: false,
+            }),
             SketchKind::CountSketch => SketchParams::CountSketch(CountSketchParams {
                 w: 2048,
                 d: 5,
@@ -3420,7 +3453,7 @@ mod tests {
         };
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: kind.clone(),
@@ -3759,27 +3792,55 @@ mod tests {
     #[test]
     fn phase_b_backend_agg_type_strings_for_every_sketch_kind() {
         let cases: Vec<(SketchKind, SketchParams, &str)> = vec![
-            (SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }), "DatasketchesKLL"),
-            (SketchKind::DDSketch, SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }), "DDSketch"),
-            (SketchKind::Hll, SketchParams::Hll(HllParams { precision: 14 }), "HLL"),
+            (
+                SketchKind::Kll,
+                SketchParams::Kll(KllParams { k: 200 }),
+                "DatasketchesKLL",
+            ),
+            (
+                SketchKind::DDSketch,
+                SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                "DDSketch",
+            ),
+            (
+                SketchKind::Hll,
+                SketchParams::Hll(HllParams { precision: 14 }),
+                "HLL",
+            ),
             (
                 SketchKind::Cms,
-                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: false }),
+                SketchParams::Cms(CmsParams {
+                    w: 4096,
+                    d: 4,
+                    with_heap: false,
+                }),
                 "CountMinSketch",
             ),
             (
                 SketchKind::Cms,
-                SketchParams::Cms(CmsParams { w: 4096, d: 4, with_heap: true }),
+                SketchParams::Cms(CmsParams {
+                    w: 4096,
+                    d: 4,
+                    with_heap: true,
+                }),
                 "CountMinSketchWithHeap",
             ),
             (
                 SketchKind::CountSketch,
-                SketchParams::CountSketch(CountSketchParams { w: 2048, d: 5, with_heap: false }),
+                SketchParams::CountSketch(CountSketchParams {
+                    w: 2048,
+                    d: 5,
+                    with_heap: false,
+                }),
                 "CountSketch",
             ),
             (
                 SketchKind::CountSketch,
-                SketchParams::CountSketch(CountSketchParams { w: 2048, d: 5, with_heap: true }),
+                SketchParams::CountSketch(CountSketchParams {
+                    w: 2048,
+                    d: 5,
+                    with_heap: true,
+                }),
                 "CountSketchWithHeap",
             ),
         ];
@@ -3801,7 +3862,7 @@ mod tests {
     fn backend_json_emits_grouping_under_labels() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "http_latency_ms".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -3847,7 +3908,7 @@ mod tests {
     fn phase_b_backend_json_aggregation_readout_alias_snapshot() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "phase_b_agg0".into(),
                 metric_name: "phase_b_metric".into(),
                 sketch_kind: SketchKind::Kll,
@@ -3895,7 +3956,7 @@ mod tests {
     fn phase_eps1_mode1_aggregation_input_is_sketch_envelope() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -3920,7 +3981,7 @@ mod tests {
     fn phase_eps1_mode2_aggregation_input_is_raw() {
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".into(),
                 metric_name: "test_metric".into(),
                 sketch_kind: SketchKind::DDSketch,
@@ -4781,7 +4842,12 @@ mod tests {
         ]));
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
-        for present in ["ddsketch:", "metrics/ddsketch_path:", "HLL:", "metrics/hll_path:"] {
+        for present in [
+            "ddsketch:",
+            "metrics/ddsketch_path:",
+            "HLL:",
+            "metrics/hll_path:",
+        ] {
             assert!(yaml.contains(present), "expected `{present}`\n{yaml}");
         }
         for pruned in [
@@ -4815,7 +4881,12 @@ mod tests {
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
         // Both families emitted.
-        for present in ["ddsketch:", "metrics/ddsketch_path:", "HLL:", "metrics/hll_path:"] {
+        for present in [
+            "ddsketch:",
+            "metrics/ddsketch_path:",
+            "HLL:",
+            "metrics/hll_path:",
+        ] {
             assert!(yaml.contains(present), "expected `{present}`\n{yaml}");
         }
         // The other 3 pruned.
@@ -4839,8 +4910,7 @@ mod tests {
         // tolerate both. Family order follows the canonical FAMILY_ORDER
         // (DDSketch before HLL).
         let inline = near.contains("[metrics/ddsketch_path, metrics/hll_path]");
-        let block = near.contains("- metrics/ddsketch_path")
-            && near.contains("- metrics/hll_path");
+        let block = near.contains("- metrics/ddsketch_path") && near.contains("- metrics/hll_path");
         assert!(
             inline || block,
             "http_requests must route to BOTH ddsketch_path AND hll_path (multi-family fan-in)\n{near}"
@@ -5024,12 +5094,12 @@ mod tests {
     /// Helper: 5-sketch edge cfg with per-metric grouping labels declared.
     fn five_sketch_edge_cfg_with_grouping_labels() -> EdgeStageConfig {
         let mut cfg = five_sketch_edge_cfg();
-        cfg.metric_to_grouping_labels.insert(
-            "http_requests_total_latency_ms".into(),
-            vec!["zone".into()],
-        );
         cfg.metric_to_grouping_labels
-            .insert("request_size_bytes".into(), vec!["zone".into(), "region".into()]);
+            .insert("http_requests_total_latency_ms".into(), vec!["zone".into()]);
+        cfg.metric_to_grouping_labels.insert(
+            "request_size_bytes".into(),
+            vec!["zone".into(), "region".into()],
+        );
         cfg.metric_to_grouping_labels
             .insert("unique_users_per_min".into(), vec!["zone".into()]);
         cfg.metric_to_grouping_labels
@@ -5089,11 +5159,23 @@ mod tests {
         let cfg = five_sketch_edge_cfg_with_grouping_labels();
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         for (pipeline, metric, family_proc) in [
-            ("metrics/ddsketch_path:", "http_requests_total_latency_ms", "ddsketch"),
+            (
+                "metrics/ddsketch_path:",
+                "http_requests_total_latency_ms",
+                "ddsketch",
+            ),
             ("metrics/kll_path:", "request_size_bytes", "KLL"),
             ("metrics/hll_path:", "unique_users_per_min", "HLL"),
-            ("metrics/countsketch_path:", "top_endpoint_qps", "countsketch"),
-            ("metrics/countminsketch_path:", "endpoint_request_freq", "countmin"),
+            (
+                "metrics/countsketch_path:",
+                "top_endpoint_qps",
+                "countsketch",
+            ),
+            (
+                "metrics/countminsketch_path:",
+                "endpoint_request_freq",
+                "countmin",
+            ),
         ] {
             let p_idx = yaml.find(pipeline).expect(pipeline);
             let after = &yaml[p_idx..];
@@ -5103,9 +5185,9 @@ mod tests {
                 .unwrap_or(after.len());
             let section = &after[..next_offset];
             let keep_needle = format!("- transform/keep_for_{metric}");
-            let k_idx = section.find(&keep_needle).unwrap_or_else(|| {
-                panic!("missing {keep_needle} in {pipeline}\n{section}")
-            });
+            let k_idx = section
+                .find(&keep_needle)
+                .unwrap_or_else(|| panic!("missing {keep_needle} in {pipeline}\n{section}"));
             let f_idx = section
                 .find(&format!("- {family_proc}"))
                 .unwrap_or_else(|| panic!("{family_proc} missing in {pipeline}\n{section}"));
@@ -5154,8 +5236,10 @@ mod tests {
     fn issue403_metricstransform_keeps_only_grouping_labels() {
         let _env = crate::test_support::env_lock();
         let mut cfg = sum_role_edge_cfg();
-        cfg.metric_to_grouping_labels
-            .insert("http_requests_total".into(), vec!["zone".into(), "region".into()]);
+        cfg.metric_to_grouping_labels.insert(
+            "http_requests_total".into(),
+            vec!["zone".into(), "region".into()],
+        );
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // serde_yaml may render the label_set inline or block; tolerate both.
         let inline = "label_set:\n        - zone\n        - region";
@@ -5347,10 +5431,8 @@ mod tests {
         let _env = crate::test_support::env_lock();
         let mut cfg = ddsketch_edge_cfg();
         cfg.source_metric = Some("http_requests_total_latency_ms".to_string());
-        cfg.metric_to_grouping_labels.insert(
-            "http_requests_total_latency_ms".into(),
-            vec!["zone".into()],
-        );
+        cfg.metric_to_grouping_labels
+            .insert("http_requests_total_latency_ms".into(), vec!["zone".into()]);
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         assert!(
             yaml.contains("transform/keep_for_http_requests_total_latency_ms:"),
@@ -5369,7 +5451,9 @@ mod tests {
         let k_idx = section
             .find("- transform/keep_for_http_requests_total_latency_ms")
             .expect("keep ref in pipeline");
-        let s_idx = section.find("- ddsketch").expect("ddsketch ref in pipeline");
+        let s_idx = section
+            .find("- ddsketch")
+            .expect("ddsketch ref in pipeline");
         assert!(
             k_idx < s_idx,
             "keep_for_* must come BEFORE ddsketch in legacy pipeline\n{section}"
@@ -5386,8 +5470,7 @@ mod tests {
     fn b1_legacy_emit_threads_x_agent_id_header() {
         let _env = crate::test_support::env_lock();
         let cfg = ddsketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-7")
-            .expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-7").expect("emit ok");
         assert!(
             yaml.contains("X-Agent-ID:"),
             "legacy edge emit must include the X-Agent-ID header in the opamp block\n{yaml}"
@@ -5406,8 +5489,7 @@ mod tests {
     fn b1_5sketch_emit_threads_x_agent_id_header() {
         let _env = crate::test_support::env_lock();
         let cfg = five_sketch_edge_cfg();
-        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-9")
-            .expect("emit ok");
+        let yaml = emit_edge_yaml(&cfg, "ws://ctrl:4320/v1/opamp", "agent-9").expect("emit ok");
         assert!(
             yaml.contains("X-Agent-ID:"),
             "5-sketch edge emit must include the X-Agent-ID header in the opamp block\n{yaml}"
@@ -5423,12 +5505,8 @@ mod tests {
     /// dance and needs the same identity contract.
     #[test]
     fn b1_gateway_emit_threads_x_agent_id_header() {
-        let yaml = emit_gateway_yaml(
-            &ddsketch_gateway_cfg(),
-            "ws://ctrl:4320/v1/opamp",
-            "gw-3",
-        )
-        .expect("emit ok");
+        let yaml = emit_gateway_yaml(&ddsketch_gateway_cfg(), "ws://ctrl:4320/v1/opamp", "gw-3")
+            .expect("emit ok");
         assert!(
             yaml.contains("X-Agent-ID:"),
             "gateway emit must include the X-Agent-ID header in the opamp block\n{yaml}"
@@ -5447,8 +5525,7 @@ mod tests {
     #[test]
     fn b1_emit_preserves_dollar_agent_id_placeholder_for_broadcast() {
         let _env = crate::test_support::env_lock();
-        let yaml =
-            emit_edge_yaml(&ddsketch_edge_cfg(), "ws://c/", "$AGENT_ID").expect("emit ok");
+        let yaml = emit_edge_yaml(&ddsketch_edge_cfg(), "ws://c/", "$AGENT_ID").expect("emit ok");
         assert!(
             yaml.contains("$AGENT_ID"),
             "broadcast emit must preserve the $AGENT_ID env placeholder verbatim\n{yaml}"
@@ -5523,8 +5600,14 @@ mod tests {
     #[test]
     fn b4_clamp_window_secs_in_range_passes_through() {
         assert_eq!(clamp_window_secs(Some(30)), Some(30));
-        assert_eq!(clamp_window_secs(Some(MIN_WINDOW_SECS)), Some(MIN_WINDOW_SECS));
-        assert_eq!(clamp_window_secs(Some(MAX_WINDOW_SECS)), Some(MAX_WINDOW_SECS));
+        assert_eq!(
+            clamp_window_secs(Some(MIN_WINDOW_SECS)),
+            Some(MIN_WINDOW_SECS)
+        );
+        assert_eq!(
+            clamp_window_secs(Some(MAX_WINDOW_SECS)),
+            Some(MAX_WINDOW_SECS)
+        );
     }
 
     #[test]
@@ -5610,7 +5693,7 @@ mod tests {
 
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: "agg0".to_string(),
                 metric_name: "http_requests_total_latency_ms".to_string(),
                 sketch_kind: SketchKind::DDSketch,
@@ -5627,7 +5710,10 @@ mod tests {
             }],
         };
         let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
-        let aggs = v.get("aggregations").and_then(|a| a.as_array()).expect("aggregations");
+        let aggs = v
+            .get("aggregations")
+            .and_then(|a| a.as_array())
+            .expect("aggregations");
         assert_eq!(
             aggs[0]["windowSize"].as_u64(),
             Some(MAX_WINDOW_SECS),
@@ -5775,9 +5861,8 @@ mod tests {
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
         // Quotes get stripped by serde_yaml for simple identifiers;
         // probe both forms so the assertion survives either output.
-        let find_any = |needle_a: &str, needle_b: &str| {
-            yaml.find(needle_a).or_else(|| yaml.find(needle_b))
-        };
+        let find_any =
+            |needle_a: &str, needle_b: &str| yaml.find(needle_a).or_else(|| yaml.find(needle_b));
         let a_idx = find_any("- aaa_counter\n", "- \"aaa_counter\"\n").expect("aaa_counter");
         let m_idx = find_any("- mmm_counter\n", "- \"mmm_counter\"\n").expect("mmm_counter");
         let z_idx = find_any("- zzz_counter\n", "- \"zzz_counter\"\n").expect("zzz_counter");
@@ -5892,9 +5977,7 @@ mod tests {
             // (the gorilla-merger HTTP ingest on 10908, NOT backend:9098)
             // + an explicit external label so the emit test asserts the
             // threaded value flows through rather than the named default.
-            cold_ship_endpoint: Some(
-                "http://gorilla-merger:10908/ingest/gorilla".into(),
-            ),
+            cold_ship_endpoint: Some("http://gorilla-merger:10908/ingest/gorilla".into()),
             cold_external_labels: vec![("cluster".into(), "asap-mvp".into())],
             metric_to_sample_p: HashMap::new(),
             metric_to_distinct_keys: HashMap::new(),
@@ -5916,8 +5999,8 @@ mod tests {
             .expect("emit fused asap_edge ok");
 
         // 1. Parses as YAML (round-trips through the loader).
-        let doc: serde_yaml::Value =
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
 
         // 2. NO routing connector in the fused shape.
         assert!(
@@ -6028,7 +6111,10 @@ mod tests {
         let hll = entry_for("unique_users_per_min");
         assert_eq!(hll.get("family").and_then(|v| v.as_str()), Some("hll"));
         let cs = entry_for("top_endpoint_qps");
-        assert_eq!(cs.get("family").and_then(|v| v.as_str()), Some("countsketch"));
+        assert_eq!(
+            cs.get("family").and_then(|v| v.as_str()),
+            Some("countsketch")
+        );
         assert_eq!(cs.get("rows").and_then(|v| v.as_u64()), Some(5));
         assert_eq!(cs.get("cols").and_then(|v| v.as_u64()), Some(2048));
         let cms = entry_for("endpoint_request_freq");
@@ -6587,8 +6673,8 @@ mod tests {
         let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
             .expect("emit fused asap_edge ok");
 
-        let doc: serde_yaml::Value =
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
         let cold = doc
             .get("processors")
             .and_then(|p| p.get("asap_edge"))
@@ -6624,8 +6710,8 @@ mod tests {
         let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
             .expect("emit fused asap_edge ok");
 
-        let doc: serde_yaml::Value =
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
         let cold = doc
             .get("processors")
             .and_then(|p| p.get("asap_edge"))
@@ -6659,13 +6745,12 @@ mod tests {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
         let mut cfg = fused_asap_edge_cfg();
         cfg.cold_format = ColdFormat::Intchunk;
-        cfg.cold_coldpart_endpoint =
-            Some("http://other-merger:10908/ingest/coldpart".into());
+        cfg.cold_coldpart_endpoint = Some("http://other-merger:10908/ingest/coldpart".into());
         let yaml = emit_edge_yaml(&cfg, "ws://controller:4320/v1/opamp", "agent-1")
             .expect("emit fused asap_edge ok");
 
-        let doc: serde_yaml::Value =
-            serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
+        let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
         let cold = doc
             .get("processors")
             .and_then(|p| p.get("asap_edge"))
@@ -6775,8 +6860,10 @@ mod tests {
         // latency family to KLL (the workload override), as the planner
         // would have populated `metric_to_family` from mvp-workload.yaml.
         let mut cfg = fused_asap_edge_cfg();
-        cfg.metric_to_family
-            .insert("http_requests_total_latency_ms".into(), one(SketchKind::Kll));
+        cfg.metric_to_family.insert(
+            "http_requests_total_latency_ms".into(),
+            one(SketchKind::Kll),
+        );
 
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("parse");
@@ -6789,8 +6876,7 @@ mod tests {
         let latency = metrics
             .iter()
             .find(|e| {
-                e.get("metric").and_then(|m| m.as_str())
-                    == Some("http_requests_total_latency_ms")
+                e.get("metric").and_then(|m| m.as_str()) == Some("http_requests_total_latency_ms")
             })
             .expect("latency entry present");
         assert_eq!(
@@ -7032,7 +7118,8 @@ mod tests {
                 }),
                 aggregation_id: "agg-cs".into(),
             };
-            let block = build_edge_processor_block(&sp, Some(60), &[], Some("top_endpoint_qps"), None);
+            let block =
+                build_edge_processor_block(&sp, Some(60), &[], Some("top_endpoint_qps"), None);
             let map = block.as_mapping().expect("processor block is a mapping");
 
             // The routing path no longer emits raw rows/cols — it emits the
@@ -7051,11 +7138,12 @@ mod tests {
             // Backend side: `sketch_params_to_json` serialises CountSketch
             // params as `{ "w", "d", "with_heap" }`. The fingerprint keys off
             // `parameters["w"]`, which must equal the agent-derived width.
-            let backend_json = sketch_params_to_json(&SketchParams::CountSketch(CountSketchParams {
-                w,
-                d,
-                with_heap: false,
-            }));
+            let backend_json =
+                sketch_params_to_json(&SketchParams::CountSketch(CountSketchParams {
+                    w,
+                    d,
+                    with_heap: false,
+                }));
             let backend_w = backend_json["w"].as_u64().expect("backend w present");
             let backend_d = backend_json["d"].as_u64().expect("backend d present");
 
@@ -7114,8 +7202,7 @@ mod tests {
     fn fused_unenumerated_countsketch_omits_heap() {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
         let cfg = fused_cfg_countsketch_no_processor();
-        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
-            .expect("fused emit ok");
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1").expect("fused emit ok");
 
         // The CountSketch entry must still be present (cols/rows defaults)...
         assert!(
@@ -7150,8 +7237,7 @@ mod tests {
             }),
             aggregation_id: "agg-cs".into(),
         }];
-        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
-            .expect("fused emit ok");
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1").expect("fused emit ok");
         assert!(
             yaml.contains("emit_heap"),
             "an enumerated CountSketch with with_heap=true must emit emit_heap:\n{yaml}"
@@ -7177,8 +7263,7 @@ mod tests {
         );
         cfg.metric_to_item_label
             .insert("endpoint_request_freq".into(), "host".to_string());
-        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1")
-            .expect("fused emit ok");
+        let yaml = emit_edge_yaml_asap_edge(&cfg, "ws://c/", "agent-1").expect("fused emit ok");
         let doc: serde_yaml::Value = serde_yaml::from_str(&yaml)
             .unwrap_or_else(|e| panic!("emitted YAML must parse: {e}\n{yaml}"));
         let metrics = doc

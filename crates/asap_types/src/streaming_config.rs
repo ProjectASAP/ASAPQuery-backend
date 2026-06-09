@@ -13,6 +13,31 @@ use crate::enums::QueryLanguage;
 use crate::policy_registry::PolicyRegistry;
 use crate::query_requirements::QueryRequirements;
 
+/// One continuous-monitoring (CDM) threshold spec. The data-plane monitor
+/// coordinator owns the AUTHORITATIVE `tau`/`epsilon`/`window_ms` (the edge
+/// copy is advisory), keyed by the same content-addressed `agg_id` the edge and
+/// coordinator share. `key` is the CMS point-frequency key for point monitors
+/// (empty for Sum / whole-stream). See
+/// `ASAPCollector/docs/continuous-monitoring-tumbling-cost-analysis.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSpec {
+    pub agg_id: u64,
+    /// CMS point-frequency key x; empty (default) for Sum / whole-stream.
+    #[serde(default)]
+    pub key: String,
+    /// Threshold τ (authoritative here, not at the edge).
+    pub tau: f64,
+    /// Relative tolerance ε; the alert fires when the estimate reaches (1−ε)τ.
+    #[serde(default = "default_monitor_epsilon")]
+    pub epsilon: f64,
+    /// Tumbling epoch length in ms; MUST match the edge window for this agg_id.
+    pub window_ms: u64,
+}
+
+fn default_monitor_epsilon() -> f64 {
+    0.05
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
     pub aggregation_configs: HashMap<u64, AggregationConfig>,
@@ -23,6 +48,11 @@ pub struct StreamingConfig {
     /// existing deploys keep dispatching to `ASAPQueryEngine`.
     #[serde(default)]
     pub storage_backend: StorageBackend,
+    /// Continuous-distributed-monitoring threshold specs the data-plane
+    /// coordinator should serve. Defaults to empty so existing configs (and the
+    /// vast majority of deploys, which run no monitors) decode unchanged.
+    #[serde(default)]
+    pub monitors: Vec<MonitorSpec>,
 }
 
 impl StreamingConfig {
@@ -30,7 +60,13 @@ impl StreamingConfig {
         Self {
             aggregation_configs,
             storage_backend: StorageBackend::default(),
+            monitors: Vec::new(),
         }
+    }
+
+    /// CDM monitor specs the data-plane coordinator should serve (may be empty).
+    pub fn monitors(&self) -> &[MonitorSpec] {
+        &self.monitors
     }
 
     /// Phase-5 constructor: build with an explicit storage-backend pin.
@@ -43,6 +79,7 @@ impl StreamingConfig {
         Self {
             aggregation_configs,
             storage_backend,
+            monitors: Vec::new(),
         }
     }
 

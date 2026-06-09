@@ -43,15 +43,15 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use data_plane::storage_engines::types::StreamingConfig;
 use data_plane::drivers::ingest::{OtlpReceiver, OtlpReceiverConfig};
 use data_plane::precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
-use data_plane::precompute_engine::output_sink::CapturingOutputSink;
-use data_plane::precompute_engine::PrecomputeEngine;
 use data_plane::precompute_engine::operators::{
     CountMinSketchAccumulator, CountSketchAccumulator, DDSketchAccumulator,
     DatasketchesKLLAccumulator, HllSketchAccumulator,
 };
+use data_plane::precompute_engine::output_sink::CapturingOutputSink;
+use data_plane::precompute_engine::PrecomputeEngine;
+use data_plane::storage_engines::types::StreamingConfig;
 
 /// Build a tumbling-window `CountMinSketch` aggregation for one metric,
 /// grouped by a single label. Mirrors the helper in
@@ -165,7 +165,7 @@ fn build_export_request(
                         aggregation_temporality: 0,
                         rows: 0,
                         cols: 0,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -412,7 +412,7 @@ fn build_count_sketch_export_request(
                         aggregation_temporality: 0,
                         rows: 0,
                         cols: 0,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -621,7 +621,7 @@ fn build_kll_export_request(
                         data_points: vec![dp],
                         aggregation_temporality: 0,
                         k: 200,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -796,7 +796,7 @@ fn build_dd_sketch_export_request(
                         data_points: vec![dp],
                         aggregation_temporality: 0,
                         relative_accuracy: 0.01,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -972,7 +972,7 @@ fn build_hll_export_request(
                         data_points: vec![dp],
                         aggregation_temporality: 0,
                         precision: 14,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -1117,7 +1117,7 @@ fn build_count_min_msgpack_export_request(
                         aggregation_temporality: 0,
                         rows: 0,
                         cols: 0,
-                        })),
+                    })),
                 }],
                 schema_url: String::new(),
             }],
@@ -1181,8 +1181,7 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     // Build a known sketch in sketch-core and serialize with msgpack — this
     // is what the Go producer (sketchlib-go) will emit once PR I's matching
     // Go-side work lands.
-    let mut cms =
-        asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
+    let mut cms = asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
     cms.update("user_a", 1.0);
     cms.update("user_b", 1.0);
     cms.update("user_a", 1.0);
@@ -1198,15 +1197,12 @@ async fn e2e_count_min_sketch_msgpack_modified_otlp_path() {
     post_otlp_http(&client, otlp_http_port, req).await;
 
     // Watermark advance using an empty msgpack sketch.
-    let empty =
-        asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
+    let empty = asap_sketchlib::CountMinSketch::new(rows as usize, cols as usize);
     let watermark_req = build_count_min_msgpack_export_request(
         metric_name,
         service_label,
         2_000_000_000,
-        empty
-            .to_msgpack()
-            .expect("serialize empty CMS msgpack"),
+        empty.to_msgpack().expect("serialize empty CMS msgpack"),
     );
     post_otlp_http(&client, otlp_http_port, watermark_req).await;
 

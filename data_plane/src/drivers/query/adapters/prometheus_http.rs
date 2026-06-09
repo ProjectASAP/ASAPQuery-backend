@@ -87,7 +87,10 @@ impl PrometheusResponse {
     /// field and mirrors a human-readable one-liner to `infos`.
     /// Chainable so both warning + accuracy paths can decorate
     /// the same `success(...)` construction.
-    pub fn with_accuracy(mut self, envelope: crate::storage_engines::sketch_db::AccuracyEnvelope) -> Self {
+    pub fn with_accuracy(
+        mut self,
+        envelope: crate::storage_engines::sketch_db::AccuracyEnvelope,
+    ) -> Self {
         self.infos.push(envelope.summary());
         self.accuracy = Some(envelope);
         self

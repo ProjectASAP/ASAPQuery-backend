@@ -86,14 +86,10 @@ pub enum Source {
     /// PromQL / DC lifecycle leaf — a metric stream identified by name +
     /// optional label filters; produces `(timestamp, value, *labels)`
     /// columns.
-    TimeSeries {
-        metric: String,
-    },
+    TimeSeries { metric: String },
     /// Tabular leaf — reserved for asap-fusion. Carries the table name;
     /// columns ride on the supplied `Schema`.
-    Table {
-        table_ref: String,
-    },
+    Table { table_ref: String },
 }
 
 /// Equality label filter on a `Scan`. PromQL `{service="api"}` → one of
@@ -198,19 +194,30 @@ pub enum BinaryOpKind {
 impl std::fmt::Display for BinaryOpKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            BinaryOpKind::Add => "+", BinaryOpKind::Sub => "-",
-            BinaryOpKind::Mul => "*", BinaryOpKind::Div => "/",
-            BinaryOpKind::Mod => "%", BinaryOpKind::Pow => "^",
-            BinaryOpKind::Eq  => "=", BinaryOpKind::Ne  => "!=",
-            BinaryOpKind::Lt  => "<", BinaryOpKind::Le  => "<=",
-            BinaryOpKind::Gt  => ">", BinaryOpKind::Ge  => ">=",
-            BinaryOpKind::And => "AND", BinaryOpKind::Or => "OR",
-            BinaryOpKind::BitAnd => "&", BinaryOpKind::BitOr => "|",
+            BinaryOpKind::Add => "+",
+            BinaryOpKind::Sub => "-",
+            BinaryOpKind::Mul => "*",
+            BinaryOpKind::Div => "/",
+            BinaryOpKind::Mod => "%",
+            BinaryOpKind::Pow => "^",
+            BinaryOpKind::Eq => "=",
+            BinaryOpKind::Ne => "!=",
+            BinaryOpKind::Lt => "<",
+            BinaryOpKind::Le => "<=",
+            BinaryOpKind::Gt => ">",
+            BinaryOpKind::Ge => ">=",
+            BinaryOpKind::And => "AND",
+            BinaryOpKind::Or => "OR",
+            BinaryOpKind::BitAnd => "&",
+            BinaryOpKind::BitOr => "|",
             BinaryOpKind::BitXor => "XOR",
             BinaryOpKind::Concat => "||",
-            BinaryOpKind::Like    => "LIKE",    BinaryOpKind::NotLike => "NOT LIKE",
-            BinaryOpKind::Regex   => "=~",      BinaryOpKind::NotRegex => "!~",
-            BinaryOpKind::Unless  => "unless",  BinaryOpKind::Atan2 => "atan2",
+            BinaryOpKind::Like => "LIKE",
+            BinaryOpKind::NotLike => "NOT LIKE",
+            BinaryOpKind::Regex => "=~",
+            BinaryOpKind::NotRegex => "!~",
+            BinaryOpKind::Unless => "unless",
+            BinaryOpKind::Atan2 => "atan2",
         };
         write!(f, "{s}")
     }
@@ -333,15 +340,9 @@ pub enum Predicate {
         rhs: Box<Predicate>,
     },
     /// IS NULL / IS NOT NULL.
-    IsNull {
-        expr: Box<Predicate>,
-        negated: bool,
-    },
+    IsNull { expr: Box<Predicate>, negated: bool },
     /// Named scalar function call (`ABS(x)`, `DATE_TRUNC('hour', ts)`).
-    FunctionCall {
-        name: String,
-        args: Vec<Predicate>,
-    },
+    FunctionCall { name: String, args: Vec<Predicate> },
     /// Scalar sub-query (`SELECT MAX(price) FROM orders`).
     ScalarSubquery(Box<QueryExpr>),
     /// `expr IN (v1, v2, …)` / `NOT IN (…)`.
@@ -401,9 +402,7 @@ pub enum QueryExpr {
     },
     /// Reference a `LetBinding` by name. Resolved at plan time; output
     /// schema = the named binding's expression's output schema.
-    Ref {
-        name: BindingName,
-    },
+    Ref { name: BindingName },
 
     // ── A-classified variants lifted in Batch 2 of the relational migration ──
     //
@@ -413,7 +412,6 @@ pub enum QueryExpr {
     // whereas legacy spells them `input:`. Consumers that haven't migrated
     // yet keep using `relational::QueryExpr::*` — the legacy variants stay
     // in place until the consumer-side redirect lands in subsequent batches.
-
     /// σ — row-level filter (WHERE / PromQL label matchers). Uses the new
     /// typed [`Predicate`] (only Column / Literal / BinaryOp / IsNull at L3
     /// for now; `FunctionCall` / `ScalarSubquery` / `InList` / `Between`
@@ -444,9 +442,7 @@ pub enum QueryExpr {
 
     /// ⊕ — union of sub-results from independent stages or shards (the
     /// exact-merge case). Sketch unions live in `PhysicalExpr`, not here.
-    Merge {
-        children: Vec<QueryExpr>,
-    },
+    Merge { children: Vec<QueryExpr> },
 
     /// Logical join. L4 picks the physical alternative
     /// (`HashJoin` / `SortMergeJoin` / `SketchJoin`).
@@ -541,9 +537,14 @@ impl QueryExpr {
                 // by-column ids must be in range.
                 let mut out_cols: Vec<Column> = Vec::with_capacity(by.len() + aggs.len());
                 for &id in by {
-                    let c = in_schema.columns.get(id).ok_or(
-                        QueryExprError::InvalidGroupByColumn(id, in_schema.columns.len()),
-                    )?;
+                    let c =
+                        in_schema
+                            .columns
+                            .get(id)
+                            .ok_or(QueryExprError::InvalidGroupByColumn(
+                                id,
+                                in_schema.columns.len(),
+                            ))?;
                     out_cols.push(c.clone());
                 }
                 // One new column per intent. PromQL convention:
@@ -632,8 +633,9 @@ impl QueryExpr {
                 .first()
                 .ok_or(QueryExprError::EmptyMerge)
                 .and_then(|c| c.output_schema_in(scope)),
-            QueryExpr::SetOp { left, .. }
-            | QueryExpr::Join { left, .. } => left.output_schema_in(scope),
+            QueryExpr::SetOp { left, .. } | QueryExpr::Join { left, .. } => {
+                left.output_schema_in(scope)
+            }
             QueryExpr::BinaryOp { lhs, .. } => lhs.output_schema_in(scope),
         }
     }
@@ -1001,10 +1003,7 @@ mod tests {
                 table_ref: "t".into(),
             },
             label_filters: vec![],
-            schema: Schema::new(vec![
-                col("a", DataType::Int64),
-                col("b", DataType::Utf8),
-            ]),
+            schema: Schema::new(vec![col("a", DataType::Int64), col("b", DataType::Utf8)]),
         };
         let expr = QueryExpr::Distinct {
             cols: vec![ColumnRef::Named("a".into())],
@@ -1129,10 +1128,7 @@ mod tests {
             negated: true,
         };
         let p2 = from_legacy_scalar(&s2).unwrap();
-        assert!(matches!(
-            p2,
-            Predicate::IsNull { negated: true, .. }
-        ));
+        assert!(matches!(p2, Predicate::IsNull { negated: true, .. }));
     }
 
     #[test]
@@ -1158,9 +1154,7 @@ mod tests {
             negated: false,
         };
         match from_legacy_scalar(&il).unwrap() {
-            Predicate::InList {
-                list, negated, ..
-            } => {
+            Predicate::InList { list, negated, .. } => {
                 assert_eq!(list.len(), 1);
                 assert!(!negated);
             }

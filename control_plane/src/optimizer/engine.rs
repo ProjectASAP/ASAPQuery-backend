@@ -31,8 +31,8 @@
 use std::collections::HashMap;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::intent_algebra::query_expr::{ColumnRef, Predicate, QueryExpr, SetOpKind, Source};
+use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::sketch_algebra::capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
 };
@@ -783,10 +783,7 @@ impl RewriteRule for SetOpFusion {
                 left,
                 right,
             } => match (*left, *right) {
-                (
-                    QueryExpr::Merge { children: mut lc },
-                    QueryExpr::Merge { children: mut rc },
-                ) => {
+                (QueryExpr::Merge { children: mut lc }, QueryExpr::Merge { children: mut rc }) => {
                     lc.append(&mut rc);
                     Some(QueryExpr::Merge { children: lc })
                 }
@@ -906,11 +903,23 @@ impl QueryOptimizer {
 
             QueryExpr::Filter { pred, child } => {
                 let (new_child, c) = recurse!(child);
-                (QueryExpr::Filter { pred, child: new_child }, c)
+                (
+                    QueryExpr::Filter {
+                        pred,
+                        child: new_child,
+                    },
+                    c,
+                )
             }
             QueryExpr::Project { cols, child } => {
                 let (new_child, c) = recurse!(child);
-                (QueryExpr::Project { cols, child: new_child }, c)
+                (
+                    QueryExpr::Project {
+                        cols,
+                        child: new_child,
+                    },
+                    c,
+                )
             }
             QueryExpr::Aggregate {
                 by,
@@ -948,21 +957,35 @@ impl QueryOptimizer {
             }
             QueryExpr::Partition { keys, child } => {
                 let (new_child, c) = recurse!(child);
-                (QueryExpr::Partition { keys, child: new_child }, c)
+                (
+                    QueryExpr::Partition {
+                        keys,
+                        child: new_child,
+                    },
+                    c,
+                )
             }
             QueryExpr::Distinct { cols, child } => {
                 let (new_child, c) = recurse!(child);
-                (QueryExpr::Distinct { cols, child: new_child }, c)
+                (
+                    QueryExpr::Distinct {
+                        cols,
+                        child: new_child,
+                    },
+                    c,
+                )
             }
             QueryExpr::Sort { keys, child } => {
                 let (new_child, c) = recurse!(child);
-                (QueryExpr::Sort { keys, child: new_child }, c)
+                (
+                    QueryExpr::Sort {
+                        keys,
+                        child: new_child,
+                    },
+                    c,
+                )
             }
-            QueryExpr::Limit {
-                n,
-                offset,
-                child,
-            } => {
+            QueryExpr::Limit { n, offset, child } => {
                 let (new_child, c) = recurse!(child);
                 (
                     QueryExpr::Limit {
@@ -989,10 +1012,8 @@ impl QueryOptimizer {
                 )
             }
             QueryExpr::Merge { children } => {
-                let (new_children, changed): (Vec<_>, Vec<_>) = children
-                    .into_iter()
-                    .map(|inp| self.apply_all(inp))
-                    .unzip();
+                let (new_children, changed): (Vec<_>, Vec<_>) =
+                    children.into_iter().map(|inp| self.apply_all(inp)).unzip();
                 (
                     QueryExpr::Merge {
                         children: new_children,
@@ -1264,9 +1285,11 @@ mod tests {
             QueryExpr::Merge { children } => children.iter().any(contains_distinct),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
-            | QueryExpr::BinaryOp { lhs: left, rhs: right, .. } => {
-                contains_distinct(left) || contains_distinct(right)
-            }
+            | QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => contains_distinct(left) || contains_distinct(right),
             QueryExpr::LetBinding { expr, child, .. } => {
                 contains_distinct(expr) || contains_distinct(child)
             }

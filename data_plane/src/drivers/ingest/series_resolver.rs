@@ -97,17 +97,11 @@ impl SeriesIdResolver {
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         let persistence = Arc::new(FilePersistence::open(path)?);
         let records = persistence.replay()?;
-        info!(
-            replayed = records.len(),
-            "series-resolver WAL replayed",
-        );
+        info!(replayed = records.len(), "series-resolver WAL replayed",);
         let cache: DashMap<CacheKey, u64> = DashMap::new();
         let mut max_sid: u64 = 0;
         for r in records {
-            cache.insert(
-                (r.metric, r.attrs_fingerprint, r.agg_kind_canonical),
-                r.sid,
-            );
+            cache.insert((r.metric, r.attrs_fingerprint, r.agg_kind_canonical), r.sid);
             if r.sid > max_sid {
                 max_sid = r.sid;
             }
@@ -167,12 +161,10 @@ impl SeriesIdResolver {
         // is durable before any caller observes the sid.
         let entry = self.cache.entry(key).or_insert_with(|| {
             let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = self.persistence.append(
-                sid,
-                metric_name,
-                attrs_fingerprint,
-                agg_kind_canonical,
-            ) {
+            if let Err(e) =
+                self.persistence
+                    .append(sid, metric_name, attrs_fingerprint, agg_kind_canonical)
+            {
                 warn!(
                     metric = %metric_name,
                     sid,
@@ -388,26 +380,24 @@ impl SeriesResolverPersistence for FilePersistence {
         let metric_bytes = metric.as_bytes();
         let fp_bytes = fp.as_bytes();
         let agg_kind_bytes = agg_kind_canonical.as_bytes();
-        let metric_len: u32 =
-            metric_bytes.len().try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "metric name longer than u32::MAX bytes",
-                )
-            })?;
+        let metric_len: u32 = metric_bytes.len().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "metric name longer than u32::MAX bytes",
+            )
+        })?;
         let fp_len: u32 = fp_bytes.len().try_into().map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "fingerprint longer than u32::MAX bytes",
             )
         })?;
-        let agg_kind_len: u32 =
-            agg_kind_bytes.len().try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "agg_kind_canonical longer than u32::MAX bytes",
-                )
-            })?;
+        let agg_kind_len: u32 = agg_kind_bytes.len().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "agg_kind_canonical longer than u32::MAX bytes",
+            )
+        })?;
 
         let mut f = self.file.lock().unwrap();
         f.write_all(&sid.to_le_bytes())?;

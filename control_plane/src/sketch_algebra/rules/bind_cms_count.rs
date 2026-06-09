@@ -22,8 +22,8 @@
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::params::{CmsParams, SketchKind, SketchParams};
-use crate::sketch_algebra::rules::Rule;
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
+use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
 
 /// Bind `Aggregate{Count}` / `Aggregate{Frequency}` to CMS.
@@ -97,7 +97,11 @@ impl Rule for BindCmsOnCount {
             // BindCmsOnCount path (frequency / count without TopK).
             // The CMS-with-heap binding fires from
             // `bind_cms_with_heap_on_topk` and sets `with_heap: true`.
-            SketchParams::Cms(CmsParams { w, d, with_heap: false }),
+            SketchParams::Cms(CmsParams {
+                w,
+                d,
+                with_heap: false,
+            }),
             (**child).clone(),
         ))
     }

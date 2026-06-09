@@ -190,14 +190,14 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
 
 #[derive(Default)]
 struct QeCollector {
-    metric_name:     Option<String>,
-    agg_types:       Vec<AggType>,
+    metric_name: Option<String>,
+    agg_types: Vec<AggType>,
     group_by_labels: Vec<String>,
-    label_filters:   HashMap<String, String>,
-    time_window:     Option<Duration>,
-    exact_required:  bool,
-    quantiles:       Vec<f64>,
-    topk:            Option<u64>,
+    label_filters: HashMap<String, String>,
+    time_window: Option<Duration>,
+    exact_required: bool,
+    quantiles: Vec<f64>,
+    topk: Option<u64>,
 }
 
 impl QeCollector {
@@ -243,7 +243,9 @@ impl QeCollector {
                 }
                 self.visit(child, schema);
             }
-            QueryExpr::Aggregate { by, aggs, child, .. } => {
+            QueryExpr::Aggregate {
+                by, aggs, child, ..
+            } => {
                 // The canonical IR folds legacy SketchAgg / WindowedAgg-inner
                 // / TopK / Aggregate into one variant carrying `AggIntent`s.
                 // `by` is positional — recover the group-by label *names*
@@ -318,24 +320,32 @@ impl QeCollector {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
-                if !self.quantiles.contains(q) { self.quantiles.push(*q); }
+                if !self.quantiles.contains(q) {
+                    self.quantiles.push(*q);
+                }
             }
             AggIntent::Min => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
-                if !self.quantiles.contains(&0.0) { self.quantiles.push(0.0); }
+                if !self.quantiles.contains(&0.0) {
+                    self.quantiles.push(0.0);
+                }
             }
             AggIntent::Max => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
-                if !self.quantiles.contains(&1.0) { self.quantiles.push(1.0); }
+                if !self.quantiles.contains(&1.0) {
+                    self.quantiles.push(1.0);
+                }
             }
             // Sum / Count / Avg / TopK / Rate / Increase / archive-only —
             // all flip the exact_required flag (no sketch benefit at the
             // legacy planner's level).
-            _ => { self.exact_required = true; }
+            _ => {
+                self.exact_required = true;
+            }
         }
     }
 
@@ -353,12 +363,12 @@ impl QeCollector {
         );
         ParsedQuery {
             metric_name,
-            aggregations:    self.agg_types,
+            aggregations: self.agg_types,
             group_by_labels: self.group_by_labels,
-            label_filters:   self.label_filters,
-            time_window:     self.time_window.unwrap_or(Duration::from_secs(300)),
-            exact_required:  self.exact_required,
-            quantiles:       qs,
+            label_filters: self.label_filters,
+            time_window: self.time_window.unwrap_or(Duration::from_secs(300)),
+            exact_required: self.exact_required,
+            quantiles: qs,
             hint,
         }
     }
@@ -395,15 +405,16 @@ fn collect_filters_from_scalar(pred: &Predicate, out: &mut HashMap<String, Strin
 
 /// Returns the DEBS-specific hint for `financial.last_trade_price` queries.
 pub(super) fn debs_hint(
-    metric:         &str,
-    aggs:           &[AggType],
-    quantiles:      &[f64],
+    metric: &str,
+    aggs: &[AggType],
+    quantiles: &[f64],
     exact_required: bool,
-    topk:           Option<u64>,
+    topk: Option<u64>,
 ) -> Option<QueryHint> {
-    let is_debs = metric == "financial.last_trade_price"
-        || metric == "financial_last_trade_price";
-    if !is_debs { return None; }
+    let is_debs = metric == "financial.last_trade_price" || metric == "financial_last_trade_price";
+    if !is_debs {
+        return None;
+    }
 
     if exact_required {
         return Some(QueryHint::ExactRequired {
@@ -416,8 +427,8 @@ pub(super) fn debs_hint(
     let primary = aggs.first()?;
     match primary {
         AggType::Cardinality => Some(QueryHint::DebsCardinality),
-        AggType::Frequency   => Some(QueryHint::DebsTopK { k: 10 }),
-        AggType::Quantile    => {
+        AggType::Frequency => Some(QueryHint::DebsTopK { k: 10 }),
+        AggType::Quantile => {
             let qs: std::collections::HashSet<i32> = quantiles
                 .iter()
                 .map(|&q| (q * 100.0).round() as i32)
@@ -448,18 +459,16 @@ mod tests {
     #[test]
     fn promql_dispatched_correctly() {
         // `by` belongs to the aggregate operator, not the function call.
-        let pq = parse_query(
-            "sum by (host) (quantile_over_time(0.99, latency[5m]))"
-        ).unwrap();
+        let pq = parse_query("sum by (host) (quantile_over_time(0.99, latency[5m]))").unwrap();
         assert!(pq.aggregations.contains(&AggType::Quantile));
         assert_eq!(pq.quantiles, vec![0.99]);
     }
 
     #[test]
     fn parse_query_expr_returns_expr() {
-        let pq = parse_query(
-            "topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))"
-        ).unwrap();
+        let pq =
+            parse_query("topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))")
+                .unwrap();
         // Should parse without error and extract the metric name.
         assert_eq!(pq.metric_name, "financial_last_trade_price");
     }
@@ -472,8 +481,9 @@ mod tests {
         // `quantile_over_time` lowers to a legacy `WindowedAgg`, which
         // `convert_root` maps to canonical `Window { child: Aggregate }`.
         let expr = parse_query_expr_canonical(
-            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
-        ).unwrap();
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+        )
+        .unwrap();
         match expr {
             CQueryExpr::Window { child, .. } => {
                 assert!(matches!(*child, CQueryExpr::Aggregate { .. }));
@@ -488,9 +498,7 @@ mod tests {
         // A bare `avg_over_time(m[w])` (no `by`) lowers to a legacy
         // `WindowedAgg` over the implicit sample-value column, which
         // `convert_root` maps to canonical `Window { child: Aggregate }`.
-        let expr = parse_query_expr_canonical(
-            "avg_over_time(cpu_seconds_total[10m])"
-        ).unwrap();
+        let expr = parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])").unwrap();
         match expr {
             CQueryExpr::Window { child, .. } => match *child {
                 CQueryExpr::Aggregate { child, .. } => {
@@ -509,9 +517,9 @@ mod tests {
         // door: it returns the raw legacy Layer-2 relational tree with no
         // sketch lowering applied — the L2→L3 fusion now lives inside
         // `convert_root`.
-        let layer2 = parse_query_expr(
-            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
-        ).unwrap();
+        let layer2 =
+            parse_query_expr("quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])")
+                .unwrap();
         // Raw Layer 2: an `Aggregate { AggFunc::Quantile }` sitting
         // *directly* over a `Window` — un-fused, un-lowered.
         match layer2 {
@@ -542,8 +550,9 @@ mod doc_verify_all {
     #[test]
     fn example4_promql_quantile() {
         let expr = parse_query_expr_canonical(
-            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])"
-        ).unwrap();
+            "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+        )
+        .unwrap();
         // Canonical fold of the legacy `WindowedAgg { Quantile }`:
         // `Window { Aggregate { by: [], [Quantile] } }`.
         match &expr {
@@ -561,8 +570,9 @@ mod doc_verify_all {
     #[test]
     fn example5_promql_topk() {
         let expr = parse_query_expr_canonical(
-            "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))"
-        ).unwrap();
+            "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))",
+        )
+        .unwrap();
         // The legacy `TopK` folds to a canonical `Aggregate` carrying an
         // `AggIntent::TopK`, over the `Partition { Window { Aggregate } }`
         // the grouped windowed frequency sketch lowers to.
@@ -574,5 +584,4 @@ mod doc_verify_all {
             other => panic!("expected Aggregate with TopK intent, got {other:?}"),
         }
     }
-
 }

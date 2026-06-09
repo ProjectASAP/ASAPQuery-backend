@@ -387,9 +387,7 @@ impl AggPayload {
     /// `approx_memory_bytes()`.
     pub fn approx_bytes(&self) -> usize {
         match self {
-            AggPayload::Sketch(s) => {
-                s.bytes.len() + std::mem::size_of::<SketchSampleState>()
-            }
+            AggPayload::Sketch(s) => s.bytes.len() + std::mem::size_of::<SketchSampleState>(),
             AggPayload::ExactAgg(p) => p.approx_memory_bytes(),
         }
     }

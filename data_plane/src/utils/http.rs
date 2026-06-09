@@ -240,8 +240,8 @@ pub fn convert_range_result_to_prometheus(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::KeyByLabelValues;
     use crate::query_engines::query_result::{InstantVectorElement, RangeVectorElement};
+    use crate::storage_engines::types::KeyByLabelValues;
 
     fn create_test_labels() -> KeyByLabelValues {
         KeyByLabelValues::new_with_labels(vec!["host1".to_string(), "job1".to_string()])

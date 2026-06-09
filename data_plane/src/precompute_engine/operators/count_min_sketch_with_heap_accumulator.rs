@@ -101,9 +101,7 @@ impl CountMinSketchWithHeapAccumulator {
     /// from_msgpack` (both heap-bearing frequency variants share the wire
     /// shape; the CountSketch-with-heap promotion is decided by the ingest
     /// router, not the bytes).
-    pub fn from_msgpack_with_heap_bytes(
-        buffer: &[u8],
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_msgpack_with_heap_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             inner: CountMinSketchWithHeap::from_msgpack(buffer)
                 .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))?,
@@ -244,7 +242,6 @@ impl CountMinSketchWithHeapAccumulator {
         })
     }
 
-
     pub fn deserialize_from_bytes(_buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         Err("deserialize_from_bytes for CountMinSketchWithHeapAccumulator not implemented".into())
     }
@@ -306,11 +303,8 @@ impl AggregateCore for CountMinSketchWithHeapAccumulator {
     /// which would let the additive matrix delta accumulate across windows
     /// (over-counting). Mirrors `CountSketchAccumulator::reset_to_empty`.
     fn reset_to_empty(&mut self) {
-        self.inner = CountMinSketchWithHeap::new(
-            self.inner.rows(),
-            self.inner.cols(),
-            self.inner.heap_size,
-        );
+        self.inner =
+            CountMinSketchWithHeap::new(self.inner.rows(), self.inner.cols(), self.inner.heap_size);
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -580,30 +574,30 @@ mod tests {
         // decode it into a heap accumulator (the cached per-series base).
         let w1 = CountMinSketchWithHeap::from_legacy_matrix(
             vec![vec![300.0; 4]; 5],
-            vec![CmsHeapItem { key: "k".into(), value: 300.0 }],
+            vec![CmsHeapItem {
+                key: "k".into(),
+                value: 300.0,
+            }],
             5,
             4,
             20,
         );
         let w1_bytes = w1.to_msgpack().expect("w1 full msgpack");
-        let mut base =
-            CountMinSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(&w1_bytes)
-                .expect("decode w1 full frame as heap accumulator");
+        let mut base = CountMinSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(&w1_bytes)
+            .expect("decode w1 full frame as heap accumulator");
         assert_eq!(base.inner.sketch_matrix()[0][0], 300.0);
 
         // Window 2 delta: this window's own state is matrix cells of value 50
         // against an EMPTY base + heap {k:50}. The DELTA-HEAP frame is encoded
         // the same way the Go producer does (4-array, is_delta, sparse cells).
-        let w2_frame = encode_delta_heap(
-            5,
-            4,
-            &[(0, 0, 50), (1, 1, 50)],
-            &[("k", 50.0)],
-            20,
-        );
+        let w2_frame = encode_delta_heap(5, 4, &[(0, 0, 50), (1, 1, 50)], &[("k", 50.0)], 20);
         // PWR: rotate base to empty at the window boundary, then apply.
         base.reset_to_empty();
-        assert_eq!(base.inner.sketch_matrix()[0][0], 0.0, "reset_to_empty cleared matrix");
+        assert_eq!(
+            base.inner.sketch_matrix()[0][0],
+            0.0,
+            "reset_to_empty cleared matrix"
+        );
         base.apply_msgpack_heap_delta_bytes(&w2_frame)
             .expect("apply w2 delta");
         assert_eq!(base.inner.sketch_matrix()[0][0], 50.0, "window-2 cell");
@@ -637,8 +631,7 @@ mod tests {
         // Equality here proves both encode AND decode are cross-language
         // byte-compatible (the decode path is exercised by the Go-golden
         // test above).
-        const GO_PARITY_HEX: &str =
-            "94c39305049293000032930101329192a16bcb404900000000000014";
+        const GO_PARITY_HEX: &str = "94c39305049293000032930101329192a16bcb404900000000000014";
         let rust_bytes = encode_delta_heap(5, 4, &[(0, 0, 50), (1, 1, 50)], &[("k", 50.0)], 20);
         assert_eq!(hex::encode(&rust_bytes), GO_PARITY_HEX);
     }
@@ -651,7 +644,10 @@ mod tests {
         // delta — the routing relies on the two shapes being distinct.
         let full = CountMinSketchWithHeap::from_legacy_matrix(
             vec![vec![1.0; 4]; 2],
-            vec![CmsHeapItem { key: "a".into(), value: 1.0 }],
+            vec![CmsHeapItem {
+                key: "a".into(),
+                value: 1.0,
+            }],
             2,
             4,
             5,
@@ -674,7 +670,12 @@ mod tests {
         heap_size: u64,
     ) -> Vec<u8> {
         #[derive(serde::Serialize)]
-        struct W<'a>(bool, (u32, u32, &'a [(u32, u32, i64)]), Vec<(String, f64)>, u64);
+        struct W<'a>(
+            bool,
+            (u32, u32, &'a [(u32, u32, i64)]),
+            Vec<(String, f64)>,
+            u64,
+        );
         let heap_owned: Vec<(String, f64)> =
             heap.iter().map(|(k, v)| (k.to_string(), *v)).collect();
         let w = W(true, (rows, cols, cells), heap_owned, heap_size);

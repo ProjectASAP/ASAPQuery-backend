@@ -340,11 +340,7 @@ mod tests {
             cost: CostEstimate::default(),
             annotation: NodeAnnotation::default(),
             children: vec![
-                PlanNode::leaf(
-                    scan("exact_child"),
-                    PipelineStage::Db,
-                    ExecutionMode::Exact,
-                ),
+                PlanNode::leaf(scan("exact_child"), PipelineStage::Db, ExecutionMode::Exact),
                 PlanNode::leaf(
                     scan("sketch_child"),
                     PipelineStage::Backend,

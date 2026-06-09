@@ -50,17 +50,19 @@ use crate::types::{SketchType, StageResourceBudgets};
 /// Mutable budget state, consumed during allocation.
 #[derive(Debug, Clone)]
 struct BudgetState {
-    agent_memory_remaining_bytes:   f64,
+    agent_memory_remaining_bytes: f64,
     backend_memory_remaining_bytes: f64,
 }
 
 impl BudgetState {
     fn from_budgets(b: &StageResourceBudgets) -> Self {
         Self {
-            agent_memory_remaining_bytes:   b.agent_memory_bytes
+            agent_memory_remaining_bytes: b
+                .agent_memory_bytes
                 .map(|v| v as f64)
                 .unwrap_or(f64::INFINITY),
-            backend_memory_remaining_bytes: b.backend_memory_bytes
+            backend_memory_remaining_bytes: b
+                .backend_memory_bytes
                 .map(|v| v as f64)
                 .unwrap_or(f64::INFINITY),
         }
@@ -75,8 +77,7 @@ impl BudgetState {
     }
 
     fn consume_agent(&mut self, bytes: f64) {
-        self.agent_memory_remaining_bytes =
-            (self.agent_memory_remaining_bytes - bytes).max(0.0);
+        self.agent_memory_remaining_bytes = (self.agent_memory_remaining_bytes - bytes).max(0.0);
     }
 
     fn consume_backend(&mut self, bytes: f64) {
@@ -90,7 +91,7 @@ impl BudgetState {
 /// Converts a (pre-optimised) canonical [`QueryExpr`] tree into an
 /// annotated [`PlanNode`] tree.
 pub struct SketchAllocator {
-    budgets:           StageResourceBudgets,
+    budgets: StageResourceBudgets,
     raw_bytes_per_sec: f64,
 }
 
@@ -258,8 +259,7 @@ impl SketchAllocator {
                 }
                 // General multi-intent / HAVING aggregate → Db (exact).
                 let child = self.alloc_node(*child, budget);
-                let kinds: Vec<&'static str> =
-                    aggs.iter().map(canonical_intent_kind_str).collect();
+                let kinds: Vec<&'static str> = aggs.iter().map(canonical_intent_kind_str).collect();
                 PlanNode {
                     expr: QueryExpr::Aggregate {
                         by,
@@ -274,9 +274,7 @@ impl SketchAllocator {
                         ..Default::default()
                     },
                     annotation: NodeAnnotation {
-                        rationale: format!(
-                            "General Aggregate at Db (exact); intents: {kinds:?}"
-                        ),
+                        rationale: format!("General Aggregate at Db (exact); intents: {kinds:?}"),
                         ..Default::default()
                     },
                     children: vec![child],
@@ -346,11 +344,7 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Limit {
-                n,
-                offset,
-                child,
-            } => {
+            QueryExpr::Limit { n, offset, child } => {
                 let child = self.alloc_node(*child, budget);
                 PlanNode {
                     expr: QueryExpr::Limit {
@@ -658,8 +652,7 @@ impl SketchAllocator {
             annotation: NodeAnnotation {
                 sketch_type: Some(sketch_type),
                 sketch_params: Some(params),
-                rationale: "Sketch demoted to Precompute (Agent+Backend budgets exceeded)"
-                    .into(),
+                rationale: "Sketch demoted to Precompute (Agent+Backend budgets exceeded)".into(),
                 budget_demotion: true,
                 ..Default::default()
             },
@@ -711,9 +704,7 @@ mod tests {
     use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
-    use crate::intent_algebra::{
-        JoinKind, LiteralValue, Predicate, QueryExpr, Schema, Source,
-    };
+    use crate::intent_algebra::{JoinKind, LiteralValue, Predicate, QueryExpr, Schema, Source};
     use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;

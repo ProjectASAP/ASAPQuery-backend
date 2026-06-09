@@ -1090,10 +1090,7 @@ mod tests {
     fn empty_router_routes_everything_to_asap_tier() {
         let r = BackendStorageRouting::empty();
         assert_eq!(r.lookup("anything"), StorageBackend::SketchStore);
-        assert_eq!(
-            r.lookup("http_requests_total"),
-            StorageBackend::SketchStore
-        );
+        assert_eq!(r.lookup("http_requests_total"), StorageBackend::SketchStore);
         assert_eq!(
             r.lookup_with_shape("anything", QueryShape::Count),
             StorageBackend::SketchStore
@@ -1736,7 +1733,10 @@ metrics:
         // Replace tenant-a only.
         let table_a_v2 = BackendStorageRouting::new_from_single_targets(
             StorageBackend::SketchStore,
-            HashMap::from([("metric_a_v2".to_string(), StorageBackend::GorillaObjectStore)]),
+            HashMap::from([(
+                "metric_a_v2".to_string(),
+                StorageBackend::GorillaObjectStore,
+            )]),
         );
         hr.swap_tenant("tenant-a", table_a_v2);
 
@@ -1748,7 +1748,10 @@ metrics:
             StorageBackend::GorillaObjectStore
         );
         let snap_b = hr.snapshot_for_tenant("tenant-b");
-        assert_eq!(snap_b.lookup("metric_b"), StorageBackend::GorillaObjectStore);
+        assert_eq!(
+            snap_b.lookup("metric_b"),
+            StorageBackend::GorillaObjectStore
+        );
         assert_eq!(snap_b.lookup("metric_a_v2"), StorageBackend::SketchStore);
     }
 

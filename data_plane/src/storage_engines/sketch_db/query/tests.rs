@@ -16,11 +16,11 @@ use asap_sketchlib::DdSketch;
 use asap_sketchlib::MessagePackCodec;
 use asap_sketchlib::{HllSketch, HllVariant};
 
-use crate::storage_engines::sketch_db::query::{SketchReducer, ASAPTierError};
 use crate::storage_engines::sketch_db::index::{
-    AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchStore, SketchInstanceMetadata,
-    SketchKindHandle, SketchSampleState,
+    AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
+    SketchKindHandle, SketchSampleState, SketchStore,
 };
+use crate::storage_engines::sketch_db::query::{ASAPTierError, SketchReducer};
 
 // ---------------------------------------------------------------------------
 // Encoders — wrap each sketchlib type in a proto SketchEnvelope so the
@@ -112,7 +112,7 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -132,7 +132,7 @@ fn kll_meta(sid: u64, k: u32) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -152,7 +152,7 @@ fn hll_meta(sid: u64, precision: u32) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -461,8 +461,8 @@ fn multi_series_one_per_label_value() {
 // TODO-1 tests — CMS-with-heap top-k.
 // ---------------------------------------------------------------------------
 
-use asap_sketchlib::CountMinSketchWithHeap;
 use asap_sketchlib::CountMinSketch;
+use asap_sketchlib::CountMinSketchWithHeap;
 
 fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
     let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
@@ -480,7 +480,7 @@ fn cms_heap_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -500,7 +500,7 @@ fn cms_only_meta(sid: u64) -> SketchInstanceMetadata {
         first_seen_unix_ms: 0,
         retired_at_ms: None,
         expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        policy_fp: asap_types::PolicyFingerprint::UNSET,
     }
 }
 
@@ -969,10 +969,17 @@ fn evaluate_exact_agg_collapses_subgroups_into_requested_groups() {
         )
         .expect("evaluate ok");
 
-    assert_eq!(result.series.len(), 1, "rack values collapse into one zone group");
+    assert_eq!(
+        result.series.len(),
+        1,
+        "rack values collapse into one zone group"
+    );
     let (label_map, samples) = &result.series[0];
     assert_eq!(label_map.get("zone").cloned(), Some("z0".to_string()));
-    assert!(!label_map.contains_key("rack"), "rack dropped (not in group_by)");
+    assert!(
+        !label_map.contains_key("rack"),
+        "rack dropped (not in group_by)"
+    );
     let last = samples.last().expect("at least one sample").1;
     assert!(
         (last - 20.0).abs() < 1e-9,
@@ -1332,7 +1339,12 @@ fn evaluate_exact_agg_rate_no_group_by_keeps_per_sid_series() {
         let mut lm = BTreeMap::new();
         lm.insert("zone".to_string(), zone.to_string());
         // Window spans the full 150s range so coverage == nominal range.
-        idx.append_precompute(sid, lm, (0, 150_000), Box::new(SumAccumulator::with_sum(value)));
+        idx.append_precompute(
+            sid,
+            lm,
+            (0, 150_000),
+            Box::new(SumAccumulator::with_sum(value)),
+        );
     }
 
     let reducer = SketchReducer::new(&idx);
@@ -1481,7 +1493,12 @@ fn kll_short_window_quantile_over_time_overlap_and_carry_in() {
     // items 26..=50. As a mergeable fragment, the rolling state ends up
     // holding 1..=50 → median ≈ 25.5.
     let delta_items: Vec<f64> = (26..=50).map(|i| i as f64).collect();
-    idx.append_sample(sid, lv.clone(), (2995, 3025), proto_delta_kll(k as u16, &delta_items));
+    idx.append_sample(
+        sid,
+        lv.clone(),
+        (2995, 3025),
+        proto_delta_kll(k as u16, &delta_items),
+    );
 
     let reducer = SketchReducer::new(&idx);
     let result = reducer
@@ -1491,7 +1508,10 @@ fn kll_short_window_quantile_over_time_overlap_and_carry_in() {
     let (_lvs, samples) = &result.series[0];
     assert_eq!(samples.len(), 1, "cumulative emits one scalar");
     let est = samples[0].1;
-    assert!(est.is_finite() && est > 0.0, "got a real quantile, not 0/NaN");
+    assert!(
+        est.is_finite() && est > 0.0,
+        "got a real quantile, not 0/NaN"
+    );
     assert!(
         (est - 25.5).abs() <= 5.0,
         "median over carried-in base + straddling delta ({est}) ~ 25.5"
@@ -1521,7 +1541,12 @@ fn kll_short_window_per_window_instant_readout_nonempty() {
         proto_full(encode_kll_items_proto(k as u16, &base_items)),
     );
     let delta_items: Vec<f64> = (26..=50).map(|i| i as f64).collect();
-    idx.append_sample(sid, lv.clone(), (2995, 3025), proto_delta_kll(k as u16, &delta_items));
+    idx.append_sample(
+        sid,
+        lv.clone(),
+        (2995, 3025),
+        proto_delta_kll(k as u16, &delta_items),
+    );
 
     let reducer = SketchReducer::new(&idx);
     let result = reducer
@@ -1538,7 +1563,10 @@ fn kll_short_window_per_window_instant_readout_nonempty() {
         "per-window readout must be non-empty for the instant projection"
     );
     let (last_end, last_val) = samples.last().copied().unwrap();
-    assert!(last_end >= 3000, "surviving sample is in-window (end={last_end})");
+    assert!(
+        last_end >= 3000,
+        "surviving sample is in-window (end={last_end})"
+    );
     assert!(
         last_val.is_finite() && last_val > 0.0,
         "instant value is real ({last_val}), not the empty-frame 0"
@@ -1716,7 +1744,10 @@ fn count_sketch_with_heap_msgpack_delta_topk_from_edge_golden() {
         vb.partial_cmp(&va).unwrap_or(std::cmp::Ordering::Equal)
     });
     assert_eq!(sorted.len(), 2, "frame heap has exactly two items");
-    assert_eq!(sorted[0].0.get("item").map(String::as_str), Some("/checkout"));
+    assert_eq!(
+        sorted[0].0.get("item").map(String::as_str),
+        Some("/checkout")
+    );
     assert_eq!(sorted[0].1.first().map(|s| s.1), Some(50.0));
     assert_eq!(sorted[1].0.get("item").map(String::as_str), Some("/cart"));
     assert_eq!(sorted[1].1.first().map(|s| s.1), Some(20.0));

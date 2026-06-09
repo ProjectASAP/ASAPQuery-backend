@@ -23,9 +23,8 @@ use tracing::{info, warn};
 use crate::backend_client::BackendClient;
 use crate::emit::{
     build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
-    extend_edge_with_demo_plumbing, generate_agent_collector_config,
-    post_typed_backend_for_role, repost_cumulative_backend_config, AgentRuntime, PushOutcome,
-    WorkloadRegistry,
+    extend_edge_with_demo_plumbing, generate_agent_collector_config, post_typed_backend_for_role,
+    repost_cumulative_backend_config, AgentRuntime, PushOutcome, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
@@ -74,8 +73,7 @@ pub struct Replanner {
     ///
     /// `None` when no backend is configured (the helper is still
     /// invoked — it logs and returns).
-    backend_routing_cache:
-        Option<Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>>,
+    backend_routing_cache: Option<Arc<Mutex<HashMap<(String, AggRole), BackendStageConfig>>>>,
     /// Optional handle to the control-plane-wide [`WorkloadRegistry`].
     /// Used only by the typed-emit path
     /// ([`Replanner::try_emit_typed_edge_yaml`]) to extend the edge
@@ -354,7 +352,9 @@ impl Replanner {
             .await
             .get(agent_id)
             .and_then(|v| v.first().cloned());
-        let Some((metric, role)) = pair else { return false };
+        let Some((metric, role)) = pair else {
+            return false;
+        };
 
         let Ok(plan) = self.plan_store.get(&metric, role) else {
             return false;
@@ -375,7 +375,8 @@ impl Replanner {
                         "[USE_TYPED_STAGE_SPLIT] typed emit failed on connect; \
                          falling back to legacy generate_agent_collector_config"
                     );
-                    match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint) {
+                    match generate_agent_collector_config(&plan.agent_config, &self.opamp_endpoint)
+                    {
                         Ok(y) => y,
                         Err(_) => {
                             warn!(agent = agent_id, metric = %metric, role = %role, "failed to generate agent config on connect");
@@ -528,9 +529,8 @@ impl Replanner {
         if stage_split::typed_stage_split_enabled() {
             if let Some(be) = self.build_backend_stage_config(&workload, role) {
                 let fallback_cache = self.backend_routing_cache.clone();
-                let cache_arc = fallback_cache.unwrap_or_else(|| {
-                    Arc::new(Mutex::new(HashMap::new()))
-                });
+                let cache_arc =
+                    fallback_cache.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
                 post_typed_backend_for_role(
                     self.backend_client.as_ref(),
                     cache_arc.as_ref(),
@@ -610,7 +610,9 @@ impl Replanner {
                     let item_labels = self
                         .workload_registry
                         .as_ref()
-                        .map(|reg| crate::emit::collect_metric_to_item_label(reg, &self.workload_store))
+                        .map(|reg| {
+                            crate::emit::collect_metric_to_item_label(reg, &self.workload_store)
+                        })
                         .unwrap_or_default();
                     for agg in &mut be.aggregations {
                         if agg.metric_name.is_empty() {
@@ -648,7 +650,7 @@ impl Replanner {
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
-            item_label: None,
+                item_label: None,
                 aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
                 metric_name: workload.metric_name.clone(),
                 // Sentinel sketch_kind / sketch_params — `agg_type_override`
@@ -693,7 +695,10 @@ impl Replanner {
             info!("replan_all: workload store empty — nothing to plan");
             return;
         }
-        info!(count = keys.len(), "replan_all: planning every (metric, role) pair");
+        info!(
+            count = keys.len(),
+            "replan_all: planning every (metric, role) pair"
+        );
         for (metric, role) in keys {
             self.replan_metric_role(&metric, role).await;
         }
@@ -706,7 +711,10 @@ impl Replanner {
         if expired.is_empty() {
             return;
         }
-        info!(count = expired.len(), "re-planning expired (metric, role) pairs");
+        info!(
+            count = expired.len(),
+            "re-planning expired (metric, role) pairs"
+        );
         for (metric, role) in expired {
             self.replan_metric_role(&metric, role).await;
         }
@@ -804,11 +812,15 @@ impl Replanner {
                 PushOutcome::BothApplied => info!(
                     "periodic backend re-POST applied cumulative streaming-config + storage-routing"
                 ),
-                PushOutcome::Skipped => { /* no backend / empty cache — nothing logged each tick */ }
-                PushOutcome::EmitFailed => warn!(
-                    "periodic backend re-POST: failed to serialise cumulative config"
-                ),
-                PushOutcome::Desynced { streaming_ok, routing_ok } => warn!(
+                PushOutcome::Skipped => { /* no backend / empty cache — nothing logged each tick */
+                }
+                PushOutcome::EmitFailed => {
+                    warn!("periodic backend re-POST: failed to serialise cumulative config")
+                }
+                PushOutcome::Desynced {
+                    streaming_ok,
+                    routing_ok,
+                } => warn!(
                     streaming_ok,
                     routing_ok,
                     "periodic backend re-POST desynced after retries; will retry next tick"
@@ -949,11 +961,11 @@ mod tests {
     async fn register_then_violation_replans_correct_metric() {
         let r = make_replanner();
         let (wl, wc) = test_workload("req_rate");
-        r.workload_store
-            .set("req_rate", AggRole::Quantile, wl, wc);
+        r.workload_store.set("req_rate", AggRole::Quantile, wl, wc);
         r.plan_store.set("req_rate", AggRole::Quantile, make_plan());
 
-        r.register_agent("agent-1", "req_rate", AggRole::Quantile).await;
+        r.register_agent("agent-1", "req_rate", AggRole::Quantile)
+            .await;
         r.handle_violation("agent-1").await;
 
         // Plan should have been refreshed.
@@ -1002,7 +1014,10 @@ mod tests {
             .plan_store
             .get("http_requests_total", AggRole::Quantile)
             .is_ok());
-        assert!(r.plan_store.get("http_requests_total", AggRole::Sum).is_ok());
+        assert!(r
+            .plan_store
+            .get("http_requests_total", AggRole::Sum)
+            .is_ok());
     }
 
     /// Targeted single-role replan via [`Replanner::replan_metric_role`]
@@ -1189,10 +1204,12 @@ mod tests {
         let app = Router::new()
             .route(
                 "/api/v1/streaming-config",
-                post(|State(h): State<StdArc<AtomicU32>>, _b: axum::body::Bytes| async move {
-                    h.fetch_add(1, Ordering::SeqCst);
-                    axum::http::StatusCode::OK
-                }),
+                post(
+                    |State(h): State<StdArc<AtomicU32>>, _b: axum::body::Bytes| async move {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        axum::http::StatusCode::OK
+                    },
+                ),
             )
             .route(
                 "/api/v1/storage_routing",
@@ -1240,14 +1257,24 @@ mod tests {
             Duration::from_secs(60),
         ));
         let r = Arc::new(
-            Replanner::new(planner, plan_store, workload_store, opamp, scraper, "ws://c/")
-                .with_backend_client(StdArc::clone(&client))
-                .with_backend_routing_cache(StdArc::clone(&cache)),
+            Replanner::new(
+                planner,
+                plan_store,
+                workload_store,
+                opamp,
+                scraper,
+                "ws://c/",
+            )
+            .with_backend_client(StdArc::clone(&client))
+            .with_backend_routing_cache(StdArc::clone(&cache)),
         );
 
         // Empty cache → re-POST is a no-op (nothing planned yet), backend
         // untouched.
-        assert_eq!(r.repost_cumulative_backend_config().await, PushOutcome::Skipped);
+        assert_eq!(
+            r.repost_cumulative_backend_config().await,
+            PushOutcome::Skipped
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 0);
 
         // Seed the SHARED cache as if a prior plan emit had populated it
@@ -1258,7 +1285,7 @@ mod tests {
                 ("http_requests_total".to_string(), AggRole::Sum),
                 BackendStageConfig {
                     aggregations: vec![BackendAggregation {
-                item_label: None,
+                        item_label: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
                         sketch_kind: SketchKind::DDSketch,
@@ -1298,6 +1325,9 @@ mod tests {
     #[tokio::test]
     async fn unwired_replanner_repost_is_skipped() {
         let r = make_replanner();
-        assert_eq!(r.repost_cumulative_backend_config().await, PushOutcome::Skipped);
+        assert_eq!(
+            r.repost_cumulative_backend_config().await,
+            PushOutcome::Skipped
+        );
     }
 }

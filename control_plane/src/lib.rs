@@ -153,7 +153,11 @@ pub(crate) mod test_support {
             unsafe {
                 std::env::set_var(key, value);
             }
-            Self { key, previous, _lock: lock }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
 
         /// Unset `key` for the lifetime of the returned guard.
@@ -164,7 +168,11 @@ pub(crate) mod test_support {
             unsafe {
                 std::env::remove_var(key);
             }
-            Self { key, previous, _lock: lock }
+            Self {
+                key,
+                previous,
+                _lock: lock,
+            }
         }
     }
 

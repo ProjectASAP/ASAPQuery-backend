@@ -30,10 +30,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::storage_engines::types::KeyByLabelValues;
 use crate::query_engines::query_result::{InstantVectorElement, QueryResult, RangeVectorElement};
 use crate::query_engines::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
 use crate::storage_engines::sketch_db::accuracy::{AccuracyEnvelope, AccuracyProfile};
+use crate::storage_engines::types::KeyByLabelValues;
 
 // ---------------------------------------------------------------------------
 // Public constants.
@@ -349,14 +349,18 @@ impl QueryEngine for ThanosQueryEngine {
                     format!("thanos rejected query (status {status}): {body}"),
                 ))
             }
-            Err(ThanosQueryError::ParseError(msg)) => Err(crate::query_engines::EngineError::backend(
-                self.data_source_id,
-                format!("thanos response parse error: {msg}"),
-            )),
-            Err(ThanosQueryError::ConfigInvalid(msg)) => Err(crate::query_engines::EngineError::backend(
-                self.data_source_id,
-                format!("thanos client misconfigured: {msg}"),
-            )),
+            Err(ThanosQueryError::ParseError(msg)) => {
+                Err(crate::query_engines::EngineError::backend(
+                    self.data_source_id,
+                    format!("thanos response parse error: {msg}"),
+                ))
+            }
+            Err(ThanosQueryError::ConfigInvalid(msg)) => {
+                Err(crate::query_engines::EngineError::backend(
+                    self.data_source_id,
+                    format!("thanos client misconfigured: {msg}"),
+                ))
+            }
         }
     }
 
@@ -386,14 +390,18 @@ impl QueryEngine for ThanosQueryEngine {
                     format!("thanos rejected range query (status {status}): {body}"),
                 ))
             }
-            Err(ThanosQueryError::ParseError(msg)) => Err(crate::query_engines::EngineError::backend(
-                self.data_source_id,
-                format!("thanos range response parse error: {msg}"),
-            )),
-            Err(ThanosQueryError::ConfigInvalid(msg)) => Err(crate::query_engines::EngineError::backend(
-                self.data_source_id,
-                format!("thanos client misconfigured: {msg}"),
-            )),
+            Err(ThanosQueryError::ParseError(msg)) => {
+                Err(crate::query_engines::EngineError::backend(
+                    self.data_source_id,
+                    format!("thanos range response parse error: {msg}"),
+                ))
+            }
+            Err(ThanosQueryError::ConfigInvalid(msg)) => {
+                Err(crate::query_engines::EngineError::backend(
+                    self.data_source_id,
+                    format!("thanos client misconfigured: {msg}"),
+                ))
+            }
         }
     }
 
@@ -789,7 +797,11 @@ pub mod test_support {
     /// to `/api/v1/query_range`, then returns `canned_body`.
     pub async fn spawn_mock_thanos_capture_range(
         canned_body: &'static str,
-    ) -> (String, Arc<Mutex<Option<CapturedParams>>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        Arc<Mutex<Option<CapturedParams>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use axum::extract::Form;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let local: SocketAddr = listener.local_addr().expect("local_addr");
@@ -807,7 +819,10 @@ pub mod test_support {
                     }
                 }),
             )
-            .route("/api/v1/query", axum::routing::post(move || async move { canned_body }));
+            .route(
+                "/api/v1/query",
+                axum::routing::post(move || async move { canned_body }),
+            );
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("capture serve");
         });
@@ -848,7 +863,10 @@ pub mod test_support {
                 "/api/v1/query_range",
                 axum::routing::post(move || async move { sc }),
             )
-            .route("/api/v1/query", axum::routing::post(|| async { axum::http::StatusCode::OK }));
+            .route(
+                "/api/v1/query",
+                axum::routing::post(|| async { axum::http::StatusCode::OK }),
+            );
         let handle = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("status serve");
         });
@@ -1052,11 +1070,15 @@ mod tests {
     #[tokio::test]
     async fn query_range_calls_range_endpoint_not_instant() {
         use test_support::{spawn_mock_thanos_capture_range, CANNED_MATRIX_BODY};
-        let (url, _captured, _handle) =
-            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
+        let (url, _captured, _handle) = spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
         let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
         let result = engine
-            .query_range("rate(http_requests_total[1m])", 1_700_000_000_000, 1_700_003_600_000, 15_000)
+            .query_range(
+                "rate(http_requests_total[1m])",
+                1_700_000_000_000,
+                1_700_003_600_000,
+                15_000,
+            )
             .await;
         assert!(result.is_ok(), "expected Ok; got {result:?}");
         match result.unwrap() {
@@ -1068,20 +1090,28 @@ mod tests {
     #[tokio::test]
     async fn query_range_passes_params_correctly() {
         use test_support::{spawn_mock_thanos_capture_range, CANNED_MATRIX_BODY};
-        let (url, captured, _handle) =
-            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
+        let (url, captured, _handle) = spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
         let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
         engine
             .query_range("up", 1_700_000_000_000, 1_700_003_600_000, 15_000)
             .await
             .expect("ok");
         let params = captured.lock().unwrap().clone().expect("params captured");
-        assert_eq!(params.0.get("query").map(|s| s.as_str()), Some("up"),
-            "query param must be forwarded verbatim");
+        assert_eq!(
+            params.0.get("query").map(|s| s.as_str()),
+            Some("up"),
+            "query param must be forwarded verbatim"
+        );
         let start: f64 = params.0["start"].parse().unwrap();
-        assert!((start - 1_700_000_000.0).abs() < 0.1, "start must be unix seconds: {start}");
+        assert!(
+            (start - 1_700_000_000.0).abs() < 0.1,
+            "start must be unix seconds: {start}"
+        );
         let end: f64 = params.0["end"].parse().unwrap();
-        assert!((end - 1_700_003_600.0).abs() < 0.1, "end must be unix seconds: {end}");
+        assert!(
+            (end - 1_700_003_600.0).abs() < 0.1,
+            "end must be unix seconds: {end}"
+        );
         let step: f64 = params.0["step"].parse().unwrap();
         assert!((step - 15.0).abs() < 0.1, "step must be seconds: {step}");
     }
@@ -1089,8 +1119,7 @@ mod tests {
     #[tokio::test]
     async fn query_range_parses_matrix_response() {
         use test_support::{spawn_mock_thanos_capture_range, CANNED_MATRIX_BODY};
-        let (url, _captured, _handle) =
-            spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
+        let (url, _captured, _handle) = spawn_mock_thanos_capture_range(CANNED_MATRIX_BODY).await;
         let engine = ThanosQueryEngine::new(config_for(&url)).expect("engine");
         let result = engine
             .query_range("up", 1_700_000_000_000, 1_700_003_600_000, 15_000)
@@ -1118,9 +1147,13 @@ mod tests {
             "4xx must surface as BadQuery; got {raw:?}",
         );
         let trait_err = QueryEngine::execute_range(&engine, "bad[", 0, 1_000, 1_000)
-            .await.unwrap_err();
+            .await
+            .unwrap_err();
         assert!(
-            matches!(trait_err, crate::query_engines::EngineError::CapabilityMiss { .. }),
+            matches!(
+                trait_err,
+                crate::query_engines::EngineError::CapabilityMiss { .. }
+            ),
             "4xx must fold into CapabilityMiss via trait; got {trait_err:?}",
         );
     }
@@ -1136,7 +1169,8 @@ mod tests {
             "5xx must surface as Unreachable; got {raw:?}",
         );
         let trait_err = QueryEngine::execute_range(&engine, "up", 0, 1_000, 1_000)
-            .await.unwrap_err();
+            .await
+            .unwrap_err();
         assert!(
             matches!(trait_err, crate::query_engines::EngineError::Backend { .. }),
             "5xx must fold into Backend via trait; got {trait_err:?}",
@@ -1158,7 +1192,8 @@ mod tests {
             "timeout must surface as Unreachable; got {raw:?}",
         );
         let trait_err = QueryEngine::execute_range(&engine, "up", 0, 1_000_000_000, 1_000)
-            .await.unwrap_err();
+            .await
+            .unwrap_err();
         assert!(
             matches!(trait_err, crate::query_engines::EngineError::Backend { .. }),
             "timeout must fold into Backend via trait; got {trait_err:?}",

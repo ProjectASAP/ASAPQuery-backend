@@ -141,7 +141,11 @@ mod tests {
     fn cms_supports_subtract_and_delete() {
         let s = SketchStateSchema::for_kind(
             SketchKind::Cms,
-            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
+            SketchParams::Cms(CmsParams {
+                w: 2048,
+                d: 5,
+                with_heap: false,
+            }),
         );
         assert!(s.caps.mergeable);
         assert!(s.caps.subtractable);
@@ -166,7 +170,11 @@ mod tests {
             SketchStateSchema::for_kind(SketchKind::Kll, SketchParams::Kll(KllParams { k: 200 }));
         let cms = SketchStateSchema::for_kind(
             SketchKind::Cms,
-            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
+            SketchParams::Cms(CmsParams {
+                w: 2048,
+                d: 5,
+                with_heap: false,
+            }),
         );
         assert!(!kll.is_compatible_for_merge(&cms));
     }

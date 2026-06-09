@@ -20,8 +20,8 @@
 use thiserror::Error;
 
 use crate::intent_algebra::QueryExpr;
-use crate::sketch_algebra::rules::dispatch;
 use crate::sketch_algebra::physical_expr::PhysicalExpr;
+use crate::sketch_algebra::rules::dispatch;
 use crate::types_v2::AccuracyTarget;
 
 /// Errors surfaced by the `bind_query_expr` lowering. Reserved — Phase C

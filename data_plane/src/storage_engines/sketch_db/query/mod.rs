@@ -75,4 +75,4 @@ pub mod window_merger;
 #[cfg(test)]
 pub mod tests;
 
-pub use sketch_reducer::{SketchReducer, ASAPTierError, ASAPTierResult};
+pub use sketch_reducer::{ASAPTierError, ASAPTierResult, SketchReducer};

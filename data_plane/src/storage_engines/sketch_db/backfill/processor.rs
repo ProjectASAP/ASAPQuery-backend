@@ -365,12 +365,7 @@ impl WindowProcessor for BackfillWindowProcessor {
                     // but the round-trip is redundant now that we hold
                     // the value.
                     for (sid, output, accumulator) in &batch {
-                        idx.ingest_precompute_with_sid(
-                            *sid,
-                            &config,
-                            output,
-                            accumulator.as_ref(),
-                        );
+                        idx.ingest_precompute_with_sid(*sid, &config, output, accumulator.as_ref());
                     }
                 }
                 None => {
@@ -402,10 +397,12 @@ impl WindowProcessor for BackfillWindowProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_engines::types::StreamingConfig;
-    use crate::storage_engines::sketch_db::backfill::BackfillSource;
+    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{
+        LabelFilter, MockRawSampleReader,
+    };
     use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
-    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{LabelFilter, MockRawSampleReader};
+    use crate::storage_engines::sketch_db::backfill::BackfillSource;
+    use crate::storage_engines::types::StreamingConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
     use std::sync::Arc;
@@ -457,8 +454,7 @@ mod tests {
             1,
         );
 
-        let processor =
-            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
+        let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
 
         // Two services → two groups → expect two PrecomputedOutput
         // entries for window (0, 100).
@@ -524,8 +520,7 @@ mod tests {
             BackfillSource::Prometheus { url: "x".into() },
             1,
         );
-        let processor =
-            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
+        let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
         processor.process_window(fp, (0, 10), vec![]).await.unwrap();
         // Empty window: no provenance record (nothing was written).
         assert!(registry.windows_written_by(job_id).is_empty());
@@ -570,8 +565,7 @@ mod tests {
             },
         ]);
 
-        let processor =
-            BackfillWindowProcessor::new(hot, registry.clone(), job_id);
+        let processor = BackfillWindowProcessor::new(hot, registry.clone(), job_id);
         let worker = BackfillWorker::new(registry.clone());
         worker
             .run_job(
@@ -935,24 +929,23 @@ mod tests {
         let resolver = SeriesIdResolver::new();
 
         // Backfill side: derive sid via the new helper.
-        let backfill_sid = resolve_backfill_bucket_sid(
-            &resolver,
-            &cfg,
-            "latency{svc=\"a\",zone=\"z0\"}",
-        );
+        let backfill_sid =
+            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\",zone=\"z0\"}");
 
         // Live side: mirror what `resolve_bucket_sid_for_agg_config`
         // in drivers/ingest/otel.rs does, manually here so the test
         // doesn't need to drive the OTLP pipeline.
-        let live_attrs_fp =
-            canonical_attrs_fingerprint(&[("svc", "a"), ("zone", "z0")]);
+        let live_attrs_fp = canonical_attrs_fingerprint(&[("svc", "a"), ("zone", "z0")]);
         let live_agg_kind = AggKind::ExactAgg {
             agg_type: cfg.aggregation_type,
             parameters_canonical: canonical_parameters(&cfg.parameters),
             spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
         };
-        let live_sid =
-            resolver.resolve(&cfg.metric, &live_attrs_fp, &live_agg_kind.canonical_string());
+        let live_sid = resolver.resolve(
+            &cfg.metric,
+            &live_attrs_fp,
+            &live_agg_kind.canonical_string(),
+        );
 
         assert_eq!(
             backfill_sid, live_sid,

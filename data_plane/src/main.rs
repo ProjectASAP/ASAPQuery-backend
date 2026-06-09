@@ -16,14 +16,14 @@ use std::sync::Arc;
 use tokio::signal;
 use tracing::{error, info, warn};
 
-use data_plane::storage_engines::types::enums::{CleanupPolicy, LockStrategy};
 use data_plane::drivers::AdapterConfig;
 use data_plane::precompute_engine::config::LateDataPolicy;
 use data_plane::precompute_engine::PrecomputeWorkerDiagnostics;
+use data_plane::storage_engines::types::enums::{CleanupPolicy, LockStrategy};
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
-    HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig, PrecomputeEngine,
-    PrecomputeEngineConfig, Result, ASAPQueryEngine, SketchStoreSink,
+    ASAPQueryEngine, HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig,
+    PrecomputeEngine, PrecomputeEngineConfig, Result, SketchStoreSink,
 };
 
 #[derive(Parser, Debug)]
@@ -125,6 +125,16 @@ struct Args {
     /// OTLP HTTP listen port
     #[arg(long, default_value = "4318")]
     otel_http_port: u16,
+
+    /// Enable the continuous-monitoring (CDM) coordinator gRPC server. Serves
+    /// the `monitors:` specs from the streaming-config; no-op if that list is
+    /// empty.
+    #[arg(long)]
+    enable_monitor_coordinator: bool,
+
+    /// CDM monitor coordinator gRPC listen port (edge MonitorService stream).
+    #[arg(long, default_value = "4319")]
+    monitor_grpc_port: u16,
 
     /// Number of precompute engine worker threads
     #[arg(long, default_value = "4")]
@@ -308,8 +318,9 @@ async fn main() -> Result<()> {
     // startup snapshot; hot-reload currently only affects the
     // control-plane GET/POST endpoint. Phase 2 will extend the swap
     // to query execution and ingest routing.
-    let hot_reload_config =
-        data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config.clone());
+    let hot_reload_config = data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(
+        streaming_config.clone(),
+    );
 
     // M2.3.6g — the legacy `SketchStore` construction is gone.
     // Production data lives in `SketchStore` (allocated below); the
@@ -348,8 +359,7 @@ async fn main() -> Result<()> {
     } else {
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
     };
-    let sketch_index =
-        Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
+    let sketch_index = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
 
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all
@@ -383,17 +393,14 @@ async fn main() -> Result<()> {
                 let ten_pct = (memory_limit_bytes / 10) as u64;
                 ten_pct.min(512 * 1024 * 1024)
             });
-        let index_persistence_dir =
-            std::path::PathBuf::from(&disk_path).join("sketch_index");
+        let index_persistence_dir = std::path::PathBuf::from(&disk_path).join("sketch_index");
         let cfg = SketchStorePersistenceConfig {
             memory_limit_bytes,
             memory_low_watermark_bytes: memory_limit_bytes * 8 / 10,
             hard_cap_bytes: memory_limit_bytes * 125 / 100,
             hot_window_ms,
             delete_older_than_ms,
-            flush_interval: std::time::Duration::from_millis(
-                args.persistence_flush_interval_ms,
-            ),
+            flush_interval: std::time::Duration::from_millis(args.persistence_flush_interval_ms),
             disk_path: index_persistence_dir.clone(),
             part_cache_bytes,
             seal_window_count: args.persistence_seal_window_count,
@@ -433,13 +440,12 @@ async fn main() -> Result<()> {
                 "Capability-miss notifications enabled → {}",
                 control_plane_endpoint
             );
-            let client: Arc<
-                dyn data_plane::drivers::control_plane_client::ControlPlaneClient,
-            > = Arc::new(
-                data_plane::drivers::control_plane_client::HttpControlPlaneClient::new(
-                    control_plane_endpoint.clone(),
-                ),
-            );
+            let client: Arc<dyn data_plane::drivers::control_plane_client::ControlPlaneClient> =
+                Arc::new(
+                    data_plane::drivers::control_plane_client::HttpControlPlaneClient::new(
+                        control_plane_endpoint.clone(),
+                    ),
+                );
             engine = engine.with_control_plane_client(client);
         } else {
             info!(
@@ -588,6 +594,58 @@ async fn main() -> Result<()> {
         None
     };
 
+    // CDM monitor coordinator: bidi MonitorService gRPC that runs the
+    // slack-countdown protocol over the streaming-config `monitors:` specs and
+    // fires a global-threshold alert through the violation sink (logged here;
+    // the control-plane replanner can subscribe via the same Violation shape).
+    let monitor_handle = if args.enable_monitor_coordinator {
+        use data_plane::monitor::{AlertSink, MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
+        let specs: Vec<MonitorConfig> = streaming_config
+            .monitors()
+            .iter()
+            .map(|m| MonitorConfig {
+                agg_id: m.agg_id,
+                key: m.key.clone().into_bytes(),
+                tau: m.tau,
+                epsilon: m.epsilon,
+                window_ms: m.window_ms,
+            })
+            .collect();
+        if specs.is_empty() {
+            warn!("--enable-monitor-coordinator set but streaming-config has no `monitors:` — coordinator will accept streams but serve nothing");
+        }
+        let sink: AlertSink = Arc::new(|v| {
+            warn!(
+                monitor = %v.agent_id,
+                observed = v.observed,
+                threshold = v.threshold,
+                "CDM global threshold crossed"
+            );
+        });
+        let coord = MonitorCoordinator::new(specs, sink);
+        let svc = MonitorServiceImpl::new(coord).into_server();
+        let port = args.monitor_grpc_port;
+        info!("Starting CDM monitor coordinator gRPC on 0.0.0.0:{port}");
+        Some(tokio::spawn(async move {
+            let addr = match format!("0.0.0.0:{port}").parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    error!("invalid monitor coordinator addr: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(svc)
+                .serve(addr)
+                .await
+            {
+                error!("monitor coordinator server error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
     // Step-1 of the JSONL deprecation deleted the local-FS cold
     // store + the §5.2 `ColdFallback` adapter; the surviving
     // fallback chain is just Prometheus (when
@@ -632,7 +690,9 @@ async fn main() -> Result<()> {
     // dev / standalone — the YAML supplies the bootstrap, control plane
     // pushes overwrite it.
     let bootstrap_routing = if let Some(routing_path) = args.backend_storage_routing.as_deref() {
-        match data_plane::storage_engines::types::BackendStorageRouting::from_yaml_file(routing_path) {
+        match data_plane::storage_engines::types::BackendStorageRouting::from_yaml_file(
+            routing_path,
+        ) {
             Ok(routing) => {
                 info!(
                     "Loaded backend-storage-routing from {:?}: default={:?}, entries={}",
@@ -715,8 +775,8 @@ async fn main() -> Result<()> {
                 "ASAP_REQUIRE_ARCHIVE_ENGINE=1 set and no archive engine configured — cold queries will return 503 NoEngineRegistered",
             );
         } else {
-            use data_plane::query_engines::NoDataArchiveEngine;
             use data_plane::query_engines::routing::QueryEngine;
+            use data_plane::query_engines::NoDataArchiveEngine;
             info!(
                 "Registering NoDataArchiveEngine stub on the archive slot (canonical data_source_id=thanos_query); set ASAP_REQUIRE_ARCHIVE_ENGINE=1 to disable",
             );
@@ -861,6 +921,12 @@ async fn main() -> Result<()> {
 
     if let Some(handle) = otel_handle {
         info!("Shutting down OTLP receiver...");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    if let Some(handle) = monitor_handle {
+        info!("Shutting down CDM monitor coordinator...");
         handle.abort();
         let _ = handle.await;
     }

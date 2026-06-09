@@ -254,11 +254,7 @@ mod tests {
             input: Box::new(src("m")),
         };
         let schema = Binder::new().bind(&tree);
-        let region_cols = schema
-            .columns
-            .iter()
-            .filter(|c| c.name == "region")
-            .count();
+        let region_cols = schema.columns.iter().filter(|c| c.name == "region").count();
         assert_eq!(region_cols, 1);
     }
 
@@ -294,7 +290,9 @@ mod tests {
         let schema = Binder::with_catalog(FixedCatalog).bind(&tree);
         // `datacenter` came from the catalog, not usage-synthesis — and it
         // is non-nullable, unlike a usage-derived column.
-        let dc = schema.column_id("datacenter").and_then(|id| schema.columns.get(id));
+        let dc = schema
+            .column_id("datacenter")
+            .and_then(|id| schema.columns.get(id));
         assert!(matches!(dc, Some(c) if !c.nullable));
     }
 }

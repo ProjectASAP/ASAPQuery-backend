@@ -677,7 +677,11 @@ mod tests {
     #[test]
     fn agg_role_bare_metric_selector_is_sum() {
         assert_eq!(
-            derive_agg_role(&entry("http_requests_total", Some("http_requests_total"), None)),
+            derive_agg_role(&entry(
+                "http_requests_total",
+                Some("http_requests_total"),
+                None
+            )),
             AggRole::Sum
         );
     }

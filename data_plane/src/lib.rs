@@ -1,4 +1,5 @@
 pub mod drivers;
+pub mod monitor;
 pub mod precompute_engine;
 pub mod query_engines;
 pub mod storage_engines;

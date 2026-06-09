@@ -24,11 +24,11 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::storage_engines::types::AggregateCore;
+use crate::precompute_engine::operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::IngestState;
-use crate::precompute_engine::operators::sketch_envelope_accumulator::SketchEnvelopeAccumulator;
 use crate::query_engines::routing::FreshnessProbeCache;
+use crate::storage_engines::types::AggregateCore;
 use asap_otel_proto::tonic::collector::metrics::v1::{
     metrics_service_server::MetricsService, ExportMetricsServiceRequest,
     ExportMetricsServiceResponse,
@@ -234,9 +234,7 @@ impl MetricsService for MetricsServiceImpl {
 
     async fn resolve_series_i_ds(
         &self,
-        request: Request<
-            asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsRequest,
-        >,
+        request: Request<asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsRequest>,
     ) -> Result<
         Response<asap_otel_proto::tonic::collector::metrics::v1::ResolveSeriesIDsResponse>,
         Status,
@@ -474,10 +472,7 @@ fn log_sketch_envelope_type(attr_name: &str, payload: &[u8], metric_name: &str) 
 /// `last_over_time(probe[10s])` query empty for the entire MVP demo
 /// run. The cache lets the HTTP query handler answer the same query
 /// from RAM with sub-second freshness.
-fn capture_freshness_probe_samples(
-    points: &[MetricPoint],
-    cache: &FreshnessProbeCache,
-) {
+fn capture_freshness_probe_samples(points: &[MetricPoint], cache: &FreshnessProbeCache) {
     let mut updated = 0usize;
     for point in points {
         // The cache filters by metric-name prefix internally; calling
@@ -618,8 +613,9 @@ fn resolve_bucket_sid_for_agg_config(
     let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&grouping_pairs);
     let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
         agg_type: config.aggregation_type,
-        parameters_canonical:
-            crate::storage_engines::sketch_db::data::canonical_parameters(&config.parameters),
+        parameters_canonical: crate::storage_engines::sketch_db::data::canonical_parameters(
+            &config.parameters,
+        ),
         spatial_filter_canonical: config.spatial_filter_normalized.clone(),
     };
     let agg_kind_canonical = agg_kind.canonical_string();
@@ -693,11 +689,8 @@ async fn route_otlp_to_precompute(
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
-            let (sid, policy_fp) = resolve_bucket_sid_for_agg_config(
-                ingest_state,
-                config,
-                &point.labels,
-            );
+            let (sid, policy_fp) =
+                resolve_bucket_sid_for_agg_config(ingest_state, config, &point.labels);
             by_bucket
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key.clone()), Vec::new()))
@@ -787,11 +780,8 @@ async fn route_otlp_to_precompute(
             // `reconcile_from_streaming_config` derives from the same
             // config (otherwise the bucket would be reachable but never
             // reconciled).
-            let (sid, policy_fp) = resolve_bucket_sid_for_agg_config(
-                ingest_state,
-                config,
-                &point.labels,
-            );
+            let (sid, policy_fp) =
+                resolve_bucket_sid_for_agg_config(ingest_state, config, &point.labels);
             sketch_messages.push(WorkerMessage::AccumulatorInput {
                 sid,
                 policy_fp,
@@ -918,9 +908,8 @@ async fn route_modified_otlp_sketches_to_precompute(
     // `SeriesIdResolver` (either fresh mint or cache hit). Returned
     // alongside `unknown_sids` so the gRPC / HTTP handler can stamp
     // them into `ExportMetricsServiceResponse.series_assignments`.
-    let mut new_assignments: Vec<
-        asap_otel_proto::tonic::collector::metrics::v1::SeriesAssignment,
-    > = Vec::new();
+    let mut new_assignments: Vec<asap_otel_proto::tonic::collector::metrics::v1::SeriesAssignment> =
+        Vec::new();
 
     for resource_metrics in &request.resource_metrics {
         let resource_attrs = resource_metrics
@@ -952,9 +941,10 @@ async fn route_modified_otlp_sketches_to_precompute(
                 // then route each tuple through the same dispatcher.
                 let dps: Vec<ModifiedOtlpSketchDp> = match &metric.data {
                     Some(Data::Ddsketch(d)) => {
-                        let cfg = crate::storage_engines::sketch_db::index::SketchConfig::DDSketch {
-                            relative_accuracy: d.relative_accuracy,
-                        };
+                        let cfg =
+                            crate::storage_engines::sketch_db::index::SketchConfig::DDSketch {
+                                relative_accuracy: d.relative_accuracy,
+                            };
                         d.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
@@ -970,7 +960,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Kllsketch(k)) => {
-                        let cfg = crate::storage_engines::sketch_db::index::SketchConfig::Kll { k: k.k };
+                        let cfg =
+                            crate::storage_engines::sketch_db::index::SketchConfig::Kll { k: k.k };
                         k.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
@@ -986,10 +977,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Countsketch(c)) => {
-                        let cfg = crate::storage_engines::sketch_db::index::SketchConfig::CountSketch {
-                            rows: c.rows,
-                            cols: c.cols,
-                        };
+                        let cfg =
+                            crate::storage_engines::sketch_db::index::SketchConfig::CountSketch {
+                                rows: c.rows,
+                                cols: c.cols,
+                            };
                         c.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
@@ -1005,10 +997,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                             .collect()
                     }
                     Some(Data::Countminsketch(c)) => {
-                        let cfg = crate::storage_engines::sketch_db::index::SketchConfig::CountMin {
-                            rows: c.rows,
-                            cols: c.cols,
-                        };
+                        let cfg =
+                            crate::storage_engines::sketch_db::index::SketchConfig::CountMin {
+                                rows: c.rows,
+                                cols: c.cols,
+                            };
                         c.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
@@ -1116,8 +1109,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                     //                           re-emit with attrs next
                     //                           pass)
                     //   (sid=0, no attrs)     → invalid wire shape, drop
-                    let attrs_pairs: Vec<(&str, &str)> =
-                        dp.attrs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let attrs_pairs: Vec<(&str, &str)> = dp
+                        .attrs
+                        .iter()
+                        .map(|(k, v)| (k.as_str(), v.as_str()))
+                        .collect();
                     // `canonical_attrs_fingerprint(&[])` is `""` — a valid,
                     // stable key. The empty-attrs case is therefore NOT a
                     // reason to skip the resolver (P1-5): a globally-
@@ -1240,8 +1236,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 // them as FrequencyEstimate so a `topk(...)`
                                 // query routes to archive (or to a different
                                 // sid that carries a heap-bearing variant).
-                                SketchKindHandle::CountSketch
-                                | SketchKindHandle::CountMin => {
+                                SketchKindHandle::CountSketch | SketchKindHandle::CountMin => {
                                     Capability::FrequencyEstimate(kind)
                                 }
                                 // Heap-BEARING frequency sketches answer
@@ -1311,11 +1306,12 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 metric_name: canonical_name.clone(),
                                 group_by_keys,
                                 capability: Some(cap),
-                                agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                                    kind,
-                                    config: cfg.clone(),
-                                    spatial_filter_canonical: String::new(),
-                                },
+                                agg_kind:
+                                    crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                                        kind,
+                                        config: cfg.clone(),
+                                        spatial_filter_canonical: String::new(),
+                                    },
                                 accuracy: Some(AccuracyBound::from_config(&cfg)),
                                 first_seen_unix_ms: ts_ms,
                                 retired_at_ms: None,
@@ -1340,9 +1336,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             let incoming_kind = sketch_kind_handle_for(&dp);
                             let upgrade_to = match (&existing.capability, incoming_kind) {
                                 (
-                                    Some(Capability::FrequencyEstimate(
-                                        SketchKindHandle::CountMin,
-                                    )),
+                                    Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
                                     SketchKindHandle::CmsWithHeap,
                                 ) => Some(SketchKindHandle::CmsWithHeap),
                                 (
@@ -1388,8 +1382,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                             dp.start_time_unix_nano / 1_000_000,
                             dp.time_unix_nano / 1_000_000,
                         );
-                        let encoding = encoding_to_handle(dp.encoding)
-                            .unwrap_or(SketchEncoding::ProtoFull);
+                        let encoding =
+                            encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
                         ingest_state.sketch_index.append_sample(
                             sid,
                             label_values,
@@ -1466,10 +1460,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                              accumulator (metric={}, \
                                              series_key={}, kind={:?}, \
                                              encoding={})",
-                                            metric.name,
-                                            series_key,
-                                            dp.kind,
-                                            dp.encoding
+                                            metric.name, series_key, dp.kind, dp.encoding
                                         );
                                         // Treat the freshly-minted empty base
                                         // as belonging to THIS delta's window
@@ -1509,10 +1500,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 "OTLP delta-sketch window boundary (metric={}, \
                                  series_key={}, prev_window_start={}, \
                                  new_window_start={}); rotating per-series base",
-                                metric.name,
-                                series_key,
-                                base_window_start,
-                                dp.start_time_unix_nano
+                                metric.name, series_key, base_window_start, dp.start_time_unix_nano
                             );
                             merged.reset_to_empty();
                         }
@@ -1615,13 +1603,13 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // so we walk it whether or not the worker push fires.
                     let matching_configs: Vec<&asap_types::aggregation_config::AggregationConfig> =
                         agg_configs
-                        .values()
-                        .filter(|config| {
-                            config.metric == canonical_name
-                                || config.spatial_filter_normalized == canonical_name
-                                || config.spatial_filter == canonical_name
-                        })
-                        .collect();
+                            .values()
+                            .filter(|config| {
+                                config.metric == canonical_name
+                                    || config.spatial_filter_normalized == canonical_name
+                                    || config.spatial_filter == canonical_name
+                            })
+                            .collect();
                     let matched_any = !matching_configs.is_empty();
 
                     // CQ-2 — only pay the worker push (and the per-config
@@ -1658,11 +1646,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // PERF-3 — `dp.attrs` is already a
                             // `HashMap<String, String>`; pass it directly
                             // instead of rebuilding `attrs_map` per config.
-                            let (bucket_sid, policy_fp) = resolve_bucket_sid_for_agg_config(
-                                ingest_state,
-                                config,
-                                &dp.attrs,
-                            );
+                            let (bucket_sid, policy_fp) =
+                                resolve_bucket_sid_for_agg_config(ingest_state, config, &dp.attrs);
                             let acc_for_msg = if i + 1 == n {
                                 // Last (or only) match — move the owned
                                 // accumulator out, no clone.
@@ -1783,8 +1768,7 @@ fn sketch_config_to_params(
         SketchConfig::Hll { precision } => {
             params.insert("precision".to_string(), serde_json::json!(*precision));
         }
-        SketchConfig::CountSketch { rows, cols }
-        | SketchConfig::CountMin { rows, cols } => {
+        SketchConfig::CountSketch { rows, cols } | SketchConfig::CountMin { rows, cols } => {
             // Canonical key mapping (matches the controller's
             // `sketch_params_to_json` in
             // `control_plane::emit::stage_config`): `w` is the
@@ -1998,7 +1982,9 @@ fn sketch_kind_handle_for(
 /// SketchStore's `SketchEncoding` enum. Returns `None` for the unset
 /// (0) encoding so callers can default to `ProtoFull` (the dominant
 /// case for full-state frames).
-fn encoding_to_handle(encoding: i32) -> Option<crate::storage_engines::sketch_db::index::SketchEncoding> {
+fn encoding_to_handle(
+    encoding: i32,
+) -> Option<crate::storage_engines::sketch_db::index::SketchEncoding> {
     use crate::storage_engines::sketch_db::index::SketchEncoding;
     match encoding {
         ENCODING_PROTO => Some(SketchEncoding::ProtoFull),
@@ -2109,9 +2095,9 @@ fn decode_modified_otlp_sketch_bytes(
                         let sample_p = DDSketchAccumulator::sample_p_from_envelope_bytes(bytes);
                         Ok(Box::new(DDSketchAccumulator { inner, sample_p }))
                     }
-                    Ok(_) => Err(
-                        "edge_runtime_adapter returned non-DDSketch reconstruction".into(),
-                    ),
+                    Ok(_) => {
+                        Err("edge_runtime_adapter returned non-DDSketch reconstruction".into())
+                    }
                     Err(_) => Ok(Box::new(DDSketchAccumulator::from_sketchlib_proto_bytes(
                         bytes,
                     )?)),
@@ -2136,9 +2122,7 @@ fn decode_modified_otlp_sketch_bytes(
                     Ok(ReconstructedSketch::Kll { snapshot_bytes }) => Ok(Box::new(
                         DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&snapshot_bytes)?,
                     )),
-                    Ok(_) => Err(
-                        "edge_runtime_adapter returned non-KLL reconstruction".into(),
-                    ),
+                    Ok(_) => Err("edge_runtime_adapter returned non-KLL reconstruction".into()),
                     Err(_) => Ok(Box::new(
                         DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(bytes)?,
                     )),
@@ -2793,7 +2777,10 @@ mod canonical_metric_name_tests {
     fn never_collapses_to_empty_string() {
         // A metric literally named `_kll` (base would be empty) is left
         // intact rather than emptied.
-        assert_eq!(canonical_sketch_metric_name("_kll", SketchKind::Kll), "_kll");
+        assert_eq!(
+            canonical_sketch_metric_name("_kll", SketchKind::Kll),
+            "_kll"
+        );
     }
 }
 
@@ -2893,10 +2880,7 @@ mod series_key_roundtrip_tests {
     fn roundtrip_value_with_all_metacharacters() {
         // One stress case combining every escape body and every
         // pair-delimiter character in a single value.
-        roundtrip(
-            "metric",
-            &[("payload", "a,b=c\"d\\e\nf"), ("svc", "auth")],
-        );
+        roundtrip("metric", &[("payload", "a,b=c\"d\\e\nf"), ("svc", "auth")]);
     }
 
     #[test]
@@ -2969,19 +2953,13 @@ mod policy_fp_lookup_tests {
         let hll = sketch_config_to_params(&SketchConfig::Hll { precision: 14 });
         assert_eq!(hll.get("precision"), Some(&serde_json::json!(14)));
 
-        let cs = sketch_config_to_params(&SketchConfig::CountSketch {
-            rows: 4,
-            cols: 256,
-        });
+        let cs = sketch_config_to_params(&SketchConfig::CountSketch { rows: 4, cols: 256 });
         // Canonical keys: w (=cols, width) and d (=rows, depth) —
         // matches `control_plane::emit::stage_config::sketch_params_to_json`.
         assert_eq!(cs.get("w"), Some(&serde_json::json!(256)));
         assert_eq!(cs.get("d"), Some(&serde_json::json!(4)));
 
-        let cm = sketch_config_to_params(&SketchConfig::CountMin {
-            rows: 4,
-            cols: 256,
-        });
+        let cm = sketch_config_to_params(&SketchConfig::CountMin { rows: 4, cols: 256 });
         assert_eq!(cm.get("w"), Some(&serde_json::json!(256)));
         assert_eq!(cm.get("d"), Some(&serde_json::json!(4)));
     }
@@ -2990,8 +2968,8 @@ mod policy_fp_lookup_tests {
 #[cfg(test)]
 mod dispatcher_tests {
     use super::*;
-    use crate::storage_engines::types::AggregateCore;
     use crate::precompute_engine::operators::{DDSketchAccumulator, HllSketchAccumulator};
+    use crate::storage_engines::types::AggregateCore;
     use asap_sketchlib::DdSketch;
     use asap_sketchlib::HllVariant;
 
@@ -3109,10 +3087,10 @@ mod dispatcher_tests {
 #[cfg(test)]
 mod sid_resolution_tests {
     use super::*;
-    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use crate::drivers::ingest::series_resolver::SeriesIdResolver;
     use crate::precompute_engine::series_router::SeriesRouter;
     use crate::storage_engines::sketch_db::index::SketchStore;
+    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
@@ -3652,8 +3630,8 @@ mod sid_resolution_tests {
     /// recover after a backend restart.
     #[tokio::test]
     async fn leading_cms_delta_bootstraps_onto_empty_base() {
-        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
         use crate::precompute_engine::operators::CountMinSketchAccumulator;
+        use asap_otel_proto::sketchlib::v1::CountMinDelta as PbDelta;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -3706,8 +3684,14 @@ mod sid_resolution_tests {
                 .downcast_ref::<CountMinSketchAccumulator>()
                 .expect("base is a CountMinSketchAccumulator");
             let matrix = cms.inner.sketch();
-            assert_eq!(matrix[0][1], 5.0, "delta cell (0,1) applied onto empty base");
-            assert_eq!(matrix[2][3], 9.0, "delta cell (2,3) applied onto empty base");
+            assert_eq!(
+                matrix[0][1], 5.0,
+                "delta cell (0,1) applied onto empty base"
+            );
+            assert_eq!(
+                matrix[2][3], 9.0,
+                "delta cell (2,3) applied onto empty base"
+            );
             assert_eq!(matrix[0][0], 0.0, "untouched cell stays empty");
         }
         // The DD/KLL "no base" drop counter must NOT have ticked — CMS is
@@ -3730,8 +3714,8 @@ mod sid_resolution_tests {
     /// the register-max updates.
     #[tokio::test]
     async fn leading_hll_delta_bootstraps_onto_empty_base() {
-        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use crate::precompute_engine::operators::HllSketchAccumulator;
+        use asap_otel_proto::sketchlib::v1::HllDelta as PbDelta;
         use prost::Message;
 
         let (state, drain) = make_state().await;
@@ -3816,11 +3800,8 @@ mod sid_resolution_tests {
             flags: 0,
             series_id: 0,
         };
-        route_modified_otlp_sketches_to_precompute(
-            &build_request("dd_latency_ms", dp),
-            &state,
-        )
-        .await;
+        route_modified_otlp_sketches_to_precompute(&build_request("dd_latency_ms", dp), &state)
+            .await;
 
         let mut attrs = HashMap::new();
         attrs.insert("zone".to_string(), "z0".to_string());
@@ -3853,8 +3834,8 @@ mod sid_resolution_tests {
     /// frame arrives for the same sid. One-way; never downgrades.
     #[tokio::test]
     async fn heap_bearing_frame_upgrades_cms_sid_capability() {
-        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
         use crate::storage_engines::sketch_db::index::{Capability, SketchKindHandle};
+        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
 
         let (state, drain) = make_state().await;
 
@@ -3904,7 +3885,10 @@ mod sid_resolution_tests {
         );
         route_modified_otlp_sketches_to_precompute(&req2, &state).await;
 
-        let meta2 = state.sketch_index.instance(sid).expect("sid still registered");
+        let meta2 = state
+            .sketch_index
+            .instance(sid)
+            .expect("sid still registered");
         assert_eq!(
             meta2.capability,
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
@@ -3927,7 +3911,10 @@ mod sid_resolution_tests {
             13_000_000,
         );
         route_modified_otlp_sketches_to_precompute(&req3, &state).await;
-        let meta3 = state.sketch_index.instance(sid).expect("sid still registered");
+        let meta3 = state
+            .sketch_index
+            .instance(sid)
+            .expect("sid still registered");
         assert_eq!(
             meta3.capability,
             Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
@@ -4012,8 +3999,8 @@ mod sid_bucketing_tests {
     use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use asap_otel_proto::tonic::common::v1::{any_value::Value as AnyVal, AnyValue, KeyValue};
     use asap_otel_proto::tonic::metrics::v1::{
-        metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge, Metric as PbMetric,
-        NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        metric::Data, number_data_point::Value as NumberValue, Gauge as PbGauge,
+        Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
@@ -4162,20 +4149,24 @@ mod sid_bucketing_tests {
         }
 
         // Filter to GroupSamples — the only variant raw OTLP emits.
-        let groups: Vec<(u64, asap_types::PolicyFingerprint, String, Vec<(String, i64, f64)>)> =
-            messages
-                .into_iter()
-                .filter_map(|m| match m {
-                    WorkerMessage::GroupSamples {
-                        sid,
-                        policy_fp,
-                        group_key,
-                        samples,
-                        ..
-                    } => Some((sid, policy_fp, group_key, samples)),
-                    _ => None,
-                })
-                .collect();
+        let groups: Vec<(
+            u64,
+            asap_types::PolicyFingerprint,
+            String,
+            Vec<(String, i64, f64)>,
+        )> = messages
+            .into_iter()
+            .filter_map(|m| match m {
+                WorkerMessage::GroupSamples {
+                    sid,
+                    policy_fp,
+                    group_key,
+                    samples,
+                    ..
+                } => Some((sid, policy_fp, group_key, samples)),
+                _ => None,
+            })
+            .collect();
 
         assert_eq!(
             groups.len(),
@@ -4186,7 +4177,10 @@ mod sid_bucketing_tests {
 
         // Both buckets carry the same policy_fp (one source config).
         for (_, pf, _, _) in &groups {
-            assert_eq!(*pf, policy_fp, "policy_fp must equal config.policy_fp_u64()");
+            assert_eq!(
+                *pf, policy_fp,
+                "policy_fp must equal config.policy_fp_u64()"
+            );
         }
 
         // sids must be non-zero (zero is reserved on the wire) and distinct.
@@ -4205,8 +4199,9 @@ mod sid_bucketing_tests {
         // sid matches the resolver mint for THAT zone.
         let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
             agg_type: cfg.aggregation_type,
-            parameters_canonical:
-                crate::storage_engines::sketch_db::data::canonical_parameters(&cfg.parameters),
+            parameters_canonical: crate::storage_engines::sketch_db::data::canonical_parameters(
+                &cfg.parameters,
+            ),
             spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
         };
         let agg_kind_canonical = agg_kind.canonical_string();
@@ -4218,10 +4213,8 @@ mod sid_bucketing_tests {
                 [10.0, 20.0] => "z1",
                 other => panic!("unexpected bucket sample values: {other:?}"),
             };
-            let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&[(
-                "zone",
-                zone_for_bucket,
-            )]);
+            let fp =
+                crate::drivers::ingest::canonical_attrs_fingerprint(&[("zone", zone_for_bucket)]);
             let resolved = resolver.lookup(metric, &fp, &agg_kind_canonical);
             assert_eq!(
                 resolved,
@@ -4232,4 +4225,3 @@ mod sid_bucketing_tests {
         }
     }
 }
-

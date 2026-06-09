@@ -324,7 +324,11 @@ fn bind_cms_with_heap_on_topk(
         // heap so `topk(...)` can enumerate items from the heap
         // directly. The streaming-config emit picks
         // `CountMinSketchWithHeap` for this binding.
-        SketchParams::Cms(CmsParams { w, d, with_heap: true }),
+        SketchParams::Cms(CmsParams {
+            w,
+            d,
+            with_heap: true,
+        }),
         (**child).clone(),
     ))
 }

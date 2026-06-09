@@ -346,7 +346,14 @@ mod tests {
     #[test]
     fn t1_greater_than_t2_yields_empty() {
         let store = SketchStore::new();
-        store.register(meta(1, "m", precompute(AggregationType::Sum), 100, None, None));
+        store.register(meta(
+            1,
+            "m",
+            precompute(AggregationType::Sum),
+            100,
+            None,
+            None,
+        ));
         let segs = timeline_for_metric(&store, "m", 1000, 500);
         assert!(segs.is_empty());
     }

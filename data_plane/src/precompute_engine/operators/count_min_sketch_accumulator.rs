@@ -60,7 +60,6 @@ impl CountMinSketchAccumulator {
         })
     }
 
-
     /// Decode from the modified OTLP wire format's
     /// `CountMinSketchDataPoint.sketch` bytes when
     /// `encoding = COUNT_MIN_SKETCH_ENCODING_MSGPACK`. The bytes are the

@@ -245,7 +245,12 @@ mod tests {
             SketchKind::Hll
         );
         assert_eq!(
-            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }).kind(),
+            SketchParams::Cms(CmsParams {
+                w: 2048,
+                d: 5,
+                with_heap: false
+            })
+            .kind(),
             SketchKind::Cms
         );
         assert_eq!(
@@ -292,7 +297,11 @@ mod tests {
             SketchParams::Kll(KllParams { k: 200 }),
             SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
             SketchParams::Hll(HllParams { precision: 14 }),
-            SketchParams::Cms(CmsParams { w: 2048, d: 5, with_heap: false }),
+            SketchParams::Cms(CmsParams {
+                w: 2048,
+                d: 5,
+                with_heap: false,
+            }),
             SketchParams::CountSketch(CountSketchParams {
                 w: 2048,
                 d: 5,

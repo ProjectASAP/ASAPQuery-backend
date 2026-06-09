@@ -52,17 +52,15 @@ use thiserror::Error;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::binder::Binder;
-use crate::intent_algebra::column_resolution::{
-    resolve_named_keys, ResolveError,
-};
-use crate::intent_algebra::relational::{
-    AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
-    ScalarExpr as LScalarExpr,
-};
+use crate::intent_algebra::column_resolution::{resolve_named_keys, ResolveError};
 use crate::intent_algebra::query_expr::{
     from_legacy_scalar, ColumnRef as CColumnRef, HavingPredicate, LiteralValue,
     PartitionKeys as CPartitionKeys, Predicate, ProjectItem as CProjectItem,
     QueryExpr as CQueryExpr, QueryExprError, Source, WindowKind as CWindowKind,
+};
+use crate::intent_algebra::relational::{
+    AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
+    ScalarExpr as LScalarExpr,
 };
 use crate::intent_algebra::schema::Schema;
 use crate::types_v2::{AccuracyTarget, BindingName};
@@ -176,8 +174,7 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             // `Aggregate` below.
             if aggs.len() == 1 && having.is_none() {
                 let item = &aggs[0];
-                let ungrouped_count =
-                    matches!(item.func, AggFunc::Count) && keys.is_empty();
+                let ungrouped_count = matches!(item.func, AggFunc::Count) && keys.is_empty();
                 if !ungrouped_count {
                     let intents = agg_func_to_intents(&item.func);
                     if !intents.is_empty() {
@@ -268,7 +265,10 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             }
             let having = match having {
                 None => None,
-                Some(se) => Some(HavingPredicate(format!("{:?}", convert_scalar(se, schema)?))),
+                Some(se) => Some(HavingPredicate(format!(
+                    "{:?}",
+                    convert_scalar(se, schema)?
+                ))),
             };
             CQueryExpr::Aggregate {
                 by,
@@ -543,7 +543,9 @@ mod tests {
                 label_filters,
                 schema,
             } => {
-                assert!(matches!(source, Source::TimeSeries { metric } if metric == "http_requests_total"));
+                assert!(
+                    matches!(source, Source::TimeSeries { metric } if metric == "http_requests_total")
+                );
                 assert!(label_filters.is_empty());
                 assert_eq!(schema.columns.len(), 2); // ts, value
             }

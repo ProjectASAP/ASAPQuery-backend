@@ -50,11 +50,15 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use crate::storage_engines::types::HotReloadStreamingConfig;
-use crate::storage_engines::sketch_db::backfill::{BackfillRegistry, BackfillSource, BackfillStatus};
 use crate::storage_engines::sketch_db::backfill::processor::BackfillWindowProcessor;
+use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{
+    LabelFilter, RawSampleReader,
+};
 use crate::storage_engines::sketch_db::backfill::worker::BackfillWorker;
-use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{LabelFilter, RawSampleReader};
+use crate::storage_engines::sketch_db::backfill::{
+    BackfillRegistry, BackfillSource, BackfillStatus,
+};
+use crate::storage_engines::types::HotReloadStreamingConfig;
 
 /// Given a `BackfillSource`, return a reader that can read raw
 /// samples from it. Used by the service to pick a concrete reader
@@ -320,8 +324,10 @@ pub fn default_reader_factory() -> ReaderFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{
+        MockRawSampleReader, RawSample,
+    };
     use crate::storage_engines::types::StreamingConfig;
-    use crate::storage_engines::sketch_db::backfill::raw_sample_reader::{MockRawSampleReader, RawSample};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
     use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;

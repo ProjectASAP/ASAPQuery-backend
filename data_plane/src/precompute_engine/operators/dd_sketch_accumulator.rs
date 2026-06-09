@@ -14,7 +14,9 @@
 //! served by controller-provisioned exact aggregations — `query_statistic`
 //! returns the unavailable-statistic error for them.
 
-use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink};
+use crate::storage_engines::types::{
+    AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink,
+};
 use asap_sketchlib::{DdSketch, DdSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -121,8 +123,7 @@ impl DDSketchAccumulator {
                 }
             }
             Err(_) => (
-                DdSketchState::decode(buffer)
-                    .map_err(|e| format!("decode DDSketchState: {e}"))?,
+                DdSketchState::decode(buffer).map_err(|e| format!("decode DDSketchState: {e}"))?,
                 1.0,
             ),
         };

@@ -115,12 +115,10 @@ pub fn resolve_window_canonical(
         (WindowKind::Tumbling, Placement::AgentCollector) => {
             PhysicalWindow::OtelTumblingFlush { duration: size }
         }
-        (WindowKind::Tumbling, Placement::PromSketchStore) => {
-            PhysicalWindow::PromSketchEH {
-                eh_k: 50,
-                time_window: size,
-            }
-        }
+        (WindowKind::Tumbling, Placement::PromSketchStore) => PhysicalWindow::PromSketchEH {
+            eh_k: 50,
+            time_window: size,
+        },
         (WindowKind::Sliding, Placement::PromSketchStore) => PhysicalWindow::PromSketchEH {
             eh_k: 50,
             time_window: size,
@@ -160,7 +158,6 @@ pub fn fused_sketch_decision(
     };
     (op, placement)
 }
-
 
 // ── Equivalence harness ──────────────────────────────────────────────────────
 //
@@ -258,7 +255,10 @@ mod tests {
             ..
         } = &node.op
         else {
-            panic!("canonical planner did not fuse Window{{Aggregate}}: {:?}", node.op);
+            panic!(
+                "canonical planner did not fuse Window{{Aggregate}}: {:?}",
+                node.op
+            );
         };
         // PhysicalWindow has no PartialEq — compare its Debug form.
         assert_eq!(

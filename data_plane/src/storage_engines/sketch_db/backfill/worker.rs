@@ -59,8 +59,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{BackfillRegistry, BackfillStatus};
 use super::raw_sample_reader::{LabelFilter, RawSample, RawSampleReader};
+use super::{BackfillRegistry, BackfillStatus};
 
 /// Per-window callback invoked by [`BackfillWorker`] after reading
 /// samples for a window. Phase 5e implements a real processor that

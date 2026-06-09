@@ -33,7 +33,9 @@
 use std::time::Duration;
 
 use anyhow::anyhow;
-use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, MatrixSelector, VectorSelector};
+use promql_parser::parser::{
+    self, AggregateExpr, Call, Expr, LabelModifier, MatrixSelector, VectorSelector,
+};
 
 use crate::intent_algebra::relational::{FilterOp, FilterVal, PartitionKeys, Predicate};
 
@@ -58,7 +60,10 @@ fn extract_matrix_arg(
     call: &Call,
     arg_idx: usize,
 ) -> anyhow::Result<(String, Vec<Predicate>, Duration)> {
-    let arg = call.args.args.get(arg_idx)
+    let arg = call
+        .args
+        .args
+        .get(arg_idx)
         .map(|b| b.as_ref())
         .ok_or_else(|| anyhow!("missing arg {} in call to {}", arg_idx, call.func.name))?;
     extract_inner_matrix(arg)
@@ -76,7 +81,10 @@ fn extract_inner_matrix(expr: &Expr) -> anyhow::Result<(String, Vec<Predicate>, 
             // rate/irate wraps a MatrixSelector.
             extract_inner_matrix(c.args.args[0].as_ref())
         }
-        other => Err(anyhow!("expected MatrixSelector, got {:?}", std::mem::discriminant(other))),
+        other => Err(anyhow!(
+            "expected MatrixSelector, got {:?}",
+            std::mem::discriminant(other)
+        )),
     }
 }
 
@@ -85,13 +93,18 @@ fn extract_inner_matrix(expr: &Expr) -> anyhow::Result<(String, Vec<Predicate>, 
 fn extract_vs_info(vs: &VectorSelector) -> (String, Vec<Predicate>) {
     // Metric name: prefer the explicit name field, fall back to __name__ matcher.
     let name = vs.name.clone().unwrap_or_else(|| {
-        vs.matchers.matchers.iter()
+        vs.matchers
+            .matchers
+            .iter()
             .find(|m| m.name == "__name__")
             .map(|m| m.value.clone())
             .unwrap_or_default()
     });
 
-    let filters = vs.matchers.matchers.iter()
+    let filters = vs
+        .matchers
+        .matchers
+        .iter()
         .filter(|m| m.name != "__name__")
         .filter_map(matcher_to_predicate)
         .collect();
@@ -102,12 +115,22 @@ fn extract_vs_info(vs: &VectorSelector) -> (String, Vec<Predicate>) {
 fn matcher_to_predicate(m: &promql_parser::label::Matcher) -> Option<Predicate> {
     use promql_parser::label::MatchOp;
     let (op, val) = match &m.op {
-        MatchOp::Equal    => (FilterOp::Eq, FilterVal::Str(m.value.clone())),
+        MatchOp::Equal => (FilterOp::Eq, FilterVal::Str(m.value.clone())),
         MatchOp::NotEqual => (FilterOp::Ne, FilterVal::Str(m.value.clone())),
-        MatchOp::Re(re)   => (FilterOp::Regex(re.to_string()), FilterVal::Str(m.value.clone())),
-        MatchOp::NotRe(re)=> (FilterOp::NotRegex(re.to_string()), FilterVal::Str(m.value.clone())),
+        MatchOp::Re(re) => (
+            FilterOp::Regex(re.to_string()),
+            FilterVal::Str(m.value.clone()),
+        ),
+        MatchOp::NotRe(re) => (
+            FilterOp::NotRegex(re.to_string()),
+            FilterVal::Str(m.value.clone()),
+        ),
     };
-    Some(Predicate { col: m.name.clone(), op, val })
+    Some(Predicate {
+        col: m.name.clone(),
+        op,
+        val,
+    })
 }
 
 // ── Helpers: number extraction ────────────────────────────────────────────────
@@ -117,7 +140,9 @@ fn extract_call_num_arg(call: &Call, idx: usize) -> anyhow::Result<f64> {
         Some(Expr::NumberLiteral(n)) => Ok(n.val),
         Some(other) => Err(anyhow!(
             "expected number at arg {} of {}, got {:?}",
-            idx, call.func.name, std::mem::discriminant(other)
+            idx,
+            call.func.name,
+            std::mem::discriminant(other)
         )),
         None => Err(anyhow!("missing arg {} in {}", idx, call.func.name)),
     }
@@ -127,7 +152,10 @@ fn extract_number_param(param: &Option<Box<Expr>>) -> anyhow::Result<f64> {
     match param {
         Some(e) => match e.as_ref() {
             Expr::NumberLiteral(n) => Ok(n.val),
-            other => Err(anyhow!("expected number param, got {:?}", std::mem::discriminant(other))),
+            other => Err(anyhow!(
+                "expected number param, got {:?}",
+                std::mem::discriminant(other)
+            )),
         },
         None => Err(anyhow!("missing required numeric parameter")),
     }
@@ -154,10 +182,9 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
 use crate::intent_algebra::relational::{
-    AggFunc, AggItem,
-    BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
-    PartitionKeys as QePartitionKeys, QueryExpr,
-    SourceSpec as QeSourceSpec, VectorGrouping, VectorMatch, VectorMatchKind,
+    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
+    PartitionKeys as QePartitionKeys, QueryExpr, SourceSpec as QeSourceSpec, VectorGrouping,
+    VectorMatch, VectorMatchKind,
 };
 use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality};
 
@@ -167,15 +194,14 @@ use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality
 /// `histogram_quantile(φ, …)` is substituted into a plain
 /// `Aggregate { Quantile(φ) }` per Step γ5 of the relational migration.
 pub fn parse_promql_expr(query: &str) -> anyhow::Result<QueryExpr> {
-    let expr = parser::parse(query)
-        .map_err(|e| anyhow!("PromQL parse error: {e}"))?;
+    let expr = parser::parse(query).map_err(|e| anyhow!("PromQL parse error: {e}"))?;
     walk_qe(&expr, WalkCtx::default())
 }
 
 fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     match expr {
         Expr::Aggregate(agg) => walk_aggregate_qe(agg, ctx),
-        Expr::Call(call)     => walk_call_qe(call, ctx),
+        Expr::Call(call) => walk_call_qe(call, ctx),
 
         // Binary op: map to QueryExpr::BinaryOp with VectorMatch.
         Expr::Binary(bin) => walk_binary_qe(bin),
@@ -186,9 +212,9 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         Expr::Subquery(sq) => {
             let inner = walk_qe(sq.expr.as_ref(), ctx.clone())?;
             Ok(QueryExpr::PromQLSubquery {
-                range:      sq.range,
+                range: sq.range,
                 resolution: sq.step,
-                input:      Box::new(inner),
+                input: Box::new(inner),
             })
         }
 
@@ -208,27 +234,28 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         // HLL-only or CMS-with-heap-only deploy).
         Expr::VectorSelector(vs) => {
             let (name, filters) = extract_vs_info(vs);
-            let source   = QueryExpr::Source(QeSourceSpec { name });
+            let source = QueryExpr::Source(QeSourceSpec { name });
             let filtered = apply_qe_filters(source, filters);
             if ctx.outer_count || ctx.topk.is_some() {
                 Ok(filtered)
             } else {
                 Ok(QueryExpr::Aggregate {
-                    keys:   vec![],
-                    aggs:   vec![AggItem {
-                        alias:    "value".into(),
-                        func:     AggFunc::Sum,
-                        col:      QeColumnRef::SampleValue,
+                    keys: vec![],
+                    aggs: vec![AggItem {
+                        alias: "value".into(),
+                        func: AggFunc::Sum,
+                        col: QeColumnRef::SampleValue,
                         distinct: false,
                     }],
                     having: None,
-                    input:  Box::new(filtered),
+                    input: Box::new(filtered),
                 })
             }
         }
 
-        Expr::NumberLiteral(_) | Expr::StringLiteral(_) =>
-            Err(anyhow!("unexpected literal at top level of PromQL expression")),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) => Err(anyhow!(
+            "unexpected literal at top level of PromQL expression"
+        )),
 
         #[allow(unreachable_patterns)]
         _ => Err(anyhow!("unsupported PromQL expression type")),
@@ -237,85 +264,116 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
 
 fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     let partition = agg.modifier.as_ref().map(modifier_to_partition);
-    let op_name   = format!("{}", agg.op);
+    let op_name = format!("{}", agg.op);
 
     match op_name.as_str() {
         "topk" | "bottomk" => {
             let k = extract_number_param(&agg.param)? as u64;
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: Some(k), outer_count: false };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: Some(k),
+                outer_count: false,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             // Don't wrap with Partition here — inner Aggregate already has the keys,
             // and the lowering pass will create the Partition when it lowers the Aggregate.
-            let result = QueryExpr::TopK { k, by: partition.as_ref().map(|p| p.keys().to_vec()).unwrap_or_default(), input: Box::new(inner) };
+            let result = QueryExpr::TopK {
+                k,
+                by: partition
+                    .as_ref()
+                    .map(|p| p.keys().to_vec())
+                    .unwrap_or_default(),
+                input: Box::new(inner),
+            };
             Ok(result)
         }
         "count" => {
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: None, outer_count: true };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: None,
+                outer_count: true,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
-                keys:   vec![],
-                aggs:   vec![AggItem {
-                    alias:    "count".into(),
-                    func:     AggFunc::CountDistinct,
-                    col:      QeColumnRef::SampleValue,
+                keys: vec![],
+                aggs: vec![AggItem {
+                    alias: "count".into(),
+                    func: AggFunc::CountDistinct,
+                    col: QeColumnRef::SampleValue,
                     distinct: false,
                 }],
                 having: None,
-                input:  Box::new(inner),
+                input: Box::new(inner),
             };
             Ok(apply_qe_partition(result, partition))
         }
         "sum" | "avg" | "min" | "max" | "group" => {
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: ctx.topk, outer_count: false };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: ctx.topk,
+                outer_count: false,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             Ok(apply_qe_partition(inner, partition))
         }
         "stddev" => {
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: None, outer_count: false };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: None,
+                outer_count: false,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
-                keys:   vec![],
-                aggs:   vec![AggItem {
-                    alias:    "stddev".into(),
-                    func:     AggFunc::StdDev { population: false },
-                    col:      QeColumnRef::SampleValue,
+                keys: vec![],
+                aggs: vec![AggItem {
+                    alias: "stddev".into(),
+                    func: AggFunc::StdDev { population: false },
+                    col: QeColumnRef::SampleValue,
                     distinct: false,
                 }],
                 having: None,
-                input:  Box::new(inner),
+                input: Box::new(inner),
             };
             Ok(apply_qe_partition(result, partition))
         }
         "stdvar" => {
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: None, outer_count: false };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: None,
+                outer_count: false,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
-                keys:   vec![],
-                aggs:   vec![AggItem {
-                    alias:    "stdvar".into(),
-                    func:     AggFunc::Variance { population: false },
-                    col:      QeColumnRef::SampleValue,
+                keys: vec![],
+                aggs: vec![AggItem {
+                    alias: "stdvar".into(),
+                    func: AggFunc::Variance { population: false },
+                    col: QeColumnRef::SampleValue,
                     distinct: false,
                 }],
                 having: None,
-                input:  Box::new(inner),
+                input: Box::new(inner),
             };
             Ok(apply_qe_partition(result, partition))
         }
         "quantile" => {
             let phi = extract_number_param(&agg.param)?;
-            let inner_ctx = WalkCtx { partition: partition.clone(), topk: None, outer_count: false };
+            let inner_ctx = WalkCtx {
+                partition: partition.clone(),
+                topk: None,
+                outer_count: false,
+            };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
-                keys:   vec![],
-                aggs:   vec![AggItem {
-                    alias:    "quantile".into(),
-                    func:     AggFunc::Quantile(phi),
-                    col:      QeColumnRef::SampleValue,
+                keys: vec![],
+                aggs: vec![AggItem {
+                    alias: "quantile".into(),
+                    func: AggFunc::Quantile(phi),
+                    col: QeColumnRef::SampleValue,
                     distinct: false,
                 }],
                 having: None,
-                input:  Box::new(inner),
+                input: Box::new(inner),
             };
             Ok(apply_qe_partition(result, partition))
         }
@@ -343,12 +401,16 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         // rewrite the Quantile(φ) into a Count-frequency aggregate, which
         // would be semantically wrong for the histogram-quantile reduction.
         "histogram_quantile" => {
-            let phi       = extract_call_num_arg(call, 0)?;
+            let phi = extract_call_num_arg(call, 0)?;
             let rate_expr = call.args.args[1].as_ref();
             let (source, filters, window) = extract_inner_matrix(rate_expr)?;
-            Ok(build_qe_aggregate(source, filters, window,
+            Ok(build_qe_aggregate(
+                source,
+                filters,
+                window,
                 AggFunc::Quantile(phi),
-                WalkCtx::default()))
+                WalkCtx::default(),
+            ))
         }
         // All other function calls: map to AggFunc (Layer 2).
         "quantile_over_time" => {
@@ -363,7 +425,10 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
                 || call.func.name == "irate"
                 || call.func.name == "increase"
             {
-                let arg = call.args.args.first()
+                let arg = call
+                    .args
+                    .args
+                    .first()
                     .map(|b| b.as_ref())
                     .ok_or_else(|| anyhow!("rate/irate/increase requires a matrix arg"))?;
                 extract_inner_matrix(arg)?
@@ -383,28 +448,32 @@ fn walk_binary_qe(bin: &BinaryExpr) -> anyhow::Result<QueryExpr> {
 
     let vector_match = bin.modifier.as_ref().map(|m| {
         let (kind, labels) = match &m.matching {
-            Some(LabelModifier::Include(ls)) => (VectorMatchKind::On,       ls.labels.clone()),
+            Some(LabelModifier::Include(ls)) => (VectorMatchKind::On, ls.labels.clone()),
             Some(LabelModifier::Exclude(ls)) => (VectorMatchKind::Ignoring, ls.labels.clone()),
-            None                              => (VectorMatchKind::On,       vec![]),
+            None => (VectorMatchKind::On, vec![]),
         };
         let grouping = match &m.card {
             VectorMatchCardinality::ManyToOne(ls) => Some(VectorGrouping {
-                side:   GroupSide::Left,
+                side: GroupSide::Left,
                 labels: ls.labels.clone(),
             }),
             VectorMatchCardinality::OneToMany(ls) => Some(VectorGrouping {
-                side:   GroupSide::Right,
+                side: GroupSide::Right,
                 labels: ls.labels.clone(),
             }),
             _ => None,
         };
-        VectorMatch { kind, labels, grouping }
+        VectorMatch {
+            kind,
+            labels,
+            grouping,
+        }
     });
 
     Ok(QueryExpr::BinaryOp {
         op,
-        lhs:          Box::new(lhs),
-        rhs:          Box::new(rhs),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
         vector_match,
     })
 }
@@ -414,23 +483,23 @@ fn promql_token_to_binop(tok: TokenType) -> BinaryOpKind {
     // token::T_* are u8 constants; TokenType wraps them as TokenType(u8).
     let id = tok.id();
     match id {
-        token::T_ADD     => BinaryOpKind::Add,
-        token::T_SUB     => BinaryOpKind::Sub,
-        token::T_MUL     => BinaryOpKind::Mul,
-        token::T_DIV     => BinaryOpKind::Div,
-        token::T_MOD     => BinaryOpKind::Mod,
-        token::T_POW     => BinaryOpKind::Pow,
-        token::T_EQLC    => BinaryOpKind::Eq,
-        token::T_NEQ     => BinaryOpKind::Ne,
-        token::T_LSS     => BinaryOpKind::Lt,
-        token::T_LTE     => BinaryOpKind::Le,
-        token::T_GTR     => BinaryOpKind::Gt,
-        token::T_GTE     => BinaryOpKind::Ge,
-        token::T_LAND    => BinaryOpKind::And,
-        token::T_LOR     => BinaryOpKind::Or,
+        token::T_ADD => BinaryOpKind::Add,
+        token::T_SUB => BinaryOpKind::Sub,
+        token::T_MUL => BinaryOpKind::Mul,
+        token::T_DIV => BinaryOpKind::Div,
+        token::T_MOD => BinaryOpKind::Mod,
+        token::T_POW => BinaryOpKind::Pow,
+        token::T_EQLC => BinaryOpKind::Eq,
+        token::T_NEQ => BinaryOpKind::Ne,
+        token::T_LSS => BinaryOpKind::Lt,
+        token::T_LTE => BinaryOpKind::Le,
+        token::T_GTR => BinaryOpKind::Gt,
+        token::T_GTE => BinaryOpKind::Ge,
+        token::T_LAND => BinaryOpKind::And,
+        token::T_LOR => BinaryOpKind::Or,
         token::T_LUNLESS => BinaryOpKind::Unless,
-        token::T_ATAN2   => BinaryOpKind::Atan2,
-        _                => BinaryOpKind::Add, // unknown — default to add
+        token::T_ATAN2 => BinaryOpKind::Atan2,
+        _ => BinaryOpKind::Add, // unknown — default to add
     }
 }
 
@@ -468,10 +537,10 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
                 AggFunc::Frequency
             })
         }
-        "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" =>
-            Ok(AggFunc::Sum),
-        "delta" | "idelta" | "deriv" | "predict_linear" =>
-            Ok(AggFunc::Delta),
+        "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" => {
+            Ok(AggFunc::Sum)
+        }
+        "delta" | "idelta" | "deriv" | "predict_linear" => Ok(AggFunc::Delta),
         "changes" | "resets" => Ok(AggFunc::Count),
         "rate" | "irate" => Ok(AggFunc::Rate),
         "increase" => Ok(AggFunc::Increase),
@@ -481,18 +550,18 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
 
 /// Build a Layer 2 `QueryExpr`: `Aggregate { AggFunc, input: Window { ... } }`.
 fn build_qe_aggregate(
-    metric:  String,
+    metric: String,
     filters: Vec<Predicate>,
-    window:  std::time::Duration,
-    func:    AggFunc,
-    ctx:     WalkCtx,
+    window: std::time::Duration,
+    func: AggFunc,
+    ctx: WalkCtx,
 ) -> QueryExpr {
-    let source   = QueryExpr::Source(QeSourceSpec { name: metric });
+    let source = QueryExpr::Source(QeSourceSpec { name: metric });
     let filtered = apply_qe_filters(source, filters);
     let windowed = QueryExpr::Window {
         duration: window,
-        slide:    None,
-        input:    Box::new(filtered),
+        slide: None,
+        input: Box::new(filtered),
     };
     let actual_func = if ctx.topk.is_some() {
         // Inside topk context, the aggregation is frequency-based.
@@ -502,83 +571,130 @@ fn build_qe_aggregate(
     };
     // Propagate partition keys into the Aggregate's GROUP BY so the lowering
     // pass sees Count-with-GROUP-BY → Frequency (not bare Count → no sketch).
-    let group_keys: Vec<String> = ctx.partition.as_ref()
+    let group_keys: Vec<String> = ctx
+        .partition
+        .as_ref()
         .map(|p| p.keys().to_vec())
         .unwrap_or_default();
     let alias = format!("{}", actual_func).to_lowercase();
     let agg = QueryExpr::Aggregate {
-        keys:   group_keys,
-        aggs:   vec![AggItem {
+        keys: group_keys,
+        aggs: vec![AggItem {
             alias,
-            func:     actual_func,
-            col:      QeColumnRef::SampleValue,
+            func: actual_func,
+            col: QeColumnRef::SampleValue,
             distinct: false,
         }],
         having: None,
-        input:  Box::new(windowed),
+        input: Box::new(windowed),
     };
     // Don't wrap with Partition separately — keys are already in the Aggregate.
     // The lowering pass will create the Partition node when it lowers the Aggregate.
     agg
 }
 
-fn apply_qe_filters(
-    input:   QueryExpr,
-    filters: Vec<Predicate>,
-) -> QueryExpr {
+fn apply_qe_filters(input: QueryExpr, filters: Vec<Predicate>) -> QueryExpr {
     if filters.is_empty() {
         input
     } else {
         use crate::intent_algebra::relational::{BinaryOpKind, LiteralValue, ScalarExpr};
-        let pred = filters.iter().fold(
-            ScalarExpr::Literal(LiteralValue::Bool(true)),
-            |acc, p| {
+        let pred = filters
+            .iter()
+            .fold(ScalarExpr::Literal(LiteralValue::Bool(true)), |acc, p| {
                 let col = ScalarExpr::Column(p.col.clone());
                 let val = match &p.val {
-                    FilterVal::Str(s)  => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
-                    FilterVal::Num(n)  => ScalarExpr::Literal(LiteralValue::Float(*n)),
-                    FilterVal::Int(i)  => ScalarExpr::Literal(LiteralValue::Int(*i)),
-                    FilterVal::Null    => ScalarExpr::Literal(LiteralValue::Null),
+                    FilterVal::Str(s) => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
+                    FilterVal::Num(n) => ScalarExpr::Literal(LiteralValue::Float(*n)),
+                    FilterVal::Int(i) => ScalarExpr::Literal(LiteralValue::Int(*i)),
+                    FilterVal::Null => ScalarExpr::Literal(LiteralValue::Null),
                 };
                 let this = match &p.op {
-                    FilterOp::Eq       => ScalarExpr::BinaryOp { op: BinaryOpKind::Eq,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Ne       => ScalarExpr::BinaryOp { op: BinaryOpKind::Ne,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Lt       => ScalarExpr::BinaryOp { op: BinaryOpKind::Lt,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Le       => ScalarExpr::BinaryOp { op: BinaryOpKind::Le,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Gt       => ScalarExpr::BinaryOp { op: BinaryOpKind::Gt,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Ge       => ScalarExpr::BinaryOp { op: BinaryOpKind::Ge,       lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::Regex(r) => ScalarExpr::BinaryOp { op: BinaryOpKind::Regex,    lhs: Box::new(col), rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))) },
-                    FilterOp::NotRegex(r) => ScalarExpr::BinaryOp { op: BinaryOpKind::NotRegex, lhs: Box::new(col), rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))) },
-                    FilterOp::Like     => ScalarExpr::BinaryOp { op: BinaryOpKind::Like,     lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::NotLike  => ScalarExpr::BinaryOp { op: BinaryOpKind::NotLike,  lhs: Box::new(col), rhs: Box::new(val) },
-                    FilterOp::IsNull   => ScalarExpr::IsNull { expr: Box::new(col), negated: false },
-                    FilterOp::IsNotNull => ScalarExpr::IsNull { expr: Box::new(col), negated: true },
+                    FilterOp::Eq => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Eq,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Ne => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Ne,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Lt => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Lt,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Le => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Le,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Gt => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Gt,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Ge => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Ge,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::Regex(r) => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Regex,
+                        lhs: Box::new(col),
+                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
+                    },
+                    FilterOp::NotRegex(r) => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::NotRegex,
+                        lhs: Box::new(col),
+                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
+                    },
+                    FilterOp::Like => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::Like,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::NotLike => ScalarExpr::BinaryOp {
+                        op: BinaryOpKind::NotLike,
+                        lhs: Box::new(col),
+                        rhs: Box::new(val),
+                    },
+                    FilterOp::IsNull => ScalarExpr::IsNull {
+                        expr: Box::new(col),
+                        negated: false,
+                    },
+                    FilterOp::IsNotNull => ScalarExpr::IsNull {
+                        expr: Box::new(col),
+                        negated: true,
+                    },
                 };
                 ScalarExpr::BinaryOp {
-                    op:  BinaryOpKind::And,
+                    op: BinaryOpKind::And,
                     lhs: Box::new(acc),
                     rhs: Box::new(this),
                 }
-            },
-        );
-        QueryExpr::Filter { pred, input: Box::new(input) }
+            });
+        QueryExpr::Filter {
+            pred,
+            input: Box::new(input),
+        }
     }
 }
 
-fn apply_qe_partition(
-    input:     QueryExpr,
-    partition: Option<PartitionKeys>,
-) -> QueryExpr {
+fn apply_qe_partition(input: QueryExpr, partition: Option<PartitionKeys>) -> QueryExpr {
     match partition {
         None => input,
         Some(p) if p.is_empty() => input,
         Some(keys) => {
             // Convert PromQL by/without → PartitionKeys.
             let qe_keys = match keys {
-                PartitionKeys::By(k)      => QePartitionKeys::By(k),
+                PartitionKeys::By(k) => QePartitionKeys::By(k),
                 PartitionKeys::Without(k) => QePartitionKeys::Without(k),
             };
-            QueryExpr::Partition { keys: qe_keys, input: Box::new(input) }
+            QueryExpr::Partition {
+                keys: qe_keys,
+                input: Box::new(input),
+            }
         }
     }
 }
@@ -604,7 +720,10 @@ mod tests {
         assert_eq!(pq.aggregations, vec![AggType::Quantile]);
         assert_eq!(pq.quantiles, vec![0.99]);
         assert_eq!(pq.group_by_labels, vec!["host"]);
-        assert_eq!(pq.label_filters.get("service").map(String::as_str), Some("web"));
+        assert_eq!(
+            pq.label_filters.get("service").map(String::as_str),
+            Some("web")
+        );
         assert_eq!(pq.time_window, Duration::from_secs(300));
     }
 
@@ -663,10 +782,7 @@ mod tests {
         let pq = pq(r#"histogram_quantile(0.99, rate(http_requests_bucket{le="0.5"}[5m]))"#);
         assert_eq!(pq.aggregations, vec![AggType::Quantile]);
         assert_eq!(pq.quantiles, vec![0.99]);
-        assert_eq!(
-            pq.label_filters.get("le").map(String::as_str),
-            Some("0.5"),
-        );
+        assert_eq!(pq.label_filters.get("le").map(String::as_str), Some("0.5"),);
     }
 
     // ── avg_over_time ─────────────────────────────────────────────────────────
@@ -717,7 +833,6 @@ mod tests {
         assert_eq!(pq.aggregations, vec![AggType::Cardinality]);
     }
 
-
     // ── stddev_over_time ──────────────────────────────────────────────────────
 
     #[test]
@@ -740,7 +855,10 @@ mod tests {
     #[test]
     fn label_eq_filter() {
         let pq = pq(r#"sum by (service) (count_over_time(hits{env="prod"}[5m]))"#);
-        assert_eq!(pq.label_filters.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            pq.label_filters.get("env").map(String::as_str),
+            Some("prod")
+        );
     }
 
     // ── duration parsing ──────────────────────────────────────────────────────

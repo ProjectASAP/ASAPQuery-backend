@@ -1,12 +1,14 @@
-use crate::storage_engines::types::{
-    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput};
 use crate::precompute_engine::accumulator_factory::{
-    create_accumulator_updater, AccumulatorUpdater};
+    create_accumulator_updater, AccumulatorUpdater,
+};
 use crate::precompute_engine::config::LateDataPolicy;
+use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
 use crate::precompute_engine::window_manager::WindowManager;
-use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+use crate::storage_engines::types::{
+    AggregateCore, HotReloadStreamingConfig, KeyByLabelValues, PrecomputedOutput,
+};
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
 use std::collections::{BTreeMap, HashMap};
@@ -65,7 +67,8 @@ struct GroupState {
     /// `active_panes` and `sketch_panes` (a single pane_start may have
     /// either or both populated). Entries are GC'd by
     /// `prune_pane_wall_clock_starts` after each window-close cycle.
-    pane_wall_clock_starts_ms: BTreeMap<i64, i64>}
+    pane_wall_clock_starts_ms: BTreeMap<i64, i64>,
+}
 
 impl GroupState {
     /// Drop wall-clock-start entries whose pane no longer exists in
@@ -90,7 +93,8 @@ pub struct WorkerRuntimeConfig {
     /// See `PrecomputeEngineConfig::wall_clock_grace_period_ms`. Set to a
     /// non-positive value to disable the wall-clock fallback entirely
     /// (event-time-only behaviour, matching pre-fix semantics).
-    pub wall_clock_grace_period_ms: i64}
+    pub wall_clock_grace_period_ms: i64,
+}
 
 /// Worker that processes samples for a shard of the sid space.
 ///
@@ -136,7 +140,8 @@ pub struct Worker {
     /// `&mut self` only on `flush_all` and pane creation, so a single
     /// non-`Sync` cell behind a mutex is fine — but we keep the bound
     /// `Send + Sync` for clarity since `Worker` itself is `Send`.
-    now_ms_fn: Box<dyn Fn() -> i64 + Send + Sync>}
+    now_ms_fn: Box<dyn Fn() -> i64 + Send + Sync>,
+}
 
 impl Worker {
     #[allow(clippy::too_many_arguments)]
@@ -156,7 +161,8 @@ impl Worker {
             pass_raw_samples,
             raw_mode_aggregation_id,
             late_data_policy,
-            wall_clock_grace_period_ms} = runtime_config;
+            wall_clock_grace_period_ms,
+        } = runtime_config;
         Self {
             id,
             receiver,
@@ -171,7 +177,8 @@ impl Worker {
             all_worker_watermarks,
             group_count,
             wall_clock_grace_period_ms,
-            now_ms_fn: Box::new(default_now_ms)}
+            now_ms_fn: Box::new(default_now_ms),
+        }
     }
 
     /// Test/diagnostic-only setter for the wall-clock source. Replaces
@@ -195,7 +202,8 @@ impl Worker {
                     policy_fp,
                     group_key,
                     samples,
-                    ingest_received_at} => {
+                    ingest_received_at,
+                } => {
                     let sample_count = samples.len();
                     let _span = debug_span!(
                         "worker_process_group",
@@ -206,8 +214,7 @@ impl Worker {
                         sample_count,
                     )
                     .entered();
-                    if let Err(e) =
-                        self.process_group_samples(sid, policy_fp, &group_key, samples)
+                    if let Err(e) = self.process_group_samples(sid, policy_fp, &group_key, samples)
                     {
                         warn!(
                             "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
@@ -222,7 +229,8 @@ impl Worker {
                 WorkerMessage::RawSamples {
                     series_key,
                     samples,
-                    ingest_received_at} => {
+                    ingest_received_at,
+                } => {
                     let _span = debug_span!(
                         "worker_process_raw",
                         worker_id = self.id,
@@ -244,7 +252,8 @@ impl Worker {
                     group_key,
                     timestamp_ms,
                     accumulator,
-                    ingest_received_at} => {
+                    ingest_received_at,
+                } => {
                     let _span = debug_span!(
                         "worker_process_accumulator",
                         worker_id = self.id,
@@ -330,7 +339,8 @@ impl Worker {
                 active_panes: BTreeMap::new(),
                 sketch_panes: BTreeMap::new(),
                 previous_watermark_ms: i64::MIN,
-                pane_wall_clock_starts_ms: BTreeMap::new()};
+                pane_wall_clock_starts_ms: BTreeMap::new(),
+            };
             self.group_states.insert(sid, gs);
             self.group_count
                 .store(self.group_states.len(), Ordering::Relaxed);
@@ -665,12 +675,8 @@ impl Worker {
             // dev/test-only today (default `raw_mode_aggregation_id=0`),
             // so this path effectively writes nothing in production;
             // wiring raw mode to a real policy is a separate concern.
-            let output = PrecomputedOutput::new(
-                ts as u64,
-                ts as u64,
-                None,
-                PolicyFingerprint::UNSET,
-            );
+            let output =
+                PrecomputedOutput::new(ts as u64, ts as u64, None, PolicyFingerprint::UNSET);
             let _ = self.raw_mode_aggregation_id;
             let accumulator = SumAccumulator::with_sum(val);
             emit_batch.push((output, Box::new(accumulator)));
@@ -905,7 +911,8 @@ fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
 pub fn extract_metric_name(series_key: &str) -> &str {
     match series_key.find('{') {
         Some(pos) => &series_key[..pos],
-        None => series_key}
+        None => series_key,
+    }
 }
 
 /// Extract grouping label values from a series key string based on the
@@ -947,10 +954,12 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
 
     let start = match series_key.find('{') {
         Some(pos) => pos + 1,
-        None => return labels};
+        None => return labels,
+    };
     let end = match series_key.rfind('}') {
         Some(pos) => pos,
-        None => return labels};
+        None => return labels,
+    };
 
     if start >= end {
         return labels;
@@ -963,7 +972,8 @@ pub fn parse_labels_from_series_key(series_key: &str) -> HashMap<&str, &str> {
     while !remaining.is_empty() {
         let eq_pos = match remaining.find('=') {
             Some(pos) => pos,
-            None => break};
+            None => break,
+        };
         let key = remaining[..eq_pos].trim();
 
         let after_eq = &remaining[eq_pos + 1..];
@@ -1124,7 +1134,8 @@ fn merge_panes_for_window(
         if let Some(acc) = pane_acc {
             merged = Some(match merged {
                 None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing)});
+                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
+            });
         }
     }
 
@@ -1155,7 +1166,8 @@ fn merge_sketch_panes_for_window(
         if let Some(acc) = pane_acc {
             merged = Some(match merged {
                 None => acc,
-                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing)});
+                Some(existing) => existing.merge_with(acc.as_ref()).unwrap_or(existing),
+            });
         }
     }
 
@@ -1242,12 +1254,12 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    use crate::storage_engines::types::StreamingConfig;
     use crate::precompute_engine::config::LateDataPolicy;
-    use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::precompute_engine::operators::datasketches_kll_accumulator::DatasketchesKLLAccumulator;
     use crate::precompute_engine::operators::multiple_sum_accumulator::MultipleSumAccumulator;
     use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
+    use crate::precompute_engine::output_sink::CapturingOutputSink;
+    use crate::storage_engines::types::StreamingConfig;
     use asap_sketchlib::KllSketch;
     use asap_types::enums::{AggregationType, WindowType};
 
@@ -1335,7 +1347,8 @@ mod tests {
                 pass_raw_samples: pass_raw,
                 raw_mode_aggregation_id: raw_agg_id,
                 late_data_policy: late_policy,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1350,9 +1363,9 @@ mod tests {
     fn make_hot_reload(
         configs: HashMap<u64, AggregationConfig>,
     ) -> crate::storage_engines::types::HotReloadStreamingConfig {
-        crate::storage_engines::types::HotReloadStreamingConfig::new(crate::storage_engines::types::StreamingConfig::new(
-            configs,
-        ))
+        crate::storage_engines::types::HotReloadStreamingConfig::new(
+            crate::storage_engines::types::StreamingConfig::new(configs),
+        )
     }
 
     /// Helper to make GroupSamples from simple (ts, val) pairs for a single series.
@@ -1503,7 +1516,12 @@ mod tests {
 
         // Close the window
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                "",
+                group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -1789,7 +1807,12 @@ mod tests {
 
         // Close the single bucket's window
         worker
-            .process_group_samples(3, pf, "", group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]))
+            .process_group_samples(
+                3,
+                pf,
+                "",
+                group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -1824,7 +1847,6 @@ mod tests {
         assert!(found_b, "expected key B inside accumulator");
     }
 
-
     #[test]
     fn test_late_data_drop() {
         let config = make_agg_config(
@@ -1853,7 +1875,8 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1906,7 +1929,8 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::ForwardToStore,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
@@ -1988,18 +2012,38 @@ aggregations:
         let pf = PolicyFingerprint(agg_id);
         let sid = 1_u64;
         worker
-            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(1_000, 3.0)]))
+            .process_group_samples(
+                sid,
+                pf,
+                "",
+                group_samples("requests_total", vec![(1_000, 3.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(5_000, 4.0)]))
+            .process_group_samples(
+                sid,
+                pf,
+                "",
+                group_samples("requests_total", vec![(5_000, 4.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(9_000, 5.0)]))
+            .process_group_samples(
+                sid,
+                pf,
+                "",
+                group_samples("requests_total", vec![(9_000, 5.0)]),
+            )
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         worker
-            .process_group_samples(sid, pf, "", group_samples("requests_total", vec![(10_000, 0.0)]))
+            .process_group_samples(
+                sid,
+                pf,
+                "",
+                group_samples("requests_total", vec![(10_000, 0.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -2094,17 +2138,32 @@ aggregations:
         let sid_b = 22_u64;
         // Group A: send sample at t=5s (within window [0, 10s))
         worker
-            .process_group_samples(sid_a, pf, "groupA", group_samples("cpu", vec![(5_000, 1.0)]))
+            .process_group_samples(
+                sid_a,
+                pf,
+                "groupA",
+                group_samples("cpu", vec![(5_000, 1.0)]),
+            )
             .unwrap();
         // Group B: send sample at t=5s (within window [0, 10s))
         worker
-            .process_group_samples(sid_b, pf, "groupB", group_samples("cpu", vec![(5_000, 2.0)]))
+            .process_group_samples(
+                sid_b,
+                pf,
+                "groupB",
+                group_samples("cpu", vec![(5_000, 2.0)]),
+            )
             .unwrap();
         let _ = sink.drain();
 
         // Advance group A's watermark to t=100s (closes many windows).
         worker
-            .process_group_samples(sid_a, pf, "groupA", group_samples("cpu", vec![(100_000, 3.0)]))
+            .process_group_samples(
+                sid_a,
+                pf,
+                "groupA",
+                group_samples("cpu", vec![(100_000, 3.0)]),
+            )
             .unwrap();
         let _ = sink.drain();
 
@@ -2148,7 +2207,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -2175,7 +2235,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -2206,7 +2267,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm0,
             all,
@@ -2246,7 +2308,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0},
+                wall_clock_grace_period_ms: 0,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             all,
@@ -2477,7 +2540,8 @@ aggregations:
             let expected_count: u64 = match zone.as_str() {
                 "us-east" => 3,
                 "us-west" => 2,
-                other => panic!("unexpected zone {other}")};
+                other => panic!("unexpected zone {other}"),
+            };
             assert_eq!(
                 dd.inner.total_count(),
                 expected_count,
@@ -2525,7 +2589,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms},
+                wall_clock_grace_period_ms,
+            },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
             vec![wm],
