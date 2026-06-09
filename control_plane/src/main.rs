@@ -641,6 +641,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             distinct_keys_per_window: None,
             // Role derivation does not depend on the inner item dimension.
             item_label: None,
+            // Role derivation does not depend on monitoring.
+            monitor: None,
         };
         control_plane::workload::derive_agg_role(&entry)
     };
@@ -793,12 +795,17 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                             // helper. See [`post_typed_backend_for_role`]
                             // doc for the swap-semantics rationale +
                             // cumulative-cache contract.
+                            // CDM monitor specs from the workload registry
+                            // (global; coordinator_url unused for the backend's
+                            // agg_id/τ/window-only entries).
+                            let monitors = st.workload_registry.monitor_intents("");
                             post_typed_backend_for_role(
                                 st.backend_client.as_ref(),
                                 &st.backend_routing_cache,
                                 &workload.metric_name,
                                 role,
                                 be,
+                                &monitors,
                             )
                             .await;
 

@@ -35,6 +35,15 @@ impl Functional {
             Functional::LinearBuckets => "linear_buckets",
         }
     }
+
+    /// Parse a functional name (workload-spec value); unknown/empty → Sum.
+    pub fn from_name(s: &str) -> Functional {
+        match s {
+            "cms_point" => Functional::CmsPoint,
+            "linear_buckets" => Functional::LinearBuckets,
+            _ => Functional::Sum,
+        }
+    }
 }
 
 /// One monitored standing-query intent: "alert when the global Σ of `metric`'s

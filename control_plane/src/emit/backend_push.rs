@@ -302,6 +302,9 @@ pub async fn post_typed_backend_for_role(
     metric: &str,
     role: AggRole,
     be: BackendStageConfig,
+    // CDM monitor specs to embed in the cumulative streaming-config (global, so
+    // included on every coupled push). Empty for non-monitored deployments.
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     // ── 1. Update cache and collect cumulative entries ───────────────────
     //
@@ -325,7 +328,14 @@ pub async fn post_typed_backend_for_role(
         v
     };
 
-    push_cumulative_entries(backend_client, &cumulative_entries, metric, Some(role)).await
+    push_cumulative_entries(
+        backend_client,
+        &cumulative_entries,
+        metric,
+        Some(role),
+        monitors,
+    )
+    .await
 }
 
 /// Re-POST the FULL cumulative streaming-config + storage-routing derived
@@ -352,6 +362,7 @@ pub async fn post_typed_backend_for_role(
 pub async fn repost_cumulative_backend_config(
     backend_client: Option<&Arc<BackendClient>>,
     cache: &BackendRoutingCache,
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     let cumulative_entries: Vec<((String, AggRole), BackendStageConfig)> = {
         let cache = cache.lock().await;
@@ -375,6 +386,7 @@ pub async fn repost_cumulative_backend_config(
         &cumulative_entries,
         "<periodic-refresh>",
         None,
+        monitors,
     )
     .await
 }
@@ -391,6 +403,7 @@ async fn push_cumulative_entries(
     cumulative_entries: &[((String, AggRole), BackendStageConfig)],
     metric: &str,
     role: Option<AggRole>,
+    monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     // ── Build BOTH cumulative documents up front (P2-3) ───────────────────
     //
@@ -414,7 +427,7 @@ async fn push_cumulative_entries(
             .flat_map(|(_, c)| c.readouts.iter().cloned())
             .collect(),
     };
-    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be) {
+    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be, monitors) {
         Ok(doc) => doc.to_string(),
         Err(e) => {
             warn!(error = %e, "emit_backend_streaming_config_json failed; skipping coupled push");
@@ -674,7 +687,7 @@ mod tests {
     async fn no_client_still_updates_cache() {
         let cache = Mutex::new(HashMap::new());
         let be = make_be("m", "agg0");
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, be).await;
+        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, be, &[]).await;
         let snap = cache.lock().await;
         assert_eq!(snap.len(), 1);
         assert!(snap.contains_key(&("m".to_string(), AggRole::Quantile)));
@@ -692,6 +705,7 @@ mod tests {
             "http_requests_total",
             AggRole::Quantile,
             make_be("http_requests_total", "q"),
+            &[],
         )
         .await;
         post_typed_backend_for_role(
@@ -700,6 +714,7 @@ mod tests {
             "http_requests_total",
             AggRole::Sum,
             make_be("http_requests_total", "s"),
+            &[],
         )
         .await;
         let snap = cache.lock().await;
@@ -715,8 +730,24 @@ mod tests {
     #[tokio::test]
     async fn same_pair_replaces_not_duplicates() {
         let cache = Mutex::new(HashMap::new());
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "v1")).await;
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "v2")).await;
+        post_typed_backend_for_role(
+            None,
+            &cache,
+            "m",
+            AggRole::Quantile,
+            make_be("m", "v1"),
+            &[],
+        )
+        .await;
+        post_typed_backend_for_role(
+            None,
+            &cache,
+            "m",
+            AggRole::Quantile,
+            make_be("m", "v2"),
+            &[],
+        )
+        .await;
         let snap = cache.lock().await;
         assert_eq!(snap.len(), 1);
         let entry = snap.get(&("m".to_string(), AggRole::Quantile)).unwrap();
@@ -797,6 +828,7 @@ mod tests {
             "latency",
             AggRole::Quantile,
             make_be("latency", "q"),
+            &[],
         )
         .await;
         assert_eq!(outcome, PushOutcome::BothApplied);
@@ -825,6 +857,7 @@ mod tests {
             "latency",
             AggRole::Quantile,
             make_be("latency", "q"),
+            &[],
         )
         .await;
         assert_eq!(
@@ -860,6 +893,7 @@ mod tests {
             "http_requests_total",
             AggRole::Sum,
             make_be("http_requests_total", "s"),
+            &[],
         )
         .await;
         assert_eq!(mock1.streaming_hits.load(StdOrdering::SeqCst), 1);
@@ -873,7 +907,7 @@ mod tests {
         assert_eq!(mock2.streaming_hits.load(StdOrdering::SeqCst), 0);
 
         // The periodic re-POST reads the SAME cache and re-pushes everything.
-        let outcome = repost_cumulative_backend_config(Some(&client2), &cache).await;
+        let outcome = repost_cumulative_backend_config(Some(&client2), &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::BothApplied);
         assert_eq!(
             mock2.streaming_hits.load(StdOrdering::SeqCst),
@@ -896,7 +930,7 @@ mod tests {
             start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
         let client = StdArc::new(BackendClient::new(url));
         let cache = Mutex::new(HashMap::new());
-        let outcome = repost_cumulative_backend_config(Some(&client), &cache).await;
+        let outcome = repost_cumulative_backend_config(Some(&client), &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::Skipped);
         assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 0);
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 0);
@@ -907,8 +941,9 @@ mod tests {
     #[tokio::test]
     async fn repost_no_client_is_skipped() {
         let cache = Mutex::new(HashMap::new());
-        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "q")).await;
-        let outcome = repost_cumulative_backend_config(None, &cache).await;
+        post_typed_backend_for_role(None, &cache, "m", AggRole::Quantile, make_be("m", "q"), &[])
+            .await;
+        let outcome = repost_cumulative_backend_config(None, &cache, &[]).await;
         assert_eq!(outcome, PushOutcome::Skipped);
     }
 }

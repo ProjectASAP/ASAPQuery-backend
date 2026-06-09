@@ -123,7 +123,9 @@ impl PlanEmitter for StreamingConfigEmitter {
     }
 
     fn emit(&self, input: &BackendStageConfig) -> Result<serde_json::Value> {
-        super::stage_config::emit_backend_streaming_config_json(input)
+        // The PlanEmitter trait input carries no monitor specs; the controller's
+        // coupled-push path (post_typed_backend_for_role) injects them instead.
+        super::stage_config::emit_backend_streaming_config_json(input, &[])
     }
 }
 
@@ -305,7 +307,7 @@ mod tests {
         let cfg = empty_backend_cfg();
         let emitter = StreamingConfigEmitter::default();
         let trait_out = emitter.emit(&cfg).expect("trait emit");
-        let direct = super::super::stage_config::emit_backend_streaming_config_json(&cfg)
+        let direct = super::super::stage_config::emit_backend_streaming_config_json(&cfg, &[])
             .expect("direct emit");
         assert_eq!(trait_out, direct);
         assert_eq!(emitter.name(), "streaming_config_json");

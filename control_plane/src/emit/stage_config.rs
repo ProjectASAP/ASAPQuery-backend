@@ -664,7 +664,10 @@ pub fn emit_gateway_yaml(
 /// PromQL query at execution time; Phase B's typed `BackendStageConfig`
 /// carries the readouts explicitly, so we ship them too — backends that
 /// don't recognise the field will ignore it without erroring).
-pub fn emit_backend_streaming_config_json(cfg: &BackendStageConfig) -> Result<JsonValue> {
+pub fn emit_backend_streaming_config_json(
+    cfg: &BackendStageConfig,
+    monitors: &[crate::emit::monitor::MonitorIntent],
+) -> Result<JsonValue> {
     let aggregations: Vec<JsonValue> = cfg
         .aggregations
         .iter()
@@ -677,10 +680,23 @@ pub fn emit_backend_streaming_config_json(cfg: &BackendStageConfig) -> Result<Js
         .map(build_backend_readout_json)
         .collect();
 
-    Ok(json!({
+    let mut doc = json!({
         "aggregations": aggregations,
         "readouts": readouts,
-    }))
+    });
+    // Continuous-monitoring (CDM) specs: only present the `monitors` key when
+    // the workload declared at least one, so configs without monitors stay
+    // byte-identical to before (the backend's MonitorSpec list defaults empty).
+    if !monitors.is_empty() {
+        let entries: Vec<JsonValue> = monitors
+            .iter()
+            .map(crate::emit::monitor::streaming_config_monitor_entry)
+            .collect();
+        doc.as_object_mut()
+            .expect("json object")
+            .insert("monitors".to_string(), JsonValue::Array(entries));
+    }
+    Ok(doc)
 }
 
 /// Phase α (MVP): build the JSON document the ASAPQuery-backend's
@@ -3287,6 +3303,37 @@ mod tests {
     }
 
     #[test]
+    fn backend_json_injects_monitors_when_present() {
+        use crate::emit::monitor::{agg_id_for_metric, Functional, MonitorIntent};
+        let cfg = BackendStageConfig {
+            aggregations: Vec::new(),
+            readouts: Vec::new(),
+        };
+        // No monitors → no `monitors` key (byte-compatible with pre-CDM emit).
+        let v0 = emit_backend_streaming_config_json(&cfg, &[]).expect("emit");
+        assert!(v0.get("monitors").is_none(), "absent when empty: {v0}");
+        // A declared monitor → monitors[] with the cross-language agg_id.
+        let intents = vec![MonitorIntent {
+            metric: "bytes_sent".into(),
+            functional: Functional::Sum,
+            key: String::new(),
+            coeffs: Vec::new(),
+            coordinator_url: String::new(),
+            tau: 1000.0,
+            epsilon: 0.05,
+            window_ms: 60_000,
+        }];
+        let v = emit_backend_streaming_config_json(&cfg, &intents).expect("emit");
+        let mons = v["monitors"].as_array().expect("monitors array");
+        assert_eq!(mons.len(), 1);
+        assert_eq!(
+            mons[0]["agg_id"].as_u64().unwrap(),
+            agg_id_for_metric("bytes_sent")
+        );
+        assert_eq!(mons[0]["window_ms"].as_u64().unwrap(), 60_000);
+    }
+
+    #[test]
     fn backend_json_round_trips_aggregations_and_readouts() {
         let cfg = BackendStageConfig {
             aggregations: vec![
@@ -3326,7 +3373,7 @@ mod tests {
                 },
             ],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
 
         let aggs = v["aggregations"].as_array().expect("aggregations array");
         assert_eq!(aggs.len(), 2, "{v}");
@@ -3402,7 +3449,7 @@ mod tests {
                 },
             ],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         let reads = v["readouts"].as_array().unwrap();
         assert_eq!(reads[0]["op"], "topk");
         assert_eq!(reads[0]["k"], 10);
@@ -3778,7 +3825,7 @@ mod tests {
             aggregations: vec![],
             readouts: vec![],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         let s = serde_json::to_string(&v).unwrap();
         assert_eq!(s, r#"{"aggregations":[],"readouts":[]}"#);
     }
@@ -3875,7 +3922,7 @@ mod tests {
             }],
             readouts: vec![],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         let grouping = v["aggregations"][0]["labels"]["grouping"]
             .as_array()
             .expect("grouping array");
@@ -3924,7 +3971,7 @@ mod tests {
                 op: EstimateOp::Quantile { q: 0.99 },
             }],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         // PR 5: `aggregationId` is no longer on the wire — neither on
         // aggregations nor readouts. Identity on the aggregation side is
         // content-derived (`PolicyFingerprint(u64)` over metric,
@@ -3969,7 +4016,7 @@ mod tests {
             }],
             readouts: vec![],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         assert_eq!(v["aggregations"][0]["aggregationInput"], "sketch_envelope");
     }
 
@@ -3994,7 +4041,7 @@ mod tests {
             }],
             readouts: vec![],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         assert_eq!(v["aggregations"][0]["aggregationInput"], "raw");
     }
 
@@ -5709,7 +5756,7 @@ mod tests {
                 op: EstimateOp::Quantile { q: 0.99 },
             }],
         };
-        let v = emit_backend_streaming_config_json(&cfg).expect("emit ok");
+        let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
         let aggs = v
             .get("aggregations")
             .and_then(|a| a.as_array())

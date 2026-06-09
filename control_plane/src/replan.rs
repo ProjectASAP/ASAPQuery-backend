@@ -531,12 +531,21 @@ impl Replanner {
                 let fallback_cache = self.backend_routing_cache.clone();
                 let cache_arc =
                     fallback_cache.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new())));
+                // CDM monitor specs declared in the workload registry (global;
+                // coordinator_url is an edge concern, so pass "" for the
+                // backend's agg_id/τ/window-only entries).
+                let monitors = self
+                    .workload_registry
+                    .as_ref()
+                    .map(|r| r.monitor_intents(""))
+                    .unwrap_or_default();
                 post_typed_backend_for_role(
                     self.backend_client.as_ref(),
                     cache_arc.as_ref(),
                     metric,
                     role,
                     be,
+                    &monitors,
                 )
                 .await;
             } else {
@@ -783,7 +792,13 @@ impl Replanner {
             // wired the cache). Nothing to do.
             return PushOutcome::Skipped;
         };
-        repost_cumulative_backend_config(self.backend_client.as_ref(), cache.as_ref()).await
+        let monitors = self
+            .workload_registry
+            .as_ref()
+            .map(|r| r.monitor_intents(""))
+            .unwrap_or_default();
+        repost_cumulative_backend_config(self.backend_client.as_ref(), cache.as_ref(), &monitors)
+            .await
     }
 
     /// P0-1: background loop that periodically re-POSTs the full cumulative
