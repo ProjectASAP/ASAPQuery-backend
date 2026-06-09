@@ -154,7 +154,19 @@ impl StreamingConfig {
             }
         }
 
-        Ok(Self::new(aggregation_configs))
+        let mut config = Self::new(aggregation_configs);
+        // Continuous-monitoring (CDM) specs: a top-level `monitors:` array, each
+        // entry deserializing into a MonitorSpec. Absent → empty (the common
+        // case). The data-plane monitor coordinator reads these.
+        if let Some(monitors) = data.get("monitors").and_then(|v| v.as_sequence()) {
+            for m in monitors {
+                let spec: MonitorSpec = serde_yaml::from_value(m.clone()).map_err(|e| {
+                    anyhow::anyhow!("invalid monitor spec in streaming-config: {e}")
+                })?;
+                config.monitors.push(spec);
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -239,7 +251,42 @@ aggregations:\n\
         let cwo = StreamingConfig::from_yaml_data(&wo).expect("without");
         let (kw, _) = cw.aggregation_configs.iter().next().unwrap();
         let (kwo, _) = cwo.aggregation_configs.iter().next().unwrap();
-        assert_eq!(kw, kwo, "explicit aggregationId in YAML must not change identity");
-        assert_ne!(*kw, 42, "the explicit value must NOT leak through as the map key");
+        assert_eq!(
+            kw, kwo,
+            "explicit aggregationId in YAML must not change identity"
+        );
+        assert_ne!(
+            *kw, 42,
+            "the explicit value must NOT leak through as the map key"
+        );
+    }
+
+    #[test]
+    fn from_yaml_data_parses_monitors_section() {
+        // CDM monitor specs: a top-level `monitors:` array must populate
+        // StreamingConfig.monitors (the data-plane coordinator reads these).
+        let yaml = "\
+aggregations: []\n\
+monitors:\n\
+- agg_id: 16346598078036168951\n  key: \"\"\n  tau: 5000.0\n  epsilon: 0.05\n  window_ms: 10000\n";
+        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
+        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode monitors");
+        assert_eq!(cfg.monitors().len(), 1, "monitors: section must be parsed");
+        let m = &cfg.monitors()[0];
+        assert_eq!(m.agg_id, 16346598078036168951);
+        assert_eq!(m.tau, 5000.0);
+        assert_eq!(m.window_ms, 10000);
+        assert_eq!(m.epsilon, 0.05);
+    }
+
+    #[test]
+    fn from_yaml_data_absent_monitors_is_empty() {
+        let yaml = "aggregations: []\n";
+        let data: Value = serde_yaml::from_str(yaml).expect("yaml ok");
+        let cfg = StreamingConfig::from_yaml_data(&data).expect("decode");
+        assert!(
+            cfg.monitors().is_empty(),
+            "no monitors: → empty (byte-compat)"
+        );
     }
 }
