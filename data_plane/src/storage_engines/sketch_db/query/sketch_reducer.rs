@@ -468,7 +468,7 @@ impl<'a> SketchReducer<'a> {
                     .expect("ASAP-tier reducer only handles sketch-backed sids");
                 for ts in series_list {
                     let mut samples_out: Vec<(i64, f64)> = Vec::with_capacity(ts.samples.len());
-                    for (w_end, state) in ts.samples.iter() {
+                    for (w_end, frames) in ts.samples.iter() {
                         any_window = true;
                         let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
                         if w < cov_lo {
@@ -477,13 +477,20 @@ impl<'a> SketchReducer<'a> {
                         if w > cov_hi {
                             cov_hi = w;
                         }
-                        // Per-item point estimate when an item key is supplied
-                        // (and the sid is item_label-mode — gated by the engine);
-                        // otherwise the per-window bucket TOTAL (sum of row 0).
-                        let value = match item_key {
-                            Some(key) => decode_frequency_estimate(sid, kind, state, key)?,
-                            None => decode_frequency_total(sid, kind, state)?,
-                        };
+                        // A window-end may carry MULTIPLE sub-window frames
+                        // (delta_transmission). Each frame is an increment of
+                        // that window's count, so the window's value is the
+                        // SUM across its frames — per-item point estimate when
+                        // an item key is supplied (sid is item_label-mode,
+                        // gated by the engine), otherwise the per-window bucket
+                        // TOTAL (sum of row 0).
+                        let mut value = 0.0;
+                        for state in frames {
+                            value += match item_key {
+                                Some(key) => decode_frequency_estimate(sid, kind, state, key)?,
+                                None => decode_frequency_total(sid, kind, state)?,
+                            };
+                        }
                         samples_out.push((*w_end, value));
                     }
                     out_series.push((ts.series_label_values, samples_out));
@@ -500,8 +507,14 @@ impl<'a> SketchReducer<'a> {
                     .map(|k| k as usize)
                     .unwrap_or(10);
                 for ts in series_list {
-                    // Find latest window's CMS-with-heap state.
-                    let Some((window_end, state)) = ts.samples.iter().next_back() else {
+                    // Find latest window's CMS-with-heap state. A window-end
+                    // may carry multiple sub-window frames; the LAST frame is
+                    // the freshest (most complete) heap for that window under
+                    // the per-window-reset model, so read it.
+                    let Some((window_end, frames)) = ts.samples.iter().next_back() else {
+                        continue;
+                    };
+                    let Some(state) = frames.last() else {
                         continue;
                     };
                     any_window = true;
@@ -632,9 +645,19 @@ impl<'a> SketchReducer<'a> {
             };
 
             for ts in series_list {
-                // Build sorted-by-window-end slice of refs.
-                let samples_vec: Vec<(i64, &SketchSampleState)> =
-                    ts.samples.iter().map(|(t, s)| (*t, s)).collect();
+                // Build a sorted-by-window-end slice of frame refs. A
+                // window-end may carry MULTIPLE sub-window frames
+                // (delta_transmission): FLATTEN them in insertion order so
+                // the delta-apply walk sees the leading Full/seed followed by
+                // its increment deltas. `per_window_evaluate` /
+                // `cumulative_evaluate` fold repeated-window-end frames into
+                // one per-window value (they key the rolling base off
+                // `window_end` changing, not off each frame).
+                let samples_vec: Vec<(i64, &SketchSampleState)> = ts
+                    .samples
+                    .iter()
+                    .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
+                    .collect();
                 // BTreeMap iteration is already sorted by key; the
                 // collect preserves order. Track coverage from raw
                 // window-end timestamps before delta evaluation
@@ -1233,15 +1256,18 @@ impl<'a> SketchReducer<'a> {
             let series_list = self.index.query_range(sid, t0_ms, t1_ms);
             for ts in series_list {
                 let entry = by_series.entry(ts.series_label_values).or_insert(0.0);
-                for (w_end, state) in ts.samples.iter() {
+                for (w_end, frames) in ts.samples.iter() {
                     any_window = true;
                     let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
                     cov_lo = cov_lo.min(w);
                     cov_hi = cov_hi.max(w);
                     span_lo = span_lo.min(w);
                     span_hi = span_hi.max(w);
-                    let total = decode_frequency_total(sid, sketch_kind, state)?;
-                    *entry += total;
+                    // Sum across every sub-window frame at this window-end
+                    // (each is an increment of the window's count).
+                    for state in frames {
+                        *entry += decode_frequency_total(sid, sketch_kind, state)?;
+                    }
                 }
             }
         }
