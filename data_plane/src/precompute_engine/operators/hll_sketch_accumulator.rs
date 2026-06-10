@@ -11,6 +11,7 @@
 //! registers + variant + HIP accumulators losslessly, so the merge +
 //! store round-trip works end-to-end without that richer query surface.
 
+use crate::precompute_engine::operators::dd_sketch_accumulator::normalize_sample_p;
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink,
 };
@@ -80,12 +81,29 @@ pub(crate) fn expand_sparse_hll_registers(
 #[derive(Debug, Clone)]
 pub struct HllSketchAccumulator {
     pub inner: HllSketch,
+    /// Edge sampling probability `p ∈ (0,1]` carried on the producer's
+    /// `SketchEnvelope.sample_p`. HLL uses HASH-THRESHOLD sampling — each
+    /// DISTINCT key is admitted into the sketch with probability `p`, so the
+    /// register-derived distinct-count estimate is ~`p`× the true
+    /// cardinality and a `Cardinality`/`Count` query must rescale by `1/p`.
+    /// `1.0` (and the proto3 default `0.0`, dual-read as `1.0`) means no
+    /// sampling, so the rescale is a no-op and the behaviour is identical to
+    /// before. Mirrors `DDSketchAccumulator::sample_p`; set from the envelope
+    /// at the `from_sketchlib_proto_bytes` decode site and preserved across
+    /// `reset_to_empty` and `merge_with`.
+    ///
+    /// NOTE: HLL edge sampling is currently force-disabled in the edge
+    /// (`warm_sketch.go` HLL case always emits `sample_p = 1.0`), so in
+    /// practice `p = 1.0` today and this is a latent-correctness fix that
+    /// activates if HLL sampling is ever enabled.
+    pub sample_p: f64,
 }
 
 impl HllSketchAccumulator {
     pub fn new(variant: HllVariant, precision: u32) -> Self {
         Self {
             inner: HllSketch::new(variant, precision),
+            sample_p: 1.0,
         }
     }
 
@@ -98,6 +116,9 @@ impl HllSketchAccumulator {
         Ok(Self {
             inner: HllSketch::from_msgpack(buffer)
                 .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?,
+            // The msgpack HllSketch struct carries no envelope/sample_p; the
+            // msgpack path is parity/test-only and is never edge-sampled.
+            sample_p: 1.0,
         })
     }
 
@@ -118,21 +139,35 @@ impl HllSketchAccumulator {
         // fall back to bare `HyperLogLogState` for callers (e.g. unit
         // tests) that encode the state directly. Mirrors the PR #14
         // fix on `CountMinSketchAccumulator::from_sketchlib_proto_bytes`.
-        let state = match SketchEnvelope::decode(buffer) {
-            Ok(env) => match env.sketch_state {
-                Some(sketch_envelope::SketchState::Hll(st)) => st,
-                Some(other) => {
-                    return Err(format!(
-                        "SketchEnvelope contains non-HLL sketch: {:?}",
-                        std::mem::discriminant(&other)
-                    )
-                    .into());
+        // Capture the envelope's `sample_p` alongside the state so a
+        // Cardinality query can rescale the distinct-count estimate by
+        // `1/p`. Bare `HyperLogLogState` bytes (no envelope) carry no
+        // sampling info → `sample_p` 1.0 (no rescale). Mirrors
+        // `DDSketchAccumulator`.
+        let (state, sample_p) = match SketchEnvelope::decode(buffer) {
+            Ok(env) => {
+                let sp = env.sample_p;
+                match env.sketch_state {
+                    Some(sketch_envelope::SketchState::Hll(st)) => (st, sp),
+                    Some(other) => {
+                        return Err(format!(
+                            "SketchEnvelope contains non-HLL sketch: {:?}",
+                            std::mem::discriminant(&other)
+                        )
+                        .into());
+                    }
+                    None => (
+                        HyperLogLogState::decode(buffer)
+                            .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+                        1.0,
+                    ),
                 }
-                None => HyperLogLogState::decode(buffer)
+            }
+            Err(_) => (
+                HyperLogLogState::decode(buffer)
                     .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
-            },
-            Err(_) => HyperLogLogState::decode(buffer)
-                .map_err(|e| format!("decode HyperLogLogState: {e}"))?,
+                1.0,
+            ),
         };
         if state.precision == 0 || state.precision > 20 {
             return Err(format!(
@@ -184,7 +219,10 @@ impl HllSketchAccumulator {
             state.hip_kxq1,
             state.hip_est,
         );
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            sample_p: normalize_sample_p(sample_p),
+        })
     }
 
     /// Apply a proto-encoded `HLLDelta` frame to this accumulator's
@@ -240,6 +278,9 @@ impl AggregateCore for HllSketchAccumulator {
     /// has no inverse, so a never-reset base accumulates the all-time-max
     /// across windows (`docs/delta-baseline-contract.md` §1.5); rotating
     /// to an empty register array makes per-window cardinality correct.
+    /// `sample_p` is a per-series config constant (not per-window data), so
+    /// it is intentionally preserved across the rotation — mirrors
+    /// `DDSketchAccumulator`.
     fn reset_to_empty(&mut self) {
         self.inner = HllSketch::new(self.inner.variant, self.inner.precision);
     }
@@ -268,8 +309,19 @@ impl AggregateCore for HllSketchAccumulator {
             .downcast_ref::<HllSketchAccumulator>()
             .ok_or("Failed to downcast to HllSketchAccumulator")?;
         let merged_inner = HllSketch::merge_refs(&[&self.inner, &other_hll.inner])?;
+        // Mirror DDSketchAccumulator's merge policy exactly: sample_p is a
+        // per-series config constant, so both operands carry the same value
+        // in practice. Prefer a sampled factor over the no-sampling default
+        // so a merge with a freshly-reset (1.0) base keeps the series'
+        // sampling rate.
+        let sample_p = if self.sample_p < 1.0 {
+            self.sample_p
+        } else {
+            other_hll.sample_p
+        };
         Ok(Box::new(Self {
             inner: merged_inner,
+            sample_p,
         }))
     }
 
@@ -297,7 +349,13 @@ impl AggregateCore for HllSketchAccumulator {
             // aggregator is HLL — that's the cardinality estimate,
             // not a sample-count. Accept both.
             Statistic::Cardinality | Statistic::Count => {
-                Ok(hll_cardinality_estimate(&self.inner.registers))
+                // HLL uses hash-threshold sampling — each distinct key is
+                // admitted with probability `sample_p`, so the register-
+                // derived distinct-count estimate is ~`p`× the true
+                // cardinality. Rescale by `1/sample_p` for an unbiased
+                // estimate. `sample_p == 1.0` (unsampled / legacy / edge
+                // HLL sampling currently force-disabled) makes this a no-op.
+                Ok(hll_cardinality_estimate(&self.inner.registers) / self.sample_p)
             }
             other => Err(format!(
                 "HllSketchAccumulator: statistic {:?} not supported (only Cardinality / Count)",
@@ -492,9 +550,11 @@ mod tests {
     fn test_aggregate_core_merge_matches_register_max() {
         let a = HllSketchAccumulator {
             inner: HllSketch::from_raw(HllVariant::Regular, 2, vec![1, 5, 3, 7], 0.0, 0.0, 0.0),
+            sample_p: 1.0,
         };
         let b = HllSketchAccumulator {
             inner: HllSketch::from_raw(HllVariant::Regular, 2, vec![4, 2, 6, 0], 0.0, 0.0, 0.0),
+            sample_p: 1.0,
         };
         let merged_box = a.merge_with(&b).expect("merge ok");
         let merged = merged_box
@@ -560,5 +620,165 @@ mod tests {
     fn test_apply_proto_delta_bytes_rejects_garbage() {
         let mut acc = HllSketchAccumulator::new(HllVariant::Regular, 2);
         assert!(acc.apply_proto_delta_bytes(b"not valid proto").is_err());
+    }
+
+    // ----- sample_p cardinality rescale -----
+    //
+    // HLL uses hash-threshold sampling: each distinct key is admitted into
+    // the sketch with probability `p`, so the register-derived cardinality
+    // estimate is ~p× the true distinct count and must be rescaled by 1/p.
+
+    #[test]
+    fn test_cardinality_is_rescaled_by_sample_p() {
+        use promql_utilities::query_logics::enums::Statistic;
+        // Build two accumulators with identical registers but different
+        // sample_p. The sampled one (p=0.25) must report ~4× the unsampled
+        // estimate. Use precision 8 (256 registers) with a spread of
+        // register values so the estimate is a non-trivial positive number.
+        let mut registers = vec![0u8; 256];
+        for (i, r) in registers.iter_mut().enumerate() {
+            *r = ((i % 7) + 1) as u8;
+        }
+        let unsampled = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 8, registers.clone(), 0.0, 0.0, 0.0),
+            sample_p: 1.0,
+        };
+        let sampled = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 8, registers, 0.0, 0.0, 0.0),
+            sample_p: 0.25,
+        };
+        let raw = unsampled
+            .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
+            .expect("cardinality ok");
+        let rescaled = sampled
+            .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
+            .expect("cardinality ok");
+        assert!(raw > 0.0, "raw estimate should be positive, got {raw}");
+        // Exact algebraic relationship: rescaled == raw / 0.25 == raw * 4.
+        assert!(
+            (rescaled - raw * 4.0).abs() < 1e-9,
+            "expected rescaled ≈ 4×raw ({}), got {rescaled}",
+            raw * 4.0
+        );
+    }
+
+    #[test]
+    fn test_count_statistic_also_rescaled_by_sample_p() {
+        use promql_utilities::query_logics::enums::Statistic;
+        // Count maps to the same cardinality estimate for HLL, so it must
+        // rescale identically.
+        let registers = vec![3u8; 16];
+        let unsampled = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 4, registers.clone(), 0.0, 0.0, 0.0),
+            sample_p: 1.0,
+        };
+        let sampled = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 4, registers, 0.0, 0.0, 0.0),
+            sample_p: 0.25,
+        };
+        let raw = unsampled
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count ok");
+        let rescaled = sampled
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count ok");
+        assert!((rescaled - raw * 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_sample_p_unset_behaves_as_one() {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use prost::Message;
+        // An envelope with no sample_p set (proto3 default 0.0) must
+        // normalize to 1.0 (no rescale) — byte-compatible with legacy frames.
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: 4,
+            registers: vec![2u8; 16],
+            hip_kxq0: 0.0,
+            hip_kxq1: 0.0,
+            hip_est: 0.0,
+            registers_sparse: None,
+        };
+        let env = SketchEnvelope {
+            // sample_p left at proto3 default 0.0.
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+        let acc = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.sample_p, 1.0, "unset sample_p must normalize to 1.0");
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_reads_envelope_sample_p() {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use promql_utilities::query_logics::enums::Statistic;
+        use prost::Message;
+
+        let registers = vec![3u8; 16];
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: 4,
+            registers: registers.clone(),
+            hip_kxq0: 0.0,
+            hip_kxq1: 0.0,
+            hip_est: 0.0,
+            registers_sparse: None,
+        };
+        let env = SketchEnvelope {
+            sample_p: 0.25,
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+        let acc = HllSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.sample_p, 0.25);
+
+        // Compare against the unsampled estimate over the same registers.
+        let unsampled = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 4, registers, 0.0, 0.0, 0.0),
+            sample_p: 1.0,
+        };
+        let raw = unsampled
+            .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
+            .expect("cardinality ok");
+        let rescaled = acc
+            .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
+            .expect("cardinality ok");
+        assert!((rescaled - raw * 4.0).abs() < 1e-9, "expected 4×raw rescale");
+    }
+
+    #[test]
+    fn test_reset_to_empty_preserves_sample_p() {
+        let mut acc = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 4, vec![3u8; 16], 0.0, 0.0, 0.0),
+            sample_p: 0.25,
+        };
+        acc.reset_to_empty();
+        assert_eq!(acc.sample_p, 0.25, "window rotation must keep sample_p");
+        assert_eq!(acc.inner.registers, vec![0u8; 16], "registers cleared");
+    }
+
+    #[test]
+    fn test_merge_prefers_sampled_factor() {
+        let a = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 2, vec![1, 1, 1, 1], 0.0, 0.0, 0.0),
+            sample_p: 0.25,
+        };
+        let b = HllSketchAccumulator {
+            inner: HllSketch::from_raw(HllVariant::Regular, 2, vec![1, 1, 1, 1], 0.0, 0.0, 0.0),
+            sample_p: 1.0,
+        };
+        let merged = a.merge_with(&b).expect("merge ok");
+        let merged = merged
+            .as_any()
+            .downcast_ref::<HllSketchAccumulator>()
+            .expect("downcast ok");
+        assert_eq!(merged.sample_p, 0.25);
     }
 }
