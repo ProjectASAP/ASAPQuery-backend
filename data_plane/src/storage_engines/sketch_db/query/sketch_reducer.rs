@@ -577,15 +577,39 @@ impl<'a> SketchReducer<'a> {
                 continue;
             }
 
-            // Quantile / Cardinality with delta stitching.
+            // Quantile / Cardinality with delta stitching. The kind
+            // carries the sketch params (alpha/k/precision) so the
+            // delta-apply walk can bootstrap an EMPTY rolling state for
+            // a window whose first frame is a delta-from-empty (the
+            // per-window-reset model — see `delta_apply::per_window_evaluate`).
+            use crate::storage_engines::sketch_db::data::SketchConfig;
+            let sketch_cfg = meta.sketch_config();
             let delta_kind = match (
                 family,
                 meta.sketch_kind()
                     .expect("ASAP-tier reducer only handles sketch-backed sids"),
             ) {
-                (QueryFamily::Quantile, SketchKindHandle::DDSketch) => DeltaSketchKind::DDSketch,
-                (QueryFamily::Quantile, SketchKindHandle::Kll) => DeltaSketchKind::Kll,
-                (QueryFamily::Cardinality, SketchKindHandle::Hll) => DeltaSketchKind::Hll,
+                (QueryFamily::Quantile, SketchKindHandle::DDSketch) => {
+                    let alpha = match sketch_cfg {
+                        Some(SketchConfig::DDSketch { relative_accuracy }) => *relative_accuracy,
+                        _ => 0.01,
+                    };
+                    DeltaSketchKind::DDSketch { alpha }
+                }
+                (QueryFamily::Quantile, SketchKindHandle::Kll) => {
+                    let k = match sketch_cfg {
+                        Some(SketchConfig::Kll { k }) => *k,
+                        _ => 200,
+                    };
+                    DeltaSketchKind::Kll { k }
+                }
+                (QueryFamily::Cardinality, SketchKindHandle::Hll) => {
+                    let precision = match sketch_cfg {
+                        Some(SketchConfig::Hll { precision }) => *precision,
+                        _ => 14,
+                    };
+                    DeltaSketchKind::Hll { precision }
+                }
                 _ => {
                     return Err(ASAPTierError::UnsupportedCapability {
                         function: function_name.to_string(),

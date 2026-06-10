@@ -32,6 +32,7 @@
 
 use asap_sketchlib::DdSketch;
 use asap_sketchlib::HllSketch;
+use asap_sketchlib::HllVariant;
 use asap_sketchlib::KllSketch;
 use asap_sketchlib::MessagePackCodec;
 
@@ -41,11 +42,35 @@ use crate::storage_engines::sketch_db::index::{SketchEncoding, SketchSampleState
 /// delta-via-`apply_delta` (HLL). The reducer reads bytes through
 /// the appropriate `decode_*_full` path and folds the result into a
 /// rolling state.
+///
+/// Each variant carries the sketch parameters (`alpha` / `k` /
+/// `precision`) needed to *bootstrap an empty rolling state* — required
+/// by the per-window-reset (PWR) delta model where a window's FIRST
+/// frame is a delta-from-empty (no carry-in Full). DD/KLL deltas embed
+/// their own params in the wire fragment, but HLL register deltas are
+/// applied onto a pre-sized register array, so the precision must be
+/// known up front to allocate it.
 #[derive(Debug, Clone, Copy)]
 pub enum DeltaSketchKind {
-    DDSketch,
-    Hll,
-    Kll,
+    DDSketch { alpha: f64 },
+    Hll { precision: u32 },
+    Kll { k: u32 },
+}
+
+impl DeltaSketchKind {
+    /// Construct an EMPTY rolling state for this kind, used to seed a
+    /// new window when its first frame is a delta-from-empty (PWR). A
+    /// delta applied onto this empty base reconstructs exactly that
+    /// window's state (delta-from-empty ⊕ empty = window state).
+    fn bootstrap_empty(&self) -> RollingState {
+        match self {
+            DeltaSketchKind::DDSketch { alpha } => RollingState::Dd(DdSketch::new(*alpha)),
+            DeltaSketchKind::Kll { k } => RollingState::Kll(KllSketch::new(*k as u16)),
+            DeltaSketchKind::Hll { precision } => {
+                RollingState::Hll(HllSketch::new(HllVariant::Regular, *precision))
+            }
+        }
+    }
 }
 
 /// Try to decode a "full" sketch from the bytes (used by both
@@ -56,29 +81,29 @@ fn decode_full(
     encoding: SketchEncoding,
 ) -> Result<RollingState, String> {
     match (kind, encoding) {
-        (DeltaSketchKind::DDSketch, SketchEncoding::ProtoFull) => {
+        (DeltaSketchKind::DDSketch { .. }, SketchEncoding::ProtoFull) => {
             let sk = dd_from_proto(bytes)?;
             Ok(RollingState::Dd(sk))
         }
-        (DeltaSketchKind::DDSketch, SketchEncoding::MsgpackFull) => {
+        (DeltaSketchKind::DDSketch { .. }, SketchEncoding::MsgpackFull) => {
             let sk = DdSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize DDSketch msgpack: {e}"))?;
             Ok(RollingState::Dd(sk))
         }
-        (DeltaSketchKind::Hll, SketchEncoding::ProtoFull) => {
+        (DeltaSketchKind::Hll { .. }, SketchEncoding::ProtoFull) => {
             let sk = hll_from_proto(bytes)?;
             Ok(RollingState::Hll(sk))
         }
-        (DeltaSketchKind::Hll, SketchEncoding::MsgpackFull) => {
+        (DeltaSketchKind::Hll { .. }, SketchEncoding::MsgpackFull) => {
             let sk = HllSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize HllSketch msgpack: {e}"))?;
             Ok(RollingState::Hll(sk))
         }
-        (DeltaSketchKind::Kll, SketchEncoding::ProtoFull) => {
+        (DeltaSketchKind::Kll { .. }, SketchEncoding::ProtoFull) => {
             let sk = kll_from_proto(bytes)?;
             Ok(RollingState::Kll(sk))
         }
-        (DeltaSketchKind::Kll, SketchEncoding::MsgpackFull) => {
+        (DeltaSketchKind::Kll { .. }, SketchEncoding::MsgpackFull) => {
             let sk = KllSketch::from_msgpack(bytes)
                 .map_err(|e| format!("deserialize KllSketch msgpack: {e}"))?;
             Ok(RollingState::Kll(sk))
@@ -127,7 +152,10 @@ impl RollingState {
                     SketchEncoding::MsgpackDelta => SketchEncoding::MsgpackFull,
                     _ => unreachable!(),
                 };
-                let other = match decode_full(&DeltaSketchKind::DDSketch, bytes, full_enc) {
+                // The params here are unused: `decode_full` reads
+                // alpha/k from the wire fragment, not from the kind tag.
+                let other = match decode_full(&DeltaSketchKind::DDSketch { alpha: 0.0 }, bytes, full_enc)
+                {
                     Ok(RollingState::Dd(s)) => s,
                     Ok(_) => {
                         return Err("decode_full(DDSketch) returned non-DDSketch state".to_string())
@@ -161,7 +189,7 @@ impl RollingState {
                     SketchEncoding::MsgpackDelta => SketchEncoding::MsgpackFull,
                     _ => unreachable!(),
                 };
-                let other = match decode_full(&DeltaSketchKind::Kll, bytes, full_enc) {
+                let other = match decode_full(&DeltaSketchKind::Kll { k: 0 }, bytes, full_enc) {
                     Ok(RollingState::Kll(s)) => s,
                     Ok(_) => return Err("decode_full(Kll) returned non-Kll state".to_string()),
                     Err(e) => return Err(e),
@@ -190,15 +218,45 @@ impl RollingState {
 }
 
 /// Walk a sorted-by-window-end slice of samples in time order and
-/// produce per-window scalars. On a `Full` payload, replace the
-/// rolling state; on a `Delta`, apply it into the rolling state.
-/// Each window emits one `(window_end_ms, scalar)`.
+/// produce ONE per-window scalar `(window_end_ms, scalar)`.
+///
+/// ## Per-window-reset (PWR) delta model
+///
+/// The edge emits frames grouped by window (all frames of one window
+/// share the same `window_end` key; the key changes across windows).
+/// The edge RESETS its snapshot base at each window boundary, so each
+/// window's state is built *from empty*:
+///
+/// * Within a window, frames accumulate to the window total. The first
+///   frame may be a `Full` (window 1, or a periodic re-snapshot) or a
+///   `Delta`-from-empty (windows 2+ under PWR); subsequent frames are
+///   `Delta` INCREMENTS applied onto the window's running base.
+/// * Across windows, the base MUST reset — a new `window_end` discards
+///   the previous window's rolling state and starts from empty. Never
+///   carry one window's state into the next (that would inflate via
+///   cross-window accumulation).
+///
+/// Concretely this fixes two bugs in the old "single rolling Option that
+/// only ever resets on a Full" walk:
+///   1. A query range whose Full lives only in window 1 (or out of
+///      range) left windows 2+ as deltas with `rolling=None`, all
+///      skipped → empty result.
+///   2. A window 2+ delta applied onto window 1's leftover rolling state
+///      → cross-window inflation.
+///
+/// For a `Delta` that is the window's FIRST frame (the PWR delta-from-
+/// empty case), we bootstrap an EMPTY rolling state of `kind` and apply
+/// the delta onto it (delta-from-empty ⊕ empty = that window's state).
+///
+/// The delta-OFF path (exactly one `Full` per window) still produces one
+/// correct value per window: the window opens with a Full, has no
+/// further frames, and emits that Full's scalar.
 ///
 /// `eval` reads a scalar from the rolling state (`quantile(q)` /
-/// `cardinality()`). Leading deltas (before any Full) are skipped
-/// with a debug-grade error returned to the caller for reporting.
+/// `cardinality()`). `skipped` counts frames that could not contribute
+/// (a delta we genuinely couldn't bootstrap from — should be rare).
 ///
-/// Returns `Ok(samples, skipped_leading_deltas)`.
+/// Returns `Ok(per_window_samples, skipped)`.
 pub fn per_window_evaluate<E>(
     samples: &[(i64, &SketchSampleState)],
     kind: DeltaSketchKind,
@@ -207,28 +265,51 @@ pub fn per_window_evaluate<E>(
 where
     E: Fn(&RollingState) -> f64,
 {
-    let mut out: Vec<(i64, f64)> = Vec::with_capacity(samples.len());
-    let mut rolling: Option<RollingState> = None;
+    let mut out: Vec<(i64, f64)> = Vec::new();
     let mut skipped = 0usize;
 
+    // Rolling state for the CURRENT window only. Reset to None whenever
+    // `window_end` changes (a new window establishes its own base from
+    // empty). `cur_end` tracks which window `rolling` belongs to.
+    let mut rolling: Option<RollingState> = None;
+    let mut cur_end: Option<i64> = None;
+
     for (window_end, state) in samples {
+        // Window boundary: flush the previous window's final accumulated
+        // value, then reset the base so this window starts from empty.
+        if cur_end != Some(*window_end) {
+            if let (Some(prev_end), Some(rs)) = (cur_end, rolling.as_ref()) {
+                out.push((prev_end, eval(rs)));
+            }
+            rolling = None;
+            cur_end = Some(*window_end);
+        }
+
         match state.encoding {
             SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
+                // A Full (re)sets this window's base.
                 rolling = Some(decode_full(&kind, &state.bytes, state.encoding)?);
-                if let Some(rs) = &rolling {
-                    out.push((*window_end, eval(rs)));
-                }
             }
             SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-                if let Some(rs) = rolling.as_mut() {
-                    rs.apply_delta_bytes(&state.bytes, state.encoding)?;
-                    out.push((*window_end, eval(rs)));
-                } else {
-                    skipped += 1;
+                // Apply onto this window's running base. If this is the
+                // window's first frame (PWR delta-from-empty), bootstrap
+                // an empty base and apply onto it.
+                if rolling.is_none() {
+                    rolling = Some(kind.bootstrap_empty());
+                }
+                match rolling.as_mut() {
+                    Some(rs) => rs.apply_delta_bytes(&state.bytes, state.encoding)?,
+                    None => skipped += 1,
                 }
             }
         }
     }
+
+    // Flush the final window.
+    if let (Some(prev_end), Some(rs)) = (cur_end, rolling.as_ref()) {
+        out.push((prev_end, eval(rs)));
+    }
+
     Ok((out, skipped))
 }
 
@@ -284,10 +365,19 @@ where
                 });
             }
             SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-                if let Some(rs) = rolling.as_mut() {
-                    rs.apply_delta_bytes(&state.bytes, state.encoding)?;
-                } else {
-                    skipped += 1;
+                // PWR: the range may have NO carry-in Full (it starts
+                // mid-stream), so the first frame is a delta-from-empty.
+                // Bootstrap an empty base and apply onto it. Under PWR
+                // each window's frames are increments-since-its-own-base;
+                // folding them all (Full-fragment merge for DD/KLL,
+                // register-max for HLL) yields the union over the range,
+                // which is the cumulative (`*_over_time`) answer.
+                if rolling.is_none() {
+                    rolling = Some(kind.bootstrap_empty());
+                }
+                match rolling.as_mut() {
+                    Some(rs) => rs.apply_delta_bytes(&state.bytes, state.encoding)?,
+                    None => skipped += 1,
                 }
             }
         }
@@ -525,5 +615,185 @@ mod tests {
             .expect("accumulator kll decode")
             .inner;
         assert_eq!(via_delta.quantile(0.5), via_acc.quantile(0.5));
+    }
+
+    // -----------------------------------------------------------------
+    // Per-window-reset (PWR) delta-apply regression tests.
+    //
+    // The edge resets its snapshot base at every window boundary, so a
+    // window's first frame is either a Full (window 1 / re-snapshot) or
+    // a Delta-from-empty (windows 2+). The query-side walk must:
+    //   * reset the rolling base when `window_end` changes,
+    //   * bootstrap an empty base for a window's leading Delta,
+    //   * emit ONE value per window (the window's final accumulated
+    //     state), never per-frame and never cross-window-accumulated.
+    // -----------------------------------------------------------------
+
+    fn full(bytes: Vec<u8>) -> SketchSampleState {
+        SketchSampleState {
+            bytes,
+            encoding: SketchEncoding::ProtoFull,
+        }
+    }
+    fn delta(bytes: Vec<u8>) -> SketchSampleState {
+        SketchSampleState {
+            bytes,
+            encoding: SketchEncoding::ProtoDelta,
+        }
+    }
+
+    fn dd_over(alpha: f64, vals: &[f64]) -> DdSketch {
+        let mut sk = DdSketch::new(alpha);
+        for &v in vals {
+            sk.update(v);
+        }
+        sk
+    }
+
+    /// PWR across 3 windows: window 1 is `[Full]`, windows 2 & 3 are
+    /// `[Delta-from-empty]` (NO Full carry-in). Each window must
+    /// reconstruct its OWN distribution's median — not empty (the old
+    /// "skip delta with no base" bug) and not cross-window-inflated.
+    #[test]
+    fn pwr_ddsketch_three_windows_delta_from_empty() {
+        let alpha = 0.01;
+        let w1 = dd_over(alpha, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let w2 = dd_over(alpha, &[10.0, 20.0, 30.0, 40.0, 50.0]);
+        let w3 = dd_over(alpha, &[100.0, 200.0, 300.0, 400.0, 500.0]);
+
+        // window 1 ships a Full; windows 2+ ship a delta-from-empty.
+        let s1 = full(encode_dd(&w1));
+        let s2 = delta(encode_dd(&w2));
+        let s3 = delta(encode_dd(&w3));
+        let samples = vec![(1000_i64, &s1), (2000, &s2), (3000, &s3)];
+
+        let kind = DeltaSketchKind::DDSketch { alpha };
+        let (out, skipped) =
+            per_window_evaluate(&samples, kind, |rs| rs.quantile(0.5)).expect("pwr eval");
+        assert_eq!(skipped, 0, "PWR must not skip delta-from-empty frames");
+        assert_eq!(out.len(), 3, "one value per window");
+
+        // Each window's median ≈ that window's own distribution median,
+        // independent of the others (no carry-in inflation).
+        let truth = [
+            w1.quantile(0.5).unwrap(),
+            w2.quantile(0.5).unwrap(),
+            w3.quantile(0.5).unwrap(),
+        ];
+        for (i, (w_end, est)) in out.iter().enumerate() {
+            assert_eq!(*w_end, (i as i64 + 1) * 1000);
+            let rel = (est - truth[i]).abs() / truth[i].max(1e-9);
+            assert!(
+                rel < 0.05,
+                "window {i}: est={est} truth={} rel={rel}",
+                truth[i]
+            );
+        }
+        // Cross-window-inflation guard: window 2's median must NOT have
+        // absorbed window 1 (would pull it well below 30).
+        assert!(
+            out[1].1 > 20.0,
+            "window 2 median {} suggests cross-window accumulation",
+            out[1].1
+        );
+    }
+
+    /// Sub-window producer: a SINGLE window carries multiple frames
+    /// `[Full, Delta, Delta]`, where each later delta is an increment
+    /// since the previous emit in that window. The walk must COLLAPSE
+    /// them to ONE value = the window's running total, not emit three.
+    #[test]
+    fn pwr_ddsketch_subwindow_frames_collapse_to_window_total() {
+        let alpha = 0.01;
+        // Three sub-window increments that together cover 1..=15.
+        let a = dd_over(alpha, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let b = dd_over(alpha, &[6.0, 7.0, 8.0, 9.0, 10.0]);
+        let c = dd_over(alpha, &[11.0, 12.0, 13.0, 14.0, 15.0]);
+        let s_a = full(encode_dd(&a));
+        let s_b = delta(encode_dd(&b));
+        let s_c = delta(encode_dd(&c));
+        // All three share the same window_end (one window, sub-window frames).
+        let samples = vec![(5000_i64, &s_a), (5000, &s_b), (5000, &s_c)];
+
+        let kind = DeltaSketchKind::DDSketch { alpha };
+        let (out, skipped) =
+            per_window_evaluate(&samples, kind, |rs| rs.quantile(0.5)).expect("subwindow eval");
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), 1, "sub-window frames collapse to ONE value");
+        assert_eq!(out[0].0, 5000);
+
+        let truth = dd_over(alpha, &(1..=15).map(|v| v as f64).collect::<Vec<_>>())
+            .quantile(0.5)
+            .unwrap();
+        let rel = (out[0].1 - truth).abs() / truth.max(1e-9);
+        assert!(rel < 0.05, "window total est={} truth={truth}", out[0].1);
+    }
+
+    /// Same sub-window collapse, but the window's FIRST frame is a
+    /// Delta-from-empty (PWR window 2+ with sub-window frames):
+    /// `[Delta-from-empty, Delta, Delta]`.
+    #[test]
+    fn pwr_ddsketch_subwindow_first_frame_delta_from_empty() {
+        let alpha = 0.01;
+        let a = dd_over(alpha, &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let b = dd_over(alpha, &[6.0, 7.0, 8.0, 9.0, 10.0]);
+        let c = dd_over(alpha, &[11.0, 12.0, 13.0, 14.0, 15.0]);
+        let s_a = delta(encode_dd(&a)); // first frame is delta-from-empty
+        let s_b = delta(encode_dd(&b));
+        let s_c = delta(encode_dd(&c));
+        let samples = vec![(9000_i64, &s_a), (9000, &s_b), (9000, &s_c)];
+
+        let kind = DeltaSketchKind::DDSketch { alpha };
+        let (out, skipped) =
+            per_window_evaluate(&samples, kind, |rs| rs.quantile(0.5)).expect("eval");
+        assert_eq!(skipped, 0);
+        assert_eq!(out.len(), 1);
+        let truth = dd_over(alpha, &(1..=15).map(|v| v as f64).collect::<Vec<_>>())
+            .quantile(0.5)
+            .unwrap();
+        let rel = (out[0].1 - truth).abs() / truth.max(1e-9);
+        assert!(rel < 0.05, "est={} truth={truth}", out[0].1);
+    }
+
+    /// PWR for HLL across 3 windows, each a Delta-from-empty (sparse
+    /// register delta). Bootstrapping an EMPTY HLL of the right precision
+    /// is required (register deltas index into a pre-sized array). Each
+    /// window's cardinality must reflect its OWN item set.
+    #[test]
+    fn pwr_hll_three_windows_delta_from_empty() {
+        let precision = 12u32;
+        // Build per-window HLLs, then encode each as a register-delta
+        // against an EMPTY sketch (= that window's full register state,
+        // the PWR delta-from-empty wire form).
+        let empty = HllSketch::new(HllVariant::Regular, precision);
+        let mut frames = Vec::new();
+        let truths = [200usize, 800, 1500];
+        for (w, &n) in truths.iter().enumerate() {
+            let mut sk = HllSketch::new(HllVariant::Regular, precision);
+            let base = (w as u64) * 100_000; // disjoint item sets per window
+            for i in 0..n as u64 {
+                sk.update(format!("u-{}", base + i).as_bytes());
+            }
+            let bytes = sk.compute_delta(&empty, 0);
+            frames.push((((w as u64) + 1) * 1000, delta(bytes)));
+        }
+        let samples: Vec<(i64, &SketchSampleState)> = frames
+            .iter()
+            .map(|(t, s)| (*t as i64, s))
+            .collect();
+
+        let kind = DeltaSketchKind::Hll { precision };
+        let (out, skipped) =
+            per_window_evaluate(&samples, kind, |rs| rs.cardinality()).expect("hll pwr eval");
+        assert_eq!(skipped, 0, "HLL delta-from-empty must bootstrap, not skip");
+        assert_eq!(out.len(), 3);
+        for (i, (_w_end, est)) in out.iter().enumerate() {
+            let n = truths[i] as f64;
+            let rel = (est - n).abs() / n;
+            assert!(
+                rel < 0.15,
+                "window {i}: HLL est={est} truth={n} rel={rel} (each window independent)"
+            );
+        }
     }
 }
