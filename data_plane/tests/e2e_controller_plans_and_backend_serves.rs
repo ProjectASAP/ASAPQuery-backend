@@ -142,7 +142,9 @@ fn plan_streaming_config_json(workload: &QueryWorkload) -> JsonValue {
         agg.grouping = workload.group_by_labels.clone();
     }
 
-    control_plane::emit::emit_backend_streaming_config_json(&backend_cfg)
+    // No continuous-monitoring (CDM) intents in these tests — pass an empty
+    // slice (the `&[MonitorIntent]` arg added when CDM monitor specs landed).
+    control_plane::emit::emit_backend_streaming_config_json(&backend_cfg, &[])
         .expect("emit_backend_streaming_config_json must succeed")
 }
 
@@ -2019,3 +2021,299 @@ async fn controller_plan_to_range_query_count_over_time_cms() {
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 }
+
+// ── Test 12 — DDSketch DELTA + sub-window FULL ingest→query roundtrip ───────
+//
+// Reproduces the live "No result" bug for
+// `quantile_over_time(0.99, http_requests_total_latency_ms[3m])` when the
+// edge runs with `delta_transmission: true` + a sub-window emit cadence.
+//
+// This is the gap the existing UNIT tests (which insert `SketchSampleState`
+// rows directly) cannot see: they hand the reducer ready-made
+// `SketchSampleState{bytes, encoding}` rows whose `bytes` are already the
+// shape the reducer's `decode_full`/`apply_delta_bytes` expects. The LIVE
+// path instead writes whatever the EDGE emits on the wire, and the edge's
+// DDSketch PROTO_DELTA frame is a `DdSketchDelta` bucket-delta proto — NOT
+// a `SketchEnvelope{DdSketchState}` full state. The ingest delta-apply path
+// decodes the former; the query-side reducer decodes the latter. The two
+// disagree, so the query reconstructs nothing.
+//
+// Wire shape faithfully mirrors the edge:
+//   * metric name is the SUFFIXED `http_requests_total_latency_ms_ddsketch`
+//     (the edge's `asapedgeprocessor` appends `_<family>`); the QUERY asks
+//     for the unsuffixed `http_requests_total_latency_ms`.
+//   * window 1 frames: [PROTO full, PROTO_DELTA, PROTO_DELTA]
+//   * windows 2..=3 frames: [PROTO_DELTA-from-empty, PROTO_DELTA, PROTO_DELTA]
+//   * all sub-window frames of one window share the SAME
+//     (start_time_unix_nano, time_unix_nano) = (window_start, window_end).
+//   * a PROTO_DELTA payload is a `DdSketchDelta{buckets:[{index,d_count}]}`
+//     proto, exactly what `DdSketch::compute_delta(&empty)` produces under
+//     the per-window-reset (delta-against-empty) contract.
+//
+// The query must reconstruct each window's distribution and answer the
+// p99 to within DDSketch's α. It currently FAILS (empty / "No result").
+
+/// Build a real `DdSketch` over `values` at relative accuracy `alpha`.
+fn dd_over_values(alpha: f64, values: &[f64]) -> asap_sketchlib::DdSketch {
+    let mut sk = asap_sketchlib::DdSketch::new(alpha);
+    for &v in values {
+        sk.update(v);
+    }
+    sk
+}
+
+/// Encode a `DdSketch` as a FULL `SketchEnvelope{DdSketchState}` frame —
+/// the PROTO (full-state) wire shape. This is what the reducer's
+/// `decode_full` and the ingest full-decode path both expect for a
+/// non-delta frame.
+fn encode_dd_full_envelope(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
+    use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
+    let state = DdSketchState {
+        alpha: sk.alpha,
+        store_counts: sk.store_counts.clone(),
+        store_offset: sk.store_offset,
+    };
+    SketchEnvelope {
+        sketch_state: Some(sketch_envelope::SketchState::Ddsketch(state)),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+/// Encode a `DdSketch` as a `DdSketchDelta` bucket-delta proto — the
+/// PROTO_DELTA wire shape the edge emits under the per-window-reset
+/// (delta-against-empty) contract, where the prior snapshot is the empty
+/// sketch so the "delta" IS this window's own full bucket store expressed
+/// as bucket increments (`compute_delta(&empty)`). Bucket index = the
+/// absolute DDSketch index = `store_offset + i`.
+fn encode_dd_delta_against_empty(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
+    use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+    let buckets = sk
+        .store_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c != 0)
+        .map(|(i, &c)| DdSketchBucketDelta {
+            index: sk.store_offset + i as i32,
+            d_count: c as u64,
+        })
+        .collect();
+    PbDelta { buckets }.encode_to_vec()
+}
+
+/// Build an OTLP `ExportMetricsServiceRequest` carrying ONE DDSketch DP
+/// with the caller's explicit `(start_time_unix_nano, time_unix_nano)`
+/// window and explicit `encoding` (PROTO=1 full / PROTO_DELTA=2). Unlike
+/// `build_dd_sketch_export` this does NOT derive start_time from end_time
+/// — the per-window-reset repro needs every sub-window frame of one window
+/// to share the exact same (window_start, window_end) pair.
+#[allow(clippy::too_many_arguments)]
+fn build_dd_sketch_export_windowed(
+    metric_name: &str,
+    attrs: &[(&str, &str)],
+    start_time_unix_nano: u64,
+    time_unix_nano: u64,
+    sketch_bytes: Vec<u8>,
+    alpha: f64,
+    encoding: i32,
+) -> ExportMetricsServiceRequest {
+    let attributes = attrs
+        .iter()
+        .map(|(k, v)| KeyValue {
+            key: k.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(v.to_string())),
+            }),
+        })
+        .collect();
+    let dp = DdSketchDataPoint {
+        attributes,
+        start_time_unix_nano,
+        time_unix_nano,
+        sketch: sketch_bytes,
+        encoding,
+        exemplars: Vec::new(),
+        flags: 0,
+        series_id: 0,
+    };
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(Data::Ddsketch(DdSketch {
+                        data_points: vec![dp],
+                        aggregation_temporality: 0,
+                        relative_accuracy: alpha,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
+    const ENCODING_PROTO: i32 = 1;
+    const ENCODING_PROTO_DELTA: i32 = 2;
+    let suffixed_metric = "http_requests_total_latency_ms_ddsketch";
+    let bare_metric = "http_requests_total_latency_ms";
+    let alpha = 0.01;
+
+    let stack = start_full_stack(19_581, 19_582).await;
+    let client = reqwest::Client::new();
+
+    // ── 1. Controller plans + POSTs the streaming-config for the BARE
+    //       metric (what the controller + query analyzer speak). 1s window
+    //       so distinct window_end timestamps fall on distinct seconds.
+    let workload = build_workload(
+        bare_metric,
+        vec![AggType::Quantile],
+        alpha,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        vec![0.99],
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    // ── 2. Three windows of known distributions. Each window is split into
+    //       three sub-window emits whose increments together cover the
+    //       window's full distribution.
+    //         window 1: 1..=30      (p99 ≈ 30)
+    //         window 2: 100..=130   (p99 ≈ 130)
+    //         window 3: 1000..=1030 (p99 ≈ 1030)
+    let window_dists: [Vec<f64>; 3] = [
+        (1..=30).map(|v| v as f64).collect(),
+        (100..=130).map(|v| v as f64).collect(),
+        (1000..=1030).map(|v| v as f64).collect(),
+    ];
+
+    // Wall-clock-relative window placement so the PromQL eval (also
+    // wall-clock) sees the windows inside its [3m] lookback. Windows end at
+    // now-150s, now-149s, now-148s — comfortably inside [3m] and outside the
+    // near-`now` watermark fuzz.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sec: u64 = 1_000_000_000;
+
+    for (w_idx, dist) in window_dists.iter().enumerate() {
+        // window_end at now - (150 - w_idx) s; window_start = window_end - 1s.
+        let window_end_ns = now_ns.saturating_sub((150 - w_idx as u64) * sec);
+        let window_start_ns = window_end_ns.saturating_sub(sec);
+
+        // Split this window's distribution into three sub-window increments.
+        let third = dist.len() / 3;
+        let sub: [&[f64]; 3] = [
+            &dist[..third],
+            &dist[third..2 * third],
+            &dist[2 * third..],
+        ];
+
+        for (f_idx, frame_vals) in sub.iter().enumerate() {
+            let sk = dd_over_values(alpha, frame_vals);
+            // window 1's FIRST frame is a PROTO full snapshot; every other
+            // frame (including windows 2+ first frame) is a delta-from-empty.
+            let (bytes, encoding) = if w_idx == 0 && f_idx == 0 {
+                (encode_dd_full_envelope(&sk), ENCODING_PROTO)
+            } else {
+                (encode_dd_delta_against_empty(&sk), ENCODING_PROTO_DELTA)
+            };
+            let req = build_dd_sketch_export_windowed(
+                suffixed_metric,
+                &[("service", "e2e-test")],
+                window_start_ns,
+                window_end_ns,
+                bytes,
+                alpha,
+                encoding,
+            );
+            post_otlp_http(&client, stack.otlp_http_port, req).await;
+        }
+    }
+
+    // Give the receiver time to land every frame in the SketchStore.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // ── 3. Query the BARE metric via PromQL quantile_over_time over [3m].
+    let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
+    let response: JsonValue = client
+        .get(&query_url)
+        .query(&[(
+            "query",
+            format!("quantile_over_time(0.99, {bare_metric}[3m])").as_str(),
+        )])
+        .send()
+        .await
+        .expect("PromQL query failed to send")
+        .json()
+        .await
+        .expect("PromQL response was not JSON");
+
+    // ── 4. Assertions: success + a non-empty reconstructed p99.
+    let status = response["status"].as_str().unwrap_or("(missing)");
+    assert_eq!(
+        status,
+        "success",
+        "quantile_over_time over a DDSketch DELTA+sub-window stream did not \
+         succeed (the live `No result` bug). Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+    let result = &response["data"]["result"];
+    let arr = result
+        .as_array()
+        .expect("result must be an array of series");
+    assert!(
+        !arr.is_empty(),
+        "quantile_over_time returned an EMPTY result vector — the delta+sub-window \
+         DDSketch path reconstructed nothing. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+
+    // cumulative_evaluate rolls the [3m] range into ONE union over all three
+    // windows (1..=30 ∪ 100..=130 ∪ 1000..=1030 = 1..=1030, 93 samples).
+    // Its p99 ≈ 1020. Pull the scalar out of the (instant or range) shape
+    // and assert it lands near that within a generous DDSketch-α envelope.
+    let value = extract_first_scalar(result)
+        .expect("could not extract a scalar from the query result");
+    // Truth: p99 of the unioned distribution.
+    let mut all: Vec<f64> = Vec::new();
+    for d in &window_dists {
+        all.extend_from_slice(d);
+    }
+    let truth = dd_over_values(alpha, &all)
+        .quantile(0.99)
+        .expect("truth p99");
+    let rel = (value - truth).abs() / truth.max(1e-9);
+    assert!(
+        rel < 0.10,
+        "reconstructed p99 {value} too far from truth {truth} (rel {rel}); \
+         the delta+sub-window reconstruction is wrong"
+    );
+}
+
+/// Pull the first scalar value out of a PromQL `data.result` array,
+/// handling both instant-vector (`value: [ts, "v"]`) and range-matrix
+/// (`values: [[ts, "v"], …]`) shapes.
+fn extract_first_scalar(result: &JsonValue) -> Option<f64> {
+    let arr = result.as_array()?;
+    let first = arr.first()?;
+    if let Some(v) = first.get("value").and_then(|v| v.as_array()) {
+        return v.get(1).and_then(|s| s.as_str()).and_then(|s| s.parse().ok());
+    }
+    if let Some(vals) = first.get("values").and_then(|v| v.as_array()) {
+        let last = vals.last()?.as_array()?;
+        return last.get(1).and_then(|s| s.as_str()).and_then(|s| s.parse().ok());
+    }
+    None
+}
+

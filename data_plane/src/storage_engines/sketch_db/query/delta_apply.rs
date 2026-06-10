@@ -143,28 +143,80 @@ impl RollingState {
         }
         match self {
             RollingState::Dd(sk) => {
-                // The wire delta for DD/KLL today is a full-sketch
-                // fragment (sparse buckets); decode it via the same
-                // full-state path and merge into `sk`. Treat the bytes
-                // as a Full payload of the matching encoding family.
-                let full_enc = match encoding {
-                    SketchEncoding::ProtoDelta => SketchEncoding::ProtoFull,
-                    SketchEncoding::MsgpackDelta => SketchEncoding::MsgpackFull,
-                    _ => unreachable!(),
-                };
-                // The params here are unused: `decode_full` reads
-                // alpha/k from the wire fragment, not from the kind tag.
-                let other = match decode_full(&DeltaSketchKind::DDSketch { alpha: 0.0 }, bytes, full_enc)
-                {
-                    Ok(RollingState::Dd(s)) => s,
-                    Ok(_) => {
-                        return Err("decode_full(DDSketch) returned non-DDSketch state".to_string())
+                match encoding {
+                    // PROTO_DELTA: dispatch on the payload SHAPE, mirroring the
+                    // edge's own `DDSketchWrapper::apply_delta`
+                    // (asap-precompute-rs/src/sketches/ddsketch.rs) — which
+                    // tries the full-envelope decode first, then falls back to
+                    // the bucket-delta proto. Two wire shapes can arrive on the
+                    // ProtoDelta channel:
+                    //
+                    //   1. `SketchEnvelope{DdSketchState}` — a full-state
+                    //      fragment, mergeable via `DdSketch::merge`. (The edge
+                    //      sends this when `compute_delta_against` hits the
+                    //      empty-current / undecodable-prior fallback and ships
+                    //      a full snapshot tagged as a delta.)
+                    //   2. `DDSketchDelta { buckets: [{index, d_count}] }` — a
+                    //      bucket-index delta proto, applied additively. This is
+                    //      the COMMON delta_transmission frame the edge emits
+                    //      under per-window-reset (`compute_delta(&empty)`).
+                    //
+                    // Before this fix the reducer decoded ONLY shape (1) via
+                    // `decode_full`. A real shape-(2) frame failed with a wire-
+                    // type mismatch on field 1 (delta field 1 = repeated
+                    // submessage; state field 1 = `double alpha`) → the whole
+                    // `quantile_over_time` returned `No result` for every
+                    // delta_transmission DDSketch stream. We wrap the rolling
+                    // `DdSketch` in a transient accumulator so the bucket-delta
+                    // apply lands on `sk` in place.
+                    SketchEncoding::ProtoDelta => {
+                        // Shape (1): full envelope fragment → merge. Try this
+                        // first (cheap decode attempt; a bucket-delta proto
+                        // fails it on the field-1 wire-type mismatch).
+                        if let Ok(RollingState::Dd(other)) = decode_full(
+                            &DeltaSketchKind::DDSketch { alpha: 0.0 },
+                            bytes,
+                            SketchEncoding::ProtoFull,
+                        ) {
+                            sk.merge(&other)
+                                .map_err(|e| format!("merge DDSketch delta envelope: {e}"))?;
+                            return Ok(());
+                        }
+                        // Shape (2): bucket-delta proto → additive apply via the
+                        // SAME decoder the ingest delta path uses.
+                        use crate::precompute_engine::operators::dd_sketch_accumulator::DDSketchAccumulator;
+                        let mut acc = DDSketchAccumulator {
+                            inner: std::mem::replace(sk, DdSketch::new(sk.alpha)),
+                            sample_p: 1.0,
+                        };
+                        let res = acc.apply_proto_delta_bytes(bytes);
+                        *sk = acc.inner;
+                        res.map_err(|e| format!("apply DDSketch proto bucket-delta: {e}"))?;
+                        Ok(())
                     }
-                    Err(e) => return Err(e),
-                };
-                sk.merge(&other)
-                    .map_err(|e| format!("merge DDSketch delta: {e}"))?;
-                Ok(())
+                    // MSGPACK_DELTA: a serialized full-sketch fragment, mergeable
+                    // via the full-state decoder. Kept for completeness — the
+                    // edge wires PROTO_DELTA for DDSketch today.
+                    SketchEncoding::MsgpackDelta => {
+                        let other = match decode_full(
+                            &DeltaSketchKind::DDSketch { alpha: 0.0 },
+                            bytes,
+                            SketchEncoding::MsgpackFull,
+                        ) {
+                            Ok(RollingState::Dd(s)) => s,
+                            Ok(_) => {
+                                return Err(
+                                    "decode_full(DDSketch) returned non-DDSketch state".to_string()
+                                )
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        sk.merge(&other)
+                            .map_err(|e| format!("merge DDSketch delta: {e}"))?;
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                }
             }
             RollingState::Hll(sk) => {
                 // HLL has a true sparse register delta in the proto
