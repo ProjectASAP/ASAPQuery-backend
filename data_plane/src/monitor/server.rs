@@ -92,11 +92,12 @@ impl MonitorCoordinator {
         window_start_ms: u64,
         local_value: f64,
         seq: u64,
+        rate: f64,
     ) -> Option<Vec<Action>> {
         let mk = (agg_id, key);
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.get_mut(&mk)?;
-        Some(mon.on_report(edge_id, window_start_ms, local_value, seq))
+        Some(mon.on_report(edge_id, window_start_ms, local_value, seq, rate))
     }
 
     /// Dispatch coordinator actions: grants to the addressed edge's stream,
@@ -109,6 +110,7 @@ impl MonitorCoordinator {
                     round,
                     local_slack,
                     window_start_ms,
+                    sample_p,
                 } => {
                     let msg = CoordToEdge {
                         msg: Some(coord_to_edge::Msg::Grant(SlackGrant {
@@ -117,6 +119,7 @@ impl MonitorCoordinator {
                             round,
                             local_slack,
                             window_start_ms,
+                            sample_p,
                         })),
                     };
                     let tx = {
@@ -186,6 +189,7 @@ impl MonitorCoordinator {
                         rep.window_start_ms,
                         rep.local_value,
                         rep.seq,
+                        rep.rate,
                     )
                     .await
                 {
