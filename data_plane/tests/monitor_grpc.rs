@@ -56,6 +56,7 @@ fn report(value: f64, seq: u64) -> EdgeToCoord {
             local_value: value,
             round: 0,
             seq,
+            rate: 0.0,
         })),
     }
 }
