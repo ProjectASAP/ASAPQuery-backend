@@ -3091,14 +3091,19 @@ mod asap_tier_classify_tests {
         );
     }
 
-    /// A delta-ONLY window with NO Full anywhere is a genuine data gap —
-    /// there is no base to stitch from. The carry-in fix does not (and
-    /// cannot) fabricate one, so the result is empty. Documents the
-    /// boundary so the carry-in change isn't mistaken for "always
-    /// non-empty"; a follow-up may convert this to a NoData → archive
-    /// failover.
+    /// A delta-ONLY window with NO Full anywhere is the COMMON case under
+    /// the edge's per-window-reset (PWR) delta model: the edge resets its
+    /// snapshot base at each window boundary, so a window's first (here:
+    /// only) frame is a delta-from-empty that, by construction, encodes
+    /// that window's full state. The delta-apply walk bootstraps an empty
+    /// rolling state of the sketch kind and applies the delta onto it, so
+    /// the window IS queryable (delta-from-empty ⊕ empty = window state).
+    ///
+    /// Previously this returned empty (the walk skipped any delta with no
+    /// carry-in Full), which is the very bug that broke end-to-end
+    /// value-validation of delta-transmitted sketches.
     #[tokio::test]
-    async fn quantile_over_time_kll_delta_only_no_base_is_empty() {
+    async fn quantile_over_time_kll_delta_only_no_base_reconstructs_from_empty() {
         let idx = Arc::new(SketchStore::new());
         let sid = 7300u64;
         idx.register(kll_meta(sid, "http_requests_total_latency_ms"));
@@ -3120,9 +3125,9 @@ mod asap_tier_classify_tests {
 
         let result = engine_quantile_result(idx, now_ms).await;
         assert!(
-            !result_nonempty(&result),
-            "delta-only window with no Full base anywhere has nothing to \
-             stitch from → empty result expected"
+            result_nonempty(&result),
+            "delta-from-empty (PWR) window with no carry-in Full must \
+             reconstruct that window's state and return a non-empty result"
         );
     }
 

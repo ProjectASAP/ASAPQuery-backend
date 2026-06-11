@@ -1778,3 +1778,232 @@ fn count_sketch_with_heap_msgpack_delta_frequency_from_edge_golden() {
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0].1, 50.0, "row-0 sum of the reconstructed matrix");
 }
+
+// ===========================================================================
+// REGRESSION: warm-tier delta_transmission query returns EMPTY (the
+// `fix/pwr-delta-query` bug). These reproduce the EXACT row sequences the
+// edge produces under `delta_transmission: true`, then drive the SAME
+// query path the HTTP `/api/v1/query` instant path uses — the engine calls
+// `SketchReducer::evaluate_for_capability(QuantileApprox, sids, [q],
+// is_cumulative=true, t0, t1)` for `quantile_over_time(0.99, m[3m])`.
+//
+// The bug: `SketchStore::query_range` collapses a sid's per-window samples
+// into a `BTreeMap<window_end_ms, SketchSampleState>` (index/mod.rs ~633).
+// When the edge emits MULTIPLE sub-window frames that all stamp the SAME
+// `(window_start, window_end)` (the sub-window-on case — frames carry the
+// FULL window range, not the sub-window slice), every later frame
+// OVERWRITES the earlier one at that window_end key. So a window emitted as
+// `[Full, Delta, Delta]` is read back as just the trailing `[Delta]`, and
+// the leading `Full` (the only frame that establishes a rolling base) is
+// silently dropped. The reducer then has a leading INCREMENT delta with no
+// base; the carry-in (`need_base`) looks for a Full ending BEFORE `t0` and
+// finds none, so the delta-apply walk reconstructs the wrong distribution
+// (or, when the increment fragment is empty/partial, an empty quantile),
+// and the engine returns "No result for query".
+// ===========================================================================
+
+/// Build a DDSketch over `vals` and return its proto-full bytes.
+fn dd_full_bytes(alpha: f64, vals: &[f64]) -> Vec<u8> {
+    let mut sk = DdSketch::new(alpha);
+    for &v in vals {
+        sk.update(v);
+    }
+    encode_ddsketch(&sk)
+}
+
+/// Reference: the cumulative (`quantile_over_time`) answer over the union
+/// of ALL values across every window in the query range.
+fn dd_truth_quantile(alpha: f64, all_vals: &[f64], q: f64) -> f64 {
+    let mut sk = DdSketch::new(alpha);
+    for &v in all_vals {
+        sk.update(v);
+    }
+    sk.quantile(q).unwrap_or(0.0)
+}
+
+/// CONTROL: full-state edge config — every window ships exactly one Full.
+/// This is the path that empirically WORKS (status=success). Pinned here
+/// so the fix can't regress it.
+#[test]
+fn delta_query_control_full_state_per_window_succeeds() {
+    let alpha = 0.01;
+    let idx = SketchStore::new();
+    let sid = 5500;
+    idx.register(dd_meta(sid));
+
+    let w1 = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let w2 = [10.0, 20.0, 30.0, 40.0, 50.0];
+    let w3 = [100.0, 200.0, 300.0, 400.0, 500.0];
+    // Three tumbling windows, each a single Full frame.
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_full(dd_full_bytes(alpha, &w1)));
+    idx.append_sample(sid, BTreeMap::new(), (2000, 3000), proto_full(dd_full_bytes(alpha, &w2)));
+    idx.append_sample(sid, BTreeMap::new(), (3000, 4000), proto_full(dd_full_bytes(alpha, &w3)));
+
+    let reducer = SketchReducer::new(&idx);
+    // Same call shape the engine uses for `quantile_over_time(0.99, m[3m])`.
+    let result = reducer
+        .evaluate_for_capability(
+            &Capability::QuantileApprox(SketchKindHandle::DDSketch),
+            &[sid],
+            &[0.99],
+            None,
+            true, // cumulative (`*_over_time`)
+            1000,
+            4000,
+        )
+        .expect("full-state cumulative quantile must succeed");
+    assert!(!result.is_empty(), "full-state path must not be empty");
+    let est = result.series[0].1.last().unwrap().1;
+    let mut all: Vec<f64> = Vec::new();
+    all.extend(&w1);
+    all.extend(&w2);
+    all.extend(&w3);
+    let truth = dd_truth_quantile(alpha, &all, 0.99);
+    let rel = (est - truth).abs() / truth.max(1e-9);
+    assert!(rel < 0.10, "control est={est} truth={truth} rel={rel}");
+}
+
+/// REPRO 1 — delta, NO sub-window (PWR):
+/// w1 = `[Full]`, w2 = `[Delta-from-empty]`, w3 = `[Delta-from-empty]`.
+/// Each window has a DISTINCT window_end, so the query_range BTreeMap does
+/// NOT collapse anything — this case should already pass and confirms the
+/// reducer's PWR walk works once the rows survive read-back.
+#[test]
+fn delta_query_pwr_no_subwindow_reconstructs_quantile() {
+    let alpha = 0.01;
+    let idx = SketchStore::new();
+    let sid = 5501;
+    idx.register(dd_meta(sid));
+
+    let w1 = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let w2 = [10.0, 20.0, 30.0, 40.0, 50.0];
+    let w3 = [100.0, 200.0, 300.0, 400.0, 500.0];
+    // w1 ships a Full; w2/w3 ship a delta-from-empty (= that window's own
+    // distribution as a mergeable fragment).
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_full(dd_full_bytes(alpha, &w1)));
+    idx.append_sample(sid, BTreeMap::new(), (2000, 3000), proto_delta(dd_full_bytes(alpha, &w2)));
+    idx.append_sample(sid, BTreeMap::new(), (3000, 4000), proto_delta(dd_full_bytes(alpha, &w3)));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate_for_capability(
+            &Capability::QuantileApprox(SketchKindHandle::DDSketch),
+            &[sid],
+            &[0.99],
+            None,
+            true,
+            1000,
+            4000,
+        )
+        .expect("PWR delta cumulative quantile must succeed");
+    assert!(!result.is_empty(), "PWR delta path must not be empty");
+    let est = result.series[0].1.last().unwrap().1;
+    let mut all: Vec<f64> = Vec::new();
+    all.extend(&w1);
+    all.extend(&w2);
+    all.extend(&w3);
+    let truth = dd_truth_quantile(alpha, &all, 0.99);
+    let rel = (est - truth).abs() / truth.max(1e-9);
+    assert!(rel < 0.10, "pwr est={est} truth={truth} rel={rel}");
+}
+
+/// REPRO 2 — delta + SUB-WINDOW (the empirically-failing config):
+/// w1 = `[Full, Delta, Delta]` (all three frames stamp the SAME full
+/// window range `(1000, 2000)`),
+/// w2 = `[Delta-from-empty, Delta, Delta]` (all stamp `(2000, 3000)`).
+///
+/// Each window's frames are sub-window INCREMENTS that together cover the
+/// window's full data. The reducer's `per_window_evaluate` already handles
+/// this (see delta_apply tests `*_subwindow_*`) — IF the frames survive the
+/// `query_range` read-back. They currently do NOT: the per-window-end
+/// BTreeMap keeps only the trailing frame, so the leading Full/seed is lost.
+#[test]
+fn delta_query_subwindow_frames_reconstruct_quantile() {
+    let alpha = 0.01;
+    let idx = SketchStore::new();
+    let sid = 5502;
+    idx.register(dd_meta(sid));
+
+    // Window 1 (window_end=2000): Full seed + 2 increment deltas.
+    // The LEADING frames carry the EXTREME (high) values; the trailing
+    // frame is low. So if `query_range` drops the leading frames and keeps
+    // only the trailing one, the reconstructed p99 collapses far below
+    // truth — catching the silent data loss, not just an empty result.
+    let w1a = [1000.0, 1100.0, 1200.0, 1300.0, 1400.0]; // Full: the high tail
+    let w1b = [50.0, 60.0, 70.0, 80.0, 90.0];
+    let w1c = [1.0, 2.0, 3.0, 4.0, 5.0]; // trailing delta: low values
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_full(dd_full_bytes(alpha, &w1a)));
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_delta(dd_full_bytes(alpha, &w1b)));
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_delta(dd_full_bytes(alpha, &w1c)));
+
+    // Window 2 (window_end=3000): Delta-from-empty seed + 2 increment deltas.
+    // Same shape: the seed carries the high tail, the trailing delta is low.
+    let w2a = [2000.0, 2100.0, 2200.0, 2300.0, 2400.0]; // seed: high tail
+    let w2b = [150.0, 160.0, 170.0, 180.0, 190.0];
+    let w2c = [10.0, 11.0, 12.0, 13.0, 14.0]; // trailing delta: low values
+    idx.append_sample(sid, BTreeMap::new(), (2000, 3000), proto_delta(dd_full_bytes(alpha, &w2a)));
+    idx.append_sample(sid, BTreeMap::new(), (2000, 3000), proto_delta(dd_full_bytes(alpha, &w2b)));
+    idx.append_sample(sid, BTreeMap::new(), (2000, 3000), proto_delta(dd_full_bytes(alpha, &w2c)));
+
+    let reducer = SketchReducer::new(&idx);
+    let result = reducer
+        .evaluate_for_capability(
+            &Capability::QuantileApprox(SketchKindHandle::DDSketch),
+            &[sid],
+            &[0.99],
+            None,
+            true,
+            1000,
+            3000,
+        )
+        .expect("sub-window delta cumulative quantile must succeed (not NoData)");
+    assert!(
+        !result.is_empty(),
+        "sub-window delta path returned EMPTY — the warm-tier delta query bug"
+    );
+    let est = result.series[0].1.last().unwrap().1;
+    // Truth: union of EVERY sub-window increment across both windows.
+    let mut all: Vec<f64> = Vec::new();
+    for s in [&w1a, &w1b, &w1c, &w2a, &w2b, &w2c] {
+        all.extend(s.iter().copied());
+    }
+    let truth = dd_truth_quantile(alpha, &all, 0.99);
+    let rel = (est - truth).abs() / truth.max(1e-9);
+    assert!(
+        rel < 0.10,
+        "sub-window reconstructed quantile wrong: est={est} truth={truth} rel={rel}"
+    );
+}
+
+/// Pin the root cause directly at the storage layer: `query_range` must
+/// return ALL frames of a sub-window window, in insertion order, not just
+/// the trailing one. This is the minimal mechanism assertion.
+#[test]
+fn query_range_preserves_all_subwindow_frames() {
+    let alpha = 0.01;
+    let idx = SketchStore::new();
+    let sid = 5503;
+    idx.register(dd_meta(sid));
+
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_full(dd_full_bytes(alpha, &[1.0])));
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_delta(dd_full_bytes(alpha, &[2.0])));
+    idx.append_sample(sid, BTreeMap::new(), (1000, 2000), proto_delta(dd_full_bytes(alpha, &[3.0])));
+
+    let series = idx.query_range(sid, 1000, 2000);
+    assert_eq!(series.len(), 1, "one label series");
+    // All 3 sub-window frames share window_end=2000; they must survive as a
+    // 3-element Vec under that key (the bug collapsed them to 1).
+    let n_frames: usize = series[0].samples.values().map(|v| v.len()).sum();
+    assert_eq!(
+        n_frames, 3,
+        "query_range must return all 3 sub-window frames, got {n_frames} \
+         (the per-window-end map collapsed them)"
+    );
+    // The first frame at this window must be the Full (the base), not a Delta.
+    let first_enc = series[0].samples.values().next().unwrap()[0].encoding;
+    assert_eq!(
+        first_enc,
+        SketchEncoding::ProtoFull,
+        "first frame must be the leading Full, not a trailing Delta"
+    );
+}

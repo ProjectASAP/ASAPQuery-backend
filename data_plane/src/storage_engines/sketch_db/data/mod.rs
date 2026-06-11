@@ -322,9 +322,22 @@ pub enum SketchEncoding {
 pub struct SketchTimeSeries {
     pub sid: u64,
     pub series_label_values: std::collections::BTreeMap<String, String>,
-    /// `window_end_unix_ms → sketch payload`. BTreeMap so the query
+    /// `window_end_unix_ms → sketch payload(s)`. BTreeMap so the query
     /// path can iterate in time order without an extra sort.
-    pub samples: std::collections::BTreeMap<i64, SketchSampleState>,
+    ///
+    /// The value is a `Vec` because the edge can emit MULTIPLE frames that
+    /// all stamp the SAME `(window_start, window_end)` range — the
+    /// sub-window delta_transmission case, where each sub-window emit
+    /// carries the FULL window range rather than the sub-window slice. All
+    /// such frames must survive read-back (the leading `Full`/seed
+    /// establishes the rolling base; the trailing `Delta`s are increments
+    /// onto it), in INSERTION ORDER. Keying by `window_end` alone and
+    /// storing one payload silently dropped all but the last frame, which
+    /// erased the base and produced empty / wildly-wrong warm-tier query
+    /// answers under delta_transmission (the `fix/pwr-delta-query` bug).
+    /// The reducer's `per_window_evaluate` / `cumulative_evaluate` already
+    /// fold repeated-window-end frames correctly once they arrive.
+    pub samples: std::collections::BTreeMap<i64, Vec<SketchSampleState>>,
 }
 
 /// Unified payload variant — what one window of one (sid, label-values

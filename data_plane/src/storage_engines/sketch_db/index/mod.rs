@@ -595,8 +595,10 @@ impl SketchStore {
         // Result is keyed by the resolved label MAP so the in-memory tier
         // (its own intern space) and the durable disk tier (independent
         // intern space) union by label identity, not `LabelValuesId`.
-        let mut by_label_map: HashMap<BTreeMap<String, String>, BTreeMap<i64, SketchSampleState>> =
-            HashMap::new();
+        let mut by_label_map: HashMap<
+            BTreeMap<String, String>,
+            BTreeMap<i64, Vec<SketchSampleState>>,
+        > = HashMap::new();
 
         // ── In-memory tier ──────────────────────────────────────────────
         // Absent series is NOT an early return: under persistence the
@@ -606,7 +608,7 @@ impl SketchStore {
         // disk union below.
         if let Some(store) = self.series.get(&sid).map(|s| s.clone()) {
             let guard = store.write().unwrap(); // exact_query may build the lazy index
-            let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, SketchSampleState>> =
+            let mut by_label_id: HashMap<LabelValuesId, BTreeMap<i64, Vec<SketchSampleState>>> =
                 HashMap::new();
 
             let mut buf: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
@@ -628,10 +630,17 @@ impl SketchStore {
                 // (M2.3) are served via the precompute query path
                 // (M2.3.5).
                 if let Some(s) = payload.as_sketch() {
+                    // PUSH, not insert: a window_end can carry MULTIPLE
+                    // sub-window frames (delta_transmission), all of which
+                    // must survive in insertion (= column) order. The
+                    // overlap scan iterates `windows_col` by index, so push
+                    // preserves the producer's emit order within a window.
                     by_label_id
                         .entry(*label_id)
                         .or_default()
-                        .insert(win.1 as i64, s.clone());
+                        .entry(win.1 as i64)
+                        .or_default()
+                        .push(s.clone());
                 }
             }
             buf.clear();
@@ -643,7 +652,9 @@ impl SketchStore {
                         by_label_id
                             .entry(*label_id)
                             .or_default()
-                            .insert(win.1 as i64, s.clone());
+                            .entry(win.1 as i64)
+                            .or_default()
+                            .push(s.clone());
                     }
                 }
                 buf.clear();
@@ -671,9 +682,12 @@ impl SketchStore {
                 let need_base: Vec<LabelValuesId> = by_label_id
                     .iter()
                     .filter(|(_, samples)| {
+                        // Earliest window's FIRST frame: a leading Full (or
+                        // sub-window seed Full) needs no carry-in.
                         samples
                             .values()
                             .next()
+                            .and_then(|frames| frames.first())
                             .map(|s| {
                                 matches!(
                                     s.encoding,
@@ -724,24 +738,31 @@ impl SketchStore {
                         buf.clear();
                     }
                     for (label_id, (w_end, state)) in latest_full {
-                        by_label_id
-                            .entry(label_id)
-                            .or_default()
-                            .entry(w_end)
-                            .or_insert(state);
+                        // Carry-in base sorts before `start` (its w_end <
+                        // start), so it heads the per-label BTreeMap and the
+                        // reducer uses it as the rolling base. Only splice it
+                        // when that window-end has no frames yet (don't
+                        // duplicate a base the in-window scan already saw).
+                        let frames = by_label_id.entry(label_id).or_default().entry(w_end).or_default();
+                        if frames.is_empty() {
+                            frames.push(state);
+                        }
                     }
                 }
             }
 
             // Materialize the in-memory result keyed by the resolved label
             // MAP so the disk tier (which has its own intern space) can be
-            // unioned by label identity rather than `LabelValuesId`.
+            // unioned by label identity rather than `LabelValuesId`. Merge
+            // per-window-end frame lists rather than overwriting, so two
+            // label_ids that resolve to the same label map (distinct intern
+            // ids, same values) union their frames instead of clobbering.
             for (label_id, samples) in by_label_id {
                 let label_values = guard.intern.resolve(label_id).cloned().unwrap_or_default();
-                by_label_map
-                    .entry(label_values)
-                    .or_default()
-                    .extend(samples);
+                let dst = by_label_map.entry(label_values).or_default();
+                for (w_end, frames) in samples {
+                    dst.entry(w_end).or_default().extend(frames);
+                }
             }
             // Release the per-sid lock before touching disk — disk reads can
             // mmap/decode and must not hold the hot ingest lock.
@@ -809,7 +830,7 @@ impl SketchStore {
         sid: u64,
         start_unix_ms: u64,
         end_unix_ms: u64,
-        by_label_map: &mut HashMap<BTreeMap<String, String>, BTreeMap<i64, SketchSampleState>>,
+        by_label_map: &mut HashMap<BTreeMap<String, String>, BTreeMap<i64, Vec<SketchSampleState>>>,
     ) {
         let handle = {
             let g = self.persistence_read.read().unwrap();
@@ -821,6 +842,15 @@ impl SketchStore {
         let Some(keys) = self.sid_group_by_keys(sid) else {
             return;
         };
+
+        // Snapshot which `(label_map, window_end)` keys the in-memory tier
+        // already populated, so the disk scan can apply the "in-memory wins"
+        // rule per window-end without colliding frame lists across tiers.
+        let in_mem_owned_ends: std::collections::HashSet<(BTreeMap<String, String>, i64)> =
+            by_label_map
+                .iter()
+                .flat_map(|(lm, by_end)| by_end.keys().map(move |w| (lm.clone(), *w)))
+                .collect();
 
         // ---- Overlap scan over disk parts in [start, end) ----
         let parts = handle
@@ -851,13 +881,18 @@ impl SketchStore {
                     bytes: entry.sketch_bytes,
                     encoding: tag_to_encoding(entry.encoding_tag),
                 };
-                by_label_map
-                    .entry(label_map)
-                    .or_default()
-                    .entry(rec.end_ts as i64)
-                    // In-memory wins — only fill window-ends disk uniquely
-                    // owns.
-                    .or_insert(sample);
+                let w_end = rec.end_ts as i64;
+                // In-memory wins on a window-end collision: only contribute
+                // disk frames at window-ends the in-memory tier left empty.
+                // When disk uniquely owns a window-end it may hold MULTIPLE
+                // sub-window frames there (a flushed sub-window window kept
+                // every frame); push them all in disk-record order. We never
+                // mix disk + in-memory frames at one window-end.
+                let by_end = by_label_map.entry(label_map.clone()).or_default();
+                if in_mem_owned_ends.contains(&(label_map, w_end)) {
+                    continue;
+                }
+                by_end.entry(w_end).or_default().push(sample);
             }
         }
 
@@ -877,6 +912,7 @@ impl SketchStore {
                 let earliest_is_delta = samples
                     .values()
                     .next()
+                    .and_then(|frames| frames.first())
                     .map(|s| {
                         matches!(
                             s.encoding,
@@ -884,12 +920,14 @@ impl SketchStore {
                         )
                     })
                     .unwrap_or(false);
-                let has_base_before = samples.iter().any(|(w_end, s)| {
+                let has_base_before = samples.iter().any(|(w_end, frames)| {
                     *w_end < start_unix_ms as i64
-                        && matches!(
-                            s.encoding,
-                            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                        )
+                        && frames.iter().any(|s| {
+                            matches!(
+                                s.encoding,
+                                SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                            )
+                        })
                 });
                 earliest_is_delta && !has_base_before
             })
@@ -945,11 +983,10 @@ impl SketchStore {
             }
         }
         for (label_map, (w_end, state)) in latest_full {
-            by_label_map
-                .entry(label_map)
-                .or_default()
-                .entry(w_end)
-                .or_insert(state);
+            let frames = by_label_map.entry(label_map).or_default().entry(w_end).or_default();
+            if frames.is_empty() {
+                frames.push(state);
+            }
         }
     }
 
@@ -2334,8 +2371,8 @@ mod tests {
         let s_a = &series[0];
         assert_eq!(s_a.series_label_values, lv_a);
         assert_eq!(s_a.samples.len(), 2);
-        assert_eq!(s_a.samples[&10].bytes, vec![1]);
-        assert_eq!(s_a.samples[&20].bytes, vec![2]);
+        assert_eq!(s_a.samples[&10][0].bytes, vec![1]);
+        assert_eq!(s_a.samples[&20][0].bytes, vec![2]);
 
         let s_b = &series[1];
         assert_eq!(s_b.series_label_values, lv_b);
@@ -2457,7 +2494,7 @@ mod tests {
         );
         // The carried-in entry must be a Full (the reducer needs a base).
         assert_eq!(
-            s.samples.get(&200).unwrap().encoding,
+            s.samples.get(&200).unwrap()[0].encoding,
             SketchEncoding::ProtoFull
         );
     }
@@ -2554,7 +2591,7 @@ mod tests {
         assert_eq!(series.len(), 1, "recent 30m window must stay queryable");
         let s = &series[0];
         assert!(!s.samples.is_empty(), "30m range query returned no samples");
-        let first = s.samples.values().next().unwrap();
+        let first = &s.samples.values().next().unwrap()[0];
         assert!(
             matches!(
                 first.encoding,
@@ -3303,19 +3340,21 @@ mod tests {
         assert_eq!(series.len(), 1);
         let s = &series[0];
         // A Full-encoded carry-in base (end < 200_000) must be present.
-        let has_full_base = s.samples.iter().any(|(w_end, smp)| {
+        let has_full_base = s.samples.iter().any(|(w_end, frames)| {
             *w_end < 200_000
-                && matches!(
-                    smp.encoding,
-                    SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
-                )
+                && frames.iter().any(|smp| {
+                    matches!(
+                        smp.encoding,
+                        SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull
+                    )
+                })
         });
         assert!(
             has_full_base,
             "delta-only window did not get a disk-resident Full carry-in base: {:?}",
             s.samples
                 .iter()
-                .map(|(k, v)| (*k, v.encoding))
+                .map(|(k, v)| (*k, v.iter().map(|s| s.encoding).collect::<Vec<_>>()))
                 .collect::<Vec<_>>()
         );
         drop(p);
