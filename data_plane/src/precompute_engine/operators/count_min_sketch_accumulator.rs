@@ -1,3 +1,4 @@
+use crate::precompute_engine::operators::dd_sketch_accumulator::normalize_sample_p;
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
     MultipleSubpopulationAggregate, SerializableToSink,
@@ -14,12 +15,25 @@ use promql_utilities::query_logics::enums::Statistic;
 #[derive(Debug, Clone)]
 pub struct CountMinSketchAccumulator {
     pub inner: CountMinSketch,
+    /// Edge sampling probability `p ∈ (0,1]` carried on the producer's
+    /// `SketchEnvelope.sample_p`. The edge admits each insert with
+    /// probability `p`, so every stored cell count is ~`p`× the true count.
+    /// CMS is L1/additive and linear, so the unbiased rescale of BOTH a
+    /// point-frequency estimate (`query_key`) and the aggregate
+    /// total-event statistics (`Count`/`Sum`/`Increase`/`Rate`) is `×1/p`.
+    /// `1.0` (and the proto3 default `0.0`, dual-read as `1.0`) means no
+    /// sampling, so the rescale is a no-op and the behaviour is identical
+    /// to before. Mirrors `DDSketchAccumulator::sample_p`; set from the
+    /// envelope at the `from_sketchlib_proto_bytes` decode site and
+    /// preserved across `reset_to_empty` and `merge_with`.
+    pub sample_p: f64,
 }
 
 impl CountMinSketchAccumulator {
     pub fn new(row_num: usize, col_num: usize) -> Self {
         Self {
             inner: CountMinSketch::new(row_num, col_num),
+            sample_p: 1.0,
         }
     }
 
@@ -29,7 +43,11 @@ impl CountMinSketchAccumulator {
     }
 
     pub fn query_key(&self, key: &KeyByLabelValues) -> f64 {
-        self.inner.estimate(&key.to_semicolon_str())
+        // The edge sampled inserts with probability `sample_p`, so the
+        // stored point-frequency estimate is ~`p`× the true frequency.
+        // CMS is linear/additive, so `×1/p` is the unbiased rescale.
+        // `sample_p == 1.0` (unsampled / legacy) makes this a no-op.
+        self.inner.estimate(&key.to_semicolon_str()) / self.sample_p
     }
 
     pub fn deserialize_from_json(data: &Value) -> Result<Self, Box<dyn std::error::Error>> {
@@ -57,6 +75,7 @@ impl CountMinSketchAccumulator {
 
         Ok(Self {
             inner: CountMinSketch::from_legacy_matrix(sketch, row_num, col_num),
+            sample_p: 1.0,
         })
     }
 
@@ -70,6 +89,9 @@ impl CountMinSketchAccumulator {
         Ok(Self {
             inner: CountMinSketch::from_msgpack(buffer)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
+            // The msgpack CountMinSketch struct carries no envelope/sample_p;
+            // the msgpack path is parity/test-only and is never edge-sampled.
+            sample_p: 1.0,
         })
     }
 
@@ -93,26 +115,37 @@ impl CountMinSketchAccumulator {
         // `SketchEnvelope{count_min: CountMinState}` via
         // `SerializePortableFO` + `proto.Marshal`. Try decoding as envelope
         // first, fall back to bare `CountMinState` for callers (e.g. unit
-        // tests) that encode the state directly.
-        let state = match SketchEnvelope::decode(buffer) {
-            Ok(env) => match env.sketch_state {
-                Some(sketch_envelope::SketchState::CountMin(st)) => st,
-                Some(other) => {
-                    return Err(format!(
-                        "SketchEnvelope contains non-CountMin sketch: {:?}",
-                        std::mem::discriminant(&other)
-                    )
-                    .into());
+        // tests) that encode the state directly. Capture the envelope's
+        // `sample_p` alongside the state so the point-frequency
+        // (`query_key`) and aggregate statistics rescale by `1/p`. Bare
+        // `CountMinState` bytes (no envelope) carry no sampling info →
+        // `sample_p` 1.0 (no rescale). Mirrors `DDSketchAccumulator`.
+        let (state, sample_p) = match SketchEnvelope::decode(buffer) {
+            Ok(env) => {
+                let sp = env.sample_p;
+                match env.sketch_state {
+                    Some(sketch_envelope::SketchState::CountMin(st)) => (st, sp),
+                    Some(other) => {
+                        return Err(format!(
+                            "SketchEnvelope contains non-CountMin sketch: {:?}",
+                            std::mem::discriminant(&other)
+                        )
+                        .into());
+                    }
+                    // Envelope decoded but was empty (e.g. the buffer is a
+                    // bare CountMinState that happened to parse as a default
+                    // envelope). Fall through to bare decode.
+                    None => (
+                        CountMinState::decode(buffer)
+                            .map_err(|e| format!("decode CountMinState: {e}"))?,
+                        1.0,
+                    ),
                 }
-                // Envelope decoded but was empty (e.g. the buffer is a
-                // bare CountMinState that happened to parse as a default
-                // envelope). Fall through to bare decode.
-                None => CountMinState::decode(buffer)
-                    .map_err(|e| format!("decode CountMinState: {e}"))?,
-            },
-            Err(_) => {
-                CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?
             }
+            Err(_) => (
+                CountMinState::decode(buffer).map_err(|e| format!("decode CountMinState: {e}"))?,
+                1.0,
+            ),
         };
         let rows = state.rows as usize;
         let cols = state.cols as usize;
@@ -169,6 +202,7 @@ impl CountMinSketchAccumulator {
         }
         Ok(Self {
             inner: CountMinSketch::from_legacy_matrix(matrix, rows, cols),
+            sample_p: normalize_sample_p(sample_p),
         })
     }
 
@@ -260,6 +294,7 @@ impl CountMinSketchAccumulator {
 
         Ok(Self {
             inner: CountMinSketch::from_legacy_matrix(sketch, row_num, col_num),
+            sample_p: 1.0,
         })
     }
 
@@ -301,8 +336,18 @@ impl CountMinSketchAccumulator {
         let inner_refs: Vec<&CountMinSketch> =
             cms_accumulators.iter().map(|acc| &acc.inner).collect();
         let merged_inner = CountMinSketch::merge_refs(&inner_refs)?;
+        // sample_p is a per-series config constant, so all operands carry the
+        // same value in practice. Mirror DDSketch's merge policy: prefer a
+        // sampled factor (< 1.0) over the no-sampling default so a merge with
+        // a freshly-reset (1.0) base keeps the series' sampling rate.
+        let sample_p = cms_accumulators
+            .iter()
+            .map(|acc| acc.sample_p)
+            .find(|&p| p < 1.0)
+            .unwrap_or(cms_accumulators[0].sample_p);
         Ok(Self {
             inner: merged_inner,
+            sample_p,
         })
     }
 }
@@ -400,7 +445,9 @@ impl AggregateCore for CountMinSketchAccumulator {
 
     /// Per-window base rotation: rebuild an empty counter matrix with
     /// the same (rows, cols) so the next window's additive cell deltas
-    /// align to the identical hash geometry.
+    /// align to the identical hash geometry. `sample_p` is a per-series
+    /// config constant (not per-window data), so it is intentionally
+    /// preserved across the rotation — mirrors `DDSketchAccumulator`.
     fn reset_to_empty(&mut self) {
         self.inner = CountMinSketch::new(self.inner.rows(), self.inner.cols());
     }
@@ -431,8 +478,19 @@ impl AggregateCore for CountMinSketchAccumulator {
             .ok_or("Failed to downcast to CountMinSketchAccumulator")?;
 
         let merged_inner = CountMinSketch::merge_refs(&[&self.inner, &other_cms.inner])?;
+        // Mirror DDSketchAccumulator's merge policy exactly: sample_p is a
+        // per-series config constant, so both operands carry the same value
+        // in practice. Prefer a sampled factor over the no-sampling default
+        // so a merge with a freshly-reset (1.0) base keeps the series'
+        // sampling rate.
+        let sample_p = if self.sample_p < 1.0 {
+            self.sample_p
+        } else {
+            other_cms.sample_p
+        };
         Ok(Box::new(Self {
             inner: merged_inner,
+            sample_p,
         }))
     }
 
@@ -475,6 +533,14 @@ impl AggregateCore for CountMinSketchAccumulator {
         // each insert increments exactly one cell per row, so every row
         // sums to the true insert count (modulo collisions, which CMS
         // never *underestimates*; min is the tightest upper bound).
+        //
+        // When the edge sampled this series (sample_p < 1.0), each insert
+        // was admitted w.p. `p`, so the stored min-row-sum is ~`p`× the
+        // true event count. CMS is L1/additive and linear, so rescale by
+        // `1/sample_p` for an unbiased estimate. `sample_p == 1.0`
+        // (unsampled / legacy) makes this a no-op. This rescales BOTH the
+        // Count/Sum/Increase statistics and (via the same closure) the
+        // Rate per-second readout.
         let total_events = || -> f64 {
             let matrix = self.inner.sketch();
             if matrix.is_empty() || matrix[0].is_empty() {
@@ -483,7 +549,7 @@ impl AggregateCore for CountMinSketchAccumulator {
             let row_totals = matrix.iter().map(|r| r.iter().sum::<f64>());
             let min_total = row_totals.fold(f64::INFINITY, f64::min);
             if min_total.is_finite() {
-                min_total
+                min_total / self.sample_p
             } else {
                 0.0
             }
@@ -606,6 +672,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
         let cms2 = CountMinSketchAccumulator {
             inner: CountMinSketch::from_legacy_matrix(
@@ -613,6 +680,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
 
         let merged = CountMinSketchAccumulator::merge_accumulators(vec![cms1, cms2]).unwrap();
@@ -703,6 +771,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
         let cms2 = CountMinSketchAccumulator {
             inner: CountMinSketch::from_legacy_matrix(
@@ -710,6 +779,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
         let cms3 = CountMinSketchAccumulator {
             inner: CountMinSketch::from_legacy_matrix(
@@ -717,6 +787,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
 
         let boxed_accs: Vec<Box<dyn AggregateCore>> =
@@ -909,6 +980,7 @@ mod tests {
                 2,
                 3,
             ),
+            sample_p: 1.0,
         };
         let bytes = PbDelta {
             rows: 2,
@@ -952,6 +1024,7 @@ mod tests {
                 2,
                 2,
             ),
+            sample_p: 1.0,
         };
         let mut kwargs = HashMap::new();
         kwargs.insert("range_ms".to_string(), "300000".to_string());
@@ -975,6 +1048,7 @@ mod tests {
         // code path.
         let cms = CountMinSketchAccumulator {
             inner: CountMinSketch::from_legacy_matrix(vec![vec![42.0, 0.0], vec![42.0, 0.0]], 2, 2),
+            sample_p: 1.0,
         };
         let trait_obj: &dyn AggregateCore = &cms;
         let v = trait_obj
@@ -990,6 +1064,7 @@ mod tests {
         // that it never divides by range.
         let cms = CountMinSketchAccumulator {
             inner: CountMinSketch::from_legacy_matrix(vec![vec![5.0, 7.0], vec![3.0, 9.0]], 2, 2),
+            sample_p: 1.0,
         };
         let trait_obj: &dyn AggregateCore = &cms;
         let v = trait_obj
@@ -1091,5 +1166,155 @@ mod tests {
             .query_statistic(Statistic::Rate, &None, &kwargs)
             .expect_err("non-numeric range_ms should error");
         assert!(err.to_string().contains("bad range_ms"));
+    }
+
+    // ----------------------------------------------------------------
+    // sample_p rescale. The edge admits each insert with probability `p`,
+    // so every stored cell is ~p× the true count. CMS is L1/additive and
+    // linear, so BOTH the point-frequency (query_key) and the aggregate
+    // total-event statistics (Count/Sum/Increase/Rate) rescale by 1/p.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_query_key_rescaled_by_sample_p() {
+        // Same stored cell counts, two sample_p values: the p=0.25 sketch
+        // must report 4× the point-frequency of the unsampled one.
+        let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
+        let mut unsampled = CountMinSketchAccumulator::new(4, 1000);
+        unsampled._update(&key, 10.0);
+        let mut sampled = CountMinSketchAccumulator::new(4, 1000);
+        sampled._update(&key, 10.0);
+        sampled.sample_p = 0.25;
+
+        let raw = unsampled.query_key(&key);
+        let rescaled = sampled.query_key(&key);
+        assert!(raw >= 10.0, "raw estimate should be >= inserted 10, got {raw}");
+        assert!(
+            (rescaled - raw * 4.0).abs() < 1e-9,
+            "expected point-frequency rescaled ≈ 4×raw ({}), got {rescaled}",
+            raw * 4.0
+        );
+    }
+
+    #[test]
+    fn test_aggregate_statistics_rescaled_by_sample_p() {
+        use promql_utilities::query_logics::enums::Statistic;
+        // Build a CMS with a known min-row-sum of 12 events, sampled at
+        // p=0.25 → every aggregate statistic should report 12 / 0.25 = 48.
+        let cms = CountMinSketchAccumulator {
+            inner: CountMinSketch::from_legacy_matrix(vec![vec![5.0, 7.0], vec![3.0, 9.0]], 2, 2),
+            sample_p: 0.25,
+        };
+        let trait_obj: &dyn AggregateCore = &cms;
+        for stat in [Statistic::Count, Statistic::Sum, Statistic::Increase] {
+            let v = trait_obj
+                .query_statistic(stat, &None, &HashMap::new())
+                .unwrap_or_else(|e| panic!("{stat:?} should be supported: {e}"));
+            // min-row-sum = 12, rescaled by 1/0.25 = 48.
+            assert!(
+                (v - 48.0).abs() < 1e-9,
+                "{stat:?}: expected rescaled 48, got {v}"
+            );
+        }
+        // Rate also divides through the rescaled total: 48 events over a
+        // 6-second (6000 ms) range = 8 events/s.
+        let mut kwargs = HashMap::new();
+        kwargs.insert("range_ms".to_string(), "6000".to_string());
+        let r = trait_obj
+            .query_statistic(Statistic::Rate, &None, &kwargs)
+            .expect("rate ok");
+        assert!((r - 8.0).abs() < 1e-9, "expected rate 8.0, got {r}");
+    }
+
+    #[test]
+    fn test_sample_p_unset_behaves_as_one() {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
+        use prost::Message;
+        // An envelope with no sample_p (proto3 default 0.0) must normalize
+        // to 1.0 (no rescale) — byte-compatible with legacy frames.
+        let state = CountMinState {
+            rows: 2,
+            cols: 2,
+            counter_type: CounterType::Int64 as i32,
+            counts_int: vec![1, 2, 3, 4],
+            counts_float: Vec::new(),
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let env = SketchEnvelope {
+            // sample_p left at proto3 default 0.0.
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.sample_p, 1.0, "unset sample_p must normalize to 1.0");
+    }
+
+    #[test]
+    fn test_from_sketchlib_proto_bytes_reads_envelope_sample_p() {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
+        use promql_utilities::query_logics::enums::Statistic;
+        use prost::Message;
+        // min-row-sum = 12 raw; sample_p 0.25 → Count = 48.
+        let state = CountMinState {
+            rows: 2,
+            cols: 2,
+            counter_type: CounterType::Float64 as i32,
+            counts_int: Vec::new(),
+            counts_float: vec![5.0, 7.0, 3.0, 9.0],
+            sum_counts: Vec::new(),
+            sum2_counts: Vec::new(),
+            l1: Vec::new(),
+            l2: Vec::new(),
+        };
+        let env = SketchEnvelope {
+            sample_p: 0.25,
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(state)),
+            ..Default::default()
+        };
+        let bytes = env.encode_to_vec();
+        let acc = CountMinSketchAccumulator::from_sketchlib_proto_bytes(&bytes).expect("decode ok");
+        assert_eq!(acc.sample_p, 0.25);
+        let trait_obj: &dyn AggregateCore = &acc;
+        let v = trait_obj
+            .query_statistic(Statistic::Count, &None, &HashMap::new())
+            .expect("count ok");
+        assert!((v - 48.0).abs() < 1e-9, "expected rescaled 48, got {v}");
+    }
+
+    #[test]
+    fn test_reset_to_empty_preserves_sample_p() {
+        let mut acc = CountMinSketchAccumulator::new(2, 3);
+        acc.sample_p = 0.25;
+        acc.reset_to_empty();
+        assert_eq!(acc.sample_p, 0.25, "window rotation must keep sample_p");
+    }
+
+    #[test]
+    fn test_merge_prefers_sampled_factor() {
+        let mut a = CountMinSketchAccumulator::new(2, 3);
+        a.sample_p = 0.25;
+        let b = CountMinSketchAccumulator::new(2, 3); // sample_p 1.0
+        let merged = a.merge_with(&b).expect("merge ok");
+        let merged = merged
+            .as_any()
+            .downcast_ref::<CountMinSketchAccumulator>()
+            .expect("downcast ok");
+        assert_eq!(merged.sample_p, 0.25);
+
+        // merge_multiple mirrors the same policy.
+        let mut c = CountMinSketchAccumulator::new(2, 3);
+        c.sample_p = 0.25;
+        let d = CountMinSketchAccumulator::new(2, 3);
+        let boxed: Vec<Box<dyn AggregateCore>> = vec![Box::new(d), Box::new(c)];
+        let merged = CountMinSketchAccumulator::merge_multiple(&boxed).expect("merge ok");
+        assert_eq!(merged.sample_p, 0.25);
     }
 }
