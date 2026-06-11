@@ -30,6 +30,8 @@
 
 use std::collections::HashMap;
 
+use super::sampling_alloc::{allocate_sample_rates, epsilon_sample_floor};
+
 /// Static configuration for one monitor, sourced from the streaming-config
 /// `monitors:` section (τ authoritative here, not at the edge).
 #[derive(Clone, Debug)]
@@ -44,12 +46,16 @@ pub struct MonitorConfig {
 /// An action the coordinator wants the transport to perform.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    /// Send a per-round slack grant to one edge.
+    /// Send a per-round slack grant to one edge. `sample_p` is the distributed-
+    /// NitroSketch update-sampling probability the coordinator allocates for this
+    /// edge (1.0 = no sampling); it is an ADDITIONAL field orthogonal to the
+    /// slack countdown.
     Grant {
         edge_id: String,
         round: u64,
         local_slack: f64,
         window_start_ms: u64,
+        sample_p: f64,
     },
     /// The global aggregate crossed τ (within ε): fire exactly once per epoch.
     Alert {
@@ -64,6 +70,9 @@ struct EdgeView {
     known_value: f64,
     last_seq: u64,
     seen_seq: bool,
+    /// Last `rate` (items/window) the edge reported; 0 = unknown ⇒ no sampling
+    /// for this edge. Feeds the coordinated `p_i` allocation.
+    rate: f64,
 }
 
 /// One monitor's coordinator state for the current epoch.
@@ -170,6 +179,7 @@ impl Monitor {
         window_start_ms: u64,
         local_value: f64,
         seq: u64,
+        rate: f64,
     ) -> Vec<Action> {
         if window_start_ms != self.window_start_ms {
             // Could be a future epoch we haven't advanced to yet — advance on
@@ -194,6 +204,11 @@ impl Monitor {
         if local_value > edge.known_value {
             edge.known_value = local_value;
         }
+        // Track the edge's latest observed per-window rate (ignore non-positive
+        // = unknown), which drives the coordinated sampling allocation.
+        if rate > 0.0 {
+            edge.rate = rate;
+        }
         self.rebroadcast()
     }
 
@@ -204,6 +219,48 @@ impl Monitor {
             self.departed_mass += e.known_value;
         }
         self.rebroadcast()
+    }
+
+    /// Coordinated update-sampling allocation for the current edge set, keyed by
+    /// edge id. Returns `p_i ∈ (0,1]` per edge, each clamped up to the CDM-
+    /// threshold coupling floor so sampling noise stays within ε.
+    ///
+    /// The merged sampling-variance budget `V` is derived from what the
+    /// coordinator already holds: the CDM tolerance on the monitored value is
+    /// `ε·τ`, and update-sampling injects a std-dev of `√(Σ f_i(1−p_i)/p_i)` into
+    /// `Σf̂`. Keeping that band within the threshold tolerance means
+    /// `√V ≤ ε·τ`, i.e. **`V = (ε·τ)²`** — the sampling noise is absorbed within
+    /// the CDM band (the "ε_cdm ≳ ε_s" coupling). Lacking a per-key frequency
+    /// split, we use each edge's `rate` as the `freqs` proxy (so `p_i ∝
+    /// 1/√rate_i`). With <2 edges or all rates unknown the allocation degenerates
+    /// to `p=1` everywhere (no sampling).
+    fn allocate_p(&self) -> HashMap<String, f64> {
+        // Stable edge order so the rate vector aligns with the p vector.
+        let ids: Vec<&String> = self.edges.keys().collect();
+        let rates: Vec<f64> = ids.iter().map(|id| self.edges[*id].rate).collect();
+        // freqs proxy = rates (no per-key split available at the coordinator).
+        let var_budget = {
+            let band = self.cfg.epsilon * self.cfg.tau;
+            band * band
+        };
+        let mut p_vec = allocate_sample_rates(&rates, &rates, var_budget);
+        // Enforce the CDM-threshold coupling floor per edge: never sample so hard
+        // that ε_s = √((1−p)/(p·rate)) exceeds the agg's ε.
+        for (i, &rate) in rates.iter().enumerate() {
+            let floor = epsilon_sample_floor(self.cfg.epsilon, rate);
+            if p_vec[i] < floor {
+                p_vec[i] = floor;
+            }
+        }
+        ids.into_iter()
+            .cloned()
+            .zip(p_vec)
+            .map(|(id, p)| {
+                // Single edge or unknown rate ⇒ no sampling (p=1).
+                let p = if p > 0.0 && p <= 1.0 { p } else { 1.0 };
+                (id, p)
+            })
+            .collect()
     }
 
     /// Recompute Δ; fire the alert once if within ε, otherwise advance the round
@@ -225,6 +282,12 @@ impl Monitor {
         let slack = self.slack();
         let round = self.round;
         let ws = self.window_start_ms;
+        // With a single edge there is no rate vector to coordinate over → p=1.
+        let p_by_edge = if self.edges.len() >= 2 {
+            self.allocate_p()
+        } else {
+            HashMap::new()
+        };
         self.edges
             .keys()
             .map(|edge_id| Action::Grant {
@@ -232,6 +295,7 @@ impl Monitor {
                 round,
                 local_slack: slack,
                 window_start_ms: ws,
+                sample_p: p_by_edge.get(edge_id).copied().unwrap_or(1.0),
             })
             .collect()
     }
@@ -264,6 +328,13 @@ mod tests {
         }
     }
 
+    fn sample_p_in(actions: &[Action], edge: &str) -> f64 {
+        match grant_for(actions, edge) {
+            Some(Action::Grant { sample_p, .. }) => *sample_p,
+            _ => panic!("no grant for {edge}"),
+        }
+    }
+
     #[test]
     fn registration_grants_initial_slack() {
         let mut m = Monitor::new(cfg(100.0));
@@ -286,10 +357,10 @@ mod tests {
         let mut m = Monitor::new(cfg(100.0));
         m.on_register("e1", 60_000, 0); // slack 50
                                         // e1 reports 50 → estimate=50, Δ=50, slack=25.
-        let a = m.on_report("e1", 0, 50.0, 1);
+        let a = m.on_report("e1", 0, 50.0, 1, 0.0);
         assert_eq!(slack_in(&a, "e1"), 25.0);
         // reports 75 → estimate=75, Δ=25, slack=12.5.
-        let a = m.on_report("e1", 0, 75.0, 2);
+        let a = m.on_report("e1", 0, 75.0, 2, 0.0);
         assert_eq!(slack_in(&a, "e1"), 12.5);
     }
 
@@ -298,15 +369,15 @@ mod tests {
         let mut m = Monitor::new(cfg(100.0)); // epsilon 0.05 → alert when Δ ≤ 5
         m.on_register("e1", 60_000, 0);
         assert!(matches!(
-            m.on_report("e1", 0, 50.0, 1).as_slice(),
+            m.on_report("e1", 0, 50.0, 1, 0.0).as_slice(),
             [Action::Grant { .. }]
         ));
         assert!(matches!(
-            m.on_report("e1", 0, 90.0, 2).as_slice(),
+            m.on_report("e1", 0, 90.0, 2, 0.0).as_slice(),
             [Action::Grant { .. }]
         ));
         // estimate 96 → Δ=4 ≤ 5 → alert.
-        let a = m.on_report("e1", 0, 96.0, 3);
+        let a = m.on_report("e1", 0, 96.0, 3, 0.0);
         match a.as_slice() {
             [Action::Alert {
                 global_estimate,
@@ -319,7 +390,7 @@ mod tests {
             other => panic!("expected alert, got {other:?}"),
         }
         // Further reports do not re-fire.
-        assert!(m.on_report("e1", 0, 200.0, 4).is_empty());
+        assert!(m.on_report("e1", 0, 200.0, 4, 0.0).is_empty());
     }
 
     #[test]
@@ -329,9 +400,9 @@ mod tests {
         m.on_register("e2", 60_000, 0);
         // Both report modestly; estimate stays well below τ → only grants, never alert.
         for seq in 1..=5 {
-            let a = m.on_report("e1", 0, seq as f64 * 2.0, seq);
+            let a = m.on_report("e1", 0, seq as f64 * 2.0, seq, 0.0);
             assert!(a.iter().all(|x| matches!(x, Action::Grant { .. })));
-            let b = m.on_report("e2", 0, seq as f64 * 2.0, seq);
+            let b = m.on_report("e2", 0, seq as f64 * 2.0, seq, 0.0);
             assert!(b.iter().all(|x| matches!(x, Action::Grant { .. })));
         }
         assert!(m.global_estimate() < 100.0);
@@ -344,7 +415,7 @@ mod tests {
         let a = m.on_register("e2", 60_000, 0);
         m.on_register("e3", 60_000, 0);
         // After 3 edges, a register re-grants ALL three; Δ=120, k=3 → slack=20.
-        let a3 = m.on_report("e1", 0, 0.0, 1);
+        let a3 = m.on_report("e1", 0, 0.0, 1, 0.0);
         assert_eq!(a3.len(), 3, "re-grant should reach all edges");
         let _ = a;
         // Safety invariant: Σ slack = k·slack = Δ/2 at all times.
@@ -358,10 +429,10 @@ mod tests {
     fn seq_dedup_ignores_retransmits() {
         let mut m = Monitor::new(cfg(100.0));
         m.on_register("e1", 60_000, 0);
-        m.on_report("e1", 0, 40.0, 1);
+        m.on_report("e1", 0, 40.0, 1, 0.0);
         let before = m.global_estimate();
         // Same seq re-delivered → ignored.
-        let a = m.on_report("e1", 0, 40.0, 1);
+        let a = m.on_report("e1", 0, 40.0, 1, 0.0);
         assert!(a.is_empty());
         assert_eq!(m.global_estimate(), before);
     }
@@ -372,7 +443,7 @@ mod tests {
         m.on_register("e1", 60_000, 120_000); // epoch starts at 120_000
         assert_eq!(m.window_start_ms(), 120_000);
         // A report tagged with the previous epoch is dropped.
-        let a = m.on_report("e1", 60_000, 99.0, 1);
+        let a = m.on_report("e1", 60_000, 99.0, 1, 0.0);
         assert!(a.is_empty());
         assert_eq!(m.global_estimate(), 0.0);
     }
@@ -382,8 +453,8 @@ mod tests {
         let mut m = Monitor::new(cfg(100.0));
         m.on_register("e1", 60_000, 0);
         m.on_register("e2", 60_000, 0);
-        m.on_report("e1", 0, 30.0, 1);
-        m.on_report("e2", 0, 20.0, 1);
+        m.on_report("e1", 0, 30.0, 1, 0.0);
+        m.on_report("e2", 0, 20.0, 1, 0.0);
         assert_eq!(m.global_estimate(), 50.0);
         // e2 leaves: its 20 stays in the estimate via departed_mass.
         m.on_leave("e2");
@@ -392,13 +463,52 @@ mod tests {
     }
 
     #[test]
+    fn single_edge_grants_no_sampling() {
+        // With one edge there is no rate vector to coordinate over → p=1.
+        let mut m = Monitor::new(cfg(1000.0));
+        m.on_register("e1", 60_000, 0);
+        let a = m.on_report("e1", 0, 10.0, 1, 50_000.0);
+        assert_eq!(sample_p_in(&a, "e1"), 1.0);
+    }
+
+    #[test]
+    fn skewed_rates_yield_differentiated_sample_p_above_floor() {
+        // Two edges, skewed reported rates: the hot edge should be sampled
+        // harder (smaller p) than the quiet edge, and BOTH must sit at/above the
+        // ε-derived coupling floor. τ is large so the monitor stays in the grant
+        // (not alert) regime while we exercise the allocation.
+        let mut m = Monitor::new(cfg(1_000_000.0)); // epsilon 0.05
+        m.on_register("e1", 60_000, 0);
+        m.on_register("e2", 60_000, 0);
+        // e1 hot (100k items/win), e2 quiet (1k/win). Small local values keep us
+        // far from τ so no alert fires.
+        m.on_report("e1", 0, 1.0, 1, 100_000.0);
+        let a = m.on_report("e2", 0, 1.0, 1, 1_000.0);
+        let p_hot = sample_p_in(&a, "e1");
+        let p_quiet = sample_p_in(&a, "e2");
+        assert!(
+            p_hot < p_quiet,
+            "hot edge p {p_hot} should be < quiet edge p {p_quiet}"
+        );
+        // Both respect the ε-derived floor for their rate.
+        let eps = m.cfg.epsilon;
+        assert!(p_hot >= epsilon_sample_floor(eps, 100_000.0) - 1e-9);
+        assert!(p_quiet >= epsilon_sample_floor(eps, 1_000.0) - 1e-9);
+        assert!(p_hot > 0.0 && p_hot <= 1.0);
+        assert!(p_quiet > 0.0 && p_quiet <= 1.0);
+        // Slack countdown unaffected: both grants carry the same (positive) slack.
+        assert!(slack_in(&a, "e1") > 0.0);
+        assert_eq!(slack_in(&a, "e1"), slack_in(&a, "e2"));
+    }
+
+    #[test]
     fn epoch_advance_resets_estimate() {
         let mut m = Monitor::new(cfg(100.0));
         m.on_register("e1", 60_000, 0);
-        m.on_report("e1", 0, 80.0, 1);
+        m.on_report("e1", 0, 80.0, 1, 0.0);
         assert_eq!(m.global_estimate(), 80.0);
         // A report for the next epoch advances and resets.
-        m.on_report("e1", 60_000, 5.0, 2);
+        m.on_report("e1", 60_000, 5.0, 2, 0.0);
         assert_eq!(m.window_start_ms(), 60_000);
         assert_eq!(m.global_estimate(), 5.0);
     }

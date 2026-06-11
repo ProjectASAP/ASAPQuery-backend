@@ -17,8 +17,10 @@
 pub mod alert;
 pub mod coordinator;
 pub mod epoch;
+pub mod sampling_alloc;
 pub mod server;
 
 pub use alert::{global_threshold_violation, AlertSink};
 pub use coordinator::{Action, Monitor, MonitorConfig};
+pub use sampling_alloc::{allocate_sample_rates, epsilon_sample_floor, uniform_sample_rate};
 pub use server::{MonitorCoordinator, MonitorServiceImpl};

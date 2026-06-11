@@ -53,6 +53,7 @@ message MonitorReport {
   double local_value = 5;      // current additive local value at report time
   uint64 round = 6;            // round this report answers
   uint64 seq = 7;              // per-edge monotonic counter; idempotent-retransmit dedup
+  double rate = 8;  // edge's observed items/window — feeds the coordinator's p_i allocation
 }
 
 // coordinator → edge: this round's per-edge slack budget. The edge reports once
@@ -63,6 +64,7 @@ message SlackGrant {
   uint64 round = 3;
   double local_slack = 4;
   uint64 window_start_ms = 5;
+  double sample_p = 6;  // distributed-NitroSketch update-sampling prob the coordinator allocates (0=unset/p=1); edge applies via WithSampleP at EpochReset
 }
 
 // coordinator → edge: demand the current local value now (round close).
