@@ -218,55 +218,114 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     }
 }
 
-#[test]
-fn bind_cms_topk_basic() {
-    let expr = QueryExpr::Aggregate {
+/// Build an `Aggregate{TopK{k, accuracy}}` over the windowed scan.
+fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
+    QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::TopK {
-            k: 10,
-            accuracy: AccuracyTarget::EpsilonDelta {
-                eps: 0.01,
-                delta: 0.001,
-            },
-        }],
+        aggs: vec![AggIntent::TopK { k, accuracy }],
         having: None,
         child: Box::new(windowed_scan()),
-    };
-    let bound = bind_query_expr(
-        &expr,
-        AccuracyTarget::EpsilonDelta {
-            eps: 0.01,
-            delta: 0.001,
-        },
-    )
-    .expect("bind_query_expr should not error");
+    }
+}
+
+/// Pull the bound `(SketchKind, with_heap, w, d)` out of a top-k binding.
+fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, bool, u32, u32) {
+    use crate::sketch_algebra::params::{CmsParams, CountSketchParams};
     match bound {
         PhysicalExpr::SketchEstimate { op, child } => {
-            assert_eq!(op, EstimateOp::TopK { k: 10 });
-            match *child {
+            assert_eq!(*op, EstimateOp::TopK { k: 10 });
+            match &**child {
                 PhysicalExpr::SketchAgg {
                     sketch_type,
                     params,
                     ..
-                } => {
-                    assert_eq!(sketch_type, SketchKind::CountSketch);
-                    match params {
-                        SketchParams::CountSketch(p) => {
-                            assert!(
-                                p.with_heap,
-                                "TopK binding must enable the heavy-hitter heap"
-                            );
-                            assert!(p.w >= 2);
-                            assert!(p.d >= 1);
-                        }
-                        other => panic!("expected CountSketchParams, got {other:?}"),
+                } => match params {
+                    SketchParams::Cms(CmsParams { w, d, with_heap }) => {
+                        (sketch_type.clone(), *with_heap, *w, *d)
                     }
-                }
+                    SketchParams::CountSketch(CountSketchParams { w, d, with_heap }) => {
+                        (sketch_type.clone(), *with_heap, *w, *d)
+                    }
+                    other => panic!("expected CMS/CountSketch params, got {other:?}"),
+                },
                 other => panic!("expected SketchAgg, got {other:?}"),
             }
         }
         other => panic!("expected SketchEstimate, got {other:?}"),
     }
+}
+
+/// (a) A **loose-recall** top-k (any non-exact accuracy target) binds the
+/// cheap **CMS-with-heap** family — the Fig-12 cost-gap fix. The old rule
+/// hard-bound the ~66×-more-expensive CountSketch here.
+#[test]
+fn bind_cms_topk_loose_recall_picks_cms_heap() {
+    let acc = AccuracyTarget::EpsilonDelta {
+        eps: 0.01,
+        delta: 0.001,
+    };
+    let expr = agg_topk(10, acc.clone());
+    let bound = bind_query_expr(&expr, acc).expect("bind_query_expr should not error");
+    let (kind, with_heap, w, d) = topk_binding_family(&bound);
+    assert_eq!(
+        kind,
+        SketchKind::Cms,
+        "loose-recall top-k must bind the cheap CMS-with-heap, not CountSketch"
+    );
+    assert!(with_heap, "top-k binding must enable the heavy-hitter heap");
+    assert!(w >= 2);
+    assert!(d >= 1);
+}
+
+/// (b) A **tight / exact-recall** top-k (the intent carries
+/// `AccuracyTarget::Exact`) binds the unbiased **CountSketch-with-heap** —
+/// the family that supports exact rank / signed estimates.
+#[test]
+fn bind_cms_topk_tight_recall_picks_countsketch() {
+    // Intent requests Exact rank; the policy-level target is non-exact.
+    let expr = agg_topk(10, AccuracyTarget::Exact);
+    let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
+        .expect("bind_query_expr should not error");
+    let (kind, with_heap, w, d) = topk_binding_family(&bound);
+    assert_eq!(
+        kind,
+        SketchKind::CountSketch,
+        "exact-rank top-k must bind the unbiased CountSketch-with-heap"
+    );
+    assert!(with_heap, "top-k binding must enable the heavy-hitter heap");
+    assert!(w >= 2);
+    assert!(d >= 1);
+}
+
+/// (c) The chosen family is the **cost-minimal one that meets the recall
+/// SLA**, per the `optimizer::cost::wire` table — the same "min cost s.t.
+/// SLA" the oracle uses. Loose → both families clear the bar → cheapest
+/// (CMS, ~4 KB) wins; the CountSketch alternative (~250 KB) is ~66×
+/// costlier.
+#[test]
+fn bind_cms_topk_picks_cost_min_meeting_sla() {
+    use crate::optimizer::cost::wire::WireCostTable;
+    let table = WireCostTable::default();
+    let cms = table.for_kind(&SketchKind::Cms).per_flush();
+    let cs = table.for_kind(&SketchKind::CountSketch).per_flush();
+    assert!(
+        cms < cs,
+        "CMS-heap ({cms} B) must be cheaper than CountSketch ({cs} B) on the wire"
+    );
+    // The cost gap the Fig-12 harness measured (~66×).
+    let ratio = cs as f64 / cms as f64;
+    assert!(
+        ratio > 50.0,
+        "CountSketch should be ~66× the CMS-heap wire cost; got {ratio:.1}×"
+    );
+
+    // Loose recall → the planner must land on the cost-min family (CMS).
+    let acc = AccuracyTarget::Epsilon(0.01);
+    let bound = bind_query_expr(&agg_topk(10, acc.clone()), acc).unwrap();
+    let (kind, ..) = topk_binding_family(&bound);
+    let chosen = table.for_kind(&kind).per_flush();
+    assert_eq!(chosen, cms.min(cs), "must pick the cost-min family that meets the SLA");
+    assert_eq!(kind, SketchKind::Cms);
 }
 
 #[test]

@@ -257,80 +257,24 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
         (SketchKind::DDSketch, _) => BindDDSketchOnQuantile.apply(&aggregate, &accuracy),
         (SketchKind::Kll, _) => BindKllOnQuantile.apply(&aggregate, &accuracy),
         (SketchKind::Hll, _) => BindHllOnCardinality.apply(&aggregate, &accuracy),
-        (SketchKind::CountSketch, _) => BindCountSketchOnTopK.apply(&aggregate, &accuracy),
-        (SketchKind::Cms, StatisticClass::TopK) => {
-            bind_cms_with_heap_on_topk(&aggregate, &accuracy)
-        }
+        // The capability matrix already pinned the family here, so force
+        // the matching recall tier rather than re-inferring it: a
+        // CountSketch pick is the unbiased canonical top-k (Tight); a CMS
+        // pick on a top-k is the cheap CMS-with-heap (Loose). This keeps
+        // `bind_workload_typed`'s contract-row mapping deterministic — the
+        // recall-aware default lives in `dispatch()` / `Rule::apply`.
+        (SketchKind::CountSketch, _) => BindCountSketchOnTopK.apply_with_tier(
+            &aggregate,
+            &accuracy,
+            crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Tight,
+        ),
+        (SketchKind::Cms, StatisticClass::TopK) => BindCountSketchOnTopK.apply_with_tier(
+            &aggregate,
+            &accuracy,
+            crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Loose,
+        ),
         (SketchKind::Cms, _) => BindCmsOnCount.apply(&aggregate, &accuracy),
     }
-}
-
-/// Bind `Aggregate{TopK{k, accuracy}}` to a CMS-with-heap sketch — the
-/// CMS-Heap pattern from Cormode & Muthukrishnan (2005). Mirrors the
-/// `(eps, delta) → (w, d)` mapping used by `BindCmsOnCount` and the
-/// `with_heap` flag pattern from `BindCountSketchOnTopK`. CountSketch
-/// remains the canonical (unbiased) TopK pick; this binder fires only
-/// when a workload override has explicitly selected `CountMinSketch` for
-/// a TopK metric.
-fn bind_cms_with_heap_on_topk(
-    expr: &crate::intent_algebra::QueryExpr,
-    accuracy: &crate::types_v2::AccuracyTarget,
-) -> Option<crate::sketch_algebra::PhysicalExpr> {
-    use crate::intent_algebra::{AggIntent, QueryExpr};
-    use crate::sketch_algebra::params::{CmsParams, SketchKind, SketchParams};
-    use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
-    use crate::types_v2::AccuracyTarget;
-
-    let (k_topk, intent_accuracy, child) = match expr {
-        QueryExpr::Aggregate {
-            aggs, child, by, ..
-        } if aggs.len() == 1 && by.is_empty() => match &aggs[0] {
-            AggIntent::TopK { k, accuracy } => (*k, accuracy.clone(), child),
-            _ => return None,
-        },
-        _ => return None,
-    };
-
-    if k_topk == 0 {
-        return None;
-    }
-
-    let (eps, delta) = match (accuracy, &intent_accuracy) {
-        (AccuracyTarget::Exact, _) | (_, AccuracyTarget::Exact) => return None,
-        (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => (a.min(*b), 0.01),
-        (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { eps, delta })
-        | (AccuracyTarget::EpsilonDelta { eps, delta }, AccuracyTarget::Epsilon(a)) => {
-            (a.min(*eps), *delta)
-        }
-        (
-            AccuracyTarget::EpsilonDelta { eps: a, delta: da },
-            AccuracyTarget::EpsilonDelta { eps: b, delta: db },
-        ) => (a.min(*b), da.min(*db)),
-    };
-
-    if eps <= 0.0 || delta <= 0.0 || delta >= 1.0 {
-        return None;
-    }
-
-    let w = (std::f64::consts::E / eps).ceil() as u32;
-    let d = (1.0 / delta).ln().ceil() as u32;
-    let w = w.max(2);
-    let d = d.max(1);
-
-    Some(PhysicalExpr::estimate_over_agg(
-        EstimateOp::TopK { k: k_topk },
-        SketchKind::Cms,
-        // CMS-Heap pattern: pair the CMS matrix with a heavy-hitter
-        // heap so `topk(...)` can enumerate items from the heap
-        // directly. The streaming-config emit picks
-        // `CountMinSketchWithHeap` for this binding.
-        SketchParams::Cms(CmsParams {
-            w,
-            d,
-            with_heap: true,
-        }),
-        (**child).clone(),
-    ))
 }
 
 pub struct RulesPlanner {
