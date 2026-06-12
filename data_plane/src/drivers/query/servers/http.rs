@@ -1789,6 +1789,46 @@ async fn handle_metrics() -> impl IntoResponse {
 // Range Query Handlers
 // ============================================================
 
+/// Warm-vs-archive routing fix: classify a range query's
+/// [`RangeTier`] from its window start vs the warm-retention boundary.
+///
+/// The defect: with cold/archive ON, a recent range query whose data is
+/// still warm-resident (and NOT yet archived) was failing over to the
+/// archive, which answers `Ok` with an EMPTY series for that recent
+/// range — the caller saw "No result" stamped `data_source:
+/// thanos_query`. The split must be by **time vs the warm-retention
+/// boundary**, not "archive-on ⇒ everything to archive".
+///
+/// * `retention_ms == Some(r)` with `r > 0`: the warm floor is
+///   `now_ms − r`. A window whose `start_ms >= warm_floor_ms` lies
+///   entirely inside warm retention ⇒ [`RangeTier::WarmOnly`] (archive
+///   guaranteed empty, so its failover leg is dropped). A window that
+///   reaches at/before the floor (genuinely-archived history, or a
+///   range straddling the boundary) ⇒ [`RangeTier::ArchiveEligible`]:
+///   the full ASAP-first-then-archive sequence runs, and the ASAP
+///   engine's hybrid-stitch path merges warm ∪ archive on overlap.
+/// * `retention_ms == None` / `Some(0)`: no boundary to split on, so we
+///   keep the archive eligible — the pre-fix behaviour — and never
+///   narrow a query that might legitimately need the archive.
+fn classify_range_tier(
+    start_ms: u64,
+    retention_ms: Option<u64>,
+    now_ms: u64,
+) -> crate::query_engines::routing::RangeTier {
+    use crate::query_engines::routing::RangeTier;
+    match retention_ms {
+        Some(retention_ms) if retention_ms > 0 => {
+            let warm_floor_ms = now_ms.saturating_sub(retention_ms);
+            if start_ms >= warm_floor_ms {
+                RangeTier::WarmOnly
+            } else {
+                RangeTier::ArchiveEligible
+            }
+        }
+        _ => RangeTier::ArchiveEligible,
+    }
+}
+
 /// Core range query execution logic shared between GET and POST handlers
 async fn process_range_query_request(
     state: &AppState,
@@ -1850,15 +1890,33 @@ async fn process_range_query_request(
     let stat = Statistic::Sum;
     let accuracy = AccuracyTarget::Approximate;
 
+    // Warm-vs-archive routing fix: split by the warm-retention boundary
+    // rather than "archive-on ⇒ everything to archive". When the
+    // requested `[start_ms, end_ms]` window lies entirely inside the
+    // warm-retention horizon, the data (if any) is warm-resident and the
+    // archive is guaranteed empty for that range — so we must NOT let an
+    // empty-but-`Ok` archive answer (stamped `data_source: thanos_query`)
+    // mask the warm tier. Suppressing the archive leg for warm-only
+    // ranges is the root fix for the recurring "No result" class of
+    // recent range queries when cold/archive is ON.
+    //
+    // The boundary is the configured SketchStore data-retention horizon
+    // (`AppState::data_retention_ms`, mirroring
+    // `--persistence-delete-older-than-secs`). When it is unset we have
+    // no boundary to split on, so we keep the archive eligible — the
+    // pre-fix behaviour — and never narrow a query that might need it.
+    let now_ms = crate::query_engines::routing::freshness_probe_now_ms() as u64;
+    let range_tier = classify_range_tier(start_ms, state.data_retention_ms, now_ms);
+
     debug!(
         "Dispatching range query via EngineRouter: query='{}' metric_storage={:?} \
-         stat={:?} accuracy={:?}",
-        parsed_request.query, metric_storage, stat, accuracy,
+         stat={:?} accuracy={:?} range_tier={:?} data_retention_ms={:?}",
+        parsed_request.query, metric_storage, stat, accuracy, range_tier, state.data_retention_ms,
     );
 
     let router_result = state
         .query_router
-        .execute_range(
+        .execute_range_for_tier(
             &parsed_request.query,
             stat,
             accuracy,
@@ -1866,6 +1924,7 @@ async fn process_range_query_request(
             start_ms,
             end_ms,
             step_ms,
+            range_tier,
         )
         .await;
 
@@ -2046,6 +2105,74 @@ mod tests {
     use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
     use reqwest::Client;
     use std::sync::Arc;
+
+    // ── warm-vs-archive range routing: tier classification ──────────────
+    // The defect is that a recent (warm-resident, not-yet-archived) range
+    // query was routed to the empty archive when cold/archive is ON. These
+    // pin the time-boundary decision `process_range_query_request` makes
+    // before dispatching to `EngineRouter::execute_range_for_tier`.
+
+    #[test]
+    fn classify_range_tier_recent_range_is_warm_only() {
+        use crate::query_engines::routing::RangeTier;
+        let now_ms = 1_700_000_000_000u64;
+        let retention_ms = 6 * 60 * 60 * 1000; // 6h warm horizon
+                                               // A `[...300s]` query ending ~now, starting 5 min ago —
+                                               // well inside the 6h warm window.
+        let start_ms = now_ms - 300_000;
+        assert_eq!(
+            classify_range_tier(start_ms, Some(retention_ms), now_ms),
+            RangeTier::WarmOnly,
+            "a recent range inside warm retention must be WarmOnly (archive is empty there)",
+        );
+    }
+
+    #[test]
+    fn classify_range_tier_old_range_is_archive_eligible() {
+        use crate::query_engines::routing::RangeTier;
+        let now_ms = 1_700_000_000_000u64;
+        let retention_ms = 6 * 60 * 60 * 1000;
+        // A range entirely older than the 6h warm floor → genuinely archived.
+        let start_ms = now_ms - 24 * 60 * 60 * 1000; // 24h ago
+        assert_eq!(
+            classify_range_tier(start_ms, Some(retention_ms), now_ms),
+            RangeTier::ArchiveEligible,
+            "a range older than the warm floor must stay ArchiveEligible",
+        );
+    }
+
+    #[test]
+    fn classify_range_tier_boundary_straddle_is_archive_eligible() {
+        use crate::query_engines::routing::RangeTier;
+        let now_ms = 1_700_000_000_000u64;
+        let retention_ms = 6 * 60 * 60 * 1000;
+        // Starts just before the warm floor, ends now → overlaps the
+        // boundary. Must stay ArchiveEligible so the older prefix is
+        // served from the archive (warm suffix merged via hybrid-stitch).
+        let warm_floor_ms = now_ms - retention_ms;
+        let start_ms = warm_floor_ms - 1;
+        assert_eq!(
+            classify_range_tier(start_ms, Some(retention_ms), now_ms),
+            RangeTier::ArchiveEligible,
+            "a boundary-straddling range must stay ArchiveEligible",
+        );
+    }
+
+    #[test]
+    fn classify_range_tier_no_retention_keeps_archive_eligible() {
+        use crate::query_engines::routing::RangeTier;
+        let now_ms = 1_700_000_000_000u64;
+        // No configured retention → no boundary to split on → never narrow.
+        assert_eq!(
+            classify_range_tier(now_ms - 300_000, None, now_ms),
+            RangeTier::ArchiveEligible,
+        );
+        assert_eq!(
+            classify_range_tier(now_ms - 300_000, Some(0), now_ms),
+            RangeTier::ArchiveEligible,
+            "retention of 0 must not narrow (degenerate boundary)",
+        );
+    }
 
     async fn setup_test_server() -> u16 {
         setup_test_server_with_hot_reload(None).await
