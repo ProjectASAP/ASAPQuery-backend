@@ -267,6 +267,60 @@ impl RollingState {
             _ => 0.0,
         }
     }
+
+    /// Borrow the inner HLL sketch when this rolling state is HLL-backed.
+    /// Used by the GLOBAL cardinality rollup (`count(hll_metric)` with no
+    /// `by`), which must MERGE the per-series HLL registers (register-wise
+    /// max) across all matched series and estimate ONCE — summing per-series
+    /// distinct estimates would double-count items present in multiple series.
+    pub fn as_hll(&self) -> Option<&HllSketch> {
+        match self {
+            RollingState::Hll(sk) => Some(sk),
+            _ => None,
+        }
+    }
+}
+
+/// Fold every in-range window's frames for ONE series into a single merged
+/// `HllSketch` (cumulative over `[t0, t1]`), returning `None` if no Full
+/// HLL frame ever landed (every sample was a leading delta). This is the
+/// per-series building block for the GLOBAL `count(hll_metric)` rollup: the
+/// reducer merges the returned sketches across series (register-wise max)
+/// before estimating, so the answer is the distinct UNION cardinality, not
+/// the sum of per-series cardinalities.
+pub fn cumulative_hll_state(
+    samples: &[(i64, &SketchSampleState)],
+    precision: u32,
+) -> Result<Option<HllSketch>, String> {
+    let kind = DeltaSketchKind::Hll { precision };
+    let mut rolling: Option<RollingState> = None;
+    for (_window_end, state) in samples {
+        match state.encoding {
+            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
+                let new_state = decode_full(&kind, &state.bytes, state.encoding)?;
+                rolling = Some(match (rolling.take(), new_state) {
+                    (None, n) => n,
+                    (Some(RollingState::Hll(mut a)), RollingState::Hll(b)) => {
+                        a.merge(&b).map_err(|e| format!("cum merge HLL: {e}"))?;
+                        RollingState::Hll(a)
+                    }
+                    (Some(prev), _) => prev,
+                });
+            }
+            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                if rolling.is_none() {
+                    rolling = Some(kind.bootstrap_empty());
+                }
+                if let Some(rs) = rolling.as_mut() {
+                    rs.apply_delta_bytes(&state.bytes, state.encoding)?;
+                }
+            }
+        }
+    }
+    Ok(rolling.and_then(|rs| match rs {
+        RollingState::Hll(sk) => Some(sk),
+        _ => None,
+    }))
 }
 
 /// Walk a sorted-by-window-end slice of samples in time order and

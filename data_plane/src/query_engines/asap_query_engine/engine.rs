@@ -656,7 +656,7 @@ impl ASAPQueryEngine {
         query: &str,
         start_ms: u64,
         end_ms: u64,
-        _step_ms: u64,
+        step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
         let Some(idx) = self.sketch_index.as_ref() else {
@@ -894,7 +894,37 @@ impl ASAPQueryEngine {
         })?;
 
         // Matrix shape — the range_query wire format requires it.
-        Ok(asap_tier_result_to_query_result(result, end_ms, true))
+        let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
+
+        // FIX 3 — coverage-aware warm+archive HYBRID STITCH for RANGE
+        // queries. The instant path (`execute`) already stitches when warm
+        // coverage is narrower than the request; the range path historically
+        // returned warm-only, so a request `[start_ms, end_ms]` whose warm
+        // sketches only cover a suffix `[cov_lo, cov_hi]` lost the
+        // prefix `[start_ms, cov_lo)` (the live "No result" / incomplete
+        // matrix symptom). When the reducer reports a coverage narrower than
+        // the requested range AND an archive engine is wired, fetch the
+        // archive's range answer over the SAME window and stitch them by
+        // (label_values, timestamp) — warm wins on overlap, archive fills the
+        // uncovered prefix/suffix. Mirrors the instant-path logic at the
+        // `execute` trait surface.
+        if let (Some((cov_lo, cov_hi)), Some(archive)) =
+            (result.coverage, self.archive_engine.as_ref())
+        {
+            if cov_lo > start_ms || cov_hi < end_ms {
+                if let Ok(archive_qr) = archive
+                    .execute_range(query, start_ms, end_ms, step_ms)
+                    .await
+                {
+                    return Ok(stitch_warm_and_archive(
+                        warm_qr, archive_qr, cov_lo, cov_hi,
+                    ));
+                }
+                // Archive error → fall back to warm-only (best effort).
+            }
+        }
+
+        Ok(warm_qr)
     }
 }
 
@@ -1703,6 +1733,25 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             now_ms,
                             accumulate_windows,
                         ),
+                        // FIX 2 — GLOBAL HLL distinct rollup. `count(hll_metric)`
+                        // with NO `by (...)` (empty group_by_keys + outer Count)
+                        // is the distinct-UNION-cardinality idiom: MERGE the
+                        // per-series HLL registers (register-wise max) across all
+                        // matched sids and estimate ONCE. The per-series
+                        // `evaluate_for_capability` path would otherwise emit one
+                        // estimate per series (double-counting overlaps / never
+                        // producing the single global number). Only the GLOBAL
+                        // (no-`by`) shape is rerouted; `count by (zone) (...)`
+                        // keeps the per-group per-series path below.
+                        crate::storage_engines::sketch_db::index::Capability::CardinalityApprox
+                            if candidate.group_by_keys.is_empty()
+                                && matches!(
+                                    candidate.outer_agg,
+                                    control_plane::asap_tier_analysis::OuterAgg::Count(_)
+                                ) =>
+                        {
+                            reducer.evaluate_cardinality_global(&hit_sids, t0_ms, now_ms)
+                        }
                         // P2-4 (typed dispatch): route off the typed
                         // `required_capability` rather than the
                         // function-name-string detour.
@@ -2954,6 +3003,120 @@ mod asap_tier_classify_tests {
             est > 100.0,
             "expected the HLL distinct-count estimate (~500), not the \
              row-count fold (1.0); got {est}"
+        );
+    }
+
+    /// Encode an HLL FULL proto frame over an EXPLICIT set of string items,
+    /// so a test can craft overlapping / disjoint distinct sets across
+    /// series and compute the TRUE union cardinality.
+    fn encode_hll_from_items(precision: u32, items: &[String]) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
+        };
+        use asap_sketchlib::{HllSketch, HllVariant};
+        use prost::Message;
+        let mut sk = HllSketch::new(HllVariant::Regular, precision);
+        for it in items {
+            sk.update(it.as_bytes());
+        }
+        let state = HyperLogLogState {
+            variant: ProtoVariant::Regular as i32,
+            precision: sk.precision,
+            registers: sk.registers.clone(),
+            hip_kxq0: sk.hip_kxq0,
+            hip_kxq1: sk.hip_kxq1,
+            hip_est: sk.hip_est,
+            registers_sparse: None,
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::Hll(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// FIX 2 — GLOBAL HLL distinct rollup. `count(hll_metric)` with no `by`
+    /// must MERGE the per-series HLL registers (register-wise max) across ALL
+    /// matched series and estimate ONCE — the distinct UNION cardinality. Two
+    /// series share an overlapping prefix of items and each carry disjoint
+    /// items, so summing per-series estimates would over-count the overlap.
+    /// The merged global estimate must land within HLL error of the true
+    /// union, and be strictly below the naive per-series sum.
+    #[tokio::test]
+    async fn execute_count_hll_global_merges_registers_across_series() {
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let w_start = now_ms.saturating_sub(3_000);
+        let w_end = now_ms.saturating_sub(2_000);
+
+        // Series A: items 0..600. Series B: items 400..1000.
+        // Overlap = [400,600) = 200 items; true union = [0,1000) = 1000.
+        let precision = 12u32; // ~1.6% standard error
+        let a_items: Vec<String> = (0..600).map(|i| format!("u-{i}")).collect();
+        let b_items: Vec<String> = (400..1000).map(|i| format!("u-{i}")).collect();
+        let true_union = 1000.0_f64;
+
+        for (sid, items) in [(8200u64, &a_items), (8201u64, &b_items)] {
+            let mut meta = hll_meta(sid, "unique_users_global");
+            meta.agg_kind = crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::Hll,
+                config: SketchConfig::Hll { precision },
+                spatial_filter_canonical: String::new(),
+            };
+            idx.register(meta);
+            idx.append_sample(
+                sid,
+                BTreeMap::new(),
+                (w_start, w_end),
+                SketchSampleState {
+                    bytes: encode_hll_from_items(precision, items),
+                    encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+                },
+            );
+        }
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("count(unique_users_global)")
+            .await
+            .expect("global count(hll_metric) must answer, not capability-miss");
+
+        // GLOBAL distinct is a single scalar — exactly one element.
+        let est = match &result {
+            crate::query_engines::query_result::QueryResult::Vector(v) => {
+                assert_eq!(
+                    v.values.len(),
+                    1,
+                    "global count() must collapse to ONE merged estimate, got {} \
+                     (per-series leak): {v:?}",
+                    v.values.len()
+                );
+                v.values[0].value
+            }
+            crate::query_engines::query_result::QueryResult::Matrix(m) => {
+                assert_eq!(m.values.len(), 1, "one merged series");
+                m.values[0].samples.last().map(|s| s.value).unwrap_or(0.0)
+            }
+        };
+
+        // Within HLL error of the true union (p=12 → ~1.04/sqrt(2^12) ≈ 1.6%;
+        // allow a generous 8% band for the estimator's finite-sample noise).
+        let rel_err = (est - true_union).abs() / true_union;
+        assert!(
+            rel_err < 0.08,
+            "global merged estimate {est} must be within HLL error of the \
+             true union {true_union} (rel_err {rel_err:.4})"
+        );
+
+        // And strictly below the naive per-series sum (600 + 600 = 1200),
+        // proving registers were MERGED (max), not the estimates SUMMED.
+        assert!(
+            est < 1150.0,
+            "merged global estimate {est} must be well below the per-series \
+             sum (~1200) — proves register-merge, not estimate-sum"
         );
     }
 
@@ -4451,5 +4614,278 @@ mod hybrid_stitch_tests {
         assert_eq!(a_at_150.value, 5.0, "warm wins on overlap");
         let b = by_label.get(&vec!["host=b".to_string()]).expect("series b");
         assert_eq!(b.samples.len(), 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FIX 3 — RANGE-query warm+archive hybrid stitch.
+//
+// The instant path already stitches; the range path historically returned
+// warm-only, so a `[start, end]` request whose warm sketches only cover a
+// suffix lost the prefix. These tests drive `execute_range_promql_modern`
+// with an archive engine wired and warm coverage narrower than the request,
+// and assert the stitched matrix covers the FULL range (prefix from archive,
+// suffix from warm).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod range_stitch_tests {
+    use super::*;
+    use crate::query_engines::query_result::{
+        QueryResult, RangeVectorElement, Sample,
+    };
+    use crate::query_engines::routing::query_engine_routing::{
+        EngineCapabilities, QueryEngine,
+    };
+    use crate::query_engines::EngineError;
+    use crate::storage_engines::sketch_db::index::{
+        AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
+        SketchKindHandle, SketchSampleState, SketchStore,
+    };
+    use crate::storage_engines::types::{HotReloadStreamingConfig, KeyByLabelValues};
+    use async_trait::async_trait;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Mock archive engine: returns a fixed full-range matrix for any range
+    /// query, so the stitch can pull the uncovered prefix from it.
+    struct FakeArchive {
+        matrix: QueryResult,
+    }
+
+    #[async_trait]
+    impl QueryEngine for FakeArchive {
+        async fn execute(&self, _query: &str) -> Result<QueryResult, EngineError> {
+            Ok(self.matrix.clone())
+        }
+        async fn execute_range(
+            &self,
+            _query: &str,
+            _start_ms: u64,
+            _end_ms: u64,
+            _step_ms: u64,
+        ) -> Result<QueryResult, EngineError> {
+            Ok(self.matrix.clone())
+        }
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities {
+                data_source_id: asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
+                storage_backend: asap_types::StorageBackend::GorillaObjectStore,
+                supports_streams_above_bytes: usize::MAX,
+            }
+        }
+    }
+
+    /// Encode a CountMin FULL proto frame whose row 0 sums to `total`
+    /// (the per-window frequency TOTAL the `count_over_time` reducer reads).
+    fn cms_bytes(total: i64) -> Vec<u8> {
+        use asap_sketchlib::proto::sketchlib::{
+            sketch_envelope, CountMinState, CounterType, SketchEnvelope,
+        };
+        use prost::Message;
+        let (rows, cols) = (2u32, 4u32);
+        let mut counts_int = vec![0i64; (rows * cols) as usize];
+        counts_int[0] = total;
+        let state = CountMinState {
+            rows,
+            cols,
+            counter_type: CounterType::Int64 as i32,
+            counts_int,
+            ..Default::default()
+        };
+        SketchEnvelope {
+            sketch_state: Some(sketch_envelope::SketchState::CountMin(state)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// A CountMin FrequencyEstimate sid — `count_over_time` over it emits one
+    /// PER-WINDOW sample (not a single cumulative scalar), which is what the
+    /// range stitch needs so warm contributes one value per covered window.
+    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::CountMin { rows: 2, cols: 4 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::CountMin,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    /// Warm DDSketch covers only the SUFFIX of the requested range
+    /// (two windows near `end`); archive returns a full-range matrix
+    /// including the prefix. The stitched matrix must span the FULL request:
+    /// prefix timestamps come from archive, suffix from warm (warm wins on
+    /// any overlap).
+    #[tokio::test]
+    async fn range_stitches_archive_prefix_with_warm_suffix() {
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        // Requested range: [now-600s, now].
+        let start_ms = now_ms.saturating_sub(600_000);
+        let end_ms = now_ms;
+
+        // Warm windows only in the suffix: [now-200s], [now-100s].
+        // `count_over_time` over a CountMin sid emits one PER-WINDOW total,
+        // so warm contributes a value at BOTH window-ends.
+        let warm_w1_end = now_ms.saturating_sub(200_000);
+        let warm_w2_end = now_ms.saturating_sub(100_000);
+        let warm_w1_total = 100.0_f64;
+        let sid = 9100u64;
+        idx.register(cms_meta(sid, "req_count"));
+        for (w_end, total) in [(warm_w1_end, 100i64), (warm_w2_end, 200i64)] {
+            idx.append_sample(
+                sid,
+                BTreeMap::new(),
+                (w_end.saturating_sub(30_000), w_end),
+                SketchSampleState {
+                    bytes: cms_bytes(total),
+                    encoding: SketchEncoding::ProtoFull,
+                },
+            );
+        }
+
+        // Archive provides the WHOLE range, including the prefix the warm
+        // tier can't cover. Use the bare empty-label series the DD reducer
+        // emits (so labels line up for the stitch merge).
+        let labels = KeyByLabelValues::new_with_labels(Vec::new());
+        let mut arch_el = RangeVectorElement::new(labels);
+        // Prefix samples (before warm coverage) + a suffix sample warm will win.
+        let prefix_ts = now_ms.saturating_sub(500_000) as i64;
+        let mid_ts = now_ms.saturating_sub(300_000) as i64;
+        arch_el.samples.push(Sample::new(prefix_ts as u64, 999.0));
+        arch_el.samples.push(Sample::new(mid_ts as u64, 998.0));
+        arch_el
+            .samples
+            .push(Sample::new(warm_w1_end, 1.0)); // overlap: warm should win
+        let archive = Arc::new(FakeArchive {
+            matrix: QueryResult::matrix(vec![arch_el]),
+        });
+
+        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
+        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000)
+            .with_sketch_index(idx)
+            .with_archive_engine(archive);
+
+        let result = engine
+            .execute_range_promql_modern(
+                "count_over_time(req_count[5m])",
+                start_ms,
+                end_ms,
+                15_000,
+            )
+            .await
+            .expect("range query must answer (stitched), not error");
+
+        let m = match result {
+            QueryResult::Matrix(m) => m,
+            other => panic!("expected Matrix, got {other:?}"),
+        };
+        assert_eq!(m.values.len(), 1, "one merged series: {m:?}");
+        let samples = &m.values[0].samples;
+        let ts: std::collections::BTreeSet<i64> =
+            samples.iter().map(|s| s.timestamp as i64).collect();
+
+        // The PREFIX timestamps (only the archive has them) must be present —
+        // this is the whole point of the fix (warm-only would have dropped
+        // them).
+        assert!(
+            ts.contains(&prefix_ts),
+            "archive prefix sample (t={prefix_ts}) must survive the stitch: {ts:?}"
+        );
+        assert!(
+            ts.contains(&mid_ts),
+            "archive mid sample (t={mid_ts}) must survive the stitch: {ts:?}"
+        );
+        // The SUFFIX warm windows must be present too.
+        assert!(
+            ts.contains(&(warm_w1_end as i64)) && ts.contains(&(warm_w2_end as i64)),
+            "warm suffix windows must be present: {ts:?}"
+        );
+
+        // Warm wins on the overlapping timestamp: at warm_w1_end the value
+        // must be the warm per-window total (100), NOT the archive sentinel 1.0.
+        let overlap = samples
+            .iter()
+            .find(|s| s.timestamp == warm_w1_end)
+            .expect("overlap sample present");
+        assert!(
+            (overlap.value - warm_w1_total).abs() < 1e-6,
+            "warm must win on overlap (expected warm total {warm_w1_total}, got {})",
+            overlap.value
+        );
+    }
+
+    /// Control: when warm coverage already spans the request exactly
+    /// (`cov_lo == start_ms && cov_hi == end_ms`), no stitch is needed and the
+    /// warm-only matrix is returned unchanged — the archive is NOT consulted
+    /// even though it's wired. Per-window coverage is window-end-point-based,
+    /// Control: with NO archive engine wired, the range path returns the
+    /// warm-only matrix (no stitch, no error) even when warm coverage is
+    /// narrower than the request — the stitch is gated on a configured
+    /// archive. This pins that the fix doesn't disturb the archive-less
+    /// deployment (the warm tier answers what it can).
+    #[tokio::test]
+    async fn range_warm_only_when_no_archive_engine() {
+        let idx = Arc::new(SketchStore::new());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let start_ms = now_ms.saturating_sub(600_000);
+        let end_ms = now_ms;
+        // Warm covers only one suffix window — narrower than the request.
+        let w_end = now_ms.saturating_sub(100_000);
+        let sid = 9200u64;
+        idx.register(cms_meta(sid, "req_count"));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (w_end.saturating_sub(30_000), w_end),
+            SketchSampleState {
+                bytes: cms_bytes(42),
+                encoding: SketchEncoding::ProtoFull,
+            },
+        );
+
+        // No `.with_archive_engine(...)` — stitch must NOT fire.
+        let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
+        let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
+        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx);
+
+        let result = engine
+            .execute_range_promql_modern("count_over_time(req_count[5m])", start_ms, end_ms, 15_000)
+            .await
+            .expect("range query must answer warm-only");
+        let m = match result {
+            QueryResult::Matrix(m) => m,
+            other => panic!("expected Matrix, got {other:?}"),
+        };
+        // Warm-only: exactly the single warm window-end sample, no archive
+        // prefix injected.
+        let ts: Vec<u64> = m
+            .values
+            .iter()
+            .flat_map(|el| el.samples.iter().map(|s| s.timestamp))
+            .collect();
+        assert_eq!(
+            ts,
+            vec![w_end],
+            "warm-only result must carry just the warm window sample: {ts:?}"
+        );
     }
 }
