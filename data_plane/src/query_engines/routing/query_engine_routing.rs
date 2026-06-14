@@ -35,6 +35,23 @@ use crate::query_engines::{EngineError, QueryResult};
 // registration time.
 // ---------------------------------------------------------------------------
 
+/// Which storage tiers a range query is eligible to consult, decided by
+/// the caller from the query's `[start_ms, end_ms]` window relative to
+/// the warm-retention boundary. Consumed by
+/// [`EngineRouter::execute_range_for_tier`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeTier {
+    /// The window lies entirely inside the warm-retention horizon — the
+    /// archive is guaranteed empty for it, so its leg of the failover
+    /// sequence is suppressed.
+    WarmOnly,
+    /// The window reaches at or past the warm-retention boundary
+    /// (genuinely-archived data, a boundary-straddling range, or an
+    /// unknown boundary). The full ASAP-first-then-archive sequence is
+    /// walked.
+    ArchiveEligible,
+}
+
 /// What a [`QueryEngine`] can serve. The router uses this to key its
 /// internal map (`data_source_id`) and to estimate cost when several
 /// compatible engines are registered.
@@ -282,12 +299,72 @@ impl EngineRouter {
         end_ms: u64,
         step_ms: u64,
     ) -> Result<QueryResult, EngineRouterError> {
-        let backends = compatible_storage_backends(stat, accuracy, metric_storage);
+        // Default tier policy preserves the pre-fix behaviour: walk the
+        // full `compatible_storage_backends` sequence (ASAP-tier first,
+        // archive failover). Callers that know the query's time range
+        // relative to the warm-retention boundary should use
+        // [`Self::execute_range_for_tier`] to suppress the archive leg
+        // for warm-resident ranges (the warm-vs-archive routing fix).
+        self.execute_range_for_tier(
+            query,
+            stat,
+            accuracy,
+            metric_storage,
+            start_ms,
+            end_ms,
+            step_ms,
+            RangeTier::ArchiveEligible,
+        )
+        .await
+    }
+
+    /// Time-aware range dispatch. Identical to [`Self::execute_range`]
+    /// except the `tier` argument decides whether the archive
+    /// (`GorillaObjectStore` / `thanos_query`) leg of the
+    /// `compatible_storage_backends` sequence is eligible:
+    ///
+    /// * [`RangeTier::WarmOnly`] — the requested `[start_ms, end_ms]`
+    ///   window lies entirely inside the warm-retention horizon, so the
+    ///   data (if it exists at all) is warm-resident and the archive is
+    ///   guaranteed empty for this range. The archive backend is dropped
+    ///   from the failover list so a warm `CapabilityMiss` surfaces as a
+    ///   real miss instead of being masked by an empty-but-`Ok` archive
+    ///   answer stamped `data_source: thanos_query`. This is the root of
+    ///   the recurring "No result" class for recent range queries when
+    ///   cold/archive is ON.
+    /// * [`RangeTier::ArchiveEligible`] — the window reaches at or past
+    ///   the warm-retention boundary (genuinely-archived data, or a
+    ///   range straddling the boundary). The full ASAP-first-then-archive
+    ///   sequence is walked; the ASAP engine's hybrid-stitch path merges
+    ///   warm ∪ archive where the ranges overlap.
+    ///
+    /// `data_source` stamping is unchanged: the engine that answers is
+    /// the one whose `capabilities().data_source_id` the HTTP layer
+    /// annotates onto the wire response.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_range_for_tier(
+        &self,
+        query: &str,
+        stat: Statistic,
+        accuracy: AccuracyTarget,
+        metric_storage: StorageBackend,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        tier: RangeTier,
+    ) -> Result<QueryResult, EngineRouterError> {
+        let mut backends = compatible_storage_backends(stat, accuracy, metric_storage);
+        if matches!(tier, RangeTier::WarmOnly) {
+            // Drop the archive leg: a range fully inside warm retention
+            // must never be answered (empty) by the archive.
+            backends.retain(|b| !matches!(b, StorageBackend::GorillaObjectStore));
+        }
         debug!(
             query = query,
             stat = ?stat,
             accuracy = ?accuracy,
             metric_storage = ?metric_storage,
+            tier = ?tier,
             backends = ?backends,
             start_ms,
             end_ms,
@@ -769,6 +846,136 @@ mod tests {
             warm_calls.load(Ordering::SeqCst),
             0,
             "Exact range query must skip the ASAP-tier and archive only",
+        );
+    }
+
+    // ── warm-vs-archive time-boundary routing (`RangeTier`) ─────────────
+
+    /// Regression test for the warm-vs-archive routing defect.
+    ///
+    /// With cold/archive ON, both `asap_query` (warm) and `thanos_query`
+    /// (archive) engines are registered. A recent range query whose data
+    /// is still warm-resident and NOT yet archived will, in the warm
+    /// tier, capability-miss for shapes the warm tier can't serve (e.g.
+    /// `sum_over_time` over counter deltas, issue #301). Pre-fix the
+    /// router then failed over to the archive, which answers `Ok` with an
+    /// EMPTY series for the recent range — the caller saw "No result"
+    /// stamped `data_source: thanos_query`.
+    ///
+    /// Post-fix: when the HTTP layer determines the range is entirely
+    /// within warm retention it passes `RangeTier::WarmOnly`, which drops
+    /// the archive leg. The empty-archive masking can no longer happen —
+    /// the warm miss surfaces as a real `AllFailed`/`NoEngineRegistered`
+    /// (which the HTTP layer renders as an honest unsupported/no-result),
+    /// and the archive engine is never consulted.
+    #[tokio::test]
+    async fn warm_only_tier_does_not_mask_warm_miss_with_empty_archive() {
+        let mut router = EngineRouter::new();
+        // Warm capability-misses (the recent-range #301 case), archive
+        // would answer Ok (empty) if consulted.
+        let (warm, warm_calls) =
+            StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range_for_tier(
+                "sum_over_time(http_requests_total[300s])",
+                Statistic::Sum,
+                AccuracyTarget::Approximate,
+                // Cold metric resolves to the archive axis, but the range
+                // is recent so the HTTP layer marks it WarmOnly.
+                StorageBackend::GorillaObjectStore,
+                1_700_000_000_000,
+                1_700_000_300_000,
+                15_000,
+                RangeTier::WarmOnly,
+            )
+            .await;
+
+        // Warm was tried; archive was NOT consulted (so no empty
+        // `thanos_query` answer can mask the warm miss).
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            0,
+            "WarmOnly tier must NOT consult the archive for a warm-resident range",
+        );
+        // The warm miss surfaces honestly rather than as a fake-success
+        // empty archive vector.
+        assert!(
+            matches!(result, Err(EngineRouterError::AllFailed { .. })),
+            "warm miss under WarmOnly must surface as AllFailed, not an empty archive Ok; got {result:?}",
+        );
+    }
+
+    /// When the warm tier CAN serve a recent range, `WarmOnly` returns
+    /// the warm answer and never touches the archive.
+    #[tokio::test]
+    async fn warm_only_tier_answers_from_warm_when_available() {
+        let mut router = EngineRouter::new();
+        let (warm, warm_calls) = StubEngine::new(StorageBackend::SketchStore, Outcome::Ok);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range_for_tier(
+                "quantile_over_time(0.99, latency_ms[300s])",
+                Statistic::Sum,
+                AccuracyTarget::Approximate,
+                StorageBackend::GorillaObjectStore,
+                1_700_000_000_000,
+                1_700_000_300_000,
+                15_000,
+                RangeTier::WarmOnly,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            0,
+            "WarmOnly tier must answer from warm and skip the archive",
+        );
+    }
+
+    /// An older / boundary-straddling range stays `ArchiveEligible`: warm
+    /// is still tried first (cheap, and contributes the recent suffix via
+    /// hybrid-stitch downstream) and on a warm miss the archive answers
+    /// the genuinely-archived history. This preserves the cold-fallback
+    /// arm the fix must not regress.
+    #[tokio::test]
+    async fn archive_eligible_tier_still_falls_over_to_archive_for_old_range() {
+        let mut router = EngineRouter::new();
+        let (warm, warm_calls) =
+            StubEngine::new(StorageBackend::SketchStore, Outcome::CapabilityMiss);
+        let (archive, archive_calls) =
+            StubEngine::new(StorageBackend::GorillaObjectStore, Outcome::Ok);
+        router.register(warm);
+        router.register(archive);
+
+        let result = router
+            .execute_range_for_tier(
+                "sum_over_time(http_requests_total[300s])",
+                Statistic::Sum,
+                AccuracyTarget::Approximate,
+                StorageBackend::GorillaObjectStore,
+                1_600_000_000_000,
+                1_600_000_300_000,
+                15_000,
+                RangeTier::ArchiveEligible,
+            )
+            .await;
+        assert!(result.is_ok(), "old range must be served by the archive");
+        assert_eq!(warm_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            archive_calls.load(Ordering::SeqCst),
+            1,
+            "ArchiveEligible tier must fail over to the archive for an old range",
         );
     }
 }
