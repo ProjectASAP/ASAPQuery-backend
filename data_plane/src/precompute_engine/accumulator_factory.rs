@@ -1,7 +1,7 @@
 use crate::precompute_engine::operators::{
-    CountMinSketchAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
-    HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
-    MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
+    CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, DDSketchAccumulator,
+    DatasketchesKLLAccumulator, HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator,
+    MultipleIncreaseAccumulator, MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
 };
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
@@ -583,6 +583,107 @@ impl AccumulatorUpdater for CmsAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
+// CmsHeapAccumulatorUpdater — value-weighted / count-weighted top-k
+// ---------------------------------------------------------------------------
+
+/// What quantity the top-k heap ranks keys by.
+///
+/// These are DIFFERENT query semantics and must be chosen explicitly:
+///
+/// * [`TopkWeight::Value`] — accumulate **Σ of the datapoint value** per key.
+///   This answers "top-k <group-by> by total <metric>" (e.g. "top-k hosts by
+///   total CPU"). The heap value is the summed metric value, so the read-side
+///   reducer's "sort heap descending by value" yields the correct ranking.
+///
+/// * [`TopkWeight::Count`] — accumulate **+1 per event** per key (occurrence
+///   frequency), the textbook heavy-hitter / frequency-top-k semantics
+///   ("which keys appear most often").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopkWeight {
+    /// Σ datapoint value per key (value-weighted top-k).
+    Value,
+    /// +1 per event per key (count-weighted / frequency top-k).
+    Count,
+}
+
+/// Keyed top-k updater backed by a real `CountMinSketchWithHeap` (a CMS
+/// matrix PLUS a size-`heap_size` top-k heap). Unlike the heap-LESS
+/// `CmsAccumulatorUpdater`, this enumerates top-k keys at read time
+/// (`get_topk_keys` / `topk_heap_items`), which is what `topk(...)` queries
+/// need.
+///
+/// The key is the configured group-by (`aggregated_labels`) value vector —
+/// e.g. `host` — formed by `extract_aggregated_key_from_series` in the worker,
+/// NOT the hardcoded metric label `item`. The accumulated quantity is selected
+/// by [`TopkWeight`]:
+///   * `Value` → `inner.update(key, value)` adds the datapoint value (Σ value).
+///   * `Count` → `inner.update(key, 1.0)` adds one per event (Σ count).
+///
+/// Both `CountMinSketchWithHeap` and `CountSketchWithHeap` raw-input policies
+/// route here; the heap is the shared distinguishing payload.
+pub struct CmsHeapAccumulatorUpdater {
+    acc: CountMinSketchWithHeapAccumulator,
+    row_num: usize,
+    col_num: usize,
+    heap_size: usize,
+    weight: TopkWeight,
+}
+
+impl CmsHeapAccumulatorUpdater {
+    pub fn new(row_num: usize, col_num: usize, heap_size: usize, weight: TopkWeight) -> Self {
+        Self {
+            acc: CountMinSketchWithHeapAccumulator::new(row_num, col_num, heap_size),
+            row_num,
+            col_num,
+            heap_size,
+            weight,
+        }
+    }
+}
+
+impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
+    fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
+        debug_assert!(
+            false,
+            "update_single called on keyed updater; use update_keyed"
+        );
+    }
+
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+        // Heap key = the group-by label-value vector (e.g. `host`), joined the
+        // same way the read-side `get_topk_keys` splits it back apart (`;`).
+        let weighted = match self.weight {
+            // Σ value: feed the datapoint value. sketchlib's CMS-heap
+            // `update(key, w)` adds `w.round()` occurrences of `key`, so the
+            // heap value accumulates the (rounded) summed metric value.
+            TopkWeight::Value => value,
+            // Σ count: one occurrence per event, regardless of value.
+            TopkWeight::Count => 1.0,
+        };
+        self.acc
+            .inner
+            .update(&key.to_semicolon_str(), weighted);
+    }
+
+    impl_clone_accumulator_methods!(acc);
+
+    fn reset(&mut self) {
+        self.acc =
+            CountMinSketchWithHeapAccumulator::new(self.row_num, self.col_num, self.heap_size);
+    }
+
+    fn is_keyed(&self) -> bool {
+        true
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of::<CountMinSketchWithHeapAccumulator>()
+            + self.row_num * self.col_num * std::mem::size_of::<f64>()
+            + self.heap_size * (std::mem::size_of::<asap_sketchlib::CmsHeapItem>() + 32)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HydraKllAccumulatorUpdater
 // ---------------------------------------------------------------------------
 
@@ -691,6 +792,47 @@ fn cms_params(config: &AggregationConfig) -> (usize, usize) {
     (row_num, col_num)
 }
 
+/// Top-k heap size for the `*WithHeap` configs. Reads `heap_size` /
+/// `k` from `parameters`; defaults to 20 (the heap holds the top-k
+/// candidates — it must be ≥ the largest `k` a query asks for).
+fn heap_size_param(config: &AggregationConfig) -> usize {
+    config
+        .parameters
+        .get("heap_size")
+        .or_else(|| config.parameters.get("k"))
+        .or_else(|| config.parameters.get("K"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .filter(|&v| v > 0)
+        .unwrap_or(20)
+}
+
+/// Top-k ranking quantity for the `*WithHeap` configs.
+///
+/// Selected by `parameters["weight_mode"]` (or alias `topk_weight`):
+///   * `"value"` / `"sum"` → [`TopkWeight::Value`] (Σ value per key).
+///   * `"count"` / `"frequency"` / `"freq"` → [`TopkWeight::Count`].
+///
+/// DEFAULT is `Value` (value-weighted). The heap variants previously
+/// routed to the heap-LESS `CmsAccumulatorUpdater` (top-k unanswerable —
+/// recall 0), so there is no count-weighted heap caller to regress;
+/// value-weighting is the semantics `topk(sum_by_key(value))` needs, and
+/// genuine frequency-top-k callers opt in with `weight_mode: count`.
+fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
+    match config
+        .parameters
+        .get("weight_mode")
+        .or_else(|| config.parameters.get("topk_weight"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("count") | Some("frequency") | Some("freq") => TopkWeight::Count,
+        // "value" / "sum" / unset / anything else → value-weighted default.
+        _ => TopkWeight::Value,
+    }
+}
+
 /// Extract `(row_num, col_num, k)` for HydraKLL configs.
 fn hydra_kll_params(config: &AggregationConfig) -> (usize, usize, u16) {
     let (row_num, col_num) = cms_params(config);
@@ -756,27 +898,35 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             sub_type.eq_ignore_ascii_case("max"),
         )),
         AggregationType::Increase => Box::new(IncreaseAccumulatorUpdater::new()),
-        AggregationType::CountMinSketch | AggregationType::CountMinSketchWithHeap => {
+        AggregationType::CountMinSketch => {
             let (row_num, col_num) = cms_params(config);
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
-        // CountSketch + CountSketchWithHeap (raw-input ingest path):
-        // route to `CmsAccumulatorUpdater` for now — it handles the
-        // same `(rows, cols)` matrix shape. The OTLP modified-sketch
-        // wire path uses `SketchEnvelope` ingest (not raw), so this
-        // arm fires only for Mode 2 / raw-input policies.
-        //
-        // Limitation: like the `CountMinSketchWithHeap` arm above,
-        // this drops the per-policy top-k heap on the raw-input side.
-        // The heap-bearing accumulator
-        // (`count_min_sketch_with_heap_accumulator.rs`) exists but
-        // doesn't yet have an `AccumulatorUpdater` impl; same is
-        // true for the CountSketch variants. Adding dedicated
-        // updaters is tracked as a follow-up — the present arm is
-        // a correctness floor (registered policy → working
-        // accumulator) without silently falling through to
-        // `SumAccumulatorUpdater`.
-        AggregationType::CountSketch | AggregationType::CountSketchWithHeap => {
+        // Heap-bearing top-k variants (raw-input ingest path): route to
+        // the real `CmsHeapAccumulatorUpdater` so the per-policy top-k
+        // heap is BUILT (heap-less CMS could not answer `topk(...)` —
+        // recall 0). Keyed by the configured group-by `aggregated_labels`
+        // (e.g. `host`), ranked by Σ value per key by default
+        // (`weight_mode: value`), or Σ count for genuine frequency-top-k
+        // (`weight_mode: count`). `CountSketchWithHeap` shares the wire
+        // shape (heap is the distinguishing payload), so it routes here
+        // too. The OTLP modified-sketch path builds the heap agent-side
+        // and uses `SketchEnvelope` ingest, not this raw arm.
+        AggregationType::CountMinSketchWithHeap | AggregationType::CountSketchWithHeap => {
+            let (row_num, col_num) = cms_params(config);
+            Box::new(CmsHeapAccumulatorUpdater::new(
+                row_num,
+                col_num,
+                heap_size_param(config),
+                topk_weight_param(config),
+            ))
+        }
+        // Heap-LESS CountSketch (raw-input ingest path): route to
+        // `CmsAccumulatorUpdater` — it handles the same `(rows, cols)`
+        // matrix shape and answers point-frequency only. CountSketch
+        // proper has no top-k heap, so `topk(...)` against it routes
+        // through the heap-bearing variant above.
+        AggregationType::CountSketch => {
             let (row_num, col_num) = cms_params(config);
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
@@ -1046,5 +1196,179 @@ mod tests {
             None,
         );
         assert_eq!(super::cms_params(&empty_config), (4, 1000));
+    }
+
+    // -----------------------------------------------------------------
+    // value-weighted vs count-weighted top-k (fix/value-weighted-topk)
+    // -----------------------------------------------------------------
+
+    /// Build a `*WithHeap` config keyed by group-by label `host`, with the
+    /// given `weight_mode` param (None → default = value-weighted).
+    fn topk_config(agg_type: AggregationType, weight_mode: Option<&str>) -> AggregationConfig {
+        use std::collections::HashMap;
+        let mut params = HashMap::new();
+        // Small, deterministic geometry; heap big enough to hold all hosts.
+        params.insert("d".to_string(), serde_json::Value::from(4_u64));
+        params.insert("w".to_string(), serde_json::Value::from(256_u64));
+        params.insert("heap_size".to_string(), serde_json::Value::from(8_u64));
+        if let Some(m) = weight_mode {
+            params.insert("weight_mode".to_string(), serde_json::Value::from(m));
+        }
+        AggregationConfig::new(
+            agg_type,
+            String::new(),
+            params,
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            // group-by = `host` (NOT the metric label `item`).
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![
+                "host".to_string(),
+            ]),
+            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            String::new(),
+            60,
+            0,
+            WindowType::Tumbling,
+            "cpu".to_string(),
+            "cpu".to_string(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Read the heap as a sorted-descending `(host, value)` list from a
+    /// finished accumulator — mirrors the read-side reducer's
+    /// `topk_heap_items()` + sort-by-value-desc.
+    fn ranked_topk(acc: &dyn AggregateCore) -> Vec<(String, f64)> {
+        let heap = acc
+            .as_any()
+            .downcast_ref::<CountMinSketchWithHeapAccumulator>()
+            .expect("WithHeap config must build a heap accumulator");
+        let mut items = heap.inner.topk_heap_items();
+        items.sort_by(|a, b| {
+            b.value
+                .partial_cmp(&a.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        items.into_iter().map(|i| (i.key, i.value)).collect()
+    }
+
+    fn host_key(h: &str) -> KeyByLabelValues {
+        KeyByLabelValues::new_with_labels(vec![h.to_string()])
+    }
+
+    /// A multi-host CPU stream where value-rank and count-rank DISAGREE,
+    /// so the test distinguishes a correct value-weighted answer from the
+    /// (buggy) count-weighted one.
+    ///
+    ///   host-a: ONE big sample  -> value 100, count 1
+    ///   host-b: TWO mid samples -> value  60, count 2
+    ///   host-c: FOUR tiny ones  -> value  20, count 4
+    ///
+    /// By Σ VALUE: a(100) > b(60) > c(20)  → top-2 = [a, b]
+    /// By Σ COUNT: c(4)   > b(2)  > a(1)   → top-2 = [c, b]
+    const STREAM: &[(&str, f64)] = &[
+        ("host-a", 100.0),
+        ("host-b", 30.0),
+        ("host-b", 30.0),
+        ("host-c", 5.0),
+        ("host-c", 5.0),
+        ("host-c", 5.0),
+        ("host-c", 5.0),
+    ];
+
+    fn feed_stream(updater: &mut dyn AccumulatorUpdater) {
+        for (i, (host, val)) in STREAM.iter().enumerate() {
+            updater.update_keyed(&host_key(host), *val, 1_000 + i as i64);
+        }
+    }
+
+    #[test]
+    fn value_weighted_topk_ranks_hosts_by_sum_of_value() {
+        // DEFAULT mode (no weight_mode param) must be value-weighted.
+        let config = topk_config(AggregationType::CountMinSketchWithHeap, None);
+        let mut updater = create_accumulator_updater(&config);
+        assert!(updater.is_keyed());
+
+        feed_stream(&mut *updater);
+        let acc = updater.take_accumulator();
+        assert_eq!(acc.type_name(), "CountMinSketchWithHeapAccumulator");
+
+        let ranked = ranked_topk(&*acc);
+        // Σ value: host-a=100, host-b=60, host-c=20.
+        assert_eq!(ranked[0].0, "host-a", "top host by Σ value");
+        assert_eq!(ranked[0].1, 100.0);
+        assert_eq!(ranked[1].0, "host-b");
+        assert_eq!(ranked[1].1, 60.0);
+        assert_eq!(ranked[2].0, "host-c");
+        assert_eq!(ranked[2].1, 20.0);
+
+        // Recall of value-weighted top-2 against ground truth {host-a, host-b}.
+        let truth: std::collections::HashSet<&str> = ["host-a", "host-b"].into_iter().collect();
+        let got: std::collections::HashSet<&str> =
+            ranked.iter().take(2).map(|(h, _)| h.as_str()).collect();
+        let recall = got.intersection(&truth).count() as f64 / truth.len() as f64;
+        assert_eq!(recall, 1.0, "value-weighted top-2 recall must be 1.0");
+    }
+
+    #[test]
+    fn count_weighted_topk_still_ranks_by_occurrence_frequency() {
+        // Opt-in frequency-top-k: weight_mode=count must rank by event count.
+        let config = topk_config(AggregationType::CountMinSketchWithHeap, Some("count"));
+        let mut updater = create_accumulator_updater(&config);
+        feed_stream(&mut *updater);
+        let acc = updater.take_accumulator();
+
+        let ranked = ranked_topk(&*acc);
+        // Σ count: host-c=4, host-b=2, host-a=1.
+        assert_eq!(ranked[0].0, "host-c", "top host by Σ count");
+        assert_eq!(ranked[0].1, 4.0);
+        assert_eq!(ranked[1].0, "host-b");
+        assert_eq!(ranked[1].1, 2.0);
+        assert_eq!(ranked[2].0, "host-a");
+        assert_eq!(ranked[2].1, 1.0);
+    }
+
+    #[test]
+    fn countsketch_with_heap_also_routes_to_value_weighted_heap() {
+        // CountSketchWithHeap shares the heap path — same value-weighted default.
+        let config = topk_config(AggregationType::CountSketchWithHeap, None);
+        let mut updater = create_accumulator_updater(&config);
+        feed_stream(&mut *updater);
+        let acc = updater.take_accumulator();
+        assert_eq!(acc.type_name(), "CountMinSketchWithHeapAccumulator");
+        let ranked = ranked_topk(&*acc);
+        assert_eq!(ranked[0].0, "host-a");
+        assert_eq!(ranked[0].1, 100.0);
+    }
+
+    #[test]
+    fn topk_weight_param_parses_modes() {
+        assert_eq!(
+            super::topk_weight_param(&topk_config(
+                AggregationType::CountMinSketchWithHeap,
+                None
+            )),
+            TopkWeight::Value,
+            "unset defaults to value-weighted"
+        );
+        for m in ["value", "sum", "VALUE"] {
+            assert_eq!(
+                super::topk_weight_param(&topk_config(
+                    AggregationType::CountMinSketchWithHeap,
+                    Some(m)
+                )),
+                TopkWeight::Value,
+            );
+        }
+        for m in ["count", "frequency", "freq", "COUNT"] {
+            assert_eq!(
+                super::topk_weight_param(&topk_config(
+                    AggregationType::CountMinSketchWithHeap,
+                    Some(m)
+                )),
+                TopkWeight::Count,
+            );
+        }
     }
 }
