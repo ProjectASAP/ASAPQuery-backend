@@ -411,6 +411,117 @@ impl<'a> SketchReducer<'a> {
         )
     }
 
+    /// GLOBAL HLL distinct rollup (FIX: sealed-window global `count()`
+    /// empty). `count(hll_metric)` with NO `by (...)` asks for the distinct
+    /// count across ALL matched series. The per-series Cardinality path emits
+    /// one estimate per series; summing them double-counts any item present
+    /// in more than one series, and the engine otherwise returns a multi-row
+    /// vector rather than the single global number. This method MERGES the
+    /// per-series HLL registers (HLL merge = element-wise max of registers)
+    /// across every matched sid, then estimates ONCE — the correct distinct
+    /// UNION cardinality.
+    ///
+    /// Returns a single-series `ASAPTierResult` (empty label set) carrying the
+    /// merged estimate at the latest covered window-end, plus the merged
+    /// coverage range. `ASAPTierError::NoData` if no sid had an in-window HLL
+    /// Full frame; `UnsupportedCapability` if a matched sid isn't HLL-backed.
+    pub fn evaluate_cardinality_global(
+        &self,
+        sids: &[u64],
+        t0_ms: u64,
+        t1_ms: u64,
+    ) -> Result<ASAPTierResult, ASAPTierError> {
+        use super::delta_apply::cumulative_hll_state;
+        use crate::storage_engines::sketch_db::data::SketchConfig;
+        use asap_sketchlib::HllSketch;
+
+        let mut merged: Option<HllSketch> = None;
+        let mut metric_name_for_err = String::new();
+        let mut cov_lo: u64 = u64::MAX;
+        let mut cov_hi: u64 = 0;
+        let mut any_window = false;
+
+        for &sid in sids {
+            let meta = match self.index.instance(sid) {
+                Some(m) => m,
+                None => continue,
+            };
+            metric_name_for_err = meta.metric_name.clone();
+            // Only HLL sids answer cardinality via register merge.
+            match meta
+                .sketch_kind()
+                .expect("ASAP-tier reducer only handles sketch-backed sids")
+            {
+                SketchKindHandle::Hll => {}
+                _ => {
+                    return Err(ASAPTierError::UnsupportedCapability {
+                        function: "cardinality_global".to_string(),
+                        capability: Capability::CardinalityApprox,
+                    });
+                }
+            }
+            let precision = match meta.sketch_config() {
+                Some(SketchConfig::Hll { precision }) => *precision,
+                _ => 14,
+            };
+
+            let series_list = self.index.query_range(sid, t0_ms, t1_ms);
+            for ts in series_list {
+                let samples_vec: Vec<(i64, &SketchSampleState)> = ts
+                    .samples
+                    .iter()
+                    .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
+                    .collect();
+                for (w_end, _) in &samples_vec {
+                    any_window = true;
+                    let w = if *w_end >= 0 { *w_end as u64 } else { 0 };
+                    cov_lo = cov_lo.min(w);
+                    cov_hi = cov_hi.max(w);
+                }
+                let series_state =
+                    cumulative_hll_state(&samples_vec, precision).map_err(|e| {
+                        ASAPTierError::DeserializeFailure {
+                            sid,
+                            encoding: SketchEncoding::ProtoFull,
+                            reason: e,
+                        }
+                    })?;
+                if let Some(sk) = series_state {
+                    merged = Some(match merged.take() {
+                        None => sk,
+                        Some(mut acc) => {
+                            acc.merge(&sk).map_err(|e| ASAPTierError::DeserializeFailure {
+                                sid,
+                                encoding: SketchEncoding::ProtoFull,
+                                reason: format!("global HLL merge: {e}"),
+                            })?;
+                            acc
+                        }
+                    });
+                }
+            }
+        }
+
+        let Some(merged) = merged else {
+            return Err(ASAPTierError::NoData {
+                metric_name: metric_name_for_err,
+            });
+        };
+        let _ = any_window;
+        let estimate = merged.estimate();
+        let window_end = if cov_hi > 0 { cov_hi as i64 } else { t1_ms as i64 };
+        let coverage = if cov_lo <= cov_hi {
+            Some((cov_lo, cov_hi))
+        } else {
+            None
+        };
+        Ok(ASAPTierResult {
+            // Empty label set — a global distinct count has no group labels.
+            series: vec![(BTreeMap::new(), vec![(window_end, estimate)])],
+            coverage,
+        })
+    }
+
     /// Shared evaluation core for the string ([`Self::evaluate`]) and
     /// typed ([`Self::evaluate_for_capability`]) entry points. `family`
     /// + `is_cumulative` are already resolved by the caller;
