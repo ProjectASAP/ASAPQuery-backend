@@ -296,6 +296,15 @@ impl Worker {
                     if let Err(e) = self.flush_all() {
                         warn!("Worker {} final flush error: {}", self.id, e);
                     }
+                    // Force-close any windows still open after the final flush.
+                    // `flush_all` only advances the watermark by +1ms (plus the
+                    // wall-clock fallback, whose grace may not have elapsed for a
+                    // one-shot batch), so the trailing window can remain open and
+                    // its data would never reach the store. No more samples will
+                    // arrive after shutdown, so close every remaining pane.
+                    if let Err(e) = self.force_close_all() {
+                        warn!("Worker {} shutdown force-close error: {}", self.id, e);
+                    }
                     break;
                 }
             }
@@ -856,6 +865,106 @@ impl Worker {
         if !emit_batch.is_empty() {
             debug!(
                 "Worker {} flush emitting {} outputs",
+                self.id,
+                emit_batch.len()
+            );
+            self.output_sink.emit_batch(emit_batch)?;
+        }
+
+        Ok(())
+    }
+
+    /// Force-close every window still open on shutdown.
+    ///
+    /// Unlike `flush_all` — which only advances the watermark by `+1ms` (plus
+    /// the wall-clock fallback, gated on grace having elapsed) — this emits the
+    /// window for every remaining pane unconditionally, because no further
+    /// samples will arrive once the engine is shutting down. Without it, a
+    /// one-shot batch whose records all fall in a single window (so event-time
+    /// never advances past the window end) would leave that window open forever
+    /// and never write it to the store. Covers both `active_panes` (sample
+    /// aggregation) and `sketch_panes` (OTLP-delivered sketches).
+    ///
+    /// To advance past the open windows we use a *finite* bound derived from
+    /// the largest open pane (`max_pane + window_size_ms`) rather than
+    /// `i64::MAX`: `WindowManager::closed_windows` enumerates window starts up
+    /// to `current_wm` one slide at a time, so passing `i64::MAX` would loop
+    /// ~`i64::MAX / slide` times and overflow. `max_pane + window_size_ms` is
+    /// the smallest watermark that closes the latest open window.
+    ///
+    /// Idempotent: closed panes are drained from both pane maps and their
+    /// wall-clock bookkeeping is pruned, so a second call emits nothing.
+    fn force_close_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.pass_raw_samples {
+            return Ok(());
+        }
+
+        let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
+
+        for (&sid, state) in &mut self.group_states {
+            let _ = sid; // sid is the bucket key; group_key/policy_fp live on `state`
+            if state.previous_watermark_ms == i64::MIN {
+                continue; // never received data — nothing to close
+            }
+
+            // The latest window start equals the largest open pane start across
+            // both pane maps; closing `[start, start + size)` needs
+            // `wm >= start + size`.
+            let max_active = state.active_panes.keys().next_back().copied();
+            let max_sketch = state.sketch_panes.keys().next_back().copied();
+            let max_pane = match (max_active, max_sketch) {
+                (Some(a), Some(b)) => a.max(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => continue, // no open panes
+            };
+            let force_wm = max_pane.saturating_add(state.window_manager.window_size_ms());
+
+            let group_key = state.group_key.clone();
+            let closed = state
+                .window_manager
+                .closed_windows(state.previous_watermark_ms, force_wm);
+
+            for window_start in &closed {
+                let (_, window_end) = state.window_manager.window_bounds(*window_start);
+                let pane_starts = state.window_manager.panes_for_window(*window_start);
+
+                if let Some(accumulator) =
+                    merge_panes_for_window(&mut state.active_panes, &pane_starts)
+                {
+                    let key = build_group_key_label_values(&group_key);
+                    let output = PrecomputedOutput::new(
+                        *window_start as u64,
+                        window_end as u64,
+                        Some(key),
+                        PolicyFingerprint::from_config(&state.config),
+                    );
+                    emit_batch.push((output, accumulator));
+                }
+
+                if let Some(accumulator) =
+                    merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
+                {
+                    let key = build_group_key_label_values(&group_key);
+                    let output = PrecomputedOutput::new(
+                        *window_start as u64,
+                        window_end as u64,
+                        Some(key),
+                        PolicyFingerprint::from_config(&state.config),
+                    );
+                    emit_batch.push((output, accumulator));
+                }
+            }
+
+            if force_wm > state.previous_watermark_ms {
+                state.previous_watermark_ms = force_wm;
+            }
+            state.prune_pane_wall_clock_starts();
+        }
+
+        if !emit_batch.is_empty() {
+            debug!(
+                "Worker {} shutdown force-close emitting {} outputs",
                 self.id,
                 emit_batch.len()
             );
@@ -2747,6 +2856,142 @@ aggregations:
             sink.len(),
             0,
             "grace=0 must disable the fallback — event-time-only semantics"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: shutdown force-close emits the trailing window
+    //
+    // The immediate-shutdown batch case: every record falls in one window and
+    // no later timestamp ever advances the watermark, so flush_all (with the
+    // wall-clock fallback disabled, grace=0) leaves the window open. On
+    // shutdown, force_close_all must close and emit it so the data reaches the
+    // store instead of being lost. Covers both the sample (`active_panes`) and
+    // sketch (`sketch_panes`) paths.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shutdown_force_close_emits_trailing_sample_window() {
+        // 10s tumbling window; make_worker uses grace=0, isolating the
+        // force-close from the wall-clock fallback.
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let mut agg_configs = HashMap::new();
+        agg_configs.insert(1, config);
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(agg_configs, sink.clone(), false, 0, LateDataPolicy::Drop);
+
+        // All samples land in window [0, 10_000); the watermark freezes below
+        // the window end because no later timestamp ever arrives.
+        let pf = PolicyFingerprint(1);
+        for i in 0..5 {
+            worker
+                .process_group_samples(1, pf, "", group_samples("cpu", vec![(1_000 + i * 100, 1.0)]))
+                .unwrap();
+        }
+
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "trailing window must remain open after the final flush"
+        );
+
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(
+            captured.len(),
+            1,
+            "shutdown force-close must emit the trailing window"
+        );
+        let (output, acc) = &captured[0];
+        assert!(!output.policy_fp.is_unset());
+        assert_eq!(output.start_timestamp, 0);
+        assert_eq!(output.end_timestamp, 10_000);
+        let sum_acc = acc
+            .as_any()
+            .downcast_ref::<SumAccumulator>()
+            .expect("should be SumAccumulator");
+        assert!(
+            (sum_acc.sum - 5.0).abs() < 1e-10,
+            "5 samples of 1.0 → sum 5, got {}",
+            sum_acc.sum
+        );
+
+        // Idempotent: panes are drained, so a second force-close emits nothing.
+        worker.force_close_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "force-close must be idempotent once panes are drained"
+        );
+    }
+
+    #[test]
+    fn shutdown_force_close_emits_trailing_sketch_window() {
+        // 30s tumbling window; grace=0 isolates the force-close.
+        let cfg = make_agg_config(
+            1,
+            "http_requests_total_latency_ms_quantile",
+            AggregationType::DDSketch,
+            "",
+            30,
+            0,
+            vec!["zone"],
+        );
+        let agg_configs = HashMap::from([(1, cfg)]);
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 0);
+
+        // 10 sketches, all stamped at frozen event-time 0 → window [0, 30_000).
+        let pf = PolicyFingerprint(1);
+        for i in 0..10 {
+            let s = make_ddsketch(0.01, &[1.0 + i as f64]);
+            worker
+                .process_accumulator_input(51, pf, "us-east", 0, Box::new(s))
+                .unwrap();
+        }
+
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "trailing sketch window must remain open after flush (grace=0, event-time frozen)"
+        );
+
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(
+            captured.len(),
+            1,
+            "shutdown force-close must emit the trailing sketch window"
+        );
+        let (output, acc) = &captured[0];
+        assert_eq!(output.start_timestamp, 0);
+        assert_eq!(output.end_timestamp, 30_000);
+        assert_eq!(acc.type_name(), "DDSketchAccumulator");
+        let dd = acc
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .expect("must downcast to DDSketchAccumulator");
+        assert_eq!(
+            dd.inner.total_count(),
+            10,
+            "all 10 frozen-time sketches must merge into the single emitted output"
+        );
+
+        worker.force_close_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "force-close must be idempotent once panes are drained"
         );
     }
 }
