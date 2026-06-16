@@ -113,6 +113,38 @@ impl CountSketchF2 {
         }
     }
 
+    /// Squared L2 norm of the whole counter vector, `‖C‖₂² = Σ_j C[j]²`.
+    /// `E[‖C‖₂²] = d·F2` (each of the `d` rows is an unbiased F2 estimator), so
+    /// the geometric layer monitors `‖C‖₂²` against `d·τ` — a smooth quadratic
+    /// whose sublevel set is a ball (unlike the robust median estimate_f2()).
+    pub fn l2_norm_sq(&self) -> f64 {
+        self.c.iter().map(|&x| (x as f64) * (x as f64)).sum()
+    }
+
+    /// New sketch = `self − other` (same dims). The per-site DRIFT `ΔC_i`.
+    pub fn minus(&self, other: &CountSketchF2) -> CountSketchF2 {
+        assert_eq!((self.d, self.w, self.seed), (other.d, other.w, other.seed));
+        let mut out = self.clone();
+        for i in 0..out.c.len() {
+            out.c[i] -= other.c[i];
+        }
+        out
+    }
+
+    /// `‖ self + scale·other ‖₂²` without allocating — used by the geometric
+    /// drift-ball test (`‖C_ref + (k/2)·ΔC_i‖`).
+    pub fn norm_sq_combo(&self, other: &CountSketchF2, scale: f64) -> f64 {
+        assert_eq!((self.d, self.w, self.seed), (other.d, other.w, other.seed));
+        self.c
+            .iter()
+            .zip(&other.c)
+            .map(|(&a, &b)| {
+                let v = a as f64 + scale * (b as f64);
+                v * v
+            })
+            .sum()
+    }
+
     /// Unbiased F2 estimate: median over the `d` rows of `Σ_b C[r][b]²`.
     pub fn estimate_f2(&self) -> f64 {
         let mut row_f2: Vec<f64> = Vec::with_capacity(self.d);
@@ -276,6 +308,118 @@ impl DistributedF2Monitor {
     }
 }
 
+/// Geometric (Sharfman–Schuster–Keren) safe-zone layer for **communication-efficient**
+/// distributed F2 monitoring — breaks the "need-L2-to-decide / need-sketch-to-get-L2"
+/// circularity. Instead of every site shipping its sketch every window, each site
+/// runs a PURELY LOCAL test (does its drift ball stay inside the safe ball
+/// `B(0, √(d·τ))`?) using only the last-broadcast reference `C_ref` and its OWN
+/// drift `ΔC_i` — never the live global. A site ships its sketch ONLY when locally
+/// unsafe, triggering a resync.
+///
+/// Monitored quantity: `‖C‖₂²` (with `E[‖C‖₂²]=d·F2`) against `d·τ`; safe-ball
+/// radius `R=√(d·τ)`. Convexity theorem: the global `C = (1/k)·Σ u_i` lies in the
+/// convex hull of the drift vectors `u_i = C_ref + k·ΔC_i`, so if every site's
+/// bounding ball `B((C_ref+u_i)/2, ‖u_i−C_ref‖/2) ⊆ B(0,R)` then `‖C‖<R ⇒ F2<τ`
+/// (no missed crossing). F2 is the clean case — its sublevel set is already a ball,
+/// so no covering-sphere construction is needed.
+pub struct GeometricF2Monitor {
+    tau: f64,
+    epsilon: f64,
+    d: usize,
+    w: usize,
+    seed: u64,
+    refs: HashMap<String, CountSketchF2>, // each site's sketch at the last sync
+    c_ref: CountSketchF2,                 // Σ refs — the broadcast reference
+    resyncs: u64,
+    alerted: bool,
+}
+
+impl GeometricF2Monitor {
+    pub fn new(tau: f64, epsilon: f64, d: usize, w: usize, seed: u64) -> Self {
+        Self {
+            tau,
+            epsilon,
+            d,
+            w,
+            seed,
+            refs: HashMap::new(),
+            c_ref: CountSketchF2::new(d, w, seed),
+            resyncs: 0,
+            alerted: false,
+        }
+    }
+
+    pub fn new_edge_sketch(&self) -> CountSketchF2 {
+        CountSketchF2::new(self.d, self.w, self.seed)
+    }
+    pub fn site_count(&self) -> usize {
+        self.refs.len()
+    }
+    pub fn resync_count(&self) -> u64 {
+        self.resyncs
+    }
+    /// Safe-ball radius `R = √(d·τ)` on the merged-sketch scale.
+    pub fn safe_radius(&self) -> f64 {
+        (self.d as f64 * self.tau).sqrt()
+    }
+
+    /// PURELY-LOCAL safety test (runs at the EDGE in deployment): given the site's
+    /// CURRENT sketch, may it stay SILENT this round? Uses only the broadcast
+    /// `C_ref` and the site's own reference/drift — NOT the live global ‖f‖₂.
+    /// Returns true ⇒ the site need not communicate.
+    pub fn is_locally_safe(&self, site: &str, current: &CountSketchF2) -> bool {
+        if current.dims() != (self.d, self.w, self.seed) {
+            return false;
+        }
+        let zero = CountSketchF2::new(self.d, self.w, self.seed);
+        let reference = self.refs.get(site).unwrap_or(&zero);
+        let delta = current.minus(reference); // ΔC_i
+        let k = self.refs.len().max(1) as f64;
+        // Bounding ball of {C_ref, u_i = C_ref + k·ΔC_i}: centre C_ref + (k/2)·ΔC_i,
+        // radius (k/2)·‖ΔC_i‖. It ⊆ B(0, R) iff ‖centre‖ + radius ≤ R.
+        let centre_norm = self.c_ref.norm_sq_combo(&delta, k / 2.0).sqrt();
+        let radius = (k / 2.0) * delta.l2_norm_sq().sqrt();
+        centre_norm + radius <= self.safe_radius()
+    }
+
+    /// Full resync: every site contributes its CURRENT sketch (a site lands here
+    /// after a local violation; the coordinator pulls all current sketches).
+    /// Recomputes `C_ref`, re-checks the exact global `F2̂`, and returns an Alert
+    /// if `F2̂ ≥ (1−ε)τ`.
+    pub fn resync(&mut self, currents: &HashMap<String, CountSketchF2>) -> Option<F2Action> {
+        self.refs.clear();
+        for (id, sk) in currents {
+            if sk.dims() == (self.d, self.w, self.seed) {
+                self.refs.insert(id.clone(), sk.clone());
+            }
+        }
+        self.recompute_ref();
+        self.resyncs += 1;
+        let f2 = self.global_f2();
+        if !self.alerted && f2 >= (1.0 - self.epsilon) * self.tau {
+            self.alerted = true;
+            return Some(F2Action::Alert {
+                f2_estimate: f2,
+                tau: self.tau,
+            });
+        }
+        Some(F2Action::Ok { f2_estimate: f2 })
+    }
+
+    fn recompute_ref(&mut self) {
+        let mut m = CountSketchF2::new(self.d, self.w, self.seed);
+        for s in self.refs.values() {
+            m.merge(s);
+        }
+        self.c_ref = m;
+    }
+
+    /// Global `F2̂` from the synced reference sketches: `‖C_ref‖₂² / d`.
+    pub fn global_f2(&self) -> f64 {
+        self.c_ref.l2_norm_sq() / self.d as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +540,75 @@ mod tests {
         assert_eq!(mon.edge_count(), 1);
         let e3 = mon.new_edge_sketch();
         assert_eq!(mon.on_report("e", 0, e3, 10.0), None); // stale
+    }
+
+    // ── geometric safe-zone layer ──
+    fn gcs(mon: &GeometricF2Monitor, pairs: &[(u64, i64)]) -> CountSketchF2 {
+        let mut s = mon.new_edge_sketch();
+        for &(k, f) in pairs {
+            s.update(k, f);
+        }
+        s
+    }
+
+    #[test]
+    fn geometric_silent_under_small_drift() {
+        // sync 2 sites each {1:40} ⇒ merged {1:80}, F2=6400 < τ=10000 (R=300).
+        let mut mon = GeometricF2Monitor::new(10_000.0, 0.1, 9, 4096, 0x1111);
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), gcs(&mon, &[(1, 40)]));
+        cur.insert("b".to_string(), gcs(&mon, &[(1, 40)]));
+        mon.resync(&cur);
+        assert!(mon.global_f2() < mon.tau);
+        // tiny drift (+1 each) ⇒ both stay locally SAFE ⇒ zero communication.
+        assert!(mon.is_locally_safe("a", &gcs(&mon, &[(1, 41)])), "small drift must be safe");
+        assert!(mon.is_locally_safe("b", &gcs(&mon, &[(1, 41)])));
+    }
+
+    #[test]
+    fn geometric_triggers_when_drift_threatens_tau() {
+        let mut mon = GeometricF2Monitor::new(10_000.0, 0.1, 9, 4096, 0x2222);
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), gcs(&mon, &[(1, 40)]));
+        cur.insert("b".to_string(), gcs(&mon, &[(1, 40)]));
+        mon.resync(&cur);
+        // one site drifts hard ⇒ local safe-zone trips ⇒ it MUST report.
+        assert!(!mon.is_locally_safe("a", &gcs(&mon, &[(1, 200)])), "large drift must trip safe-zone");
+    }
+
+    #[test]
+    fn geometric_stays_silent_then_resyncs_on_violation() {
+        let mut mon = GeometricF2Monitor::new(10_000.0, 0.1, 9, 4096, 0x3333);
+        let a = gcs(&mon, &[(1, 30)]);
+        let b = gcs(&mon, &[(1, 30)]);
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), a.clone());
+        cur.insert("b".to_string(), b);
+        mon.resync(&cur);
+        let base = mon.resync_count();
+        // many small local updates: all silent (no resync triggered).
+        let mut ca = a;
+        for _ in 0..5 {
+            ca.update(1, 1);
+            assert!(mon.is_locally_safe("a", &ca));
+        }
+        assert_eq!(mon.resync_count(), base, "silent updates must not resync");
+        // a big jump trips the safe-zone → protocol resyncs.
+        let big = gcs(&mon, &[(1, 300)]);
+        assert!(!mon.is_locally_safe("a", &big));
+        cur.insert("a".to_string(), big);
+        mon.resync(&cur);
+        assert_eq!(mon.resync_count(), base + 1);
+    }
+
+    #[test]
+    fn geometric_alert_when_resync_global_exceeds_tau() {
+        // merged {1:100} ⇒ F2=10000 ≥ (1-0.1)·8000=7200 ⇒ Alert.
+        let mut mon = GeometricF2Monitor::new(8_000.0, 0.1, 9, 4096, 0x4444);
+        let mut cur = HashMap::new();
+        cur.insert("a".to_string(), gcs(&mon, &[(1, 50)]));
+        cur.insert("b".to_string(), gcs(&mon, &[(1, 50)]));
+        let act = mon.resync(&cur).unwrap();
+        assert!(matches!(act, F2Action::Alert { .. }), "global over τ ⇒ Alert, got {act:?}");
     }
 }
