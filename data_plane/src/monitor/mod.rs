@@ -17,6 +17,7 @@
 pub mod alert;
 pub mod coordinator;
 pub mod epoch;
+pub mod f2;
 pub mod sampling_alloc;
 pub mod server;
 
