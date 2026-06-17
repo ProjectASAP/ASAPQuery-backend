@@ -22,7 +22,13 @@ use crate::query_requirements::QueryRequirements;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorSpec {
     pub agg_id: u64,
-    /// CMS point-frequency key x; empty (default) for Sum / whole-stream.
+    /// Additive readout the edge reports: "sum" (default), "cms_point", "f2".
+    /// Pass-through metadata so the edge can auto-learn its reporting mode from
+    /// the pushed config; the coordinator allocation is value-driven and does not
+    /// branch on it (p_i ∝ √(value/rate) is the F2 allocation when value=‖f‖²).
+    #[serde(default)]
+    pub functional: String,
+    /// CMS point-frequency key x; empty (default) for Sum / whole-stream / F2.
     #[serde(default)]
     pub key: String,
     /// Threshold τ (authoritative here, not at the edge).

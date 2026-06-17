@@ -31,7 +31,6 @@
 
 use std::collections::HashMap;
 
-use super::sampling_alloc::{allocate_sample_rates, epsilon_sample_floor};
 
 /// murmur3 64-bit finalizer (`fmix64`).
 #[inline]
@@ -183,12 +182,12 @@ pub enum F2Action {
 #[derive(Clone, Debug)]
 struct EdgeF2 {
     sketch: CountSketchF2,
-    rate: f64,
 }
 
-/// Distributed F2 threshold monitor + coordinated-sampling allocator. Holds each
-/// edge's latest Count-Sketch + rate, merges on report, estimates the global
-/// `F2̂`, fires at `F2̂ ≥ (1−ε)τ`, and allocates `p_i ∝ √(F2̂_i / rate_i)`.
+/// Distributed F2 **threshold** monitor. Holds each edge's latest Count-Sketch,
+/// linearly merges on report, estimates the global `F2̂`, and fires at
+/// `F2̂ ≥ (1−ε)τ`. F2 is a MONITORED quantity only — per-edge update-sampling is
+/// the single whole-sketch ε-floor law (`sampling_alloc`), not driven by F2.
 pub struct DistributedF2Monitor {
     tau: f64,
     epsilon: f64,
@@ -237,15 +236,16 @@ impl DistributedF2Monitor {
         false
     }
 
-    /// Ingest one edge's `(Count-Sketch, rate)` for `window_start_ms`. Replaces
-    /// that edge's prior report, re-estimates the merged global F2, and returns
-    /// an Alert iff it crossed `(1−ε)τ`.
+    /// Ingest one edge's Count-Sketch for `window_start_ms`. Replaces that edge's
+    /// prior report, re-estimates the merged global F2, and returns an Alert iff
+    /// it crossed `(1−ε)τ`. (`rate` is part of the edge wire report but the F2
+    /// threshold needs only the sketch; sampling consumes rate elsewhere.)
     pub fn on_report(
         &mut self,
         edge_id: &str,
         window_start_ms: u64,
         sketch: CountSketchF2,
-        rate: f64,
+        _rate: f64,
     ) -> Option<F2Action> {
         if sketch.dims() != (self.d, self.w, self.seed) {
             return None; // mis-dimensioned — drop
@@ -253,7 +253,7 @@ impl DistributedF2Monitor {
         if !self.ensure_epoch(window_start_ms) {
             return None; // stale epoch
         }
-        self.edges.insert(edge_id.to_string(), EdgeF2 { sketch, rate });
+        self.edges.insert(edge_id.to_string(), EdgeF2 { sketch });
         let f2 = self.global_f2();
         if !self.alerted && f2 >= (1.0 - self.epsilon) * self.tau {
             self.alerted = true;
@@ -275,37 +275,10 @@ impl DistributedF2Monitor {
         merged.estimate_f2()
     }
 
-    /// L2 sampling variance budget `V = (ε·‖f‖₂)² = ε²·F2̂` (vs L1's `(ε·τ)²`).
-    pub fn sampling_var_budget(&self) -> f64 {
-        self.epsilon * self.epsilon * self.global_f2()
-    }
-
-    /// Coordinated per-edge sampling probability `p_i ∝ √(F2̂_i / rate_i)`: the
-    /// freq weight is each edge's LOCAL F2 (from its own sketch), the rate is its
-    /// reported update rate, the budget is `ε²·F2̂_global`. An edge contributing
-    /// more L2 mass is sampled less (higher p) to preserve the F2 estimate.
-    /// Mirrors the L1 `coordinator::allocate_p` but with L2 freq/budget.
-    pub fn allocate_p(&self) -> HashMap<String, f64> {
-        let ids: Vec<&String> = self.edges.keys().collect();
-        let rates: Vec<f64> = ids.iter().map(|id| self.edges[*id].rate).collect();
-        let freqs: Vec<f64> = ids
-            .iter()
-            .map(|id| self.edges[*id].sketch.estimate_f2()) // local F2̂_i
-            .collect();
-        let var_budget = self.sampling_var_budget();
-        let mut p = allocate_sample_rates(&rates, &freqs, var_budget);
-        for (i, &rate) in rates.iter().enumerate() {
-            let floor = epsilon_sample_floor(self.epsilon, rate);
-            if p[i] < floor {
-                p[i] = floor;
-            }
-        }
-        ids.into_iter()
-            .cloned()
-            .zip(p)
-            .map(|(id, pi)| (id, if pi > 0.0 && pi <= 1.0 { pi } else { 1.0 }))
-            .collect()
-    }
+    // NOTE: F2 here is a MONITORED quantity (threshold/alert), NOT a sampling
+    // driver. Per-edge update-sampling is the single whole-sketch ε-floor law
+    // (`sampling_alloc::epsilon_sample_floor`); the old `√(F2/rate)` allocation
+    // was retired (it is not a valid sketch-sampling regime — see `monitor` docs).
 }
 
 /// Geometric (Sharfman–Schuster–Keren) safe-zone layer for **communication-efficient**
@@ -490,42 +463,6 @@ mod tests {
         lo.on_report("a", 0, a2, 1000.0);
         let r_lo = lo.on_report("b", 0, b2, 1000.0).unwrap();
         assert!(matches!(r_lo, F2Action::Alert { .. }), "above tau ⇒ Alert, got {r_lo:?}");
-    }
-
-    #[test]
-    fn allocate_p_higher_local_f2_keeps_higher_p_at_equal_rate() {
-        // Equal rate; edge A carries far more L2 mass than edge B (disjoint keys).
-        // p_i ∝ √(F2_i/rate) ⇒ A (high F2) keeps a HIGHER p (sampled less) to
-        // preserve the F2 estimate. High rate ⇒ low floor so the allocation, not
-        // the floor, drives the spread.
-        let seed = 0x1357_2468;
-        let mut mon = DistributedF2Monitor::new(1.0e12, 0.1, 9, 4096, seed);
-        let mut a = mon.new_edge_sketch();
-        let mut b = mon.new_edge_sketch();
-        fill(&mut a, &[(1u64, 100i64)]); // local F2 ≈ 10000
-        fill(&mut b, &[(2u64, 1i64)]); //  local F2 ≈ 1
-        mon.on_report("a", 0, a, 1_000_000.0);
-        mon.on_report("b", 0, b, 1_000_000.0);
-        let p = mon.allocate_p();
-        let pa = p["a"];
-        let pb = p["b"];
-        let floor = epsilon_sample_floor(0.1, 1_000_000.0);
-        assert!(pa > pb, "high-F2 edge p {pa} should exceed low-F2 p {pb}");
-        assert!(pa > floor + 1e-9 && pb > floor + 1e-9, "p ({pa},{pb}) above floor {floor}");
-    }
-
-    #[test]
-    fn sampling_var_budget_is_eps2_times_f2() {
-        let seed = 0x9999_1111;
-        let eps = 0.2;
-        let mut mon = DistributedF2Monitor::new(1.0e12, eps, 9, 4096, seed);
-        let mut e = mon.new_edge_sketch();
-        fill(&mut e, &(1..=100u64).map(|k| (k, k as i64)).collect::<Vec<_>>());
-        mon.on_report("e", 0, e, 1000.0);
-        let f2 = mon.global_f2();
-        let v = mon.sampling_var_budget();
-        assert!((v - eps * eps * f2).abs() < 1e-6);
-        assert!(v > 0.0);
     }
 
     #[test]

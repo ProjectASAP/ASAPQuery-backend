@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use super::sampling_alloc::{allocate_sample_rates, epsilon_sample_floor};
+use super::sampling_alloc::epsilon_sample_floor;
 
 /// Static configuration for one monitor, sourced from the streaming-config
 /// `monitors:` section (τ authoritative here, not at the edge).
@@ -235,42 +235,31 @@ impl Monitor {
     /// 1/√rate_i`). With <2 edges or all rates unknown the allocation degenerates
     /// to `p=1` everywhere (no sampling).
     fn allocate_p(&self) -> HashMap<String, f64> {
-        // Stable edge order so the rate / freq vectors align with the p vector.
-        let ids: Vec<&String> = self.edges.keys().collect();
-        let rates: Vec<f64> = ids.iter().map(|id| self.edges[*id].rate).collect();
-        // Per-key frequency `f_i` = the monitored functional's value this edge
-        // knows this epoch (`known_value`: the cms_point key frequency, or the
-        // edge's contribution to the monitored sum), which is DISTINCT from the
-        // edge's total update `rate`. Feeding `f_i` (not `rates`) into the KKT
-        // allocation is what makes `p_i ∝ √(f_i/rate_i)` differentiate by the
-        // monitored key's *share* of each edge's stream. Previously this passed
-        // `rates` as both vectors → `√(rate_i/rate_i)=1` for every edge → a
-        // uniform allocation, with ALL differentiation left to the ε-floor;
-        // now the allocation itself is freq-driven (an edge that carries more of
-        // the monitored key at equal total rate keeps a higher p). An edge with
-        // no monitored-key mass yet (`known_value=0`) falls back to `p_i=1`
-        // (allocate_sample_rates: `freqs_i ≤ 0 ⇒ p_i=1`), i.e. nothing to sample.
-        let freqs: Vec<f64> = ids.iter().map(|id| self.edges[*id].known_value).collect();
-        let var_budget = {
-            let band = self.cfg.epsilon * self.cfg.tau;
-            band * band
-        };
-        let mut p_vec = allocate_sample_rates(&rates, &freqs, var_budget);
-        // Enforce the CDM-threshold coupling floor per edge: never sample so hard
-        // that ε_s = √((1−p)/(p·rate)) exceeds the agg's ε.
-        for (i, &rate) in rates.iter().enumerate() {
-            let floor = epsilon_sample_floor(self.cfg.epsilon, rate);
-            if p_vec[i] < floor {
-                p_vec[i] = floor;
-            }
-        }
-        ids.into_iter()
-            .cloned()
-            .zip(p_vec)
-            .map(|(id, p)| {
-                // Single edge or unknown rate ⇒ no sampling (p=1).
-                let p = if p > 0.0 && p <= 1.0 { p } else { 1.0 };
-                (id, p)
+        // Coordinated update-sampling for a SKETCH is governed by the whole-sketch
+        // ε-floor — a single law, NOT a per-key `√(f_i/rate_i)` KKT allocation.
+        //
+        // Why: the sampling protects the warm SKETCH's accuracy. A sketch point/L2
+        // estimate's error is bounded by the sketch NORM (‖f‖, rate-spread over
+        // buckets — NitroSketch), never by a single key's `f(x)`. So the only
+        // accuracy a per-edge `p_i` can buy is "keep this edge's L2 contribution
+        // within ε", i.e. ε_s = √((1−p)/(p·rate)) ≤ ε, which gives
+        //     p_i = 1/(1 + ε²·rate_i)        (the CDM-threshold coupling floor).
+        // The `√(freq/rate)` allocation only holds when a key is EXACT-counted
+        // OUTSIDE the sketch (then sampling that one counter is pointless anyway),
+        // so it is not a valid sketch-sampling regime — it has been retired. The
+        // monitored functional (cms_point / f2 / sum) still drives the THRESHOLD
+        // (`known_value` → `global_estimate`/alert); it no longer drives sampling.
+        // See `monitor` module docs for the derivation.
+        self.edges
+            .iter()
+            .map(|(id, e)| {
+                // Unknown rate ⇒ no sampling (p=1).
+                let p = if e.rate > 0.0 {
+                    epsilon_sample_floor(self.cfg.epsilon, e.rate)
+                } else {
+                    1.0
+                };
+                (id.clone(), p)
             })
             .collect()
     }
@@ -484,61 +473,42 @@ mod tests {
     }
 
     #[test]
-    fn skewed_rates_yield_differentiated_sample_p_above_floor() {
-        // Two edges, skewed reported rates: the hot edge should be sampled
-        // harder (smaller p) than the quiet edge, and BOTH must sit at/above the
-        // ε-derived coupling floor. τ is large so the monitor stays in the grant
-        // (not alert) regime while we exercise the allocation.
+    fn skewed_rates_yield_sample_p_at_the_epsilon_floor() {
+        // The whole-sketch sampling law: p_i = ε-floor(rate_i). The hot (high-rate)
+        // edge is sampled harder (smaller p) than the quiet edge, and each p sits
+        // EXACTLY at its rate's ε-floor. τ is large so no alert fires.
         let mut m = Monitor::new(cfg(1_000_000.0)); // epsilon 0.05
         m.on_register("e1", 60_000, 0);
         m.on_register("e2", 60_000, 0);
-        // e1 hot (100k items/win), e2 quiet (1k/win). Small local values keep us
-        // far from τ so no alert fires.
-        m.on_report("e1", 0, 1.0, 1, 100_000.0);
-        let a = m.on_report("e2", 0, 1.0, 1, 1_000.0);
+        m.on_report("e1", 0, 1.0, 1, 100_000.0); // hot: 100k items/win
+        let a = m.on_report("e2", 0, 1.0, 1, 1_000.0); // quiet: 1k/win
         let p_hot = sample_p_in(&a, "e1");
         let p_quiet = sample_p_in(&a, "e2");
-        assert!(
-            p_hot < p_quiet,
-            "hot edge p {p_hot} should be < quiet edge p {p_quiet}"
-        );
-        // Both respect the ε-derived floor for their rate.
         let eps = m.cfg.epsilon;
-        assert!(p_hot >= epsilon_sample_floor(eps, 100_000.0) - 1e-9);
-        assert!(p_quiet >= epsilon_sample_floor(eps, 1_000.0) - 1e-9);
-        assert!(p_hot > 0.0 && p_hot <= 1.0);
-        assert!(p_quiet > 0.0 && p_quiet <= 1.0);
+        assert!(p_hot < p_quiet, "hot p {p_hot} should be < quiet p {p_quiet}");
+        assert!((p_hot - epsilon_sample_floor(eps, 100_000.0)).abs() < 1e-12);
+        assert!((p_quiet - epsilon_sample_floor(eps, 1_000.0)).abs() < 1e-12);
         // Slack countdown unaffected: both grants carry the same (positive) slack.
         assert!(slack_in(&a, "e1") > 0.0);
         assert_eq!(slack_in(&a, "e1"), slack_in(&a, "e2"));
     }
 
     #[test]
-    fn per_key_freq_differentiates_at_equal_rate() {
-        // EQUAL total rate, but different monitored-key frequency (`known_value`):
-        // the edge carrying more of the monitored key keeps a HIGHER p (sampled
-        // less), since p_i ∝ √(f_i/rate_i) and rate cancels. Under the old
-        // freqs==rates this returned a UNIFORM p (same rate ⇒ same floor ⇒ tie),
-        // so this test fails on the pre-fix code — it pins the freq-driven branch.
-        // High rate ⇒ low ε-floor, modest τ ⇒ tight var_budget, so the allocation
-        // (not the floor) is the operative differentiator.
-        let mut m = Monitor::new(cfg(2_000.0)); // epsilon 0.05 ⇒ var_budget=(100)^2
+    fn sampling_is_rate_floor_independent_of_monitored_freq() {
+        // Unified law: p_i = ε-floor(rate_i), the whole-sketch sampling law — it
+        // depends ONLY on rate, never on the monitored-key frequency
+        // (`known_value`). EQUAL rate but very different known_value ⇒ EQUAL p.
+        // (The retired `√(f_i/rate_i)` allocation would have differentiated here;
+        // it does not, because sketch accuracy is rate/L2-bounded, not per-key.)
+        let mut m = Monitor::new(cfg(2_000.0));
         m.on_register("e1", 60_000, 0);
         m.on_register("e2", 60_000, 0);
-        // same rate (100k/win); e1 sees the monitored key 10× more than e2.
         m.on_report("e1", 0, 900.0, 1, 100_000.0); // known_value=900
-        let a = m.on_report("e2", 0, 90.0, 1, 100_000.0); // known_value=90
+        let a = m.on_report("e2", 0, 90.0, 1, 100_000.0); // known_value=90, same rate
         let p_e1 = sample_p_in(&a, "e1");
         let p_e2 = sample_p_in(&a, "e2");
-        let floor = epsilon_sample_floor(m.cfg.epsilon, 100_000.0);
-        assert!(
-            p_e1 > p_e2,
-            "high-freq edge p {p_e1} should exceed low-freq p {p_e2} (freq-driven, not floor)"
-        );
-        // Both sit ABOVE the (equal) rate-floor, proving the allocation — not the
-        // floor — produced the spread.
-        assert!(p_e1 > floor + 1e-6 && p_e2 > floor + 1e-6,
-            "both p ({p_e1}, {p_e2}) should exceed the equal rate-floor {floor}");
+        assert_eq!(p_e1, p_e2, "equal rate ⇒ equal p regardless of monitored freq");
+        assert!((p_e1 - epsilon_sample_floor(m.cfg.epsilon, 100_000.0)).abs() < 1e-12);
     }
 
     #[test]

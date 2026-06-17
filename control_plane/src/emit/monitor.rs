@@ -25,6 +25,11 @@ pub enum Functional {
     Sum,
     CmsPoint,
     LinearBuckets,
+    /// Whole-sketch second frequency moment F2 = ‖f‖₂². Monitors the entire
+    /// sketch's L2 mass (no per-point key) so any future point query stays within
+    /// ε — see `data_plane::monitor` module docs for the whole-sketch-vs-point
+    /// decision rule. The edge reports its local F2 = Σ_x f_i(x)² as the value.
+    F2,
 }
 
 impl Functional {
@@ -33,6 +38,7 @@ impl Functional {
             Functional::Sum => "sum",
             Functional::CmsPoint => "cms_point",
             Functional::LinearBuckets => "linear_buckets",
+            Functional::F2 => "f2",
         }
     }
 
@@ -41,6 +47,7 @@ impl Functional {
         match s {
             "cms_point" => Functional::CmsPoint,
             "linear_buckets" => Functional::LinearBuckets,
+            "f2" | "l2" => Functional::F2,
             _ => Functional::Sum,
         }
     }
@@ -118,6 +125,7 @@ pub fn edge_threshold_block(intent: &MonitorIntent) -> Value {
 pub fn streaming_config_monitor_entry(intent: &MonitorIntent) -> serde_json::Value {
     serde_json::json!({
         "agg_id": agg_id_for_metric(&intent.metric),
+        "functional": intent.functional.as_str(),
         "key": intent.key,
         "tau": intent.tau,
         "epsilon": intent.epsilon,
