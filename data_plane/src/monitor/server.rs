@@ -31,9 +31,12 @@ type EdgeTx = mpsc::Sender<Result<CoordToEdge, Status>>;
 pub struct MonitorCoordinator {
     /// Live per-monitor state machines, created lazily from `cfgs`.
     monitors: Mutex<HashMap<MonKey, Monitor>>,
-    /// Static monitor specs (τ, ε, window) from the streaming-config
-    /// `monitors:` section — the authoritative source of τ.
-    cfgs: HashMap<MonKey, MonitorConfig>,
+    /// Monitor specs (τ, ε, window) from the streaming-config `monitors:`
+    /// section — the authoritative source of τ. Behind an `RwLock` so the
+    /// control plane's hot-reload (`reconfigure`) can add/update/remove monitors
+    /// on a live coordinator without a process restart. Held only for brief,
+    /// non-`await` critical sections, so a `std` lock is safe in async code.
+    cfgs: std::sync::RwLock<HashMap<MonKey, MonitorConfig>>,
     /// Outbound stream sender per connected edge.
     edges: Mutex<HashMap<String, EdgeTx>>,
     /// Alert egress (control-plane violation sink).
@@ -48,7 +51,7 @@ impl MonitorCoordinator {
             .collect();
         Arc::new(Self {
             monitors: Mutex::new(HashMap::new()),
-            cfgs,
+            cfgs: std::sync::RwLock::new(cfgs),
             edges: Mutex::new(HashMap::new()),
             alert_sink,
         })
@@ -56,7 +59,74 @@ impl MonitorCoordinator {
 
     /// Number of configured monitors (test/observability).
     pub fn monitor_count(&self) -> usize {
-        self.cfgs.len()
+        self.cfgs.read().unwrap().len()
+    }
+
+    /// Hot-reload the monitor set from a freshly-pushed streaming-config.
+    ///
+    /// The coordinator originally read `monitors:` only at boot; a monitor the
+    /// control plane published *after* start (via the `/api/v1/streaming-config`
+    /// hot-reload POST) never reached it, so every edge registering for that
+    /// monitor was rejected as "unconfigured". This applies the new spec list to
+    /// the live coordinator:
+    ///   * **added** specs become matchable immediately (the next register
+    ///     lazily builds the `Monitor`);
+    ///   * **changed** specs (different τ/ε/window for an existing key) drop the
+    ///     stale live `Monitor` so the next register rebuilds it under the new
+    ///     spec — the edge re-registers every epoch, so this self-heals within
+    ///     one window;
+    ///   * **removed** specs drop both the spec and any live state.
+    /// Unchanged monitors keep their in-flight slack-countdown state untouched.
+    ///
+    /// Returns `(added, changed, removed)` counts for observability. Idempotent:
+    /// re-applying the same specs is a no-op that returns `(0, 0, 0)`.
+    pub async fn reconfigure(&self, specs: Vec<MonitorConfig>) -> (usize, usize, usize) {
+        let new_cfgs: HashMap<MonKey, MonitorConfig> = specs
+            .into_iter()
+            .map(|c| ((c.agg_id, c.key.clone()), c))
+            .collect();
+
+        // Diff against the current specs to find keys to evict from live state
+        // (removed, or changed so the live Monitor's τ is stale).
+        let (added, changed, removed, evict): (usize, usize, usize, Vec<MonKey>) = {
+            let old = self.cfgs.read().unwrap();
+            let mut added = 0;
+            let mut changed = 0;
+            let mut evict = Vec::new();
+            for (k, c) in new_cfgs.iter() {
+                match old.get(k) {
+                    None => added += 1,
+                    Some(prev) if prev != c => {
+                        changed += 1;
+                        evict.push(k.clone());
+                    }
+                    Some(_) => {}
+                }
+            }
+            let mut removed = 0;
+            for k in old.keys() {
+                if !new_cfgs.contains_key(k) {
+                    removed += 1;
+                    evict.push(k.clone());
+                }
+            }
+            (added, changed, removed, evict)
+        };
+
+        if added == 0 && changed == 0 && removed == 0 {
+            return (0, 0, 0);
+        }
+
+        // Swap the spec map first so any register racing the eviction below sees
+        // the new spec (and rebuilds correctly), then drop stale live state.
+        *self.cfgs.write().unwrap() = new_cfgs;
+        if !evict.is_empty() {
+            let mut monitors = self.monitors.lock().await;
+            for k in &evict {
+                monitors.remove(k);
+            }
+        }
+        (added, changed, removed)
     }
 
     fn monitor_id(agg_id: u64, key: &[u8]) -> String {
@@ -78,7 +148,7 @@ impl MonitorCoordinator {
         window_start_ms: u64,
     ) -> Option<Vec<Action>> {
         let mk = (agg_id, key.clone());
-        let cfg = self.cfgs.get(&mk)?.clone();
+        let cfg = self.cfgs.read().unwrap().get(&mk)?.clone();
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.entry(mk).or_insert_with(|| Monitor::new(cfg));
         Some(mon.on_register(edge_id, epoch_window_ms, window_start_ms))
@@ -266,5 +336,83 @@ impl MonitorService for MonitorServiceImpl {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+#[cfg(test)]
+mod reconfigure_tests {
+    use super::MonitorCoordinator;
+    use crate::monitor::alert::AlertSink;
+    use crate::monitor::coordinator::MonitorConfig;
+    use std::sync::Arc;
+
+    fn sink() -> AlertSink {
+        Arc::new(|_v| {})
+    }
+
+    fn cfg(agg_id: u64, key: &str, tau: f64) -> MonitorConfig {
+        MonitorConfig {
+            agg_id,
+            key: key.as_bytes().to_vec(),
+            tau,
+            epsilon: 0.2,
+            window_ms: 15_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconfigure_adds_changes_and_removes_specs() {
+        // Boot with one sum monitor.
+        let coord = MonitorCoordinator::new(vec![cfg(1, "", 100.0)], sink());
+        assert_eq!(coord.monitor_count(), 1);
+
+        // Add a cms_point monitor (agg 2, key s0) and change agg 1's τ; agg 1's
+        // key "" stays but τ differs -> counts as a change. Nothing removed.
+        let (added, changed, removed) = coord
+            .reconfigure(vec![cfg(1, "", 200.0), cfg(2, "s0", 5000.0)])
+            .await;
+        assert_eq!((added, changed, removed), (1, 1, 0));
+        assert_eq!(coord.monitor_count(), 2);
+
+        // Idempotent: same specs -> no-op.
+        assert_eq!(
+            coord
+                .reconfigure(vec![cfg(1, "", 200.0), cfg(2, "s0", 5000.0)])
+                .await,
+            (0, 0, 0)
+        );
+
+        // Drop agg 1, keep agg 2 unchanged.
+        let (added, changed, removed) =
+            coord.reconfigure(vec![cfg(2, "s0", 5000.0)]).await;
+        assert_eq!((added, changed, removed), (0, 0, 1));
+        assert_eq!(coord.monitor_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconfigure_evicts_live_state_for_changed_monitor() {
+        let coord = MonitorCoordinator::new(vec![cfg(7, "s0", 5000.0)], sink());
+        // A register materializes live Monitor state for (7, s0).
+        let actions = coord
+            .apply_register(7, b"s0".to_vec(), "edge-a", 15_000, 15_000)
+            .await;
+        assert!(actions.is_some(), "register for a configured monitor succeeds");
+        assert_eq!(coord.monitors.lock().await.len(), 1);
+
+        // Changing the spec (new τ) must drop the stale live state so the next
+        // register rebuilds the Monitor under the new τ.
+        let (_, changed, _) = coord.reconfigure(vec![cfg(7, "s0", 9000.0)]).await;
+        assert_eq!(changed, 1);
+        assert_eq!(
+            coord.monitors.lock().await.len(),
+            0,
+            "changed monitor's live state evicted"
+        );
+
+        // An unconfigured key is still rejected after reconfigure.
+        assert!(coord
+            .apply_register(7, b"other".to_vec(), "edge-a", 15_000, 15_000)
+            .await
+            .is_none());
     }
 }

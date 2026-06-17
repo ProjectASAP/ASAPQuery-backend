@@ -34,7 +34,7 @@ use super::sampling_alloc::{allocate_sample_rates, epsilon_sample_floor};
 
 /// Static configuration for one monitor, sourced from the streaming-config
 /// `monitors:` section (τ authoritative here, not at the edge).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MonitorConfig {
     pub agg_id: u64,
     pub key: Vec<u8>,
