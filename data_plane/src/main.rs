@@ -612,7 +612,7 @@ async fn main() -> Result<()> {
             })
             .collect();
         if specs.is_empty() {
-            warn!("--enable-monitor-coordinator set but streaming-config has no `monitors:` — coordinator will accept streams but serve nothing");
+            warn!("--enable-monitor-coordinator set but streaming-config has no `monitors:` yet — the coordinator will pick them up live when the control plane pushes a config (hot-reload)");
         }
         let sink: AlertSink = Arc::new(|v| {
             warn!(
@@ -623,6 +623,52 @@ async fn main() -> Result<()> {
             );
         });
         let coord = MonitorCoordinator::new(specs, sink);
+
+        // Hot-reload watcher: the coordinator reads `monitors:` once at boot, but
+        // the control plane pushes the real config slightly AFTER boot via the
+        // `/api/v1/streaming-config` POST (an ArcSwap in `hot_reload_config`).
+        // Without this, a monitor that arrives post-boot never reaches the
+        // coordinator and every edge registering for it is rejected as
+        // "unconfigured". Watch the ArcSwap and re-apply its `monitors:` to the
+        // live coordinator on each swap (cheap: an atomic load + pointer compare
+        // every 2s; `reconfigure` is a no-op unless the spec set actually
+        // changed). The same path covers controller-driven monitor add/remove.
+        {
+            let coord = coord.clone();
+            let hot = hot_reload_config.clone();
+            tokio::spawn(async move {
+                let mut last = hot.snapshot();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let cur = hot.snapshot();
+                    if Arc::ptr_eq(&last, &cur) {
+                        continue;
+                    }
+                    last = cur.clone();
+                    let specs: Vec<MonitorConfig> = cur
+                        .monitors()
+                        .iter()
+                        .map(|m| MonitorConfig {
+                            agg_id: m.agg_id,
+                            key: m.key.clone().into_bytes(),
+                            tau: m.tau,
+                            epsilon: m.epsilon,
+                            window_ms: m.window_ms,
+                        })
+                        .collect();
+                    let (added, changed, removed) = coord.reconfigure(specs).await;
+                    if added + changed + removed > 0 {
+                        info!(
+                            added,
+                            changed,
+                            removed,
+                            "CDM monitor coordinator hot-reloaded monitors from pushed streaming-config"
+                        );
+                    }
+                }
+            });
+        }
+
         let svc = MonitorServiceImpl::new(coord).into_server();
         let port = args.monitor_grpc_port;
         info!("Starting CDM monitor coordinator gRPC on 0.0.0.0:{port}");
