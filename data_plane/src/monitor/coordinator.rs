@@ -235,15 +235,27 @@ impl Monitor {
     /// 1/√rate_i`). With <2 edges or all rates unknown the allocation degenerates
     /// to `p=1` everywhere (no sampling).
     fn allocate_p(&self) -> HashMap<String, f64> {
-        // Stable edge order so the rate vector aligns with the p vector.
+        // Stable edge order so the rate / freq vectors align with the p vector.
         let ids: Vec<&String> = self.edges.keys().collect();
         let rates: Vec<f64> = ids.iter().map(|id| self.edges[*id].rate).collect();
-        // freqs proxy = rates (no per-key split available at the coordinator).
+        // Per-key frequency `f_i` = the monitored functional's value this edge
+        // knows this epoch (`known_value`: the cms_point key frequency, or the
+        // edge's contribution to the monitored sum), which is DISTINCT from the
+        // edge's total update `rate`. Feeding `f_i` (not `rates`) into the KKT
+        // allocation is what makes `p_i ∝ √(f_i/rate_i)` differentiate by the
+        // monitored key's *share* of each edge's stream. Previously this passed
+        // `rates` as both vectors → `√(rate_i/rate_i)=1` for every edge → a
+        // uniform allocation, with ALL differentiation left to the ε-floor;
+        // now the allocation itself is freq-driven (an edge that carries more of
+        // the monitored key at equal total rate keeps a higher p). An edge with
+        // no monitored-key mass yet (`known_value=0`) falls back to `p_i=1`
+        // (allocate_sample_rates: `freqs_i ≤ 0 ⇒ p_i=1`), i.e. nothing to sample.
+        let freqs: Vec<f64> = ids.iter().map(|id| self.edges[*id].known_value).collect();
         let var_budget = {
             let band = self.cfg.epsilon * self.cfg.tau;
             band * band
         };
-        let mut p_vec = allocate_sample_rates(&rates, &rates, var_budget);
+        let mut p_vec = allocate_sample_rates(&rates, &freqs, var_budget);
         // Enforce the CDM-threshold coupling floor per edge: never sample so hard
         // that ε_s = √((1−p)/(p·rate)) exceeds the agg's ε.
         for (i, &rate) in rates.iter().enumerate() {
@@ -499,6 +511,34 @@ mod tests {
         // Slack countdown unaffected: both grants carry the same (positive) slack.
         assert!(slack_in(&a, "e1") > 0.0);
         assert_eq!(slack_in(&a, "e1"), slack_in(&a, "e2"));
+    }
+
+    #[test]
+    fn per_key_freq_differentiates_at_equal_rate() {
+        // EQUAL total rate, but different monitored-key frequency (`known_value`):
+        // the edge carrying more of the monitored key keeps a HIGHER p (sampled
+        // less), since p_i ∝ √(f_i/rate_i) and rate cancels. Under the old
+        // freqs==rates this returned a UNIFORM p (same rate ⇒ same floor ⇒ tie),
+        // so this test fails on the pre-fix code — it pins the freq-driven branch.
+        // High rate ⇒ low ε-floor, modest τ ⇒ tight var_budget, so the allocation
+        // (not the floor) is the operative differentiator.
+        let mut m = Monitor::new(cfg(2_000.0)); // epsilon 0.05 ⇒ var_budget=(100)^2
+        m.on_register("e1", 60_000, 0);
+        m.on_register("e2", 60_000, 0);
+        // same rate (100k/win); e1 sees the monitored key 10× more than e2.
+        m.on_report("e1", 0, 900.0, 1, 100_000.0); // known_value=900
+        let a = m.on_report("e2", 0, 90.0, 1, 100_000.0); // known_value=90
+        let p_e1 = sample_p_in(&a, "e1");
+        let p_e2 = sample_p_in(&a, "e2");
+        let floor = epsilon_sample_floor(m.cfg.epsilon, 100_000.0);
+        assert!(
+            p_e1 > p_e2,
+            "high-freq edge p {p_e1} should exceed low-freq p {p_e2} (freq-driven, not floor)"
+        );
+        // Both sit ABOVE the (equal) rate-floor, proving the allocation — not the
+        // floor — produced the spread.
+        assert!(p_e1 > floor + 1e-6 && p_e2 > floor + 1e-6,
+            "both p ({p_e1}, {p_e2}) should exceed the equal rate-floor {floor}");
     }
 
     #[test]
