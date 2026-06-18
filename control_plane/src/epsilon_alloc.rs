@@ -19,7 +19,11 @@
 //! control_plane has no dependency on data_plane, so the canonical one-liner is
 //! re-stated here — keep the two in sync.)
 
-use crate::query_planning::QuerySetPlan;
+use std::collections::HashMap;
+
+use serde::Serialize;
+
+use crate::query_planning::{plan_sketches_for_queries, QuerySetPlan};
 use crate::types::SketchType;
 
 /// Admission sampling probability under the unified ε-floor law,
@@ -96,6 +100,79 @@ pub fn allocate_knobs(
         .collect()
 }
 
+/// Wire-serializable view of one planned metric (`POST /api/v1/plan/auto`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlannedMetric {
+    pub metric: String,
+    pub sketches: Vec<SketchType>,
+    pub sample_p: f64,
+    pub delta_threshold: Option<f64>,
+}
+
+/// A query routed to the cold tier, with the human-readable reason.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ColdEntry {
+    pub query: String,
+    pub reason: Option<String>,
+}
+
+/// The full autonomous-allocation response: per-metric warm plan + cold-tier
+/// fallthrough, for a given `(ε, queries)` (and optional rate/monitor inputs).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutoPlanResponse {
+    pub epsilon: f64,
+    pub metrics: Vec<PlannedMetric>,
+    pub cold_only: Vec<ColdEntry>,
+}
+
+/// End-to-end autonomous allocation: `(ε, queries) → AutoPlanResponse`.
+///
+/// Runs slice 2 ([`plan_sketches_for_queries`]) then slice 3
+/// ([`allocate_knobs`]), flattening to a serializable response. `default_rate`
+/// (≈ no sampling when `None`) feeds the ε-floor `p` for every metric;
+/// `monitors[metric] = (τ, sites)` adds the CDM `δ` for monitored metrics.
+/// This is the single function the `/api/v1/plan/auto` handler wraps, kept in
+/// the lib so it is unit-testable without standing up the HTTP server.
+pub fn build_auto_plan<S: AsRef<str>>(
+    epsilon: f64,
+    queries: &[S],
+    default_rate: Option<f64>,
+    monitors: &HashMap<String, (f64, u32)>,
+) -> AutoPlanResponse {
+    let plan = plan_sketches_for_queries(queries.iter().map(|s| s.as_ref()));
+    let rate = default_rate.unwrap_or(1.0);
+    let allocated = allocate_knobs(
+        epsilon,
+        &plan,
+        |_m| rate,
+        |m| monitors.get(m).copied(),
+    );
+
+    let metrics = allocated
+        .into_iter()
+        .map(|a| PlannedMetric {
+            metric: a.metric_name,
+            sketches: a.sketches,
+            sample_p: a.knobs.sample_p,
+            delta_threshold: a.knobs.delta_threshold,
+        })
+        .collect();
+    let cold_only = plan
+        .cold_only
+        .into_iter()
+        .map(|c| ColdEntry {
+            query: c.query,
+            reason: c.reason.map(|r| format!("{r:?}")),
+        })
+        .collect();
+
+    AutoPlanResponse {
+        epsilon,
+        metrics,
+        cold_only,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +229,39 @@ mod tests {
         assert!(
             a.sketches.contains(&SketchType::DDSketch) || a.sketches.contains(&SketchType::KLL)
         );
+    }
+
+    #[test]
+    fn build_auto_plan_end_to_end_over_query_set() {
+        // (ε, queries) → full response. A quantile read + a monitored threshold.
+        let mut monitors = HashMap::new();
+        monitors.insert("latency_ms".to_string(), (7000.0, 4));
+        let resp = build_auto_plan(
+            0.05,
+            &[
+                "quantile_over_time(0.99, latency_ms[5m])".to_string(),
+                "not valid promql @@@".to_string(),
+            ],
+            Some(2000.0),
+            &monitors,
+        );
+        assert_eq!(resp.epsilon, 0.05);
+        // the quantile metric is planned with a quantile sketch + ε-floor p + δ
+        let m = resp
+            .metrics
+            .iter()
+            .find(|m| m.metric == "latency_ms")
+            .expect("latency_ms planned");
+        assert!(
+            m.sketches.contains(&SketchType::DDSketch) || m.sketches.contains(&SketchType::KLL)
+        );
+        assert!((m.sample_p - 1.0 / 6.0).abs() < 1e-9); // 1/(1+0.0025*2000)
+        assert_eq!(m.delta_threshold, Some(87.5)); // 0.05*7000/4
+        // the unparseable query falls through to cold
+        assert_eq!(resp.cold_only.len(), 1);
+        // and the response serializes to JSON cleanly (the handler's job)
+        let v = serde_json::to_value(&resp).expect("serializes");
+        assert!((v["metrics"][0]["sample_p"].as_f64().unwrap() - 1.0 / 6.0).abs() < 1e-9);
     }
 
     #[test]

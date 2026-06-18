@@ -8,6 +8,7 @@ use control_plane::opamp;
 use control_plane::optimizer;
 use control_plane::physical;
 use control_plane::pipeline;
+use control_plane::epsilon_alloc;
 use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
@@ -551,6 +552,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
+        .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
         .route("/api/v1/plan/:metric", get(handle_get_plan))
         .route("/api/v1/plan/:metric/rollback", post(handle_rollback))
@@ -865,6 +867,56 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         })),
     )
         .into_response()
+}
+
+/// Request body for `POST /api/v1/plan/auto` — autonomous capability-match
+/// allocation. Given a target accuracy `epsilon` and a set of `queries`, the
+/// control plane derives, per metric: which sketch families to allocate (from
+/// the queries' required capabilities), the admission sampling probability
+/// `p = 1/(1+ε²·rate)`, and the CDM delta-transmission slack `δ = ε·τ/sites`
+/// for any metric carrying a monitored threshold. Queries the warm sketch tier
+/// can't answer are returned under `cold_only`.
+#[derive(serde::Deserialize)]
+struct AutoPlanRequest {
+    epsilon: f64,
+    queries: Vec<String>,
+    /// Estimated per-window update rate feeding the ε-floor `p`; applied to
+    /// every metric (a per-metric / runtime-telemetry source is a future
+    /// refinement). Omitted → 1.0 (≈ no sampling).
+    #[serde(default)]
+    default_rate: Option<f64>,
+    /// Optional per-metric CDM monitor thresholds `{metric: {tau, sites}}`.
+    /// Metrics absent here get no delta-transmission knob.
+    #[serde(default)]
+    monitors: std::collections::HashMap<String, AutoMonitor>,
+}
+
+#[derive(serde::Deserialize)]
+struct AutoMonitor {
+    tau: f64,
+    #[serde(default = "default_sites")]
+    sites: u32,
+}
+fn default_sites() -> u32 {
+    1
+}
+
+/// Run the autonomous allocation pipeline (`query_planning` → `epsilon_alloc`)
+/// and return the derived per-metric sketch+knob plan plus the cold-tier
+/// fallthrough set. Pure w.r.t. the request — no shared state needed.
+async fn handle_plan_auto(Json(req): Json<AutoPlanRequest>) -> impl IntoResponse {
+    let monitors: std::collections::HashMap<String, (f64, u32)> = req
+        .monitors
+        .iter()
+        .map(|(m, am)| (m.clone(), (am.tau, am.sites)))
+        .collect();
+    let resp = epsilon_alloc::build_auto_plan(
+        req.epsilon,
+        &req.queries,
+        req.default_rate,
+        &monitors,
+    );
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 /// Request body for `POST /api/v1/plan/pareto`.
