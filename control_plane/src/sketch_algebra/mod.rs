@@ -38,6 +38,7 @@ pub mod physical_expr;
 pub mod rules;
 pub mod schema;
 pub mod sketch_params;
+pub mod sketch_selection;
 
 // Back-compat alias. External call sites that imported
 // `control_plane::sketch_algebra::params::*` (and the in-tree
@@ -59,6 +60,9 @@ pub use capability_matching::{
 pub use lower::{bind_query_expr, BindingError};
 pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 pub use schema::{SketchStateMetadata, SketchStateSchema};
+pub use sketch_selection::{
+    required_sketches_for_capabilities, sketch_families_for_capability, sketch_type_for_handle,
+};
 pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };
