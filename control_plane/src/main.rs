@@ -903,8 +903,13 @@ fn default_sites() -> u32 {
 
 /// Run the autonomous allocation pipeline (`query_planning` → `epsilon_alloc`)
 /// and return the derived per-metric sketch+knob plan plus the cold-tier
-/// fallthrough set. Pure w.r.t. the request — no shared state needed.
-async fn handle_plan_auto(Json(req): Json<AutoPlanRequest>) -> impl IntoResponse {
+/// fallthrough set. The per-metric ε-floor `p` rate is sourced from runtime
+/// telemetry (by allocated sketch family) with the request `default_rate` as
+/// fallback.
+async fn handle_plan_auto(
+    State(st): State<AppState>,
+    Json(req): Json<AutoPlanRequest>,
+) -> impl IntoResponse {
     let monitors: std::collections::HashMap<String, (f64, u32)> = req
         .monitors
         .iter()
@@ -913,7 +918,8 @@ async fn handle_plan_auto(Json(req): Json<AutoPlanRequest>) -> impl IntoResponse
     let resp = epsilon_alloc::build_auto_plan(
         req.epsilon,
         &req.queries,
-        req.default_rate,
+        req.default_rate.unwrap_or(1.0),
+        |_m, sketches| epsilon_alloc::metric_rate_from_telemetry(&st.runtime_samples, sketches),
         &monitors,
     );
     (StatusCode::OK, Json(resp)).into_response()
