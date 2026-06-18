@@ -124,6 +124,11 @@ pub struct AutoPlanResponse {
     pub epsilon: f64,
     pub metrics: Vec<PlannedMetric>,
     pub cold_only: Vec<ColdEntry>,
+    /// Number of metrics actually applied (monitor injected → repost emits it →
+    /// coordinator derives live `p`) when the request set `apply: true`. `None`
+    /// for a dry-run plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<usize>,
 }
 
 /// Best-effort per-metric update rate from runtime telemetry.
@@ -229,6 +234,7 @@ where
         epsilon,
         metrics,
         cold_only,
+        applied: None,
     }
 }
 

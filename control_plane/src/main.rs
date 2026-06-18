@@ -889,6 +889,12 @@ struct AutoPlanRequest {
     /// Metrics absent here get no delta-transmission knob.
     #[serde(default)]
     monitors: std::collections::HashMap<String, AutoMonitor>,
+    /// When true, APPLY the plan: inject a runtime monitor entry per allocated
+    /// metric into the workload registry and trigger a replan, so the backend
+    /// `StreamingConfig` carries the monitor (ε, τ) and the data-plane
+    /// coordinator derives the live ε-floor `p`. Default false = dry-run plan.
+    #[serde(default)]
+    apply: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -896,9 +902,14 @@ struct AutoMonitor {
     tau: f64,
     #[serde(default = "default_sites")]
     sites: u32,
+    #[serde(default = "default_monitor_window_secs")]
+    window_secs: u64,
 }
 fn default_sites() -> u32 {
     1
+}
+fn default_monitor_window_secs() -> u64 {
+    30
 }
 
 /// Run the autonomous allocation pipeline (`query_planning` → `epsilon_alloc`)
@@ -915,13 +926,53 @@ async fn handle_plan_auto(
         .iter()
         .map(|(m, am)| (m.clone(), (am.tau, am.sites)))
         .collect();
-    let resp = epsilon_alloc::build_auto_plan(
+    let mut resp = epsilon_alloc::build_auto_plan(
         req.epsilon,
         &req.queries,
         req.default_rate.unwrap_or(1.0),
         |_m, sketches| epsilon_alloc::metric_rate_from_telemetry(&st.runtime_samples, sketches),
         &monitors,
     );
+
+    if req.apply {
+        // Inject a runtime workload entry per allocated metric carrying the
+        // chosen sketch + monitor(ε, τ). monitor_intents() overlays these, so
+        // the next backend repost emits them and the coordinator derives the
+        // live ε-floor p. We trigger replan_all() to expedite (the 60s repost
+        // ticker would otherwise pick them up).
+        let mut applied = 0usize;
+        for m in &resp.metrics {
+            let monitor = req.monitors.get(&m.metric).map(|am| {
+                control_plane::workload::MonitorDecl {
+                    tau: am.tau,
+                    functional: "sum".to_string(),
+                    key: String::new(),
+                    epsilon: req.epsilon,
+                    window_secs: am.window_secs,
+                }
+            });
+            let entry = control_plane::workload::WorkloadEntry {
+                metric_name: m.metric.clone(),
+                query_string: None,
+                accuracy_sla: (1.0 - req.epsilon).clamp(0.0, 1.0),
+                assign_to_role: "agent".to_string(),
+                sketch_family_override: m.sketches.first().cloned(),
+                target_path: None,
+                grouping_labels: Vec::new(),
+                // The coordinator derives the live p from the monitor ε; the
+                // static sample_p stays 1.0 (no double-sampling).
+                sample_p: 1.0,
+                distinct_keys_per_window: None,
+                item_label: None,
+                monitor,
+            };
+            st.workload_registry.insert_runtime(entry);
+            applied += 1;
+        }
+        st.replanner.replan_all().await;
+        resp.applied = Some(applied);
+    }
+
     (StatusCode::OK, Json(resp)).into_response()
 }
 
