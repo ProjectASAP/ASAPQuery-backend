@@ -69,6 +69,7 @@ pub mod optimizer;
 pub mod physical;
 pub mod pipeline;
 pub mod query_parser;
+pub mod query_planning;
 pub mod replan;
 pub mod runtime_samples;
 pub mod sketch_algebra;
