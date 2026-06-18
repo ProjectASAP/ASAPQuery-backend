@@ -935,41 +935,71 @@ async fn handle_plan_auto(
     );
 
     if req.apply {
-        // Inject a runtime workload entry per allocated metric carrying the
-        // chosen sketch + monitor(ε, τ). monitor_intents() overlays these, so
-        // the next backend repost emits them and the coordinator derives the
-        // live ε-floor p. We trigger replan_all() to expedite (the 60s repost
-        // ticker would otherwise pick them up).
+        use control_plane::workload::{derive_agg_role, MonitorDecl, WorkloadEntry};
+        // Chosen sketch per metric (first candidate family).
+        let chosen: std::collections::HashMap<String, control_plane::types::SketchType> = resp
+            .metrics
+            .iter()
+            .filter_map(|m| m.sketches.first().map(|s| (m.metric.clone(), s.clone())))
+            .collect();
+
+        // For each query: analyze → QueryWorkload, pin the chosen sketch, register
+        // it in the workload_store (so replan emits the SKETCH plan) AND inject a
+        // runtime registry entry carrying the monitor (so the repost emits the
+        // monitor(ε,τ) → the coordinator derives the live ε-floor p). Then replan
+        // the (metric, role) to push both to the data-plane now.
         let mut applied = 0usize;
-        for m in &resp.metrics {
-            let monitor = req.monitors.get(&m.metric).map(|am| {
-                control_plane::workload::MonitorDecl {
-                    tau: am.tau,
-                    functional: "sum".to_string(),
-                    key: String::new(),
-                    epsilon: req.epsilon,
-                    window_secs: am.window_secs,
-                }
+        let mut done: std::collections::HashSet<(String, _)> = std::collections::HashSet::new();
+        for q in &req.queries {
+            let spec: pipeline::QuerySpec =
+                match serde_json::from_value(json!({ "query_string": q })) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+            let mut wl = match st.analyzer.analyze(spec) {
+                Ok(w) => w,
+                Err(_) => continue, // unparseable / cold-only query
+            };
+            let metric = wl.metric_name.clone();
+            let Some(sketch) = chosen.get(&metric).cloned() else {
+                continue; // query routed cold (no sketch allocated)
+            };
+            wl.sketch_type_override = Some(sketch.clone());
+
+            let monitor = req.monitors.get(&metric).map(|am| MonitorDecl {
+                tau: am.tau,
+                functional: "sum".to_string(),
+                key: String::new(),
+                epsilon: req.epsilon,
+                window_secs: am.window_secs,
             });
-            let entry = control_plane::workload::WorkloadEntry {
-                metric_name: m.metric.clone(),
-                query_string: None,
+            let entry = WorkloadEntry {
+                metric_name: metric.clone(),
+                query_string: Some(q.clone()),
                 accuracy_sla: (1.0 - req.epsilon).clamp(0.0, 1.0),
                 assign_to_role: "agent".to_string(),
-                sketch_family_override: m.sketches.first().cloned(),
+                sketch_family_override: Some(sketch),
                 target_path: None,
                 grouping_labels: Vec::new(),
-                // The coordinator derives the live p from the monitor ε; the
-                // static sample_p stays 1.0 (no double-sampling).
+                // Coordinator derives live p from the monitor ε; keep static 1.0.
                 sample_p: 1.0,
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor,
             };
+            let role = derive_agg_role(&entry);
             st.workload_registry.insert_runtime(entry);
-            applied += 1;
+            st.workload_store.set(
+                &metric,
+                role,
+                wl,
+                control_plane::types::WorkloadCharacteristics::default(),
+            );
+            if done.insert((metric.clone(), role)) {
+                st.replanner.replan_metric_role(&metric, role).await;
+                applied += 1;
+            }
         }
-        st.replanner.replan_all().await;
         resp.applied = Some(applied);
     }
 
