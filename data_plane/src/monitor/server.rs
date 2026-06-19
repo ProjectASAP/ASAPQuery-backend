@@ -148,7 +148,22 @@ impl MonitorCoordinator {
         window_start_ms: u64,
     ) -> Option<Vec<Action>> {
         let mk = (agg_id, key.clone());
-        let cfg = self.cfgs.read().unwrap().get(&mk)?.clone();
+        let cfg = {
+            let cfgs = self.cfgs.read().unwrap();
+            match cfgs.get(&mk) {
+                Some(c) => c.clone(),
+                None => {
+                    warn!(
+                        agg_id,
+                        req_key = ?key,
+                        req_key_len = key.len(),
+                        configured = ?cfgs.keys().map(|(a, k)| format!("{a}/len{}", k.len())).collect::<Vec<_>>(),
+                        "apply_register MISS — (agg_id,key) not in cfgs"
+                    );
+                    return None;
+                }
+            }
+        };
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.entry(mk).or_insert_with(|| Monitor::new(cfg));
         Some(mon.on_register(edge_id, epoch_window_ms, window_start_ms))
