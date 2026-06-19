@@ -902,14 +902,41 @@ struct AutoMonitor {
     tau: f64,
     #[serde(default = "default_sites")]
     sites: u32,
-    #[serde(default = "default_monitor_window_secs")]
-    window_secs: u64,
+    /// CDM epoch (seconds) the monitor is bound to. MUST equal the edge's
+    /// reporting epoch (its SDK window) or the coordinator's alignment guard
+    /// silently refuses to grant. Omit to AUTO-DERIVE from the deployment's edge
+    /// epoch (`CONTROLLER_MONITOR_WINDOW_SECS`, default 1s) — see
+    /// `autonomous_monitor_window_secs`.
+    #[serde(default)]
+    window_secs: Option<u64>,
+    /// CDM functional the coordinator monitors: "sum"/"f2" (whole-sketch,
+    /// empty key) or "cms_point" (per-key). Must match what the edge reports.
+    #[serde(default = "default_functional")]
+    functional: String,
+    /// The monitored key (cms_point series id). Empty for sum/f2. Must match
+    /// the key the edge registers under, or the coordinator rejects it.
+    #[serde(default)]
+    key: String,
+}
+fn default_functional() -> String {
+    "sum".to_string()
 }
 fn default_sites() -> u32 {
     1
 }
-fn default_monitor_window_secs() -> u64 {
-    30
+
+/// The CDM epoch (seconds) autonomous monitors bind to, when the request does
+/// not pin one. This MUST equal the edge's reporting epoch (its SDK window):
+/// the coordinator's `on_register` alignment guard refuses to grant when
+/// `monitor.window_ms != edge.epoch_window_ms`, so a mismatch silently no-ops
+/// the whole sampling loop. Defaults to 1s (the standard edge SDK window);
+/// override per-deployment with `CONTROLLER_MONITOR_WINDOW_SECS`.
+fn autonomous_monitor_window_secs() -> u64 {
+    std::env::var("CONTROLLER_MONITOR_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(1)
 }
 
 /// Run the autonomous allocation pipeline (`query_planning` → `epsilon_alloc`)
@@ -936,70 +963,67 @@ async fn handle_plan_auto(
 
     if req.apply {
         use control_plane::workload::{derive_agg_role, MonitorDecl, WorkloadEntry};
-        // Chosen sketch per metric (first candidate family).
-        let chosen: std::collections::HashMap<String, control_plane::types::SketchType> = resp
-            .metrics
-            .iter()
-            .filter_map(|m| m.sketches.first().map(|s| (m.metric.clone(), s.clone())))
-            .collect();
-
-        // For each query: analyze → QueryWorkload, pin the chosen sketch, register
-        // it in the workload_store (so replan emits the SKETCH plan) AND inject a
-        // runtime registry entry carrying the monitor (so the repost emits the
-        // monitor(ε,τ) → the coordinator derives the live ε-floor p). Then replan
-        // the (metric, role) to push both to the data-plane now.
         let mut applied = 0usize;
-        let mut done: std::collections::HashSet<(String, _)> = std::collections::HashSet::new();
-        for q in &req.queries {
-            let spec: pipeline::QuerySpec =
-                match serde_json::from_value(json!({ "query_string": q })) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-            let mut wl = match st.analyzer.analyze(spec) {
-                Ok(w) => w,
-                Err(_) => continue, // unparseable / cold-only query
-            };
-            let metric = wl.metric_name.clone();
-            let Some(sketch) = chosen.get(&metric).cloned() else {
-                continue; // query routed cold (no sketch allocated)
-            };
-            wl.sketch_type_override = Some(sketch.clone());
-
+        for m in &resp.metrics {
+            let metric = m.metric.clone();
+            let sketch = m.sketches.first().cloned();
             let monitor = req.monitors.get(&metric).map(|am| MonitorDecl {
                 tau: am.tau,
-                functional: "sum".to_string(),
-                key: String::new(),
+                functional: am.functional.clone(),
+                key: am.key.clone(),
                 epsilon: req.epsilon,
-                window_secs: am.window_secs,
+                // Auto-derive the CDM window to the edge epoch unless pinned —
+                // a mismatch silently no-ops the grant (alignment guard).
+                window_secs: am.window_secs.unwrap_or_else(autonomous_monitor_window_secs),
             });
             let entry = WorkloadEntry {
                 metric_name: metric.clone(),
-                query_string: Some(q.clone()),
+                query_string: None,
                 accuracy_sla: (1.0 - req.epsilon).clamp(0.0, 1.0),
                 assign_to_role: "agent".to_string(),
-                sketch_family_override: Some(sketch),
+                sketch_family_override: sketch.clone(),
                 target_path: None,
                 grouping_labels: Vec::new(),
-                // Coordinator derives live p from the monitor ε; keep static 1.0.
+                // Coordinator derives the live p from the monitor ε; keep static 1.0.
                 sample_p: 1.0,
                 distinct_keys_per_window: None,
                 item_label: None,
                 monitor,
             };
             let role = derive_agg_role(&entry);
+            // (1) Inject the monitor unconditionally — only needs the metric name;
+            // monitor_intents() overlays it so the repost emits monitor(ε,τ) and
+            // the data-plane coordinator derives the live ε-floor p.
             st.workload_registry.insert_runtime(entry);
-            st.workload_store.set(
-                &metric,
-                role,
-                wl,
-                control_plane::types::WorkloadCharacteristics::default(),
-            );
-            if done.insert((metric.clone(), role)) {
-                st.replanner.replan_metric_role(&metric, role).await;
-                applied += 1;
+            // (2) Best-effort SKETCH registration: analyze a query for this metric
+            // and register the QueryWorkload (with the chosen sketch) so replan
+            // emits a fresh sketch plan. The pipeline analyzer accepts a narrower
+            // grammar than the planner's, so this is non-fatal on rejection.
+            for q in &req.queries {
+                let Ok(spec) =
+                    serde_json::from_value::<pipeline::QuerySpec>(json!({ "query_string": q }))
+                else {
+                    continue;
+                };
+                if let Ok(mut wl) = st.analyzer.analyze(spec) {
+                    if wl.metric_name == metric {
+                        wl.sketch_type_override = sketch.clone();
+                        st.workload_store.set(
+                            &metric,
+                            role,
+                            wl,
+                            control_plane::types::WorkloadCharacteristics::default(),
+                        );
+                        break;
+                    }
+                }
             }
+            applied += 1;
         }
+        // Push now: replan_all re-posts the cumulative backend config, which
+        // carries the overlaid monitor intents (the 60s repost ticker would
+        // otherwise pick them up).
+        st.replanner.replan_all().await;
         resp.applied = Some(applied);
     }
 
