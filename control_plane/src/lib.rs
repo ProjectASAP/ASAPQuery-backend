@@ -60,6 +60,7 @@
 pub mod accuracy;
 pub mod backend_client;
 pub mod deployment_model;
+pub mod epsilon_alloc;
 pub mod emit;
 pub mod intent_algebra;
 pub mod metrics_exposer;
@@ -69,6 +70,7 @@ pub mod optimizer;
 pub mod physical;
 pub mod pipeline;
 pub mod query_parser;
+pub mod query_planning;
 pub mod replan;
 pub mod runtime_samples;
 pub mod sketch_algebra;

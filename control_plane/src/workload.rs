@@ -362,6 +362,13 @@ where
 #[derive(Debug, Clone)]
 pub struct WorkloadRegistry {
     entries: Vec<WorkloadEntry>,
+    /// Runtime-injected entries — e.g. from the autonomous `/api/v1/plan/auto`
+    /// apply path. Kept SEPARATE from the static YAML `entries` so the static
+    /// accessors (`entries()`, `for_role()`) are byte-for-byte unchanged; only
+    /// monitor emission ([`monitor_intents`]) overlays these. `Arc<RwLock<…>>`
+    /// so cloned registries (AppState + Replanner hold clones) share the same
+    /// runtime injections.
+    runtime: std::sync::Arc<std::sync::RwLock<Vec<WorkloadEntry>>>,
 }
 
 impl WorkloadRegistry {
@@ -375,8 +382,10 @@ impl WorkloadRegistry {
         coordinator_url: &str,
     ) -> Vec<crate::emit::monitor::MonitorIntent> {
         use crate::emit::monitor::{Functional, MonitorIntent};
+        let runtime = self.runtime.read().expect("runtime registry lock poisoned");
         self.entries
             .iter()
+            .chain(runtime.iter())
             .filter_map(|e| {
                 let m = e.monitor.as_ref()?;
                 Some(MonitorIntent {
@@ -393,35 +402,61 @@ impl WorkloadRegistry {
             .collect()
     }
 
+    /// Inject (or replace, keyed by `metric_name`) a runtime workload entry.
+    /// Used by the autonomous-allocation apply path to register a synthesized
+    /// monitor so the next replan/repost emits it into the backend
+    /// `StreamingConfig` (the coordinator then derives the ε-floor `p`). Shared
+    /// across registry clones via the `Arc<RwLock<…>>` overlay.
+    pub fn insert_runtime(&self, entry: WorkloadEntry) {
+        let mut rt = self.runtime.write().expect("runtime registry lock poisoned");
+        rt.retain(|e| e.metric_name != entry.metric_name);
+        rt.push(entry);
+    }
+
     /// Load from a YAML file. Returns an empty registry on any error.
     pub fn load(path: &str) -> Self {
         match std::fs::read_to_string(path) {
             Ok(contents) => match serde_yaml::from_str::<Vec<WorkloadEntry>>(&contents) {
                 Ok(entries) => {
                     info!(path, count = entries.len(), "loaded workload registry");
-                    Self { entries }
+                    Self {
+                    entries,
+                    runtime: Default::default(),
+                }
                 }
                 Err(e) => {
                     warn!(path, error = %e, "invalid workloads YAML; using empty registry");
-                    Self { entries: vec![] }
+                    Self {
+                    entries: vec![],
+                    runtime: Default::default(),
+                }
                 }
             },
             Err(_) => {
                 info!(path, "workloads file not found; using empty registry");
-                Self { entries: vec![] }
+                Self {
+                    entries: vec![],
+                    runtime: Default::default(),
+                }
             }
         }
     }
 
     /// Create an empty registry (no file).
     pub fn empty() -> Self {
-        Self { entries: vec![] }
+        Self {
+            entries: vec![],
+            runtime: Default::default(),
+        }
     }
 
     /// Create a registry from in-memory entries (useful for tests and
     /// programmatic construction).
     pub fn from_entries(entries: Vec<WorkloadEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            runtime: Default::default(),
+        }
     }
 
     /// Returns all workload entries.
@@ -474,7 +509,7 @@ mod tests {
   assign_to_role: agent
 "#;
         let entries: Vec<WorkloadEntry> = serde_yaml::from_str(yaml).expect("parse workload yaml");
-        let reg = WorkloadRegistry { entries };
+        let reg = WorkloadRegistry::from_entries(entries);
         let intents = reg.monitor_intents("data-plane:4319");
         assert_eq!(intents.len(), 1, "only the entry with a monitor decl");
         let i = &intents[0];
@@ -502,6 +537,63 @@ mod tests {
     }
 
     #[test]
+    fn runtime_injected_monitor_is_emitted() {
+        // autonomous apply path: insert a runtime entry carrying a monitor and
+        // assert monitor_intents() overlays it (the static accessors stay empty).
+        let reg = WorkloadRegistry::empty();
+        assert!(reg.monitor_intents("dp:4319").is_empty());
+        reg.insert_runtime(WorkloadEntry {
+            metric_name: "auto_latency".into(),
+            query_string: None,
+            accuracy_sla: 0.01,
+            assign_to_role: "agent".into(),
+            sketch_family_override: Some(crate::types::SketchType::DDSketch),
+            target_path: None,
+            grouping_labels: vec![],
+            sample_p: 1.0,
+            distinct_keys_per_window: None,
+            item_label: None,
+            monitor: Some(MonitorDecl {
+                tau: 7000.0,
+                functional: "sum".into(),
+                key: String::new(),
+                epsilon: 0.05,
+                window_secs: 30,
+            }),
+        });
+        let intents = reg.monitor_intents("dp:4319");
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].metric, "auto_latency");
+        assert_eq!(intents[0].tau, 7000.0);
+        assert_eq!(intents[0].epsilon, 0.05);
+        // static accessors untouched by the runtime overlay
+        assert!(reg.entries().is_empty());
+        // replace-by-metric: re-inserting the same metric does not duplicate
+        reg.insert_runtime(WorkloadEntry {
+            metric_name: "auto_latency".into(),
+            query_string: None,
+            accuracy_sla: 0.01,
+            assign_to_role: "agent".into(),
+            sketch_family_override: Some(crate::types::SketchType::DDSketch),
+            target_path: None,
+            grouping_labels: vec![],
+            sample_p: 1.0,
+            distinct_keys_per_window: None,
+            item_label: None,
+            monitor: Some(MonitorDecl {
+                tau: 9000.0,
+                functional: "sum".into(),
+                key: String::new(),
+                epsilon: 0.05,
+                window_secs: 30,
+            }),
+        });
+        let intents = reg.monitor_intents("dp:4319");
+        assert_eq!(intents.len(), 1, "replaced, not duplicated");
+        assert_eq!(intents[0].tau, 9000.0);
+    }
+
+    #[test]
     fn deserialize_entries() {
         let yaml = r#"
 - metric_name: latency
@@ -523,8 +615,7 @@ mod tests {
 
     #[test]
     fn for_role_filters_correctly() {
-        let reg = WorkloadRegistry {
-            entries: vec![
+        let reg = WorkloadRegistry::from_entries(vec![
                 WorkloadEntry {
                     metric_name: "a".into(),
                     query_string: None,
@@ -564,8 +655,7 @@ mod tests {
                     item_label: None,
                     monitor: None,
                 },
-            ],
-        };
+            ]);
         assert_eq!(reg.for_role("agent").len(), 2);
         assert_eq!(reg.for_role("backend").len(), 1);
         assert_eq!(reg.first_for_role("agent").unwrap().metric_name, "a");

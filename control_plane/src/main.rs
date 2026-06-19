@@ -8,6 +8,7 @@ use control_plane::opamp;
 use control_plane::optimizer;
 use control_plane::physical;
 use control_plane::pipeline;
+use control_plane::epsilon_alloc;
 use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
@@ -551,6 +552,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
+        .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
         .route("/api/v1/plan/:metric", get(handle_get_plan))
         .route("/api/v1/plan/:metric/rollback", post(handle_rollback))
@@ -865,6 +867,167 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         })),
     )
         .into_response()
+}
+
+/// Request body for `POST /api/v1/plan/auto` — autonomous capability-match
+/// allocation. Given a target accuracy `epsilon` and a set of `queries`, the
+/// control plane derives, per metric: which sketch families to allocate (from
+/// the queries' required capabilities), the admission sampling probability
+/// `p = 1/(1+ε²·rate)`, and the CDM delta-transmission slack `δ = ε·τ/sites`
+/// for any metric carrying a monitored threshold. Queries the warm sketch tier
+/// can't answer are returned under `cold_only`.
+#[derive(serde::Deserialize)]
+struct AutoPlanRequest {
+    epsilon: f64,
+    queries: Vec<String>,
+    /// Estimated per-window update rate feeding the ε-floor `p`; applied to
+    /// every metric (a per-metric / runtime-telemetry source is a future
+    /// refinement). Omitted → 1.0 (≈ no sampling).
+    #[serde(default)]
+    default_rate: Option<f64>,
+    /// Optional per-metric CDM monitor thresholds `{metric: {tau, sites}}`.
+    /// Metrics absent here get no delta-transmission knob.
+    #[serde(default)]
+    monitors: std::collections::HashMap<String, AutoMonitor>,
+    /// When true, APPLY the plan: inject a runtime monitor entry per allocated
+    /// metric into the workload registry and trigger a replan, so the backend
+    /// `StreamingConfig` carries the monitor (ε, τ) and the data-plane
+    /// coordinator derives the live ε-floor `p`. Default false = dry-run plan.
+    #[serde(default)]
+    apply: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct AutoMonitor {
+    tau: f64,
+    #[serde(default = "default_sites")]
+    sites: u32,
+    /// CDM epoch (seconds) the monitor is bound to. MUST equal the edge's
+    /// reporting epoch (its SDK window) or the coordinator's alignment guard
+    /// silently refuses to grant. Omit to AUTO-DERIVE from the deployment's edge
+    /// epoch (`CONTROLLER_MONITOR_WINDOW_SECS`, default 1s) — see
+    /// `autonomous_monitor_window_secs`.
+    #[serde(default)]
+    window_secs: Option<u64>,
+    /// CDM functional the coordinator monitors: "sum"/"f2" (whole-sketch,
+    /// empty key) or "cms_point" (per-key). Must match what the edge reports.
+    #[serde(default = "default_functional")]
+    functional: String,
+    /// The monitored key (cms_point series id). Empty for sum/f2. Must match
+    /// the key the edge registers under, or the coordinator rejects it.
+    #[serde(default)]
+    key: String,
+}
+fn default_functional() -> String {
+    "sum".to_string()
+}
+fn default_sites() -> u32 {
+    1
+}
+
+/// The CDM epoch (seconds) autonomous monitors bind to, when the request does
+/// not pin one. This MUST equal the edge's reporting epoch (its SDK window):
+/// the coordinator's `on_register` alignment guard refuses to grant when
+/// `monitor.window_ms != edge.epoch_window_ms`, so a mismatch silently no-ops
+/// the whole sampling loop. Defaults to 1s (the standard edge SDK window);
+/// override per-deployment with `CONTROLLER_MONITOR_WINDOW_SECS`.
+fn autonomous_monitor_window_secs() -> u64 {
+    std::env::var("CONTROLLER_MONITOR_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&w| w > 0)
+        .unwrap_or(1)
+}
+
+/// Run the autonomous allocation pipeline (`query_planning` → `epsilon_alloc`)
+/// and return the derived per-metric sketch+knob plan plus the cold-tier
+/// fallthrough set. The per-metric ε-floor `p` rate is sourced from runtime
+/// telemetry (by allocated sketch family) with the request `default_rate` as
+/// fallback.
+async fn handle_plan_auto(
+    State(st): State<AppState>,
+    Json(req): Json<AutoPlanRequest>,
+) -> impl IntoResponse {
+    let monitors: std::collections::HashMap<String, (f64, u32)> = req
+        .monitors
+        .iter()
+        .map(|(m, am)| (m.clone(), (am.tau, am.sites)))
+        .collect();
+    let mut resp = epsilon_alloc::build_auto_plan(
+        req.epsilon,
+        &req.queries,
+        req.default_rate.unwrap_or(1.0),
+        |_m, sketches| epsilon_alloc::metric_rate_from_telemetry(&st.runtime_samples, sketches),
+        &monitors,
+    );
+
+    if req.apply {
+        use control_plane::workload::{derive_agg_role, MonitorDecl, WorkloadEntry};
+        let mut applied = 0usize;
+        for m in &resp.metrics {
+            let metric = m.metric.clone();
+            let sketch = m.sketches.first().cloned();
+            let monitor = req.monitors.get(&metric).map(|am| MonitorDecl {
+                tau: am.tau,
+                functional: am.functional.clone(),
+                key: am.key.clone(),
+                epsilon: req.epsilon,
+                // Auto-derive the CDM window to the edge epoch unless pinned —
+                // a mismatch silently no-ops the grant (alignment guard).
+                window_secs: am.window_secs.unwrap_or_else(autonomous_monitor_window_secs),
+            });
+            let entry = WorkloadEntry {
+                metric_name: metric.clone(),
+                query_string: None,
+                accuracy_sla: (1.0 - req.epsilon).clamp(0.0, 1.0),
+                assign_to_role: "agent".to_string(),
+                sketch_family_override: sketch.clone(),
+                target_path: None,
+                grouping_labels: Vec::new(),
+                // Coordinator derives the live p from the monitor ε; keep static 1.0.
+                sample_p: 1.0,
+                distinct_keys_per_window: None,
+                item_label: None,
+                monitor,
+            };
+            let role = derive_agg_role(&entry);
+            // (1) Inject the monitor unconditionally — only needs the metric name;
+            // monitor_intents() overlays it so the repost emits monitor(ε,τ) and
+            // the data-plane coordinator derives the live ε-floor p.
+            st.workload_registry.insert_runtime(entry);
+            // (2) Best-effort SKETCH registration: analyze a query for this metric
+            // and register the QueryWorkload (with the chosen sketch) so replan
+            // emits a fresh sketch plan. The pipeline analyzer accepts a narrower
+            // grammar than the planner's, so this is non-fatal on rejection.
+            for q in &req.queries {
+                let Ok(spec) =
+                    serde_json::from_value::<pipeline::QuerySpec>(json!({ "query_string": q }))
+                else {
+                    continue;
+                };
+                if let Ok(mut wl) = st.analyzer.analyze(spec) {
+                    if wl.metric_name == metric {
+                        wl.sketch_type_override = sketch.clone();
+                        st.workload_store.set(
+                            &metric,
+                            role,
+                            wl,
+                            control_plane::types::WorkloadCharacteristics::default(),
+                        );
+                        break;
+                    }
+                }
+            }
+            applied += 1;
+        }
+        // Push now: replan_all re-posts the cumulative backend config, which
+        // carries the overlaid monitor intents (the 60s repost ticker would
+        // otherwise pick them up).
+        st.replanner.replan_all().await;
+        resp.applied = Some(applied);
+    }
+
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 /// Request body for `POST /api/v1/plan/pareto`.
