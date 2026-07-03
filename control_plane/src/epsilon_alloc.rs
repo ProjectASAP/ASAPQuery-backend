@@ -52,6 +52,35 @@ pub fn derive_delta_threshold(epsilon: f64, tau: f64, n_sites: u32) -> f64 {
     epsilon * tau / k
 }
 
+/// GOS budget split (design §7, Layer B): divide the residual accuracy budget
+/// `ε_res` (after the sketch takes its `ε_sk` share) between **sampling**
+/// (`ε_sa`, buys edge CPU) and **staleness/threshold** (`ε_st`, buys
+/// communication), keeping `ε_sa² + ε_st² = ε_res²`.
+///
+/// Both costs scale like `1/ε²` in their share, so minimizing
+/// `w_edge·CPU(ε_sa) + w_comm·Comm(ε_st)` under the quadrature constraint gives a
+/// closed form: with `r = √(w_comm/w_edge)` the split is
+/// `ε_sa² = ε_res²/(1+r)`, `ε_st² = ε_res² − ε_sa²`. Limits are intuitive:
+///   * `w_edge = 0` (don't care about edge CPU) ⇒ all budget to `ε_st`, `ε_sa=0`
+///     ⇒ **no sampling** (`p=1`) and cheap communication;
+///   * `w_comm = 0` (don't care about bytes) ⇒ all to `ε_sa` ⇒ coarse sampling,
+///     tight thresholds.
+pub fn split_budget(eps_res: f64, w_edge: f64, w_comm: f64) -> (f64, f64) {
+    if eps_res <= 0.0 {
+        return (0.0, 0.0);
+    }
+    if w_edge <= 0.0 {
+        return (0.0, eps_res); // no CPU concern → no sampling
+    }
+    if w_comm <= 0.0 {
+        return (eps_res, 0.0); // no comm concern → no threshold slack
+    }
+    let r = (w_comm / w_edge).sqrt(); // ε_st²/ε_sa²
+    let sa2 = eps_res * eps_res / (1.0 + r);
+    let st2 = eps_res * eps_res - sa2;
+    (sa2.sqrt(), st2.sqrt())
+}
+
 /// The runtime knobs derived for one metric.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricKnobs {
@@ -248,6 +277,26 @@ mod tests {
         // p = 1/(1+ε²·rate); ε=0.05, rate=1000 → 1/(1+2.5) = 0.2857…
         let p = derive_sample_p(0.05, 1000.0);
         assert!((p - 1.0 / 3.5).abs() < 1e-9, "got {p}");
+    }
+
+    #[test]
+    fn split_budget_quadrature_and_limits() {
+        // Quadrature preserved: ε_sa² + ε_st² = ε_res².
+        let (sa, st) = split_budget(0.1, 1.0, 1.0);
+        assert!((sa * sa + st * st - 0.01).abs() < 1e-12);
+        assert!((sa - st).abs() < 1e-9, "equal weights ⇒ equal split");
+        // No edge-CPU concern ⇒ no sampling, all to thresholds.
+        let (sa, st) = split_budget(0.1, 0.0, 1.0);
+        assert_eq!(sa, 0.0);
+        assert!((st - 0.1).abs() < 1e-12);
+        // No comm concern ⇒ all to sampling.
+        let (sa, st) = split_budget(0.1, 1.0, 0.0);
+        assert!((sa - 0.1).abs() < 1e-12);
+        assert_eq!(st, 0.0);
+        // Higher edge weight ⇒ more budget to sampling (larger ε_sa).
+        let (sa_hi, _) = split_budget(0.1, 4.0, 1.0);
+        let (sa_lo, _) = split_budget(0.1, 1.0, 1.0);
+        assert!(sa_hi > sa_lo);
     }
 
     #[test]

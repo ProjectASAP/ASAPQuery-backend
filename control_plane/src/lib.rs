@@ -75,6 +75,7 @@ pub mod replan;
 pub mod runtime_samples;
 pub mod sketch_algebra;
 pub mod store;
+pub mod threshold_alloc;
 pub mod types;
 pub mod types_v2;
 pub mod workload;
