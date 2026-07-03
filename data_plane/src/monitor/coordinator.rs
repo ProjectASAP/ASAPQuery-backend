@@ -32,6 +32,54 @@ use std::collections::HashMap;
 
 use super::sampling_alloc::epsilon_sample_floor;
 
+/// Which readout of a series' sketch the monitor thresholds. Scalar functionals
+/// (`Sum`/`CmsPoint`/`LinearBuckets`) drive the CMY slack-countdown [`Monitor`];
+/// `F2` is a whole-sketch, non-linear functional handled by the F2 monitors in
+/// [`super::f2`] and routed separately by the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Functional {
+    #[default]
+    Sum,
+    CmsPoint,
+    LinearBuckets,
+    F2,
+}
+
+impl Functional {
+    /// Parse the pushed-config functional string (`streaming_config` /
+    /// `emit/monitor.rs` use the same names). Unknown ⇒ `Sum`.
+    pub fn from_name(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cms_point" | "cms" => Functional::CmsPoint,
+            "linear_buckets" | "linear" => Functional::LinearBuckets,
+            "f2" | "l2" => Functional::F2,
+            _ => Functional::Sum,
+        }
+    }
+    /// Whole-sketch (non-scalar) functional ⇒ routed to the F2 monitors.
+    pub fn is_whole_sketch(&self) -> bool {
+        matches!(self, Functional::F2)
+    }
+}
+
+/// F2 distributed-monitoring variant: ship-every-window baseline vs the
+/// Sharfman–Schuster–Keren geometric safe-zone (ship only on local violation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum F2Mode {
+    #[default]
+    Distributed,
+    Geometric,
+}
+
+impl F2Mode {
+    pub fn from_name(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "geometric" | "geom" | "safezone" | "safe_zone" => F2Mode::Geometric,
+            _ => F2Mode::Distributed,
+        }
+    }
+}
+
 /// Static configuration for one monitor, sourced from the streaming-config
 /// `monitors:` section (τ authoritative here, not at the edge).
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +89,32 @@ pub struct MonitorConfig {
     pub tau: f64,
     pub epsilon: f64,
     pub window_ms: u64,
+    /// Which functional this monitor thresholds. Defaults to `Sum` (the scalar
+    /// countdown) so existing scalar construction sites are unaffected.
+    pub functional: Functional,
+    /// Count-Sketch dimensions for whole-sketch (`F2`) monitors: `d` = depth
+    /// (rows / median groups), `w` = width (buckets/row). Ignored by scalar
+    /// monitors. Must match the edge's configured Count-Sketch for this agg.
+    pub f2_d: usize,
+    pub f2_w: usize,
+    /// F2 monitoring variant (ignored by scalar monitors).
+    pub f2_mode: F2Mode,
+}
+
+impl Default for MonitorConfig {
+    fn default() -> Self {
+        Self {
+            agg_id: 0,
+            key: Vec::new(),
+            tau: 0.0,
+            epsilon: 0.05,
+            window_ms: 0,
+            functional: Functional::Sum,
+            f2_d: 0,
+            f2_w: 0,
+            f2_mode: F2Mode::Distributed,
+        }
+    }
 }
 
 /// An action the coordinator wants the transport to perform.
@@ -313,6 +387,7 @@ mod tests {
             tau,
             epsilon: 0.05,
             window_ms: 60_000,
+            ..Default::default()
         }
     }
 

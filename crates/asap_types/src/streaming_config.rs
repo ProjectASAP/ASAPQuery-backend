@@ -38,6 +38,19 @@ pub struct MonitorSpec {
     pub epsilon: f64,
     /// Tumbling epoch length in ms; MUST match the edge window for this agg_id.
     pub window_ms: u64,
+    /// Count-Sketch depth (rows) for whole-sketch `functional="f2"` monitors.
+    /// 0 (default) for scalar monitors; MUST match the edge's Count-Sketch for
+    /// this agg when F2 (both sides square/merge the same cell matrix).
+    #[serde(default)]
+    pub d: usize,
+    /// Count-Sketch width (buckets/row) for F2 monitors; 0 for scalar.
+    #[serde(default)]
+    pub w: usize,
+    /// F2 monitoring variant: "distributed" (default, ship every window) or
+    /// "geometric" (Sharfman–Schuster–Keren safe-zone, ship on local violation).
+    /// Ignored by scalar monitors.
+    #[serde(default)]
+    pub mode: String,
 }
 
 fn default_monitor_epsilon() -> f64 {

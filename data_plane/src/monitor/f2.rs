@@ -71,7 +71,8 @@ pub struct CountSketchF2 {
     d: usize, // depth (rows / median groups)  ~ log(1/δ)
     w: usize, // width (buckets per row)        ~ 1/ε²
     seed: u64,
-    c: Vec<i64>, // length d*w, row-major
+    c: Vec<f64>, // length d*w, row-major. f64 (not i64) so sampling-rescaled
+                 // (`1/p`) fractional counts round-trip through the wire matrix.
 }
 
 impl CountSketchF2 {
@@ -81,12 +82,45 @@ impl CountSketchF2 {
             d,
             w,
             seed,
-            c: vec![0; d * w],
+            c: vec![0.0; d * w],
         }
+    }
+
+    /// Build directly from a decoded `portable::CountSketch` cell matrix
+    /// (`rows × cols` of `f64` counts) — the wire path. The coordinator only
+    /// ever does matrix arithmetic (merge/norm/drift), never `update()`, so the
+    /// `seed` is irrelevant here (it drives only the bucket/sign hashing that the
+    /// EDGE already applied); we store 0. Panics on a ragged matrix.
+    pub fn from_matrix(matrix: &[Vec<f64>]) -> Self {
+        let d = matrix.len();
+        assert!(d > 0, "matrix must have at least one row");
+        let w = matrix[0].len();
+        assert!(w > 0, "matrix rows must be non-empty");
+        let mut c = Vec::with_capacity(d * w);
+        for row in matrix {
+            assert_eq!(row.len(), w, "ragged matrix: rows must share width");
+            c.extend_from_slice(row);
+        }
+        Self { d, w, seed: 0, c }
+    }
+
+    /// Emit the cell matrix as `rows × cols` `f64` (the wire form — feeds
+    /// `portable::CountSketch::from_legacy_matrix` for msgpack serialization).
+    pub fn to_matrix(&self) -> Vec<Vec<f64>> {
+        (0..self.d)
+            .map(|r| self.c[r * self.w..(r + 1) * self.w].to_vec())
+            .collect()
     }
 
     pub fn dims(&self) -> (usize, usize, u64) {
         (self.d, self.w, self.seed)
+    }
+
+    /// Dimensions that matter for matrix arithmetic across sketches from
+    /// different sources (edge sketches carry the hashing seed; wire-rebuilt
+    /// ones carry 0), so merges compare only `(d, w)`.
+    pub fn shape(&self) -> (usize, usize) {
+        (self.d, self.w)
     }
 
     /// Add `delta` occurrences of `key` (delta may be negative / fractional via
@@ -94,18 +128,18 @@ impl CountSketchF2 {
     pub fn update(&mut self, key: u64, delta: i64) {
         for r in 0..self.d {
             let b = bucket(self.seed, r, key, self.w);
-            self.c[r * self.w + b] += sign(self.seed, r, key) * delta;
+            self.c[r * self.w + b] += (sign(self.seed, r, key) * delta) as f64;
         }
     }
 
-    /// Linearly merge another sketch (must share `(d, w, seed)`). THIS is what
+    /// Linearly merge another sketch (must share `(d, w)`). THIS is what
     /// makes distributed F2 correct: `C_merged = Σ_i C_i`, and the later square
     /// recovers the cross terms a per-edge `Σ F2(f_i)` would miss.
     pub fn merge(&mut self, other: &CountSketchF2) {
         assert_eq!(
-            (self.d, self.w, self.seed),
-            (other.d, other.w, other.seed),
-            "cannot merge Count-Sketches with different (d, w, seed)"
+            self.shape(),
+            other.shape(),
+            "cannot merge Count-Sketches with different (d, w)"
         );
         for i in 0..self.c.len() {
             self.c[i] += other.c[i];
@@ -117,12 +151,12 @@ impl CountSketchF2 {
     /// the geometric layer monitors `‖C‖₂²` against `d·τ` — a smooth quadratic
     /// whose sublevel set is a ball (unlike the robust median estimate_f2()).
     pub fn l2_norm_sq(&self) -> f64 {
-        self.c.iter().map(|&x| (x as f64) * (x as f64)).sum()
+        self.c.iter().map(|&x| x * x).sum()
     }
 
-    /// New sketch = `self − other` (same dims). The per-site DRIFT `ΔC_i`.
+    /// New sketch = `self − other` (same shape). The per-site DRIFT `ΔC_i`.
     pub fn minus(&self, other: &CountSketchF2) -> CountSketchF2 {
-        assert_eq!((self.d, self.w, self.seed), (other.d, other.w, other.seed));
+        assert_eq!(self.shape(), other.shape());
         let mut out = self.clone();
         for i in 0..out.c.len() {
             out.c[i] -= other.c[i];
@@ -133,12 +167,12 @@ impl CountSketchF2 {
     /// `‖ self + scale·other ‖₂²` without allocating — used by the geometric
     /// drift-ball test (`‖C_ref + (k/2)·ΔC_i‖`).
     pub fn norm_sq_combo(&self, other: &CountSketchF2, scale: f64) -> f64 {
-        assert_eq!((self.d, self.w, self.seed), (other.d, other.w, other.seed));
+        assert_eq!(self.shape(), other.shape());
         self.c
             .iter()
             .zip(&other.c)
             .map(|(&a, &b)| {
-                let v = a as f64 + scale * (b as f64);
+                let v = a + scale * b;
                 v * v
             })
             .sum()
@@ -150,7 +184,7 @@ impl CountSketchF2 {
         for r in 0..self.d {
             let mut s = 0.0f64;
             for b in 0..self.w {
-                let v = self.c[r * self.w + b] as f64;
+                let v = self.c[r * self.w + b];
                 s += v * v;
             }
             row_f2.push(s);
@@ -247,7 +281,7 @@ impl DistributedF2Monitor {
         sketch: CountSketchF2,
         _rate: f64,
     ) -> Option<F2Action> {
-        if sketch.dims() != (self.d, self.w, self.seed) {
+        if sketch.shape() != (self.d, self.w) {
             return None; // mis-dimensioned — drop
         }
         if !self.ensure_epoch(window_start_ms) {
@@ -331,9 +365,12 @@ impl GeometricF2Monitor {
     pub fn resync_count(&self) -> u64 {
         self.resyncs
     }
-    /// Safe-ball radius `R = √(d·τ)` on the merged-sketch scale.
+    /// Safe-ball radius `R = √(d·(1−ε)τ)` on the merged-sketch scale. Monitors the
+    /// ALERT threshold `(1−ε)τ` (not the raw `τ`) so that all-sites-locally-safe
+    /// ⇒ `F2 < (1−ε)τ` — otherwise sites stay silent through the `[(1−ε)τ, τ)`
+    /// band and the alert fires late (see the Go edge `f2engine.go`).
     pub fn safe_radius(&self) -> f64 {
-        (self.d as f64 * self.tau).sqrt()
+        (self.d as f64 * (1.0 - self.epsilon) * self.tau).sqrt()
     }
 
     /// PURELY-LOCAL safety test (runs at the EDGE in deployment): given the site's
@@ -341,7 +378,7 @@ impl GeometricF2Monitor {
     /// `C_ref` and the site's own reference/drift — NOT the live global ‖f‖₂.
     /// Returns true ⇒ the site need not communicate.
     pub fn is_locally_safe(&self, site: &str, current: &CountSketchF2) -> bool {
-        if current.dims() != (self.d, self.w, self.seed) {
+        if current.shape() != (self.d, self.w) {
             return false;
         }
         let zero = CountSketchF2::new(self.d, self.w, self.seed);
@@ -362,7 +399,7 @@ impl GeometricF2Monitor {
     pub fn resync(&mut self, currents: &HashMap<String, CountSketchF2>) -> Option<F2Action> {
         self.refs.clear();
         for (id, sk) in currents {
-            if sk.dims() == (self.d, self.w, self.seed) {
+            if sk.shape() == (self.d, self.w) {
                 self.refs.insert(id.clone(), sk.clone());
             }
         }
@@ -415,6 +452,47 @@ mod tests {
         let est = sk.estimate_f2();
         let rel = (est - exact).abs() / exact;
         assert!(rel < 0.12, "F2 est {est} vs exact {exact} (rel {rel})");
+    }
+
+    /// A sketch rebuilt from its cell matrix (the wire path) must yield the
+    /// SAME `l2_norm_sq` / `estimate_f2` as the sketch that produced it.
+    #[test]
+    fn from_matrix_round_trips_norms() {
+        let v: Vec<(u64, i64)> = (1..=200u64).map(|k| (k, k as i64)).collect();
+        let mut sk = CountSketchF2::new(9, 4096, 0xABCD_1234);
+        fill(&mut sk, &v);
+        // Serialize to a rows×cols f64 matrix, then rebuild.
+        let (d, w, _) = sk.dims();
+        let mut matrix = vec![vec![0.0f64; w]; d];
+        for r in 0..d {
+            for b in 0..w {
+                matrix[r][b] = sk.c[r * w + b];
+            }
+        }
+        let rebuilt = CountSketchF2::from_matrix(&matrix);
+        assert_eq!(rebuilt.shape(), (d, w));
+        assert_eq!(rebuilt.l2_norm_sq(), sk.l2_norm_sq());
+        assert_eq!(rebuilt.estimate_f2(), sk.estimate_f2());
+    }
+
+    /// Fractional (sampling-rescaled `1/p`) counts must survive the f64 vector.
+    #[test]
+    fn from_matrix_preserves_fractional_counts() {
+        let matrix = vec![vec![1.5, -2.25, 0.0, 4.0], vec![-1.0, 0.5, 3.5, -0.75]];
+        let sk = CountSketchF2::from_matrix(&matrix);
+        let expected: f64 = matrix.iter().flatten().map(|x| x * x).sum();
+        assert!((sk.l2_norm_sq() - expected).abs() < 1e-12);
+    }
+
+    /// Edge sketch (seed != 0) and a wire-rebuilt sketch (seed 0) must merge on
+    /// matching shape without a seed-mismatch panic.
+    #[test]
+    fn merge_ignores_seed_only_shape() {
+        let mut a = CountSketchF2::new(4, 8, 0x1234);
+        a.update(7, 3);
+        let b = CountSketchF2::from_matrix(&vec![vec![0.0; 8]; 4]);
+        a.merge(&b); // must not panic (a.seed != b.seed, same shape)
+        assert_eq!(a.shape(), (4, 8));
     }
 
     #[test]
@@ -536,6 +614,29 @@ mod tests {
         cur.insert("a".to_string(), big);
         mon.resync(&cur);
         assert_eq!(mon.resync_count(), base + 1);
+    }
+
+    /// Cross-language parity gate: the SAME golden matrices are evaluated by the
+    /// Go edge (asap-precompute-go/monitor/f2engine_test.go
+    /// `TestF2LocallySafeGolden`). Both must return the SAME safe/unsafe verdict
+    /// — any divergence silently breaks the geometric no-missed-crossing
+    /// guarantee. This recomputes the exact `is_locally_safe` arithmetic
+    /// (`‖C_ref + (k/2)ΔC‖ + (k/2)‖ΔC‖ ≤ √(d·τ)`) via the CountSketchF2
+    /// primitives, on ref=0, current=cRef=[[10,0,0],[0,10,0]], k=1, d=2.
+    #[test]
+    fn is_locally_safe_matches_go_golden() {
+        let current = CountSketchF2::from_matrix(&[vec![10.0, 0.0, 0.0], vec![0.0, 10.0, 0.0]]);
+        let reference = CountSketchF2::from_matrix(&[vec![0.0, 0.0, 0.0], vec![0.0, 0.0, 0.0]]);
+        let c_ref = CountSketchF2::from_matrix(&[vec![10.0, 0.0, 0.0], vec![0.0, 10.0, 0.0]]);
+        let d: f64 = 2.0;
+        let k: f64 = 1.0;
+        let delta = current.minus(&reference);
+        let centre_norm = c_ref.norm_sq_combo(&delta, k / 2.0).sqrt();
+        let ball = (k / 2.0) * delta.l2_norm_sq().sqrt();
+        let sum = centre_norm + ball; // ≈ 28.284
+
+        assert!(sum <= (d * 500.0).sqrt(), "tau=500 must be SAFE (R≈31.62)");
+        assert!(sum > (d * 300.0).sqrt(), "tau=300 must be UNSAFE (R≈24.49)");
     }
 
     #[test]

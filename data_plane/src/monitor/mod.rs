@@ -38,10 +38,13 @@ pub mod alert;
 pub mod coordinator;
 pub mod epoch;
 pub mod f2;
+pub mod f2_coord;
+pub mod geo;
 pub mod sampling_alloc;
 pub mod server;
 
 pub use alert::{global_threshold_violation, AlertSink};
-pub use coordinator::{Action, Monitor, MonitorConfig};
+pub use coordinator::{Action, F2Mode, Functional, Monitor, MonitorConfig};
+pub use f2_coord::{F2CoordMonitor, F2Out};
 pub use sampling_alloc::epsilon_sample_floor;
 pub use server::{MonitorCoordinator, MonitorServiceImpl};

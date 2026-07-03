@@ -57,6 +57,7 @@ fn report(value: f64, seq: u64) -> EdgeToCoord {
             round: 0,
             seq,
             rate: 0.0,
+            sketch: Vec::new(),
         })),
     }
 }
@@ -80,6 +81,7 @@ fn sum_cfg(tau: f64) -> MonitorConfig {
         tau,
         epsilon: 0.05,
         window_ms: 60_000,
+        ..Default::default()
     }
 }
 
@@ -180,6 +182,7 @@ fn report_edge(edge_id: &str, value: f64, seq: u64, rate: f64) -> EdgeToCoord {
             round: 0,
             seq,
             rate,
+            sketch: Vec::new(),
         })),
     }
 }

@@ -54,6 +54,12 @@ message MonitorReport {
   uint64 round = 6;            // round this report answers
   uint64 seq = 7;              // per-edge monotonic counter; idempotent-retransmit dedup
   double rate = 8;  // edge's observed items/window — feeds the coordinator's p_i allocation
+  // Whole-sketch payload for non-scalar (F2/L2) monitors: a msgpack-serialized
+  // Count-Sketch cell matrix (asapmsgpack.MarshalCountSketch ↔ Rust
+  // portable::CountSketch codec). Empty for scalar (sum/cms_point) monitors,
+  // which use local_value. Distributed F2 ships this every window; geometric
+  // F2 ships it only on a local safe-zone violation or a PollLocal resync pull.
+  bytes sketch = 9;
 }
 
 // coordinator → edge: this round's per-edge slack budget. The edge reports once
@@ -82,6 +88,20 @@ message RoundClose {
   uint64 window_start_ms = 3;
 }
 
+// coordinator → edge: the broadcast reference `C_ref = Σ_j ref_j` (merged
+// Count-Sketch at the last sync) plus the current site count `k`, used by the
+// GEOMETRIC F2 protocol. Each edge runs a purely-local safe-zone test against
+// this reference (‖C_ref + (k/2)·ΔC_i‖ + (k/2)·‖ΔC_i‖ ≤ √(d·τ)) and stays
+// silent while safe. Sent after every resync.
+message RefBroadcast {
+  uint64 agg_id = 1;
+  bytes key = 2;
+  uint64 round = 3;
+  uint64 window_start_ms = 4;
+  uint64 k = 5;          // number of sites in the reference (for the (k/2) scaling)
+  bytes c_ref = 6;       // msgpack-serialized merged Count-Sketch matrix
+}
+
 // Out-of-band (NOT carried on the Monitor stream): the coordinator serializes
 // this into the control-plane violation/notifier sink when the global aggregate
 // crosses τ. Defined here so both sides share the shape for logging/tests.
@@ -107,6 +127,7 @@ message CoordToEdge {
     SlackGrant grant = 1;
     PollLocal poll = 2;
     RoundClose close = 3;
+    RefBroadcast ref = 4;  // geometric-F2 reference broadcast (resync)
   }
 }
 

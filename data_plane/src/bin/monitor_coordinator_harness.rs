@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tau,
         epsilon: 0.05,
         window_ms,
+        ..Default::default()
     };
     let coord = MonitorCoordinator::new(vec![cfg], sink);
     let svc = MonitorServiceImpl::new(coord).into_server();
