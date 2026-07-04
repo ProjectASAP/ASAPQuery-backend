@@ -124,7 +124,31 @@ impl AccuracyProfile {
     /// necessary entries in `parameters`; falls back to exact for
     /// unknown / legacy variants (harmless — the caller just gets
     /// "0 error" rather than a panic).
+    ///
+    /// GOS continuous-query envelope (design-gos-unified-edge-telemetry.md §4,
+    /// Theorem 1): when the edge gates delta transmission by the GOS relative
+    /// threshold (`parameters["gos_delta_epsilon"] = ε_st > 0`), the warm
+    /// sketch answered from delta-applied state carries an extra DETERMINISTIC
+    /// staleness term of at most `ε_st` (relative) at any query time — it adds
+    /// linearly to the sketch's own probabilistic bound (`ε_total = ε_sk +
+    /// ε_st`; the random parts compose in quadrature but the staleness part is
+    /// adversarial, so linear addition is the honest envelope). δ is
+    /// unchanged (staleness is not probabilistic).
     pub fn derive(config: &AggregationConfig) -> Self {
+        let mut profile = Self::derive_sketch_only(config);
+        let eps_st = config
+            .parameters
+            .get("gos_delta_epsilon")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if eps_st > 0.0 && profile.kind != AccuracyKind::Exact {
+            profile.epsilon += eps_st;
+        }
+        profile
+    }
+
+    /// The sketch's own theoretical bound, without the GOS staleness term.
+    fn derive_sketch_only(config: &AggregationConfig) -> Self {
         match config.aggregation_type {
             // Exact aggregates. (The `SetAggregator` /
             // `DeltaSetAggregator` exact-set-membership family lived
@@ -489,6 +513,34 @@ mod tests {
             let p = AccuracyProfile::derive(&base_config(t, HashMap::new()));
             assert_eq!(p.kind, AccuracyKind::Exact);
         }
+    }
+
+    #[test]
+    fn gos_staleness_widens_epsilon_linearly() {
+        // A CountSketch (ε_sk = 1/√w) whose edge gates deltas at ε_st carries
+        // ε_total = ε_sk + ε_st in the continuous-query envelope (Theorem 1);
+        // δ is unchanged (staleness is deterministic).
+        let mut params = HashMap::new();
+        params.insert("d".to_string(), json!(5));
+        params.insert("w".to_string(), json!(256));
+        let base = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params.clone()));
+        params.insert("gos_delta_epsilon".to_string(), json!(0.05));
+        let widened =
+            AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
+        assert!((widened.epsilon - (base.epsilon + 0.05)).abs() < 1e-12);
+        assert_eq!(widened.delta, base.delta);
+        assert_eq!(widened.kind, base.kind);
+    }
+
+    #[test]
+    fn gos_staleness_does_not_touch_exact() {
+        // Exact aggregates are not GOS-gated (Count-Sketch families only), so a
+        // stray parameter must not fabricate an ε>0 "exact" answer.
+        let mut params = HashMap::new();
+        params.insert("gos_delta_epsilon".to_string(), json!(0.05));
+        let p = AccuracyProfile::derive(&base_config(AggregationType::Sum, params));
+        assert_eq!(p.epsilon, 0.0);
+        assert_eq!(p.kind, AccuracyKind::Exact);
     }
 
     #[test]
