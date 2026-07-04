@@ -199,6 +199,14 @@ impl CountSketchF2 {
     }
 
     /// Unbiased F2 estimate: median over the `d` rows of `Σ_b C[r][b]²`.
+    ///
+    /// IMPORTANT — assumes the input Count-Sketch was **not** update-sampled.
+    /// F2 squares the cells, so with per-row Bernoulli(p) admission + `1/p`
+    /// weighting the linear cell estimate stays unbiased but the squared sum is
+    /// biased: `E[Σ_b C[r][b]²] = F2 + (1−p)/p·F2 = F2/p`. Sampling and F2
+    /// monitoring must therefore not run on the same sketch (use `p=1` for
+    /// F2-monitored sketches, or bias-correct by `×p`). Frequency (point)
+    /// queries are unaffected. See design-gos-unified-edge-telemetry.md §3.2.
     pub fn estimate_f2(&self) -> f64 {
         let mut row_f2: Vec<f64> = Vec::with_capacity(self.d);
         for r in 0..self.d {
@@ -217,7 +225,8 @@ fn median(v: &mut [f64]) -> f64 {
     if v.is_empty() {
         return 0.0;
     }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // NaN-safe: a NaN cell from a malformed wire matrix must not panic the sort.
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
     if n % 2 == 1 {
         v[n / 2]

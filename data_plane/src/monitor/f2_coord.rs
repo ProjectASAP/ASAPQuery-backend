@@ -142,7 +142,9 @@ impl F2CoordMonitor {
         window_start_ms: u64,
         matrix: Vec<Vec<f64>>,
     ) -> Vec<F2Out> {
-        if matrix.len() != self.d || matrix.first().map(|r| r.len()) != Some(self.w) {
+        // Validate EVERY row's width (not just the first) — a ragged wire matrix
+        // would otherwise panic in CountSketchF2::from_matrix below.
+        if matrix.len() != self.d || matrix.iter().any(|r| r.len() != self.w) {
             return Vec::new(); // mis-dimensioned — drop
         }
         if !self.ensure_epoch(window_start_ms) {
