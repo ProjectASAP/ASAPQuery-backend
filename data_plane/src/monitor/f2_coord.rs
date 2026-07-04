@@ -37,15 +37,28 @@ pub enum F2Out {
         tau: f64,
         window_start_ms: u64,
     },
-    /// Geometric mode: broadcast the refreshed reference `C_ref = Σ latest_i`
-    /// (as a cell matrix) and the site count `k` to every edge, so each can run
-    /// its local safe-zone test. The server serializes the matrix and counts the
-    /// egress bytes.
+    /// Geometric mode: broadcast the refreshed reference `C_ref = Σ latest_i` and
+    /// the site count `k` to every edge, so each can run its local safe-zone test.
+    /// The update is `Full` (first broadcast of the epoch) or a sparse `Delta` of
+    /// the cells that changed since the last broadcast — the latter removes the
+    /// O(k) full-matrix amplification of the geometric resync.
     RefBroadcast {
         round: u64,
         window_start_ms: u64,
         k: u64,
-        c_ref: Vec<Vec<f64>>,
+        cref: CRefUpdate,
+    },
+}
+
+/// A `C_ref` reference update: a full cell matrix, or a sparse delta of changed
+/// cells `(row, col, Δ)` against the edge's cached reference.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CRefUpdate {
+    Full(Vec<Vec<f64>>),
+    Delta {
+        rows: usize,
+        cols: usize,
+        cells: Vec<(u32, u32, f64)>,
     },
 }
 
@@ -60,6 +73,14 @@ pub struct F2CoordMonitor {
     round: u64,
     /// Each edge's latest reported sketch (its coordinator-side reference).
     latest: HashMap<String, CountSketchF2>,
+    /// Running merged sketch `Σ_i latest_i`, maintained incrementally (a report
+    /// applies `running += new_i − old_i`, O(d·w)) instead of re-merging all k
+    /// edges every report (O(k·d·w)).
+    running: CountSketchF2,
+    /// Last `C_ref` broadcast (geometric mode) — the base for the sparse delta
+    /// broadcast, so the coordinator ships only the changed cells of `C_ref`
+    /// instead of the full matrix each resync.
+    last_broadcast: Option<CountSketchF2>,
     alerted: bool,
 }
 
@@ -74,6 +95,8 @@ impl F2CoordMonitor {
             window_start_ms: 0,
             round: 0,
             latest: HashMap::new(),
+            running: CountSketchF2::new(d, w, 0),
+            last_broadcast: None,
             alerted: false,
         }
     }
@@ -100,19 +123,12 @@ impl F2CoordMonitor {
             self.window_start_ms = window_start;
             self.round = 0;
             self.latest.clear();
+            self.running = CountSketchF2::new(self.d, self.w, 0);
+            self.last_broadcast = None;
             self.alerted = false;
             return true;
         }
         false
-    }
-
-    /// Merge all latest per-edge references into one sketch.
-    fn merged(&self) -> CountSketchF2 {
-        let mut m = CountSketchF2::new(self.d, self.w, 0);
-        for sk in self.latest.values() {
-            m.merge(sk);
-        }
-        m
     }
 
     /// Ingest one edge's Count-Sketch cell matrix for `window_start_ms`.
@@ -132,12 +148,22 @@ impl F2CoordMonitor {
         if !self.ensure_epoch(window_start_ms) {
             return Vec::new(); // stale epoch
         }
-        self.latest
-            .insert(edge_id.to_string(), CountSketchF2::from_matrix(&matrix));
+        // Incremental merge: running += new_i − old_i  (O(d·w), not O(k·d·w)).
+        let new = CountSketchF2::from_matrix(&matrix);
+        let (delta, is_new_edge) = match self.latest.get(edge_id) {
+            Some(old) => (new.minus(old), false),
+            None => (new.clone(), true),
+        };
+        self.running.merge(&delta);
+        self.latest.insert(edge_id.to_string(), new);
+        // A newly-joined edge has no cached C_ref to apply a delta onto, so force
+        // a Full keyframe this round (drop the delta base).
+        if is_new_edge {
+            self.last_broadcast = None;
+        }
 
-        let merged = self.merged();
         let mut out = Vec::new();
-        let f2 = merged.estimate_f2();
+        let f2 = self.running.estimate_f2();
         if !self.alerted && f2 >= (1.0 - self.epsilon) * self.tau {
             self.alerted = true;
             out.push(F2Out::Alert {
@@ -148,11 +174,21 @@ impl F2CoordMonitor {
         }
         if self.mode == F2Mode::Geometric {
             self.round += 1;
+            // Full on the first broadcast of the epoch; sparse delta thereafter.
+            let cref = match &self.last_broadcast {
+                None => CRefUpdate::Full(self.running.to_matrix()),
+                Some(last) => CRefUpdate::Delta {
+                    rows: self.d,
+                    cols: self.w,
+                    cells: self.running.sparse_delta_cells(last),
+                },
+            };
+            self.last_broadcast = Some(self.running.clone());
             out.push(F2Out::RefBroadcast {
                 round: self.round,
                 window_start_ms: self.window_start_ms,
                 k: self.latest.len() as u64,
-                c_ref: merged.to_matrix(),
+                cref,
             });
         }
         out
@@ -160,7 +196,7 @@ impl F2CoordMonitor {
 
     /// Current global `F2̂` (test/eval ground-truth readout).
     pub fn global_f2(&self) -> f64 {
-        self.merged().estimate_f2()
+        self.running.estimate_f2()
     }
 }
 

@@ -104,6 +104,26 @@ impl CountSketchF2 {
         Self { d, w, seed: 0, c }
     }
 
+    /// Sparse changed cells of `self` relative to `base`: `(row, col, self−base)`
+    /// for every cell where they differ. The delta form of the reference so a
+    /// `C_ref` broadcast ships only the changed cells (removing the O(k)
+    /// full-matrix amplification of the geometric resync). Panics on shape
+    /// mismatch.
+    pub fn sparse_delta_cells(&self, base: &CountSketchF2) -> Vec<(u32, u32, f64)> {
+        assert_eq!(self.shape(), base.shape());
+        let mut cells = Vec::new();
+        for r in 0..self.d {
+            for c in 0..self.w {
+                let i = r * self.w + c;
+                let d = self.c[i] - base.c[i];
+                if d != 0.0 {
+                    cells.push((r as u32, c as u32, d));
+                }
+            }
+        }
+        cells
+    }
+
     /// Emit the cell matrix as `rows × cols` `f64` (the wire form — feeds
     /// `portable::CountSketch::from_legacy_matrix` for msgpack serialization).
     pub fn to_matrix(&self) -> Vec<Vec<f64>> {

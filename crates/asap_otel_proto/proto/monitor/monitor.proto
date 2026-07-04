@@ -100,6 +100,7 @@ message RefBroadcast {
   uint64 window_start_ms = 4;
   uint64 k = 5;          // number of sites in the reference (for the (k/2) scaling)
   bytes c_ref = 6;       // msgpack-serialized merged Count-Sketch matrix
+  bool is_delta = 7;       // c_ref carries a sparse [rows,cols,rowIdx,colIdx,vals] delta (apply to cached C_ref) vs a full matrix
 }
 
 // Out-of-band (NOT carried on the Monitor stream): the coordinator serializes

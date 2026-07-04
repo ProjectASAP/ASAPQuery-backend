@@ -24,7 +24,7 @@ use asap_otel_proto::monitor::v1::{
 
 use super::alert::{global_threshold_violation, AlertSink};
 use super::coordinator::{Action, Monitor, MonitorConfig};
-use super::f2_coord::{F2CoordMonitor, F2Out};
+use super::f2_coord::{CRefUpdate, F2CoordMonitor, F2Out};
 
 type MonKey = (u64, Vec<u8>);
 type EdgeTx = mpsc::Sender<Result<CoordToEdge, Status>>;
@@ -277,17 +277,35 @@ impl MonitorCoordinator {
                     round,
                     window_start_ms,
                     k,
-                    c_ref,
+                    cref,
                 } => {
-                    let rows = c_ref.len() as u64;
-                    let cols = c_ref.first().map(|r| r.len()).unwrap_or(0) as u64;
-                    // Serialize as the same 3-element `[rows, cols, matrix]` array the
-                    // Go edge's asapmsgpack.UnmarshalCountSketch expects.
-                    let bytes = match rmp_serde::to_vec(&(rows, cols, c_ref)) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(error = %e, "failed to serialize C_ref — skipping broadcast");
-                            continue;
+                    // Full = the 3-element `[rows, cols, matrix]` array (byte-parity
+                    // with Go asapmsgpack.UnmarshalCountSketch). Delta = a 5-element
+                    // `[rows, cols, rowIdx[], colIdx[], vals[]]` array of changed
+                    // cells (is_delta=true) — the edge applies it to its cached C_ref.
+                    let (bytes, is_delta) = match cref {
+                        CRefUpdate::Full(matrix) => {
+                            let rows = matrix.len() as u64;
+                            let cols = matrix.first().map(|r| r.len()).unwrap_or(0) as u64;
+                            match rmp_serde::to_vec(&(rows, cols, matrix)) {
+                                Ok(b) => (b, false),
+                                Err(e) => {
+                                    warn!(error = %e, "serialize C_ref full — skip");
+                                    continue;
+                                }
+                            }
+                        }
+                        CRefUpdate::Delta { rows, cols, cells } => {
+                            let ri: Vec<u32> = cells.iter().map(|c| c.0).collect();
+                            let ci: Vec<u32> = cells.iter().map(|c| c.1).collect();
+                            let vs: Vec<f64> = cells.iter().map(|c| c.2).collect();
+                            match rmp_serde::to_vec(&(rows as u64, cols as u64, ri, ci, vs)) {
+                                Ok(b) => (b, true),
+                                Err(e) => {
+                                    warn!(error = %e, "serialize C_ref delta — skip");
+                                    continue;
+                                }
+                            }
                         }
                     };
                     let msg = CoordToEdge {
@@ -298,6 +316,7 @@ impl MonitorCoordinator {
                             window_start_ms,
                             k,
                             c_ref: bytes.clone(),
+                            is_delta,
                         })),
                     };
                     let txs: Vec<EdgeTx> = {
