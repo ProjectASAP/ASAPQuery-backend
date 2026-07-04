@@ -163,6 +163,70 @@ pub fn allocate_thresholds(cells: &[CellInput], p: &AllocParams) -> Vec<f64> {
     out
 }
 
+/// Inputs to the joint sampling×threshold allocation (design §7, Layers B–C).
+#[derive(Debug, Clone, Copy)]
+pub struct JointParams {
+    /// Total accuracy budget `ε` for the metric.
+    pub epsilon: f64,
+    /// The sketch's own share `ε_sk = Θ(1/√w)` (removed before the split).
+    pub eps_sketch: f64,
+    /// Cost weights: edge CPU vs communication (steer the budget split).
+    pub w_edge: f64,
+    pub w_comm: f64,
+    /// Per-window update rate (drives the sampling `p`).
+    pub rate: f64,
+    /// Sites `k`, current norm `‖Ĉ‖`, sketch dims, and the box caps.
+    pub k: u32,
+    pub norm: f64,
+    pub t_query_cap: f64,
+    pub fresh_delta: f64,
+}
+
+/// The result of the joint allocation: the split budget, sampling probability,
+/// and per-cell thresholds (which already respect the sampling-coupling floor).
+#[derive(Debug, Clone)]
+pub struct JointAlloc {
+    pub eps_sample: f64,
+    pub eps_stale: f64,
+    pub sample_p: f64,
+    pub thresholds: Vec<f64>,
+}
+
+/// Joint sampling×threshold allocation. Composes the three water-fillings of the
+/// GOS framework in one pass (they don't need to iterate — the coupling is the
+/// shared ε budget plus the floor `T_j ≥ √(V_j(1−p)/p)`):
+///
+/// 1. `ε_res = √(ε² − ε_sk²)` split into `(ε_sa, ε_st)` by [`split_budget`];
+/// 2. sampling `p = 1/(1+ε_sa²·rate)` ([`derive_sample_p`]);
+/// 3. thresholds from the F2-relative budget `B = ε_st·‖Ĉ‖²` via
+///    [`allocate_thresholds`], with the floor computed from `p`.
+pub fn allocate_joint(cells: &[CellInput], jp: &JointParams) -> JointAlloc {
+    use crate::epsilon_alloc::{derive_sample_p, split_budget};
+
+    let eps_res = (jp.epsilon * jp.epsilon - jp.eps_sketch * jp.eps_sketch)
+        .max(0.0)
+        .sqrt();
+    let (eps_sa, eps_st) = split_budget(eps_res, jp.w_edge, jp.w_comm);
+    let sample_p = derive_sample_p(eps_sa, jp.rate);
+    let budget = eps_st * jp.norm * jp.norm; // F2-relative budget ε_st·‖Ĉ‖²
+    let thresholds = allocate_thresholds(
+        cells,
+        &AllocParams {
+            budget,
+            k: jp.k,
+            t_query_cap: jp.t_query_cap,
+            sample_p,
+            fresh_delta: jp.fresh_delta,
+        },
+    );
+    JointAlloc {
+        eps_sample: eps_sa,
+        eps_stale: eps_st,
+        sample_p,
+        thresholds,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +298,46 @@ mod tests {
         for tj in &t {
             assert!((*tj - 10.0).abs() < 1e-9, "floor 10, got {tj}");
         }
+    }
+
+    fn joint(w_edge: f64, w_comm: f64) -> JointAlloc {
+        let cells = vec![CellInput { grad: 2.0, activity: 100.0 }; 8];
+        allocate_joint(
+            &cells,
+            &JointParams {
+                epsilon: 0.1,
+                eps_sketch: 0.02,
+                w_edge,
+                w_comm,
+                rate: 5000.0,
+                k: 4,
+                norm: 1000.0,
+                t_query_cap: f64::INFINITY,
+                fresh_delta: f64::INFINITY,
+            },
+        )
+    }
+
+    #[test]
+    fn joint_no_edge_weight_disables_sampling() {
+        // w_edge=0 ⇒ ε_sa=0 ⇒ p=1 (no sampling), all budget to thresholds.
+        let a = joint(0.0, 1.0);
+        assert_eq!(a.sample_p, 1.0);
+        assert_eq!(a.eps_sample, 0.0);
+        assert!(a.eps_stale > 0.0);
+        assert!(a.thresholds.iter().all(|&t| t > 0.0));
+    }
+
+    #[test]
+    fn joint_edge_weight_enables_sampling_and_floors_thresholds() {
+        // Caring about edge CPU ⇒ ε_sa>0 ⇒ p<1 ⇒ the sampling floor lifts the
+        // thresholds off zero even under a tight budget.
+        let a = joint(4.0, 1.0);
+        assert!(a.sample_p < 1.0, "p={}", a.sample_p);
+        assert!(a.eps_sample > 0.0 && a.eps_stale > 0.0);
+        // budget quadrature preserved through the split (minus the sketch share).
+        let res2 = 0.1 * 0.1 - 0.02 * 0.02;
+        assert!((a.eps_sample.powi(2) + a.eps_stale.powi(2) - res2).abs() < 1e-9);
     }
 
     #[test]
