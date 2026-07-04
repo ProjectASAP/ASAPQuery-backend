@@ -186,6 +186,18 @@ fn build_processor_block(cfg: &AgentCollectorConfig) -> Value {
                 Value::Number(cfg.delta_threshold.into()),
             );
         }
+        // GOS relative delta gating (Count-Sketch only today — the edge's
+        // applyGosMode structural assert matches CountSketchWrapper): the edge
+        // replaces the fixed threshold with the norm-adaptive GOS one.
+        if let Some(g) = &cfg.gos {
+            if cfg.sketch_type == SketchType::CountSketch {
+                m.insert("gos_delta_epsilon".into(), Value::Number(g.epsilon.into()));
+                m.insert("gos_sites".into(), Value::Number((g.sites as u64).into()));
+                if g.anisotropic {
+                    m.insert("gos_anisotropic".into(), Value::Bool(true));
+                }
+            }
+        }
     }
 
     // Sketch-type-specific params.
@@ -273,6 +285,7 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: true,
             series_id_ttl_secs: 0,
             // Pre-existing fixture tests (`contains_prometheus_exporter`,
@@ -401,6 +414,7 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: true,
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
@@ -439,6 +453,7 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: true,
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
@@ -547,6 +562,7 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: true,
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
@@ -581,6 +597,7 @@ mod tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: true,
             series_id_ttl_secs: 0,
             data_sink: AgentDataSink::default(),
@@ -653,6 +670,7 @@ mod tests {
                 drop_original: true,
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: true,
                 series_id_ttl_secs: 0,
                 data_sink: AgentDataSink::default(),

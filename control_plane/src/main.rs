@@ -1315,6 +1315,7 @@ async fn handle_bootstrap_agent_config(
         drop_original: true,
         delta_transmission: false,
         delta_threshold: 0.0,
+        gos: None,
         enable_series_id: false,
         series_id_ttl_secs: 300,
         data_sink: types::AgentDataSink::default(),
@@ -2381,6 +2382,7 @@ mod api_tests {
             drop_original: true,
             delta_transmission: false,
             delta_threshold: 0.0,
+            gos: None,
             enable_series_id: false,
             series_id_ttl_secs: 300,
             // This test asserts on `doc["exporters"]["prometheus"]`

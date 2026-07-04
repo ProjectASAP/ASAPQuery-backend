@@ -437,6 +437,34 @@ impl SketchParams {
     }
 }
 
+/// GOS delta-gating knobs pushed to the edge (Count-Sketch families).
+/// `epsilon` = the staleness share ε_st of the metric's accuracy budget;
+/// `sites` = k (fleet size for the merged-error bound); `anisotropic` selects
+/// the per-cell {T_j} water-filling (O(d·w) edge memory) over the isotropic
+/// scalar (O(1)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GosKnobs {
+    pub epsilon: f64,
+    pub sites: u32,
+    pub anisotropic: bool,
+}
+
+impl GosKnobs {
+    /// Derive the edge delta-gate knobs from the metric's ε budget and the
+    /// edge-CPU-vs-communication cost weights: `epsilon` is the **staleness
+    /// share** ε_st from [`crate::epsilon_alloc::split_budget`] (the rest, ε_sa,
+    /// would fund sampling). `sites` = fleet size k (≥1); `anisotropic` selects
+    /// per-cell {T_j} over the isotropic scalar at the edge.
+    pub fn derive(epsilon: f64, sites: u32, w_edge: f64, w_comm: f64, anisotropic: bool) -> Self {
+        let (_eps_sa, eps_st) = crate::epsilon_alloc::split_budget(epsilon, w_edge, w_comm);
+        Self {
+            epsilon: eps_st,
+            sites: sites.max(1),
+            anisotropic,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentCollectorConfig {
     pub output_mode: OutputMode,
@@ -462,6 +490,11 @@ pub struct AgentCollectorConfig {
     /// Minimum absolute cell change included in a delta payload (T).
     /// Ignored when `delta_transmission` is false.
     pub delta_threshold: f64,
+    /// GOS relative delta gating (design-gos-unified-edge-telemetry.md §7).
+    /// When set, the edge replaces the fixed `delta_threshold` with the
+    /// norm-adaptive GOS threshold; `None` = fixed threshold (unchanged).
+    /// Produced by the ε-budget split (`epsilon_alloc::split_budget`).
+    pub gos: Option<GosKnobs>,
     /// Data sink the planner wants the agent to emit to. Decoupled
     /// from the planner output (which sketch / window / projection)
     /// because where the data goes is a deployment-scope concern,
