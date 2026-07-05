@@ -5,7 +5,12 @@
 //! can assert the Go edge ⇄ Rust coordinator wire path end-to-end without
 //! standing up the full data-plane.
 //!
-//! Usage: monitor_coordinator_harness <port> <agg_id> <tau> <window_ms> [timeout_secs]
+//! Usage: monitor_coordinator_harness <port> <agg_id> <tau> <window_ms> [timeout_secs] [key]
+//!
+//! `key` is the monitor's group key (the edge's canonical `k=v;k2=v2` label
+//! encoding). Scalar (Sum) monitors register under their series-group key, so
+//! the harness config must carry the same key or registrations are rejected
+//! as unconfigured. Empty (default) = ungrouped.
 
 use std::sync::Arc;
 
@@ -19,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tau: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(100.0);
     let window_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3_600_000);
     let timeout_secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let key: Vec<u8> = args.next().map(|s| s.into_bytes()).unwrap_or_default();
 
     // Exit-on-alert: the sink prints a machine-greppable line and signals the
     // run to finish.
@@ -33,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = MonitorConfig {
         agg_id,
-        key: Vec::new(),
+        key,
         tau,
         epsilon: 0.05,
         window_ms,
