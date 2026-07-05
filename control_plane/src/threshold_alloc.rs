@@ -203,10 +203,7 @@ pub struct JointAlloc {
 pub fn allocate_joint(cells: &[CellInput], jp: &JointParams) -> JointAlloc {
     use crate::epsilon_alloc::{derive_sample_p, split_budget};
 
-    let eps_res = (jp.epsilon * jp.epsilon - jp.eps_sketch * jp.eps_sketch)
-        .max(0.0)
-        .sqrt();
-    let (eps_sa, eps_st) = split_budget(eps_res, jp.w_edge, jp.w_comm);
+    let (eps_sa, eps_st) = split_budget(jp.epsilon, jp.eps_sketch, jp.w_edge, jp.w_comm);
     let sample_p = derive_sample_p(eps_sa, jp.rate);
     let budget = eps_st * jp.norm * jp.norm; // F2-relative budget ε_st·‖Ĉ‖²
     let thresholds = allocate_thresholds(
@@ -320,10 +317,10 @@ mod tests {
 
     #[test]
     fn joint_no_edge_weight_disables_sampling() {
-        // w_edge=0 ⇒ ε_sa=0 ⇒ p=1 (no sampling), all budget to thresholds.
+        // w_edge=0 ⇒ ε_sa≈0 ⇒ p≈1 (no sampling), all budget to thresholds.
         let a = joint(0.0, 1.0);
-        assert_eq!(a.sample_p, 1.0);
-        assert_eq!(a.eps_sample, 0.0);
+        assert!((a.sample_p - 1.0).abs() < 1e-6, "p={}", a.sample_p);
+        assert!(a.eps_sample < 1e-6, "ε_sa={}", a.eps_sample);
         assert!(a.eps_stale > 0.0);
         assert!(a.thresholds.iter().all(|&t| t > 0.0));
     }
@@ -335,9 +332,9 @@ mod tests {
         let a = joint(4.0, 1.0);
         assert!(a.sample_p < 1.0, "p={}", a.sample_p);
         assert!(a.eps_sample > 0.0 && a.eps_stale > 0.0);
-        // budget quadrature preserved through the split (minus the sketch share).
-        let res2 = 0.1 * 0.1 - 0.02 * 0.02;
-        assert!((a.eps_sample.powi(2) + a.eps_stale.powi(2) - res2).abs() < 1e-9);
+        // Exact linear composition preserved: √(ε_sk² + ε_sa²) + ε_st = ε_q.
+        let combined = (0.02_f64 * 0.02 + a.eps_sample * a.eps_sample).sqrt() + a.eps_stale;
+        assert!((combined - 0.1).abs() < 1e-9, "combined={combined}");
     }
 
     #[test]

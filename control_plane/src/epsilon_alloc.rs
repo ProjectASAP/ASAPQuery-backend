@@ -52,33 +52,42 @@ pub fn derive_delta_threshold(epsilon: f64, tau: f64, n_sites: u32) -> f64 {
     epsilon * tau / k
 }
 
-/// GOS budget split (design §7, Layer B): divide the residual accuracy budget
-/// `ε_res` (after the sketch takes its `ε_sk` share) between **sampling**
-/// (`ε_sa`, buys edge CPU) and **staleness/threshold** (`ε_st`, buys
-/// communication), keeping `ε_sa² + ε_st² = ε_res²`.
+/// GOS budget split (design §7, Layer B) — **exact linear peel**.
 ///
-/// Both costs scale like `1/ε²` in their share, so minimizing
-/// `w_edge·CPU(ε_sa) + w_comm·Comm(ε_st)` under the quadrature constraint gives a
-/// closed form: with `r = √(w_comm/w_edge)` the split is
-/// `ε_sa² = ε_res²/(1+r)`, `ε_st² = ε_res² − ε_sa²`. Limits are intuitive:
-///   * `w_edge = 0` (don't care about edge CPU) ⇒ all budget to `ε_st`, `ε_sa=0`
-///     ⇒ **no sampling** (`p=1`) and cheap communication;
-///   * `w_comm = 0` (don't care about bytes) ⇒ all to `ε_sa` ⇒ coarse sampling,
+/// The staleness term `ε_st` is a *deterministic worst-case* bound, so it adds
+/// **linearly** to the random error (Theorem 1): the composition is
+/// `√(ε_sk² + ε_sa²) + ε_st ≤ ε_q`, NOT a three-way quadrature. This deriver
+/// therefore peels `ε_st` off linearly first and splits only the *random*
+/// residual between the sketch and sampling:
+///
+/// 1. linear headroom above the sketch: `excess = ε_q − ε_sk` (0 if the sketch
+///    already consumes the budget);
+/// 2. give a fraction `t = w_comm/(w_edge+w_comm)` of it to staleness:
+///    `ε_st = t·excess` (more comm-weight ⇒ looser thresholds ⇒ larger `ε_st`);
+/// 3. the remaining *random* budget is `ε_rand = ε_q − ε_st`, split in
+///    quadrature: `ε_sa = √(ε_rand² − ε_sk²)`.
+///
+/// This satisfies `√(ε_sk² + ε_sa²) + ε_st = ε_q` **exactly**. Limits:
+///   * `w_edge = 0` ⇒ `t=1` ⇒ `ε_st = ε_q−ε_sk`, `ε_rand=ε_sk`, `ε_sa=0` ⇒
+///     **no sampling** (`p=1`), cheap communication;
+///   * `w_comm = 0` ⇒ `t=0` ⇒ `ε_st=0`, `ε_sa=√(ε_q²−ε_sk²)` ⇒ coarse sampling,
 ///     tight thresholds.
-pub fn split_budget(eps_res: f64, w_edge: f64, w_comm: f64) -> (f64, f64) {
-    if eps_res <= 0.0 {
-        return (0.0, 0.0);
+pub fn split_budget(eps_total: f64, eps_sketch: f64, w_edge: f64, w_comm: f64) -> (f64, f64) {
+    if eps_total <= eps_sketch {
+        return (0.0, 0.0); // the sketch already uses the whole ε budget
     }
-    if w_edge <= 0.0 {
-        return (0.0, eps_res); // no CPU concern → no sampling
-    }
-    if w_comm <= 0.0 {
-        return (eps_res, 0.0); // no comm concern → no threshold slack
-    }
-    let r = (w_comm / w_edge).sqrt(); // ε_st²/ε_sa²
-    let sa2 = eps_res * eps_res / (1.0 + r);
-    let st2 = eps_res * eps_res - sa2;
-    (sa2.sqrt(), st2.sqrt())
+    let excess = eps_total - eps_sketch; // linear headroom above the sketch
+    let t = if w_edge + w_comm <= 0.0 {
+        0.0
+    } else {
+        w_comm / (w_edge + w_comm)
+    };
+    let eps_st = t * excess;
+    let eps_rand = eps_total - eps_st; // random budget after the linear peel
+    let eps_sa = (eps_rand * eps_rand - eps_sketch * eps_sketch)
+        .max(0.0)
+        .sqrt();
+    (eps_sa, eps_st)
 }
 
 /// The runtime knobs derived for one metric.
@@ -280,23 +289,25 @@ mod tests {
     }
 
     #[test]
-    fn split_budget_quadrature_and_limits() {
-        // Quadrature preserved: ε_sa² + ε_st² = ε_res².
-        let (sa, st) = split_budget(0.1, 1.0, 1.0);
-        assert!((sa * sa + st * st - 0.01).abs() < 1e-12);
-        assert!((sa - st).abs() < 1e-9, "equal weights ⇒ equal split");
-        // No edge-CPU concern ⇒ no sampling, all to thresholds.
-        let (sa, st) = split_budget(0.1, 0.0, 1.0);
-        assert_eq!(sa, 0.0);
-        assert!((st - 0.1).abs() < 1e-12);
-        // No comm concern ⇒ all to sampling.
-        let (sa, st) = split_budget(0.1, 1.0, 0.0);
-        assert!((sa - 0.1).abs() < 1e-12);
+    fn split_budget_linear_peel_and_limits() {
+        // Exact linear composition: √(ε_sk² + ε_sa²) + ε_st = ε_q.
+        let (eq, esk) = (0.1, 0.03);
+        let (sa, st) = split_budget(eq, esk, 1.0, 1.0);
+        assert!(((esk * esk + sa * sa).sqrt() + st - eq).abs() < 1e-12);
+        // No edge-CPU concern ⇒ no sampling (ε_sa=0), all headroom to staleness.
+        let (sa, st) = split_budget(eq, esk, 0.0, 1.0);
+        assert!(sa.abs() < 1e-12);
+        assert!((st - (eq - esk)).abs() < 1e-12);
+        // No comm concern ⇒ no staleness, ε_sa = √(ε_q²−ε_sk²).
+        let (sa, st) = split_budget(eq, esk, 1.0, 0.0);
         assert_eq!(st, 0.0);
-        // Higher edge weight ⇒ more budget to sampling (larger ε_sa).
-        let (sa_hi, _) = split_budget(0.1, 4.0, 1.0);
-        let (sa_lo, _) = split_budget(0.1, 1.0, 1.0);
+        assert!((sa - (eq * eq - esk * esk).sqrt()).abs() < 1e-12);
+        // Higher edge weight ⇒ more of the budget to sampling (larger ε_sa).
+        let (sa_hi, _) = split_budget(eq, esk, 4.0, 1.0);
+        let (sa_lo, _) = split_budget(eq, esk, 1.0, 1.0);
         assert!(sa_hi > sa_lo);
+        // Sketch consumes the whole budget ⇒ nothing left.
+        assert_eq!(split_budget(0.03, 0.05, 1.0, 1.0), (0.0, 0.0));
     }
 
     #[test]

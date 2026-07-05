@@ -456,7 +456,9 @@ impl GosKnobs {
     /// would fund sampling). `sites` = fleet size k (≥1); `anisotropic` selects
     /// per-cell {T_j} over the isotropic scalar at the edge.
     pub fn derive(epsilon: f64, sites: u32, w_edge: f64, w_comm: f64, anisotropic: bool) -> Self {
-        let (_eps_sa, eps_st) = crate::epsilon_alloc::split_budget(epsilon, w_edge, w_comm);
+        // The sketch's own ε is accounted separately (accuracy.rs), so the delta
+        // gate splits the full accuracy budget (eps_sketch=0 here).
+        let (_eps_sa, eps_st) = crate::epsilon_alloc::split_budget(epsilon, 0.0, w_edge, w_comm);
         Self {
             epsilon: eps_st,
             sites: sites.max(1),
