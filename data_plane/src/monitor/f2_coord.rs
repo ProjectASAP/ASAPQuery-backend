@@ -165,7 +165,11 @@ impl F2CoordMonitor {
         }
 
         let mut out = Vec::new();
-        let f2 = self.running.estimate_f2();
+        // Mean-of-rows F2 (‖C‖²/d): the SAME estimator the edge geometric
+        // safe-zone ball monitors, so silence and alert are consistent
+        // (all-sites-safe ⟺ mean_f2 < (1−ε)τ). Both modes use it so distributed
+        // (baseline) and geometric alert on the identical quantity.
+        let f2 = self.running.mean_f2();
         if !self.alerted && f2 >= (1.0 - self.epsilon) * self.tau {
             self.alerted = true;
             out.push(F2Out::Alert {
@@ -196,9 +200,9 @@ impl F2CoordMonitor {
         out
     }
 
-    /// Current global `F2̂` (test/eval ground-truth readout).
+    /// Current global `F2̂` (mean-of-rows, consistent with the alert/safe-zone).
     pub fn global_f2(&self) -> f64 {
-        self.running.estimate_f2()
+        self.running.mean_f2()
     }
 }
 

@@ -174,6 +174,18 @@ impl CountSketchF2 {
         self.c.iter().map(|&x| x * x).sum()
     }
 
+    /// Mean-of-rows F2 estimate `‖C‖₂²/d`. This is the estimator the geometric
+    /// **safe-zone ball** is built on (`‖C‖ ≤ √(d·τ) ⟺ ‖C‖²/d ≤ τ`), so the
+    /// geometric alert must use it too — then silence and alert are exactly
+    /// consistent: all sites locally safe ⟺ `mean_f2 < (1−ε)τ`. Less robust than
+    /// the median `estimate_f2()` but required for the ball's smooth quadratic.
+    pub fn mean_f2(&self) -> f64 {
+        if self.d == 0 {
+            return 0.0;
+        }
+        self.l2_norm_sq() / self.d as f64
+    }
+
     /// New sketch = `self − other` (same shape). The per-site DRIFT `ΔC_i`.
     pub fn minus(&self, other: &CountSketchF2) -> CountSketchF2 {
         assert_eq!(self.shape(), other.shape());
