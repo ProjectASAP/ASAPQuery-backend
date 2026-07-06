@@ -360,12 +360,13 @@ impl DistributedF2Monitor {
 /// distributed F2 monitoring — breaks the "need-L2-to-decide / need-sketch-to-get-L2"
 /// circularity. Instead of every site shipping its sketch every window, each site
 /// runs a PURELY LOCAL test (does its drift ball stay inside the safe ball
-/// `B(0, √(d·τ))`?) using only the last-broadcast reference `C_ref` and its OWN
-/// drift `ΔC_i` — never the live global. A site ships its sketch ONLY when locally
-/// unsafe, triggering a resync.
+/// `B(0, √(d·(1−ε)τ))`?) using only the last-broadcast reference `C_ref` and its
+/// OWN drift `ΔC_i` — never the live global. A site ships its sketch ONLY when
+/// locally unsafe, triggering a resync.
 ///
-/// Monitored quantity: `‖C‖₂²` (with `E[‖C‖₂²]=d·F2`) against `d·τ`; safe-ball
-/// radius `R=√(d·τ)`. Convexity theorem: the global `C = (1/k)·Σ u_i` lies in the
+/// Monitored quantity: `‖C‖₂²` (with `E[‖C‖₂²]=d·F2`) against `d·(1−ε)τ`;
+/// safe-ball radius `R=√(d·(1−ε)τ)` (the ALERT threshold `(1−ε)τ`, not the raw
+/// `τ` — see `safe_radius`). Convexity theorem: the global `C = (1/k)·Σ u_i` lies in the
 /// convex hull of the drift vectors `u_i = C_ref + k·ΔC_i`, so if every site's
 /// bounding ball `B((C_ref+u_i)/2, ‖u_i−C_ref‖/2) ⊆ B(0,R)` then `‖C‖<R ⇒ F2<τ`
 /// (no missed crossing). F2 is the clean case — its sublevel set is already a ball,

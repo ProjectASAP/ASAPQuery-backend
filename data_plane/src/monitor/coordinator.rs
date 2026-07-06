@@ -296,18 +296,18 @@ impl Monitor {
     }
 
     /// Coordinated update-sampling allocation for the current edge set, keyed by
-    /// edge id. Returns `p_i ∈ (0,1]` per edge, each clamped up to the CDM-
-    /// threshold coupling floor so sampling noise stays within ε.
+    /// edge id. Returns `p_i ∈ (0,1]` per edge, set by the whole-sketch ε-floor
+    /// so each edge's sampling noise stays within the CDM band.
     ///
-    /// The merged sampling-variance budget `V` is derived from what the
-    /// coordinator already holds: the CDM tolerance on the monitored value is
-    /// `ε·τ`, and update-sampling injects a std-dev of `√(Σ f_i(1−p_i)/p_i)` into
-    /// `Σf̂`. Keeping that band within the threshold tolerance means
-    /// `√V ≤ ε·τ`, i.e. **`V = (ε·τ)²`** — the sampling noise is absorbed within
-    /// the CDM band (the "ε_cdm ≳ ε_s" coupling). Lacking a per-key frequency
-    /// split, we use each edge's `rate` as the `freqs` proxy (so `p_i ∝
-    /// 1/√rate_i`). With <2 edges or all rates unknown the allocation degenerates
-    /// to `p=1` everywhere (no sampling).
+    /// The allocation is the per-edge CDM-threshold coupling floor
+    /// `p_i = 1/(1 + ε²·rate_i)` (see `epsilon_sample_floor`), NOT the earlier
+    /// per-key `√(f_i/rate_i)` KKT water-filling — that allocation has been
+    /// retired (see the note in the function body for why sketch sampling is
+    /// governed by the whole-sketch ε-floor rather than a per-key frequency
+    /// split). `rate_i` is each edge's observed items/window, used directly as
+    /// the mass whose L2 contribution the floor keeps within ε. With <2 edges or
+    /// all rates unknown the allocation degenerates to `p=1` everywhere (no
+    /// sampling).
     fn allocate_p(&self) -> HashMap<String, f64> {
         // Coordinated update-sampling for a SKETCH is governed by the whole-sketch
         // ε-floor — a single law, NOT a per-key `√(f_i/rate_i)` KKT allocation.
