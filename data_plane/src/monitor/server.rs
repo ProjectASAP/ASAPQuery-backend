@@ -195,15 +195,22 @@ impl MonitorCoordinator {
                 }
             }
         };
-        // Whole-sketch (F2) monitors do not run the scalar slack countdown:
-        // lazily materialize their F2 state and return no grant actions (the
-        // edge ships/gates sketches on its own window cadence).
+        // Whole-sketch (F2) monitors: lazily materialize the F2 state for the
+        // sketch-shipping protocol. They ALSO register with the scalar Monitor
+        // below — an F2 monitor serves two edge populations at once, told apart
+        // by the report PAYLOAD (the wire contract: `MonitorReport.sketch` is
+        // empty for scalar reports):
+        //   * sketch-shipping edges (F2Engine): geometric safe-zone, gated by
+        //     their own window cadence — they ignore grants;
+        //   * scalar edges (otel-app coordinated sampling): report the running
+        //     F2 as local_value and NEED the Grant(slack, sample_p) flow, which
+        //     only the scalar Monitor emits. Returning no actions here starved
+        //     them forever (the scalar engine stays silent without a grant).
         if cfg.functional.is_whole_sketch() {
             let mut f2 = self.f2_monitors.lock().await;
-            f2.entry(mk).or_insert_with(|| {
+            f2.entry(mk.clone()).or_insert_with(|| {
                 F2CoordMonitor::new(cfg.f2_mode, cfg.tau, cfg.epsilon, cfg.f2_d, cfg.f2_w)
             });
-            return Some(Vec::new());
         }
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.entry(mk).or_insert_with(|| Monitor::new(cfg));
@@ -418,15 +425,20 @@ impl MonitorCoordinator {
                 }
             }
             Some(edge_to_coord::Msg::Report(rep)) => {
-                // Whole-sketch (F2) reports carry a msgpack sketch payload and are
-                // routed to the F2 coordinator; scalar reports drive the countdown.
+                // Route by PAYLOAD, per the wire contract (`MonitorReport.sketch`
+                // is empty for scalar reports): a sketch-bearing report on a
+                // whole-sketch (F2) monitor goes to the F2 coordinator; an
+                // empty-sketch report drives the scalar countdown even when the
+                // functional is f2 — that is the otel-app coordinated-sampling
+                // population, which reports the running F2 as local_value and
+                // relies on the scalar Grant flow.
                 let is_f2 = {
                     let cfgs = self.cfgs.read().unwrap();
                     cfgs.get(&(rep.agg_id, rep.key.clone()))
                         .map(|c| c.functional.is_whole_sketch())
                         .unwrap_or(false)
                 };
-                if is_f2 {
+                if is_f2 && !rep.sketch.is_empty() {
                     self.apply_f2_report(rep).await;
                 } else if let Some(actions) = self
                     .apply_report(
@@ -520,11 +532,60 @@ impl MonitorService for MonitorServiceImpl {
 mod reconfigure_tests {
     use super::MonitorCoordinator;
     use crate::monitor::alert::AlertSink;
-    use crate::monitor::coordinator::MonitorConfig;
+    use crate::monitor::coordinator::{Functional, MonitorConfig};
     use std::sync::Arc;
 
     fn sink() -> AlertSink {
         Arc::new(|_v| {})
+    }
+
+    fn f2_cfg(agg_id: u64, tau: f64) -> MonitorConfig {
+        MonitorConfig {
+            agg_id,
+            key: Vec::new(),
+            tau,
+            epsilon: 0.2,
+            window_ms: 15_000,
+            functional: Functional::F2,
+            f2_d: 2,
+            f2_w: 8,
+            ..Default::default()
+        }
+    }
+
+    // Regression for the two-F2-populations collision: an F2 (whole-sketch)
+    // monitor must STILL run the scalar registration so scalar edges (otel-app
+    // coordinated sampling, which reports the running F2 as local_value with an
+    // EMPTY sketch payload) receive the Grant(slack, sample_p) flow. The old
+    // routing returned no actions on register, starving them forever (the
+    // scalar engine stays silent without a grant) — fig9_f2 regressed to empty
+    // results.
+    #[tokio::test]
+    async fn f2_monitor_still_grants_scalar_registrations() {
+        let coord = MonitorCoordinator::new(vec![f2_cfg(7, 1e9)], sink());
+        let actions = coord
+            .apply_register(7, Vec::new(), "edge-a", 15_000, 0)
+            .await
+            .expect("f2 monitor is configured");
+        assert!(
+            !actions.is_empty(),
+            "register on an f2 monitor must emit a scalar Grant (coordinated \
+             sampling), got no actions"
+        );
+        // The F2 state was ALSO materialized (sketch-shipping edges route by
+        // payload in handle_msg).
+        assert_eq!(coord.f2_monitors.lock().await.len(), 1);
+        // An empty-sketch scalar report drives the countdown and re-grants.
+        let actions = coord
+            .apply_report(7, Vec::new(), "edge-a", 0, 1000.0, 1, 500.0)
+            .await
+            .expect("scalar report on the f2 monitor reaches the scalar Monitor");
+        assert!(
+            !actions.is_empty(),
+            "scalar report must produce grant/alert actions"
+        );
+        // Nothing crossed into the F2 sketch path.
+        assert_eq!(coord.f2_comm().2, 0, "no sketch ships counted");
     }
 
     fn cfg(agg_id: u64, key: &str, tau: f64) -> MonitorConfig {
