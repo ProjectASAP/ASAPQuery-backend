@@ -28,6 +28,17 @@ use std::collections::HashMap;
 use super::coordinator::F2Mode;
 use super::f2::CountSketchF2;
 
+/// Periodic keyframe cadence for the geometric `C_ref` broadcast: every Nth
+/// broadcast ships a **Full** matrix instead of a sparse delta, bounding how long
+/// an edge that missed/failed to apply a delta can run against a diverged cached
+/// reference (an I-frame, in video terms). The edge already force-ships while its
+/// reference is untrustworthy (see `f2engine.go` `needFull`), so this only
+/// governs how fast such an edge recovers to silent operation — it does not
+/// affect safety. Chosen larger than the eval's per-mode broadcast count so the
+/// reported communication figures are unchanged; a diverged edge otherwise
+/// self-heals at the next epoch boundary regardless.
+const F2_KEYFRAME_INTERVAL: u64 = 32;
+
 /// An action the F2 coordinator wants the transport to perform.
 #[derive(Clone, Debug, PartialEq)]
 pub enum F2Out {
@@ -180,14 +191,17 @@ impl F2CoordMonitor {
         }
         if self.mode == F2Mode::Geometric {
             self.round += 1;
-            // Full on the first broadcast of the epoch; sparse delta thereafter.
+            // Full on the first broadcast of the epoch and every
+            // F2_KEYFRAME_INTERVAL rounds (a periodic keyframe that bounds an
+            // edge's delta-loss divergence recovery); sparse delta otherwise.
+            let force_keyframe = self.round % F2_KEYFRAME_INTERVAL == 0;
             let cref = match &self.last_broadcast {
-                None => CRefUpdate::Full(self.running.to_matrix()),
-                Some(last) => CRefUpdate::Delta {
+                Some(last) if !force_keyframe => CRefUpdate::Delta {
                     rows: self.d,
                     cols: self.w,
                     cells: self.running.sparse_delta_cells(last),
                 },
+                _ => CRefUpdate::Full(self.running.to_matrix()),
             };
             self.last_broadcast = Some(self.running.clone());
             out.push(F2Out::RefBroadcast {
@@ -275,5 +289,37 @@ mod tests {
     fn mis_dimensioned_dropped() {
         let mut mon = F2CoordMonitor::new(F2Mode::Distributed, 100.0, 0.1, 4, 8);
         assert!(mon.on_sketch("e", 0, vec![vec![0.0; 4]; 4]).is_empty());
+    }
+
+    #[test]
+    fn periodic_keyframe_bounds_delta_divergence() {
+        // A single edge ships every window (τ huge → no alert, only RefBroadcast).
+        // The broadcast is Full at round 1 (bootstrap keyframe) and again at
+        // round F2_KEYFRAME_INTERVAL; every round in between is a sparse Delta —
+        // so a diverged edge fully resyncs within one interval.
+        let (d, w, seed) = (5, 256, 9u64);
+        let mut mon = F2CoordMonitor::new(F2Mode::Geometric, 1e12, 0.1, d, w);
+        let s = sketch(d, w, seed, &[(1, 10)]);
+        let mut full_rounds = Vec::new();
+        for round in 1..=F2_KEYFRAME_INTERVAL {
+            let out = mon.on_sketch("a", 0, s.clone());
+            let is_full = out.iter().any(|o| {
+                matches!(
+                    o,
+                    F2Out::RefBroadcast {
+                        cref: CRefUpdate::Full(_),
+                        ..
+                    }
+                )
+            });
+            if is_full {
+                full_rounds.push(round);
+            }
+        }
+        assert_eq!(
+            full_rounds,
+            vec![1, F2_KEYFRAME_INTERVAL],
+            "Full keyframe must land at round 1 and every F2_KEYFRAME_INTERVAL; deltas in between"
+        );
     }
 }
