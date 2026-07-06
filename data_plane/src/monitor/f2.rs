@@ -110,18 +110,43 @@ impl CountSketchF2 {
     /// full-matrix amplification of the geometric resync). Panics on shape
     /// mismatch.
     pub fn sparse_delta_cells(&self, base: &CountSketchF2) -> Vec<(u32, u32, f64)> {
+        self.sparse_delta_cells_thresholded(base, 0.0)
+    }
+
+    /// Cells whose change since `base` exceeds `threshold` in magnitude — the
+    /// OctoSketch-style thresholded `C_ref` broadcast gate (design §12 #1). With
+    /// `threshold = 0` this is the exact sparse delta; with the §7 F2 per-cell
+    /// threshold it keeps the broadcast sparse even for a DENSE sketch (2048 keys
+    /// in a 1280-cell matrix, where `Δ ≠ 0` degenerates to a full matrix). The
+    /// caller MUST fold only the emitted cells back into its `last_broadcast`
+    /// (see `apply_cells`) so sub-threshold changes ACCUMULATE and eventually
+    /// ship — bounding the C_ref approximation error to `threshold` per cell.
+    pub fn sparse_delta_cells_thresholded(
+        &self,
+        base: &CountSketchF2,
+        threshold: f64,
+    ) -> Vec<(u32, u32, f64)> {
         assert_eq!(self.shape(), base.shape());
         let mut cells = Vec::new();
         for r in 0..self.d {
             for c in 0..self.w {
                 let i = r * self.w + c;
                 let d = self.c[i] - base.c[i];
-                if d != 0.0 {
+                if d.abs() > threshold {
                     cells.push((r as u32, c as u32, d));
                 }
             }
         }
         cells
+    }
+
+    /// Apply a sparse cell delta in place — the mirror of the edge's cached
+    /// `C_ref` update. Lets the coordinator track EXACTLY what an edge holds
+    /// after a thresholded broadcast (only the shipped cells reach the edge).
+    pub fn apply_cells(&mut self, cells: &[(u32, u32, f64)]) {
+        for &(r, c, d) in cells {
+            self.c[r as usize * self.w + c as usize] += d;
+        }
     }
 
     /// Emit the cell matrix as `rows × cols` `f64` (the wire form — feeds
@@ -478,6 +503,33 @@ mod tests {
         // tiny drift (+1 each) ⇒ both stay locally SAFE ⇒ zero communication.
         assert!(mon.is_locally_safe("a", &gcs(&mon, &[(1, 41)])), "small drift must be safe");
         assert!(mon.is_locally_safe("b", &gcs(&mon, &[(1, 41)])));
+    }
+
+    #[test]
+    fn thresholded_broadcast_drops_subthreshold_and_tracks_last() {
+        // base = zeros; running has one big cell (Δ=100) and one small (Δ=5).
+        let d = 2;
+        let w = 3;
+        let base = CountSketchF2::from_matrix(&vec![vec![0.0; w]; d]);
+        let mut running = base.clone();
+        running.apply_cells(&[(0, 0, 100.0), (1, 2, 5.0)]);
+
+        // threshold 10 keeps only the big cell.
+        let cells = running.sparse_delta_cells_thresholded(&base, 10.0);
+        assert_eq!(cells, vec![(0, 0, 100.0)], "only |Δ|>T ships");
+        // exact delta (T=0) ships both.
+        assert_eq!(running.sparse_delta_cells(&base).len(), 2);
+
+        // last_broadcast tracks ONLY the shipped cell → the dropped Δ=5
+        // accumulates as (running − last) error, bounded by T.
+        let mut last = base.clone();
+        last.apply_cells(&cells);
+        let residual = running.sparse_delta_cells(&last); // what the edge is still missing
+        assert_eq!(residual, vec![(1, 2, 5.0)], "sub-threshold change is retained, not lost");
+        assert!(
+            residual.iter().all(|&(_, _, dv)| dv.abs() <= 10.0),
+            "C_ref approximation error is ≤ T per cell"
+        );
     }
 
     #[test]

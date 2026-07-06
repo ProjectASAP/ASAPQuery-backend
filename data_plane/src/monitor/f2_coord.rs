@@ -195,15 +195,36 @@ impl F2CoordMonitor {
             // F2_KEYFRAME_INTERVAL rounds (a periodic keyframe that bounds an
             // edge's delta-loss divergence recovery); sparse delta otherwise.
             let force_keyframe = self.round % F2_KEYFRAME_INTERVAL == 0;
-            let cref = match &self.last_broadcast {
-                Some(last) if !force_keyframe => CRefUpdate::Delta {
-                    rows: self.d,
-                    cols: self.w,
-                    cells: self.running.sparse_delta_cells(last),
-                },
-                _ => CRefUpdate::Full(self.running.to_matrix()),
+            let (cref, new_last) = match &self.last_broadcast {
+                Some(last) if !force_keyframe => {
+                    // Thresholded broadcast gate (design §12 #1): ship only cells
+                    // that moved by more than the §7 F2 per-cell threshold
+                    // T = ε‖C‖/(2k√(dw)) — a cell changing by less than that does
+                    // not materially move the F2 estimate, so broadcasting it is
+                    // pure O(k) amplification on a dense sketch. Sub-T changes
+                    // accumulate in (running − last_broadcast) and ship once they
+                    // cross T, so the edge's C_ref error stays ≤ T per cell.
+                    let k = self.latest.len().max(1) as f64;
+                    let norm = self.running.l2_norm_sq().sqrt();
+                    let t = self.epsilon * norm / (2.0 * k * ((self.d * self.w) as f64).sqrt());
+                    let cells = self.running.sparse_delta_cells_thresholded(last, t);
+                    // last_broadcast must track what the edge ACTUALLY holds:
+                    // the previous reference plus only the shipped cells.
+                    let mut nb = last.clone();
+                    nb.apply_cells(&cells);
+                    (
+                        CRefUpdate::Delta {
+                            rows: self.d,
+                            cols: self.w,
+                            cells,
+                        },
+                        nb,
+                    )
+                }
+                // Full keyframe: the edge receives the whole running sketch.
+                _ => (CRefUpdate::Full(self.running.to_matrix()), self.running.clone()),
             };
-            self.last_broadcast = Some(self.running.clone());
+            self.last_broadcast = Some(new_last);
             out.push(F2Out::RefBroadcast {
                 round: self.round,
                 window_start_ms: self.window_start_ms,
