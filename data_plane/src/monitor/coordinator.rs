@@ -338,14 +338,60 @@ impl Monitor {
             .collect()
     }
 
-    /// Recompute Δ; fire the alert once if within ε, otherwise advance the round
-    /// and emit a fresh slack grant to every edge.
+    /// Sampling margin `m_sa` for the safe-fire rule (derivations §10):
+    /// `Ĝ + m_sa + m_cdm ≥ (1−ε)τ`. When an edge's readout comes from a sampled
+    /// sketch, `known_value` is a two-sided Horvitz–Thompson estimate, not an
+    /// exact lower bound, so the coordinator can under-estimate the global by the
+    /// sampling noise and fire a real crossing late. `m_sa` is the aggregate
+    /// 1-σ sampling standard deviation `√(Σ_i kv_i·(1−p_i)/p_i)`, with `p_i` the
+    /// coordinator's own allocated floor `1/(1+ε²·rate_i)` — the same `p` it
+    /// grants (self-consistent with its sampling model). It is **0 whenever no
+    /// edge is sampled** (`rate=0 ⇒ p=1`), so the unsampled path is unchanged.
+    ///
+    /// This is the 1-σ heuristic §4.2/§6.2 use, not the high-probability Bernstein
+    /// margin — a theorem-grade alert would use `z_δ·` this. It is deliberately
+    /// conservative for a Sum monitor (whose `local_value` is exact and carries no
+    /// sampling noise even if the coordinator allocated `p<1`): the extra margin
+    /// only fires earlier, never later, which is the safe direction for a
+    /// threshold alert (a false-early beat a missed crossing).
+    fn sampling_margin(&self) -> f64 {
+        // Mirror the grant policy exactly: `rebroadcast` allocates p<1 only for
+        // ≥2 edges (a single edge is never sampled — `allocate_p` returns p=1),
+        // so a lone edge's readout is exact and carries no sampling margin.
+        if self.edges.len() < 2 {
+            return 0.0;
+        }
+        let var: f64 = self
+            .edges
+            .values()
+            .map(|e| {
+                if e.rate <= 0.0 {
+                    return 0.0;
+                }
+                let p = epsilon_sample_floor(self.cfg.epsilon, e.rate);
+                if p >= 1.0 {
+                    return 0.0;
+                }
+                // HT variance of a 1/p-weighted Bernoulli readout of mass kv_i.
+                e.known_value.max(0.0) * (1.0 - p) / p
+            })
+            .sum();
+        var.sqrt()
+    }
+
+    /// Recompute Δ; fire the alert once if within ε (plus the sampling margin),
+    /// otherwise advance the round and emit a fresh slack grant to every edge.
     fn rebroadcast(&mut self) -> Vec<Action> {
         if self.alerted || self.edges.is_empty() {
             return Vec::new();
         }
         let est = self.global_estimate();
-        if self.gap() <= self.cfg.epsilon * self.cfg.tau {
+        // Safe-fire rule (§10): fold the sampling margin into the band so a
+        // sampling-under-estimated global still fires within [(1−ε)τ, τ). m_cdm
+        // is already realized by the slack countdown (Ĝ = Σ known_value is a
+        // lower bound each edge maintains within its granted slack), so only the
+        // sampling term is added here.
+        if self.gap() <= self.cfg.epsilon * self.cfg.tau + self.sampling_margin() {
             self.alerted = true;
             return vec![Action::Alert {
                 global_estimate: est,
@@ -499,6 +545,60 @@ mod tests {
         let delta = 120.0 - est;
         let total_slack = 3.0 * slack_in(&a3, "e1");
         assert!((total_slack - delta / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sampling_margin_fires_alert_earlier() {
+        // τ=100, ε=0.05 → unsampled band fires at Δ≤5 (estimate ≥ 95). Sampling is
+        // granted only with ≥2 edges, so this uses two. Each sampled edge has
+        // rate=400 → p = 1/(1+0.05²·400) = 0.5; at kv=45 each, the aggregate
+        // margin m_sa = √(45·(1−0.5)/0.5 + 45·(1−0.5)/0.5) = √90 ≈ 9.49, loosening
+        // the fire threshold to Δ ≤ 5 + 9.49 → estimate ≥ ~85.5.
+
+        // Unsampled control (rate=0): estimate 90 is below the 95 fire point → grant.
+        let mut m = Monitor::new(cfg(100.0));
+        m.on_register("e1", 60_000, 0);
+        m.on_register("e2", 60_000, 0);
+        m.on_report("e1", 0, 45.0, 1, 0.0);
+        assert!(
+            matches!(
+                m.on_report("e2", 0, 45.0, 1, 0.0).as_slice(),
+                [Action::Grant { .. }, ..]
+            ),
+            "unsampled: estimate 90 must not alert (m_sa=0)"
+        );
+
+        // Sampled (rate=400): same estimate 90, but the margin fires the alert.
+        let mut ms = Monitor::new(cfg(100.0));
+        ms.on_register("e1", 60_000, 0);
+        ms.on_register("e2", 60_000, 0);
+        ms.on_report("e1", 0, 45.0, 1, 400.0);
+        let a = ms.on_report("e2", 0, 45.0, 1, 400.0);
+        assert!(
+            matches!(a.as_slice(), [Action::Alert { .. }]),
+            "sampled: m_sa≈9.49 must fire the alert at estimate 90, got {a:?}"
+        );
+    }
+
+    #[test]
+    fn sampling_margin_zero_without_sampling() {
+        // rate=0 (nothing to sample) ⇒ 0 margin, even with ≥2 edges.
+        let mut m = Monitor::new(cfg(100.0));
+        m.on_register("e1", 60_000, 0);
+        m.on_register("e2", 60_000, 0);
+        m.on_report("e1", 0, 40.0, 1, 0.0);
+        m.on_report("e2", 0, 40.0, 1, 0.0);
+        assert_eq!(m.sampling_margin(), 0.0, "rate=0 edges add no margin");
+
+        // A lone edge is never sampled (grant policy) ⇒ 0 margin even at high rate.
+        let mut solo = Monitor::new(cfg(100.0));
+        solo.on_register("e1", 60_000, 0);
+        solo.on_report("e1", 0, 40.0, 1, 10_000.0);
+        assert_eq!(
+            solo.sampling_margin(),
+            0.0,
+            "single edge is unsampled → no margin"
+        );
     }
 
     #[test]
