@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex};
@@ -19,12 +18,11 @@ use tracing::{debug, info, warn};
 use asap_otel_proto::monitor::v1::{
     coord_to_edge, edge_to_coord,
     monitor_service_server::{MonitorService, MonitorServiceServer},
-    CoordToEdge, EdgeToCoord, MonitorReport, RefBroadcast, SlackGrant,
+    CoordToEdge, EdgeToCoord, SlackGrant,
 };
 
 use super::alert::{global_threshold_violation, AlertSink};
 use super::coordinator::{Action, Monitor, MonitorConfig};
-use super::f2_coord::{CRefUpdate, F2CoordMonitor, F2Out};
 
 type MonKey = (u64, Vec<u8>);
 type EdgeTx = mpsc::Sender<Result<CoordToEdge, Status>>;
@@ -33,17 +31,6 @@ type EdgeTx = mpsc::Sender<Result<CoordToEdge, Status>>;
 pub struct MonitorCoordinator {
     /// Live per-monitor scalar state machines, created lazily from `cfgs`.
     monitors: Mutex<HashMap<MonKey, Monitor>>,
-    /// Live per-monitor whole-sketch (F2) state machines, created lazily from
-    /// `cfgs` for monitors whose functional is `F2`.
-    f2_monitors: Mutex<HashMap<MonKey, F2CoordMonitor>>,
-    /// F2 communication accounting (for the eval): total msgpack sketch bytes
-    /// received from edges, total reference-broadcast bytes egressed, and the
-    /// message counts. `f2_bytes_out` counts each `RefBroadcast` once per
-    /// recipient edge.
-    f2_bytes_in: AtomicU64,
-    f2_bytes_out: AtomicU64,
-    f2_ships_in: AtomicU64,
-    f2_refs_out: AtomicU64,
     /// Monitor specs (τ, ε, window) from the streaming-config `monitors:`
     /// section — the authoritative source of τ. Behind an `RwLock` so the
     /// control plane's hot-reload (`reconfigure`) can add/update/remove monitors
@@ -64,26 +51,10 @@ impl MonitorCoordinator {
             .collect();
         Arc::new(Self {
             monitors: Mutex::new(HashMap::new()),
-            f2_monitors: Mutex::new(HashMap::new()),
-            f2_bytes_in: AtomicU64::new(0),
-            f2_bytes_out: AtomicU64::new(0),
-            f2_ships_in: AtomicU64::new(0),
-            f2_refs_out: AtomicU64::new(0),
             cfgs: std::sync::RwLock::new(cfgs),
             edges: Mutex::new(HashMap::new()),
             alert_sink,
         })
-    }
-
-    /// F2 communication accounting `(sketch_bytes_in, ref_bytes_out, ships_in,
-    /// refs_out)` — the eval reads this to compare geometric vs distributed cost.
-    pub fn f2_comm(&self) -> (u64, u64, u64, u64) {
-        (
-            self.f2_bytes_in.load(Ordering::Relaxed),
-            self.f2_bytes_out.load(Ordering::Relaxed),
-            self.f2_ships_in.load(Ordering::Relaxed),
-            self.f2_refs_out.load(Ordering::Relaxed),
-        )
     }
 
     /// Number of configured monitors (test/observability).
@@ -151,10 +122,8 @@ impl MonitorCoordinator {
         *self.cfgs.write().unwrap() = new_cfgs;
         if !evict.is_empty() {
             let mut monitors = self.monitors.lock().await;
-            let mut f2 = self.f2_monitors.lock().await;
             for k in &evict {
                 monitors.remove(k);
-                f2.remove(k);
             }
         }
         (added, changed, removed)
@@ -195,23 +164,6 @@ impl MonitorCoordinator {
                 }
             }
         };
-        // Whole-sketch (F2) monitors: lazily materialize the F2 state for the
-        // sketch-shipping protocol. They ALSO register with the scalar Monitor
-        // below — an F2 monitor serves two edge populations at once, told apart
-        // by the report PAYLOAD (the wire contract: `MonitorReport.sketch` is
-        // empty for scalar reports):
-        //   * sketch-shipping edges (F2Engine): geometric safe-zone, gated by
-        //     their own window cadence — they ignore grants;
-        //   * scalar edges (otel-app coordinated sampling): report the running
-        //     F2 as local_value and NEED the Grant(slack, sample_p) flow, which
-        //     only the scalar Monitor emits. Returning no actions here starved
-        //     them forever (the scalar engine stays silent without a grant).
-        if cfg.functional.is_whole_sketch() {
-            let mut f2 = self.f2_monitors.lock().await;
-            f2.entry(mk.clone()).or_insert_with(|| {
-                F2CoordMonitor::new(cfg.f2_mode, cfg.tau, cfg.epsilon, cfg.f2_d, cfg.f2_w)
-            });
-        }
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.entry(mk).or_insert_with(|| Monitor::new(cfg));
         Some(mon.on_register(edge_id, epoch_window_ms, window_start_ms))
@@ -231,117 +183,6 @@ impl MonitorCoordinator {
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.get_mut(&mk)?;
         Some(mon.on_report(edge_id, window_start_ms, local_value, seq, rate))
-    }
-
-    /// Handle a whole-sketch (F2) report: decode the msgpack Count-Sketch cell
-    /// matrix, feed the F2 coordinator, and dispatch the resulting actions
-    /// (alert to the sink; geometric `RefBroadcast` to every edge). Byte
-    /// accounting feeds the eval.
-    async fn apply_f2_report(&self, rep: MonitorReport) {
-        let mk = (rep.agg_id, rep.key.clone());
-        let bytes_len = rep.sketch.len();
-        // Wire form is the 3-element msgpack array `[rows, cols, matrix]` that
-        // asapmsgpack.MarshalCountSketch (Go edge) emits — decode it as that exact
-        // tuple (NOT the 4-field portable::CountSketch, whose `to_msgpack` also
-        // writes a `topk` element the Go side does not read).
-        let matrix = match rmp_serde::from_slice::<(u64, u64, Vec<Vec<f64>>)>(&rep.sketch) {
-            Ok((_rows, _cols, m)) => m,
-            Err(e) => {
-                warn!(agg_id = rep.agg_id, edge = %rep.edge_id, error = %e,
-                      "F2 report carried an undecodable Count-Sketch — dropped");
-                return;
-            }
-        };
-        self.f2_bytes_in.fetch_add(bytes_len as u64, Ordering::Relaxed);
-        self.f2_ships_in.fetch_add(1, Ordering::Relaxed);
-        let outs = {
-            let mut f2 = self.f2_monitors.lock().await;
-            match f2.get_mut(&mk) {
-                Some(mon) => mon.on_sketch(&rep.edge_id, rep.window_start_ms, matrix),
-                None => return, // register precedes reports
-            }
-        };
-        self.dispatch_f2(rep.agg_id, &rep.key, outs).await;
-    }
-
-    /// Dispatch F2 coordinator actions. Alerts egress through the violation sink;
-    /// a `RefBroadcast` is serialized once and sent to every connected edge (each
-    /// tags its agg_id/key so non-subscribers ignore it).
-    async fn dispatch_f2(&self, agg_id: u64, key: &[u8], outs: Vec<F2Out>) {
-        for out in outs {
-            match out {
-                F2Out::Alert {
-                    f2_estimate,
-                    tau,
-                    window_start_ms,
-                } => {
-                    let id = Self::monitor_id(agg_id, key);
-                    info!(monitor = %id, f2_estimate, tau, window_start_ms,
-                          "F2 global threshold crossed — firing alert");
-                    (self.alert_sink)(global_threshold_violation(id, f2_estimate, tau));
-                }
-                F2Out::RefBroadcast {
-                    round,
-                    window_start_ms,
-                    k,
-                    cref,
-                } => {
-                    // Full = the 3-element `[rows, cols, matrix]` array (byte-parity
-                    // with Go asapmsgpack.UnmarshalCountSketch). Delta = a 5-element
-                    // `[rows, cols, rowIdx[], colIdx[], vals[]]` array of changed
-                    // cells (is_delta=true) — the edge applies it to its cached C_ref.
-                    let (bytes, is_delta) = match cref {
-                        CRefUpdate::Full(matrix) => {
-                            let rows = matrix.len() as u64;
-                            let cols = matrix.first().map(|r| r.len()).unwrap_or(0) as u64;
-                            match rmp_serde::to_vec(&(rows, cols, matrix)) {
-                                Ok(b) => (b, false),
-                                Err(e) => {
-                                    warn!(error = %e, "serialize C_ref full — skip");
-                                    continue;
-                                }
-                            }
-                        }
-                        CRefUpdate::Delta { rows, cols, cells } => {
-                            let ri: Vec<u32> = cells.iter().map(|c| c.0).collect();
-                            let ci: Vec<u32> = cells.iter().map(|c| c.1).collect();
-                            let vs: Vec<f64> = cells.iter().map(|c| c.2).collect();
-                            match rmp_serde::to_vec(&(rows as u64, cols as u64, ri, ci, vs)) {
-                                Ok(b) => (b, true),
-                                Err(e) => {
-                                    warn!(error = %e, "serialize C_ref delta — skip");
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    let msg = CoordToEdge {
-                        msg: Some(coord_to_edge::Msg::Ref(RefBroadcast {
-                            agg_id,
-                            key: key.to_vec(),
-                            round,
-                            window_start_ms,
-                            k,
-                            c_ref: bytes.clone(),
-                            is_delta,
-                        })),
-                    };
-                    let txs: Vec<EdgeTx> = {
-                        let edges = self.edges.lock().await;
-                        edges.values().cloned().collect()
-                    };
-                    for tx in &txs {
-                        if tx.send(Ok(msg.clone())).await.is_err() {
-                            debug!("C_ref broadcast send failed (edge gone)");
-                        }
-                    }
-                    self.f2_bytes_out
-                        .fetch_add(bytes.len() as u64 * txs.len() as u64, Ordering::Relaxed);
-                    self.f2_refs_out
-                        .fetch_add(txs.len() as u64, Ordering::Relaxed);
-                }
-            }
-        }
     }
 
     /// Dispatch coordinator actions: grants to the addressed edge's stream,
@@ -425,22 +266,8 @@ impl MonitorCoordinator {
                 }
             }
             Some(edge_to_coord::Msg::Report(rep)) => {
-                // Route by PAYLOAD, per the wire contract (`MonitorReport.sketch`
-                // is empty for scalar reports): a sketch-bearing report on a
-                // whole-sketch (F2) monitor goes to the F2 coordinator; an
-                // empty-sketch report drives the scalar countdown even when the
-                // functional is f2 — that is the otel-app coordinated-sampling
-                // population, which reports the running F2 as local_value and
-                // relies on the scalar Grant flow.
-                let is_f2 = {
-                    let cfgs = self.cfgs.read().unwrap();
-                    cfgs.get(&(rep.agg_id, rep.key.clone()))
-                        .map(|c| c.functional.is_whole_sketch())
-                        .unwrap_or(false)
-                };
-                if is_f2 && !rep.sketch.is_empty() {
-                    self.apply_f2_report(rep).await;
-                } else if let Some(actions) = self
+                // Every report drives the scalar CMY slack-countdown Monitor.
+                if let Some(actions) = self
                     .apply_report(
                         rep.agg_id,
                         rep.key.clone(),
@@ -532,60 +359,11 @@ impl MonitorService for MonitorServiceImpl {
 mod reconfigure_tests {
     use super::MonitorCoordinator;
     use crate::monitor::alert::AlertSink;
-    use crate::monitor::coordinator::{Functional, MonitorConfig};
+    use crate::monitor::coordinator::MonitorConfig;
     use std::sync::Arc;
 
     fn sink() -> AlertSink {
         Arc::new(|_v| {})
-    }
-
-    fn f2_cfg(agg_id: u64, tau: f64) -> MonitorConfig {
-        MonitorConfig {
-            agg_id,
-            key: Vec::new(),
-            tau,
-            epsilon: 0.2,
-            window_ms: 15_000,
-            functional: Functional::F2,
-            f2_d: 2,
-            f2_w: 8,
-            ..Default::default()
-        }
-    }
-
-    // Regression for the two-F2-populations collision: an F2 (whole-sketch)
-    // monitor must STILL run the scalar registration so scalar edges (otel-app
-    // coordinated sampling, which reports the running F2 as local_value with an
-    // EMPTY sketch payload) receive the Grant(slack, sample_p) flow. The old
-    // routing returned no actions on register, starving them forever (the
-    // scalar engine stays silent without a grant) — fig9_f2 regressed to empty
-    // results.
-    #[tokio::test]
-    async fn f2_monitor_still_grants_scalar_registrations() {
-        let coord = MonitorCoordinator::new(vec![f2_cfg(7, 1e9)], sink());
-        let actions = coord
-            .apply_register(7, Vec::new(), "edge-a", 15_000, 0)
-            .await
-            .expect("f2 monitor is configured");
-        assert!(
-            !actions.is_empty(),
-            "register on an f2 monitor must emit a scalar Grant (coordinated \
-             sampling), got no actions"
-        );
-        // The F2 state was ALSO materialized (sketch-shipping edges route by
-        // payload in handle_msg).
-        assert_eq!(coord.f2_monitors.lock().await.len(), 1);
-        // An empty-sketch scalar report drives the countdown and re-grants.
-        let actions = coord
-            .apply_report(7, Vec::new(), "edge-a", 0, 1000.0, 1, 500.0)
-            .await
-            .expect("scalar report on the f2 monitor reaches the scalar Monitor");
-        assert!(
-            !actions.is_empty(),
-            "scalar report must produce grant/alert actions"
-        );
-        // Nothing crossed into the F2 sketch path.
-        assert_eq!(coord.f2_comm().2, 0, "no sketch ships counted");
     }
 
     fn cfg(agg_id: u64, key: &str, tau: f64) -> MonitorConfig {

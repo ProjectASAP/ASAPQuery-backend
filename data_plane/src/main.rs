@@ -600,7 +600,7 @@ async fn main() -> Result<()> {
     // the control-plane replanner can subscribe via the same Violation shape).
     let monitor_handle = if args.enable_monitor_coordinator {
         use data_plane::monitor::{
-            AlertSink, F2Mode, Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
+            AlertSink, Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
         };
         let specs: Vec<MonitorConfig> = streaming_config
             .monitors()
@@ -612,9 +612,6 @@ async fn main() -> Result<()> {
                 epsilon: m.epsilon,
                 window_ms: m.window_ms,
                 functional: Functional::from_name(&m.functional),
-                f2_d: m.d,
-                f2_w: m.w,
-                f2_mode: F2Mode::from_name(&m.mode),
             })
             .collect();
         if specs.is_empty() {
@@ -661,9 +658,6 @@ async fn main() -> Result<()> {
                             epsilon: m.epsilon,
                             window_ms: m.window_ms,
                             functional: Functional::from_name(&m.functional),
-                            f2_d: m.d,
-                            f2_w: m.w,
-                            f2_mode: F2Mode::from_name(&m.mode),
                         })
                         .collect();
                     let (added, changed, removed) = coord.reconfigure(specs).await;

@@ -14,16 +14,13 @@
 //!   - [`alert`]       — alert egress via the control-plane `Violation` sink.
 //!   - [`server`]      — the tonic bidi-streaming `MonitorService` server.
 //!   - [`sampling_alloc`] — the coordinated update-sampling law (ε-floor).
-//!   - [`f2`]          — whole-sketch L2/F2 *threshold* monitor (Count-Sketch +
-//!     geometric safe-zone). NOTE: F2 here is a MONITORED quantity (alert), not a
-//!     sampling driver — see the sampling law below.
 //!
 //! # Two orthogonal axes — DON'T conflate them
 //!
-//! 1. **What to monitor / alert on** (the `functional`): `sum`, `cms_point`
-//!    (a declared point `f(x)`), or `f2` (whole-sketch L2). This sets the
-//!    THRESHOLD `g vs τ` and what `known_value` means. Identity is `(agg_id,key)`
-//!    — `cms_point` carries a key; `sum`/`f2` are whole-stream (`key=""`).
+//! 1. **What to monitor / alert on** (the `functional`): `sum` or `cms_point`
+//!    (a declared point `f(x)`). This sets the THRESHOLD `g vs τ` and what
+//!    `known_value` means. Identity is `(agg_id,key)` — `cms_point` carries a
+//!    key; `sum` is whole-stream (`key=""`).
 //!
 //! 2. **How hard to sample** (the per-edge `p_i`): a SINGLE law, the whole-sketch
 //!    **ε-floor** `p_i = 1/(1+ε²·rate_i)` (see [`sampling_alloc`]). It depends
@@ -37,14 +34,10 @@
 pub mod alert;
 pub mod coordinator;
 pub mod epoch;
-pub mod f2;
-pub mod f2_coord;
-pub mod geo;
 pub mod sampling_alloc;
 pub mod server;
 
 pub use alert::{global_threshold_violation, AlertSink};
-pub use coordinator::{Action, F2Mode, Functional, Monitor, MonitorConfig};
-pub use f2_coord::{F2CoordMonitor, F2Out};
+pub use coordinator::{Action, Functional, Monitor, MonitorConfig};
 pub use sampling_alloc::epsilon_sample_floor;
 pub use server::{MonitorCoordinator, MonitorServiceImpl};
