@@ -617,17 +617,75 @@ impl<'a> SketchReducer<'a> {
                     .filter(|k| *k > 0.0)
                     .map(|k| k as usize)
                     .unwrap_or(10);
+                // Guard the sketch kind once — heap enumeration needs a
+                // heap-bearing variant; this doesn't depend on any frame.
+                match meta
+                    .sketch_kind()
+                    .expect("ASAP-tier reducer only handles sketch-backed sids")
+                {
+                    SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {}
+                    SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
+                        // Heap-LESS variants can't enumerate top-k — they
+                        // support point-frequency only (QueryFamily::FrequencyEstimate).
+                        return Err(ASAPTierError::MissingHeap {
+                            sid,
+                            sketch_kind: meta
+                                .sketch_kind()
+                                .expect("ASAP-tier reducer only handles sketch-backed sids"),
+                        });
+                    }
+                    other => {
+                        return Err(ASAPTierError::UnsupportedCapability {
+                            function: function_name.to_string(),
+                            capability: Capability::FrequencyTopk(other),
+                        });
+                    }
+                }
                 for ts in series_list {
-                    // Find latest window's CMS-with-heap state. A window-end
-                    // may carry multiple sub-window frames; the LAST frame is
-                    // the freshest (most complete) heap for that window under
-                    // the per-window-reset model, so read it.
+                    // The latest window-end may carry MULTIPLE sub-window frames
+                    // (delta_transmission / threshold sub-windowing at the
+                    // check_interval cadence). Under the empty-base
+                    // per-window-reset contract EACH frame is a DISJOINT
+                    // increment of that window, so the full-window count of a
+                    // key is the SUM of its per-frame heap values — NOT
+                    // `frames.last()`, which is only the final (often near-empty
+                    // tail) sub-window and undercounts a heavy hitter by
+                    // ~n_frames×. We sum the agent-computed heap values directly
+                    // rather than re-estimating from a merged matrix: the
+                    // heap-bearing family here can be a *CountSketch* (signed
+                    // hashing), whose value the CMS-with-heap `estimate()` (min
+                    // over rows) cannot recover — but the agent already stored
+                    // the correct per-key count in each frame's heap. Mirrors
+                    // the FrequencyEstimate branch's Σ-over-frames.
                     let Some((window_end, frames)) = ts.samples.iter().next_back() else {
                         continue;
                     };
-                    let Some(state) = frames.last() else {
+                    let mut summed: std::collections::HashMap<String, f64> =
+                        std::collections::HashMap::new();
+                    let mut any_frame = false;
+                    for state in frames {
+                        // A FULL frame deserializes directly; a MSGPACK_DELTA
+                        // frame is reconstructed by applying its sparse matrix
+                        // delta + full heap onto an empty base (per-window-reset).
+                        let decoded = match state.encoding {
+                            SketchEncoding::MsgpackDelta => {
+                                decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                            }
+                            _ => decode_cms_with_heap_from_msgpack(&state.bytes),
+                        }
+                        .map_err(|e| ASAPTierError::DeserializeFailure {
+                            sid,
+                            encoding: state.encoding,
+                            reason: e,
+                        })?;
+                        for item in decoded.topk_heap_items() {
+                            *summed.entry(item.key).or_insert(0.0) += item.value;
+                        }
+                        any_frame = true;
+                    }
+                    if !any_frame {
                         continue;
-                    };
+                    }
                     any_window = true;
                     let w_end_u64 = if *window_end >= 0 {
                         *window_end as u64
@@ -640,62 +698,15 @@ impl<'a> SketchReducer<'a> {
                     if w_end_u64 > cov_hi {
                         cov_hi = w_end_u64;
                     }
-                    let cms_heap = match meta
-                        .sketch_kind()
-                        .expect("ASAP-tier reducer only handles sketch-backed sids")
-                    {
-                        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
-                            // Both heap-bearing variants serialize the
-                            // outer `CountMinSketchWithHeap` envelope via
-                            // msgpack (`CountSketchWithHeap` reuses the
-                            // same wire shape since the heap is the
-                            // distinguishing payload). A FULL frame
-                            // deserializes directly; a MSGPACK_DELTA frame
-                            // (the delta-heap wire form produced by the
-                            // delta-heap ingest path) is reconstructed by
-                            // applying its sparse matrix delta + full heap
-                            // onto an empty base (per-window-reset).
-                            let decoded = match state.encoding {
-                                SketchEncoding::MsgpackDelta => {
-                                    decode_cms_with_heap_from_msgpack_delta(&state.bytes)
-                                }
-                                _ => decode_cms_with_heap_from_msgpack(&state.bytes),
-                            };
-                            decoded.map_err(|e| ASAPTierError::DeserializeFailure {
-                                sid,
-                                encoding: state.encoding,
-                                reason: e,
-                            })?
-                        }
-                        SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
-                            // Heap-LESS variants can't enumerate top-k —
-                            // they support point-frequency only (which
-                            // routes through QueryFamily::FrequencyEstimate).
-                            return Err(ASAPTierError::MissingHeap {
-                                sid,
-                                sketch_kind: meta
-                                    .sketch_kind()
-                                    .expect("ASAP-tier reducer only handles sketch-backed sids"),
-                            });
-                        }
-                        other => {
-                            return Err(ASAPTierError::UnsupportedCapability {
-                                function: function_name.to_string(),
-                                capability: Capability::FrequencyTopk(other),
-                            });
-                        }
-                    };
-                    let mut items = cms_heap.topk_heap_items();
-                    // Sort descending by estimated count.
+                    // Sort descending by summed count, take top-k.
+                    let mut items: Vec<(String, f64)> = summed.into_iter().collect();
                     items.sort_by(|a, b| {
-                        b.value
-                            .partial_cmp(&a.value)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    for item in items.into_iter().take(k) {
+                    for (key, value) in items.into_iter().take(k) {
                         let mut lv = ts.series_label_values.clone();
-                        lv.insert("item".to_string(), item.key);
-                        out_series.push((lv, vec![(*window_end, item.value)]));
+                        lv.insert("item".to_string(), key);
+                        out_series.push((lv, vec![(*window_end, value)]));
                     }
                 }
                 continue;
