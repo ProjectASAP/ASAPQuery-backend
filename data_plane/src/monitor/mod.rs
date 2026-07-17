@@ -20,9 +20,6 @@
 //!   - [`epoch`]       — tumbling-epoch alignment (matches the edge formula).
 //!   - [`server`]      — the tonic bidi-streaming `MonitorService` server.
 //!   - [`sampling_alloc`] — the coordinated update-sampling law (ε-floor).
-//!   - [`f2`]          — whole-sketch L2/F2 *threshold* monitor (Count-Sketch +
-//!     geometric safe-zone). NOTE: F2 here is a MONITORED quantity (alert), not a
-//!     sampling driver — see the sampling law below.
 //!
 //! **How hard to sample** (the per-edge `p_i`): a SINGLE law, the whole-sketch
 //! **ε-floor** `p_i = 1/(1+ε²·rate_i)` (see [`sampling_alloc`]). It depends
@@ -34,7 +31,6 @@
 
 pub mod coordinator;
 pub mod epoch;
-pub mod f2;
 pub mod sampling_alloc;
 pub mod server;
 
