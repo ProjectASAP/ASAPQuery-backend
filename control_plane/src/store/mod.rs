@@ -212,6 +212,7 @@ mod tests {
                 drop_original: true,
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: false,
                 series_id_ttl_secs: 300,
 

@@ -29,7 +29,7 @@ use crate::emit::{
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
 use crate::optimizer::baseline::BaselinePlanner;
-use crate::optimizer::{cost as cost_model, rules};
+use crate::optimizer::rules;
 use crate::physical::colored_dag::emitter::BackendStageConfig;
 use crate::physical::stage_split;
 use crate::store::{PlanStore, WorkloadStore};
@@ -916,6 +916,7 @@ mod tests {
                 drop_original: true,
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: false,
                 series_id_ttl_secs: 300,
 

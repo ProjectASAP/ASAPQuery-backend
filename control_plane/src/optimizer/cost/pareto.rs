@@ -191,10 +191,13 @@ fn apply_delta(
         DeltaDecision::UseDelta { threshold, .. } => {
             plan.agent_config.delta_transmission = true;
             plan.agent_config.delta_threshold = *threshold;
+            plan.agent_config.gos = (plan.agent_config.sketch_type == SketchType::CountSketch)
+                .then(|| GosKnobs::derive(w.accuracy_sla, 1, 0.0, 1.0, false));
         }
         _ => {
             plan.agent_config.delta_transmission = false;
             plan.agent_config.delta_threshold = 0.0;
+            plan.agent_config.gos = None;
         }
     }
     plan.delta_decision = decision;

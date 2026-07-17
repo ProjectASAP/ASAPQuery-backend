@@ -341,6 +341,7 @@ impl RulesPlanner {
                 // CostModelPlanner overwrites them via decide_delta().
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: true,
                 series_id_ttl_secs: 0,
 
@@ -380,6 +381,7 @@ impl RulesPlanner {
                 drop_original: false,
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: true,
                 series_id_ttl_secs: 0,
 

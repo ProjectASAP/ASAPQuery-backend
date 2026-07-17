@@ -306,10 +306,16 @@ fn apply_delta_decision_with(
         DeltaDecision::UseDelta { threshold, .. } => {
             plan.agent_config.delta_transmission = true;
             plan.agent_config.delta_threshold = *threshold;
+            // GOS relative delta gating: the edge replaces the fixed threshold
+            // with the norm-adaptive one for Count-Sketch. ε_st = the staleness
+            // share of the accuracy budget (w_edge=0 → all to thresholds).
+            plan.agent_config.gos = (plan.agent_config.sketch_type == SketchType::CountSketch)
+                .then(|| GosKnobs::derive(w.accuracy_sla, 1, 0.0, 1.0, false));
         }
         _ => {
             plan.agent_config.delta_transmission = false;
             plan.agent_config.delta_threshold = 0.0;
+            plan.agent_config.gos = None;
         }
     }
 
@@ -1043,6 +1049,7 @@ mod tests {
                 drop_original: true,
                 delta_transmission: false,
                 delta_threshold: 0.0,
+                gos: None,
                 enable_series_id: false,
                 series_id_ttl_secs: 0,
 

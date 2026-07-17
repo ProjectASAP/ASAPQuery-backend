@@ -22,11 +22,13 @@
 //!
 //! **Which sketches:** the law applies to any additive/linear sketch whose
 //! estimate is unbiased (after a 1/p rescale) under update-sampling, and whose
-//! error is norm- or rank-bounded: **Count-Min (L1), Count-Sketch (L2),
-//! DDSketch & KLL (quantile rank; rank-preserving, no 1/p rescale needed), Sum**.
-//! It does NOT apply to **HLL / cardinality**: update-sampling systematically
+//! error is norm-bounded: **Count-Min (L1), Count-Sketch (L2), DDSketch
+//! (additive bucket counts, per-item d=1)**. It does NOT apply to **KLL** —
+//! non-linear random compaction, so dropping or weighting an insert breaks the
+//! rank guarantee — nor to **HLL / cardinality**: update-sampling systematically
 //! under-counts distinct items (you measure the sample's cardinality, not the
-//! full set) and is not 1/p-correctable, so HLL needs a separate treatment.
+//! full set) and is not 1/p-correctable. KLL and HLL therefore emit every update
+//! (matches the edge gating in precompute.applyGrantedSampleP and design §3.1).
 
 /// The whole-sketch coordinated-sampling probability for an edge with the given
 /// per-window `rate` (items/window): `p = 1/(1 + ε²·rate)`.
