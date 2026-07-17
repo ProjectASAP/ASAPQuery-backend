@@ -27,11 +27,6 @@ pub enum ViolationKind {
     Bandwidth,
     Accuracy,
     Cpu,
-    /// A continuous-monitoring (CDM) global aggregate crossed its threshold τ.
-    /// Emitted by the data-plane monitor coordinator, not the metrics scraper:
-    /// `agent_id` carries the monitor id, `observed` the global estimate at
-    /// fire time, `threshold` the τ.
-    GlobalThresholdCrossed,
 }
 
 impl std::fmt::Display for ViolationKind {
@@ -40,7 +35,6 @@ impl std::fmt::Display for ViolationKind {
             ViolationKind::Bandwidth => write!(f, "bandwidth"),
             ViolationKind::Accuracy => write!(f, "accuracy"),
             ViolationKind::Cpu => write!(f, "cpu"),
-            ViolationKind::GlobalThresholdCrossed => write!(f, "global_threshold_crossed"),
         }
     }
 }
