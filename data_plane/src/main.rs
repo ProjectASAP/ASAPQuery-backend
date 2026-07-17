@@ -594,12 +594,12 @@ async fn main() -> Result<()> {
         None
     };
 
-    // CDM monitor coordinator: bidi MonitorService gRPC that runs the
-    // slack-countdown protocol over the streaming-config `monitors:` specs and
-    // fires a global-threshold alert through the violation sink (logged here;
-    // the control-plane replanner can subscribe via the same Violation shape).
+    // Coordinated-sampling monitor coordinator: bidi MonitorService gRPC that
+    // answers each edge's periodic rate report with its whole-sketch ε-floor
+    // sample_p grant. Global-threshold alerting is retired (see
+    // data_plane::monitor module docs) — this coordinator never fires one.
     let monitor_handle = if args.enable_monitor_coordinator {
-        use data_plane::monitor::{AlertSink, MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
+        use data_plane::monitor::{Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
         let specs: Vec<MonitorConfig> = streaming_config
             .monitors()
             .iter()
@@ -609,20 +609,13 @@ async fn main() -> Result<()> {
                 tau: m.tau,
                 epsilon: m.epsilon,
                 window_ms: m.window_ms,
+                functional: Functional::from_name(&m.functional),
             })
             .collect();
         if specs.is_empty() {
             warn!("--enable-monitor-coordinator set but streaming-config has no `monitors:` yet — the coordinator will pick them up live when the control plane pushes a config (hot-reload)");
         }
-        let sink: AlertSink = Arc::new(|v| {
-            warn!(
-                monitor = %v.agent_id,
-                observed = v.observed,
-                threshold = v.threshold,
-                "CDM global threshold crossed"
-            );
-        });
-        let coord = MonitorCoordinator::new(specs, sink);
+        let coord = MonitorCoordinator::new(specs);
 
         // Hot-reload watcher: the coordinator reads `monitors:` once at boot, but
         // the control plane pushes the real config slightly AFTER boot via the
@@ -654,6 +647,7 @@ async fn main() -> Result<()> {
                             tau: m.tau,
                             epsilon: m.epsilon,
                             window_ms: m.window_ms,
+                            functional: Functional::from_name(&m.functional),
                         })
                         .collect();
                     let (added, changed, removed) = coord.reconfigure(specs).await;

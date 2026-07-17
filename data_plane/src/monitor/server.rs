@@ -2,8 +2,9 @@
 //! `Monitor` stream and multiplexes all of its monitors over it. The server
 //! reads `EdgeToCoord` (register / report) messages, drives the per-monitor
 //! [`Monitor`] state machine, and pushes the resulting `CoordToEdge`
-//! (slack-grant) messages back to the addressed edge's stream. Global-threshold
-//! alerts go out-of-band through the control-plane violation sink.
+//! (coordinated-sampling grant) back to the addressed edge's stream.
+//! Global-threshold alerting is retired (see `coordinator` module docs) — this
+//! server never fires one.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -21,7 +22,6 @@ use asap_otel_proto::monitor::v1::{
     CoordToEdge, EdgeToCoord, SlackGrant,
 };
 
-use super::alert::{global_threshold_violation, AlertSink};
 use super::coordinator::{Action, Monitor, MonitorConfig};
 
 type MonKey = (u64, Vec<u8>);
@@ -29,22 +29,20 @@ type EdgeTx = mpsc::Sender<Result<CoordToEdge, Status>>;
 
 /// Shared coordinator state behind the gRPC service. One per data-plane process.
 pub struct MonitorCoordinator {
-    /// Live per-monitor state machines, created lazily from `cfgs`.
+    /// Live per-monitor scalar state machines, created lazily from `cfgs`.
     monitors: Mutex<HashMap<MonKey, Monitor>>,
-    /// Monitor specs (τ, ε, window) from the streaming-config `monitors:`
-    /// section — the authoritative source of τ. Behind an `RwLock` so the
-    /// control plane's hot-reload (`reconfigure`) can add/update/remove monitors
-    /// on a live coordinator without a process restart. Held only for brief,
-    /// non-`await` critical sections, so a `std` lock is safe in async code.
+    /// Monitor specs (ε, window) from the streaming-config `monitors:`
+    /// section. Behind an `RwLock` so the control plane's hot-reload
+    /// (`reconfigure`) can add/update/remove monitors on a live coordinator
+    /// without a process restart. Held only for brief, non-`await` critical
+    /// sections, so a `std` lock is safe in async code.
     cfgs: std::sync::RwLock<HashMap<MonKey, MonitorConfig>>,
     /// Outbound stream sender per connected edge.
     edges: Mutex<HashMap<String, EdgeTx>>,
-    /// Alert egress (control-plane violation sink).
-    alert_sink: AlertSink,
 }
 
 impl MonitorCoordinator {
-    pub fn new(cfgs: Vec<MonitorConfig>, alert_sink: AlertSink) -> Arc<Self> {
+    pub fn new(cfgs: Vec<MonitorConfig>) -> Arc<Self> {
         let cfgs = cfgs
             .into_iter()
             .map(|c| ((c.agg_id, c.key.clone()), c))
@@ -53,13 +51,23 @@ impl MonitorCoordinator {
             monitors: Mutex::new(HashMap::new()),
             cfgs: std::sync::RwLock::new(cfgs),
             edges: Mutex::new(HashMap::new()),
-            alert_sink,
         })
     }
 
     /// Number of configured monitors (test/observability).
     pub fn monitor_count(&self) -> usize {
         self.cfgs.read().unwrap().len()
+    }
+
+    /// The coordinated-sampling grant currently computed for `edge_id` under
+    /// monitor `(agg_id, key)`, or `None` if the monitor doesn't exist yet or
+    /// that edge hasn't reported a rate (test/observability — see
+    /// `Monitor::sample_p_for_edge`).
+    pub async fn granted_sample_p(&self, agg_id: u64, key: &[u8], edge_id: &str) -> Option<f64> {
+        let monitors = self.monitors.lock().await;
+        monitors
+            .get(&(agg_id, key.to_vec()))?
+            .sample_p_for_edge(edge_id)
     }
 
     /// Hot-reload the monitor set from a freshly-pushed streaming-config.
@@ -76,7 +84,7 @@ impl MonitorCoordinator {
     ///     spec — the edge re-registers every epoch, so this self-heals within
     ///     one window;
     ///   * **removed** specs drop both the spec and any live state.
-    /// Unchanged monitors keep their in-flight slack-countdown state untouched.
+    /// Unchanged monitors keep their in-flight per-edge rate state untouched.
     ///
     /// Returns `(added, changed, removed)` counts for observability. Idempotent:
     /// re-applying the same specs is a no-op that returns `(0, 0, 0)`.
@@ -129,14 +137,6 @@ impl MonitorCoordinator {
         (added, changed, removed)
     }
 
-    fn monitor_id(agg_id: u64, key: &[u8]) -> String {
-        if key.is_empty() {
-            format!("agg:{agg_id}/sum")
-        } else {
-            format!("agg:{agg_id}/{}", String::from_utf8_lossy(key))
-        }
-    }
-
     /// Apply a register and return the resulting actions, or None if no monitor
     /// is configured for (agg_id, key).
     async fn apply_register(
@@ -175,57 +175,43 @@ impl MonitorCoordinator {
         key: Vec<u8>,
         edge_id: &str,
         window_start_ms: u64,
-        local_value: f64,
-        seq: u64,
         rate: f64,
     ) -> Option<Vec<Action>> {
         let mk = (agg_id, key);
         let mut monitors = self.monitors.lock().await;
         let mon = monitors.get_mut(&mk)?;
-        Some(mon.on_report(edge_id, window_start_ms, local_value, seq, rate))
+        Some(mon.on_report(edge_id, window_start_ms, rate))
     }
 
-    /// Dispatch coordinator actions: grants to the addressed edge's stream,
-    /// alerts to the violation sink.
+    /// Dispatch coordinator actions: grants to the addressed edge's stream.
+    /// No alert path — this coordinator no longer makes alerting decisions
+    /// (see `coordinator` module docs).
     async fn dispatch(&self, agg_id: u64, key: &[u8], actions: Vec<Action>) {
         for action in actions {
-            match action {
-                Action::Grant {
-                    edge_id,
+            let Action::Grant {
+                edge_id,
+                round,
+                local_slack,
+                window_start_ms,
+                sample_p,
+            } = action;
+            let msg = CoordToEdge {
+                msg: Some(coord_to_edge::Msg::Grant(SlackGrant {
+                    agg_id,
+                    key: key.to_vec(),
                     round,
                     local_slack,
                     window_start_ms,
                     sample_p,
-                } => {
-                    let msg = CoordToEdge {
-                        msg: Some(coord_to_edge::Msg::Grant(SlackGrant {
-                            agg_id,
-                            key: key.to_vec(),
-                            round,
-                            local_slack,
-                            window_start_ms,
-                            sample_p,
-                        })),
-                    };
-                    let tx = {
-                        let edges = self.edges.lock().await;
-                        edges.get(&edge_id).cloned()
-                    };
-                    if let Some(tx) = tx {
-                        if tx.send(Ok(msg)).await.is_err() {
-                            debug!(edge = %edge_id, "grant send failed (edge gone)");
-                        }
-                    }
-                }
-                Action::Alert {
-                    global_estimate,
-                    tau,
-                    window_start_ms,
-                } => {
-                    let id = Self::monitor_id(agg_id, key);
-                    info!(monitor = %id, global_estimate, tau, window_start_ms,
-                          "CDM global threshold crossed — firing alert");
-                    (self.alert_sink)(global_threshold_violation(id, global_estimate, tau));
+                })),
+            };
+            let tx = {
+                let edges = self.edges.lock().await;
+                edges.get(&edge_id).cloned()
+            };
+            if let Some(tx) = tx {
+                if tx.send(Ok(msg)).await.is_err() {
+                    debug!(edge = %edge_id, "grant send failed (edge gone)");
                 }
             }
         }
@@ -266,16 +252,12 @@ impl MonitorCoordinator {
                 }
             }
             Some(edge_to_coord::Msg::Report(rep)) => {
+                // A rate report: reply to this edge alone with its freshly
+                // computed coordinated-sampling grant (rep.local_value / seq
+                // are no longer consulted — no countdown left to feed them
+                // into; they still ride the wire message for compatibility).
                 if let Some(actions) = self
-                    .apply_report(
-                        rep.agg_id,
-                        rep.key.clone(),
-                        &rep.edge_id,
-                        rep.window_start_ms,
-                        rep.local_value,
-                        rep.seq,
-                        rep.rate,
-                    )
+                    .apply_report(rep.agg_id, rep.key.clone(), &rep.edge_id, rep.window_start_ms, rep.rate)
                     .await
                 {
                     self.dispatch(rep.agg_id, &rep.key, actions).await;
@@ -285,22 +267,14 @@ impl MonitorCoordinator {
         }
     }
 
-    /// An edge stream closed: drop its sender and fold its last-known value into
-    /// every monitor's departed mass, then route any re-grants. Actions are
-    /// collected under the monitors lock and dispatched after releasing it, so
-    /// no send is awaited while the lock is held.
+    /// An edge stream closed: drop its sender and its membership in every
+    /// monitor it was part of. No re-grant fan-out needed — each edge's grant
+    /// is independent, so one edge leaving never perturbs another's.
     async fn handle_disconnect(&self, edge_id: &str) {
         self.edges.lock().await.remove(edge_id);
-        let pending: Vec<(u64, Vec<u8>, Vec<Action>)> = {
-            let mut monitors = self.monitors.lock().await;
-            monitors
-                .iter_mut()
-                .map(|(mk, mon)| (mk.0, mk.1.clone(), mon.on_leave(edge_id)))
-                .filter(|(_, _, actions)| !actions.is_empty())
-                .collect()
-        };
-        for (agg_id, key, actions) in pending {
-            self.dispatch(agg_id, &key, actions).await;
+        let mut monitors = self.monitors.lock().await;
+        for mon in monitors.values_mut() {
+            mon.on_leave(edge_id);
         }
     }
 }
@@ -357,13 +331,7 @@ impl MonitorService for MonitorServiceImpl {
 #[cfg(test)]
 mod reconfigure_tests {
     use super::MonitorCoordinator;
-    use crate::monitor::alert::AlertSink;
     use crate::monitor::coordinator::MonitorConfig;
-    use std::sync::Arc;
-
-    fn sink() -> AlertSink {
-        Arc::new(|_v| {})
-    }
 
     fn cfg(agg_id: u64, key: &str, tau: f64) -> MonitorConfig {
         MonitorConfig {
@@ -372,13 +340,14 @@ mod reconfigure_tests {
             tau,
             epsilon: 0.2,
             window_ms: 15_000,
+            ..Default::default()
         }
     }
 
     #[tokio::test]
     async fn reconfigure_adds_changes_and_removes_specs() {
         // Boot with one sum monitor.
-        let coord = MonitorCoordinator::new(vec![cfg(1, "", 100.0)], sink());
+        let coord = MonitorCoordinator::new(vec![cfg(1, "", 100.0)]);
         assert_eq!(coord.monitor_count(), 1);
 
         // Add a cms_point monitor (agg 2, key s0) and change agg 1's τ; agg 1's
@@ -406,7 +375,7 @@ mod reconfigure_tests {
 
     #[tokio::test]
     async fn reconfigure_evicts_live_state_for_changed_monitor() {
-        let coord = MonitorCoordinator::new(vec![cfg(7, "s0", 5000.0)], sink());
+        let coord = MonitorCoordinator::new(vec![cfg(7, "s0", 5000.0)]);
         // A register materializes live Monitor state for (7, s0).
         let actions = coord
             .apply_register(7, b"s0".to_vec(), "edge-a", 15_000, 15_000)
