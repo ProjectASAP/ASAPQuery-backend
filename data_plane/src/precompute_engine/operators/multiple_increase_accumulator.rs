@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::storage_engines::types::Measurement;
 use promql_utilities::query_logics::enums::Statistic;
 
 /// Accumulator that maintains separate increase accumulators for multiple keys
