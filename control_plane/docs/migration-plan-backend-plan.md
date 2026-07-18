@@ -41,9 +41,14 @@ phase-by-phase execution plan). Read that doc first.
 §9 before any code lands.
 
 **Work — decided:**
-- `Frequency` → adopt ASAPController's `RankingMeasure::Frequency` under
-  `TopK`. control_plane's standalone `AggIntent::Frequency` call sites get
-  rewritten onto this shape.
+- `Frequency` → **corrected during Phase 1 implementation (#391)**: kept,
+  not folded. `AggIntent::Frequency` (control_plane's standalone
+  point-frequency-via-CMS query, `count(*) WHERE key = k`, ~12 real call
+  sites in `bind_cms_count.rs` and elsewhere) and `RankingMeasure::Frequency`
+  (ASAPController's classifier for what a `TopK` ranks by) are unrelated
+  capabilities that happen to share a name — folding one into the other
+  would have deleted a real, currently-used capability. Both are kept:
+  `Frequency` as control_plane-only, `RankingMeasure` adopted additively.
 - `irate`/`rate` → adopt ASAPController's fold (both lower to `AggIntent::Rate`,
   estimation-method distinction pushed to L4).
 - **control_plane gains SQL support** as a first-class query surface, not
@@ -208,6 +213,16 @@ uncertainty.
 ---
 
 ## Phase 3 — Fix `capability_for()` to close D1-D5
+
+> **Blocker found during Phase 1 (#391): the corpus this phase's testing
+> bar depends on no longer exists under its documented name.**
+> `analyzer-parity-matrix.md` names its acceptance test as
+> `data_plane/src/query_engines/asap_query_engine/engine.rs::analyzer_parity_tests`;
+> that module isn't present in current `data_plane` (grepped, not found).
+> Before starting this phase: locate whether the corpus moved/was renamed,
+> or rebuild it from the doc's 18 queries + D1-D5 table as a fresh test.
+> Either way, resolve this first — don't start the `capability_for()` change
+> assuming the gate already exists.
 
 **Scope:** `control_plane/src/sketch_algebra/capability.rs`. Independent
 of Phase 1-2 mechanically (touches a different file), but should land
@@ -389,7 +404,7 @@ trustworthy.
 
 | # | Question | Status |
 |---|---|---|
-| 1 | `Frequency`: standalone intent or `TopK::RankingMeasure`? | **Decided — ASAPController's `RankingMeasure::Frequency`.** |
+| 1 | `Frequency`: standalone intent or `TopK::RankingMeasure`? | **Corrected (#391) — both, kept separate.** Not the same capability; see Phase 1 work item above. |
 | 2 | `irate`/`rate`: fold at L3 or keep distinct? | **Decided — fold, per ASAPController.** |
 | 3 | Does merging `frontend-sql` mean `control_plane` regains SQL as a first-class surface? | **Decided — yes.** IR/parsing merge only in this plan (Phase 2 item 7); a `data_plane` SQL query endpoint is separate future work. |
 | 4 | `cse.rs`: L3 (current control_plane) or L4 (ASAPController's `crates/plan`)? | **Decided — L4.** See Phase 2 item 5 for the required regression pass. |
