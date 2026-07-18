@@ -289,11 +289,13 @@ mod tests {
                         name: "ts".into(),
                         dtype: DataType::Timestamp,
                         nullable: false,
+                        table: None,
                     },
                     Column {
                         name: "value".into(),
                         dtype: DataType::Float64,
                         nullable: false,
+                        table: None,
                     },
                 ],
                 0,

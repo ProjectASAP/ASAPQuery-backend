@@ -170,6 +170,7 @@ mod tests {
             name: name.into(),
             dtype,
             nullable: false,
+            table: None,
         }
     }
 

@@ -21,6 +21,7 @@ fn col(name: &str, dtype: DataType) -> Column {
         name: name.into(),
         dtype,
         nullable: false,
+        table: None,
     }
 }
 
