@@ -73,6 +73,12 @@
 
 pub mod agg_intent;
 pub mod cse;
+// Not yet re-exported into the crate::intent_algebra::* top-level surface
+// below -- `query_expr::ColumnRef` already claims that name, and this
+// module is unused until the query_expr.rs/relational.rs merge (next
+// Phase 2 step) retargets `Predicate`/`ScalarExpr` onto `L3Expr`/`L2Expr`.
+// Reachable today only via the full `intent_algebra::expr_ir::` path.
+pub mod expr_ir;
 pub mod query_expr;
 pub mod schema;
 
