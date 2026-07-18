@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn equivalence_sum_intent() {
         assert_equivalent(
-            AggIntent::Sum,
+            AggIntent::Sum { col: None },
             WindowKind::Tumbling,
             Duration::from_secs(300),
             None,
@@ -334,7 +334,7 @@ mod tests {
         // sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
             by: Vec::new(),
-            aggs: vec![AggIntent::Sum],
+            aggs: vec![AggIntent::Sum { col: None }],
             having: None,
             child: Box::new(canonical_scan("m")),
         };

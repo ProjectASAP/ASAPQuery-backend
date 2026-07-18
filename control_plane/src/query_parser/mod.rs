@@ -311,7 +311,7 @@ impl QeCollector {
                     self.agg_types.push(AggType::Cardinality);
                 }
             }
-            AggIntent::Frequency { .. } => {
+            op if crate::intent_algebra::as_frequency(op).is_some() => {
                 if !self.agg_types.contains(&AggType::Frequency) {
                     self.agg_types.push(AggType::Frequency);
                 }
@@ -324,7 +324,7 @@ impl QeCollector {
                     self.quantiles.push(*q);
                 }
             }
-            AggIntent::Min => {
+            AggIntent::Min { .. } => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
@@ -332,7 +332,7 @@ impl QeCollector {
                     self.quantiles.push(0.0);
                 }
             }
-            AggIntent::Max => {
+            AggIntent::Max { .. } => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }

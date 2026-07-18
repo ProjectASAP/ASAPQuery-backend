@@ -57,7 +57,11 @@ fn windowed_scan() -> QueryExpr {
 fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Quantile { q, accuracy }],
+        aggs: vec![AggIntent::Quantile {
+            col: None,
+            q,
+            accuracy,
+        }],
         having: None,
         child: Box::new(windowed_scan()),
     }
@@ -261,7 +265,7 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, bool, u32, u32) {
 #[test]
 fn bind_cms_topk_loose_recall_picks_cms_heap() {
     let acc = AccuracyTarget::EpsilonDelta {
-        eps: 0.01,
+        epsilon: 0.01,
         delta: 0.001,
     };
     let expr = agg_topk(10, acc.clone());
@@ -324,7 +328,11 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
     let bound = bind_query_expr(&agg_topk(10, acc.clone()), acc).unwrap();
     let (kind, ..) = topk_binding_family(&bound);
     let chosen = table.for_kind(&kind).per_flush();
-    assert_eq!(chosen, cms.min(cs), "must pick the cost-min family that meets the SLA");
+    assert_eq!(
+        chosen,
+        cms.min(cs),
+        "must pick the cost-min family that meets the SLA"
+    );
     assert_eq!(kind, SketchKind::Cms);
 }
 
@@ -333,6 +341,7 @@ fn bind_hll_cardinality_basic() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Cardinality {
+            col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
         having: None,
@@ -375,7 +384,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // exact-aggregation path can serve the intent.
     let expr = QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -462,6 +471,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Quantile {
+            col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
@@ -497,7 +507,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -521,7 +531,7 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
         by: vec![1], // service column
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(ts_scan()),
     };
@@ -542,9 +552,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
         by: vec![1],
-        aggs: vec![AggIntent::Rate {
-            window: Duration::from_secs(300),
-        }],
+        aggs: vec![AggIntent::Rate],
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -573,7 +581,10 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
 #[test]
 fn phase_b_pattern_archive_only_routes_to_archive() {
     let intent = AggIntent::Absent;
-    assert!(intent.archive_only(), "Phase β intent must flag archive");
+    assert!(
+        crate::intent_algebra::archive_only(&intent),
+        "Phase β intent must flag archive"
+    );
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![intent.clone()],
@@ -664,7 +675,7 @@ fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SketchKind> {
 fn binding_is_archive(expr: &PhysicalExpr) -> bool {
     match expr {
         PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
-            aggs.iter().any(|a| a.archive_only())
+            aggs.iter().any(crate::intent_algebra::archive_only)
         }
         PhysicalExpr::Logical(_) => false,
         PhysicalExpr::SketchEstimate { child, .. } => binding_is_archive(child),
@@ -843,34 +854,22 @@ fn phase_b_e2e_archive_only_e2e_binding() {
 fn phase_b_archive_only_intents_round_trip_through_binder() {
     let intents = vec![
         AggIntent::Absent,
-        AggIntent::Present,
-        AggIntent::Delta {
-            window: Duration::from_secs(60),
+        AggIntent::AbsentOverTime,
+        AggIntent::PresentOverTime,
+        AggIntent::Delta,
+        AggIntent::Deriv,
+        AggIntent::PredictLinear { seconds: 60.0 },
+        AggIntent::DoubleExpSmoothing {
+            smoothing: 0.3,
+            trend: 0.3,
         },
-        AggIntent::Deriv {
-            window: Duration::from_secs(60),
-        },
-        AggIntent::PredictLinear {
-            window: Duration::from_secs(300),
-            ahead: Duration::from_secs(60),
-        },
-        AggIntent::HoltWinters {
-            window: Duration::from_secs(300),
-            smoothing_factor: 0.3,
-            trend_factor: 0.3,
-        },
-        AggIntent::Idelta {
-            window: Duration::from_secs(60),
-        },
-        AggIntent::Irate {
-            window: Duration::from_secs(60),
-        },
-        AggIntent::Resets {
-            window: Duration::from_secs(300),
-        },
-        AggIntent::Changes {
-            window: Duration::from_secs(300),
-        },
+        AggIntent::IDelta,
+        AggIntent::Resets,
+        AggIntent::Changes,
+        // Spot-check a couple of the Phase 1 IR merge's new archive-only
+        // intents through the same round-trip.
+        AggIntent::HistogramCount,
+        AggIntent::Group,
     ];
     for intent in intents {
         let expr = QueryExpr::Aggregate {
@@ -885,7 +884,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
             PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
                 assert_eq!(aggs.len(), 1);
                 assert!(
-                    aggs[0].archive_only(),
+                    crate::intent_algebra::archive_only(&aggs[0]),
                     "{intent:?} should preserve archive_only() flag through bind"
                 );
             }

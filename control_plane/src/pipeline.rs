@@ -163,7 +163,7 @@ impl Analyzer {
         let accuracy_sla = match &spec.accuracy {
             Some(AccuracyTarget::Exact) => 1.0,
             Some(AccuracyTarget::Epsilon(eps)) => (1.0 - eps).clamp(0.0, 1.0),
-            Some(AccuracyTarget::EpsilonDelta { eps, .. }) => (1.0 - eps).clamp(0.0, 1.0),
+            Some(AccuracyTarget::EpsilonDelta { epsilon, .. }) => (1.0 - epsilon).clamp(0.0, 1.0),
             None => spec.accuracy_sla,
         };
 
@@ -734,7 +734,7 @@ mod tests {
             "accuracy_sla":     0.5,
             "id":               "q-001",
             "language":         "prom_ql",
-            "accuracy":         { "kind": "epsilon", "value": 0.02 },
+            "accuracy":         { "Epsilon": 0.02 },
             "dollars":          0.001,
             "deployment_model": "asaplifecycle",
             "shape":            { "kind": "periodic", "every": { "secs": 60, "nanos": 0 } },

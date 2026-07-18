@@ -515,10 +515,10 @@ impl AggFunc {
             AggFunc::Count => Some(AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             }),
-            AggFunc::Sum => Some(AggIntent::Sum),
-            AggFunc::Avg => Some(AggIntent::Avg),
-            AggFunc::Min => Some(AggIntent::Min),
-            AggFunc::Max => Some(AggIntent::Max),
+            AggFunc::Sum => Some(AggIntent::Sum { col: None }),
+            AggFunc::Avg => Some(AggIntent::Avg { col: None }),
+            AggFunc::Min => Some(AggIntent::Min { col: None }),
+            AggFunc::Max => Some(AggIntent::Max { col: None }),
             _ => None,
         }
     }
@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn agg_func_to_sketch_op_heavy_hitters() {
         let op = AggFunc::HeavyHitters { k: 50 }.to_sketch_op();
-        assert!(matches!(op, Some(AggIntent::Frequency { .. })));
+        assert!(op.is_some_and(|i| crate::intent_algebra::as_frequency(&i).is_some()));
     }
 
     // ── ScalarExpr predicate list conversion ──────────────────────────────────
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn agg_intent_avg_not_mergeable() {
-        assert!(!agg_is_mergeable(&AggIntent::Avg));
+        assert!(!agg_is_mergeable(&AggIntent::Avg { col: None }));
     }
 
     #[test]
@@ -936,9 +936,9 @@ mod tests {
 
     #[test]
     fn agg_intent_is_exact() {
-        assert!(agg_is_exact(&AggIntent::Sum));
-        assert!(agg_is_exact(&AggIntent::Min));
-        assert!(agg_is_exact(&AggIntent::Max));
+        assert!(agg_is_exact(&AggIntent::Sum { col: None }));
+        assert!(agg_is_exact(&AggIntent::Min { col: None }));
+        assert!(agg_is_exact(&AggIntent::Max { col: None }));
         assert!(!agg_is_exact(&default_cardinality()));
     }
 }

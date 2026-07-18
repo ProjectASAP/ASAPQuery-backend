@@ -90,20 +90,27 @@ impl Rule for BindExactAgg {
         // the query can fan results out over the surviving labels.
         // Unkeyed aggregations stay on the single-pop variant.
         let agg_type = match intent {
-            AggIntent::Sum => {
+            AggIntent::Sum { .. } => {
                 if keyed {
                     AggregationType::MultipleSum
                 } else {
                     AggregationType::Sum
                 }
             }
-            AggIntent::Rate { window } | AggIntent::Increase { window } => {
-                // The window is informational here — the data plane keys
-                // the policy on (metric, attrs, agg_kind, filter) plus
-                // the per-policy `window_size`. Empty windows are
-                // semantically meaningless; reject them so the rule
-                // doesn't fire on a malformed L3 input.
-                if *window == Duration::ZERO {
+            AggIntent::Rate | AggIntent::Increase => {
+                // The window used to live on the intent (`Rate { window
+                // }`); after the ASAPController IR merge it lives on the
+                // enclosing `QueryExpr::Window` node instead. The data
+                // plane keys the policy on (metric, attrs, agg_kind,
+                // filter) plus the per-policy `window_size` -- the value
+                // is informational here, not consumed further. Empty
+                // windows are semantically meaningless; reject them so
+                // the rule doesn't fire on a malformed L3 input.
+                let window = match &**child {
+                    QueryExpr::Window { size, .. } => *size,
+                    _ => Duration::ZERO,
+                };
+                if window == Duration::ZERO {
                     return None;
                 }
                 if keyed {
@@ -153,6 +160,24 @@ mod tests {
         }
     }
 
+    /// Like `agg_over`, but wraps the scan in a `QueryExpr::Window` --
+    /// `Rate`/`Increase` read their window off this enclosing node, not
+    /// off the intent (post ASAPController IR merge; the intent used to
+    /// carry `window: Duration` itself).
+    fn windowed_agg_over(intent: AggIntent, metric: &str, window: Duration) -> QueryExpr {
+        QueryExpr::Aggregate {
+            aggs: vec![intent],
+            child: Box::new(QueryExpr::Window {
+                kind: crate::intent_algebra::WindowKind::Sliding,
+                size: window,
+                slide: None,
+                child: Box::new(scan(metric)),
+            }),
+            by: vec![],
+            having: None,
+        }
+    }
+
     fn check_binds(intent: AggIntent, expected: AggregationType) {
         let expr = agg_over(intent, "test_metric");
         let bound = BindExactAgg
@@ -164,27 +189,36 @@ mod tests {
         }
     }
 
+    fn check_binds_windowed(intent: AggIntent, window: Duration, expected: AggregationType) {
+        let expr = windowed_agg_over(intent, "test_metric", window);
+        let bound = BindExactAgg
+            .apply(&expr, &AccuracyTarget::Exact)
+            .unwrap_or_else(|| panic!("rule didn't fire on {expected:?}"));
+        match bound {
+            PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(agg_type, expected),
+            other => panic!("expected ExactAgg, got {other:?}"),
+        }
+    }
+
     #[test]
     fn binds_sum_to_exact_agg_sum() {
-        check_binds(AggIntent::Sum, AggregationType::Sum);
+        check_binds(AggIntent::Sum { col: None }, AggregationType::Sum);
     }
 
     #[test]
     fn binds_rate_to_exact_agg_increase() {
-        check_binds(
-            AggIntent::Rate {
-                window: Duration::from_secs(60),
-            },
+        check_binds_windowed(
+            AggIntent::Rate,
+            Duration::from_secs(60),
             AggregationType::Increase,
         );
     }
 
     #[test]
     fn binds_increase_to_exact_agg_increase() {
-        check_binds(
-            AggIntent::Increase {
-                window: Duration::from_secs(300),
-            },
+        check_binds_windowed(
+            AggIntent::Increase,
+            Duration::from_secs(300),
             AggregationType::Increase,
         );
     }
@@ -217,7 +251,7 @@ mod tests {
 
     #[test]
     fn does_not_bind_avg() {
-        let expr = agg_over(AggIntent::Avg, "test_metric");
+        let expr = agg_over(AggIntent::Avg { col: None }, "test_metric");
         assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 
@@ -225,6 +259,7 @@ mod tests {
     fn does_not_bind_quantile() {
         let expr = agg_over(
             AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
@@ -242,6 +277,25 @@ mod tests {
         }
     }
 
+    fn windowed_agg_over_with_by(
+        intent: AggIntent,
+        metric: &str,
+        window: Duration,
+        by: Vec<usize>,
+    ) -> QueryExpr {
+        QueryExpr::Aggregate {
+            aggs: vec![intent],
+            child: Box::new(QueryExpr::Window {
+                kind: crate::intent_algebra::WindowKind::Sliding,
+                size: window,
+                slide: None,
+                child: Box::new(scan(metric)),
+            }),
+            by,
+            having: None,
+        }
+    }
+
     fn check_keyed_binds(intent: AggIntent, expected: AggregationType) {
         let expr = agg_over_with_by(intent, "test_metric", vec![0]);
         let bound = BindExactAgg
@@ -253,27 +307,36 @@ mod tests {
         }
     }
 
+    fn check_keyed_binds_windowed(intent: AggIntent, window: Duration, expected: AggregationType) {
+        let expr = windowed_agg_over_with_by(intent, "test_metric", window, vec![0]);
+        let bound = BindExactAgg
+            .apply(&expr, &AccuracyTarget::Exact)
+            .unwrap_or_else(|| panic!("rule didn't fire on keyed {expected:?}"));
+        match bound {
+            PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(agg_type, expected),
+            other => panic!("expected ExactAgg, got {other:?}"),
+        }
+    }
+
     #[test]
     fn keyed_sum_binds_to_multiple_sum() {
-        check_keyed_binds(AggIntent::Sum, AggregationType::MultipleSum);
+        check_keyed_binds(AggIntent::Sum { col: None }, AggregationType::MultipleSum);
     }
 
     #[test]
     fn keyed_rate_binds_to_multiple_increase() {
-        check_keyed_binds(
-            AggIntent::Rate {
-                window: Duration::from_secs(60),
-            },
+        check_keyed_binds_windowed(
+            AggIntent::Rate,
+            Duration::from_secs(60),
             AggregationType::MultipleIncrease,
         );
     }
 
     #[test]
     fn keyed_increase_binds_to_multiple_increase() {
-        check_keyed_binds(
-            AggIntent::Increase {
-                window: Duration::from_secs(300),
-            },
+        check_keyed_binds_windowed(
+            AggIntent::Increase,
+            Duration::from_secs(300),
             AggregationType::MultipleIncrease,
         );
     }
@@ -296,18 +359,24 @@ mod tests {
     fn unkeyed_sum_still_binds_to_single_pop_sum() {
         // Regression guard: the keyed/unkeyed branch must still
         // dispatch correctly on `by.is_empty()`.
-        check_binds(AggIntent::Sum, AggregationType::Sum);
+        check_binds(AggIntent::Sum { col: None }, AggregationType::Sum);
     }
 
     #[test]
     fn rejects_zero_window_rate() {
         // Defensive — a zero-window Rate is semantically meaningless.
-        let expr = agg_over(
-            AggIntent::Rate {
-                window: Duration::ZERO,
-            },
-            "test_metric",
-        );
+        // `agg_over` (unwindowed child) exercises this directly: no
+        // enclosing `QueryExpr::Window` node means the window read
+        // defaults to `Duration::ZERO`.
+        let expr = agg_over(AggIntent::Rate, "test_metric");
+        assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
+    }
+
+    #[test]
+    fn rejects_explicit_zero_window_rate() {
+        // Same rejection when the Window node is present but its size is
+        // literally zero (as opposed to no Window node at all).
+        let expr = windowed_agg_over(AggIntent::Rate, "test_metric", Duration::ZERO);
         assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 

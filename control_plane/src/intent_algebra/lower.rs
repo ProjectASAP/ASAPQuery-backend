@@ -488,25 +488,28 @@ fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
         AggFunc::Frequency => vec![default_frequency()],
         AggFunc::Count => vec![default_frequency()],
         AggFunc::Avg => vec![AggIntent::Quantile {
+            col: None,
             q: 0.5,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
-        AggFunc::Min => vec![AggIntent::Min],
-        AggFunc::Max => vec![AggIntent::Max],
+        AggFunc::Min => vec![AggIntent::Min { col: None }],
+        AggFunc::Max => vec![AggIntent::Max { col: None }],
         // StdDev / Variance: legacy carried two quantiles in a single
         // Quantile intent; Step α F1 fans them out into two siblings.
         AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![
             AggIntent::Quantile {
+                col: None,
                 q: 0.25,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
             AggIntent::Quantile {
+                col: None,
                 q: 0.75,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
         ],
         AggFunc::Sum | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
-            vec![AggIntent::Sum]
+            vec![AggIntent::Sum { col: None }]
         }
         AggFunc::Custom(_) => vec![],
     }
@@ -590,7 +593,7 @@ mod tests {
                 assert_eq!(size, Duration::from_secs(300));
                 match *child {
                     CQueryExpr::Aggregate { aggs, child, .. } => {
-                        assert!(matches!(aggs.as_slice(), [AggIntent::Sum]));
+                        assert!(matches!(aggs.as_slice(), [AggIntent::Sum { col: None }]));
                         assert!(matches!(*child, CQueryExpr::Scan { .. }));
                     }
                     other => panic!("expected Aggregate, got {other:?}"),
@@ -629,7 +632,7 @@ mod tests {
         match convert_root(&legacy).unwrap() {
             CQueryExpr::Aggregate { by, aggs, .. } => {
                 assert!(by.is_empty(), "no GROUP BY → empty `by`: {by:?}");
-                assert!(matches!(aggs.as_slice(), [AggIntent::Sum]));
+                assert!(matches!(aggs.as_slice(), [AggIntent::Sum { col: None }]));
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }

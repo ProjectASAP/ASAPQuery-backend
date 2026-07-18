@@ -220,7 +220,7 @@ impl CostModel for DefaultCostModel {
                 match &aggs[0] {
                     AggIntent::Quantile { .. } => 0.05,
                     AggIntent::Cardinality { .. } => 0.02,
-                    AggIntent::Frequency { .. } => 0.03,
+                    op if crate::intent_algebra::as_frequency(op).is_some() => 0.03,
                     AggIntent::TopK { k, .. } => (*k as f64).recip().min(0.1),
                     op if agg_is_exact(op) => 1.0,
                     _ => 0.1,

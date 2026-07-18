@@ -53,7 +53,7 @@ impl Rule for BindArchiveOnly {
             QueryExpr::Aggregate { aggs, .. } => {
                 // Single-intent Aggregate is the canonical Phase β shape;
                 // multi-intent fans out to per-intent rules elsewhere.
-                if aggs.len() == 1 && aggs[0].archive_only() {
+                if aggs.len() == 1 && crate::intent_algebra::archive_only(&aggs[0]) {
                     Some(PhysicalExpr::Logical(expr.clone()))
                 } else {
                     None
@@ -143,34 +143,20 @@ mod tests {
     fn binds_each_archive_only_intent() {
         let intents = vec![
             AggIntent::Absent,
-            AggIntent::Present,
-            AggIntent::Delta {
-                window: Duration::from_secs(60),
+            AggIntent::AbsentOverTime,
+            AggIntent::PresentOverTime,
+            AggIntent::Delta,
+            AggIntent::Deriv,
+            AggIntent::PredictLinear { seconds: 60.0 },
+            AggIntent::DoubleExpSmoothing {
+                smoothing: 0.3,
+                trend: 0.3,
             },
-            AggIntent::Deriv {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::PredictLinear {
-                window: Duration::from_secs(300),
-                ahead: Duration::from_secs(60),
-            },
-            AggIntent::HoltWinters {
-                window: Duration::from_secs(300),
-                smoothing_factor: 0.3,
-                trend_factor: 0.3,
-            },
-            AggIntent::Idelta {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Irate {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Resets {
-                window: Duration::from_secs(300),
-            },
-            AggIntent::Changes {
-                window: Duration::from_secs(300),
-            },
+            AggIntent::IDelta,
+            AggIntent::Resets,
+            AggIntent::Changes,
+            AggIntent::HistogramCount,
+            AggIntent::Group,
         ];
         for intent in intents {
             let expr = agg_with(intent.clone());
@@ -187,27 +173,23 @@ mod tests {
         // Sum / Quantile / Cardinality / TopK are NOT archive-only — they
         // must NOT trigger BindArchiveOnly (the ASAP-tier rules own them).
         for intent in [
-            AggIntent::Sum,
+            AggIntent::Sum { col: None },
             AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
             AggIntent::Cardinality {
+                col: None,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
             AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             },
-            AggIntent::Frequency {
-                accuracy: AccuracyTarget::Epsilon(0.01),
-            },
-            AggIntent::Rate {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Increase {
-                window: Duration::from_secs(60),
-            },
+            crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01)),
+            AggIntent::Rate,
+            AggIntent::Increase,
         ] {
             let expr = agg_with(intent.clone());
             assert!(

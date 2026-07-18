@@ -635,6 +635,7 @@ mod tests {
     #[test]
     fn resolve_preserves_intent() {
         let intent = AggIntent::Quantile {
+            col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.005),
         };
@@ -721,7 +722,7 @@ mod tests {
         // (no single sketch serves multiple intents).
         let expr = QueryExpr::Aggregate {
             by: vec![],
-            aggs: vec![AggIntent::Sum, AggIntent::Min],
+            aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             having: None,
             child: Box::new(scan("trades")),
         };

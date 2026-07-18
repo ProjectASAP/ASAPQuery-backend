@@ -33,9 +33,7 @@
 use std::time::Duration;
 
 use anyhow::anyhow;
-use promql_parser::parser::{
-    self, AggregateExpr, Call, Expr, LabelModifier, VectorSelector,
-};
+use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, VectorSelector};
 
 use crate::intent_algebra::relational::{FilterOp, FilterVal, PartitionKeys, Predicate};
 
