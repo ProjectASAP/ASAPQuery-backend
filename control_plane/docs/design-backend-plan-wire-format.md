@@ -87,23 +87,30 @@ instead of maintaining a second, divergent analyzer.
 
 ## 4. L1-L3 IR merge
 
-**Base = ASAPController.** Per the audit in §1, this is now the richer,
-faster-growing side; the reconciliation doc's original "base = control_plane"
-recommendation is stale.
+**Base = ASAPController, and this is now the standing tie-break rule, not
+just a per-item lean.** Decided: wherever control_plane and ASAPController
+diverge — in L1-L3 or anywhere else this merge touches — adopt
+ASAPController's current version. The exception is anything genuinely
+control_plane-specific with no ASAPController equivalent at all (not a
+divergent version of the same thing, but functionality ASAPController never
+had) — that gets ported *onto* the ASAPController-based version, not used
+as a reason to keep control_plane's side of a shared file.
 
-Known reconciliation items, audited directly against current source (not
-the reconciliation doc's cached numbers):
+Resolved reconciliation items (Phase 0, decided):
 
 | Item | control_plane | ASAPController | Resolution |
 |---|---|---|---|
-| `Frequency` | Standalone `AggIntent::Frequency { accuracy }` | Folded into `TopK`'s `RankingMeasure::Frequency` | **TBD** — pick one representation; capability exists on both sides, only the shape differs |
-| `irate` vs `rate` | Distinct intents: `Rate{window}`, `Irate{window}` | Both lower to the same `AggIntent::Rate`; the avg-vs-last-two-samples distinction is deliberately pushed to L4 | **Adopt ASAPController's approach** — consistent with the L3 design rule "intent at L3, estimation method at L4" |
+| `Frequency` | Standalone `AggIntent::Frequency { accuracy }` | Folded into `TopK`'s `RankingMeasure::Frequency` | **Decided: adopt ASAPController's `RankingMeasure::Frequency` shape.** control_plane's standalone-intent call sites get rewritten onto this. |
+| `irate` vs `rate` | Distinct intents: `Rate{window}`, `Irate{window}` | Both lower to the same `AggIntent::Rate`; the avg-vs-last-two-samples distinction is deliberately pushed to L4 | **Decided: adopt ASAPController's fold** — consistent with the L3 design rule "intent at L3, estimation method at L4" |
 | `Project` node (SQL) | Present (`relational.rs`) | Previously flagged missing by `intent-algebra-reconciliation.md`; **confirmed present** in current source (`l2::relational::Project`, `ir::intent_algebra::query_expr::ProjectItem`) | No action — already closed |
+| SQL as a first-class query surface | No SQL frontend registered; `query_parser` is PromQL-only | `frontend-sql` is a full, maintained crate | **Decided: control_plane gains SQL support.** Not just an IR-merge detail — see the migration plan's Phase 2 note on what this actually requires beyond the IR. |
+| CSE placement | Runs at L3, inside `intent_algebra` | Runs at L4, inside `crates/plan` alongside the optimizer | **Decided: move to L4**, matching ASAPController. This changes control_plane's existing optimizer rule-firing order — treat as a real behavior change requiring its own regression pass, not a mechanical move. |
 
-No other gaps identified in the current audit; re-diff `schema.rs` /
-`binder.rs` / `column_resolution.rs` at merge time rather than trusting
-`intent-algebra-reconciliation.md`'s line-count table, which predates
-ASAPController's #43-#51 growth.
+Re-diff `schema.rs` / `binder.rs` / `column_resolution.rs` at merge time
+rather than trusting `intent-algebra-reconciliation.md`'s line-count table
+(which predates ASAPController's #43-#51 growth) — but per the tie-break
+rule above, the diff's purpose is now "confirm nothing control_plane-only
+gets silently dropped," not "decide which side wins."
 
 ## 5. `BackendPlan`: the new control-plane → data-plane wire contract
 
