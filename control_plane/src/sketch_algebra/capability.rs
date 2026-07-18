@@ -475,6 +475,22 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 /// | `Avg` | `None` — needs cross-policy join (Sum + Count); follow-up |
 /// | Every archive-only intent | `None` |
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
+    if let Some(accuracy) = crate::intent_algebra::as_frequency(intent) {
+        return if is_exact(&accuracy) {
+            // Exact aggregation — sketch fallback is only meaningful
+            // when raw counters aren't kept at the ingest tier; with
+            // accuracy=Exact the caller wants exact `sum by (label)
+            // (rate(...))`, which routes to archive.
+            None
+        } else {
+            // Bare frequency point-query uses a frequency-family
+            // sketch — any of CMS / CountSketch / CmsWithHeap /
+            // CountSketchWithHeap works (the heap is additional
+            // info that the FrequencyTopk path uses). `Any` here
+            // means the optimizer picks the cheapest indexed sid.
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        };
+    }
     match intent {
         AggIntent::Quantile { accuracy, .. } => {
             if is_exact(accuracy) {
@@ -532,22 +548,6 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
                 Some(Capability::FrequencyTopk(SketchKindHandle::Any))
             }
         }
-        AggIntent::Frequency { accuracy } => {
-            if is_exact(accuracy) {
-                // Exact aggregation — sketch fallback is only meaningful
-                // when raw counters aren't kept at the ingest tier; with
-                // accuracy=Exact the caller wants exact `sum by (label)
-                // (rate(...))`, which routes to archive.
-                None
-            } else {
-                // Bare frequency point-query uses a frequency-family
-                // sketch — any of CMS / CountSketch / CmsWithHeap /
-                // CountSketchWithHeap works (the heap is additional
-                // info that the FrequencyTopk path uses). `Any` here
-                // means the optimizer picks the cheapest indexed sid.
-                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
-            }
-        }
         // ── Min / Max via quantile sketches ──────────────────────────
         // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
         // out of the box. No dedicated extrema sketch is needed; route
@@ -564,7 +564,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         // structurally — a sid registered as `ExactAgg(Sum)` only
         // satisfies a required `ExactAgg(Sum)`.
         AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
-        AggIntent::Rate { .. } | AggIntent::Increase { .. } => {
+        AggIntent::Rate | AggIntent::Increase => {
             Some(Capability::ExactAgg(AggregationType::Increase))
         }
         // ── Avg / StdDev / Variance: still no ASAP-tier substitute ────
@@ -582,13 +582,13 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         AggIntent::Absent
         | AggIntent::AbsentOverTime
         | AggIntent::PresentOverTime
-        | AggIntent::Delta { .. }
-        | AggIntent::Deriv { .. }
+        | AggIntent::Delta
+        | AggIntent::Deriv
         | AggIntent::PredictLinear { .. }
         | AggIntent::DoubleExpSmoothing { .. }
-        | AggIntent::IDelta { .. }
-        | AggIntent::Resets { .. }
-        | AggIntent::Changes { .. }
+        | AggIntent::IDelta
+        | AggIntent::Resets
+        | AggIntent::Changes
         | AggIntent::HistogramCount
         | AggIntent::HistogramSum
         | AggIntent::HistogramAvg
@@ -607,6 +607,9 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         | AggIntent::TsOfMaxOverTime
         | AggIntent::TsOfFirstOverTime
         | AggIntent::TsOfLastOverTime => None,
+        // Unrecognized Extension (not the Frequency one, guarded above) -- no
+        // binding exists for a shape core cannot even see into.
+        AggIntent::Extension { .. } => None,
     }
 }
 
@@ -898,7 +901,7 @@ mod tests {
         let intent = AggIntent::Cardinality {
             col: None,
             accuracy: AccuracyTarget::EpsilonDelta {
-                eps: 0.01,
+                epsilon: 0.01,
                 delta: 0.001,
             },
         };
@@ -980,18 +983,8 @@ mod tests {
         // ExactAgg(Increase) — the counter-reset-aware exact precompute.
         // Pre-follow-up this returned `None`.
         let exact_inc = Some(Capability::ExactAgg(AggregationType::Increase));
-        assert_eq!(
-            capability_for(&AggIntent::Rate {
-                window: Duration::from_secs(60)
-            }),
-            exact_inc
-        );
-        assert_eq!(
-            capability_for(&AggIntent::Increase {
-                window: Duration::from_secs(60)
-            }),
-            exact_inc
-        );
+        assert_eq!(capability_for(&AggIntent::Rate), exact_inc);
+        assert_eq!(capability_for(&AggIntent::Increase), exact_inc);
     }
 
     #[test]
@@ -1023,9 +1016,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_returns_frequency_estimate_approx() {
-        let intent = AggIntent::Frequency {
-            accuracy: AccuracyTarget::Epsilon(0.01),
-        };
+        let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01));
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -1034,12 +1025,10 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_delta_returns_frequency_estimate_approx() {
-        let intent = AggIntent::Frequency {
-            accuracy: AccuracyTarget::EpsilonDelta {
-                eps: 0.01,
-                delta: 0.001,
-            },
-        };
+        let intent = crate::intent_algebra::frequency(AccuracyTarget::EpsilonDelta {
+            epsilon: 0.01,
+            delta: 0.001,
+        });
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -1050,9 +1039,7 @@ mod tests {
     fn frequency_estimate_with_exact_returns_none() {
         // Exact aggregation routes to archive (sketch fallback only
         // meaningful when raw counters aren't kept).
-        let intent = AggIntent::Frequency {
-            accuracy: AccuracyTarget::Exact,
-        };
+        let intent = crate::intent_algebra::frequency(AccuracyTarget::Exact);
         assert_eq!(capability_for(&intent), None);
     }
 
@@ -1065,18 +1052,8 @@ mod tests {
         assert_eq!(capability_for(&AggIntent::Absent), None);
         assert_eq!(capability_for(&AggIntent::AbsentOverTime), None);
         assert_eq!(capability_for(&AggIntent::PresentOverTime), None);
-        assert_eq!(
-            capability_for(&AggIntent::Delta {
-                window: Duration::from_secs(60)
-            }),
-            None
-        );
-        assert_eq!(
-            capability_for(&AggIntent::IDelta {
-                window: Duration::from_secs(60)
-            }),
-            None
-        );
+        assert_eq!(capability_for(&AggIntent::Delta), None);
+        assert_eq!(capability_for(&AggIntent::IDelta), None);
         assert_eq!(capability_for(&AggIntent::HistogramCount), None);
         assert_eq!(capability_for(&AggIntent::Group), None);
     }
@@ -1271,15 +1248,11 @@ mod tests {
             Some(Capability::ExactAgg(AggregationType::Sum))
         );
         assert_eq!(
-            capability_for(&AggIntent::Rate {
-                window: Duration::from_secs(60)
-            }),
+            capability_for(&AggIntent::Rate),
             Some(Capability::ExactAgg(AggregationType::Increase))
         );
         assert_eq!(
-            capability_for(&AggIntent::Increase {
-                window: Duration::from_secs(60)
-            }),
+            capability_for(&AggIntent::Increase),
             Some(Capability::ExactAgg(AggregationType::Increase))
         );
         // `Count{Exact}` (count_over_time) and `Avg` both need a real

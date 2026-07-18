@@ -53,7 +53,7 @@ impl Rule for BindArchiveOnly {
             QueryExpr::Aggregate { aggs, .. } => {
                 // Single-intent Aggregate is the canonical Phase β shape;
                 // multi-intent fans out to per-intent rules elsewhere.
-                if aggs.len() == 1 && aggs[0].archive_only() {
+                if aggs.len() == 1 && crate::intent_algebra::archive_only(&aggs[0]) {
                     Some(PhysicalExpr::Logical(expr.clone()))
                 } else {
                     None
@@ -145,30 +145,16 @@ mod tests {
             AggIntent::Absent,
             AggIntent::AbsentOverTime,
             AggIntent::PresentOverTime,
-            AggIntent::Delta {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Deriv {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::PredictLinear {
-                window: Duration::from_secs(300),
-                seconds: 60.0,
-            },
+            AggIntent::Delta,
+            AggIntent::Deriv,
+            AggIntent::PredictLinear { seconds: 60.0 },
             AggIntent::DoubleExpSmoothing {
-                window: Duration::from_secs(300),
                 smoothing: 0.3,
                 trend: 0.3,
             },
-            AggIntent::IDelta {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Resets {
-                window: Duration::from_secs(300),
-            },
-            AggIntent::Changes {
-                window: Duration::from_secs(300),
-            },
+            AggIntent::IDelta,
+            AggIntent::Resets,
+            AggIntent::Changes,
             AggIntent::HistogramCount,
             AggIntent::Group,
         ];
@@ -201,15 +187,9 @@ mod tests {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             },
-            AggIntent::Frequency {
-                accuracy: AccuracyTarget::Epsilon(0.01),
-            },
-            AggIntent::Rate {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Increase {
-                window: Duration::from_secs(60),
-            },
+            crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01)),
+            AggIntent::Rate,
+            AggIntent::Increase,
         ] {
             let expr = agg_with(intent.clone());
             assert!(

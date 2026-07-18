@@ -67,10 +67,12 @@ pub fn sketch_type_for_agg(aggs: &[AggType]) -> SketchType {
 
 /// Resolve the concrete [`SketchType`] for an [`AggIntent`] IR node.
 pub fn sketch_type_for_op(op: &AggIntent) -> SketchType {
+    if crate::intent_algebra::as_frequency(op).is_some() {
+        return SketchType::CountSketch;
+    }
     match op {
         AggIntent::Quantile { .. } => SketchType::DDSketch,
         AggIntent::Cardinality { .. } => SketchType::HLL,
-        AggIntent::Frequency { .. } => SketchType::CountSketch,
         // Min/Max/Sum/Count/Avg/TopK/Rate/Increase + archive-only — all
         // historically rode the "DDSketch / exact passthrough" rails in
         // the legacy resolver. Keep that mapping until Step γ migrates the
@@ -91,6 +93,13 @@ pub fn sketch_type_for_per_partition(wrap: &PerPartitionWrap) -> SketchType {
 
 /// Derive [`SketchParams`] from an [`AggIntent`] IR node.
 pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
+    if crate::intent_algebra::as_frequency(op).is_some() {
+        let acc = agg_accuracy(op);
+        return SketchParams::CountSketch {
+            epsilon: acc,
+            delta: 0.01,
+        };
+    }
     match op {
         AggIntent::Quantile { q, .. } => SketchParams::DDSketch {
             relative_accuracy: agg_accuracy(op),
@@ -105,13 +114,6 @@ pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
             let registers = ((1.04 / acc).powi(2) as u32).next_power_of_two();
             let precision = (registers as f64).log2() as u32;
             SketchParams::HLL { precision }
-        }
-        AggIntent::Frequency { .. } => {
-            let acc = agg_accuracy(op);
-            SketchParams::CountSketch {
-                epsilon: acc,
-                delta: 0.01,
-            }
         }
         // Min / Max — preserve the legacy `Extrema` mapping (DDSketch over
         // the 0.0 / 1.0 boundary quantiles).
@@ -145,6 +147,12 @@ pub fn sketch_type_and_params(op: &AggIntent) -> (SketchType, SketchParams) {
 /// Used by the physical planner's placement decision to defer a sketch
 /// build off a stage when its budget would be exceeded.
 pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
+    if crate::intent_algebra::as_frequency(op).is_some() {
+        let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
+        // CMS: width ≈ e/accuracy, depth ≈ 5, memory = width*depth*8
+        let width = (std::f64::consts::E / acc) as u64;
+        return width * 5 * 8;
+    }
     match op {
         AggIntent::Quantile { .. } => 4_096,
         AggIntent::Cardinality { .. } => {
@@ -152,12 +160,6 @@ pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
             // HLL: registers ≈ (1.04/accuracy)^2, memory = registers
             let registers = ((1.04 / acc).powi(2) as u64).next_power_of_two();
             registers.max(16)
-        }
-        AggIntent::Frequency { .. } => {
-            let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
-            // CMS: width ≈ e/accuracy, depth ≈ 5, memory = width*depth*8
-            let width = (std::f64::consts::E / acc) as u64;
-            width * 5 * 8
         }
         // Legacy `Extrema { .. }` (now canonical Min / Max) — 16 bytes.
         AggIntent::Min { .. } | AggIntent::Max { .. } => 16,

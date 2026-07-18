@@ -102,8 +102,9 @@ pub use binder::{Binder, SchemaCatalog, UsageDerivedCatalog};
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
 pub use agg_intent::{
-    agg_accuracy, agg_is_exact, agg_is_mergeable, default_cardinality, default_frequency,
-    default_quantile, AggIntent,
+    agg_accuracy, agg_is_exact, agg_is_mergeable, archive_only, as_frequency, default_cardinality,
+    default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
+    ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use query_expr::{

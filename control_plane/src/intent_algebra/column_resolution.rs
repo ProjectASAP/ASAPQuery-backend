@@ -267,7 +267,7 @@ pub fn output_schema_for_aggregate(input: &Schema, by: &[ColumnId], aggs: &[AggI
             nullable: false,
         });
     for intent in aggs {
-        out_cols.push(intent.output_column(&probe));
+        out_cols.push(crate::intent_algebra::output_column(intent, &probe));
     }
     // Output unique_keys = [by] when by is non-empty; empty (global) → no UK.
     let unique_keys = if by.is_empty() {

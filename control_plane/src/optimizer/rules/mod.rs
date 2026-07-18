@@ -185,9 +185,7 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
             col: None,
             accuracy: intent_accuracy,
         },
-        StatisticClass::Frequency => L3AggIntent::Frequency {
-            accuracy: intent_accuracy,
-        },
+        StatisticClass::Frequency => crate::intent_algebra::frequency(intent_accuracy),
         StatisticClass::TopK => L3AggIntent::TopK {
             k: 10,
             accuracy: intent_accuracy,

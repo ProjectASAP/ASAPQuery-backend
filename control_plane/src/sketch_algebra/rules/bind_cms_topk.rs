@@ -185,8 +185,8 @@ impl BindCountSketchOnTopK {
         // in play. Note we no longer bail to `None` on `Exact`: an exact
         // top-k intent picks the unbiased CountSketch family (the closest
         // sketch-tier approximation) rather than declining the binding.
-        let tier =
-            forced_tier.unwrap_or_else(|| TopkRecallTier::from_accuracy(accuracy, &intent_accuracy));
+        let tier = forced_tier
+            .unwrap_or_else(|| TopkRecallTier::from_accuracy(accuracy, &intent_accuracy));
 
         // Derive (w, d) from the frequency-error budget. `Exact` on either
         // side leaves the ε/δ unspecified (it's a *recall* tier signal,
@@ -196,17 +196,36 @@ impl BindCountSketchOnTopK {
             (AccuracyTarget::Exact, AccuracyTarget::Exact) => (0.01, 0.01),
             (AccuracyTarget::Exact, other) | (other, AccuracyTarget::Exact) => match other {
                 AccuracyTarget::Epsilon(a) => (*a, 0.01),
-                AccuracyTarget::EpsilonDelta { eps, delta } => (*eps, *delta),
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: eps,
+                    delta,
+                } => (*eps, *delta),
                 AccuracyTarget::Exact => (0.01, 0.01),
             },
             (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => (a.min(*b), 0.01),
-            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { eps, delta })
-            | (AccuracyTarget::EpsilonDelta { eps, delta }, AccuracyTarget::Epsilon(a)) => {
-                (a.min(*eps), *delta)
-            }
             (
-                AccuracyTarget::EpsilonDelta { eps: a, delta: da },
-                AccuracyTarget::EpsilonDelta { eps: b, delta: db },
+                AccuracyTarget::Epsilon(a),
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: eps,
+                    delta,
+                },
+            )
+            | (
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: eps,
+                    delta,
+                },
+                AccuracyTarget::Epsilon(a),
+            ) => (a.min(*eps), *delta),
+            (
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: a,
+                    delta: da,
+                },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: b,
+                    delta: db,
+                },
             ) => (a.min(*b), da.min(*db)),
         };
 

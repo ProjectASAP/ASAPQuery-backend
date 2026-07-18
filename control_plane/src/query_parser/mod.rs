@@ -311,7 +311,7 @@ impl QeCollector {
                     self.agg_types.push(AggType::Cardinality);
                 }
             }
-            AggIntent::Frequency { .. } => {
+            op if crate::intent_algebra::as_frequency(op).is_some() => {
                 if !self.agg_types.contains(&AggType::Frequency) {
                     self.agg_types.push(AggType::Frequency);
                 }

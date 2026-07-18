@@ -795,7 +795,7 @@ mod tests {
     #[test]
     fn agg_func_to_sketch_op_heavy_hitters() {
         let op = AggFunc::HeavyHitters { k: 50 }.to_sketch_op();
-        assert!(matches!(op, Some(AggIntent::Frequency { .. })));
+        assert!(op.is_some_and(|i| crate::intent_algebra::as_frequency(&i).is_some()));
     }
 
     // ── ScalarExpr predicate list conversion ──────────────────────────────────

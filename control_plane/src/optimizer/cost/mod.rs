@@ -703,6 +703,9 @@ fn node_cost_aggregate(by: &[usize], aggs: &[AggIntent], _input: &Schema) -> f64
 /// agrees with L4's "sketch is cheaper than exact for these" intuition.
 #[allow(dead_code)]
 fn intent_cost(intent: &AggIntent) -> f64 {
+    if crate::intent_algebra::as_frequency(intent).is_some() {
+        return 15.0;
+    }
     match intent {
         AggIntent::Sum { .. }
         | AggIntent::Min { .. }
@@ -712,14 +715,13 @@ fn intent_cost(intent: &AggIntent) -> f64 {
         AggIntent::Quantile { .. } => 20.0,
         AggIntent::Cardinality { .. } => 15.0,
         AggIntent::TopK { .. } => 25.0,
-        AggIntent::Frequency { .. } => 15.0,
-        AggIntent::Rate { .. } | AggIntent::Increase { .. } => 8.0,
+        AggIntent::Rate | AggIntent::Increase => 8.0,
         // Phase β archive-only intents — priced as a cold-tier scan
         // rather than a streaming aggregate. Higher than `Sum` (the engine
         // must read the raw archive) but lower than the sketch intents
         // (no per-sample sketch update on the hot path). Tightening this
         // is a follow-up once real measurements land.
-        intent if intent.archive_only() => 12.0,
+        intent if crate::intent_algebra::archive_only(intent) => 12.0,
         // Defensive fallback — any future intent that isn't archive-only
         // and doesn't match an explicit arm prices as a generic aggregate.
         _ => 5.0,

@@ -9,7 +9,7 @@
 //! - `AggIntent::Frequency{accuracy}` — `count(*) WHERE key = k`. CMS is
 //!   the textbook fit (Cormode-Muthukrishnan).
 //!
-//! Accuracy mapping: `AccuracyTarget::EpsilonDelta { eps, delta }` →
+//! Accuracy mapping: `AccuracyTarget::EpsilonDelta { epsilon: eps, delta }` →
 //! `(w, d) = (⌈e/eps⌉, ⌈ln(1/delta)⌉)`. CMS guarantees additive error
 //! `≤ eps · ‖f‖₁` with probability `≥ 1 − delta` (see
 //! `accuracy_profile.rs` in ASAPQuery-backend for the formal bound).
@@ -56,8 +56,8 @@ impl Rule for BindCmsOnCount {
                         child,
                     )
                 }
-                AggIntent::Frequency { accuracy } => (
-                    accuracy.clone(),
+                intent if crate::intent_algebra::as_frequency(intent).is_some() => (
+                    crate::intent_algebra::as_frequency(intent).unwrap(),
                     EstimateOp::PointCount { key: "*".into() },
                     child,
                 ),
@@ -71,13 +71,29 @@ impl Rule for BindCmsOnCount {
         let (eps, delta) = match (accuracy, &intent_accuracy) {
             (AccuracyTarget::Exact, _) | (_, AccuracyTarget::Exact) => return None,
             (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => (a.min(*b), 0.01),
-            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { eps, delta })
-            | (AccuracyTarget::EpsilonDelta { eps, delta }, AccuracyTarget::Epsilon(a)) => {
-                (a.min(*eps), *delta)
-            }
             (
-                AccuracyTarget::EpsilonDelta { eps: a, delta: da },
-                AccuracyTarget::EpsilonDelta { eps: b, delta: db },
+                AccuracyTarget::Epsilon(a),
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: eps,
+                    delta,
+                },
+            )
+            | (
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: eps,
+                    delta,
+                },
+                AccuracyTarget::Epsilon(a),
+            ) => (a.min(*eps), *delta),
+            (
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: a,
+                    delta: da,
+                },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: b,
+                    delta: db,
+                },
             ) => (a.min(*b), da.min(*db)),
         };
 

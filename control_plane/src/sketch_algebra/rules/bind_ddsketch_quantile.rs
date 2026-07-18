@@ -62,11 +62,13 @@ impl Rule for BindDDSketchOnQuantile {
         let alpha = match (accuracy, &intent_accuracy) {
             (AccuracyTarget::Exact, _) | (_, AccuracyTarget::Exact) => return None,
             (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => a.min(*b),
-            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { eps, .. })
-            | (AccuracyTarget::EpsilonDelta { eps, .. }, AccuracyTarget::Epsilon(a)) => a.min(*eps),
+            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { epsilon: eps, .. })
+            | (AccuracyTarget::EpsilonDelta { epsilon: eps, .. }, AccuracyTarget::Epsilon(a)) => {
+                a.min(*eps)
+            }
             (
-                AccuracyTarget::EpsilonDelta { eps: a, .. },
-                AccuracyTarget::EpsilonDelta { eps: b, .. },
+                AccuracyTarget::EpsilonDelta { epsilon: a, .. },
+                AccuracyTarget::EpsilonDelta { epsilon: b, .. },
             ) => a.min(*b),
         };
 

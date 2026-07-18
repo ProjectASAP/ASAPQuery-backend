@@ -48,47 +48,31 @@ pub enum QueryLanguage {
 
 /// Per-target accuracy SLA, in the typed form `design.md` §6 calls for.
 ///
-/// Drives L4 sketch binding (`Exact` disables every `Bind*` rule, so the
-/// optimiser falls back to an exact `HashAgg` / `SortAgg`; `Epsilon` and
-/// `EpsilonDelta` set the ε / δ budget the cost model has to satisfy when
-/// it picks a sketch family + parameters).
-///
-/// The legacy `analyzer::QuerySpec.accuracy_sla: f64` field is preserved
-/// for back-compat — when a caller supplies a typed `accuracy: Some(…)`
-/// it takes precedence; otherwise the analyzer translates the legacy
-/// fraction to `Epsilon(1.0 - accuracy_sla)`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum AccuracyTarget {
-    /// No approximation allowed. L4 must pick an exact path; sketch
-    /// binding rules are skipped.
-    Exact,
-    /// Bound on relative error. The L4 cost model must pick sketch
-    /// parameters that satisfy `error ≤ eps` with whatever default
-    /// confidence the sketch family provides.
-    Epsilon(f64),
-    /// Bound on relative error and the probability of exceeding it
-    /// (Pr[error > eps] ≤ delta). Required for sketches whose
-    /// guarantees are inherently probabilistic (CMS, HLL).
-    EpsilonDelta {
-        /// Relative-error bound.
-        eps: f64,
-        /// Probability of exceeding the bound.
-        delta: f64,
-    },
-}
+/// Phase 1b (docs/migration-plan-backend-plan.md): re-exported from
+/// `asap_ir::types` rather than defined locally -- `AggIntent`'s
+/// `accuracy` fields are typed against ASAPController's `AccuracyTarget`,
+/// so keeping a separate local type here would force a conversion at
+/// every one of the ~400 `AggIntent` call sites. Two real differences
+/// from the pre-merge local type, both confirmed safe to fold on
+/// (no external YAML/JSON persists the old wire shape -- only one
+/// in-Rust test fixture, `pipeline.rs`, needed updating):
+/// - Wire shape: was `#[serde(tag = "kind", content = "value")]`
+///   (`{"kind": "epsilon", "value": 0.02}`); now serde's default
+///   externally-tagged representation (`{"Epsilon": 0.02}`).
+/// - `EpsilonDelta`'s second field is `epsilon`, not `eps`.
+pub use asap_ir::types::AccuracyTarget;
 
-impl AccuracyTarget {
-    /// Translate the legacy `accuracy_sla: f64` field — a fractional
-    /// "1.0 = exact, 0.0 = anything goes" SLA — into the typed form.
-    /// `accuracy_sla == 1.0` round-trips to `Exact`; everything else
-    /// becomes `Epsilon(1.0 - accuracy_sla)` (the implied error bound).
-    pub fn from_legacy_accuracy_sla(accuracy_sla: f64) -> Self {
-        if accuracy_sla >= 1.0 {
-            AccuracyTarget::Exact
-        } else {
-            AccuracyTarget::Epsilon((1.0 - accuracy_sla).max(0.0))
-        }
+/// Translate the legacy `accuracy_sla: f64` field -- a fractional
+/// "1.0 = exact, 0.0 = anything goes" SLA -- into the typed form.
+/// `accuracy_sla == 1.0` round-trips to `Exact`; everything else becomes
+/// `Epsilon(1.0 - accuracy_sla)` (the implied error bound). Free function,
+/// not `impl AccuracyTarget` -- Rust's orphan rules don't allow inherent
+/// impls on a foreign type.
+pub fn accuracy_target_from_legacy_accuracy_sla(accuracy_sla: f64) -> AccuracyTarget {
+    if accuracy_sla >= 1.0 {
+        AccuracyTarget::Exact
+    } else {
+        AccuracyTarget::Epsilon((1.0 - accuracy_sla).max(0.0))
     }
 }
 
@@ -276,7 +260,7 @@ mod tests {
             AccuracyTarget::Exact,
             AccuracyTarget::Epsilon(0.05),
             AccuracyTarget::EpsilonDelta {
-                eps: 0.01,
+                epsilon: 0.01,
                 delta: 0.001,
             },
         ];
@@ -291,11 +275,11 @@ mod tests {
     fn accuracy_target_from_legacy() {
         // 1.0 means exact in the legacy schema.
         assert_eq!(
-            AccuracyTarget::from_legacy_accuracy_sla(1.0),
+            accuracy_target_from_legacy_accuracy_sla(1.0),
             AccuracyTarget::Exact
         );
         // 0.99 SLA → ε = 0.01.
-        match AccuracyTarget::from_legacy_accuracy_sla(0.99) {
+        match accuracy_target_from_legacy_accuracy_sla(0.99) {
             AccuracyTarget::Epsilon(eps) => {
                 assert!((eps - 0.01).abs() < 1e-9, "got eps={eps}");
             }
@@ -303,7 +287,7 @@ mod tests {
         }
         // Out-of-range guard — analyzer rejects these upstream, but the
         // helper itself must not panic on a 0.0 SLA.
-        match AccuracyTarget::from_legacy_accuracy_sla(0.0) {
+        match accuracy_target_from_legacy_accuracy_sla(0.0) {
             AccuracyTarget::Epsilon(eps) => assert!((eps - 1.0).abs() < 1e-9),
             other => panic!("expected Epsilon, got {other:?}"),
         }

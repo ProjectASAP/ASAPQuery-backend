@@ -353,6 +353,9 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
 /// the AST walker can recover them; this fallback runs when the AST
 /// walk fails.
 fn intent_kind_label(intent: &AggIntent) -> &'static str {
+    if crate::intent_algebra::as_frequency(intent).is_some() {
+        return "frequency";
+    }
     match intent {
         AggIntent::Count { .. } => "count",
         AggIntent::Sum { .. } => "sum",
@@ -364,19 +367,18 @@ fn intent_kind_label(intent: &AggIntent) -> &'static str {
         AggIntent::Quantile { .. } => "quantile",
         AggIntent::TopK { .. } => "topk",
         AggIntent::Cardinality { .. } => "cardinality",
-        AggIntent::Frequency { .. } => "frequency",
-        AggIntent::Rate { .. } => "rate",
-        AggIntent::Increase { .. } => "increase",
+        AggIntent::Rate => "rate",
+        AggIntent::Increase => "increase",
         AggIntent::Absent => "absent",
         AggIntent::AbsentOverTime => "absent_over_time",
         AggIntent::PresentOverTime => "present_over_time",
-        AggIntent::Delta { .. } => "delta",
-        AggIntent::Deriv { .. } => "deriv",
+        AggIntent::Delta => "delta",
+        AggIntent::Deriv => "deriv",
         AggIntent::PredictLinear { .. } => "predict_linear",
         AggIntent::DoubleExpSmoothing { .. } => "double_exponential_smoothing",
-        AggIntent::IDelta { .. } => "idelta",
-        AggIntent::Resets { .. } => "resets",
-        AggIntent::Changes { .. } => "changes",
+        AggIntent::IDelta => "idelta",
+        AggIntent::Resets => "resets",
+        AggIntent::Changes => "changes",
         AggIntent::HistogramCount => "histogram_count",
         AggIntent::HistogramSum => "histogram_sum",
         AggIntent::HistogramAvg => "histogram_avg",
@@ -395,6 +397,8 @@ fn intent_kind_label(intent: &AggIntent) -> &'static str {
         AggIntent::TsOfMaxOverTime => "ts_of_max_over_time",
         AggIntent::TsOfFirstOverTime => "ts_of_first_over_time",
         AggIntent::TsOfLastOverTime => "ts_of_last_over_time",
+        // Unrecognized Extension (not the Frequency one, guarded above).
+        AggIntent::Extension { .. } => "extension",
     }
 }
 

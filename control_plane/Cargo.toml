@@ -35,6 +35,12 @@ tokio-stream   = { version = "0.1", features = ["net"] }
 promql_utilities.workspace = true
 asap_types.workspace = true
 
+# Transitional pin (docs/migration-plan-backend-plan.md Phase 1b): locked to a
+# specific commit on ASAPController's main, not a tag -- ASAPController has no
+# tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
+# once one exists.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "c73c2a5099e3e0d0439e86d895f5a61a7e1231b1" }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = { version = "0.4", features = ["util"] }

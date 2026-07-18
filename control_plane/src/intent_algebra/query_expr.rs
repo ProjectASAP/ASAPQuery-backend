@@ -562,7 +562,7 @@ impl QueryExpr {
                         nullable: false,
                     });
                 for intent in aggs {
-                    out_cols.push(intent.output_column(&probe));
+                    out_cols.push(crate::intent_algebra::output_column(intent, &probe));
                 }
                 // Output unique_keys = [by]. The group-by column tuple
                 // is unique in the output by construction (design.md §6
