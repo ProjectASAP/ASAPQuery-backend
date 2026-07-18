@@ -40,25 +40,40 @@ phase-by-phase execution plan). Read that doc first.
 **Scope:** Resolve the open questions in `design-backend-plan-wire-format.md`
 §9 before any code lands.
 
-**Work:**
-- Decide `Frequency` representation (standalone intent vs
-  `RankingMeasure::Frequency` under `TopK`) — default to ASAPController's
-  shape unless someone identifies a control_plane consumer that needs it
-  standalone.
-- Confirm `irate`-folds-into-`Rate` (already leaning ASAPController's way
-  per the L3-design-rule "intent at L3, estimation method at L4" —
-  needs explicit sign-off, not just a lean).
-- Decide whether merging ASAPController's `frontend-sql` means
-  `control_plane` regains SQL support as a first-class query surface, or
-  whether the SQL frontend is merged into the shared IR but left
-  unregistered/unexposed in `control_plane`'s own entry points for now.
-  **This wasn't decided in the design doc and materially changes Phase 2's
-  scope** — resolve it here, not implicitly during Phase 2.
-- Rollup algebra and `MaterializationPayload` extensibility can stay
-  deferred (as the design doc already says) — not blocking for Phase 0.
+**Work — decided:**
+- `Frequency` → adopt ASAPController's `RankingMeasure::Frequency` under
+  `TopK`. control_plane's standalone `AggIntent::Frequency` call sites get
+  rewritten onto this shape.
+- `irate`/`rate` → adopt ASAPController's fold (both lower to `AggIntent::Rate`,
+  estimation-method distinction pushed to L4).
+- **control_plane gains SQL support** as a first-class query surface, not
+  just an IR-only merge. This is a bigger scope item than it looks —
+  `data_plane` currently has no SQL query entry point at all (`drivers/query`
+  implements the Prometheus HTTP API only); merging `frontend-sql` into the
+  IR does not by itself give users a way to *send* a SQL query. Scoping
+  call: **this plan covers merging `frontend-sql` into the shared IR only**
+  (Phase 2, item 7). Exposing an actual SQL query endpoint in `data_plane`
+  is a separate follow-on phase, not included in Phases 1-7 below — flag it
+  as future work rather than silently expanding this plan's scope.
+- **CSE moves to L4** (ASAPController's `crates/plan` placement, not
+  control_plane's current L3 placement). This reorders control_plane's
+  existing optimizer rule firing — Phase 2 item 5 below now treats this as
+  a real behavior change requiring its own regression pass, not an optional
+  "keep as-is unless there's a reason to move it."
+- **Standing tie-break rule for everything else this merge touches**:
+  wherever control_plane and ASAPController diverge, adopt
+  ASAPController's current version. The only exception is functionality
+  that's genuinely control_plane-only with no ASAPController equivalent —
+  that gets ported onto the ASAPController-based version, not used to keep
+  control_plane's side of a shared file. This replaces Phase 2's earlier
+  "re-diff and decide per file" framing — the diffs still happen, but their
+  purpose is now "confirm nothing control_plane-only gets silently
+  dropped," not "pick a winner."
+- Rollup algebra and `MaterializationPayload` extensibility stay deferred
+  (per the design doc) — not blocking for Phase 0.
 
-**Exit criteria:** design doc PR approved, with the SQL-scope decision
-recorded in this document's Decision log (§ below) before Phase 2 starts.
+**Exit criteria:** met — decisions recorded in this document's Decision
+log (§ below) and in `design-backend-plan-wire-format.md` §4.
 
 **Risk:** none — no code changes.
 
@@ -116,7 +131,11 @@ find-and-replace.
 **Do not reuse `ASAPController/docs/intent-algebra-reconciliation.md`'s
 per-file base recommendations.** Re-measuring current source shows several
 have flipped which side is bigger since that doc was written — it is not a
-reliable guide anymore, only a source of *questions to re-ask*:
+reliable guide anymore, only a source of *questions to re-ask*. Per the
+Phase 0 tie-break rule, the answer to "which side wins" is now always
+"ASAPController" — the per-file diff below exists to catch anything
+control_plane-only that needs porting onto ASAPController's version, not
+to relitigate which side is richer:
 
 | File | control_plane (current) | ASAPController (current) | Note |
 |---|---:|---:|---|
@@ -144,23 +163,28 @@ reliable guide anymore, only a source of *questions to re-ask*:
 4. `binder.rs` / `column_resolution.rs` — fresh diff, adopt whichever is
    semantically ahead per-function (may not be the same side for every
    function).
-5. **`cse.rs` placement decision** — control_plane currently runs CSE at L3
-   (inside `intent_algebra`); ASAPController runs it at L4 (inside
-   `crates/plan`, alongside the optimizer). This is a real architectural
-   question, not a file-diff question: does CSE belong before or after
-   sketch binding? Resolve explicitly (recommend: keep it wherever
-   `control_plane`'s existing `optimizer/engine.rs` rule ordering assumes
-   it runs today — moving it changes rule firing order and needs its own
-   regression pass, don't bundle that risk into this phase without a
-   reason).
+5. **`cse.rs` moves to L4** (decided in Phase 0) — port it into
+   control_plane's `optimizer` module (mirroring ASAPController's
+   `crates/plan` placement), not `intent_algebra`. This reorders when CSE
+   fires relative to control_plane's existing `optimizer/engine.rs` R1-R12
+   rules. **Required regression pass**: re-run every existing optimizer
+   test with CSE now running after sketch binding instead of before, and
+   specifically check the rules that do fan-in/reuse detection
+   (`CommonSubexprElim`/R8 itself may become partially redundant with the
+   relocated CSE pass — reconcile rather than run both) — do not treat
+   this as a mechanical file move.
 6. `lower.rs` — the one genuinely medium-risk file per the original
    reconciliation doc's assessment (per-branch binding, accuracy
    threading) — re-verify that assessment still holds given the size
-   flip, then do the merge.
-7. Retarget the PromQL frontend onto the merged IR. **SQL frontend**: per
-   the Phase 0 decision — either wire it into `control_plane`'s own
-   entry points (if Phase 0 decided control_plane regains SQL) or land it
-   unregistered (if not).
+   flip, then adopt ASAPController's version per the tie-break rule.
+7. Retarget the PromQL frontend onto the merged IR. **SQL frontend**
+   (decided in Phase 0: control_plane gains SQL) — merge
+   ASAPController's `frontend-sql` into the shared IR and wire it into
+   control_plane's own parsing entry points (`query_parser`). Per Phase
+   0's scoping note: this phase delivers SQL *parsing/lowering* inside
+   control_plane; it does not add a SQL query HTTP endpoint to
+   `data_plane` — that's explicitly out of scope here and should be
+   tracked as separate future work if wanted.
 
 **Testing:**
 - Golden-file round-trip test (parse → lower → `QueryExpr` JSON) — port
@@ -365,12 +389,13 @@ trustworthy.
 
 | # | Question | Status |
 |---|---|---|
-| 1 | `Frequency`: standalone intent or `TopK::RankingMeasure`? | Leaning ASAPController's shape — confirm in Phase 0 |
-| 2 | `irate`/`rate`: fold at L3 or keep distinct? | Leaning fold (ASAPController's approach) — confirm in Phase 0 |
-| 3 | Does merging `frontend-sql` mean `control_plane` regains SQL as a first-class surface? | **Open — must be decided in Phase 0, not implicitly during Phase 2** |
-| 4 | `cse.rs`: L3 (current control_plane) or L4 (ASAPController's `crates/plan`)? | Open — see Phase 2 step 5 |
+| 1 | `Frequency`: standalone intent or `TopK::RankingMeasure`? | **Decided — ASAPController's `RankingMeasure::Frequency`.** |
+| 2 | `irate`/`rate`: fold at L3 or keep distinct? | **Decided — fold, per ASAPController.** |
+| 3 | Does merging `frontend-sql` mean `control_plane` regains SQL as a first-class surface? | **Decided — yes.** IR/parsing merge only in this plan (Phase 2 item 7); a `data_plane` SQL query endpoint is separate future work. |
+| 4 | `cse.rs`: L3 (current control_plane) or L4 (ASAPController's `crates/plan`)? | **Decided — L4.** See Phase 2 item 5 for the required regression pass. |
 | 5 | Rollup algebra — which `AggIntent`s roll up safely across a coarser group-by? | Open — blocks Phase 5 step 2, not earlier phases |
 | 6 | `MaterializationPayload` extensibility (closed enum vs URN-tagged)? | Deferred indefinitely per the design doc — revisit only on real need |
+| 7 | General tie-break for any other control_plane/ASAPController divergence found during Phase 1-2? | **Decided — adopt ASAPController's version by default; exception only for control_plane-only functionality with no ASAPController equivalent.** |
 
 ## Rollback strategy
 
