@@ -91,11 +91,13 @@ pub fn infer_source_schema(_metric_or_table_name: &str) -> Schema {
                 name: "ts".into(),
                 dtype: DataType::Timestamp,
                 nullable: false,
+                table: None,
             },
             Column {
                 name: "value".into(),
                 dtype: DataType::Float64,
                 nullable: false,
+                table: None,
             },
         ],
         0,
@@ -265,6 +267,7 @@ pub fn output_schema_for_aggregate(input: &Schema, by: &[ColumnId], aggs: &[AggI
             name: "value".into(),
             dtype: DataType::Float64,
             nullable: false,
+            table: None,
         });
     for intent in aggs {
         out_cols.push(crate::intent_algebra::output_column(intent, &probe));
@@ -280,6 +283,7 @@ pub fn output_schema_for_aggregate(input: &Schema, by: &[ColumnId], aggs: &[AggI
         columns: out_cols,
         time_index: None,
         unique_keys,
+        closed: false,
     }
 }
 
@@ -402,11 +406,13 @@ mod tests {
             name: "host".into(),
             dtype: DataType::Utf8,
             nullable: false,
+            table: None,
         });
         input.columns.push(Column {
             name: "region".into(),
             dtype: DataType::Utf8,
             nullable: false,
+            table: None,
         });
         // Group by host, region (positions 2 and 3).
         let by = vec![2usize, 3usize];
@@ -439,6 +445,7 @@ mod tests {
             name: "host".into(),
             dtype: DataType::Utf8,
             nullable: false,
+            table: None,
         });
         let ids = resolve_named_keys(&["host".to_string()], &s).unwrap();
         assert_eq!(ids, vec![2usize]);

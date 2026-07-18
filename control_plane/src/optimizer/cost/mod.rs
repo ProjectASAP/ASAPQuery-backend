@@ -744,6 +744,7 @@ mod workload_cost_tests {
             name: name.into(),
             dtype,
             nullable: false,
+            table: None,
         }
     }
 

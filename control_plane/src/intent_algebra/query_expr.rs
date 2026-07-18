@@ -560,6 +560,7 @@ impl QueryExpr {
                         name: "value".into(),
                         dtype: DataType::Float64,
                         nullable: false,
+                        table: None,
                     });
                 for intent in aggs {
                     out_cols.push(crate::intent_algebra::output_column(intent, &probe));
@@ -578,6 +579,7 @@ impl QueryExpr {
                     columns: out_cols,
                     time_index: None,
                     unique_keys,
+                    closed: false,
                 })
             }
             QueryExpr::LetBinding { name, expr, child } => {
@@ -794,6 +796,7 @@ mod tests {
             name: name.into(),
             dtype,
             nullable: false,
+            table: None,
         }
     }
 
