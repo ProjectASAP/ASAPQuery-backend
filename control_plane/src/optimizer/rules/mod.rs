@@ -212,11 +212,13 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
                     name: "ts".into(),
                     dtype: DataType::Timestamp,
                     nullable: false,
+                    table: None,
                 },
                 Column {
                     name: "value".into(),
                     dtype: DataType::Float64,
                     nullable: false,
+                    table: None,
                 },
             ],
             0,

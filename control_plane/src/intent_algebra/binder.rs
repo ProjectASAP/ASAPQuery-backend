@@ -137,6 +137,7 @@ impl<C: SchemaCatalog> Binder<C> {
                     name,
                     dtype: DataType::Utf8, // labels / group keys are strings
                     nullable: true,
+                    table: None,
                 });
             }
         }
@@ -146,6 +147,7 @@ impl<C: SchemaCatalog> Binder<C> {
             columns,
             time_index,
             unique_keys: Vec::new(),
+            closed: false,
         }
     }
 }
@@ -157,11 +159,13 @@ fn default_leaf_columns() -> Vec<Column> {
             name: "ts".into(),
             dtype: DataType::Timestamp,
             nullable: false,
+            table: None,
         },
         Column {
             name: "value".into(),
             dtype: DataType::Float64,
             nullable: false,
+            table: None,
         },
     ]
 }
@@ -269,16 +273,19 @@ mod tests {
                             name: "ts".into(),
                             dtype: DataType::Timestamp,
                             nullable: false,
+                            table: None,
                         },
                         Column {
                             name: "value".into(),
                             dtype: DataType::Float64,
                             nullable: false,
+                            table: None,
                         },
                         Column {
                             name: "datacenter".into(),
                             dtype: DataType::Utf8,
                             nullable: false,
+                            table: None,
                         },
                     ])
                 } else {

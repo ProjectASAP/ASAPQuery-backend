@@ -8,6 +8,12 @@
 //! ASAPController has no tagged releases yet) and holds only what's
 //! genuinely control_plane-specific:
 //!
+//! (Phase 2: `Column`/`DataType` are also re-exported from `asap_ir` now
+//! — `schema.rs` got the full swap, not a boundary conversion, since
+//! asap_ir's version turned out to be a purely additive, backward-
+//! compatible superset. `output_column` below no longer needs a
+//! conversion layer as a result.)
+//!
 //! - **`frequency()` / `as_frequency()`** — control_plane's standalone
 //!   point-frequency-via-CMS query (`count(*) WHERE key = k`), carried
 //!   through the shared `AggIntent` as an `Extension` rather than a
@@ -43,7 +49,6 @@
 //! in scope, not off the intent.
 
 use asap_ir::intent_algebra::agg_accuracy as asap_agg_accuracy;
-use asap_ir::intent_algebra::schema::{Column as AsapColumn, DataType as AsapDataType};
 pub use asap_ir::intent_algebra::{
     agg_is_exact, agg_is_mergeable, default_cardinality, default_quantile,
     is_frequency_heavy_hitter, ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
@@ -53,43 +58,6 @@ use crate::intent_algebra::schema::{Column, DataType};
 use crate::types_v2::AccuracyTarget;
 
 const FREQUENCY_EXT_KIND: &str = "frequency";
-
-/// `control_plane::Column`/`DataType` and `asap_ir::Column`/`DataType`
-/// are structurally identical but not the same type — merging `schema.rs`
-/// itself is Phase 2 scope (it cascades into `Schema`/`QueryExpr`, used
-/// pervasively; ~38 `Column{}` literals across this repo). Convert at
-/// this boundary instead of widening this change.
-fn to_asap_dtype(dt: &DataType) -> AsapDataType {
-    match dt {
-        DataType::Int64 => AsapDataType::Int64,
-        DataType::Float64 => AsapDataType::Float64,
-        DataType::Utf8 => AsapDataType::Utf8,
-        DataType::Bool => AsapDataType::Bool,
-        DataType::Timestamp => AsapDataType::Timestamp,
-    }
-}
-
-fn from_asap_dtype(dt: &AsapDataType) -> DataType {
-    match dt {
-        AsapDataType::Int64 => DataType::Int64,
-        AsapDataType::Float64 => DataType::Float64,
-        AsapDataType::Utf8 => DataType::Utf8,
-        AsapDataType::Bool => DataType::Bool,
-        AsapDataType::Timestamp => DataType::Timestamp,
-    }
-}
-
-fn to_asap_column(c: &Column) -> AsapColumn {
-    AsapColumn::new(c.name.clone(), to_asap_dtype(&c.dtype), c.nullable)
-}
-
-fn from_asap_column(c: AsapColumn) -> Column {
-    Column {
-        name: c.name,
-        dtype: from_asap_dtype(&c.dtype),
-        nullable: c.nullable,
-    }
-}
 
 /// Construct control_plane's point-frequency-via-CMS intent. See module
 /// docs for why this is an `Extension`, not a shared first-class variant.
@@ -190,11 +158,7 @@ pub fn archive_only(intent: &AggIntent) -> bool {
 /// `"frequency"` — that's control_plane-only knowledge).
 pub fn output_column(intent: &AggIntent, input: &Column) -> Column {
     if as_frequency(intent).is_some() {
-        return Column {
-            name: "frequency".into(),
-            dtype: DataType::Int64,
-            nullable: false,
-        };
+        return Column::new("frequency", DataType::Int64, false);
     }
-    from_asap_column(intent.output_column(&to_asap_column(input)))
+    intent.output_column(input)
 }
