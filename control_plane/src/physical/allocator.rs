@@ -527,7 +527,7 @@ impl SketchAllocator {
         let intent = aggs[0].clone();
 
         // Exact non-mergeable (Avg) → always Db.
-        if matches!(intent, AggIntent::Avg) {
+        if matches!(intent, AggIntent::Avg { .. }) {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
                     by,
@@ -673,10 +673,12 @@ fn estimated_sketch_memory(op: &AggIntent) -> f64 {
 fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
     match intent {
         AggIntent::Count { .. } => "count",
-        AggIntent::Sum => "sum",
-        AggIntent::Min => "min",
-        AggIntent::Max => "max",
-        AggIntent::Avg => "avg",
+        AggIntent::Sum { .. } => "sum",
+        AggIntent::Min { .. } => "min",
+        AggIntent::Max { .. } => "max",
+        AggIntent::Avg { .. } => "avg",
+        AggIntent::StdDev { .. } => "stddev",
+        AggIntent::Variance { .. } => "variance",
         AggIntent::Quantile { .. } => "quantile",
         AggIntent::TopK { .. } => "topk",
         AggIntent::Cardinality { .. } => "cardinality",
@@ -684,15 +686,33 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
         AggIntent::Rate { .. } => "rate",
         AggIntent::Increase { .. } => "increase",
         AggIntent::Absent => "absent",
-        AggIntent::Present => "present",
+        AggIntent::AbsentOverTime => "absent_over_time",
+        AggIntent::PresentOverTime => "present_over_time",
         AggIntent::Delta { .. } => "delta",
         AggIntent::Deriv { .. } => "deriv",
         AggIntent::PredictLinear { .. } => "predict_linear",
-        AggIntent::HoltWinters { .. } => "holt_winters",
-        AggIntent::Idelta { .. } => "idelta",
-        AggIntent::Irate { .. } => "irate",
+        AggIntent::DoubleExpSmoothing { .. } => "double_exponential_smoothing",
+        AggIntent::IDelta { .. } => "idelta",
         AggIntent::Resets { .. } => "resets",
         AggIntent::Changes { .. } => "changes",
+        AggIntent::HistogramCount => "histogram_count",
+        AggIntent::HistogramSum => "histogram_sum",
+        AggIntent::HistogramAvg => "histogram_avg",
+        AggIntent::HistogramStdDev => "histogram_stddev",
+        AggIntent::HistogramStdVar => "histogram_stdvar",
+        AggIntent::HistogramFraction { .. } => "histogram_fraction",
+        AggIntent::HistogramQuantile { .. } => "histogram_quantile",
+        AggIntent::Math(_) => "math",
+        AggIntent::TimeFn(_) => "time_fn",
+        AggIntent::Group => "group",
+        AggIntent::CountValues { .. } => "count_values",
+        AggIntent::LastOverTime => "last_over_time",
+        AggIntent::FirstOverTime => "first_over_time",
+        AggIntent::MadOverTime => "mad_over_time",
+        AggIntent::TsOfMinOverTime => "ts_of_min_over_time",
+        AggIntent::TsOfMaxOverTime => "ts_of_max_over_time",
+        AggIntent::TsOfFirstOverTime => "ts_of_first_over_time",
+        AggIntent::TsOfLastOverTime => "ts_of_last_over_time",
     }
 }
 
@@ -808,7 +828,7 @@ mod tests {
 
     #[test]
     fn exact_avg_goes_to_db() {
-        let node = alloc(unlimited(), agg(AggIntent::Avg));
+        let node = alloc(unlimited(), agg(AggIntent::Avg { col: None }));
         assert_eq!(node.stage, PipelineStage::Db);
         assert_eq!(node.mode, ExecutionMode::Exact);
     }
@@ -817,7 +837,7 @@ mod tests {
 
     #[test]
     fn exact_sum_goes_to_backend() {
-        let node = alloc(unlimited(), agg(AggIntent::Sum));
+        let node = alloc(unlimited(), agg(AggIntent::Sum { col: None }));
         assert_eq!(node.stage, PipelineStage::Backend);
         assert_eq!(node.mode, ExecutionMode::Exact);
     }
@@ -886,7 +906,7 @@ mod tests {
     fn multi_intent_aggregate_goes_to_db() {
         let expr = QueryExpr::Aggregate {
             by: vec![],
-            aggs: vec![AggIntent::Sum, AggIntent::Min],
+            aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             having: None,
             child: Box::new(scan("m")),
         };

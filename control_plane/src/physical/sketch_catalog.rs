@@ -115,7 +115,7 @@ pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
         }
         // Min / Max — preserve the legacy `Extrema` mapping (DDSketch over
         // the 0.0 / 1.0 boundary quantiles).
-        AggIntent::Min | AggIntent::Max => SketchParams::DDSketch {
+        AggIntent::Min { .. } | AggIntent::Max { .. } => SketchParams::DDSketch {
             relative_accuracy: 0.01,
             quantiles: vec![0.0, 1.0],
         },
@@ -160,7 +160,7 @@ pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
             width * 5 * 8
         }
         // Legacy `Extrema { .. }` (now canonical Min / Max) — 16 bytes.
-        AggIntent::Min | AggIntent::Max => 16,
+        AggIntent::Min { .. } | AggIntent::Max { .. } => 16,
         // Sum / Count / Avg / TopK / Rate / Increase / archive-only — no
         // sketch state; preserve the legacy `Exact(_) → 8` mapping.
         _ => 8,
@@ -270,6 +270,7 @@ mod tests {
     fn op_quantile_yields_ddsketch_type_and_params() {
         use crate::types_v2::AccuracyTarget;
         let op = AggIntent::Quantile {
+            col: None,
             q: 0.5,
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
@@ -303,6 +304,7 @@ mod tests {
     fn memory_quantile() {
         use crate::types_v2::AccuracyTarget;
         let op = AggIntent::Quantile {
+            col: None,
             q: 0.5,
             accuracy: AccuracyTarget::Epsilon(0.01),
         };

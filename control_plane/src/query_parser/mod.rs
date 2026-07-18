@@ -324,7 +324,7 @@ impl QeCollector {
                     self.quantiles.push(*q);
                 }
             }
-            AggIntent::Min => {
+            AggIntent::Min { .. } => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }
@@ -332,7 +332,7 @@ impl QeCollector {
                     self.quantiles.push(0.0);
                 }
             }
-            AggIntent::Max => {
+            AggIntent::Max { .. } => {
                 if !self.agg_types.contains(&AggType::Quantile) {
                     self.agg_types.push(AggType::Quantile);
                 }

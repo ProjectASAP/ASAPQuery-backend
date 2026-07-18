@@ -325,6 +325,7 @@ mod tests {
         QueryExpr::Aggregate {
             by: vec![],
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],

@@ -823,6 +823,7 @@ mod tests {
         let expr = QueryExpr::Aggregate {
             by: vec![1], // service
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
@@ -860,7 +861,7 @@ mod tests {
             }),
             child: Box::new(QueryExpr::Aggregate {
                 by: vec![1],
-                aggs: vec![AggIntent::Max],
+                aggs: vec![AggIntent::Max { col: None }],
                 having: None,
                 child: Box::new(QueryExpr::Ref {
                     name: BindingName::new("w"),
@@ -906,7 +907,7 @@ mod tests {
     fn query_expr_aggregate_invalid_by_column() {
         let expr = QueryExpr::Aggregate {
             by: vec![99],
-            aggs: vec![AggIntent::Sum],
+            aggs: vec![AggIntent::Sum { col: None }],
             having: None,
             child: Box::new(ts_scan()),
         };
@@ -919,6 +920,7 @@ mod tests {
         let expr = QueryExpr::Aggregate {
             by: vec![1],
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
@@ -942,7 +944,7 @@ mod tests {
         // consumers can legally share this.
         let producer_with_uk = QueryExpr::Aggregate {
             by: vec![1],
-            aggs: vec![AggIntent::Sum],
+            aggs: vec![AggIntent::Sum { col: None }],
             having: None,
             child: Box::new(QueryExpr::Window {
                 kind: WindowKind::Sliding,

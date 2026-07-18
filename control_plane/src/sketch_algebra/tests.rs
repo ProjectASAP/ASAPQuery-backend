@@ -57,7 +57,11 @@ fn windowed_scan() -> QueryExpr {
 fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Quantile { q, accuracy }],
+        aggs: vec![AggIntent::Quantile {
+            col: None,
+            q,
+            accuracy,
+        }],
         having: None,
         child: Box::new(windowed_scan()),
     }
@@ -324,7 +328,11 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
     let bound = bind_query_expr(&agg_topk(10, acc.clone()), acc).unwrap();
     let (kind, ..) = topk_binding_family(&bound);
     let chosen = table.for_kind(&kind).per_flush();
-    assert_eq!(chosen, cms.min(cs), "must pick the cost-min family that meets the SLA");
+    assert_eq!(
+        chosen,
+        cms.min(cs),
+        "must pick the cost-min family that meets the SLA"
+    );
     assert_eq!(kind, SketchKind::Cms);
 }
 
@@ -333,6 +341,7 @@ fn bind_hll_cardinality_basic() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Cardinality {
+            col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
         having: None,
@@ -375,7 +384,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // exact-aggregation path can serve the intent.
     let expr = QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -462,6 +471,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
         aggs: vec![AggIntent::Quantile {
+            col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
@@ -497,7 +507,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
         by: vec![],
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -521,7 +531,7 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
         by: vec![1], // service column
-        aggs: vec![AggIntent::Sum],
+        aggs: vec![AggIntent::Sum { col: None }],
         having: None,
         child: Box::new(ts_scan()),
     };
@@ -843,7 +853,8 @@ fn phase_b_e2e_archive_only_e2e_binding() {
 fn phase_b_archive_only_intents_round_trip_through_binder() {
     let intents = vec![
         AggIntent::Absent,
-        AggIntent::Present,
+        AggIntent::AbsentOverTime,
+        AggIntent::PresentOverTime,
         AggIntent::Delta {
             window: Duration::from_secs(60),
         },
@@ -852,17 +863,14 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         },
         AggIntent::PredictLinear {
             window: Duration::from_secs(300),
-            ahead: Duration::from_secs(60),
+            seconds: 60.0,
         },
-        AggIntent::HoltWinters {
+        AggIntent::DoubleExpSmoothing {
             window: Duration::from_secs(300),
-            smoothing_factor: 0.3,
-            trend_factor: 0.3,
+            smoothing: 0.3,
+            trend: 0.3,
         },
-        AggIntent::Idelta {
-            window: Duration::from_secs(60),
-        },
-        AggIntent::Irate {
+        AggIntent::IDelta {
             window: Duration::from_secs(60),
         },
         AggIntent::Resets {
@@ -871,6 +879,10 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         AggIntent::Changes {
             window: Duration::from_secs(300),
         },
+        // Spot-check a couple of the Phase 1 IR merge's new archive-only
+        // intents through the same round-trip.
+        AggIntent::HistogramCount,
+        AggIntent::Group,
     ];
     for intent in intents {
         let expr = QueryExpr::Aggregate {

@@ -143,7 +143,8 @@ mod tests {
     fn binds_each_archive_only_intent() {
         let intents = vec![
             AggIntent::Absent,
-            AggIntent::Present,
+            AggIntent::AbsentOverTime,
+            AggIntent::PresentOverTime,
             AggIntent::Delta {
                 window: Duration::from_secs(60),
             },
@@ -152,17 +153,14 @@ mod tests {
             },
             AggIntent::PredictLinear {
                 window: Duration::from_secs(300),
-                ahead: Duration::from_secs(60),
+                seconds: 60.0,
             },
-            AggIntent::HoltWinters {
+            AggIntent::DoubleExpSmoothing {
                 window: Duration::from_secs(300),
-                smoothing_factor: 0.3,
-                trend_factor: 0.3,
+                smoothing: 0.3,
+                trend: 0.3,
             },
-            AggIntent::Idelta {
-                window: Duration::from_secs(60),
-            },
-            AggIntent::Irate {
+            AggIntent::IDelta {
                 window: Duration::from_secs(60),
             },
             AggIntent::Resets {
@@ -171,6 +169,8 @@ mod tests {
             AggIntent::Changes {
                 window: Duration::from_secs(300),
             },
+            AggIntent::HistogramCount,
+            AggIntent::Group,
         ];
         for intent in intents {
             let expr = agg_with(intent.clone());
@@ -187,12 +187,14 @@ mod tests {
         // Sum / Quantile / Cardinality / TopK are NOT archive-only — they
         // must NOT trigger BindArchiveOnly (the ASAP-tier rules own them).
         for intent in [
-            AggIntent::Sum,
+            AggIntent::Sum { col: None },
             AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
             AggIntent::Cardinality {
+                col: None,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
             AggIntent::TopK {

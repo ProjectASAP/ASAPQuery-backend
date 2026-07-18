@@ -217,6 +217,7 @@ mod tests {
         let q = QueryExpr::Aggregate {
             by: vec![1],
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
@@ -237,6 +238,7 @@ mod tests {
         let q1 = QueryExpr::Aggregate {
             by: vec![1],
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
@@ -246,6 +248,7 @@ mod tests {
         let q2 = QueryExpr::Aggregate {
             by: vec![1],
             aggs: vec![AggIntent::Quantile {
+                col: None,
                 q: 0.95,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
@@ -280,7 +283,7 @@ mod tests {
     fn dedupe_subtrees_no_shared_subexpr() {
         let q1 = QueryExpr::Aggregate {
             by: vec![],
-            aggs: vec![AggIntent::Sum],
+            aggs: vec![AggIntent::Sum { col: None }],
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -303,7 +306,7 @@ mod tests {
         };
         let q2 = QueryExpr::Aggregate {
             by: vec![],
-            aggs: vec![AggIntent::Max],
+            aggs: vec![AggIntent::Max { col: None }],
             having: None,
             child: Box::new(QueryExpr::Window {
                 kind: WindowKind::Sliding,

@@ -48,7 +48,7 @@ impl Rule for BindKllOnQuantile {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
             } if aggs.len() == 1 && by.is_empty() => match &aggs[0] {
-                AggIntent::Quantile { q, accuracy } => (*q, accuracy.clone(), child),
+                AggIntent::Quantile { q, accuracy, .. } => (*q, accuracy.clone(), child),
                 _ => return None,
             },
             _ => return None,

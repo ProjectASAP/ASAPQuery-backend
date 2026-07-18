@@ -483,7 +483,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
                 Some(Capability::QuantileApprox(SketchKindHandle::Any))
             }
         }
-        AggIntent::Cardinality { accuracy } => {
+        AggIntent::Cardinality { accuracy, .. } => {
             if is_exact(accuracy) {
                 None
             } else {
@@ -552,7 +552,9 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
         // out of the box. No dedicated extrema sketch is needed; route
         // these through the quantile-family handler.
-        AggIntent::Min | AggIntent::Max => Some(Capability::QuantileApprox(SketchKindHandle::Any)),
+        AggIntent::Min { .. } | AggIntent::Max { .. } => {
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        }
         // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
         // These intents previously returned `None` and routed to the
         // archive engine. Now that the data plane carries
@@ -561,28 +563,50 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         // state instead. `is_satisfied_by` checks `agg_type` equality
         // structurally — a sid registered as `ExactAgg(Sum)` only
         // satisfies a required `ExactAgg(Sum)`.
-        AggIntent::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
         AggIntent::Rate { .. } | AggIntent::Increase { .. } => {
             Some(Capability::ExactAgg(AggregationType::Increase))
         }
-        // ── Avg: still no ASAP-tier substitute ───────────────────────
+        // ── Avg / StdDev / Variance: still no ASAP-tier substitute ────
         // Avg = Sum / Count, which needs two separate ExactAgg policies
         // (one for Sum, one for Count) joined at query time. The L4
         // binder doesn't yet emit that pattern, so capability_for keeps
-        // Avg on the archive path for now. Follow-up.
-        AggIntent::Avg => None,
+        // these on the archive path for now. Follow-up.
+        AggIntent::Avg { .. } | AggIntent::StdDev { .. } | AggIntent::Variance { .. } => None,
         // Archive-only intents — never bind to a ASAP-tier capability;
-        // routed to the cold tier (Gorilla / Thanos).
+        // routed to the cold tier (Gorilla / Thanos). Includes every
+        // intent added by the Phase 1 IR merge (none has a `Bind*` rule
+        // yet) plus the pre-existing archive-only set. `Irate` is
+        // intentionally absent — folded into `Rate` above (see
+        // `agg_intent.rs` module docs).
         AggIntent::Absent
-        | AggIntent::Present
+        | AggIntent::AbsentOverTime
+        | AggIntent::PresentOverTime
         | AggIntent::Delta { .. }
         | AggIntent::Deriv { .. }
         | AggIntent::PredictLinear { .. }
-        | AggIntent::HoltWinters { .. }
-        | AggIntent::Idelta { .. }
-        | AggIntent::Irate { .. }
+        | AggIntent::DoubleExpSmoothing { .. }
+        | AggIntent::IDelta { .. }
         | AggIntent::Resets { .. }
-        | AggIntent::Changes { .. } => None,
+        | AggIntent::Changes { .. }
+        | AggIntent::HistogramCount
+        | AggIntent::HistogramSum
+        | AggIntent::HistogramAvg
+        | AggIntent::HistogramStdDev
+        | AggIntent::HistogramStdVar
+        | AggIntent::HistogramFraction { .. }
+        | AggIntent::HistogramQuantile { .. }
+        | AggIntent::Math(_)
+        | AggIntent::TimeFn(_)
+        | AggIntent::Group
+        | AggIntent::CountValues { .. }
+        | AggIntent::LastOverTime
+        | AggIntent::FirstOverTime
+        | AggIntent::MadOverTime
+        | AggIntent::TsOfMinOverTime
+        | AggIntent::TsOfMaxOverTime
+        | AggIntent::TsOfFirstOverTime
+        | AggIntent::TsOfLastOverTime => None,
     }
 }
 
@@ -838,6 +862,7 @@ mod tests {
     #[test]
     fn capability_for_quantile_returns_quantile_approx() {
         let intent = AggIntent::Quantile {
+            col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
@@ -850,6 +875,7 @@ mod tests {
     #[test]
     fn capability_for_quantile_exact_returns_none() {
         let intent = AggIntent::Quantile {
+            col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Exact,
         };
@@ -861,6 +887,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_epsilon_returns_cardinality_approx() {
         let intent = AggIntent::Cardinality {
+            col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
         assert_eq!(capability_for(&intent), Some(Capability::CardinalityApprox));
@@ -869,6 +896,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_epsilon_delta_returns_cardinality_approx() {
         let intent = AggIntent::Cardinality {
+            col: None,
             accuracy: AccuracyTarget::EpsilonDelta {
                 eps: 0.01,
                 delta: 0.001,
@@ -880,6 +908,7 @@ mod tests {
     #[test]
     fn capability_for_cardinality_with_exact_returns_none() {
         let intent = AggIntent::Cardinality {
+            col: None,
             accuracy: AccuracyTarget::Exact,
         };
         assert_eq!(capability_for(&intent), None);
@@ -913,7 +942,7 @@ mod tests {
         // PR-6 follow-up: Sum routes to ASAP-tier ExactAgg(Sum) state.
         // Pre-follow-up this returned `None`.
         assert_eq!(
-            capability_for(&AggIntent::Sum),
+            capability_for(&AggIntent::Sum { col: None }),
             Some(Capability::ExactAgg(AggregationType::Sum))
         );
     }
@@ -924,14 +953,14 @@ mod tests {
         // today (a sketch-bound `Avg` would fold onto `Quantile{q=0.5}`
         // only when the cost model allows the relaxation, which is a
         // follow-up).
-        assert_eq!(capability_for(&AggIntent::Avg), None);
+        assert_eq!(capability_for(&AggIntent::Avg { col: None }), None);
     }
 
     #[test]
     fn capability_for_min_returns_quantile_approx() {
         // Min = quantile(0); DDSketch / KLL answer it directly.
         assert_eq!(
-            capability_for(&AggIntent::Min),
+            capability_for(&AggIntent::Min { col: None }),
             Some(Capability::QuantileApprox(SketchKindHandle::Any))
         );
     }
@@ -940,7 +969,7 @@ mod tests {
     fn capability_for_max_returns_quantile_approx() {
         // Max = quantile(1); DDSketch / KLL answer it directly.
         assert_eq!(
-            capability_for(&AggIntent::Max),
+            capability_for(&AggIntent::Max { col: None }),
             Some(Capability::QuantileApprox(SketchKindHandle::Any))
         );
     }
@@ -1029,9 +1058,13 @@ mod tests {
 
     #[test]
     fn capability_for_archive_only_intents_return_none() {
-        // Spot-check each archive-only variant.
+        // Spot-check each archive-only variant, including a few added by
+        // the Phase 1 IR merge. `Irate` is intentionally absent — folded
+        // into `Rate` (see `agg_intent.rs` module docs); `rate`/`irate`
+        // now share `capability_for`'s `Rate` arm.
         assert_eq!(capability_for(&AggIntent::Absent), None);
-        assert_eq!(capability_for(&AggIntent::Present), None);
+        assert_eq!(capability_for(&AggIntent::AbsentOverTime), None);
+        assert_eq!(capability_for(&AggIntent::PresentOverTime), None);
         assert_eq!(
             capability_for(&AggIntent::Delta {
                 window: Duration::from_secs(60)
@@ -1039,17 +1072,13 @@ mod tests {
             None
         );
         assert_eq!(
-            capability_for(&AggIntent::Idelta {
+            capability_for(&AggIntent::IDelta {
                 window: Duration::from_secs(60)
             }),
             None
         );
-        assert_eq!(
-            capability_for(&AggIntent::Irate {
-                window: Duration::from_secs(60)
-            }),
-            None
-        );
+        assert_eq!(capability_for(&AggIntent::HistogramCount), None);
+        assert_eq!(capability_for(&AggIntent::Group), None);
     }
 
     // ── Capability::is_satisfied_by ──────────────────────────────────────
@@ -1238,7 +1267,7 @@ mod tests {
         // data plane has a real accumulator for: `Sum` (SumAccumulator)
         // and `Rate` / `Increase` (IncreaseAccumulator).
         assert_eq!(
-            capability_for(&AggIntent::Sum),
+            capability_for(&AggIntent::Sum { col: None }),
             Some(Capability::ExactAgg(AggregationType::Sum))
         );
         assert_eq!(
@@ -1262,7 +1291,7 @@ mod tests {
             }),
             None
         );
-        assert_eq!(capability_for(&AggIntent::Avg), None);
+        assert_eq!(capability_for(&AggIntent::Avg { col: None }), None);
     }
 
     #[test]

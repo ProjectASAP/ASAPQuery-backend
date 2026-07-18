@@ -36,7 +36,7 @@ impl Rule for BindHllOnCardinality {
             QueryExpr::Aggregate {
                 aggs, child, by, ..
             } if aggs.len() == 1 && by.is_empty() => match &aggs[0] {
-                AggIntent::Cardinality { accuracy } => (accuracy.clone(), child),
+                AggIntent::Cardinality { accuracy, .. } => (accuracy.clone(), child),
                 _ => return None,
             },
             _ => return None,

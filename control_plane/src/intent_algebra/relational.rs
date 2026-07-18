@@ -515,10 +515,10 @@ impl AggFunc {
             AggFunc::Count => Some(AggIntent::Count {
                 accuracy: AccuracyTarget::Exact,
             }),
-            AggFunc::Sum => Some(AggIntent::Sum),
-            AggFunc::Avg => Some(AggIntent::Avg),
-            AggFunc::Min => Some(AggIntent::Min),
-            AggFunc::Max => Some(AggIntent::Max),
+            AggFunc::Sum => Some(AggIntent::Sum { col: None }),
+            AggFunc::Avg => Some(AggIntent::Avg { col: None }),
+            AggFunc::Min => Some(AggIntent::Min { col: None }),
+            AggFunc::Max => Some(AggIntent::Max { col: None }),
             _ => None,
         }
     }
@@ -914,7 +914,7 @@ mod tests {
 
     #[test]
     fn agg_intent_avg_not_mergeable() {
-        assert!(!agg_is_mergeable(&AggIntent::Avg));
+        assert!(!agg_is_mergeable(&AggIntent::Avg { col: None }));
     }
 
     #[test]
@@ -936,9 +936,9 @@ mod tests {
 
     #[test]
     fn agg_intent_is_exact() {
-        assert!(agg_is_exact(&AggIntent::Sum));
-        assert!(agg_is_exact(&AggIntent::Min));
-        assert!(agg_is_exact(&AggIntent::Max));
+        assert!(agg_is_exact(&AggIntent::Sum { col: None }));
+        assert!(agg_is_exact(&AggIntent::Min { col: None }));
+        assert!(agg_is_exact(&AggIntent::Max { col: None }));
         assert!(!agg_is_exact(&default_cardinality()));
     }
 }

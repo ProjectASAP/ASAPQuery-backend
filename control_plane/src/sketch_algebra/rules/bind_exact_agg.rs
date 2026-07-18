@@ -90,7 +90,7 @@ impl Rule for BindExactAgg {
         // the query can fan results out over the surviving labels.
         // Unkeyed aggregations stay on the single-pop variant.
         let agg_type = match intent {
-            AggIntent::Sum => {
+            AggIntent::Sum { .. } => {
                 if keyed {
                     AggregationType::MultipleSum
                 } else {
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn binds_sum_to_exact_agg_sum() {
-        check_binds(AggIntent::Sum, AggregationType::Sum);
+        check_binds(AggIntent::Sum { col: None }, AggregationType::Sum);
     }
 
     #[test]
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn does_not_bind_avg() {
-        let expr = agg_over(AggIntent::Avg, "test_metric");
+        let expr = agg_over(AggIntent::Avg { col: None }, "test_metric");
         assert!(BindExactAgg.apply(&expr, &AccuracyTarget::Exact).is_none());
     }
 
@@ -225,6 +225,7 @@ mod tests {
     fn does_not_bind_quantile() {
         let expr = agg_over(
             AggIntent::Quantile {
+                col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn keyed_sum_binds_to_multiple_sum() {
-        check_keyed_binds(AggIntent::Sum, AggregationType::MultipleSum);
+        check_keyed_binds(AggIntent::Sum { col: None }, AggregationType::MultipleSum);
     }
 
     #[test]
@@ -296,7 +297,7 @@ mod tests {
     fn unkeyed_sum_still_binds_to_single_pop_sum() {
         // Regression guard: the keyed/unkeyed branch must still
         // dispatch correctly on `by.is_empty()`.
-        check_binds(AggIntent::Sum, AggregationType::Sum);
+        check_binds(AggIntent::Sum { col: None }, AggregationType::Sum);
     }
 
     #[test]

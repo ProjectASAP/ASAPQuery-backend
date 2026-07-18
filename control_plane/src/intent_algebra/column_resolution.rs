@@ -236,7 +236,7 @@ pub fn resolve_named_keys(keys: &[String], schema: &Schema) -> Result<Vec<Column
 /// let by: Vec<usize> = vec![];
 /// let aggs = vec![
 ///     AggIntent::Count { accuracy: types_v2::AccuracyTarget::Exact },
-///     AggIntent::Sum,
+///     AggIntent::Sum { col: None },
 /// ];
 /// let output = output_schema_for_aggregate(&input, &by, &aggs);
 /// assert_eq!(output.columns.len(), 2);          // count + sum
@@ -410,7 +410,7 @@ mod tests {
         });
         // Group by host, region (positions 2 and 3).
         let by = vec![2usize, 3usize];
-        let aggs = vec![AggIntent::Sum];
+        let aggs = vec![AggIntent::Sum { col: None }];
         let out = output_schema_for_aggregate(&input, &by, &aggs);
         // Output columns: host, region, sum.
         assert_eq!(out.columns.len(), 3);
@@ -425,7 +425,7 @@ mod tests {
     fn output_schema_for_aggregate_drops_out_of_range_by_ids() {
         let input = infer_source_schema("m");
         // schema only has columns 0..=1; ask for by=[5] which is out of range.
-        let aggs = vec![AggIntent::Sum];
+        let aggs = vec![AggIntent::Sum { col: None }];
         let out = output_schema_for_aggregate(&input, &[5usize], &aggs);
         // The out-of-range by id is silently dropped; output has only the agg.
         assert_eq!(out.columns.len(), 1);
