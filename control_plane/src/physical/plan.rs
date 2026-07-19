@@ -286,7 +286,7 @@ mod tests {
             source: Source::TimeSeries {
                 metric: name.into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::default(),
         }
     }

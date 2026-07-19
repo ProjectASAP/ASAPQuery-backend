@@ -204,14 +204,13 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
         source: Source::TimeSeries {
             metric: w.metric_name.clone(),
         },
-        label_filters: w
-            .label_filters
-            .iter()
-            .map(|(k, v)| crate::intent_algebra::LabelFilter {
-                label: k.clone(),
-                equals: v.clone(),
-            })
-            .collect(),
+        // This synthetic scan only exists to drive `Bind*` rule dispatch
+        // against a representative `Aggregate` shape — the rules key off
+        // the `AggIntent`/accuracy/window, not the scan's predicates, and
+        // `w.label_filters`' labels aren't columns in the synthetic
+        // `(ts, value)` schema below anyway (`label_filter_to_predicate`
+        // would resolve every one of them to `None`).
+        predicates: Vec::new(),
         schema: Schema::with_time_index(
             vec![
                 Column {
@@ -238,8 +237,9 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
         child: Box::new(scan),
     };
     let aggregate = QueryExpr::Aggregate {
-        by: vec![],
+        by: crate::intent_algebra::GroupKeys::none(),
         aggs: vec![intent],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed),
     };

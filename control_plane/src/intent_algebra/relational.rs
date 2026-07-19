@@ -27,6 +27,7 @@
 
 use std::time::Duration;
 
+use crate::intent_algebra::query_expr::{ArithOp, CompareOp};
 use crate::types_v2::AccuracyTarget;
 
 // ── AggIntent harmonization ──────────────────────────────────────────────────
@@ -653,14 +654,14 @@ fn scalar_from_predicate(p: &Predicate) -> ScalarExpr {
         FilterVal::Null => ScalarExpr::Literal(LiteralValue::Null),
     };
     match &p.op {
-        FilterOp::Eq => bin(BinaryOpKind::Eq, col, val),
-        FilterOp::Ne => bin(BinaryOpKind::Ne, col, val),
-        FilterOp::Lt => bin(BinaryOpKind::Lt, col, val),
-        FilterOp::Le => bin(BinaryOpKind::Le, col, val),
-        FilterOp::Gt => bin(BinaryOpKind::Gt, col, val),
-        FilterOp::Ge => bin(BinaryOpKind::Ge, col, val),
-        FilterOp::Like => bin(BinaryOpKind::Like, col, val),
-        FilterOp::NotLike => bin(BinaryOpKind::NotLike, col, val),
+        FilterOp::Eq => bin(BinaryOpKind::Compare(CompareOp::Eq), col, val),
+        FilterOp::Ne => bin(BinaryOpKind::Compare(CompareOp::Ne), col, val),
+        FilterOp::Lt => bin(BinaryOpKind::Compare(CompareOp::Lt), col, val),
+        FilterOp::Le => bin(BinaryOpKind::Compare(CompareOp::Le), col, val),
+        FilterOp::Gt => bin(BinaryOpKind::Compare(CompareOp::Gt), col, val),
+        FilterOp::Ge => bin(BinaryOpKind::Compare(CompareOp::Ge), col, val),
+        FilterOp::Like => bin(BinaryOpKind::Compare(CompareOp::Like), col, val),
+        FilterOp::NotLike => bin(BinaryOpKind::Compare(CompareOp::NotLike), col, val),
         FilterOp::IsNull => ScalarExpr::IsNull {
             expr: Box::new(col),
             negated: false,
@@ -670,12 +671,12 @@ fn scalar_from_predicate(p: &Predicate) -> ScalarExpr {
             negated: true,
         },
         FilterOp::Regex(r) => bin(
-            BinaryOpKind::Regex,
+            BinaryOpKind::Compare(CompareOp::Regex),
             col,
             ScalarExpr::Literal(LiteralValue::Str(r.clone())),
         ),
         FilterOp::NotRegex(r) => bin(
-            BinaryOpKind::NotRegex,
+            BinaryOpKind::Compare(CompareOp::NotRegex),
             col,
             ScalarExpr::Literal(LiteralValue::Str(r.clone())),
         ),
@@ -834,10 +835,10 @@ mod tests {
 
     #[test]
     fn binary_op_kind_display() {
-        assert_eq!(BinaryOpKind::Add.to_string(), "+");
+        assert_eq!(BinaryOpKind::Arith(ArithOp::Add).to_string(), "+");
         assert_eq!(BinaryOpKind::And.to_string(), "AND");
-        assert_eq!(BinaryOpKind::Regex.to_string(), "=~");
-        assert_eq!(BinaryOpKind::NotRegex.to_string(), "!~");
+        assert_eq!(BinaryOpKind::Compare(CompareOp::Regex).to_string(), "=~");
+        assert_eq!(BinaryOpKind::Compare(CompareOp::NotRegex).to_string(), "!~");
         assert_eq!(BinaryOpKind::Unless.to_string(), "unless");
     }
 

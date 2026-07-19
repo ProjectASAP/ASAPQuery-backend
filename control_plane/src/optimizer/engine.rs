@@ -9,17 +9,17 @@
 //!
 //! | Rule | Name | Description |
 //! |------|------|-------------|
-//! | R1 | `PredicatePushDown`     | Push `Filter` below `Window`, `Partition`, `Sort` |
+//! | R1 | `PredicatePushDown`     | Push `Filter` below `Window`, `Sort` |
 //! | R2 | `MergeLifting`          | Lift a mergeable single-intent `Aggregate` above `Merge` |
 //! | R3 | `HLLDedupElim`          | Eliminate `Distinct` before a cardinality `Aggregate` |
 //! | R4 | `FilterWindowSwap`      | Swap `Filter` below `Window` to reduce window input size |
 //! | R5 | `TopKFusion`            | Fuse `Limit(Sort DESC)` into a `TopK`-intent `Aggregate` |
 //! | R6 | _(retired)_             | `HistogramQuantileFusion` retired in Step γ5 |
-//! | R7 | `SubqueryDecorrelation` | Hoist a `ScalarSubquery` predicate to a `LetBinding` |
+//! | R7 | _(retired)_             | `SubqueryDecorrelation` retired in the `asap_ir` merge — see `intent_algebra::lower` module docs |
 //! | R8 | `CommonSubexprElim`     | Extract identical `Scan` sub-trees into `LetBinding`s |
 //! | R9 | `HydraConversion`       | (disabled — Step γ TODO; see struct docs) |
 //! | R10| `WindowMerge`           | Merge adjacent identical `Window` nodes |
-//! | R11| `PartitionElim`         | Remove `Partition` with empty key list |
+//! | R11| _(retired)_             | `PartitionElim` retired — `Partition` no longer exists in the canonical IR; its keys fold into `Aggregate.by` at construction time |
 //! | R12| `SetOpFusion`           | Fuse `SetOp(Union, Merge, Merge)` into a single `Merge` |
 //!
 //! Step γ7: the optimizer consumes and produces the canonical
@@ -30,13 +30,15 @@
 
 use std::collections::HashMap;
 
+use asap_ir::intent_algebra::BindingName;
+
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{ColumnRef, Predicate, QueryExpr, SetOpKind, Source};
+use crate::intent_algebra::query_expr::{GroupKeys, QueryExpr, SetOpKind, Source};
 use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::optimizer::cost::sketch_capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
 };
-use crate::types_v2::{AccuracyTarget, BindingName};
+use crate::types_v2::AccuracyTarget;
 
 // ── Cost model interface ──────────────────────────────────────────────────────
 
@@ -223,7 +225,6 @@ impl CostModel for DefaultCostModel {
             }
             QueryExpr::Merge { children } => 1.0 / (children.len().max(1) as f64),
             QueryExpr::Filter { .. } => 0.5,
-            QueryExpr::Partition { .. } => 0.8, // partition adds overhead
             QueryExpr::Distinct { .. } => 0.9,
             _ => 1.0,
         };
@@ -262,9 +263,7 @@ impl CostModel for DefaultCostModel {
                 }
                 // Multi-intent / HAVING aggregate → exact original DB.
                 QueryExpr::Aggregate { .. } => &dc.original_db,
-                QueryExpr::Partition { .. }
-                | QueryExpr::Merge { .. }
-                | QueryExpr::Distinct { .. } => &dc.backend_collector,
+                QueryExpr::Merge { .. } | QueryExpr::Distinct { .. } => &dc.backend_collector,
                 QueryExpr::BinaryOp { .. } | QueryExpr::Subquery { .. } => &dc.backend_db,
                 _ => &dc.agent,
             };
@@ -330,8 +329,12 @@ pub trait RewriteRule: Send + Sync {
 /// Push `Filter` nodes as deep as possible — reduces data volume early.
 ///
 /// * `Filter(p, Window(…, e))`    → `Window(…, Filter(p, e))`
-/// * `Filter(p, Partition(k, e))` → `Partition(k, Filter(p, e))`
 /// * `Filter(p, Sort(k, e))`      → `Sort(k, Filter(p, e))`
+///
+/// No `Partition` case: folded into `Aggregate.by` at construction time
+/// (`intent_algebra::lower`), so `Filter` never wraps a bare grouping
+/// marker anymore — pushing a `Filter` below an `Aggregate` would change
+/// which rows get aggregated, so that's not a safe pushdown.
 pub struct PredicatePushDown;
 
 impl RewriteRule for PredicatePushDown {
@@ -354,14 +357,14 @@ impl RewriteRule for PredicatePushDown {
                     slide,
                     child: Box::new(QueryExpr::Filter { pred, child: inner }),
                 }),
-                // Filter below Partition
-                QueryExpr::Partition { keys, child: inner } => Some(QueryExpr::Partition {
-                    keys,
-                    child: Box::new(QueryExpr::Filter { pred, child: inner }),
-                }),
                 // Filter below Sort (safe when pred references input columns only)
-                QueryExpr::Sort { keys, child: inner } => Some(QueryExpr::Sort {
+                QueryExpr::Sort {
                     keys,
+                    partition_by,
+                    child: inner,
+                } => Some(QueryExpr::Sort {
+                    keys,
+                    partition_by,
                     child: Box::new(QueryExpr::Filter { pred, child: inner }),
                 }),
                 // Not applicable — reconstruct
@@ -397,6 +400,7 @@ impl RewriteRule for MergeLifting {
                 ref aggs,
                 ref having,
                 ref child,
+                ..
             } if aggs.len() == 1 && having.is_none() && agg_is_mergeable(&aggs[0]) => {
                 if let QueryExpr::Merge { children } = child.as_ref() {
                     let new_children: Vec<QueryExpr> = children
@@ -404,6 +408,7 @@ impl RewriteRule for MergeLifting {
                         .map(|branch| QueryExpr::Aggregate {
                             by: by.clone(),
                             aggs: aggs.clone(),
+                            output_names: Vec::new(),
                             having: None,
                             child: Box::new(branch.clone()),
                         })
@@ -437,6 +442,7 @@ impl RewriteRule for HLLDedupElim {
             QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having: None,
                 child,
             } if aggs.len() == 1 && matches!(&aggs[0], AggIntent::Cardinality { .. }) => {
@@ -444,6 +450,7 @@ impl RewriteRule for HLLDedupElim {
                     return Some(QueryExpr::Aggregate {
                         by,
                         aggs,
+                        output_names,
                         having: None,
                         child: inner,
                     });
@@ -509,15 +516,19 @@ impl RewriteRule for TopKFusion {
                 offset: 0,
                 child,
             } => {
-                if let QueryExpr::Sort { keys, child: inner } = *child {
+                if let QueryExpr::Sort {
+                    keys, child: inner, ..
+                } = *child
+                {
                     // Only fuse when all keys are DESC (top-k semantics).
-                    if !keys.is_empty() && keys.iter().all(|k| k.desc) {
+                    if !keys.is_empty() && keys.iter().all(|k| !k.ascending) {
                         return Some(QueryExpr::Aggregate {
-                            by: vec![],
+                            by: GroupKeys::none(),
                             aggs: vec![AggIntent::TopK {
                                 k: n,
                                 accuracy: AccuracyTarget::Epsilon(0.05),
                             }],
+                            output_names: Vec::new(),
                             having: None,
                             child: inner,
                         });
@@ -537,70 +548,13 @@ impl RewriteRule for TopKFusion {
 // `Aggregate{Quantile(φ)}`. The fusion rule that used to merge a
 // `HistogramQuantile` wrapper with an inner DDSketch is no longer needed.
 
-// ── R7: SubqueryDecorrelation ─────────────────────────────────────────────────
-
-/// Hoist a `ScalarSubquery` predicate into a `LetBinding` so the subquery
-/// is evaluated once rather than once per row.
-///
-/// Handles the simple case: a `Filter` whose `Predicate::BinaryOp` has a
-/// `ScalarSubquery` on one side.
-pub struct SubqueryDecorrelation;
-
-impl RewriteRule for SubqueryDecorrelation {
-    fn name(&self) -> &'static str {
-        "SubqueryDecorrelation"
-    }
-
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
-        match expr {
-            QueryExpr::Filter { pred, child } => {
-                if let Some((name, sq_expr, new_pred)) = extract_scalar_subquery(pred) {
-                    return Some(QueryExpr::LetBinding {
-                        name: BindingName::new(name),
-                        expr: Box::new(sq_expr),
-                        child: Box::new(QueryExpr::Filter {
-                            pred: new_pred,
-                            child,
-                        }),
-                    });
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-}
-
-/// If `pred` contains a `ScalarSubquery`, extract it as
-/// `(binding_name, subquery_expr, pred_with_ref)`.
-fn extract_scalar_subquery(pred: Predicate) -> Option<(String, QueryExpr, Predicate)> {
-    match pred {
-        Predicate::BinaryOp { op, lhs, rhs } => {
-            // Check lhs
-            if let Predicate::ScalarSubquery(sq) = *lhs {
-                let name = "__subq_0".to_string();
-                let new_pred = Predicate::BinaryOp {
-                    op,
-                    lhs: Box::new(Predicate::Column(ColumnRef::Named(name.clone()))),
-                    rhs,
-                };
-                return Some((name, *sq, new_pred));
-            }
-            // Check rhs
-            if let Predicate::ScalarSubquery(sq) = *rhs {
-                let name = "__subq_0".to_string();
-                let new_pred = Predicate::BinaryOp {
-                    op,
-                    lhs,
-                    rhs: Box::new(Predicate::Column(ColumnRef::Named(name.clone()))),
-                };
-                return Some((name, *sq, new_pred));
-            }
-            None
-        }
-        _ => None,
-    }
-}
+// R7 (retired): `SubqueryDecorrelation` used to hoist a `ScalarSubquery`
+// predicate into a `LetBinding`, pattern-matching the old `Predicate`
+// enum's `BinaryOp` / `ScalarSubquery` / `Column(ColumnRef::Named(_))`
+// variants directly. The canonical `Predicate(L3Expr)` merge (see
+// `intent_algebra::lower` module docs) rejects `ScalarSubquery` at
+// construction time instead of lowering it, so this rule has no
+// construction site left to fire against — deleted rather than ported.
 
 // ── R8: CommonSubexprElim ─────────────────────────────────────────────────────
 
@@ -739,26 +693,11 @@ impl RewriteRule for WindowMerge {
     }
 }
 
-// ── R11: PartitionElim ────────────────────────────────────────────────────────
-
-/// Remove `Partition` with an empty key list — equivalent to a global
-/// aggregation with no GROUP BY.
-///
-/// `Partition([], e)` → `e`
-pub struct PartitionElim;
-
-impl RewriteRule for PartitionElim {
-    fn name(&self) -> &'static str {
-        "PartitionElim"
-    }
-
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
-        match expr {
-            QueryExpr::Partition { keys, child } if keys.is_empty() => Some(*child),
-            _ => None,
-        }
-    }
-}
+// R11 (retired): `PartitionElim` removed a `Partition` node with an empty
+// key list. `Partition` no longer exists in the canonical IR — its keys
+// fold into `Aggregate.by: GroupKeys` at construction time
+// (`intent_algebra::lower`), so an empty-keys `Partition` never gets
+// built in the first place; nothing left for this rule to eliminate.
 
 // ── R12: SetOpFusion ──────────────────────────────────────────────────────────
 
@@ -906,11 +845,16 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Project { cols, child } => {
+            QueryExpr::Project {
+                cols,
+                qualifier,
+                child,
+            } => {
                 let (new_child, c) = recurse!(child);
                 (
                     QueryExpr::Project {
                         cols,
+                        qualifier,
                         child: new_child,
                     },
                     c,
@@ -919,6 +863,7 @@ impl QueryOptimizer {
             QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child,
             } => {
@@ -927,6 +872,7 @@ impl QueryOptimizer {
                     QueryExpr::Aggregate {
                         by,
                         aggs,
+                        output_names,
                         having,
                         child: new_child,
                     },
@@ -950,16 +896,6 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Partition { keys, child } => {
-                let (new_child, c) = recurse!(child);
-                (
-                    QueryExpr::Partition {
-                        keys,
-                        child: new_child,
-                    },
-                    c,
-                )
-            }
             QueryExpr::Distinct { cols, child } => {
                 let (new_child, c) = recurse!(child);
                 (
@@ -970,11 +906,16 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Sort { keys, child } => {
+            QueryExpr::Sort {
+                keys,
+                partition_by,
+                child,
+            } => {
                 let (new_child, c) = recurse!(child);
                 (
                     QueryExpr::Sort {
                         keys,
+                        partition_by,
                         child: new_child,
                     },
                     c,
@@ -1082,6 +1023,18 @@ impl QueryOptimizer {
                     ce || cb,
                 )
             }
+            // `asap_ir`'s `QueryExpr` superset (Scalar / EvalTime /
+            // VectorFromScalar / ScalarFromVector / Relabel / InfoJoin /
+            // Sample / TimeRange / TimeShift / WindowFunc) — PromQL
+            // surface no rule here targets yet. Treated as opaque leaves:
+            // returned unchanged rather than recursed into, so a rewrite
+            // opportunity nested inside one of these is missed rather
+            // than mishandled. Not a correctness issue (the optimizer is
+            // a pure best-effort rewrite pass — leaving a subtree
+            // unrewritten is always semantically safe), just a
+            // known coverage gap to close when a rule needs to see
+            // inside them.
+            other => (other, false),
         }
     }
 }
@@ -1093,13 +1046,13 @@ fn default_rules() -> Vec<Box<dyn RewriteRule>> {
         Box::new(FilterWindowSwap),
         Box::new(HLLDedupElim),
         Box::new(WindowMerge),
-        Box::new(PartitionElim),
         Box::new(TopKFusion),
         // R6 (HistogramQuantileFusion) retired in Step γ5.
         Box::new(MergeLifting),
         Box::new(SetOpFusion),
         Box::new(HydraConversion),
-        Box::new(SubqueryDecorrelation),
+        // R7 (SubqueryDecorrelation) and R11 (PartitionElim) retired — see
+        // the doc-table notes above.
         Box::new(CommonSubexprElim),
     ]
 }
@@ -1114,13 +1067,13 @@ pub fn default_rules_as_optimizer_rules() -> Vec<Box<dyn crate::optimizer::trait
         Box::new(FilterWindowSwap),
         Box::new(HLLDedupElim),
         Box::new(WindowMerge),
-        Box::new(PartitionElim),
         Box::new(TopKFusion),
         // R6 (HistogramQuantileFusion) retired in Step γ5.
         Box::new(MergeLifting),
         Box::new(SetOpFusion),
         Box::new(HydraConversion),
-        Box::new(SubqueryDecorrelation),
+        // R7 (SubqueryDecorrelation) and R11 (PartitionElim) retired — see
+        // the doc-table notes above.
         Box::new(CommonSubexprElim),
     ]
 }
@@ -1166,14 +1119,6 @@ impl OptimizerRule for WindowMerge {
         RuleCategory::Fusion
     }
 }
-impl OptimizerRule for PartitionElim {
-    fn name(&self) -> &'static str {
-        <Self as RewriteRule>::name(self)
-    }
-    fn category(&self) -> RuleCategory {
-        RuleCategory::Elim
-    }
-}
 impl OptimizerRule for TopKFusion {
     fn name(&self) -> &'static str {
         <Self as RewriteRule>::name(self)
@@ -1206,14 +1151,6 @@ impl OptimizerRule for HydraConversion {
         RuleCategory::Fusion
     }
 }
-impl OptimizerRule for SubqueryDecorrelation {
-    fn name(&self) -> &'static str {
-        <Self as RewriteRule>::name(self)
-    }
-    fn category(&self) -> RuleCategory {
-        RuleCategory::Decorrelate
-    }
-}
 impl OptimizerRule for CommonSubexprElim {
     fn name(&self) -> &'static str {
         <Self as RewriteRule>::name(self)
@@ -1228,9 +1165,10 @@ impl OptimizerRule for CommonSubexprElim {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intent_algebra::query_expr::Predicate;
     use crate::intent_algebra::relational::{default_cardinality, default_quantile};
     use crate::intent_algebra::{
-        BinaryOpKind, LiteralValue, PartitionKeys, Schema, SortKey, Source, WindowKind,
+        BinaryOpKind, L3Expr, L3Scalar, Schema, SortKey, Source, WindowKind,
     };
     use std::time::Duration;
 
@@ -1240,7 +1178,7 @@ mod tests {
             source: Source::TimeSeries {
                 metric: name.into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::default(),
         }
     }
@@ -1249,15 +1187,16 @@ mod tests {
     /// the legacy `SketchAgg`.
     fn sketch_agg(intent: AggIntent, child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: GroupKeys::none(),
             aggs: vec![intent],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(child),
         }
     }
 
     fn true_pred() -> Predicate {
-        Predicate::Literal(LiteralValue::Bool(true))
+        Predicate(L3Expr::Literal(L3Scalar::Boolean(true)))
     }
 
     fn opt() -> QueryOptimizer {
@@ -1265,15 +1204,18 @@ mod tests {
     }
 
     /// Recursively check whether the tree contains any `Distinct` node.
+    /// Only walks the variants these tests actually build (`Scan`/`Ref`,
+    /// `Filter`/`Project`/`Aggregate`/`Window`/`Sort`/`Limit`/`Subquery`,
+    /// `Merge`, `Join`/`SetOp`/`BinaryOp`, `LetBinding`, `Distinct`) — the
+    /// PromQL-only leaves (`Scalar`, `EvalTime`, `Relabel`, …) never appear
+    /// in a tree these helpers construct.
     fn contains_distinct(qe: &QueryExpr) -> bool {
         match qe {
             QueryExpr::Distinct { .. } => true,
-            QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => false,
             QueryExpr::Filter { child, .. }
             | QueryExpr::Project { child, .. }
             | QueryExpr::Aggregate { child, .. }
             | QueryExpr::Window { child, .. }
-            | QueryExpr::Partition { child, .. }
             | QueryExpr::Sort { child, .. }
             | QueryExpr::Limit { child, .. }
             | QueryExpr::Subquery { child, .. } => contains_distinct(child),
@@ -1288,6 +1230,7 @@ mod tests {
             QueryExpr::LetBinding { expr, child, .. } => {
                 contains_distinct(expr) || contains_distinct(child)
             }
+            _ => false,
         }
     }
 
@@ -1313,16 +1256,21 @@ mod tests {
     }
 
     #[test]
-    fn r1_pushes_filter_below_partition() {
+    fn r1_pushes_filter_below_sort() {
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::Partition {
-                keys: PartitionKeys::By(vec!["host".into()]),
+            child: Box::new(QueryExpr::Sort {
+                keys: vec![SortKey {
+                    expr: L3Expr::Column(0),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                partition_by: GroupKeys::none(),
                 child: Box::new(scan("cpu")),
             }),
         };
         let (result, _) = opt().optimize(expr);
-        assert!(matches!(&result, QueryExpr::Partition { child, .. }
+        assert!(matches!(&result, QueryExpr::Sort { child, .. }
             if matches!(child.as_ref(), QueryExpr::Filter { .. })));
     }
 
@@ -1333,7 +1281,7 @@ mod tests {
         let expr = sketch_agg(
             default_cardinality(),
             QueryExpr::Distinct {
-                cols: vec![ColumnRef::Named("user_id".into())],
+                cols: vec![0],
                 child: Box::new(scan("events")),
             },
         );
@@ -1353,10 +1301,11 @@ mod tests {
             offset: 0,
             child: Box::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    col: "count".into(),
-                    desc: true,
-                    nulls_first: None,
+                    expr: L3Expr::Column(0),
+                    ascending: false,
+                    nulls_first: false,
                 }],
+                partition_by: GroupKeys::none(),
                 child: Box::new(scan("events")),
             }),
         };
@@ -1375,10 +1324,11 @@ mod tests {
             offset: 0,
             child: Box::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    col: "ts".into(),
-                    desc: false,
-                    nulls_first: None,
+                    expr: L3Expr::Column(0),
+                    ascending: true,
+                    nulls_first: false,
                 }],
+                partition_by: GroupKeys::none(),
                 child: Box::new(scan("events")),
             }),
         };
@@ -1413,21 +1363,6 @@ mod tests {
         );
     }
 
-    // ── R11: PartitionElim ────────────────────────────────────────────────────
-
-    #[test]
-    fn r11_removes_empty_partition() {
-        let expr = QueryExpr::Partition {
-            keys: PartitionKeys::By(vec![]),
-            child: Box::new(scan("m")),
-        };
-        let (result, _) = opt().optimize(expr);
-        assert!(
-            matches!(&result, QueryExpr::Scan { .. }),
-            "empty Partition should be eliminated: {result:?}"
-        );
-    }
-
     // ── Fixed-point convergence ───────────────────────────────────────────────
 
     #[test]
@@ -1451,7 +1386,7 @@ mod tests {
                 child: Box::new(sketch_agg(
                     default_cardinality(),
                     QueryExpr::Distinct {
-                        cols: vec![ColumnRef::Named("uid".into())],
+                        cols: vec![0],
                         child: Box::new(scan("events")),
                     },
                 )),

@@ -23,9 +23,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{
-    BinaryOpKind, ColumnRef, LiteralValue, Predicate, QueryExpr, Source,
-};
+use crate::intent_algebra::query_expr::{Predicate, QueryExpr, Source};
+use crate::intent_algebra::{CompareOp, L3Expr, L3Scalar};
 use crate::types::AggType;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
@@ -167,7 +166,6 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Window { child, .. }
         | QueryExpr::Aggregate { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Project { child, .. }
         | QueryExpr::Sort { child, .. }
@@ -184,7 +182,11 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
         QueryExpr::LetBinding { expr, child, .. } => {
             root_scan_schema(expr).or_else(|| root_scan_schema(child))
         }
-        QueryExpr::Ref { .. } => None,
+        // `Ref` has no reachable `Scan` without a `LetBinding` scope, and
+        // the PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
+        // WindowFunc) isn't constructed by this parser today.
+        _ => None,
     }
 }
 
@@ -208,8 +210,8 @@ impl QeCollector {
         match expr {
             QueryExpr::Scan {
                 source,
-                label_filters,
-                ..
+                predicates,
+                schema: scan_schema,
             } => {
                 if self.metric_name.is_none() {
                     self.metric_name = Some(match source {
@@ -217,29 +219,25 @@ impl QeCollector {
                         Source::Table { table_ref } => table_ref.clone(),
                     });
                 }
-                // Canonical `Scan` carries equality label filters inline.
-                for lf in label_filters {
-                    self.label_filters
-                        .entry(lf.label.clone())
-                        .or_insert_with(|| lf.equals.clone());
+                // Canonical `Scan.predicates` carries equality label
+                // filters as typed `Predicate(L3Expr::Compare{Column, Eq,
+                // Literal(Utf8)})` trees (the shape
+                // `query_expr::label_filter_to_predicate` builds) — resolve
+                // each `Column` id back to its name via the Scan's own
+                // schema to recover the flat name/value map this legacy
+                // `ParsedQuery` output still wants.
+                for p in predicates {
+                    collect_filters_from_expr(&p.0, Some(scan_schema), &mut self.label_filters);
                 }
             }
             QueryExpr::Filter { pred, child } => {
                 // Extract equality label filters from the predicate tree.
-                collect_filters_from_scalar(pred, &mut self.label_filters);
+                collect_filters_from_scalar(pred, schema, &mut self.label_filters);
                 self.visit(child, schema);
             }
             QueryExpr::Window { size, child, .. } => {
                 if self.time_window.is_none() {
                     self.time_window = Some(*size);
-                }
-                self.visit(child, schema);
-            }
-            QueryExpr::Partition { keys, child } => {
-                for k in keys.keys() {
-                    if !self.group_by_labels.contains(k) {
-                        self.group_by_labels.push(k.clone());
-                    }
                 }
                 self.visit(child, schema);
             }
@@ -294,7 +292,13 @@ impl QeCollector {
                 self.visit(expr, schema);
                 self.visit(child, schema);
             }
+            // `Ref` has no reachable `Scan` without a `LetBinding` scope
+            // to resolve it against, and the PromQL-surface superset
+            // (Scalar/EvalTime/VectorFromScalar/ScalarFromVector/Relabel/
+            // InfoJoin/Sample/TimeRange/TimeShift/WindowFunc) isn't
+            // constructed by this parser today.
             QueryExpr::Ref { .. } => {}
+            _ => {}
         }
     }
 
@@ -374,28 +378,41 @@ impl QeCollector {
     }
 }
 
-fn collect_filters_from_scalar(pred: &Predicate, out: &mut HashMap<String, String>) {
-    match pred {
-        Predicate::BinaryOp {
-            op: BinaryOpKind::Eq,
-            lhs,
-            rhs,
+fn collect_filters_from_scalar(
+    pred: &Predicate,
+    schema: Option<&crate::intent_algebra::Schema>,
+    out: &mut HashMap<String, String>,
+) {
+    collect_filters_from_expr(&pred.0, schema, out);
+}
+
+/// Recover a flat name/value equality map from a canonical `L3Expr`
+/// predicate tree — `Column(id) == Literal(Utf8(v))` conjuncts, `id`
+/// resolved back to a name via `schema` (positional `Column` carries no
+/// name of its own, unlike the pre-merge name-based `Predicate::Column`).
+fn collect_filters_from_expr(
+    expr: &L3Expr,
+    schema: Option<&crate::intent_algebra::Schema>,
+    out: &mut HashMap<String, String>,
+) {
+    match expr {
+        L3Expr::Compare {
+            left,
+            op: CompareOp::Eq,
+            right,
         } => {
-            if let (
-                Predicate::Column(ColumnRef::Named(col)),
-                Predicate::Literal(LiteralValue::Str(v)),
-            ) = (lhs.as_ref(), rhs.as_ref())
+            if let (L3Expr::Column(id), L3Expr::Literal(L3Scalar::Utf8(v))) =
+                (left.as_ref(), right.as_ref())
             {
-                out.insert(col.clone(), v.clone());
+                if let Some(col) = schema.and_then(|s| s.columns.get(*id)) {
+                    out.entry(col.name.clone()).or_insert_with(|| v.clone());
+                }
             }
         }
-        Predicate::BinaryOp {
-            op: BinaryOpKind::And,
-            lhs,
-            rhs,
-        } => {
-            collect_filters_from_scalar(lhs, out);
-            collect_filters_from_scalar(rhs, out);
+        L3Expr::BoolAnd(parts) => {
+            for p in parts {
+                collect_filters_from_expr(p, schema, out);
+            }
         }
         _ => {}
     }
@@ -574,12 +591,14 @@ mod doc_verify_all {
         )
         .unwrap();
         // The legacy `TopK` folds to a canonical `Aggregate` carrying an
-        // `AggIntent::TopK`, over the `Partition { Window { Aggregate } }`
-        // the grouped windowed frequency sketch lowers to.
+        // `AggIntent::TopK`, over the `Window { Aggregate { by } } }` the
+        // grouped windowed frequency sketch lowers to — the group-by key
+        // folds straight into the inner `Aggregate.by: GroupKeys` (no
+        // `Partition` wrap; that node doesn't exist in the canonical IR).
         match &expr {
             QueryExpr::Aggregate { aggs, child, .. } => {
                 assert!(matches!(aggs.as_slice(), [AggIntent::TopK { k: 10, .. }]));
-                assert!(matches!(child.as_ref(), QueryExpr::Partition { .. }));
+                assert!(matches!(child.as_ref(), QueryExpr::Window { .. }));
             }
             other => panic!("expected Aggregate with TopK intent, got {other:?}"),
         }

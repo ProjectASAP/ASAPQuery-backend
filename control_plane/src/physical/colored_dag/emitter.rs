@@ -982,18 +982,36 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
     match qe {
         QE::Scan {
             source,
-            label_filters,
-            ..
+            predicates,
+            schema,
         } => {
             if let Source::TimeSeries { metric } = source {
                 if edge.source_metric.is_none() {
                     edge.source_metric = Some(metric.clone());
                 }
             }
-            for f in label_filters {
-                let pair = (f.label.clone(), f.equals.clone());
-                if !edge.label_filters.contains(&pair) {
-                    edge.label_filters.push(pair);
+            // Canonical `Scan.predicates` carries equality label filters
+            // as typed `Predicate(L3Expr::Compare{Column, Eq,
+            // Literal(Utf8)})` trees — resolve each `Column` id back to
+            // its name via the Scan's own schema.
+            use crate::intent_algebra::{CompareOp, L3Expr, L3Scalar};
+            for p in predicates {
+                if let L3Expr::Compare {
+                    left,
+                    op: CompareOp::Eq,
+                    right,
+                } = &p.0
+                {
+                    if let (L3Expr::Column(id), L3Expr::Literal(L3Scalar::Utf8(v))) =
+                        (left.as_ref(), right.as_ref())
+                    {
+                        if let Some(col) = schema.columns.get(*id) {
+                            let pair = (col.name.clone(), v.clone());
+                            if !edge.label_filters.contains(&pair) {
+                                edge.label_filters.push(pair);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1017,7 +1035,6 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
         // filters, window size) from any leaves below.
         QE::Filter { child, .. }
         | QE::Project { child, .. }
-        | QE::Partition { child, .. }
         | QE::Distinct { child, .. }
         | QE::Sort { child, .. }
         | QE::Limit { child, .. }
@@ -1037,6 +1054,14 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
             extract_edge_facts(left, edge);
             extract_edge_facts(right, edge);
         }
+        // `Partition` no longer exists in the canonical IR (its keys
+        // fold into `Aggregate.by` at construction time). The PromQL-
+        // surface superset (Scalar/EvalTime/VectorFromScalar/
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
+        // WindowFunc) isn't constructed here today; a no-op default is
+        // safe since none of the single-child ones carry edge facts this
+        // extractor cares about.
+        _ => {}
     }
 }
 

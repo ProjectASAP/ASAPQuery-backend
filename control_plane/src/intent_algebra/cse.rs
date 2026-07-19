@@ -133,14 +133,20 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
             QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child,
             } if *child == shared_expr => QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child: Box::new(QueryExpr::Ref {
-                    name: binding_name.clone(),
+                    // `QueryExpr::Ref.name` is `asap_ir`'s `BindingName`
+                    // (positional-workload-agnostic) — distinct from this
+                    // module's own `types_v2::BindingName` (CSE-plan-level
+                    // binding identity). Convert at the boundary.
+                    name: asap_ir::intent_algebra::BindingName::new(binding_name.0.clone()),
                 }),
             },
             other => other,
@@ -175,23 +181,27 @@ mod tests {
     }
 
     fn ts_scan() -> QueryExpr {
+        let schema = Schema::with_time_index(
+            vec![
+                col("ts", DataType::Timestamp),
+                col("service", DataType::Utf8),
+                col("value", DataType::Float64),
+            ],
+            0,
+            vec![vec![0, 1]],
+        );
+        let lf = LabelFilter {
+            label: "service".into(),
+            equals: "api".into(),
+        };
+        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+            .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
-            schema: Schema::with_time_index(
-                vec![
-                    col("ts", DataType::Timestamp),
-                    col("service", DataType::Utf8),
-                    col("value", DataType::Float64),
-                ],
-                0,
-                vec![vec![0, 1]],
-            ),
+            predicates: vec![pred],
+            schema,
         }
     }
 
@@ -216,12 +226,13 @@ mod tests {
     #[test]
     fn dedupe_subtrees_single_root_passthrough() {
         let q = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -237,22 +248,24 @@ mod tests {
     #[test]
     fn dedupe_subtrees_basic() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.95,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -269,7 +282,7 @@ mod tests {
                 QueryExpr::Aggregate { child, .. } => assert_eq!(
                     **child,
                     QueryExpr::Ref {
-                        name: BindingName::new("shared_0"),
+                        name: asap_ir::intent_algebra::BindingName::new("shared_0"),
                     },
                     "Aggregate child should be a Ref to the hoisted binding"
                 ),
@@ -283,8 +296,9 @@ mod tests {
     #[test]
     fn dedupe_subtrees_no_shared_subexpr() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -294,7 +308,7 @@ mod tests {
             source: Source::TimeSeries {
                 metric: "different_metric".into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::with_time_index(
                 vec![
                     col("ts", DataType::Timestamp),
@@ -306,8 +320,9 @@ mod tests {
             ),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Max { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(QueryExpr::Window {
                 kind: WindowKind::Sliding,

@@ -136,17 +136,18 @@ impl Rule for BindExactAgg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::{LabelFilter, Schema, Source};
+    use crate::intent_algebra::{Schema, Source};
 
     fn scan(metric: &str) -> QueryExpr {
+        // `Schema::default()` has no columns, so a "service" label filter
+        // could never resolve to a `Predicate` here anyway
+        // (`label_filter_to_predicate` would return `None`) — dropped
+        // rather than built-and-discarded.
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: metric.into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
+            predicates: Vec::new(),
             schema: Schema::default(),
         }
     }
@@ -155,7 +156,8 @@ mod tests {
         QueryExpr::Aggregate {
             aggs: vec![intent],
             child: Box::new(scan(metric)),
-            by: vec![],
+            by: vec![].into(),
+            output_names: Vec::new(),
             having: None,
         }
     }
@@ -173,7 +175,8 @@ mod tests {
                 slide: None,
                 child: Box::new(scan(metric)),
             }),
-            by: vec![],
+            by: vec![].into(),
+            output_names: Vec::new(),
             having: None,
         }
     }
@@ -272,7 +275,8 @@ mod tests {
         QueryExpr::Aggregate {
             aggs: vec![intent],
             child: Box::new(scan(metric)),
-            by,
+            by: by.into(),
+            output_names: Vec::new(),
             having: None,
         }
     }
@@ -291,7 +295,8 @@ mod tests {
                 slide: None,
                 child: Box::new(scan(metric)),
             }),
-            by,
+            by: by.into(),
+            output_names: Vec::new(),
             having: None,
         }
     }

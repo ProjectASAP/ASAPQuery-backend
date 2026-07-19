@@ -319,10 +319,11 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
         QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
         // A-variants lifted in Batch 2 of the relational migration. They
         // carry no AggIntent themselves — recurse into their children to
-        // find Aggregates further down the tree.
+        // find Aggregates further down the tree. `Partition` no longer
+        // exists in the canonical IR — its keys fold into `Aggregate.by`
+        // at construction time (`intent_algebra::lower`).
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
@@ -342,6 +343,12 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
             collect_agg_intents(left, out);
             collect_agg_intents(right, out);
         }
+        // The PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
+        // WindowFunc) isn't constructed by this parser today; the
+        // single-child wrappers among them carry no `AggIntent` either
+        // way, so a no-op default is safe.
+        _ => {}
     }
 }
 

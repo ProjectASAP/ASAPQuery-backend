@@ -435,7 +435,12 @@ pub fn workload_cost(plan: &WorkloadCostPlan<'_>) -> Result<WorkloadCost, QueryE
         let cost = subtree_cost(expr, &binding_costs, &schema_scope)?;
         let schema = expr.output_schema_in(&schema_scope)?;
         binding_costs.insert(name.as_str().to_owned(), cost);
-        schema_scope = schema_scope.with(name.clone(), schema);
+        // `BindingScope::with` (asap_ir) keys on asap_ir's `BindingName`,
+        // distinct from this module's workload-level `types_v2::BindingName`.
+        schema_scope = schema_scope.with(
+            asap_ir::intent_algebra::BindingName::new(name.0.clone()),
+            schema,
+        );
     }
 
     // 2. Cost each root in the bindings scope. `Ref` lookups charge 0.0
@@ -542,7 +547,6 @@ fn walk_children_zero_cost_bundled(
     match expr {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. } => {
@@ -618,7 +622,6 @@ fn walk_children_zero_cost_standalone(
     match expr {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. } => {
@@ -750,23 +753,27 @@ mod workload_cost_tests {
     }
 
     fn ts_scan() -> QueryExpr {
+        let schema = Schema::with_time_index(
+            vec![
+                col("ts", DataType::Timestamp),
+                col("service", DataType::Utf8),
+                col("value", DataType::Float64),
+            ],
+            0,
+            vec![vec![0, 1]],
+        );
+        let lf = LabelFilter {
+            label: "service".into(),
+            equals: "api".into(),
+        };
+        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+            .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
-            schema: Schema::with_time_index(
-                vec![
-                    col("ts", DataType::Timestamp),
-                    col("service", DataType::Utf8),
-                    col("value", DataType::Float64),
-                ],
-                0,
-                vec![vec![0, 1]],
-            ),
+            predicates: vec![pred],
+            schema,
         }
     }
 
@@ -782,12 +789,13 @@ mod workload_cost_tests {
     /// Wrap `child` in `Aggregate { by: [], aggs: [Quantile{q}] }`.
     fn quantile_root(q: f64, child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(child),
         }
@@ -796,8 +804,9 @@ mod workload_cost_tests {
     /// Wrap `child` in `Aggregate { by: [], aggs: [Max] }`.
     fn max_root(child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Max { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(child),
         }
@@ -856,13 +865,13 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
 
@@ -905,13 +914,13 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         // q3 builds its own scan + window — no shared producer.
@@ -948,17 +957,17 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q3 = max_root(QueryExpr::Ref {
-            name: BindingName::new("w"),
+            name: asap_ir::intent_algebra::BindingName::new("w"),
         });
         let plan = WorkloadCostPlan {
             bindings: vec![(BindingName::new("w"), &shared)],
@@ -1006,7 +1015,7 @@ mod workload_cost_tests {
         let q = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("missing"),
+                name: asap_ir::intent_algebra::BindingName::new("missing"),
             },
         );
         let plan = WorkloadCostPlan {

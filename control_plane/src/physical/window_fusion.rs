@@ -78,6 +78,7 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
         aggs,
         having,
         child: inner_child,
+        ..
     } = child.as_ref()
     else {
         return None;
@@ -210,8 +211,9 @@ mod tests {
             size,
             slide,
             child: Box::new(QueryExpr::Aggregate {
-                by: Vec::new(),
+                by: crate::intent_algebra::GroupKeys::none(),
                 aggs: vec![agg],
+                output_names: Vec::new(),
                 having: None,
                 child: Box::new(canonical_scan("m")),
             }),
@@ -333,8 +335,9 @@ mod tests {
         // A canonical `Aggregate` with no enclosing `Window` is the unfused
         // sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
-            by: Vec::new(),
+            by: crate::intent_algebra::GroupKeys::none(),
             aggs: vec![AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(canonical_scan("m")),
         };

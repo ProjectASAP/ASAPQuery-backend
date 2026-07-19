@@ -240,19 +240,21 @@ impl ThreeStageWalker {
             // No colored-DAG consumer constructs them today; conservatively
             // route to the Edge stage (matches the per-row Scan/Window
             // policy) so the build is total. The proper stage-placement
-            // rules for Filter/Project/Partition/Distinct/Merge/Join/SetOp/
-            // Sort/Limit/BinaryOp land alongside their consumers in
-            // follow-up batches.
-            QE::Filter { .. }
-            | QE::Project { .. }
-            | QE::Partition { .. }
-            | QE::Distinct { .. }
-            | QE::Sort { .. }
-            | QE::Limit { .. }
-            | QE::Subquery { .. } => Ok(StageId::Edge),
+            // rules for Filter/Project/Distinct/Sort/Limit/BinaryOp (and,
+            // since the `asap_ir` merge, the PromQL-surface superset —
+            // Scalar/EvalTime/VectorFromScalar/ScalarFromVector/Relabel/
+            // InfoJoin/Sample/TimeRange/TimeShift/WindowFunc, also
+            // unconstructed here today) land alongside their consumers in
+            // follow-up batches. `Partition` no longer exists in the
+            // canonical IR — its keys fold into `Aggregate.by` at
+            // construction time (`intent_algebra::lower`).
             QE::Merge { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
                 Ok(StageId::Backend)
             }
+            // Filter/Project/Distinct/Sort/Limit/Subquery, plus the
+            // PromQL-surface superset unconstructed here today, all fall
+            // through to this Edge default.
+            _ => Ok(StageId::Edge),
         }
     }
 }
@@ -282,7 +284,7 @@ mod tests {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::with_time_index(
                 vec![
                     Column {

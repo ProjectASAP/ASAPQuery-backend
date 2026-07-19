@@ -184,6 +184,7 @@ use crate::intent_algebra::relational::{
     PartitionKeys as QePartitionKeys, QueryExpr, SourceSpec as QeSourceSpec, VectorGrouping,
     VectorMatch, VectorMatchKind,
 };
+use crate::intent_algebra::{ArithOp, CompareOp};
 use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality};
 
 /// Parse a PromQL expression string directly into an optimised [`QueryExpr`].
@@ -481,23 +482,23 @@ fn promql_token_to_binop(tok: TokenType) -> BinaryOpKind {
     // token::T_* are u8 constants; TokenType wraps them as TokenType(u8).
     let id = tok.id();
     match id {
-        token::T_ADD => BinaryOpKind::Add,
-        token::T_SUB => BinaryOpKind::Sub,
-        token::T_MUL => BinaryOpKind::Mul,
-        token::T_DIV => BinaryOpKind::Div,
-        token::T_MOD => BinaryOpKind::Mod,
+        token::T_ADD => BinaryOpKind::Arith(ArithOp::Add),
+        token::T_SUB => BinaryOpKind::Arith(ArithOp::Sub),
+        token::T_MUL => BinaryOpKind::Arith(ArithOp::Mul),
+        token::T_DIV => BinaryOpKind::Arith(ArithOp::Div),
+        token::T_MOD => BinaryOpKind::Arith(ArithOp::Mod),
         token::T_POW => BinaryOpKind::Pow,
-        token::T_EQLC => BinaryOpKind::Eq,
-        token::T_NEQ => BinaryOpKind::Ne,
-        token::T_LSS => BinaryOpKind::Lt,
-        token::T_LTE => BinaryOpKind::Le,
-        token::T_GTR => BinaryOpKind::Gt,
-        token::T_GTE => BinaryOpKind::Ge,
+        token::T_EQLC => BinaryOpKind::Compare(CompareOp::Eq),
+        token::T_NEQ => BinaryOpKind::Compare(CompareOp::Ne),
+        token::T_LSS => BinaryOpKind::Compare(CompareOp::Lt),
+        token::T_LTE => BinaryOpKind::Compare(CompareOp::Le),
+        token::T_GTR => BinaryOpKind::Compare(CompareOp::Gt),
+        token::T_GTE => BinaryOpKind::Compare(CompareOp::Ge),
         token::T_LAND => BinaryOpKind::And,
         token::T_LOR => BinaryOpKind::Or,
         token::T_LUNLESS => BinaryOpKind::Unless,
         token::T_ATAN2 => BinaryOpKind::Atan2,
-        _ => BinaryOpKind::Add, // unknown — default to add
+        _ => BinaryOpKind::Arith(ArithOp::Add), // unknown — default to add
     }
 }
 
@@ -586,8 +587,10 @@ fn build_qe_aggregate(
         having: None,
         input: Box::new(windowed),
     };
-    // Don't wrap with Partition separately — keys are already in the Aggregate.
-    // The lowering pass will create the Partition node when it lowers the Aggregate.
+    // Don't wrap with Partition separately — keys are already in the
+    // Aggregate. The lowering pass folds them straight into the
+    // canonical `Aggregate.by: GroupKeys` (no `Partition` node exists in
+    // the canonical IR).
     agg
 }
 
@@ -596,6 +599,7 @@ fn apply_qe_filters(input: QueryExpr, filters: Vec<Predicate>) -> QueryExpr {
         input
     } else {
         use crate::intent_algebra::relational::{BinaryOpKind, LiteralValue, ScalarExpr};
+        use crate::intent_algebra::CompareOp;
         let pred = filters
             .iter()
             .fold(ScalarExpr::Literal(LiteralValue::Bool(true)), |acc, p| {
@@ -608,52 +612,52 @@ fn apply_qe_filters(input: QueryExpr, filters: Vec<Predicate>) -> QueryExpr {
                 };
                 let this = match &p.op {
                     FilterOp::Eq => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Eq,
+                        op: BinaryOpKind::Compare(CompareOp::Eq),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Ne => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Ne,
+                        op: BinaryOpKind::Compare(CompareOp::Ne),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Lt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Lt,
+                        op: BinaryOpKind::Compare(CompareOp::Lt),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Le => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Le,
+                        op: BinaryOpKind::Compare(CompareOp::Le),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Gt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Gt,
+                        op: BinaryOpKind::Compare(CompareOp::Gt),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Ge => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Ge,
+                        op: BinaryOpKind::Compare(CompareOp::Ge),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::Regex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Regex,
+                        op: BinaryOpKind::Compare(CompareOp::Regex),
                         lhs: Box::new(col),
                         rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
                     },
                     FilterOp::NotRegex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::NotRegex,
+                        op: BinaryOpKind::Compare(CompareOp::NotRegex),
                         lhs: Box::new(col),
                         rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
                     },
                     FilterOp::Like => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Like,
+                        op: BinaryOpKind::Compare(CompareOp::Like),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },
                     FilterOp::NotLike => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::NotLike,
+                        op: BinaryOpKind::Compare(CompareOp::NotLike),
                         lhs: Box::new(col),
                         rhs: Box::new(val),
                     },

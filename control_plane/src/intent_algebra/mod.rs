@@ -73,11 +73,10 @@
 
 pub mod agg_intent;
 pub mod cse;
-// Not yet re-exported into the crate::intent_algebra::* top-level surface
-// below -- `query_expr::ColumnRef` already claims that name, and this
-// module is unused until the query_expr.rs/relational.rs merge (next
-// Phase 2 step) retargets `Predicate`/`ScalarExpr` onto `L3Expr`/`L2Expr`.
-// Reachable today only via the full `intent_algebra::expr_ir::` path.
+// `L2Expr` isn't used yet -- `relational.rs` (L2) still builds its own
+// `ScalarExpr`, not `L2Expr`; that's the next Phase 2 step. `L3Expr` is
+// used now: `query_expr.rs`'s `Predicate` is `L3Expr`-based as of this
+// merge.
 pub mod expr_ir;
 pub mod query_expr;
 pub mod schema;
@@ -113,11 +112,12 @@ pub use agg_intent::{
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
+pub use expr_ir::{ArithOp, ColumnRef, CompareOp, Expr, L2Expr, L3Expr, L3Scalar};
 pub use query_expr::{
-    from_legacy_scalar, BinaryOpKind, BindingScope, ColumnRef, GroupSide, HavingPredicate,
-    JoinKind, LabelFilter, LiteralValue, PartitionKeys, Predicate, ProjectItem, QueryExpr,
-    QueryExprError, SetOpKind, SortKey, Source, VectorGrouping, VectorMatch, VectorMatchKind,
-    WindowKind,
+    aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,
+    BindingScope, DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate,
+    ProjectItem, QueryExpr, QueryExprError, SampleKind, SetOpKind, SortKey, Source, TimeShift,
+    VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
 

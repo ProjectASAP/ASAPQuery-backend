@@ -170,25 +170,83 @@ fn default_leaf_columns() -> Vec<Column> {
     ]
 }
 
-/// Walk the legacy tree and collect every distinct group-key name the
+/// Walk the legacy tree and collect every distinct column name the
 /// legacy → canonical converter resolves positionally: `Aggregate.keys`,
-/// `TopK.by`, and `Partition.keys`. Sorted + de-duplicated for a stable,
-/// deterministic column order.
+/// `TopK.by`, `Partition.keys`, and every `ScalarExpr::Column(name)`
+/// reachable from a `Filter.pred` / `Aggregate.having` / `Join.pred` /
+/// `Project` item — since the canonical `Predicate(L3Expr)` is fully
+/// positional (`L3Expr::Column(ColumnId)`, no name-based fallback),
+/// `convert_scalar` requires every referenced name to already be in the
+/// schema. Sorted + de-duplicated for a stable, deterministic column
+/// order.
 ///
 /// `AggItem.col` (the statistic's *input* column) is deliberately not
 /// collected — the converter never resolves it positionally; it only
-/// ever resolves group-by keys.
+/// ever resolves group-by keys and predicate/projection columns.
 fn collect_referenced_columns(tree: &LQueryExpr) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     tree.walk(&mut |node| match node {
-        LQueryExpr::Aggregate { keys, .. } => out.extend(keys.iter().cloned()),
+        LQueryExpr::Aggregate { keys, having, .. } => {
+            out.extend(keys.iter().cloned());
+            if let Some(pred) = having {
+                collect_columns_from_scalar(pred, &mut out);
+            }
+        }
         LQueryExpr::TopK { by, .. } => out.extend(by.iter().cloned()),
         LQueryExpr::Partition { keys, .. } => out.extend(keys.keys().iter().cloned()),
+        LQueryExpr::Filter { pred, .. } => collect_columns_from_scalar(pred, &mut out),
+        LQueryExpr::Join {
+            pred: Some(pred), ..
+        } => collect_columns_from_scalar(pred, &mut out),
+        LQueryExpr::Project { cols, .. } => {
+            for item in cols {
+                collect_columns_from_scalar(&item.expr, &mut out);
+            }
+        }
         _ => {}
     });
     out.sort();
     out.dedup();
     out
+}
+
+/// Recursively collect every `ScalarExpr::Column(name)` reachable from
+/// `expr`. Does not descend into `ScalarSubquery`'s inner `QueryExpr` —
+/// `lower::convert_scalar` rejects `ScalarSubquery` outright (see its
+/// module doc), so there is no positional resolution to satisfy inside
+/// one.
+fn collect_columns_from_scalar(
+    expr: &crate::intent_algebra::relational::ScalarExpr,
+    out: &mut Vec<String>,
+) {
+    use crate::intent_algebra::relational::ScalarExpr as SE;
+    match expr {
+        SE::Column(name) => out.push(name.clone()),
+        SE::Literal(_) | SE::ScalarSubquery(_) => {}
+        SE::BinaryOp { lhs, rhs, .. } => {
+            collect_columns_from_scalar(lhs, out);
+            collect_columns_from_scalar(rhs, out);
+        }
+        SE::FunctionCall { args, .. } => {
+            for a in args {
+                collect_columns_from_scalar(a, out);
+            }
+        }
+        SE::InList { expr, list, .. } => {
+            collect_columns_from_scalar(expr, out);
+            for a in list {
+                collect_columns_from_scalar(a, out);
+            }
+        }
+        SE::Between {
+            expr, low, high, ..
+        } => {
+            collect_columns_from_scalar(expr, out);
+            collect_columns_from_scalar(low, out);
+            collect_columns_from_scalar(high, out);
+        }
+        SE::IsNull { expr, .. } => collect_columns_from_scalar(expr, out),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

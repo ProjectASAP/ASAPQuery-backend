@@ -255,38 +255,42 @@ mod tests {
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
+        let schema = Schema::with_time_index(
+            vec![
+                Column {
+                    name: "ts".into(),
+                    dtype: DataType::Timestamp,
+                    nullable: false,
+                    table: None,
+                },
+                Column {
+                    name: "service".into(),
+                    dtype: DataType::Utf8,
+                    nullable: false,
+                    table: None,
+                },
+                Column {
+                    name: "value".into(),
+                    dtype: DataType::Float64,
+                    nullable: false,
+                    table: None,
+                },
+            ],
+            0,
+            vec![vec![0, 1]],
+        );
+        let lf = LabelFilter {
+            label: "service".into(),
+            equals: "api".into(),
+        };
+        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+            .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
-            schema: Schema::with_time_index(
-                vec![
-                    Column {
-                        name: "ts".into(),
-                        dtype: DataType::Timestamp,
-                        nullable: false,
-                        table: None,
-                    },
-                    Column {
-                        name: "service".into(),
-                        dtype: DataType::Utf8,
-                        nullable: false,
-                        table: None,
-                    },
-                    Column {
-                        name: "value".into(),
-                        dtype: DataType::Float64,
-                        nullable: false,
-                        table: None,
-                    },
-                ],
-                0,
-                vec![vec![0, 1]],
-            ),
+            predicates: vec![pred],
+            schema,
         }
     }
 

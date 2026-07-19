@@ -5,33 +5,87 @@
 //! *whole* canonical `query_expr::QueryExpr` tree. This is the single
 //! entry the parse path routes through — [`convert_root`].
 //!
+//! ## Phase 2 step 3 (docs/migration-plan-backend-plan.md)
+//!
+//! Two shape changes since the canonical `QueryExpr` merged onto
+//! `asap_ir` (see `query_expr.rs`'s module docs for the full rationale):
+//!
+//! - **Predicates** translate to `L3Expr` (via `Predicate`, `expr_ir.rs`)
+//!   instead of this repo's old 8-variant `Predicate` enum. `Between`
+//!   desugars via `query_expr::between`. **`ScalarSubquery` is rejected**
+//!   ([`ConvertError::UnsupportedScalarSubquery`]) rather than lowered:
+//!   `asap_ir`'s `L3Expr` has no slot for "reference the value bound by
+//!   an enclosing `LetBinding`" (the old `Predicate::Column(ColumnRef::
+//!   Named(subq_name))` was itself a hack the canonical positional
+//!   `L3Expr::Column(ColumnId)` can't reproduce without inventing a
+//!   sentinel id space nothing downstream knows about). ASAPController's
+//!   own L2→L3 lowering (`crates/l2/src/lower.rs`) has no correlated-
+//!   subquery construct either — its `Ref`/`LetBinding` are documented as
+//!   "Reserved: no front end emits yet." This repo's own front ends never
+//!   construct `ScalarExpr::ScalarSubquery` either (grep-verified: the
+//!   only non-test, non-definition sites were `lower.rs` itself and the
+//!   now-dead `optimizer/engine.rs` R7 rule), so rejecting it is a no-op
+//!   for every real query today. `optimizer/engine.rs`'s R7
+//!   `SubqueryDecorrelation` is deleted rather than ported — it pattern-
+//!   matched the removed `Predicate::BinaryOp` / `Predicate::ScalarSubquery`
+//!   / `Predicate::Column(ColumnRef::Named)` variants directly and has no
+//!   construction site left to fire against. Real correlated-subquery
+//!   support is follow-up work once `asap_ir` grows a representation for
+//!   it.
+//! - **`GROUP BY` keys attach directly to `Aggregate.by: GroupKeys`**
+//!   instead of wrapping the result in a `Partition` node (removed from
+//!   `asap_ir`'s `QueryExpr` — folded into `GroupKeys`'s `by`/`without`
+//!   distinction). The single-statistic fusion arm resolves `keys` once
+//!   and threads `GroupKeys` into every fused node (including both
+//!   siblings of a `StdDev`/`Variance` `Merge` fan-out) instead of
+//!   wrapping the finished shape afterward. A standalone legacy
+//!   `LQueryExpr::Partition` (not part of the fusion arm) folds its keys
+//!   into the nearest `Aggregate` its converted subtree contains, via
+//!   [`fold_partition_keys`].
+//!
+//! `having` is `Option<Predicate>` (real typed HAVING) directly — no
+//! translation needed beyond running the HAVING expression through
+//! [`convert_scalar`] like any other predicate.
+//!
 //! ## Variant mapping
 //!
 //! | relational `QueryExpr`     | canonical `QueryExpr`                              |
 //! |---|---|
-//! | `Source(spec)`             | `Scan { TimeSeries, label_filters: [], schema }`   |
+//! | `Source(spec)`             | `Scan { TimeSeries, predicates: [], schema }`      |
 //! | `Ref(name)`                | `Ref { name }`                                     |
 //! | `Filter`                   | `Filter` (pred via [`convert_scalar`])             |
 //! | `Project`                  | `Project` (each item's expr via [`convert_scalar`])|
-//! | `Aggregate` (multi-agg / HAVING / `Custom` / un-grouped `COUNT(*)`) | plain `Aggregate` (keys→by, AggFunc→AggIntent) |
-//! | `Aggregate` (single sketchable) | *fuses* — `Window`-input → `Window { Aggregate }`, `GROUP BY` → wrapping `Partition`, `StdDev`/`Variance` → `Merge` of sibling quantile aggregates. See the `Aggregate` arm. |
+//! | `Aggregate`                | single agg + no HAVING → *fuses* (see below); otherwise plain `Aggregate` (keys→by: GroupKeys, AggFunc→AggIntent via [`agg_func_to_intents`]) |
 //! | `Window`                   | `Window` (slide → Sliding else Tumbling)           |
-//! | `Partition`                | `Partition`                                        |
+//! | `Partition`                | keys folded into the nearest `Aggregate.by` inside the converted subtree, via [`fold_partition_keys`] |
 //! | `Distinct`                 | `Distinct`                                         |
 //! | `TopK`                     | `Aggregate { aggs: [AggIntent::TopK] }` (HeavyHitter)|
 //! | `Merge`                    | `Merge`                                            |
 //! | `Join`                     | `Join` (None pred → `Literal(Bool(true))`)         |
 //! | `SetOp`                    | `SetOp`                                            |
-//! | `Sort`                     | `Sort`                                             |
+//! | `Sort`                     | `Sort` (keys pass through — `relational::SortKey` already re-exports the canonical, `L3Expr`-based type) |
 //! | `Limit`                    | `Limit`                                            |
 //! | `LetBinding`               | `LetBinding` (relational `body` → canonical `child`)|
 //! | `PromQLSubquery`           | `Subquery`                                         |
-//! | `BinaryOp`                 | `BinaryOp`                                         |
+//! | `BinaryOp`                 | `BinaryOp` (`op` passes straight through — `relational::BinaryOpKind` is a re-export of the canonical type, not a separate flat enum) |
 //!
-//! The single-statistic sketchable `Aggregate` fusion (`Window`-swap,
-//! `Partition` wrap, `StdDev` / `Variance` fan-out) is done directly in
-//! canonical terms inside the [`convert`] `Aggregate` arm — there is no
-//! intermediate sketch-fused L2-or-L3 IR.
+//! A single-statistic `Aggregate` (exactly one `AggItem`, no `HAVING`)
+//! fuses directly into canonical shape rather than staying a plain
+//! `Aggregate` wrapping the untouched child:
+//!   * input is a `Window` → emit `Window { Aggregate { by } } }` (the
+//!     window-defines-sketch-lifecycle shape);
+//!   * otherwise → emit `Aggregate { by }`;
+//!   * `StdDev` / `Variance` fan out into a `Merge` of two sibling
+//!     quantile aggregates, both carrying the same `by` (Step α F1
+//!     strategy) — the only `AggFunc`s [`agg_func_to_intents`] maps to
+//!     more than one `AggIntent`;
+//!   * `GROUP BY` keys resolve once and thread into every fused node's
+//!     `by: GroupKeys` directly.
+//! `AggFunc::Custom` produces no canonical intent regardless of arity —
+//! [`agg_func_to_intents`] returns empty, which raises
+//! [`ConvertError::NoCanonicalIntent`] once execution reaches the plain
+//! multi-agg path (single-agg-with-empty-intents falls through to it
+//! rather than being special-cased inline).
 //!
 //! ## Schema threading
 //!
@@ -46,61 +100,43 @@
 
 #![allow(dead_code)]
 
-use std::time::Duration;
-
-use thiserror::Error;
+use asap_ir::intent_algebra::BindingName;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::binder::Binder;
-use crate::intent_algebra::column_resolution::{resolve_named_keys, ResolveError};
+use crate::intent_algebra::column_resolution::{
+    resolve_column_ref, resolve_column_refs, resolve_named_keys, ResolveError,
+};
 use crate::intent_algebra::query_expr::{
-    from_legacy_scalar, ColumnRef as CColumnRef, HavingPredicate, LiteralValue,
-    PartitionKeys as CPartitionKeys, Predicate, ProjectItem as CProjectItem,
-    QueryExpr as CQueryExpr, QueryExprError, Source, WindowKind as CWindowKind,
+    between, ArithOp, BinaryOpKind, CompareOp, GroupKeys, L3Scalar, Predicate,
+    ProjectItem as CProjectItem, QueryExpr as CQueryExpr, Source, WindowKind as CWindowKind,
 };
 use crate::intent_algebra::relational::{
     AggFunc, ColumnRef as LColumnRef, PartitionKeys as LPartitionKeys, QueryExpr as LQueryExpr,
     ScalarExpr as LScalarExpr,
 };
 use crate::intent_algebra::schema::Schema;
-use crate::types_v2::{AccuracyTarget, BindingName};
+use crate::intent_algebra::L3Expr;
+use crate::types_v2::AccuracyTarget;
 
 /// Errors produced while converting a legacy `QueryExpr` to canonical.
-///
-/// `PartialEq` is not derived because [`QueryExprError`] (carried by
-/// `Scalar`) does not derive it — callers compare via
-/// `matches!(err, ConvertError::Variant { .. })`.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConvertError {
-    /// A column reference (`Aggregate` key, `Partition` / `TopK` key)
-    /// did not resolve against the inherited schema.
+    /// A column reference (`Aggregate` key, `Distinct` column, scalar
+    /// `Column` leaf) did not resolve against the inherited schema.
     #[error("column resolution failed: {0}")]
     Resolve(#[from] ResolveError),
     /// An `AggItem.func` has no canonical `AggIntent` equivalent — only
     /// `AggFunc::Custom(_)` triggers this today.
     #[error("AggItem `{alias}` uses non-canonical func ({func_dbg}) — no AggIntent equivalent")]
     NoCanonicalIntent { alias: String, func_dbg: String },
-    /// A legacy `ScalarExpr` leaf failed to translate. Unreachable in
-    /// practice — `convert_scalar` handles every variant — but kept as a
-    /// typed boundary around [`from_legacy_scalar`].
-    #[error("scalar translation failed: {0}")]
-    Scalar(QueryExprError),
+    /// A `ScalarExpr::ScalarSubquery` was encountered. See the module doc
+    /// for why this is rejected rather than lowered.
+    #[error("scalar subqueries are not supported by the canonical IR yet")]
+    UnsupportedScalarSubquery,
 }
 
 /// Lower a legacy Layer-2 `QueryExpr` tree to the canonical L3 IR.
-///
-/// A single recursive walk ([`convert`]): every Layer-2 relational node
-/// maps onto its canonical counterpart, and the single-statistic
-/// sketchable `Aggregate` fuses (window-swap, `Partition` wrap, `StdDev`
-/// fan-out) directly in canonical terms — see the [`convert`] `Aggregate`
-/// arm. There is no intermediate legacy Layer-3 IR.
-///
-/// The inherited schema comes from the [`Binder`] — the explicit L3
-/// name-resolution pass — which builds the complete, self-contained
-/// schema every `ColumnId` indexes into. Because the Binder guarantees
-/// every referenced name is in scope, the per-arm positional resolution
-/// below (`resolve_column_ref` / `resolve_named_keys`) is **total**: it
-/// cannot raise `ConvertError::Resolve` on a well-formed legacy tree.
 pub fn convert_root(legacy: &LQueryExpr) -> Result<CQueryExpr, ConvertError> {
     let schema = Binder::new().bind(legacy);
     convert(legacy, &schema)
@@ -115,7 +151,7 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             source: Source::TimeSeries {
                 metric: spec.name.clone(),
             },
-            label_filters: Vec::new(),
+            predicates: Vec::new(),
             // Carry the Binder's complete schema — the same self-contained
             // scope every `ColumnId` in this tree resolves against.
             schema: schema.clone(),
@@ -130,21 +166,19 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             child: Box::new(convert(input, schema)?),
         },
 
-        LQueryExpr::Project { cols, input } => {
-            let cols = cols
+        LQueryExpr::Project { cols, input } => CQueryExpr::Project {
+            cols: cols
                 .iter()
                 .map(|pi| {
                     Ok(CProjectItem {
                         alias: pi.alias.clone(),
-                        expr: convert_scalar(&pi.expr, schema)?,
+                        expr: convert_scalar(&pi.expr, schema)?.0,
                     })
                 })
-                .collect::<Result<Vec<_>, ConvertError>>()?;
-            CQueryExpr::Project {
-                cols,
-                child: Box::new(convert(input, schema)?),
-            }
-        }
+                .collect::<Result<Vec<_>, ConvertError>>()?,
+            qualifier: None,
+            child: Box::new(convert(input, schema)?),
+        },
 
         LQueryExpr::Aggregate {
             keys,
@@ -152,109 +186,72 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             having,
             input,
         } => {
-            // A single-statistic sketchable aggregate *fuses* — this is the
-            // former `legacy_lower::lower_aggregate` step, done directly in
+            let by: GroupKeys = resolve_named_keys(keys, schema)?.into();
+
+            // A single-statistic aggregate *fuses* — this is the former
+            // `legacy_lower::lower_aggregate` step, done directly in
             // canonical terms rather than via an intermediate legacy L3
-            // node:
-            //   * input is a `Window` → emit `Window { Aggregate { by: [] } }`
-            //     (the window-defines-sketch-lifecycle shape);
-            //   * otherwise           → emit `Aggregate { by: [] }`;
-            //   * `StdDev` / `Variance` fan out into a `Merge` of two
-            //     sibling quantile aggregates (Step α F1 strategy);
-            //   * `GROUP BY` keys wrap the result in a `Partition`.
-            //
-            // Matching the *raw* `input` for `Window` is exact for every
-            // tree the parsers emit: they never nest an `Aggregate`
-            // directly over a `Window` directly over another sketchable
-            // `Aggregate`, the only shape where the raw vs. sketch-lowered
-            // input would differ.
-            //
-            // Multi-agg, `HAVING`-bearing, `Custom`, and un-grouped
-            // `COUNT(*)` aggregates fall through to the plain canonical
-            // `Aggregate` below.
+            // node. `Custom` (empty `intents`) falls through to the plain
+            // multi-agg path below, which raises `NoCanonicalIntent`
+            // uniformly for every arity.
             if aggs.len() == 1 && having.is_none() {
                 let item = &aggs[0];
-                let ungrouped_count = matches!(item.func, AggFunc::Count) && keys.is_empty();
-                if !ungrouped_count {
-                    let intents = agg_func_to_intents(&item.func);
-                    if !intents.is_empty() {
-                        let nodes: Vec<CQueryExpr> = match input.as_ref() {
-                            LQueryExpr::Window {
-                                duration,
-                                slide,
-                                input: win_input,
-                            } => {
-                                let kind = if slide.is_some() {
-                                    CWindowKind::Sliding
-                                } else {
-                                    CWindowKind::Tumbling
-                                };
-                                let win_child = convert(win_input, schema)?;
-                                intents
-                                    .into_iter()
-                                    .map(|intent| CQueryExpr::Window {
-                                        kind: kind.clone(),
-                                        size: *duration,
-                                        slide: *slide,
-                                        child: Box::new(CQueryExpr::Aggregate {
-                                            by: Vec::new(),
-                                            aggs: vec![intent],
-                                            having: None,
-                                            child: Box::new(win_child.clone()),
-                                        }),
-                                    })
-                                    .collect()
-                            }
-                            other => {
-                                let child = convert(other, schema)?;
-                                intents
-                                    .into_iter()
-                                    .map(|intent| CQueryExpr::Aggregate {
-                                        by: Vec::new(),
+                let intents = agg_func_to_intents(&item.func, !keys.is_empty());
+                if !intents.is_empty() {
+                    let nodes: Vec<CQueryExpr> = match input.as_ref() {
+                        LQueryExpr::Window {
+                            duration,
+                            slide,
+                            input: win_input,
+                        } => {
+                            let kind = if slide.is_some() {
+                                CWindowKind::Sliding
+                            } else {
+                                CWindowKind::Tumbling
+                            };
+                            let win_child = convert(win_input, schema)?;
+                            intents
+                                .into_iter()
+                                .map(|intent| CQueryExpr::Window {
+                                    kind: kind.clone(),
+                                    size: *duration,
+                                    slide: *slide,
+                                    child: Box::new(CQueryExpr::Aggregate {
+                                        by: by.clone(),
                                         aggs: vec![intent],
+                                        output_names: Vec::new(),
                                         having: None,
-                                        child: Box::new(child.clone()),
-                                    })
-                                    .collect()
-                            }
-                        };
-                        let sketch = if nodes.len() == 1 {
-                            nodes.into_iter().next().unwrap()
-                        } else {
-                            CQueryExpr::Merge { children: nodes }
-                        };
-                        return Ok(if keys.is_empty() {
-                            sketch
-                        } else {
-                            CQueryExpr::Partition {
-                                keys: CPartitionKeys::By(keys.clone()),
-                                child: Box::new(sketch),
-                            }
-                        });
-                    }
-                    // `intents` empty → `Custom` func; fall through to the
-                    // plain path, which raises `NoCanonicalIntent`.
+                                        child: Box::new(win_child.clone()),
+                                    }),
+                                })
+                                .collect()
+                        }
+                        other => {
+                            let child = convert(other, schema)?;
+                            intents
+                                .into_iter()
+                                .map(|intent| CQueryExpr::Aggregate {
+                                    by: by.clone(),
+                                    aggs: vec![intent],
+                                    output_names: Vec::new(),
+                                    having: None,
+                                    child: Box::new(child.clone()),
+                                })
+                                .collect()
+                        }
+                    };
+                    return Ok(if nodes.len() == 1 {
+                        nodes.into_iter().next().unwrap()
+                    } else {
+                        CQueryExpr::Merge { children: nodes }
+                    });
                 }
             }
 
-            // Plain canonical `Aggregate`: multi-agg, `HAVING`, `Custom`,
-            // or the un-grouped `COUNT(*)` exact-row-count case.
-            let by = resolve_named_keys(keys, schema)?;
+            // Plain canonical `Aggregate`: multi-agg, `HAVING`, or `Custom`.
             let mut intents: Vec<AggIntent> = Vec::with_capacity(aggs.len());
             for item in aggs {
-                // Faithful mapping for un-grouped `COUNT(*)`: no GROUP BY
-                // means an exact row count, no sketch benefit.
-                // `agg_func_to_intents` is the *sketch* map and would pick
-                // `Frequency` — that loses the "this is exact" decision. Map
-                // it to `Count { Exact }` so downstream (`capability_for`,
-                // the `QeCollector`) sees it as exact.
-                if matches!(item.func, AggFunc::Count) && keys.is_empty() {
-                    intents.push(AggIntent::Count {
-                        accuracy: AccuracyTarget::Exact,
-                    });
-                    continue;
-                }
-                let mapped = agg_func_to_intents(&item.func);
+                let mapped = agg_func_to_intents(&item.func, !keys.is_empty());
                 if mapped.is_empty() {
                     return Err(ConvertError::NoCanonicalIntent {
                         alias: item.alias.clone(),
@@ -263,16 +260,14 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                 }
                 intents.extend(mapped);
             }
-            let having = match having {
-                None => None,
-                Some(se) => Some(HavingPredicate(format!(
-                    "{:?}",
-                    convert_scalar(se, schema)?
-                ))),
-            };
+            let having = having
+                .as_ref()
+                .map(|se| convert_scalar(se, schema))
+                .transpose()?;
             CQueryExpr::Aggregate {
                 by,
                 aggs: intents,
+                output_names: Vec::new(),
                 having,
                 child: Box::new(convert(input, schema)?),
             }
@@ -293,16 +288,17 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             child: Box::new(convert(input, schema)?),
         },
 
-        LQueryExpr::Partition { keys, input } => CQueryExpr::Partition {
-            keys: match keys {
-                LPartitionKeys::By(k) => CPartitionKeys::By(k.clone()),
-                LPartitionKeys::Without(k) => CPartitionKeys::Without(k.clone()),
-            },
-            child: Box::new(convert(input, schema)?),
-        },
+        LQueryExpr::Partition { keys, input } => {
+            let by: GroupKeys = match keys {
+                LPartitionKeys::By(k) => resolve_named_keys(k, schema)?.into(),
+                LPartitionKeys::Without(k) => GroupKeys::without(resolve_named_keys(k, schema)?),
+            };
+            let converted = convert(input, schema)?;
+            fold_partition_keys(converted, by)
+        }
 
         LQueryExpr::Distinct { cols, input } => CQueryExpr::Distinct {
-            cols: cols.iter().map(convert_column_ref).collect(),
+            cols: resolve_column_refs(cols, schema)?,
             child: Box::new(convert(input, schema)?),
         },
 
@@ -310,13 +306,14 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             // γ4 classification default: heavy-hitter intent. The generic
             // `Sort + Limit` case never reaches a legacy `TopK` node —
             // see `topk_bridge` module doc.
-            let by = resolve_named_keys(by, schema)?;
+            let by: GroupKeys = resolve_named_keys(by, schema)?.into();
             CQueryExpr::Aggregate {
                 by,
                 aggs: vec![AggIntent::TopK {
                     k: *k as usize,
                     accuracy: AccuracyTarget::Epsilon(0.05),
                 }],
+                output_names: Vec::new(),
                 having: None,
                 child: Box::new(convert(input, schema)?),
             }
@@ -336,11 +333,11 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             right,
         } => CQueryExpr::Join {
             kind: kind.clone(),
-            // Canonical `Join` requires a predicate; a legacy `None` pred
-            // is a CROSS JOIN — model it as the tautology `true`.
             pred: match pred {
                 Some(se) => convert_scalar(se, schema)?,
-                None => Predicate::Literal(LiteralValue::Bool(true)),
+                // Canonical `Join` requires a predicate; a legacy `None`
+                // pred is a CROSS JOIN — model it as the tautology `true`.
+                None => Predicate(L3Expr::Literal(L3Scalar::Boolean(true))),
             },
             left: Box::new(convert(left, schema)?),
             right: Box::new(convert(right, schema)?),
@@ -359,8 +356,8 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
         },
 
         LQueryExpr::Sort { keys, input } => CQueryExpr::Sort {
-            // `SortKey` is the single canonical type (deduped in PR 1).
             keys: keys.clone(),
+            partition_by: GroupKeys::none(),
             child: Box::new(convert(input, schema)?),
         },
 
@@ -393,8 +390,6 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             rhs,
             vector_match,
         } => CQueryExpr::BinaryOp {
-            // `BinaryOpKind` / `VectorMatch` are the single canonical
-            // types (deduped in PR 1).
             op: op.clone(),
             lhs: Box::new(convert(lhs, schema)?),
             rhs: Box::new(convert(rhs, schema)?),
@@ -403,99 +398,175 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
     })
 }
 
+/// Fold `by` into the nearest `Aggregate` inside `qe` — the replacement
+/// for wrapping in a `Partition` node, which `asap_ir`'s `QueryExpr`
+/// doesn't have. Handles the shapes the parsers actually produce: a bare
+/// `Aggregate`, a `Window` wrapping one, or a `Merge` of siblings (the
+/// `StdDev`/`Variance` fan-out) — folding into every sibling so they stay
+/// consistent. Falls through unchanged (with a debug assertion) for any
+/// other shape; nothing in the current parsers produces a standalone
+/// `LQueryExpr::Partition` over a non-aggregate subtree.
+fn fold_partition_keys(qe: CQueryExpr, by: GroupKeys) -> CQueryExpr {
+    match qe {
+        CQueryExpr::Aggregate {
+            aggs,
+            output_names,
+            having,
+            child,
+            ..
+        } => CQueryExpr::Aggregate {
+            by,
+            aggs,
+            output_names,
+            having,
+            child,
+        },
+        CQueryExpr::Window {
+            kind,
+            size,
+            slide,
+            child,
+        } => CQueryExpr::Window {
+            kind,
+            size,
+            slide,
+            child: Box::new(fold_partition_keys(*child, by)),
+        },
+        CQueryExpr::Merge { children } => CQueryExpr::Merge {
+            children: children
+                .into_iter()
+                .map(|c| fold_partition_keys(c, by.clone()))
+                .collect(),
+        },
+        other => {
+            debug_assert!(
+                false,
+                "Partition over a non-aggregate shape has no GroupKeys home: {other:?}"
+            );
+            other
+        }
+    }
+}
+
 /// Translate a legacy `ScalarExpr` to a canonical `Predicate`, recursing
-/// through every composite variant so a nested `ScalarSubquery` (which
-/// carries a legacy `QueryExpr` sub-tree) can be converted via [`convert`].
-/// `from_legacy_scalar` alone cannot do this — it has no converter to
-/// recurse with — which is why `ScalarSubquery` was the one arm it defers.
+/// through every composite variant.
 pub fn convert_scalar(se: &LScalarExpr, schema: &Schema) -> Result<Predicate, ConvertError> {
     match se {
-        LScalarExpr::ScalarSubquery(inner) => {
-            Ok(Predicate::ScalarSubquery(Box::new(convert(inner, schema)?)))
+        LScalarExpr::ScalarSubquery(_) => Err(ConvertError::UnsupportedScalarSubquery),
+        LScalarExpr::BinaryOp { op, lhs, rhs } => {
+            let l = convert_scalar(lhs, schema)?.0;
+            let r = convert_scalar(rhs, schema)?.0;
+            Ok(binary_scalar_op(op, l, r))
         }
-        LScalarExpr::BinaryOp { op, lhs, rhs } => Ok(Predicate::BinaryOp {
-            op: op.clone(),
-            lhs: Box::new(convert_scalar(lhs, schema)?),
-            rhs: Box::new(convert_scalar(rhs, schema)?),
-        }),
-        LScalarExpr::IsNull { expr, negated } => Ok(Predicate::IsNull {
-            expr: Box::new(convert_scalar(expr, schema)?),
-            negated: *negated,
-        }),
-        LScalarExpr::FunctionCall { name, args } => Ok(Predicate::FunctionCall {
-            name: name.clone(),
-            args: args
+        LScalarExpr::IsNull { expr, negated } => {
+            let inner = Box::new(convert_scalar(expr, schema)?.0);
+            Ok(Predicate(if *negated {
+                L3Expr::IsNotNull(inner)
+            } else {
+                L3Expr::IsNull(inner)
+            }))
+        }
+        LScalarExpr::FunctionCall { name, args } => {
+            let exprs = args
                 .iter()
-                .map(|a| convert_scalar(a, schema))
-                .collect::<Result<Vec<_>, _>>()?,
-        }),
+                .map(|a| Ok(convert_scalar(a, schema)?.0))
+                .collect::<Result<Vec<_>, ConvertError>>()?;
+            Ok(Predicate(L3Expr::FunctionCall {
+                name: name.clone(),
+                args: exprs,
+            }))
+        }
         LScalarExpr::InList {
             expr,
             list,
             negated,
-        } => Ok(Predicate::InList {
-            expr: Box::new(convert_scalar(expr, schema)?),
-            list: list
+        } => {
+            let e = convert_scalar(expr, schema)?.0;
+            let list_exprs = list
                 .iter()
-                .map(|a| convert_scalar(a, schema))
-                .collect::<Result<Vec<_>, _>>()?,
-            negated: *negated,
-        }),
+                .map(|a| Ok(convert_scalar(a, schema)?.0))
+                .collect::<Result<Vec<_>, ConvertError>>()?;
+            Ok(Predicate(L3Expr::InList {
+                expr: Box::new(e),
+                list: list_exprs,
+                negated: *negated,
+            }))
+        }
         LScalarExpr::Between {
             expr,
             low,
             high,
             negated,
-        } => Ok(Predicate::Between {
-            expr: Box::new(convert_scalar(expr, schema)?),
-            low: Box::new(convert_scalar(low, schema)?),
-            high: Box::new(convert_scalar(high, schema)?),
-            negated: *negated,
-        }),
-        // `Column` / `Literal` are subquery-free leaves — `from_legacy_scalar`
-        // translates them directly (and cannot fail for these arms).
-        LScalarExpr::Column(_) | LScalarExpr::Literal(_) => {
-            from_legacy_scalar(se).map_err(ConvertError::Scalar)
+        } => {
+            let e = convert_scalar(expr, schema)?.0;
+            let l = convert_scalar(low, schema)?.0;
+            let h = convert_scalar(high, schema)?.0;
+            Ok(Predicate(between(e, l, h, *negated)))
         }
+        LScalarExpr::Column(name) => {
+            let id = resolve_column_ref(&LColumnRef::Named(name.clone()), schema)?;
+            Ok(Predicate(L3Expr::Column(id)))
+        }
+        LScalarExpr::Literal(lit) => Ok(Predicate(literal_from_legacy(lit))),
     }
 }
 
-/// Legacy `ColumnRef` → canonical `ColumnRef`. The two enums have
-/// identical variants; the canonical one is what L3 nodes carry.
-fn convert_column_ref(c: &LColumnRef) -> CColumnRef {
-    match c {
-        LColumnRef::Named(n) => CColumnRef::Named(n.clone()),
-        LColumnRef::SampleValue => CColumnRef::SampleValue,
-        LColumnRef::Wildcard => CColumnRef::Wildcard,
-    }
+/// Translate a legacy `ScalarExpr::BinaryOp`'s operator + converted
+/// operands into the corresponding `L3Expr`. `op` is already the
+/// canonical `BinaryOpKind` (`relational::BinaryOpKind` re-exports the
+/// same type `query_expr::BinaryOp.op` carries — no separate flat legacy
+/// enum exists), so this is a structural unwrap, not a value mapping.
+fn binary_scalar_op(op: &BinaryOpKind, l: L3Expr, r: L3Expr) -> Predicate {
+    let e = match op {
+        BinaryOpKind::Arith(arith_op) => L3Expr::Arith {
+            op: arith_op.clone(),
+            left: Box::new(l),
+            right: Box::new(r),
+        },
+        BinaryOpKind::Compare(cmp_op) => L3Expr::Compare {
+            left: Box::new(l),
+            op: cmp_op.clone(),
+            right: Box::new(r),
+        },
+        BinaryOpKind::And => L3Expr::BoolAnd(vec![l, r]),
+        BinaryOpKind::Or => L3Expr::BoolOr(vec![l, r]),
+        // `Unless` / `Pow` / `Atan2` are PromQL vector-set / power ops with
+        // no scalar-predicate counterpart; neither parser constructs a
+        // `ScalarExpr::BinaryOp` with one of these (they only appear on
+        // `QueryExpr::BinaryOp`, passed straight through in `convert`).
+        // Defensive fallback rather than a panic on unreachable input.
+        BinaryOpKind::Unless | BinaryOpKind::Pow | BinaryOpKind::Atan2 => {
+            L3Expr::Literal(L3Scalar::Boolean(true))
+        }
+    };
+    Predicate(e)
+}
+
+fn literal_from_legacy(lit: &crate::intent_algebra::relational::LiteralValue) -> L3Expr {
+    use crate::intent_algebra::relational::LiteralValue as L;
+    L3Expr::Literal(match lit {
+        L::Null => L3Scalar::Null,
+        L::Bool(b) => L3Scalar::Boolean(*b),
+        L::Int(i) => L3Scalar::Int64(*i),
+        L::Float(f) => L3Scalar::Float64(*f),
+        L::Str(s) => L3Scalar::Utf8(s.clone()),
+        // No L3Scalar counterpart -- fold to nanosecond count, matching
+        // the pre-merge `from_legacy_scalar`'s documented behavior.
+        L::Duration(d) => L3Scalar::Int64(d.as_nanos() as i64),
+    })
 }
 
 // ── AggFunc → AggIntent sketch mapping ───────────────────────────────────────
 
 /// Map an [`AggFunc`] to the canonical [`AggIntent`]s the `convert`
-/// `Aggregate` arm fuses on. Empty for non-sketchable functions
-/// (`Custom`); one intent for single-statistic functions; two for the
-/// `StdDev` / `Variance` fan-out (the caller wraps the pair in a `Merge`
-/// of sibling sketch aggregates).
-fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
-    use crate::intent_algebra::relational::{
-        default_cardinality, default_frequency, default_quantile,
-    };
+/// `Aggregate` arm fuses on. `grouped` is `!keys.is_empty()` at the call
+/// site. Empty for non-canonical functions (`Custom` only); one intent
+/// for every ordinary function (delegates to [`AggFunc::to_sketch_op`]);
+/// two for the `StdDev` / `Variance` fan-out (the caller wraps the pair
+/// in a `Merge` of sibling sketch aggregates, the one case `to_sketch_op`
+/// can't express since it returns a single `Option<AggIntent>`).
+fn agg_func_to_intents(func: &AggFunc, grouped: bool) -> Vec<AggIntent> {
     match func {
-        AggFunc::Quantile(phi) => vec![default_quantile(*phi)],
-        AggFunc::CountDistinct => vec![default_cardinality()],
-        AggFunc::HeavyHitters { .. } => vec![default_frequency()],
-        AggFunc::Frequency => vec![default_frequency()],
-        AggFunc::Count => vec![default_frequency()],
-        AggFunc::Avg => vec![AggIntent::Quantile {
-            col: None,
-            q: 0.5,
-            accuracy: AccuracyTarget::Epsilon(0.01),
-        }],
-        AggFunc::Min => vec![AggIntent::Min { col: None }],
-        AggFunc::Max => vec![AggIntent::Max { col: None }],
-        // StdDev / Variance: legacy carried two quantiles in a single
-        // Quantile intent; Step α F1 fans them out into two siblings.
         AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![
             AggIntent::Quantile {
                 col: None,
@@ -508,10 +579,42 @@ fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
                 accuracy: AccuracyTarget::Epsilon(0.01),
             },
         ],
-        AggFunc::Sum | AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => {
-            vec![AggIntent::Sum { col: None }]
-        }
-        AggFunc::Custom(_) => vec![],
+        // `Rate` / `Increase` / `Delta` map onto `AggIntent::Sum`, not
+        // the dedicated `AggIntent::Rate` / `Increase` / `Delta`
+        // variants `to_sketch_op()` would otherwise reach for — the
+        // `asap_tier_analysis` engine dispatch deliberately collapses
+        // all of `rate` / `irate` / `increase` / `sum_over_time` onto
+        // one `Capability::ExactAgg(Sum)` and disambiguates via the
+        // separate typed `outer_fn` field instead (see
+        // `asap_tier_analysis::tests::rate_and_sum_over_time_share_
+        // capability_but_differ_on_outer_fn` and the surrounding
+        // "outer_fn — rate vs plain disambiguation" test block, which
+        // documents this as the deliberate replacement for a retired
+        // raw-PromQL re-parser). Using the dedicated intents here would
+        // fragment that dispatch.
+        AggFunc::Rate | AggFunc::Increase | AggFunc::Delta => vec![AggIntent::Sum { col: None }],
+        // `Avg` approximates as the p50 (median) quantile sketch rather
+        // than `to_sketch_op()`'s literal `AggIntent::Avg` (exact,
+        // non-mergeable) — matches `Min`/`Max`'s boundary-quantile
+        // treatment (`AggIntent::Min` ~ q=0.0, `Max` ~ q=1.0) and is what
+        // `query_parser::QeCollector::collect_op` (which has no `Avg`
+        // arm of its own) relies on to classify `avg_over_time` as
+        // `AggType::Quantile` with `quantiles: [0.5]`.
+        AggFunc::Avg => vec![AggIntent::Quantile {
+            col: None,
+            q: 0.5,
+            accuracy: AccuracyTarget::Epsilon(0.01),
+        }],
+        // A *grouped* `Count` is `count_over_time(...) by (...)` (or the
+        // PromQL `topk` bridge's synthetic `Count` — see
+        // `query_parser::promql::build_windowed_agg`'s "Count-with-
+        // GROUP-BY → Frequency" comment) — structurally per-series and
+        // sketchable, so it takes the same `Frequency`/CMS path as
+        // `AggFunc::Frequency`/`HeavyHitters`. An *ungrouped* `Count` is
+        // the SQL `COUNT(*)` exact-row-count case and keeps
+        // `to_sketch_op()`'s literal `AggIntent::Count{Exact}`.
+        AggFunc::Count if grouped => vec![crate::intent_algebra::default_frequency()],
+        other => other.to_sketch_op().into_iter().collect(),
     }
 }
 
@@ -521,8 +624,9 @@ fn agg_func_to_intents(func: &AggFunc) -> Vec<AggIntent> {
 mod tests {
     use super::*;
     use crate::intent_algebra::relational::{
-        AggFunc, AggItem, ColumnRef as LColumnRef, ProjectItem as LProjectItem, SourceSpec,
+        AggItem, ColumnRef as LColumnRef, ProjectItem as LProjectItem, SourceSpec,
     };
+    use std::time::Duration;
 
     fn src(name: &str) -> LQueryExpr {
         LQueryExpr::Source(SourceSpec { name: name.into() })
@@ -543,13 +647,13 @@ mod tests {
         match c {
             CQueryExpr::Scan {
                 source,
-                label_filters,
+                predicates,
                 schema,
             } => {
                 assert!(
                     matches!(source, Source::TimeSeries { metric } if metric == "http_requests_total")
                 );
-                assert!(label_filters.is_empty());
+                assert!(predicates.is_empty());
                 assert_eq!(schema.columns.len(), 2); // ts, value
             }
             other => panic!("expected Scan, got {other:?}"),
@@ -620,9 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn single_sketchable_aggregate_folds_to_canonical_aggregate() {
-        // A single-statistic sketchable `Aggregate` over a non-`Window`
-        // input folds to a canonical `Aggregate { by: [], aggs: [intent] }`.
+    fn single_aggregate_folds_to_canonical_aggregate() {
         let legacy = LQueryExpr::Aggregate {
             keys: vec![],
             aggs: vec![agg_item("s", AggFunc::Sum)],
@@ -639,10 +741,26 @@ mod tests {
     }
 
     #[test]
+    fn ungrouped_count_is_exact() {
+        let legacy = LQueryExpr::Aggregate {
+            keys: vec![],
+            aggs: vec![agg_item("n", AggFunc::Count)],
+            having: None,
+            input: Box::new(src("m")),
+        };
+        match convert_root(&legacy).unwrap() {
+            CQueryExpr::Aggregate { aggs, .. } => assert!(matches!(
+                aggs.as_slice(),
+                [AggIntent::Count {
+                    accuracy: AccuracyTarget::Exact
+                }]
+            )),
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn aggregate_target_column_is_not_a_group_by_key() {
-        // The `AggItem.col` (the statistic's input column) is *not* a
-        // GROUP BY key — only `Aggregate.keys` is. A `Named` agg-target
-        // column therefore leaves the canonical `by` empty.
         let legacy = LQueryExpr::Aggregate {
             keys: vec![],
             aggs: vec![AggItem {
@@ -661,10 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn single_sketchable_aggregate_over_window_folds_to_window_over_aggregate() {
-        // A single-statistic sketchable `Aggregate` whose input is a
-        // `Window` folds to the `Window { Aggregate { by: [] } }` shape —
-        // the window-defines-sketch-lifecycle form.
+    fn single_aggregate_over_window_folds_to_window_over_aggregate() {
         let legacy = LQueryExpr::Aggregate {
             keys: vec![],
             aggs: vec![agg_item("q", AggFunc::Quantile(0.99))],
@@ -690,10 +805,35 @@ mod tests {
     }
 
     #[test]
+    fn stddev_fans_out_into_merge_of_quantile_siblings() {
+        let legacy = LQueryExpr::Aggregate {
+            keys: vec![],
+            aggs: vec![agg_item("sd", AggFunc::StdDev { population: false })],
+            having: None,
+            input: Box::new(src("m")),
+        };
+        match convert_root(&legacy).unwrap() {
+            CQueryExpr::Merge { children } => {
+                assert_eq!(children.len(), 2);
+                for c in &children {
+                    assert!(matches!(
+                        c,
+                        CQueryExpr::Aggregate {
+                            aggs,
+                            ..
+                        } if matches!(aggs.as_slice(), [AggIntent::Quantile { .. }])
+                    ));
+                }
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn topk_folds_into_aggregate_with_topk_intent() {
         let legacy = LQueryExpr::TopK {
             k: 5,
-            by: vec![],
+            by: vec![].into(),
             input: Box::new(src("m")),
         };
         match convert_root(&legacy).unwrap() {
@@ -720,23 +860,17 @@ mod tests {
     }
 
     #[test]
-    fn filter_pred_with_scalar_subquery_recurses() {
-        // Filter { pred: ScalarSubquery(Ref("cte")), Source } — the
-        // ScalarSubquery arm `from_legacy_scalar` defers is handled here
-        // by recursing through `convert`.
+    fn filter_pred_with_scalar_subquery_is_rejected() {
+        // ScalarSubquery has no canonical L3Expr representation (see the
+        // module doc) -- convert_scalar rejects it rather than guessing.
         let legacy = LQueryExpr::Filter {
             pred: LScalarExpr::ScalarSubquery(Box::new(LQueryExpr::Ref("cte".into()))),
             input: Box::new(src("m")),
         };
-        match convert_root(&legacy).unwrap() {
-            CQueryExpr::Filter { pred, .. } => match pred {
-                Predicate::ScalarSubquery(inner) => {
-                    assert!(matches!(*inner, CQueryExpr::Ref { name } if name.as_str() == "cte"));
-                }
-                other => panic!("expected ScalarSubquery, got {other:?}"),
-            },
-            other => panic!("expected Filter, got {other:?}"),
-        }
+        assert!(matches!(
+            convert_root(&legacy).unwrap_err(),
+            ConvertError::UnsupportedScalarSubquery
+        ));
     }
 
     #[test]
@@ -752,7 +886,7 @@ mod tests {
             CQueryExpr::Project { cols, .. } => {
                 assert_eq!(cols.len(), 1);
                 assert_eq!(cols[0].alias.as_deref(), Some("v"));
-                assert!(matches!(&cols[0].expr, Predicate::Column(_)));
+                assert!(matches!(cols[0].expr, L3Expr::Column(_)));
             }
             other => panic!("expected Project, got {other:?}"),
         }
@@ -761,7 +895,7 @@ mod tests {
     #[test]
     fn binary_op_converts_both_sides() {
         let legacy = LQueryExpr::BinaryOp {
-            op: crate::intent_algebra::query_expr::BinaryOpKind::Add,
+            op: BinaryOpKind::Arith(ArithOp::Add),
             lhs: Box::new(src("a")),
             rhs: Box::new(src("b")),
             vector_match: None,
@@ -776,16 +910,36 @@ mod tests {
     }
 
     #[test]
+    fn scalar_binary_op_translates_arith_and_compare() {
+        let legacy = LScalarExpr::BinaryOp {
+            op: BinaryOpKind::Compare(CompareOp::Gt),
+            lhs: Box::new(LScalarExpr::Column("value".into())),
+            rhs: Box::new(LScalarExpr::Literal(
+                crate::intent_algebra::relational::LiteralValue::Float(1.0),
+            )),
+        };
+        let schema = crate::intent_algebra::column_resolution::infer_source_schema("m");
+        let pred = convert_scalar(&legacy, &schema).unwrap();
+        assert!(matches!(
+            pred.0,
+            L3Expr::Compare {
+                op: CompareOp::Gt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn cross_join_none_pred_becomes_true_literal() {
         let legacy = LQueryExpr::Join {
-            kind: crate::intent_algebra::query_expr::JoinKind::Cross,
+            kind: crate::intent_algebra::relational::JoinKind::Cross,
             pred: None,
             left: Box::new(src("a")),
             right: Box::new(src("b")),
         };
         match convert_root(&legacy).unwrap() {
             CQueryExpr::Join { pred, .. } => {
-                assert!(matches!(pred, Predicate::Literal(LiteralValue::Bool(true))));
+                assert!(matches!(pred.0, L3Expr::Literal(L3Scalar::Boolean(true))));
             }
             other => panic!("expected Join, got {other:?}"),
         }
@@ -831,7 +985,6 @@ mod tests {
             }),
         };
         let c = convert_root(&legacy).unwrap();
-        // Walk down and assert the spine survived.
         let CQueryExpr::Sort { child, .. } = c else {
             panic!("expected Sort")
         };
