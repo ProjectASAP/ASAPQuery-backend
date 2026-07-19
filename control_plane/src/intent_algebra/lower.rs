@@ -509,9 +509,10 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
 /// `Aggregate` arm fuses on. `frequency_trigger` is `true` when the
 /// enclosing `Aggregate` is grouped or windowed — see the module doc's
 /// "Frequency preservation" section; it only affects the `Count` arm.
-/// One intent for every ordinary function; two for the `StdDev` /
-/// `Variance` fan-out (the caller wraps the pair in a `Merge` of sibling
-/// sketch aggregates).
+/// One intent for every function today — the former `StdDev`/`Variance`
+/// two-quantile IQR-proxy fan-out is gone (see the `Avg`/`StdDev`/
+/// `Variance` comment below), so the `Merge`-of-siblings path this
+/// `Vec` return type still supports is currently unexercised.
 fn agg_func_to_intents(func: &AggFunc, frequency_trigger: bool) -> Vec<AggIntent> {
     let q = |q: f64| AggIntent::Quantile {
         col: None,
@@ -539,7 +540,24 @@ fn agg_func_to_intents(func: &AggFunc, frequency_trigger: bool) -> Vec<AggIntent
         AggFunc::Avg => vec![AggIntent::Avg { col: None }],
         AggFunc::Min => vec![AggIntent::Min { col: None }],
         AggFunc::Max => vec![AggIntent::Max { col: None }],
-        AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![q(0.25), q(0.75)],
+        // `StdDev`/`Variance` map onto their literal `AggIntent`s,
+        // matching `asap_l2::lower` exactly — same fix as `Avg` above,
+        // same reasoning: `capability_for` already declares both
+        // archive-only (`Avg { .. } | StdDev { .. } | Variance { .. }
+        // => None`), so the former `vec![q(0.25), q(0.75)]` IQR proxy
+        // (interquartile range as a stand-in for stddev) was silently
+        // claiming ASAP-tier `QuantileApprox` support neither this
+        // repo's own capability table nor ASAPController's `asap-plan`
+        // (`pass_through_intents_stay_logical`) actually backs with a
+        // real bind rule.
+        AggFunc::StdDev { population } => vec![AggIntent::StdDev {
+            col: None,
+            population: *population,
+        }],
+        AggFunc::Variance { population } => vec![AggIntent::Variance {
+            col: None,
+            population: *population,
+        }],
         AggFunc::Quantile(phi) => vec![q(*phi)],
         AggFunc::CountDistinct => vec![crate::intent_algebra::default_cardinality()],
         AggFunc::HeavyHitters { .. } => vec![crate::intent_algebra::default_frequency()],
@@ -836,7 +854,12 @@ mod tests {
     }
 
     #[test]
-    fn stddev_fans_out_into_merge_of_quantile_siblings() {
+    fn stddev_maps_to_literal_exact_intent() {
+        // Matches `asap_l2::lower`'s own mapping: no more two-quantile
+        // IQR-proxy `Merge` fan-out (that claimed a `QuantileApprox`
+        // ASAP-tier capability `capability_for` never actually backed
+        // for `StdDev`/`Variance` — same bug class as the old
+        // `avg → p50` approximation).
         let legacy = agg(
             vec![],
             false,
@@ -844,17 +867,16 @@ mod tests {
             src("m"),
         );
         match convert_root(&legacy).unwrap() {
-            CQueryExpr::Merge { children } => {
-                assert_eq!(children.len(), 2);
-                for c in &children {
-                    assert!(matches!(
-                        c,
-                        CQueryExpr::Aggregate { aggs, .. }
-                            if matches!(aggs.as_slice(), [AggIntent::Quantile { .. }])
-                    ));
-                }
+            CQueryExpr::Aggregate { aggs, .. } => {
+                assert!(matches!(
+                    aggs.as_slice(),
+                    [AggIntent::StdDev {
+                        population: false,
+                        ..
+                    }]
+                ));
             }
-            other => panic!("expected Merge, got {other:?}"),
+            other => panic!("expected a plain Aggregate, got {other:?}"),
         }
     }
 

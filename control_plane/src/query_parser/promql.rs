@@ -1091,10 +1091,15 @@ mod tests {
     // ── stddev_over_time ──────────────────────────────────────────────────────
 
     #[test]
-    fn stddev_over_time_iqr_proxy() {
+    fn stddev_over_time_is_exact() {
+        // `AggIntent::StdDev` has no ASAP-tier sketch substitute
+        // (`capability_for` returns `None`, same as `Avg`), so
+        // `stddev_over_time` routes exact -- no more IQR-proxy
+        // `[q(0.25), q(0.75)]` approximation.
         let pq = pq("avg by (host) (stddev_over_time(cpu[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
-        assert!(pq.quantiles.contains(&0.25) && pq.quantiles.contains(&0.75));
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.quantiles.is_empty());
+        assert!(pq.exact_required);
     }
 
     // ── sum_over_time → exact ─────────────────────────────────────────────────
