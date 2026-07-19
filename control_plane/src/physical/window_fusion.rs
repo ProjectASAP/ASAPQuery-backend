@@ -191,10 +191,7 @@ mod tests {
     /// A canonical `Scan` leaf — built through `convert_root` so it carries
     /// the same Binder-built schema a real converted tree would.
     fn canonical_scan(metric: &str) -> QueryExpr {
-        convert_root(&LQueryExpr::Source(SourceSpec {
-            name: metric.into(),
-        }))
-        .expect("convert source")
+        convert_root(&LQueryExpr::Source(SourceSpec::new(metric))).expect("convert source")
     }
 
     /// The canonical `Window { Aggregate { by: [], aggs: [agg] } }` shape —
@@ -350,7 +347,7 @@ mod tests {
         let legacy = LQueryExpr::Window {
             duration: Duration::from_secs(60),
             slide: None,
-            input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+            input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
         };
         let canonical = convert_root(&legacy).expect("convert");
         assert!(recognize_windowed_sketch(&canonical).is_none());
@@ -363,17 +360,17 @@ mod tests {
         // shape the recognizer matches.
         let legacy = LQueryExpr::Aggregate {
             keys: vec![],
+            without: false,
             aggs: vec![AggItem {
-                alias: "q".into(),
+                alias: Some("q".into()),
                 func: AggFunc::Quantile(0.99),
                 col: LColumnRef::SampleValue,
-                distinct: false,
             }],
             having: None,
             input: Box::new(LQueryExpr::Window {
                 duration: Duration::from_secs(300),
                 slide: None,
-                input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+                input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
             }),
         };
         let canonical = convert_root(&legacy).expect("convert");

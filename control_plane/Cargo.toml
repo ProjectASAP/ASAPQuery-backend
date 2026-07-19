@@ -24,7 +24,12 @@ thiserror   = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono      = { version = "0.4",  features = ["serde"] }
-promql-parser  = "0.8"
+# Private mirror of GreptimeTeam/promql-parser (Apache-2.0), matching
+# ASAPController's frontend-promql -- carries local patches (limitk /
+# limit_ratio, a batch of experimental Prometheus functions) upstream
+# crates.io 0.8 doesn't have. Pinned to a commit, not the `asap` branch,
+# for the same reproducibility reason as the asap-ir pin below.
+promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "c51beafb361af4cc95ed62ae377862c660ceb757" }
 prost          = "0.13"
 bytes          = "1"
 zstd           = "0.13"
@@ -44,7 +49,11 @@ asap_types.workspace = true
 # scratchpad/artifacts/enum-unification-plan.md) -- WindowKind needs
 # Copy/Default/Hash/Display/FromStr + snake_case serde for
 # asap_types::enums::WindowKind to replace the backend's own WindowType.
+# Also satisfies everything Phase 2 (#395) needs -- asap-l2 (Step 4),
+# asap-plan/asap-sketch + Implementation::is_satisfied_by (Steps 8-9) --
+# 7fcaf91 is a strict descendant of every rev that PR pinned along the way.
 asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 

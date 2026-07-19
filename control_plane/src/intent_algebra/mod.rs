@@ -128,5 +128,5 @@ pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schem
 // at the point where they need a positional `ColumnId`.
 pub use column_resolution::{
     infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
-    resolve_column_refs, resolve_named_keys, ResolveError,
+    resolve_column_refs, resolve_expr, resolve_group_keys_promql, ResolveError,
 };

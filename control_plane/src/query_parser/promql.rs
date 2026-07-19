@@ -35,15 +35,39 @@ use std::time::Duration;
 use anyhow::anyhow;
 use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, VectorSelector};
 
-use crate::intent_algebra::relational::{FilterOp, FilterVal, PartitionKeys, Predicate};
+use crate::intent_algebra::relational::{FilterOp, FilterVal, Predicate};
 
 // ── Walk context ──────────────────────────────────────────────────────────────
+
+/// PromQL `by(labels)` / `without(labels)` aggregation modifier, accumulated
+/// as we descend the AST. Control_plane-only walking state — `asap_l2`'s
+/// `relational::QueryExpr::Aggregate` has no separate `Partition` node to
+/// mirror this against (its `keys`/`without` fields live directly on
+/// `Aggregate`, see `intent_algebra::relational`'s module doc), so this
+/// folds straight into the nearest `Aggregate`/`Window` via
+/// [`fold_group_mod`] instead of wrapping a dedicated node.
+#[derive(Clone)]
+enum GroupMod {
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+impl GroupMod {
+    fn keys(&self) -> &[String] {
+        match self {
+            GroupMod::By(k) | GroupMod::Without(k) => k,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.keys().is_empty()
+    }
+}
 
 /// Context accumulated as we descend the AST.
 #[derive(Default, Clone)]
 struct WalkCtx {
     /// GROUP BY / `without` clause from an outer Aggregate node.
-    partition: Option<PartitionKeys>,
+    partition: Option<GroupMod>,
     /// Top-K k from an outer `topk` / `bottomk` operator.
     topk: Option<u64>,
     /// Whether the outer context is a `count()` aggregate (→ CountDistinct).
@@ -159,12 +183,12 @@ fn extract_number_param(param: &Option<Box<Expr>>) -> anyhow::Result<f64> {
     }
 }
 
-// ── Helpers: PartitionKeys from LabelModifier ─────────────────────────────────
+// ── Helpers: GroupMod from LabelModifier ──────────────────────────────────────
 
-fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
+fn modifier_to_partition(modifier: &LabelModifier) -> GroupMod {
     match modifier {
-        LabelModifier::Include(labels) => PartitionKeys::By(labels.labels.clone()),
-        LabelModifier::Exclude(labels) => PartitionKeys::Without(labels.labels.clone()),
+        LabelModifier::Include(labels) => GroupMod::By(labels.labels.clone()),
+        LabelModifier::Exclude(labels) => GroupMod::Without(labels.labels.clone()),
     }
 }
 
@@ -180,9 +204,8 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
 use crate::intent_algebra::relational::{
-    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
-    PartitionKeys as QePartitionKeys, QueryExpr, SourceSpec as QeSourceSpec, VectorGrouping,
-    VectorMatch, VectorMatchKind,
+    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide, QueryExpr,
+    SourceSpec as QeSourceSpec, VectorGrouping, VectorMatch, VectorMatchKind,
 };
 use crate::intent_algebra::{ArithOp, CompareOp};
 use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality};
@@ -233,18 +256,18 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         // HLL-only or CMS-with-heap-only deploy).
         Expr::VectorSelector(vs) => {
             let (name, filters) = extract_vs_info(vs);
-            let source = QueryExpr::Source(QeSourceSpec { name });
+            let source = QueryExpr::Source(QeSourceSpec::new(name));
             let filtered = apply_qe_filters(source, filters);
             if ctx.outer_count || ctx.topk.is_some() {
                 Ok(filtered)
             } else {
                 Ok(QueryExpr::Aggregate {
                     keys: vec![],
+                    without: false,
                     aggs: vec![AggItem {
-                        alias: "value".into(),
+                        alias: Some("value".into()),
                         func: AggFunc::Sum,
                         col: QeColumnRef::SampleValue,
-                        distinct: false,
                     }],
                     having: None,
                     input: Box::new(filtered),
@@ -274,13 +297,14 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
                 outer_count: false,
             };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
-            // Don't wrap with Partition here — inner Aggregate already has the keys,
-            // and the lowering pass will create the Partition when it lowers the Aggregate.
+            // Don't fold the group keys into a separate wrapper here — the
+            // inner Aggregate already has them (or will, once its own
+            // construction site folds `partition` in).
             let result = QueryExpr::TopK {
                 k,
                 by: partition
                     .as_ref()
-                    .map(|p| p.keys().to_vec())
+                    .map(|p| p.keys().iter().cloned().map(QeColumnRef::Named).collect())
                     .unwrap_or_default(),
                 input: Box::new(inner),
             };
@@ -295,16 +319,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "count".into(),
+                    alias: Some("count".into()),
                     func: AggFunc::CountDistinct,
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "sum" | "avg" | "min" | "max" | "group" => {
             let inner_ctx = WalkCtx {
@@ -313,7 +337,7 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
                 outer_count: false,
             };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
-            Ok(apply_qe_partition(inner, partition))
+            Ok(fold_group_mod(inner, partition.as_ref()))
         }
         "stddev" => {
             let inner_ctx = WalkCtx {
@@ -324,16 +348,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "stddev".into(),
+                    alias: Some("stddev".into()),
                     func: AggFunc::StdDev { population: false },
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "stdvar" => {
             let inner_ctx = WalkCtx {
@@ -344,16 +368,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "stdvar".into(),
+                    alias: Some("stdvar".into()),
                     func: AggFunc::Variance { population: false },
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "quantile" => {
             let phi = extract_number_param(&agg.param)?;
@@ -365,16 +389,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "quantile".into(),
+                    alias: Some("quantile".into()),
                     func: AggFunc::Quantile(phi),
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         other => Err(anyhow!("unsupported PromQL aggregate operator: {other}")),
     }
@@ -419,7 +443,6 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             Ok(build_qe_aggregate(source, filters, window, func, ctx))
         }
         _ => {
-            let func = walk_call_to_op(call, &ctx)?;
             let (source, filters, window) = if call.func.name == "rate"
                 || call.func.name == "irate"
                 || call.func.name == "increase"
@@ -434,6 +457,7 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             } else {
                 extract_matrix_arg(call, 0)?
             };
+            let func = walk_call_to_op(call, &ctx, window)?;
             Ok(build_qe_aggregate(source, filters, window, func, ctx))
         }
     }
@@ -503,7 +527,14 @@ fn promql_token_to_binop(tok: TokenType) -> BinaryOpKind {
 }
 
 /// Map a PromQL function call to an [`AggFunc`] (Layer 2 relational operator).
-fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
+/// `window` is the range-vector's duration — only `Rate`/`Increase` carry it
+/// on the `AggFunc` itself (`asap_l2`'s design: "no separate Window node").
+/// Every other function still relies on the caller wrapping its `Aggregate`
+/// in an `L2::Window`, matching this repo's pre-`asap_l2`-merge behavior
+/// (see `lower.rs`'s module doc on why `Rate`/`Increase` map to
+/// `AggIntent::Sum` here rather than adopting the dedicated intents that
+/// window field would otherwise feed).
+fn walk_call_to_op(call: &Call, ctx: &WalkCtx, window: Duration) -> anyhow::Result<AggFunc> {
     let name = call.func.name;
     match name {
         "quantile_over_time" => {
@@ -521,19 +552,19 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
             //    `CountDistinct` (HLL distinct counting; the outer
             //    count of inner counts is cardinality).
             //  * Inside `topk(N, count_over_time(...))` → `Count`
-            //    (the topk wrapper expects a count-shaped inner).
-            //  * Otherwise → `Frequency` (per-series sample-count
-            //    estimation; routes to CMS / CountSketch via the
-            //    `AggFunc::Frequency → default_frequency()` lowering).
-            //    This was previously `AggFunc::Count` which the
-            //    un-grouped lowering branch pinned to
-            //    `AggIntent::Count{Exact}` → unsupported by ASAP.
+            //    (the topk wrapper expects a count-shaped inner; the
+            //    grouped-or-windowed `Count` → `Frequency` substitution
+            //    happens in `lower.rs::agg_func_to_intents`).
+            //  * Otherwise → plain `Count`, still windowed here — the
+            //    same `lower.rs` substitution recognizes the windowed
+            //    shape and routes to CMS / CountSketch (per-series
+            //    sample-count estimation), matching the pre-`asap_l2`
+            //    behavior this used to reach via a dedicated
+            //    `AggFunc::Frequency` variant that no longer exists.
             Ok(if ctx.outer_count {
                 AggFunc::CountDistinct
-            } else if ctx.topk.is_some() {
-                AggFunc::Count
             } else {
-                AggFunc::Frequency
+                AggFunc::Count
             })
         }
         "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" => {
@@ -541,9 +572,32 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
         }
         "delta" | "idelta" | "deriv" | "predict_linear" => Ok(AggFunc::Delta),
         "changes" | "resets" => Ok(AggFunc::Count),
-        "rate" | "irate" => Ok(AggFunc::Rate),
-        "increase" => Ok(AggFunc::Increase),
+        "rate" | "irate" => Ok(AggFunc::Rate { window }),
+        "increase" => Ok(AggFunc::Increase { window }),
         other => Err(anyhow!("unsupported PromQL function: {other}")),
+    }
+}
+
+/// Short lowercase label for an `AggFunc`, used as the `AggItem` alias.
+/// `AggFunc` is foreign (from `asap_l2`) — Rust's orphan rules forbid
+/// implementing `Display` for it here, unlike this repo's pre-merge own
+/// `AggFunc`, which had one.
+fn agg_func_label(f: &AggFunc) -> String {
+    match f {
+        AggFunc::Count => "count".into(),
+        AggFunc::Sum => "sum".into(),
+        AggFunc::Avg => "avg".into(),
+        AggFunc::Min => "min".into(),
+        AggFunc::Max => "max".into(),
+        AggFunc::StdDev { .. } => "stddev".into(),
+        AggFunc::Variance { .. } => "variance".into(),
+        AggFunc::Quantile(_) => "quantile".into(),
+        AggFunc::CountDistinct => "count_distinct".into(),
+        AggFunc::HeavyHitters { .. } => "heavy_hitters".into(),
+        AggFunc::Rate { .. } => "rate".into(),
+        AggFunc::Increase { .. } => "increase".into(),
+        AggFunc::Delta => "delta".into(),
+        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -555,7 +609,7 @@ fn build_qe_aggregate(
     func: AggFunc,
     ctx: WalkCtx,
 ) -> QueryExpr {
-    let source = QueryExpr::Source(QeSourceSpec { name: metric });
+    let source = QueryExpr::Source(QeSourceSpec::new(metric));
     let filtered = apply_qe_filters(source, filters);
     let windowed = QueryExpr::Window {
         duration: window,
@@ -568,136 +622,155 @@ fn build_qe_aggregate(
     } else {
         func
     };
-    // Propagate partition keys into the Aggregate's GROUP BY so the lowering
-    // pass sees Count-with-GROUP-BY → Frequency (not bare Count → no sketch).
-    let group_keys: Vec<String> = ctx
-        .partition
-        .as_ref()
-        .map(|p| p.keys().to_vec())
-        .unwrap_or_default();
-    let alias = format!("{}", actual_func).to_lowercase();
-    let agg = QueryExpr::Aggregate {
-        keys: group_keys,
+    // Propagate partition keys into the Aggregate's GROUP BY so
+    // `lower.rs`'s `agg_func_to_intents` sees a grouped `Count` → the
+    // `Frequency` sketch trigger (not a bare, exact `Count`).
+    let (group_keys, without): (Vec<String>, bool) = match &ctx.partition {
+        Some(GroupMod::By(k)) => (k.clone(), false),
+        Some(GroupMod::Without(k)) => (k.clone(), true),
+        None => (Vec::new(), false),
+    };
+    let alias = agg_func_label(&actual_func);
+    QueryExpr::Aggregate {
+        keys: group_keys.into_iter().map(QeColumnRef::Named).collect(),
+        without,
         aggs: vec![AggItem {
-            alias,
+            alias: Some(alias),
             func: actual_func,
             col: QeColumnRef::SampleValue,
-            distinct: false,
         }],
         having: None,
         input: Box::new(windowed),
-    };
-    // Don't wrap with Partition separately — keys are already in the
-    // Aggregate. The lowering pass folds them straight into the
-    // canonical `Aggregate.by: GroupKeys` (no `Partition` node exists in
-    // the canonical IR).
-    agg
+    }
 }
 
 fn apply_qe_filters(input: QueryExpr, filters: Vec<Predicate>) -> QueryExpr {
     if filters.is_empty() {
-        input
+        return input;
+    }
+    use crate::intent_algebra::{L2Expr, L3Scalar};
+
+    let conjuncts: Vec<L2Expr> = filters
+        .iter()
+        .map(|p| {
+            let col = L2Expr::Column(QeColumnRef::Named(p.col.clone()));
+            let val = |v: &FilterVal| match v {
+                FilterVal::Str(s) => L2Expr::Literal(L3Scalar::Utf8(s.clone())),
+                FilterVal::Num(n) => L2Expr::Literal(L3Scalar::Float64(*n)),
+                FilterVal::Int(i) => L2Expr::Literal(L3Scalar::Int64(*i)),
+                FilterVal::Null => L2Expr::Literal(L3Scalar::Null),
+            };
+            match &p.op {
+                FilterOp::Eq => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Eq,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Ne => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Ne,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Lt => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Lt,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Le => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Le,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Gt => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Gt,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Ge => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Ge,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Regex(r) => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Regex,
+                    right: Box::new(L2Expr::Literal(L3Scalar::Utf8(r.clone()))),
+                },
+                FilterOp::NotRegex(r) => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::NotRegex,
+                    right: Box::new(L2Expr::Literal(L3Scalar::Utf8(r.clone()))),
+                },
+                FilterOp::Like => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Like,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::NotLike => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::NotLike,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::IsNull => L2Expr::IsNull(Box::new(col)),
+                FilterOp::IsNotNull => L2Expr::IsNotNull(Box::new(col)),
+            }
+        })
+        .collect();
+    let pred = if conjuncts.len() == 1 {
+        conjuncts.into_iter().next().unwrap()
     } else {
-        use crate::intent_algebra::relational::{BinaryOpKind, LiteralValue, ScalarExpr};
-        use crate::intent_algebra::CompareOp;
-        let pred = filters
-            .iter()
-            .fold(ScalarExpr::Literal(LiteralValue::Bool(true)), |acc, p| {
-                let col = ScalarExpr::Column(p.col.clone());
-                let val = match &p.val {
-                    FilterVal::Str(s) => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
-                    FilterVal::Num(n) => ScalarExpr::Literal(LiteralValue::Float(*n)),
-                    FilterVal::Int(i) => ScalarExpr::Literal(LiteralValue::Int(*i)),
-                    FilterVal::Null => ScalarExpr::Literal(LiteralValue::Null),
-                };
-                let this = match &p.op {
-                    FilterOp::Eq => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Eq),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Ne => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Ne),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Lt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Lt),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Le => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Le),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Gt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Gt),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Ge => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Ge),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Regex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Regex),
-                        lhs: Box::new(col),
-                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
-                    },
-                    FilterOp::NotRegex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::NotRegex),
-                        lhs: Box::new(col),
-                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
-                    },
-                    FilterOp::Like => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::Like),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::NotLike => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Compare(CompareOp::NotLike),
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::IsNull => ScalarExpr::IsNull {
-                        expr: Box::new(col),
-                        negated: false,
-                    },
-                    FilterOp::IsNotNull => ScalarExpr::IsNull {
-                        expr: Box::new(col),
-                        negated: true,
-                    },
-                };
-                ScalarExpr::BinaryOp {
-                    op: BinaryOpKind::And,
-                    lhs: Box::new(acc),
-                    rhs: Box::new(this),
-                }
-            });
-        QueryExpr::Filter {
-            pred,
-            input: Box::new(input),
-        }
+        L2Expr::BoolAnd(conjuncts)
+    };
+    QueryExpr::Filter {
+        pred,
+        input: Box::new(input),
     }
 }
 
-fn apply_qe_partition(input: QueryExpr, partition: Option<PartitionKeys>) -> QueryExpr {
-    match partition {
-        None => input,
-        Some(p) if p.is_empty() => input,
-        Some(keys) => {
-            // Convert PromQL by/without → PartitionKeys.
-            let qe_keys = match keys {
-                PartitionKeys::By(k) => QePartitionKeys::By(k),
-                PartitionKeys::Without(k) => QePartitionKeys::Without(k),
-            };
-            QueryExpr::Partition {
-                keys: qe_keys,
-                input: Box::new(input),
-            }
-        }
+/// Fold `group` into the nearest `Aggregate` inside `qe` — `asap_l2`'s
+/// `Aggregate` carries `keys`/`without` directly (no separate `Partition`
+/// node to wrap in; see `intent_algebra::relational`'s module doc).
+/// Mirrors `lower.rs`'s `fold_partition_keys`, one layer up (L2, not L3):
+/// handles the shapes the walker actually produces (a bare `Aggregate` or
+/// a `Window` wrapping one); anything else (`BinaryOp`, a bare `Source`)
+/// has no `Aggregate` to fold into and passes through unchanged — e.g.
+/// `sum by (host) (a or b)`, where the group modifier belongs to a
+/// `BinaryOp` composition, not a reducing aggregate.
+fn fold_group_mod(qe: QueryExpr, group: Option<&GroupMod>) -> QueryExpr {
+    let Some(group) = group else {
+        return qe;
+    };
+    if group.is_empty() {
+        return qe;
+    }
+    match qe {
+        QueryExpr::Aggregate {
+            aggs,
+            having,
+            input,
+            ..
+        } => QueryExpr::Aggregate {
+            keys: group
+                .keys()
+                .iter()
+                .cloned()
+                .map(QeColumnRef::Named)
+                .collect(),
+            without: matches!(group, GroupMod::Without(_)),
+            aggs,
+            having,
+            input,
+        },
+        QueryExpr::Window {
+            duration,
+            slide,
+            input,
+        } => QueryExpr::Window {
+            duration,
+            slide,
+            input: Box::new(fold_group_mod(*input, Some(group))),
+        },
+        other => other,
     }
 }
 
