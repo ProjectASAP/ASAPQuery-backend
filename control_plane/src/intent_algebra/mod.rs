@@ -41,10 +41,13 @@
 //!   may share a `LetBinding` only when the producer's output schema
 //!   has at least one `unique_keys` set. This is the proof point that
 //!   `unique_keys` is load-bearing.
-//! - [`dedupe_subtrees`] — basic workload-level CSE pass that hoists
+//! - `dedupe_subtrees` — the basic workload-level CSE pass that hoists
 //!   structurally-identical sub-trees into shared `LetBinding`s
-//!   (`design.md` §6 batched-queries example, ~line 1256). The full
-//!   alpha-equivalence + nested-CSE algorithm is downstream.
+//!   (`design.md` §6 batched-queries example, ~line 1256) — lives in
+//!   `optimizer::cse` as of Phase 2 step 5 (ASAPController places this
+//!   pass in its cost-aware planning crate, not alongside the L3 IR type
+//!   definitions). The full alpha-equivalence + nested-CSE algorithm is
+//!   downstream.
 //!
 //! Scope reduction. The PR ships the variants the DC + PromQL deployment
 //! actually needs (`Scan`, `Window`, `Aggregate`, `LetBinding`, `Ref`).
@@ -72,11 +75,6 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod agg_intent;
-pub mod cse;
-// `L2Expr` isn't used yet -- `relational.rs` (L2) still builds its own
-// `ScalarExpr`, not `L2Expr`; that's the next Phase 2 step. `L3Expr` is
-// used now: `query_expr.rs`'s `Predicate` is `L3Expr`-based as of this
-// merge.
 pub mod expr_ir;
 pub mod query_expr;
 pub mod schema;
@@ -111,7 +109,6 @@ pub use agg_intent::{
     default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
-pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use expr_ir::{ArithOp, ColumnRef, CompareOp, Expr, L2Expr, L3Expr, L3Scalar};
 pub use query_expr::{
     aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,

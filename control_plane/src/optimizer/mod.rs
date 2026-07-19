@@ -26,12 +26,14 @@
 
 pub mod baseline;
 pub mod cost;
+pub mod cse;
 pub mod engine;
 pub mod rules;
 pub mod trait_def;
 
 // Re-exports — preserve the surface that `crate::algebra::QueryOptimizer`
 // and `crate::planner::*` consumers historically relied on.
+pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use engine::{DeploymentConstraints, QueryOptimizer};
 pub use trait_def::{OptimizerRule, RuleCategory};
 

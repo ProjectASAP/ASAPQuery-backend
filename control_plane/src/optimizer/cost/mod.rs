@@ -352,9 +352,10 @@ fn apply_delta_decision_with(
 // the lint baseline clean — mirrors the module-wide allowance on
 // `intent_algebra/mod.rs` while Phase B sat consumer-less.
 #[allow(unused_imports)]
-use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Schema};
+use asap_ir::intent_algebra::{BindingName, QueryId};
+
 #[allow(unused_imports)]
-use crate::types_v2::{BindingName, QueryId};
+use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Schema};
 
 /// Bundled cost of a multi-query workload, with per-root contributions
 /// and the savings unlocked by shared-producer credit. Returned by
@@ -435,12 +436,7 @@ pub fn workload_cost(plan: &WorkloadCostPlan<'_>) -> Result<WorkloadCost, QueryE
         let cost = subtree_cost(expr, &binding_costs, &schema_scope)?;
         let schema = expr.output_schema_in(&schema_scope)?;
         binding_costs.insert(name.as_str().to_owned(), cost);
-        // `BindingScope::with` (asap_ir) keys on asap_ir's `BindingName`,
-        // distinct from this module's workload-level `types_v2::BindingName`.
-        schema_scope = schema_scope.with(
-            asap_ir::intent_algebra::BindingName::new(name.0.clone()),
-            schema,
-        );
+        schema_scope = schema_scope.with(name.clone(), schema);
     }
 
     // 2. Cost each root in the bindings scope. `Ref` lookups charge 0.0
@@ -740,7 +736,8 @@ mod workload_cost_tests {
     use crate::intent_algebra::{
         AggIntent, Column, DataType, LabelFilter, QueryExpr, Schema, Source, WindowKind,
     };
-    use crate::types_v2::{AccuracyTarget, BindingName, QueryId};
+    use crate::types_v2::AccuracyTarget;
+    use asap_ir::intent_algebra::{BindingName, QueryId};
     use std::time::Duration;
 
     fn col(name: &str, dtype: DataType) -> Column {
