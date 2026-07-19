@@ -204,10 +204,12 @@ fn modifier_to_partition(modifier: &LabelModifier) -> GroupMod {
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
 use crate::intent_algebra::relational::{
-    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide, QueryExpr,
+    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide, L2SortKey, QueryExpr,
     SourceSpec as QeSourceSpec, VectorGrouping, VectorMatch, VectorMatchKind,
 };
-use crate::intent_algebra::{ArithOp, CompareOp};
+use crate::intent_algebra::{
+    is_frequency_heavy_hitter, ArithOp, CompareOp, L2Expr, RankingMeasure,
+};
 use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality};
 
 /// Parse a PromQL expression string directly into an optimised [`QueryExpr`].
@@ -284,6 +286,21 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     }
 }
 
+/// Whether `expr` (a `topk`/`bottomk` argument) is `count_over_time(...)`,
+/// possibly parenthesized — the one PromQL shape ranked by
+/// `RankingMeasure::Frequency`, the only measure with a realised
+/// heavy-hitter sketch today (`agg_intent::is_frequency_heavy_hitter`).
+/// A bare `count(...)` doesn't qualify: it's a *cross-series* reduction
+/// (one value, not per-series), so ranking by it isn't a per-series
+/// heavy-hitter shape in the first place.
+fn is_count_over_time(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(p) => is_count_over_time(p.expr.as_ref()),
+        Expr::Call(c) => c.func.name == "count_over_time",
+        _ => false,
+    }
+}
+
 fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     let partition = agg.modifier.as_ref().map(modifier_to_partition);
     let op_name = format!("{}", agg.op);
@@ -291,22 +308,71 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
     match op_name.as_str() {
         "topk" | "bottomk" => {
             let k = extract_number_param(&agg.param)? as u64;
+            let descending = op_name == "topk";
+            // A ranking is the heavy-hitter `TopK` intent only when it
+            // takes the *top* k (`descending` — `bottomk` never
+            // qualifies) *and* ranks by a measure with a realised
+            // heavy-hitter sketch — today, unweighted frequency
+            // (`count_over_time(...)`) only. Every other measure
+            // (avg/quantile/rate/a bare selector/...) is
+            // `RankingMeasure::NonAdditive` and falls through to a
+            // generic `Sort + Limit` order-by-value below — matching
+            // ASAPController's `frontend-promql` design (issue #38: "the
+            // descending-plus-measure rule is shared with the L3
+            // canonicalize promotion so the two cannot drift"). Before
+            // this, `topk(k, <anything>)` unconditionally forced a
+            // `Count`-shaped inner regardless of what was actually being
+            // ranked — silently wrong for `topk(k, avg_over_time(...))`
+            // and friends.
+            let measure = if is_count_over_time(agg.expr.as_ref()) {
+                RankingMeasure::Frequency
+            } else {
+                RankingMeasure::NonAdditive
+            };
+            if is_frequency_heavy_hitter(descending, measure) {
+                let inner_ctx = WalkCtx {
+                    partition: partition.clone(),
+                    topk: Some(k),
+                    outer_count: false,
+                };
+                let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
+                // Don't fold the group keys into a separate wrapper here —
+                // the inner Aggregate already has them (or will, once its
+                // own construction site folds `partition` in).
+                return Ok(QueryExpr::TopK {
+                    k,
+                    by: partition
+                        .as_ref()
+                        .map(|p| p.keys().iter().cloned().map(QeColumnRef::Named).collect())
+                        .unwrap_or_default(),
+                    input: Box::new(inner),
+                });
+            }
+            // Generic order-by-value + limit: `bottomk`, and any `topk`
+            // ranking by a non-count measure. `ctx.topk` stays `None` so
+            // `build_qe_aggregate` doesn't force a `Count`-shaped inner.
             let inner_ctx = WalkCtx {
                 partition: partition.clone(),
-                topk: Some(k),
+                topk: None,
                 outer_count: false,
             };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
-            // Don't fold the group keys into a separate wrapper here — the
-            // inner Aggregate already has them (or will, once its own
-            // construction site folds `partition` in).
-            let result = QueryExpr::TopK {
-                k,
-                by: partition
+            let sorted = QueryExpr::Sort {
+                keys: vec![L2SortKey {
+                    expr: L2Expr::Column(QeColumnRef::SampleValue),
+                    ascending: !descending,
+                    nulls_first: false,
+                }],
+                partition_by: partition
                     .as_ref()
                     .map(|p| p.keys().iter().cloned().map(QeColumnRef::Named).collect())
                     .unwrap_or_default(),
                 input: Box::new(inner),
+            };
+            let result = QueryExpr::Limit {
+                n: k,
+                offset: 0,
+                input: Box::new(sorted),
             };
             Ok(result)
         }
@@ -442,6 +508,16 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             let func = AggFunc::Quantile(phi);
             Ok(build_qe_aggregate(source, filters, window, func, ctx))
         }
+        // `predict_linear(v[w], t)` — `t` (seconds into the future) is a
+        // scalar 2nd argument, so it doesn't fit `walk_call_to_op`'s
+        // `(call, ctx, window)` shape; special-cased here like
+        // `quantile_over_time`'s φ argument above.
+        "predict_linear" => {
+            let seconds = extract_call_num_arg(call, 1)?;
+            let (source, filters, window) = extract_matrix_arg(call, 0)?;
+            let func = AggFunc::PredictLinear { seconds };
+            Ok(build_qe_aggregate(source, filters, window, func, ctx))
+        }
         _ => {
             let (source, filters, window) = if call.func.name == "rate"
                 || call.func.name == "irate"
@@ -530,10 +606,12 @@ fn promql_token_to_binop(tok: TokenType) -> BinaryOpKind {
 /// `window` is the range-vector's duration — only `Rate`/`Increase` carry it
 /// on the `AggFunc` itself (`asap_l2`'s design: "no separate Window node").
 /// Every other function still relies on the caller wrapping its `Aggregate`
-/// in an `L2::Window`, matching this repo's pre-`asap_l2`-merge behavior
-/// (see `lower.rs`'s module doc on why `Rate`/`Increase` map to
-/// `AggIntent::Sum` here rather than adopting the dedicated intents that
-/// window field would otherwise feed).
+/// in an `L2::Window`.
+///
+/// `predict_linear` is handled separately in `walk_call_qe` (its 2nd,
+/// scalar argument doesn't fit this function's `(call, ctx, window)`
+/// shape, matching how `quantile_over_time`/`histogram_quantile`'s φ
+/// argument is already special-cased there).
 fn walk_call_to_op(call: &Call, ctx: &WalkCtx, window: Duration) -> anyhow::Result<AggFunc> {
     let name = call.func.name;
     match name {
@@ -547,31 +625,52 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx, window: Duration) -> anyhow::Resu
         "stddev_over_time" => Ok(AggFunc::StdDev { population: false }),
         "stdvar_over_time" => Ok(AggFunc::Variance { population: false }),
         "count_over_time" => {
-            // Three cases, in priority order:
+            // Two cases, in priority order:
             //  * Inside `count by (...) (count_over_time(...))` →
             //    `CountDistinct` (HLL distinct counting; the outer
             //    count of inner counts is cardinality).
-            //  * Inside `topk(N, count_over_time(...))` → `Count`
-            //    (the topk wrapper expects a count-shaped inner; the
-            //    grouped-or-windowed `Count` → `Frequency` substitution
-            //    happens in `lower.rs::agg_func_to_intents`).
             //  * Otherwise → plain `Count`, still windowed here — the
-            //    same `lower.rs` substitution recognizes the windowed
-            //    shape and routes to CMS / CountSketch (per-series
-            //    sample-count estimation), matching the pre-`asap_l2`
-            //    behavior this used to reach via a dedicated
-            //    `AggFunc::Frequency` variant that no longer exists.
+            //    `lower.rs::agg_func_to_intents` grouped-or-windowed
+            //    substitution recognizes the windowed shape and routes
+            //    to CMS / CountSketch (per-series sample-count
+            //    estimation), matching the pre-`asap_l2` behavior this
+            //    used to reach via a dedicated `AggFunc::Frequency`
+            //    variant that no longer exists. `topk(N, count_over_time
+            //    (...))`'s heavy-hitter fusion is handled entirely in
+            //    `walk_aggregate_qe`'s `topk`/`bottomk` arm now (it no
+            //    longer forces `Count` here via `ctx.topk`).
             Ok(if ctx.outer_count {
                 AggFunc::CountDistinct
             } else {
                 AggFunc::Count
             })
         }
-        "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" => {
-            Ok(AggFunc::Sum)
-        }
-        "delta" | "idelta" | "deriv" | "predict_linear" => Ok(AggFunc::Delta),
-        "changes" | "resets" => Ok(AggFunc::Count),
+        "sum_over_time" => Ok(AggFunc::Sum),
+        "last_over_time" => Ok(AggFunc::LastOverTime),
+        "present_over_time" => Ok(AggFunc::PresentOverTime),
+        "absent_over_time" => Ok(AggFunc::AbsentOverTime),
+        // Each of these used to collapse onto `Delta` (delta/idelta/deriv)
+        // or `Count` (changes/resets) — a crude placeholder bucketing from
+        // before `asap_l2` gave every one of them its own dedicated
+        // `AggFunc`/`AggIntent`. All are archive-only (no ASAP-tier
+        // Bind* rule exists for any of them, same as before this fix) —
+        // the correctness gain is `capability_for` now correctly
+        // returning `None` (route to archive) instead of the wrong
+        // `Some(ExactAgg(Sum))` / `Some(CardinalityApprox))` these used
+        // to produce, which claimed the ASAP tier could answer a
+        // `deriv()`/`changes()` query it structurally cannot.
+        "delta" => Ok(AggFunc::Delta),
+        "idelta" => Ok(AggFunc::IDelta),
+        "deriv" => Ok(AggFunc::Deriv),
+        "changes" => Ok(AggFunc::Changes),
+        "resets" => Ok(AggFunc::Resets),
+        // `Rate`/`Increase` now map onto their own dedicated `AggIntent`s
+        // in `lower.rs` (`capability_for` already has a real, tested
+        // `Rate | Increase => ExactAgg(Increase)` arm — this activates
+        // it for the first time via the PromQL path; previously
+        // collapsed onto `AggIntent::Sum`, which happened to route to
+        // the same *kind* of exact-precompute capability but under the
+        // wrong classification).
         "rate" | "irate" => Ok(AggFunc::Rate { window }),
         "increase" => Ok(AggFunc::Increase { window }),
         other => Err(anyhow!("unsupported PromQL function: {other}")),
@@ -896,8 +995,81 @@ mod tests {
 
     #[test]
     fn topk_avg_over_time() {
+        // `topk` ranking by a non-count measure (`avg_over_time`, here)
+        // is not a heavy-hitter shape — `RankingMeasure::NonAdditive`,
+        // per `agg_intent::is_frequency_heavy_hitter` — so this becomes
+        // a generic `Sort + Limit` over `avg_over_time`'s own
+        // `Aggregate{Quantile(0.5)}` p50 approximation, not a forced
+        // `Count`/`Frequency` aggregate. Before the topk/rate precision
+        // fix this incorrectly asserted `[Frequency]`.
         let pq = pq("topk by (host) (5, avg_over_time(cpu[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Frequency]);
+        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
+        assert_eq!(pq.quantiles, vec![0.5]);
+    }
+
+    #[test]
+    fn topk_avg_over_time_is_sort_limit_not_topk_node() {
+        // Structural check backing `topk_avg_over_time` above: the tree
+        // must be `Limit { Sort { Aggregate{Quantile} } }`, not
+        // `QueryExpr::TopK` — confirms the non-heavy-hitter path is
+        // really taken, not just that the flattened `ParsedQuery`
+        // happens to read the same.
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("topk by (host) (5, avg_over_time(cpu[5m]))")
+            .expect("parse should succeed");
+        match &qe {
+            QueryExpr::Limit { n, input, .. } => {
+                assert_eq!(*n, 5);
+                assert!(
+                    matches!(input.as_ref(), QueryExpr::Sort { .. }),
+                    "expected Sort under Limit, got {input:?}"
+                );
+            }
+            other => panic!("expected Limit{{Sort{{...}}}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bottomk_count_over_time_is_never_heavy_hitter() {
+        // `bottomk` never qualifies as the heavy-hitter `TopK` intent
+        // even when ranking by `count_over_time` — `descending` must
+        // also hold (`is_frequency_heavy_hitter`), and `bottomk` is
+        // ascending by definition. Must still lower to `Limit{Sort{...}}`.
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("bottomk(5, count_over_time(http_requests_total[5m]))")
+            .expect("parse should succeed");
+        assert!(
+            !matches!(qe, QueryExpr::TopK { .. }),
+            "bottomk must never produce the heavy-hitter TopK node, got {qe:?}"
+        );
+        match &qe {
+            QueryExpr::Limit { n, input, .. } => {
+                assert_eq!(*n, 5);
+                match input.as_ref() {
+                    QueryExpr::Sort { keys, .. } => {
+                        assert!(keys[0].ascending, "bottomk must sort ascending");
+                    }
+                    other => panic!("expected Sort under Limit, got {other:?}"),
+                }
+            }
+            other => panic!("expected Limit{{Sort{{...}}}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_count_over_time_is_topk_node() {
+        // The one real heavy-hitter shape: `topk` (descending) ranking
+        // by `count_over_time` (`RankingMeasure::Frequency`).
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("topk(5, count_over_time(http_requests_total[5m]))")
+            .expect("parse should succeed");
+        assert!(
+            matches!(qe, QueryExpr::TopK { k: 5, .. }),
+            "expected QueryExpr::TopK{{k: 5, ..}}, got {qe:?}"
+        );
     }
 
     // ── count cardinality ─────────────────────────────────────────────────────

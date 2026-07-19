@@ -9,21 +9,43 @@
 //!
 //! Now that `relational.rs` (L2) itself merged onto `asap_l2` (see that
 //! file's module doc), this converter is control_plane's *own* — not a
-//! re-export of `asap_l2::lower::convert_root` — for one deliberate
-//! reason: `asap_l2`'s `AggFunc`→`AggIntent` mapping
-//! (`agg_func_to_intent` in its `lower.rs`) produces literal
-//! `AggIntent::Avg` / `Rate` / `Increase` for those `AggFunc`s, whereas
-//! this repo needs the pre-merge behavior a real, tested consumer
-//! (`asap_tier_analysis`'s `outer_fn` dispatch) still depends on:
-//! `avg_over_time` → a p50 quantile-sketch approximation, and
-//! `Rate`/`Increase`/`Delta` → `AggIntent::Sum` (disambiguated via the
-//! separate `outer_fn` field, not by intent shape). Reconciling that
-//! dispatch to consume the dedicated intents directly is real,
-//! deliberately-deferred follow-up work (tracked for the PromQL-frontend
-//! semantic-retarget step), not a byproduct of this type merge. Every
-//! *structural* piece below (scalar resolution, schema threading, the
-//! `GroupKeys` shape) is unchanged from `asap_l2`'s own converter —
-//! only the `Aggregate`/`AggFunc` handling is control_plane-specific.
+//! re-export of `asap_l2::lower::convert_root` — for one remaining
+//! deliberate reason: `avg_over_time` stays a p50 quantile-sketch
+//! approximation rather than `asap_l2`'s literal (exact,
+//! non-mergeable) `AggIntent::Avg`, because
+//! `query_parser::QeCollector::collect_op` (which has no `Avg` arm of
+//! its own) relies on that substitution to classify `avg_over_time` as
+//! `AggType::Quantile`. Every *structural* piece below (scalar
+//! resolution, schema threading, the `GroupKeys` shape) is unchanged
+//! from `asap_l2`'s own converter — only this one `Aggregate`/`AggFunc`
+//! mapping choice is control_plane-specific.
+//!
+//! **PromQL-frontend semantic-retarget step (topk/rate precision fix).**
+//! `Rate`/`Increase`/`Changes`/`Delta`/`IDelta`/`Deriv`/`PredictLinear`/
+//! `DoubleExpSmoothing`/`Resets` used to all collapse onto
+//! `AggIntent::Sum` or `Count` here — a crude placeholder bucketing
+//! predating `asap_l2`'s own per-function `AggIntent` vocabulary. They
+//! now map onto their own dedicated intents, matching `asap_l2`'s
+//! mapping exactly (this repo no longer diverges from it for these).
+//! `Rate`/`Increase` activate a real, previously-dormant
+//! `capability_for` arm (`Rate | Increase => ExactAgg(Increase)`) for
+//! the first time via the PromQL path; the rest are archive-only
+//! either way, so the fix is `capability_for` now correctly returning
+//! `None` instead of a wrong `Some(...)` for functions the ASAP tier
+//! was never actually able to answer that way. `asap_tier_analysis`'s
+//! `outer_fn` field is unaffected by any of this — it's computed
+//! independently off the raw PromQL function name, not the lowered
+//! `AggIntent`.
+//!
+//! `query_parser::promql`'s `topk`/`bottomk` handling was the other half
+//! of this step: it used to force every `topk(...)` argument into a
+//! `Count`-shaped inner regardless of what was actually being ranked
+//! (silently wrong for `topk(k, avg_over_time(...))`). It now only takes
+//! the heavy-hitter `TopK` path when ranking descending by
+//! `count_over_time(...)` specifically (`RankingMeasure::Frequency`,
+//! the one realised heavy-hitter measure) — everything else, including
+//! every `bottomk`, becomes a generic `Sort + Limit`, matching
+//! ASAPController's `frontend-promql` design.
 //!
 //! Two consequences of adopting `asap_l2::relational::QueryExpr`:
 //!
@@ -502,43 +524,57 @@ fn agg_func_to_intents(func: &AggFunc, frequency_trigger: bool) -> Vec<AggIntent
         AggFunc::Quantile(phi) => vec![q(*phi)],
         AggFunc::CountDistinct => vec![crate::intent_algebra::default_cardinality()],
         AggFunc::HeavyHitters { .. } => vec![crate::intent_algebra::default_frequency()],
-        // `Rate` / `Increase` / `Delta` map onto `AggIntent::Sum`, not the
-        // dedicated `AggIntent::Rate` / `Increase` / `Delta` variants —
-        // the `asap_tier_analysis` engine dispatch deliberately collapses
-        // all of `rate` / `irate` / `increase` / `sum_over_time` onto one
-        // `Capability::ExactAgg(Sum)` and disambiguates via the separate
-        // typed `outer_fn` field instead (see
-        // `asap_tier_analysis::tests::rate_and_sum_over_time_share_
-        // capability_but_differ_on_outer_fn` and the surrounding
-        // "outer_fn — rate vs plain disambiguation" test block). Using
-        // the dedicated intents here would fragment that dispatch.
-        // `Changes`/`Resets` also collapse onto `Count` for the same
-        // reason (this repo's pre-`asap_l2`-merge `AggFunc` never
-        // distinguished them from `Count` either) -- and everything else
-        // in the "counter-derivative range functions" family collapses
-        // onto `Delta`, matching this repo's pre-merge behavior exactly.
-        // Properly distinguishing all of these is deferred to the
-        // PromQL-frontend semantic-retarget step, alongside the
-        // `outer_fn` reconciliation above.
-        AggFunc::Rate { .. } | AggFunc::Increase { .. } => vec![AggIntent::Sum { col: None }],
-        AggFunc::Changes | AggFunc::Resets => {
-            agg_func_to_intents(&AggFunc::Count, frequency_trigger)
+        // `Rate` / `Increase` now map onto their own dedicated
+        // `AggIntent`s (PromQL-frontend semantic-retarget step) --
+        // `capability_for` already has a real, tested
+        // `Rate | Increase => ExactAgg(Increase)` arm (`sketch_algebra::
+        // capability`); this activates it via the PromQL path for the
+        // first time. `asap_tier_analysis`'s `outer_fn` field is
+        // unaffected -- it's computed independently, straight off the
+        // raw PromQL function name (`trace_from_promql`'s
+        // `set_counter_fn`), not off the lowered `AggIntent`, so it
+        // still tells the engine's reducer *how* to interpret the
+        // accumulated value (rate needs a divide-by-range step, increase
+        // doesn't) regardless of what capability got matched.
+        AggFunc::Rate { .. } => vec![AggIntent::Rate],
+        AggFunc::Increase { .. } => vec![AggIntent::Increase],
+        // `Changes` / `Delta` / `IDelta` / `Deriv` / `PredictLinear` /
+        // `DoubleExpSmoothing` / `Resets` likewise now map onto their own
+        // dedicated `AggIntent`s instead of collapsing onto `Count`/`Sum`
+        // -- all are archive-only (`agg_intent::archive_only`; no
+        // `Bind*` rule exists for any of them, same as before this fix),
+        // so the real effect is `capability_for` now correctly returning
+        // `None` (route to archive) instead of the wrong
+        // `Some(ExactAgg(Sum))` / `Some(CardinalityApprox)` the old
+        // Sum/Count collapse produced -- these functions were never
+        // actually answerable from the ASAP tier that way.
+        AggFunc::Changes => vec![AggIntent::Changes],
+        AggFunc::Resets => vec![AggIntent::Resets],
+        AggFunc::Delta => vec![AggIntent::Delta],
+        AggFunc::IDelta => vec![AggIntent::IDelta],
+        AggFunc::Deriv => vec![AggIntent::Deriv],
+        AggFunc::PredictLinear { seconds } => vec![AggIntent::PredictLinear { seconds: *seconds }],
+        AggFunc::DoubleExpSmoothing { smoothing, trend } => {
+            vec![AggIntent::DoubleExpSmoothing {
+                smoothing: *smoothing,
+                trend: *trend,
+            }]
         }
-        AggFunc::Delta
-        | AggFunc::IDelta
-        | AggFunc::Deriv
-        | AggFunc::PredictLinear { .. }
-        | AggFunc::DoubleExpSmoothing { .. } => vec![AggIntent::Sum { col: None }],
         // Every remaining `AggFunc` (native-histogram accessors,
-        // math/trig, presence, time/calendar, `Group`/`CountValues`,
-        // the extended range-vector reducers) has no pre-`asap_l2`-merge
-        // equivalent in this repo's PromQL surface at all -- promql.rs
-        // doesn't construct any of them today (`walk_call_to_op`'s
-        // exhaustive function-name table has no arm reaching them), so
-        // there's no existing behavior to preserve. Map each directly
-        // onto its like-named `AggIntent` (all archive-only per
+        // math/trig, time/calendar, `Group`/`CountValues`, the extended
+        // range-vector reducers) has no pre-`asap_l2`-merge equivalent
+        // in this repo's PromQL surface at all -- promql.rs doesn't
+        // construct any of them today (`walk_call_to_op`'s exhaustive
+        // function-name table has no arm reaching them), so there's no
+        // existing behavior to preserve. Map each directly onto its
+        // like-named `AggIntent` (all archive-only per
         // `agg_intent::archive_only`, so this is inert until a real
-        // caller constructs one).
+        // caller constructs one). `Absent` / `AbsentOverTime` /
+        // `PresentOverTime` / `LastOverTime` *are* constructed by
+        // promql.rs today (`absent_over_time` / `present_over_time` /
+        // `last_over_time`) -- listed here rather than above only
+        // because they were already correctly mapped before this fix
+        // (never went through the Sum collapse).
         AggFunc::HistogramCount => vec![AggIntent::HistogramCount],
         AggFunc::HistogramSum => vec![AggIntent::HistogramSum],
         AggFunc::HistogramAvg => vec![AggIntent::HistogramAvg],
@@ -804,19 +840,50 @@ mod tests {
     }
 
     #[test]
-    fn rate_and_increase_map_to_sum() {
-        for func in [
-            AggFunc::Rate {
-                window: Duration::from_secs(300),
-            },
-            AggFunc::Increase {
-                window: Duration::from_secs(300),
-            },
-        ] {
+    fn rate_and_increase_map_to_dedicated_intents() {
+        let cases = [
+            (
+                AggFunc::Rate {
+                    window: Duration::from_secs(300),
+                },
+                AggIntent::Rate,
+            ),
+            (
+                AggFunc::Increase {
+                    window: Duration::from_secs(300),
+                },
+                AggIntent::Increase,
+            ),
+        ];
+        for (func, expected) in cases {
             let legacy = agg(vec![], false, vec![agg_item("r", func)], src("m"));
             match convert_root(&legacy).unwrap() {
                 CQueryExpr::Aggregate { aggs, .. } => {
-                    assert!(matches!(aggs.as_slice(), [AggIntent::Sum { col: None }]))
+                    assert_eq!(aggs.as_slice(), [expected]);
+                }
+                other => panic!("expected Aggregate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn changes_resets_delta_family_map_to_dedicated_intents() {
+        let cases = [
+            (AggFunc::Changes, AggIntent::Changes),
+            (AggFunc::Resets, AggIntent::Resets),
+            (AggFunc::Delta, AggIntent::Delta),
+            (AggFunc::IDelta, AggIntent::IDelta),
+            (AggFunc::Deriv, AggIntent::Deriv),
+            (
+                AggFunc::PredictLinear { seconds: 60.0 },
+                AggIntent::PredictLinear { seconds: 60.0 },
+            ),
+        ];
+        for (func, expected) in cases {
+            let legacy = agg(vec![], false, vec![agg_item("x", func)], src("m"));
+            match convert_root(&legacy).unwrap() {
+                CQueryExpr::Aggregate { aggs, .. } => {
+                    assert_eq!(aggs.as_slice(), [expected]);
                 }
                 other => panic!("expected Aggregate, got {other:?}"),
             }
