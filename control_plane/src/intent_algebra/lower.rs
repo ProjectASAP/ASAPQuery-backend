@@ -9,16 +9,29 @@
 //!
 //! Now that `relational.rs` (L2) itself merged onto `asap_l2` (see that
 //! file's module doc), this converter is control_plane's *own* — not a
-//! re-export of `asap_l2::lower::convert_root` — for one remaining
-//! deliberate reason: `avg_over_time` stays a p50 quantile-sketch
-//! approximation rather than `asap_l2`'s literal (exact,
-//! non-mergeable) `AggIntent::Avg`, because
-//! `query_parser::QeCollector::collect_op` (which has no `Avg` arm of
-//! its own) relies on that substitution to classify `avg_over_time` as
-//! `AggType::Quantile`. Every *structural* piece below (scalar
-//! resolution, schema threading, the `GroupKeys` shape) is unchanged
-//! from `asap_l2`'s own converter — only this one `Aggregate`/`AggFunc`
-//! mapping choice is control_plane-specific.
+//! re-export of `asap_l2::lower::convert_root` — because the
+//! `Aggregate` arm's multi-agg fusion and `frequency_trigger` heuristic
+//! (see the `Frequency` preservation section below) are control_plane's
+//! own dispatch design, with no `asap_l2` equivalent (`asap_l2` always
+//! threads a single workload-level `AccuracyTarget` through
+//! `agg_func_to_intent` with no grouped/windowed heuristic of its own).
+//! Every other *structural* piece below (scalar resolution, schema
+//! threading, the `GroupKeys` shape, and now also the full `AggFunc`→
+//! `AggIntent` mapping table itself) is unchanged from `asap_l2`'s own
+//! converter — `avg_over_time` used to be the one deliberate mapping
+//! divergence (a p50 quantile-sketch approximation in place of
+//! `asap_l2`'s literal, exact `AggIntent::Avg`) but that's gone too:
+//! `AggFunc::Avg` now maps onto the literal `AggIntent::Avg` exactly
+//! like `asap_l2::lower` does, since `capability_for(&AggIntent::Avg)`
+//! already correctly returns `None` (no ASAP-tier sketch substitute —
+//! `avg` needs a cross-policy Sum+Count join, tracked as a follow-up)
+//! and ASAPController's own `crates/plan/src/bind.rs` treats
+//! `AggIntent::Avg` the same way (`pass_through_intents_stay_logical`
+//! keeps it a whole logical, unsketched subtree). `avg` now routes
+//! through the same exact/archive path as `Sum`/`Count`/every
+//! archive-only intent — `QeCollector::collect_op`'s existing catch-all
+//! `exact_required = true` arm already handles it with no dedicated
+//! `Avg` arm needed.
 //!
 //! **PromQL-frontend semantic-retarget step (topk/rate precision fix).**
 //! `Rate`/`Increase`/`Changes`/`Delta`/`IDelta`/`Deriv`/`PredictLinear`/
@@ -511,13 +524,19 @@ fn agg_func_to_intents(func: &AggFunc, frequency_trigger: bool) -> Vec<AggIntent
             accuracy: AccuracyTarget::Exact,
         }],
         AggFunc::Sum => vec![AggIntent::Sum { col: None }],
-        // `Avg` approximates as the p50 (median) quantile sketch rather
-        // than a literal (exact, non-mergeable) `AggIntent::Avg` —
-        // matches `Min`/`Max`'s boundary-quantile treatment and is what
-        // `query_parser::QeCollector::collect_op` (which has no `Avg`
-        // arm of its own) relies on to classify `avg_over_time` as
-        // `AggType::Quantile` with `quantiles: [0.5]`.
-        AggFunc::Avg => vec![q(0.5)],
+        // `Avg` maps onto the literal, exact, non-mergeable
+        // `AggIntent::Avg` — matching `asap_l2::lower`'s own mapping
+        // exactly. `capability_for(&AggIntent::Avg)` already returns
+        // `None` (no ASAP-tier sketch substitute; needs a cross-policy
+        // Sum+Count join, tracked as a follow-up), matching
+        // ASAPController's own stance: `crates/plan/src/bind.rs`'s
+        // `pass_through_intents_stay_logical` test keeps `AggIntent::Avg`
+        // as a whole logical subtree with no sketch binding. So `avg`
+        // routes through the exact/archive path, same as `Sum`/`Count`/
+        // `TopK`/every archive-only intent — `QeCollector::collect_op`
+        // already handles this correctly via its catch-all
+        // `exact_required = true` arm, no dedicated `Avg` arm needed.
+        AggFunc::Avg => vec![AggIntent::Avg { col: None }],
         AggFunc::Min => vec![AggIntent::Min { col: None }],
         AggFunc::Max => vec![AggIntent::Max { col: None }],
         AggFunc::StdDev { .. } | AggFunc::Variance { .. } => vec![q(0.25), q(0.75)],

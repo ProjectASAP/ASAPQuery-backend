@@ -962,10 +962,17 @@ mod tests {
     // ── avg_over_time ─────────────────────────────────────────────────────────
 
     #[test]
-    fn avg_over_time_maps_to_p50() {
+    fn avg_over_time_is_exact() {
+        // `AggIntent::Avg` has no ASAP-tier sketch substitute
+        // (`capability_for` returns `None` — needs a cross-policy
+        // Sum+Count join) and ASAPController's own `asap-plan` treats it
+        // the same way (`pass_through_intents_stay_logical`), so `avg`
+        // routes through the exact/archive path like `Sum`/`Count`,
+        // not the p50-quantile-sketch approximation this used to be.
         let pq = pq("avg by (symbol) (avg_over_time(financial_last_trade_price[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
-        assert_eq!(pq.quantiles, vec![0.5]);
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.quantiles.is_empty());
+        assert!(pq.exact_required);
     }
 
     // ── min/max_over_time ─────────────────────────────────────────────────────
@@ -998,13 +1005,14 @@ mod tests {
         // `topk` ranking by a non-count measure (`avg_over_time`, here)
         // is not a heavy-hitter shape — `RankingMeasure::NonAdditive`,
         // per `agg_intent::is_frequency_heavy_hitter` — so this becomes
-        // a generic `Sort + Limit` over `avg_over_time`'s own
-        // `Aggregate{Quantile(0.5)}` p50 approximation, not a forced
-        // `Count`/`Frequency` aggregate. Before the topk/rate precision
-        // fix this incorrectly asserted `[Frequency]`.
+        // a generic `Sort + Limit` over `avg_over_time`'s own exact
+        // `Aggregate{Avg}`, not a forced `Count`/`Frequency` aggregate.
+        // Before the topk/rate precision fix this incorrectly asserted
+        // `[Frequency]`; `avg_over_time` itself is exact (see
+        // `avg_over_time_is_exact`), not a p50 quantile-sketch anymore.
         let pq = pq("topk by (host) (5, avg_over_time(cpu[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
-        assert_eq!(pq.quantiles, vec![0.5]);
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.exact_required);
     }
 
     #[test]

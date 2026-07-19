@@ -562,8 +562,11 @@ mod tests {
         spec.metric_name = "my_custom_metric".into();
         let w = Analyzer::new().analyze(spec).unwrap();
         assert_eq!(w.metric_name, "my_custom_metric");
-        // aggregations still come from parse (avg → DDSketch → Quantile)
-        assert_eq!(w.aggregations, vec![AggType::Quantile]);
+        // aggregations still come from parse — `avg_over_time` is exact
+        // (no ASAP-tier sketch substitute for `AggIntent::Avg`), so
+        // `aggregations` stays empty and `exact_required` flips instead.
+        assert_eq!(w.aggregations, Vec::<AggType>::new());
+        assert!(w.exact_required);
     }
 
     /// Explicit time_window overrides the window derived from query_string.
