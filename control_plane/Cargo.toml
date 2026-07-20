@@ -40,13 +40,14 @@ asap_types.workspace = true
 # tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
 # once one exists.
 #
-# Bumped to 283b6ab (merge of PR #141, "convert Implementation::is_satisfied_by
-# into a Matcher trait") to pick up asap-plan::Matcher/Implementation and
-# asap-sketch::{SummaryKind, SummaryParams} for the sketch-identity
-# unification work (see scratchpad/artifacts/enum-unification-plan.md).
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
+# Bumped to 150ef7d (merge of PR #142, "derive PartialOrd/Ord for
+# SummaryKind") for the sketch-identity unification work (see
+# scratchpad/artifacts/enum-unification-plan.md) -- SummaryKind needs Ord
+# for the BTreeSet<SummaryKind> deterministic-emission-order contract in
+# control_plane::physical::colored_dag::emitter::EdgeStageConfig::metric_to_family.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

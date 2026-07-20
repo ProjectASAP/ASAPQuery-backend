@@ -51,10 +51,10 @@ pub use trait_def::{
 pub use crate::workload::WorkloadRegistry;
 
 use crate::physical::colored_dag::emitter::EdgeStageConfig;
-use crate::sketch_algebra::params::SketchKind;
 use crate::sketch_algebra::PhysicalExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
+use asap_sketch::SummaryKind;
 
 /// Phase ε.1.5 — which edge runtime an agent identifies as.
 ///
@@ -290,7 +290,7 @@ fn apply_cold_format_from_env(edge_cfg: &mut EdgeStageConfig) {
 /// (`Logical`-only, unresolved `Ref`, raw Mode-3 archive). These map
 /// onto the raw-passthrough default pipeline in the routing emitter,
 /// which is correct.
-pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
+pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SummaryKind> {
     match expr {
         PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
         PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
@@ -324,7 +324,7 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
 /// (`quantile_over_time` → DDSketch, `count`-distinct → HLL, `topk` →
 /// CountSketch, …). We therefore collect the UNION of every workload
 /// entry's committed sketch family per metric into a
-/// `BTreeSet<SketchKind>` (deterministic order). The emitter routes the
+/// `BTreeSet<SummaryKind>` (deterministic order). The emitter routes the
 /// metric to EACH family in its set and prunes pipelines/processors to
 /// the union of all sets — eliminating the prior all-5 fan-out that
 /// shipped sketch state through every family regardless of need.
@@ -344,8 +344,8 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchKind> {
 pub fn collect_metric_to_family(
     registry: &WorkloadRegistry,
     workload_store: &WorkloadStore,
-) -> std::collections::HashMap<String, std::collections::BTreeSet<SketchKind>> {
-    let mut out: std::collections::HashMap<String, std::collections::BTreeSet<SketchKind>> =
+) -> std::collections::HashMap<String, std::collections::BTreeSet<SummaryKind>> {
+    let mut out: std::collections::HashMap<String, std::collections::BTreeSet<SummaryKind>> =
         std::collections::HashMap::new();
     for entry in registry.entries() {
         // B2 (metric, role) restructure: walk EVERY role registered for
@@ -733,8 +733,7 @@ mod runtime_tests {
         let _env = crate::test_support::env_lock();
         use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
-        use crate::sketch_algebra::params::SketchKind;
-        use crate::sketch_algebra::params::{DDSketchParams, SketchParams};
+        use asap_sketch::SummaryParams;
 
         let cfg = EdgeStageConfig {
             source_metric: Some("m".to_string()),
@@ -742,8 +741,8 @@ mod runtime_tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),
@@ -919,7 +918,7 @@ mod runtime_tests {
 
     #[test]
     fn collect_metric_to_family_binds_all_six_contract_metrics_from_live_yaml() {
-        use crate::sketch_algebra::params::SketchKind;
+        use asap_sketch::SummaryKind;
 
         // The 6 contract metrics reproduced inline (mirrors
         // deploy/configs/mvp-workload.yaml entries 1, 5, 6, 7, 8 plus the
@@ -973,27 +972,27 @@ mod runtime_tests {
         // metric needs. For THIS workload every sketched metric is
         // queried by exactly one capability, so each set has size 1.
         use std::collections::BTreeSet;
-        let expected: Vec<(&str, Option<BTreeSet<SketchKind>>)> = vec![
+        let expected: Vec<(&str, Option<BTreeSet<SummaryKind>>)> = vec![
             (
                 "http_latency_ms",
-                Some(BTreeSet::from([SketchKind::DDSketch])),
+                Some(BTreeSet::from([SummaryKind::DDSketch])),
             ),
             ("http_requests_total", None), // raw passthrough
             (
                 "request_size_bytes",
-                Some(BTreeSet::from([SketchKind::Kll])),
+                Some(BTreeSet::from([SummaryKind::Kll])),
             ),
             (
                 "unique_users_per_min",
-                Some(BTreeSet::from([SketchKind::Hll])),
+                Some(BTreeSet::from([SummaryKind::Hll])),
             ),
             (
                 "top_endpoint_qps",
-                Some(BTreeSet::from([SketchKind::CountSketch])),
+                Some(BTreeSet::from([SummaryKind::CountSketchWithHeap])),
             ),
             (
                 "endpoint_request_freq",
-                Some(BTreeSet::from([SketchKind::Cms])),
+                Some(BTreeSet::from([SummaryKind::Cms])),
             ),
         ];
         for (metric, want) in &expected {
@@ -1122,9 +1121,9 @@ mod runtime_tests {
     /// analyzer's query-string → AggType parsing.
     #[test]
     fn collect_metric_to_family_unions_multiple_capabilities_per_metric() {
-        use crate::sketch_algebra::params::SketchKind;
         use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
         use crate::workload::AggRole;
+        use asap_sketch::SummaryKind;
         use std::collections::BTreeSet;
         use std::time::Duration;
 
@@ -1193,7 +1192,7 @@ mod runtime_tests {
             .unwrap_or_else(|| panic!("http_requests must be in the map\nmap: {map:?}"));
         assert_eq!(
             got,
-            BTreeSet::from([SketchKind::DDSketch, SketchKind::Hll, SketchKind::Cms]),
+            BTreeSet::from([SummaryKind::DDSketch, SummaryKind::Hll, SummaryKind::Cms]),
             "a metric queried by 3 capabilities must accumulate 3 families (UNION, not first-wins)\nmap: {map:?}"
         );
     }
@@ -1260,7 +1259,7 @@ mod runtime_tests {
         let _env = crate::test_support::env_lock();
         use crate::physical::colored_dag::emitter::{EdgeStageConfig, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
-        use crate::sketch_algebra::params::SketchKind;
+        use asap_sketch::SummaryKind;
 
         let yaml = r#"
 - metric_name: http_requests_total_latency_ms
@@ -1286,7 +1285,7 @@ mod runtime_tests {
             warm_passthrough_metrics: Vec::new(),
             metric_to_family: std::collections::HashMap::from([(
                 "http_requests_total_latency_ms".to_string(),
-                std::collections::BTreeSet::from([SketchKind::DDSketch]),
+                std::collections::BTreeSet::from([SummaryKind::DDSketch]),
             )]),
             metric_to_grouping_labels: std::collections::HashMap::new(),
             cumulative_counter_metrics: Vec::new(),

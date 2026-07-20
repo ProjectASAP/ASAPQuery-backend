@@ -7,7 +7,7 @@
 //! size, which intents each sketch family serves), read by the optimizer
 //! for cost-based plan rewriting and by the physical planner to check
 //! whether a sketch fits within a stage's budget — it was never L4 IR, just
-//! filed alongside it because both modules touched `SketchKind`.
+//! filed alongside it because both modules touched `SummaryKind`.
 //!
 //! Distinct from [`crate::sketch_algebra::schema::SketchStateMetadata`] —
 //! that struct carries the **L4 type-system flags** (`mergeable` /
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sketch_algebra::params::SketchKind;
+use asap_sketch::SummaryKind;
 
 /// Performance and capability profile for a single sketch family.
 ///
@@ -118,15 +118,15 @@ struct SketchCapabilitiesFile {
     count_min_sketch: SketchCapabilityYaml,
 }
 
-/// Compiled-in capability defaults — one entry per [`SketchKind`].
+/// Compiled-in capability defaults — one entry per [`SummaryKind`].
 /// Replaces the per-variant `sketch_capability(SketchType)` function
 /// that previously lived in `algebra/optimizer.rs`. Numerical values
 /// are mirrored from the YAML so the in-process defaults match the
 /// reference deployment file.
-pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
+pub fn default_capability_table() -> HashMap<SummaryKind, SketchCapability> {
     let mut map = HashMap::new();
     map.insert(
-        SketchKind::DDSketch,
+        SummaryKind::DDSketch,
         SketchCapability {
             insert_throughput: 10_000_000.0,
             query_throughput: 50_000_000.0,
@@ -140,7 +140,7 @@ pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
         },
     );
     map.insert(
-        SketchKind::Kll,
+        SummaryKind::Kll,
         SketchCapability {
             insert_throughput: 5_000_000.0,
             query_throughput: 20_000_000.0,
@@ -154,7 +154,7 @@ pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
         },
     );
     map.insert(
-        SketchKind::Hll,
+        SummaryKind::Hll,
         SketchCapability {
             insert_throughput: 20_000_000.0,
             query_throughput: 100_000_000.0,
@@ -168,7 +168,7 @@ pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
         },
     );
     map.insert(
-        SketchKind::CountSketch,
+        SummaryKind::CountSketch,
         SketchCapability {
             insert_throughput: 8_000_000.0,
             query_throughput: 10_000_000.0,
@@ -182,7 +182,7 @@ pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
         },
     );
     map.insert(
-        SketchKind::Cms,
+        SummaryKind::Cms,
         SketchCapability {
             insert_throughput: 8_000_000.0,
             query_throughput: 10_000_000.0,
@@ -203,15 +203,15 @@ pub fn default_capability_table() -> HashMap<SketchKind, SketchCapability> {
 /// Replaces `algebra::optimizer::load_sketch_capabilities`.
 ///
 /// Env var: `CONTROLLER_SKETCH_CAPABILITIES=path/to/this/file.yml`.
-pub fn load_capability_overrides(path: &str) -> HashMap<SketchKind, SketchCapability> {
+pub fn load_capability_overrides(path: &str) -> HashMap<SummaryKind, SketchCapability> {
     if let Ok(contents) = std::fs::read_to_string(path) {
         if let Ok(file) = serde_yaml::from_str::<SketchCapabilitiesFile>(&contents) {
             let mut map = HashMap::new();
-            map.insert(SketchKind::DDSketch, file.ddsketch.to_capability());
-            map.insert(SketchKind::Kll, file.kll.to_capability());
-            map.insert(SketchKind::Hll, file.hll.to_capability());
-            map.insert(SketchKind::CountSketch, file.count_sketch.to_capability());
-            map.insert(SketchKind::Cms, file.count_min_sketch.to_capability());
+            map.insert(SummaryKind::DDSketch, file.ddsketch.to_capability());
+            map.insert(SummaryKind::Kll, file.kll.to_capability());
+            map.insert(SummaryKind::Hll, file.hll.to_capability());
+            map.insert(SummaryKind::CountSketch, file.count_sketch.to_capability());
+            map.insert(SummaryKind::Cms, file.count_min_sketch.to_capability());
             return map;
         }
     }
@@ -225,17 +225,17 @@ mod tests {
     #[test]
     fn default_table_carries_all_five_sketch_kinds() {
         let t = default_capability_table();
-        assert!(t.contains_key(&SketchKind::DDSketch));
-        assert!(t.contains_key(&SketchKind::Kll));
-        assert!(t.contains_key(&SketchKind::Hll));
-        assert!(t.contains_key(&SketchKind::Cms));
-        assert!(t.contains_key(&SketchKind::CountSketch));
+        assert!(t.contains_key(&SummaryKind::DDSketch));
+        assert!(t.contains_key(&SummaryKind::Kll));
+        assert!(t.contains_key(&SummaryKind::Hll));
+        assert!(t.contains_key(&SummaryKind::Cms));
+        assert!(t.contains_key(&SummaryKind::CountSketch));
     }
 
     #[test]
     fn default_table_ddsketch_serves_quantile_intent() {
         let t = default_capability_table();
-        let cap = t.get(&SketchKind::DDSketch).unwrap();
+        let cap = t.get(&SummaryKind::DDSketch).unwrap();
         assert!(cap.supported_intents.contains(&SupportedIntent::Quantile));
         assert!(cap.mergeable);
     }
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn default_table_hll_serves_cardinality_intent() {
         let t = default_capability_table();
-        let cap = t.get(&SketchKind::Hll).unwrap();
+        let cap = t.get(&SummaryKind::Hll).unwrap();
         assert!(cap
             .supported_intents
             .contains(&SupportedIntent::Cardinality));

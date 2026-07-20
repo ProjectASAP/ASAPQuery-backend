@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Default URL for Prometheus's native OTLP HTTP receiver.
 /// Matches `super::stage_config::emit_edge_yaml`'s placeholder so the
@@ -296,39 +296,68 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
         Value::String(sketch_kind_tag(&sp.sketch_kind).into()),
     );
     match &sp.sketch_params {
-        SketchParams::Kll(p) => {
-            m.insert("k".into(), Value::Number((p.k as u64).into()));
+        SummaryParams::Kll { k } => {
+            m.insert("k".into(), Value::Number((*k as u64).into()));
         }
-        SketchParams::DDSketch(p) => {
-            m.insert("relative_accuracy".into(), Value::Number(p.alpha.into()));
+        SummaryParams::DDSketch { alpha } => {
+            m.insert("relative_accuracy".into(), Value::Number((*alpha).into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
         }
-        SketchParams::Hll(_p) => {
+        SummaryParams::Hll { .. } => {
             m.insert("delta_transmission".into(), Value::Bool(true));
         }
-        SketchParams::Cms(p) => {
-            m.insert("rows".into(), Value::Number((p.d as u64).into()));
-            m.insert("columns".into(), Value::Number((p.w as u64).into()));
+        // Heap-bearing width/depth extraction is identical to the bare
+        // kind — this path never distinguished `with_heap` even before
+        // `SummaryKind` split it into its own variant (heap_size wasn't
+        // emitted here either way).
+        SummaryParams::Cms { width, depth } | SummaryParams::CmsWithHeap { width, depth, .. } => {
+            m.insert("rows".into(), Value::Number((*depth as u64).into()));
+            m.insert("columns".into(), Value::Number((*width as u64).into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
         }
-        SketchParams::CountSketch(p) => {
-            let epsilon = std::f64::consts::E / (p.w as f64);
-            let delta = 2f64.powi(-(p.d as i32));
+        SummaryParams::CountSketch { width, depth }
+        | SummaryParams::CountSketchWithHeap { width, depth, .. } => {
+            let epsilon = std::f64::consts::E / (*width as f64);
+            let delta = 2f64.powi(-(*depth as i32));
             m.insert("epsilon".into(), Value::Number(epsilon.into()));
             m.insert("delta".into(), Value::Number(delta.into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
+        }
+        SummaryParams::Sum
+        | SummaryParams::Count
+        | SummaryParams::MinMax
+        | SummaryParams::Increase
+        | SummaryParams::Rate
+        | SummaryParams::Kmv { .. }
+        | SummaryParams::Theta { .. } => {
+            unreachable!(
+                "edge sketch processor config requested for a non-sketch or unsupported \
+                 SummaryKind; no Bind* rule in this repo produces one"
+            )
         }
     }
     Value::Mapping(m)
 }
 
-fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
+fn sketch_kind_tag(kind: &SummaryKind) -> &'static str {
     match kind {
-        SketchKind::Kll => "kll",
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Hll => "hll",
-        SketchKind::Cms => "cms",
-        SketchKind::CountSketch => "count_sketch",
+        SummaryKind::Kll => "kll",
+        SummaryKind::DDSketch => "ddsketch",
+        SummaryKind::Hll => "hll",
+        SummaryKind::Cms | SummaryKind::CmsWithHeap => "cms",
+        SummaryKind::CountSketch | SummaryKind::CountSketchWithHeap => "count_sketch",
+        SummaryKind::Sum
+        | SummaryKind::Count
+        | SummaryKind::MinMax
+        | SummaryKind::Increase
+        | SummaryKind::Rate
+        | SummaryKind::Kmv
+        | SummaryKind::Theta => {
+            unreachable!(
+                "edge sketch processor config requested for a non-sketch or unsupported \
+                 SummaryKind; no Bind* rule in this repo produces one"
+            )
+        }
     }
 }
 
@@ -338,7 +367,7 @@ fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use crate::sketch_algebra::params::DDSketchParams;
+    use asap_sketch::{SummaryKind, SummaryParams};
 
     /// Minimal struct-stub used to validate the emitted DAG parses as the
     /// otap-dataflow schema. We don't pull in the otap-df-config crate
@@ -385,8 +414,8 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),

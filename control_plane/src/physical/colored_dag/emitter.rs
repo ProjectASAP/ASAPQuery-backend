@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Errors surfaced by [`Emitter::emit_per_stage`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -45,10 +45,10 @@ pub enum EmitError {
     #[error("unsupported topology for this emitter: {0:?} (expected {1:?})")]
     UnsupportedTopology(Topology, Topology),
     /// A sketch processor name could not be derived for the supplied
-    /// `SketchKind`. Should not occur with the catalog ranges shipped
+    /// `SummaryKind`. Should not occur with the catalog ranges shipped
     /// in Phase C — kept as a defensive error for future kinds.
     #[error("no edge processor known for sketch kind {0:?}")]
-    NoEdgeProcessor(SketchKind),
+    NoEdgeProcessor(SummaryKind),
     /// Backend would emit an empty StreamingConfig because no sketch
     /// state ever reaches it (e.g. a colouring with only `Logical`
     /// nodes). Surfaced as a clean error so callers can fall back to
@@ -73,8 +73,7 @@ pub trait Emitter {
 /// The variants are deliberately struct-shaped (named fields) so future
 /// downstream consumers can pattern-match without relying on tuple-index
 /// stability.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "stage", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StageConfig {
     /// Edge agent's logical config — what the OpAMP push for this
     /// agent will need to materialise into OTel collector YAML.
@@ -104,7 +103,7 @@ impl StageConfig {
 /// Mirrors the surface of `crate::types::AgentCollectorConfig` minus the
 /// wire-format details (delta encoding, series-id TTL, sink addressing)
 /// — those are emitter-side decisions Phase G+ owns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EdgeStageConfig {
     /// Source metric name (from the L3 `Scan{Source::TimeSeries}`
     /// node). `None` only for synthetic colourings used in tests.
@@ -131,7 +130,6 @@ pub struct EdgeStageConfig {
     ///
     /// Empty list = no Mode 3 metrics → no `otlphttp/prometheus`
     /// exporter is emitted (the YAML is identical to Phase β).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prometheus_archive_metrics: Vec<PrometheusArchiveMetric>,
     /// Phase 3.2.5 — archive-tier metrics that should flow through the
     /// `gorillas3` processor at the edge agent (write a Gorilla-S3
@@ -150,7 +148,6 @@ pub struct EdgeStageConfig {
     /// drop a `PhysicalExpr` node, but the agent still has to land its
     /// counter samples in MinIO so the Gorilla-S3 / Thanos archive
     /// can answer `last_over_time(...)`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_tier_metrics: Vec<ArchiveTierMetric>,
     /// Phase 3.2.5 — metrics that must be carried through the
     /// ASAP-tier pipeline WITHOUT the family-specific sketch processor
@@ -166,7 +163,6 @@ pub struct EdgeStageConfig {
     /// `metrics/warm_passthrough` pipeline (gorillas3 if archive is
     /// declared, then exporter — NO sketch processor); everything
     /// else takes the existing `metrics/asap_tier` pipeline.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warm_passthrough_metrics: Vec<String>,
     /// MVP §46 / ASAPCollector#400 — per-metric → **set of** sketch
     /// families populated by the planner from the workload spec. When
@@ -182,7 +178,7 @@ pub struct EdgeStageConfig {
     /// because different planned queries on the same metric require
     /// different capabilities (e.g. `quantile_over_time` → DDSketch,
     /// `count`-distinct → HLL, `topk` → CountSketch all on one metric).
-    /// The value type is therefore a `BTreeSet<SketchKind>` (the UNION
+    /// The value type is therefore a `BTreeSet<SummaryKind>` (the UNION
     /// of capabilities across all of that metric's workload entries),
     /// not a single family. A metric in two families produces two
     /// routing-connector OTTL conditions → its samples fan into both
@@ -195,12 +191,11 @@ pub struct EdgeStageConfig {
     /// This eliminates the prior multi-family fan-out (every metric
     /// shipped sketch state through all 5 families regardless of need).
     ///
-    /// `SketchFamily` is a control-plane-side alias for `SketchKind` per
-    /// `sketch_algebra::params`. Empty map ⇒ legacy single-pipeline /
+    /// `SketchFamily` is a control-plane-side alias for `asap_sketch::SummaryKind`.
+    /// Empty map ⇒ legacy single-pipeline /
     /// Mode-3 / warm-passthrough wire shapes are emitted unchanged
     /// (backward-compat).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub metric_to_family: HashMap<String, BTreeSet<SketchKind>>,
+    pub metric_to_family: HashMap<String, BTreeSet<SummaryKind>>,
     /// MVP blocker B3 — per-metric attribute allowlist the agent must
     /// reduce wire attrs to BEFORE the sketch processor sees them.
     /// Maps each metric to its grouping-label list; the 5-sketch routing
@@ -212,7 +207,6 @@ pub struct EdgeStageConfig {
     /// Without this the agent sketches with the full wire-attr tuple,
     /// minting one sid per unique tuple — defeating the streaming-config's
     /// `grouping_labels` contract.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_grouping_labels: HashMap<String, Vec<String>>,
     /// Issue #298 — metrics whose OTel datapoints arrive with
     /// **cumulative** temporality (OTel SDK's default for `Counter`
@@ -239,7 +233,6 @@ pub struct EdgeStageConfig {
     /// Empty list (default) ⇒ no `cumulativetodelta` processor is
     /// emitted; backward-compat for plans that never declare a counter
     /// metric (e.g. quantile-only workloads).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cumulative_counter_metrics: Vec<String>,
     /// PR #311 follow-up — the cold-tier (Gorilla archive) ingest URL the
     /// fused `asap_edge` processor ships per-emit Gorilla blocks to. This
@@ -256,7 +249,6 @@ pub struct EdgeStageConfig {
     /// (it is deployment-independent — no `DeploymentConstraints` is
     /// plumbed in), so it populates the named default; a future layer that
     /// holds deploy info can set a concrete value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_ship_endpoint: Option<String>,
     /// PR #311 follow-up — external labels stamped on every cold-tier
     /// Gorilla block the fused `asap_edge` processor ships (the merger
@@ -266,7 +258,6 @@ pub struct EdgeStageConfig {
     /// field threads it explicitly. Empty ⇒ the emitter falls back to
     /// [`default_cold_external_labels`] (a single named default that reads
     /// `ASAP_CLUSTER`, defaulting to `asap-mvp`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cold_external_labels: Vec<(String, String)>,
     /// Per-metric sketch **sampling probability** `p` in `(0, 1]`,
     /// populated by the planner from each workload entry's
@@ -288,7 +279,6 @@ pub struct EdgeStageConfig {
     /// optimizer-driven dynamic `p` is a follow-up (out of scope here).
     ///
     /// Empty map (default) ⇒ no metric carries sampling — backward-compat.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_sample_p: HashMap<String, f64>,
     /// Per-metric **known distinct-key count per window** (cardinality hint),
     /// populated by the planner from each workload entry's
@@ -307,7 +297,6 @@ pub struct EdgeStageConfig {
     /// (per-series ⇒ sparse, whole-stream ⇒ dense), so the emitted config stays
     /// byte-identical when no cardinality hint is declared. Empty map (default)
     /// ⇒ no metric carries a hint — backward-compat.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_distinct_keys: HashMap<String, u64>,
     /// Per-metric **inner item dimension** for the item-counting sketch
     /// families (HLL / CountSketch / CountMinSketch): the data-point
@@ -331,7 +320,6 @@ pub struct EdgeStageConfig {
     /// convention (`countsketch_item_label_for`) when a metric is absent
     /// from this map, preserving the prior behaviour. Empty map (default) ⇒
     /// no metric carries an explicit item dimension — backward-compat.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metric_to_item_label: HashMap<String, String>,
     /// Cold-archive **wire format** the agent's `asapedgeprocessor` ships
     /// its cold tier in. Two formats are merged in the agent:
@@ -348,7 +336,6 @@ pub struct EdgeStageConfig {
     /// emits NEITHER key, so the agent's cold block stays byte-identical to
     /// the pre-format emit (`ship_endpoint` only) — no behavior change when
     /// unset.
-    #[serde(default, skip_serializing_if = "ColdFormat::is_default")]
     pub cold_format: ColdFormat,
     /// Cold-archive intchunk ingest URL — the gorilla-merger's coldpart
     /// HTTP ingest endpoint (`http://gorilla-merger:10908/ingest/coldpart`).
@@ -360,7 +347,6 @@ pub struct EdgeStageConfig {
     /// to `/ingest/coldpart` (same merger host:port as the fragment
     /// endpoint), falling back to [`default_cold_coldpart_endpoint`] when
     /// neither is set. Ignored entirely for [`ColdFormat::Fragment`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_coldpart_endpoint: Option<String>,
 }
 
@@ -474,15 +460,20 @@ pub struct PrometheusArchiveMetric {
 }
 
 /// One sketch processor configured at an edge agent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Not `Serialize`/`Deserialize` (see `PhysicalExpr`'s doc for why —
+/// `SummaryKind`/`SummaryParams` have no serde impl, and nothing on the
+/// real emit path ever whole-struct-serialized this type; every actual
+/// YAML/JSON payload goes through a hand-written builder).
+#[derive(Debug, Clone, PartialEq)]
 pub struct EdgeSketchProcessor {
     /// OTel processor component id — `KLL`, `ddsketch`, `HLL`,
-    /// `countmin`, etc. Maps 1:1 from `SketchKind`.
+    /// `countmin`, etc. Maps 1:1 from `SummaryKind`.
     pub processor_name: String,
     /// Sketch family (mirror of the `SketchAgg::sketch_type` field).
-    pub sketch_kind: SketchKind,
+    pub sketch_kind: SummaryKind,
     /// Sketch parameters (mirror of the `SketchAgg::params` field).
-    pub sketch_params: SketchParams,
+    pub sketch_params: SummaryParams,
     /// Internal emitter plumbing — threads `EdgeSketchProcessor` →
     /// `GatewayMergeProcessor` (which DOES surface it on the wire to
     /// route merged streams) during the DAG walk. Phase E derives a
@@ -503,7 +494,7 @@ pub struct EdgeSketchProcessor {
 }
 
 /// Logical content of a gateway aggregator's per-stage config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayStageConfig {
     /// OTLP receiver port — Phase E surfaces the abstract `Default`
     /// (`4317`); deployment-specific overrides happen at Phase G.
@@ -515,13 +506,15 @@ pub struct GatewayStageConfig {
 }
 
 /// One sketch-merge processor configured at the gateway.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Not `Serialize`/`Deserialize` — same reason as `EdgeSketchProcessor`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct GatewayMergeProcessor {
     /// OTel processor name — `sketchmergeprocessor`.
     pub processor_name: String,
     /// Sketch family being merged. All inputs to the merge agree on
     /// this (L4 type checker enforces it; design.md §6.4).
-    pub sketch_kind: SketchKind,
+    pub sketch_kind: SummaryKind,
     /// Aggregation id — matches the upstream edge's
     /// `EdgeSketchProcessor::aggregation_id` so the gateway routes
     /// streams correctly.
@@ -536,7 +529,7 @@ pub struct GatewayMergeProcessor {
 }
 
 /// Logical content of the backend `StreamingConfig`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendStageConfig {
     /// One entry per readout query the backend must serve. The
     /// `aggregation_id` in each routing entry is the backend's
@@ -555,7 +548,13 @@ pub struct BackendStageConfig {
 /// the controller-allocated id; the backend content-addresses identity
 /// via `PolicyFingerprint(u64)` derived from `metric_name`,
 /// `sketch_kind`, `sketch_params`, grouping labels, and `spatial_filter`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Not `Serialize`/`Deserialize` — same reason as `EdgeSketchProcessor`:
+/// `SummaryKind`/`SummaryParams` have no serde impl, and the real wire
+/// payload is built by `emit::stage_config::build_backend_aggregation_json`
+/// (a hand-written JSON builder reading these fields), never a whole-struct
+/// serialize.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendAggregation {
     /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,
@@ -564,17 +563,16 @@ pub struct BackendAggregation {
     /// `AggregationConfig` parser.
     pub metric_name: String,
     /// Sketch family.
-    pub sketch_kind: SketchKind,
+    pub sketch_kind: SummaryKind,
     /// Sketch parameters — the backend uses these to build its
     /// per-aggregation `Sketch` instance (KLL with the right `k`,
     /// DDSketch with the right `alpha`, etc.).
-    pub sketch_params: SketchParams,
+    pub sketch_params: SummaryParams,
     /// Tumbling window size in seconds. Required by the backend; the
     /// parser rejects zero-window aggregations.
     pub window_secs: u64,
     /// Spatial filter (comma-joined `k=v` pairs from the edge's
     /// `label_filters`). Empty string when no filter applies.
-    #[serde(default)]
     pub spatial_filter: String,
     /// Group-by label names — keys in `labels.grouping` on the backend
     /// side, where the precompute engine's accumulator pipeline keys
@@ -588,7 +586,6 @@ pub struct BackendAggregation {
     /// columns (open-set label naming is a Step γ TODO in
     /// `intent_algebra::column_resolution`), so the workload-spec
     /// strings are the only reliable source of the names today.
-    #[serde(default)]
     pub grouping: Vec<String>,
     /// Per-item dimension (the data-point attribute NAME, e.g. "endpoint"
     /// or "service") for an item_label-mode frequency sketch. Like
@@ -596,7 +593,6 @@ pub struct BackendAggregation {
     /// it from the workload's `item_label`. Emitted into the aggregation's
     /// `parameters["item_label"]` so the data-plane ingest records it on the
     /// CMS sid and can answer per-item `estimate(key)` (FrequencyEstimate).
-    #[serde(default)]
     pub item_label: Option<String>,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
@@ -605,7 +601,6 @@ pub struct BackendAggregation {
     /// backend builds the sketch from raw OTLP samples at ingest. The
     /// backend's `StreamingConfig` consumer interprets the field —
     /// Phase ε.2 implements the raw-input ingest path.
-    #[serde(default)]
     pub aggregation_input: AggregationInput,
 
     /// Option B (post-PR-#287) — when `Some(s)`, the wire-side
@@ -627,7 +622,6 @@ pub struct BackendAggregation {
     /// resolve. `sketch_kind` / `sketch_params` carry sentinel
     /// values when the override is in effect (their emitted form is
     /// suppressed in `build_backend_aggregation_json`).
-    #[serde(default)]
     pub agg_type_override: Option<String>,
 }
 
@@ -948,17 +942,34 @@ impl Emitter for ThreeStageEmitter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Map a `SketchKind` to the OTel collector processor name. Mirrors the
+/// Map a `SummaryKind` to the OTel collector processor name. Mirrors the
 /// names the existing OpAMP YAML emitter (and the per-sketch processor
 /// crates in `opentelemetry-collector-contrib`) already use.
-pub(crate) fn edge_processor_name(kind: &SketchKind) -> Result<String, EmitError> {
-    Ok(match kind {
-        SketchKind::Kll => "KLL".into(),
-        SketchKind::DDSketch => "ddsketch".into(),
-        SketchKind::Hll => "HLL".into(),
-        SketchKind::Cms => "countmin".into(),
-        SketchKind::CountSketch => "countsketch".into(),
-    })
+///
+/// Heap-bearing kinds (`CmsWithHeap`/`CountSketchWithHeap`) reuse their
+/// bare counterpart's processor name — the retired `sketch_algebra::SketchKind`
+/// this replaces had no heap-bearing variant at all (`with_heap` was a
+/// `SketchParams` field this function never received), so heap-bearing
+/// and bare CMS/CountSketch already mapped to the identical processor
+/// name; this preserves that exactly. Exact accumulators and `Kmv`/`Theta`
+/// have no OTel edge processor — nothing in this repo's binding rules
+/// constructs a `SketchAgg`/`RawAtEdgeSketchAtBackend` with one of these
+/// kinds today, but the match must stay exhaustive.
+pub(crate) fn edge_processor_name(kind: &SummaryKind) -> Result<String, EmitError> {
+    match kind {
+        SummaryKind::Kll => Ok("KLL".into()),
+        SummaryKind::DDSketch => Ok("ddsketch".into()),
+        SummaryKind::Hll => Ok("HLL".into()),
+        SummaryKind::Cms | SummaryKind::CmsWithHeap => Ok("countmin".into()),
+        SummaryKind::CountSketch | SummaryKind::CountSketchWithHeap => Ok("countsketch".into()),
+        SummaryKind::Sum
+        | SummaryKind::Count
+        | SummaryKind::MinMax
+        | SummaryKind::Increase
+        | SummaryKind::Rate
+        | SummaryKind::Kmv
+        | SummaryKind::Theta => Err(EmitError::NoEdgeProcessor(kind.clone())),
+    }
 }
 
 /// Recursively descend an L3 [`crate::intent_algebra::QueryExpr`]
@@ -1058,7 +1069,7 @@ fn first_sketch_child_via_edges(
     dag: &ColoredDag,
     parent: crate::physical::colored_dag::dag::NodeId,
     sketch_agg_ids: &HashMap<usize, String>,
-) -> Option<(SketchKind, String)> {
+) -> Option<(SummaryKind, String)> {
     for cid in children_of(dag, parent) {
         let cnode = dag.nodes.get(cid.0)?;
         match &cnode.expr {

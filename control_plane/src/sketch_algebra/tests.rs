@@ -7,12 +7,12 @@ use std::time::Duration;
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
 use crate::sketch_algebra::lower::bind_query_expr;
-use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::sketch_algebra::rules::{
     bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_kll_quantile::BindKllOnQuantile, Rule,
 };
 use crate::types_v2::{AccuracyTarget, BindingName};
+use asap_sketch::{SummaryKind, SummaryParams};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -67,76 +67,6 @@ fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     }
 }
 
-// ── Serde round-trip across all variants ──────────────────────────────────────
-
-#[test]
-fn physical_expr_serde_roundtrip() {
-    use crate::sketch_algebra::params::{CmsParams, CountSketchParams, DDSketchParams, HllParams};
-    let cases = vec![
-        PhysicalExpr::Logical(windowed_scan()),
-        PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::Kll,
-            params: SketchParams::Kll(KllParams { k: 200 }),
-            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-        },
-        PhysicalExpr::SketchEstimate {
-            op: EstimateOp::Quantile { q: 0.5 },
-            child: Box::new(PhysicalExpr::SketchAgg {
-                sketch_type: SketchKind::DDSketch,
-                params: SketchParams::DDSketch(DDSketchParams { alpha: 0.005 }),
-                child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-            }),
-        },
-        PhysicalExpr::SketchMerge {
-            algebra: MergeAlgebra::Union,
-            children: vec![
-                PhysicalExpr::SketchAgg {
-                    sketch_type: SketchKind::Hll,
-                    params: SketchParams::Hll(HllParams { precision: 14 }),
-                    child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-                },
-                PhysicalExpr::SketchAgg {
-                    sketch_type: SketchKind::Hll,
-                    params: SketchParams::Hll(HllParams { precision: 14 }),
-                    child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-                },
-            ],
-        },
-        PhysicalExpr::LetBinding {
-            name: BindingName::new("kll_state"),
-            expr: Box::new(PhysicalExpr::SketchAgg {
-                sketch_type: SketchKind::CountSketch,
-                params: SketchParams::CountSketch(CountSketchParams {
-                    w: 2048,
-                    d: 5,
-                    with_heap: false,
-                }),
-                child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-            }),
-            child: Box::new(PhysicalExpr::Ref {
-                name: BindingName::new("kll_state"),
-            }),
-        },
-        PhysicalExpr::Ref {
-            name: BindingName::new("alone"),
-        },
-        PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::Cms,
-            params: SketchParams::Cms(CmsParams {
-                w: 2048,
-                d: 5,
-                with_heap: false,
-            }),
-            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-        },
-    ];
-    for c in cases {
-        let json = serde_json::to_string(&c).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(c, back);
-    }
-}
-
 // ── Bind rule tests ───────────────────────────────────────────────────────────
 
 #[test]
@@ -156,8 +86,8 @@ fn bind_kll_quantile_basic() {
                     params,
                     child,
                 } => {
-                    assert_eq!(sketch_type, SketchKind::Kll);
-                    assert_eq!(params, SketchParams::Kll(KllParams { k: 200 }));
+                    assert_eq!(sketch_type, SummaryKind::Kll);
+                    assert_eq!(params, SummaryParams::Kll { k: 200 });
                     assert!(matches!(
                         *child,
                         PhysicalExpr::Logical(QueryExpr::Window { .. })
@@ -185,10 +115,12 @@ fn bind_ddsketch_quantile_basic() {
                     params,
                     ..
                 } => {
-                    assert_eq!(sketch_type, SketchKind::DDSketch);
+                    assert_eq!(sketch_type, SummaryKind::DDSketch);
                     match params {
-                        SketchParams::DDSketch(p) => assert!((p.alpha - 0.01).abs() < 1e-12),
-                        other => panic!("expected DDSketchParams, got {other:?}"),
+                        SummaryParams::DDSketch { alpha } => {
+                            assert!((alpha - 0.01).abs() < 1e-12)
+                        }
+                        other => panic!("expected DDSketch params, got {other:?}"),
                     }
                 }
                 other => panic!("expected SketchAgg, got {other:?}"),
@@ -212,7 +144,7 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
             PhysicalExpr::SketchAgg { sketch_type, .. } => {
                 assert_eq!(
                     sketch_type,
-                    SketchKind::DDSketch,
+                    SummaryKind::DDSketch,
                     "dispatcher should pick DDSketch (priority 6) over KLL (priority 5) on ε-driven Quantile"
                 );
             }
@@ -232,9 +164,12 @@ fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
     }
 }
 
-/// Pull the bound `(SketchKind, with_heap, w, d)` out of a top-k binding.
-fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, bool, u32, u32) {
-    use crate::sketch_algebra::params::{CmsParams, CountSketchParams};
+/// Pull the bound `(SummaryKind, w, d)` out of a top-k binding.
+/// `SummaryKind` (unlike the retired `sketch_algebra::SketchKind`)
+/// promotes `with_heap` to kind identity — `bind_cms_topk` always binds
+/// `CmsWithHeap`/`CountSketchWithHeap` for a top-k intent, never the
+/// bare kind, so there's no separate heap flag to return anymore.
+fn topk_binding_family(bound: &PhysicalExpr) -> (SummaryKind, u32, u32) {
     match bound {
         PhysicalExpr::SketchEstimate { op, child } => {
             assert_eq!(*op, EstimateOp::TopK { k: 10 });
@@ -244,13 +179,15 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, bool, u32, u32) {
                     params,
                     ..
                 } => match params {
-                    SketchParams::Cms(CmsParams { w, d, with_heap }) => {
-                        (sketch_type.clone(), *with_heap, *w, *d)
+                    SummaryParams::CmsWithHeap { width, depth, .. } => {
+                        (sketch_type.clone(), *width, *depth)
                     }
-                    SketchParams::CountSketch(CountSketchParams { w, d, with_heap }) => {
-                        (sketch_type.clone(), *with_heap, *w, *d)
+                    SummaryParams::CountSketchWithHeap { width, depth, .. } => {
+                        (sketch_type.clone(), *width, *depth)
                     }
-                    other => panic!("expected CMS/CountSketch params, got {other:?}"),
+                    other => {
+                        panic!("expected CmsWithHeap/CountSketchWithHeap params, got {other:?}")
+                    }
                 },
                 other => panic!("expected SketchAgg, got {other:?}"),
             }
@@ -270,13 +207,12 @@ fn bind_cms_topk_loose_recall_picks_cms_heap() {
     };
     let expr = agg_topk(10, acc.clone());
     let bound = bind_query_expr(&expr, acc).expect("bind_query_expr should not error");
-    let (kind, with_heap, w, d) = topk_binding_family(&bound);
+    let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
         kind,
-        SketchKind::Cms,
+        SummaryKind::CmsWithHeap,
         "loose-recall top-k must bind the cheap CMS-with-heap, not CountSketch"
     );
-    assert!(with_heap, "top-k binding must enable the heavy-hitter heap");
     assert!(w >= 2);
     assert!(d >= 1);
 }
@@ -290,13 +226,12 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
     let expr = agg_topk(10, AccuracyTarget::Exact);
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
         .expect("bind_query_expr should not error");
-    let (kind, with_heap, w, d) = topk_binding_family(&bound);
+    let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
         kind,
-        SketchKind::CountSketch,
+        SummaryKind::CountSketchWithHeap,
         "exact-rank top-k must bind the unbiased CountSketch-with-heap"
     );
-    assert!(with_heap, "top-k binding must enable the heavy-hitter heap");
     assert!(w >= 2);
     assert!(d >= 1);
 }
@@ -310,8 +245,8 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
 fn bind_cms_topk_picks_cost_min_meeting_sla() {
     use crate::optimizer::cost::wire::WireCostTable;
     let table = WireCostTable::default();
-    let cms = table.for_kind(&SketchKind::Cms).per_flush();
-    let cs = table.for_kind(&SketchKind::CountSketch).per_flush();
+    let cms = table.for_kind(&SummaryKind::Cms).per_flush();
+    let cs = table.for_kind(&SummaryKind::CountSketch).per_flush();
     assert!(
         cms < cs,
         "CMS-heap ({cms} B) must be cheaper than CountSketch ({cs} B) on the wire"
@@ -333,7 +268,7 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
         cms.min(cs),
         "must pick the cost-min family that meets the SLA"
     );
-    assert_eq!(kind, SketchKind::Cms);
+    assert_eq!(kind, SummaryKind::CmsWithHeap);
 }
 
 #[test]
@@ -357,11 +292,11 @@ fn bind_hll_cardinality_basic() {
                     params,
                     ..
                 } => {
-                    assert_eq!(sketch_type, SketchKind::Hll);
+                    assert_eq!(sketch_type, SummaryKind::Hll);
                     match params {
-                        SketchParams::Hll(p) => {
+                        SummaryParams::Hll { precision } => {
                             assert!(
-                                p.precision >= 12,
+                                precision >= 12,
                                 "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
                             );
                         }
@@ -412,49 +347,6 @@ fn bind_exact_accuracy_disables_quantile_binding() {
     );
 }
 
-/// Two `SketchEstimate` parents reading different quantiles can share
-/// one underlying `SketchAgg{KLL}` via `LetBinding` / `Ref`. Mirrors the
-/// design.md §6 batched-queries example (line ~1326) — within the L4
-/// IR, fan-in is expressible as a `LetBinding` whose bound expression
-/// is the shared `SketchAgg`.
-#[test]
-fn let_binding_ref_through_sketch_dag() {
-    let shared_agg = PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
-        child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-    };
-    let expr = PhysicalExpr::LetBinding {
-        name: BindingName::new("kll_state"),
-        expr: Box::new(shared_agg),
-        child: Box::new(PhysicalExpr::SketchMerge {
-            algebra: MergeAlgebra::Union,
-            // Two `SketchEstimate` parents reading the shared sketch via
-            // `Ref` — the design.md §6 line ~1339 two-tier fan-in shape.
-            children: vec![
-                PhysicalExpr::SketchEstimate {
-                    op: EstimateOp::Quantile { q: 0.99 },
-                    child: Box::new(PhysicalExpr::Ref {
-                        name: BindingName::new("kll_state"),
-                    }),
-                },
-                PhysicalExpr::SketchEstimate {
-                    op: EstimateOp::Quantile { q: 0.95 },
-                    child: Box::new(PhysicalExpr::Ref {
-                        name: BindingName::new("kll_state"),
-                    }),
-                },
-            ],
-        }),
-    };
-    // Round-trip the DAG through serde to verify the multi-parent fan-in
-    // shape survives wire encoding (the L4 type checker, when it lands,
-    // will assert the matching sketch-state schema on each `Ref` reader).
-    let json = serde_json::to_string(&expr).unwrap();
-    let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-    assert_eq!(expr, back);
-}
-
 // ── Phase β: pattern-migration coverage ───────────────────────────────────────
 //
 // The five PromQL pattern shapes defined in `asap-planner-rs/src/planner/
@@ -486,7 +378,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
                 PhysicalExpr::SketchAgg { sketch_type, .. } => {
                     assert!(matches!(
                         sketch_type,
-                        SketchKind::Kll | SketchKind::DDSketch
+                        SummaryKind::Kll | SummaryKind::DDSketch
                     ));
                 }
                 other => panic!("expected SketchAgg under SketchEstimate, got {other:?}"),
@@ -630,9 +522,9 @@ fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
 /// Walk a `PhysicalExpr` and collect every `SketchAgg`'s sketch_kind. The
 /// number of entries + the kind set is the wire-equivalent of
 /// asap-planner-rs's "aggregation_id rows in StreamingConfig output".
-fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SketchKind> {
+fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SummaryKind> {
     let mut out = Vec::new();
-    fn walk(e: &PhysicalExpr, out: &mut Vec<SketchKind>) {
+    fn walk(e: &PhysicalExpr, out: &mut Vec<SummaryKind>) {
         match e {
             PhysicalExpr::SketchAgg {
                 sketch_type, child, ..
@@ -659,7 +551,7 @@ fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SketchKind> {
                 walk(child, out);
             }
             PhysicalExpr::RawAtEdgePrometheusArchive { .. } => {}
-            // ExactAgg has no SketchKind to collect; its child may
+            // ExactAgg has no SummaryKind to collect; its child may
             // carry one transitively (rare but possible if nested).
             PhysicalExpr::ExactAgg { child, .. } => walk(child, out),
         }
@@ -713,7 +605,7 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
     let kinds = collect_sketch_kinds(&bound);
     assert_eq!(kinds.len(), 1, "expected 1 sketch agg, got {kinds:?}");
     assert!(
-        matches!(kinds[0], SketchKind::Kll | SketchKind::DDSketch),
+        matches!(kinds[0], SummaryKind::Kll | SummaryKind::DDSketch),
         "expected quantile sketch family, got {:?}",
         kinds[0]
     );
@@ -764,14 +656,17 @@ fn phase_b_e2e_sum_by_preserves_grouping_label() {
     // ParsedQuery only carries `aggregations: Vec<AggType>` not the
     // by-axis directly). In either case the metric name + label survive
     // somewhere in the L3 sub-tree — assert that.
-    let json = serde_json::to_string(&bound).unwrap();
+    // `PhysicalExpr` is no longer `Serialize` (see its doc) — `Debug`
+    // output still contains every string literal in the tree, so it
+    // works just as well for this substring search.
+    let dbg = format!("{bound:?}");
     assert!(
-        json.contains("http_requests_total"),
-        "metric name lost through pipeline: {json}"
+        dbg.contains("http_requests_total"),
+        "metric name lost through pipeline: {dbg}"
     );
     assert!(
-        json.contains("instance"),
-        "by-label `instance` lost through pipeline: {json}"
+        dbg.contains("instance"),
+        "by-label `instance` lost through pipeline: {dbg}"
     );
 }
 

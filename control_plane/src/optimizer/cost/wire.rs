@@ -29,7 +29,8 @@
 
 #![allow(dead_code)]
 
-use crate::sketch_algebra::params::SketchKind;
+use asap_sketch::SummaryKind;
+
 use crate::types::WorkloadCharacteristics;
 
 // ── Wire-cost table ──────────────────────────────────────────────────────────
@@ -103,13 +104,36 @@ impl WireCostTable {
     }
 
     /// Lookup the per-flush cost for a sketch family.
-    pub const fn for_kind(&self, kind: &SketchKind) -> SketchWireCost {
+    ///
+    /// `SummaryKind` (unlike the retired `sketch_algebra::SketchKind`)
+    /// distinguishes heap-bearing from bare frequency sketches at the
+    /// kind level rather than via a `with_heap` param flag. This table
+    /// never modeled the heap's extra bytes separately (the old
+    /// `for_kind` took a bare `SketchKind` with no visibility into
+    /// `with_heap` at all) — `CmsWithHeap`/`CountSketchWithHeap` reuse
+    /// their bare counterpart's cost to preserve that exact behavior.
+    /// `Kmv`/`Theta` have no established cost number (nothing in this
+    /// repo binds a cardinality intent to either today — the candidate
+    /// list stays `Hll`-only, see `capability.rs`); they reuse `hll_delta`
+    /// as a same-order-of-magnitude placeholder pending real numbers if
+    /// this repo ever adopts them.
+    pub const fn for_kind(&self, kind: &SummaryKind) -> SketchWireCost {
         match kind {
-            SketchKind::DDSketch => self.ddsketch_delta,
-            SketchKind::Kll => self.kll_full,
-            SketchKind::Hll => self.hll_delta,
-            SketchKind::Cms => self.count_min_delta,
-            SketchKind::CountSketch => self.count_sketch_delta,
+            SummaryKind::DDSketch => self.ddsketch_delta,
+            SummaryKind::Kll => self.kll_full,
+            SummaryKind::Hll => self.hll_delta,
+            SummaryKind::Kmv | SummaryKind::Theta => self.hll_delta,
+            SummaryKind::Cms => self.count_min_delta,
+            SummaryKind::CmsWithHeap => self.count_min_delta,
+            SummaryKind::CountSketch => self.count_sketch_delta,
+            SummaryKind::CountSketchWithHeap => self.count_sketch_delta,
+            SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate => {
+                panic!("WireCostTable::for_kind: exact accumulators have no sketch wire-state cost")
+            }
         }
     }
 }
@@ -222,13 +246,13 @@ pub enum BindMode {
     /// Mode 1: sketch processor at the edge ships sketch state via OTLP
     /// to the backend's ASAP tier. The default for high-sample-per-window
     /// workloads where the sketch's per-flush wire cost beats raw OTLP.
-    SketchAtEdge { family: SketchKind },
+    SketchAtEdge { family: SummaryKind },
 
     /// Mode 2: no sketch processor at edge; raw OTLP forwards to the
     /// gateway/backend, which builds sketches at ingest. Picked when the
     /// edge is resource-constrained (CPU / RAM) but the sketch still
     /// wins on backend-side bandwidth + accuracy.
-    RawAtEdgeSketchAtBackend { family: SketchKind },
+    RawAtEdgeSketchAtBackend { family: SummaryKind },
 
     /// Mode 3: no sketch processor at edge; raw OTLP ships directly to
     /// Prometheus's native OTLP receiver. Backend HTTP-forwards queries
@@ -261,7 +285,7 @@ pub enum BindMode {
 /// future revision will consult observed processor CPU from the
 /// OnlineMetricsStore.
 pub fn select_bind_mode(
-    families: &[SketchKind],
+    families: &[SummaryKind],
     workload: &WireWorkload,
     table: &WireCostTable,
 ) -> BindMode {
@@ -387,7 +411,7 @@ mod tests {
         // DDSketch state — 600 + 200 = 800 B. Sketch wins.
         let ddsketch = est_wire_bytes_per_window_per_series(
             &BindMode::SketchAtEdge {
-                family: SketchKind::DDSketch,
+                family: SummaryKind::DDSketch,
             },
             &w,
             &table,
@@ -396,7 +420,7 @@ mod tests {
         // HLL state — 10 000 + 200 = 10 200 B. HLL loses at 60 samples.
         let hll = est_wire_bytes_per_window_per_series(
             &BindMode::SketchAtEdge {
-                family: SketchKind::Hll,
+                family: SummaryKind::Hll,
             },
             &w,
             &table,
@@ -417,11 +441,11 @@ mod tests {
             edge_cpu_budget: None,
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::DDSketch, SketchKind::Kll], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::DDSketch, SummaryKind::Kll], &w, &table);
         assert_eq!(
             mode,
             BindMode::SketchAtEdge {
-                family: SketchKind::DDSketch
+                family: SummaryKind::DDSketch
             }
         );
     }
@@ -439,11 +463,11 @@ mod tests {
             edge_cpu_budget: Some(0.1),
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::DDSketch, SketchKind::Kll], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::DDSketch, SummaryKind::Kll], &w, &table);
         assert_eq!(
             mode,
             BindMode::RawAtEdgeSketchAtBackend {
-                family: SketchKind::DDSketch
+                family: SummaryKind::DDSketch
             }
         );
     }
@@ -465,7 +489,7 @@ mod tests {
             edge_cpu_budget: None,
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::Hll, SketchKind::CountSketch], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::Hll, SummaryKind::CountSketch], &w, &table);
         assert_eq!(mode, BindMode::RawAtEdgePrometheusArchive);
     }
 
@@ -509,7 +533,7 @@ mod tests {
             edge_cpu_budget: None,
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::Hll], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::Hll], &w, &table);
         assert_eq!(mode, BindMode::RawAtEdgePrometheusArchive);
     }
 
@@ -526,11 +550,11 @@ mod tests {
             edge_cpu_budget: None,
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::Hll], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::Hll], &w, &table);
         assert_eq!(
             mode,
             BindMode::SketchAtEdge {
-                family: SketchKind::Hll
+                family: SummaryKind::Hll
             }
         );
     }
@@ -553,11 +577,11 @@ mod tests {
             edge_cpu_budget: Some(0.1),
             edge_ram_budget: None,
         };
-        let mode = select_bind_mode(&[SketchKind::DDSketch, SketchKind::Kll], &w, &table);
+        let mode = select_bind_mode(&[SummaryKind::DDSketch, SummaryKind::Kll], &w, &table);
         assert_eq!(
             mode,
             BindMode::RawAtEdgeSketchAtBackend {
-                family: SketchKind::DDSketch
+                family: SummaryKind::DDSketch
             }
         );
     }
@@ -582,20 +606,20 @@ mod tests {
         // HLL: 10 200 B → loses
         // CountMin: 4 200 B → loses
         // CountSketch: 250 200 B → loses
-        let dd = select_bind_mode(&[SketchKind::DDSketch], &w, &table);
+        let dd = select_bind_mode(&[SummaryKind::DDSketch], &w, &table);
         assert_eq!(
             dd,
             BindMode::SketchAtEdge {
-                family: SketchKind::DDSketch
+                family: SummaryKind::DDSketch
             }
         );
-        let kll = select_bind_mode(&[SketchKind::Kll], &w, &table);
+        let kll = select_bind_mode(&[SummaryKind::Kll], &w, &table);
         assert_eq!(kll, BindMode::RawAtEdgePrometheusArchive);
-        let hll = select_bind_mode(&[SketchKind::Hll], &w, &table);
+        let hll = select_bind_mode(&[SummaryKind::Hll], &w, &table);
         assert_eq!(hll, BindMode::RawAtEdgePrometheusArchive);
-        let cms = select_bind_mode(&[SketchKind::Cms], &w, &table);
+        let cms = select_bind_mode(&[SummaryKind::Cms], &w, &table);
         assert_eq!(cms, BindMode::RawAtEdgePrometheusArchive);
-        let cs = select_bind_mode(&[SketchKind::CountSketch], &w, &table);
+        let cs = select_bind_mode(&[SummaryKind::CountSketch], &w, &table);
         assert_eq!(cs, BindMode::RawAtEdgePrometheusArchive);
     }
 }

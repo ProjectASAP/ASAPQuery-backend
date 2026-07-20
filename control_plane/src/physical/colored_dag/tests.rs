@@ -14,11 +14,9 @@ use crate::intent_algebra::{LabelFilter, QueryExpr, Schema, Source, WindowKind};
 use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::params::{
-    DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
-};
 use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
+use asap_sketch::{SummaryKind, SummaryParams};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -76,8 +74,8 @@ fn windowed_scan() -> QueryExpr {
 fn quantile_kll_dag() -> PhysicalExpr {
     PhysicalExpr::estimate_over_agg(
         EstimateOp::Quantile { q: 0.99 },
-        SketchKind::Kll,
-        SketchParams::Kll(KllParams { k: 200 }),
+        SummaryKind::Kll,
+        SummaryParams::Kll { k: 200 },
         windowed_scan(),
     )
 }
@@ -122,8 +120,8 @@ fn allocator_sketch_agg_under_scan_pinned_edge() {
     // Exact design.md §6 invariant: a SketchAgg whose child is a Scan
     // (wrapped in Logical) MUST land on Edge.
     let expr = PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Hll,
-        params: SketchParams::Hll(HllParams { precision: 14 }),
+        sketch_type: SummaryKind::Hll,
+        params: SummaryParams::Hll { precision: 14 },
         child: Box::new(PhysicalExpr::Logical(ts_scan("events", None))),
     };
     let dag = StageAllocator
@@ -152,8 +150,8 @@ fn allocator_let_binding_color_propagates() {
     // LetBinding takes the bound expression's stage. Bind a
     // SketchAgg{KLL} (edge) and verify the LetBinding node colors edge.
     let inner_agg = PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
+        sketch_type: SummaryKind::Kll,
+        params: SummaryParams::Kll { k: 200 },
         child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
     let bind = PhysicalExpr::LetBinding {
@@ -183,8 +181,8 @@ fn allocator_ref_resolves_to_binding_stage() {
     // Ref takes the stage of its binding. Same fixture as above; Ref
     // child of SketchEstimate must color Edge (the binding's stage).
     let inner_agg = PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
+        sketch_type: SummaryKind::Kll,
+        params: SummaryParams::Kll { k: 200 },
         child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
     let bind = PhysicalExpr::LetBinding {
@@ -212,8 +210,8 @@ fn allocator_ref_resolves_to_binding_stage() {
 fn allocator_sketch_merge_lands_gateway() {
     // SketchMerge over edge-built KLL sketches → Gateway.
     let one_agg = || PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
+        sketch_type: SummaryKind::Kll,
+        params: SummaryParams::Kll { k: 200 },
         child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
     let merge = PhysicalExpr::SketchMerge {
@@ -243,8 +241,8 @@ fn emitter_three_stage_emits_three_configs() {
     // Build a DAG with all three stages occupied: SketchEstimate over
     // SketchMerge over two SketchAggs.
     let one_agg = || PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
+        sketch_type: SummaryKind::Kll,
+        params: SummaryParams::Kll { k: 200 },
         child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
     let merge = PhysicalExpr::SketchMerge {
@@ -275,7 +273,7 @@ fn emitter_edge_config_has_correct_processor_kll() {
         StageConfig::Edge(e) => {
             assert_eq!(e.sketch_processors.len(), 1);
             assert_eq!(e.sketch_processors[0].processor_name, "KLL");
-            assert_eq!(e.sketch_processors[0].sketch_kind, SketchKind::Kll);
+            assert_eq!(e.sketch_processors[0].sketch_kind, SummaryKind::Kll);
             assert_eq!(
                 e.source_metric.as_deref(),
                 Some("http_request_duration_seconds")
@@ -290,8 +288,8 @@ fn emitter_edge_config_has_correct_processor_kll() {
 fn emitter_edge_config_has_correct_processor_ddsketch() {
     let expr = PhysicalExpr::estimate_over_agg(
         EstimateOp::Quantile { q: 0.99 },
-        SketchKind::DDSketch,
-        SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+        SummaryKind::DDSketch,
+        SummaryParams::DDSketch { alpha: 0.01 },
         windowed_scan(),
     );
     let dag = StageAllocator
@@ -320,7 +318,7 @@ fn emitter_backend_config_routes_aggregation_id() {
         StageConfig::Backend(b) => {
             assert_eq!(b.aggregations.len(), 1);
             assert_eq!(b.aggregations[0].aggregation_id, edge_aid);
-            assert_eq!(b.aggregations[0].sketch_kind, SketchKind::Kll);
+            assert_eq!(b.aggregations[0].sketch_kind, SummaryKind::Kll);
             assert_eq!(b.readouts.len(), 1);
             assert_eq!(b.readouts[0].aggregation_id, edge_aid);
             assert_eq!(b.readouts[0].op, EstimateOp::Quantile { q: 0.99 });
@@ -368,8 +366,8 @@ fn end_to_end_quantile_workload() {
     // Gateway: SketchMerge + Merge; Backend: SketchEstimate + final
     // root).
     let agg = || PhysicalExpr::SketchAgg {
-        sketch_type: SketchKind::Kll,
-        params: SketchParams::Kll(KllParams { k: 200 }),
+        sketch_type: SummaryKind::Kll,
+        params: SummaryParams::Kll { k: 200 },
         child: Box::new(PhysicalExpr::Logical(windowed_scan())),
     };
     let merge_kll = PhysicalExpr::SketchMerge {
@@ -403,7 +401,7 @@ fn end_to_end_quantile_workload() {
         StageConfig::Gateway(g) => {
             assert!(!g.merge_processors.is_empty());
             assert_eq!(g.merge_processors[0].processor_name, "sketchmergeprocessor");
-            assert_eq!(g.merge_processors[0].sketch_kind, SketchKind::Kll);
+            assert_eq!(g.merge_processors[0].sketch_kind, SummaryKind::Kll);
         }
         _ => unreachable!(),
     }

@@ -14,8 +14,9 @@
 
 #![allow(dead_code)]
 
+use asap_sketch::{SummaryKind, SummaryParams};
+
 use crate::intent_algebra::{AggIntent, QueryExpr};
-use crate::sketch_algebra::params::{HllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
@@ -64,8 +65,8 @@ impl Rule for BindHllOnCardinality {
 
         Some(PhysicalExpr::estimate_over_agg(
             EstimateOp::Cardinality,
-            SketchKind::Hll,
-            SketchParams::Hll(HllParams { precision }),
+            SummaryKind::Hll,
+            SummaryParams::Hll { precision },
             (**child).clone(),
         ))
     }
@@ -74,7 +75,9 @@ impl Rule for BindHllOnCardinality {
 /// Map an ε standard-error budget to the HLL `precision` (log2 register
 /// count). Mirrors the in-tree default rungs in `algebra::directory` —
 /// precision 10 (ε≈3.25%) / 12 (ε≈1.6%) / 14 (ε≈0.81%) / 16 (ε≈0.41%).
-fn hll_precision_for_eps(eps: f64) -> u32 {
+/// `u8` to match `asap_sketch::SummaryParams::Hll`'s field type — every
+/// rung here is well within range.
+fn hll_precision_for_eps(eps: f64) -> u8 {
     if eps <= 0.0 {
         return 16;
     }

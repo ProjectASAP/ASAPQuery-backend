@@ -21,10 +21,10 @@
 #![allow(dead_code)]
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
-use crate::sketch_algebra::params::{CmsParams, SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Bind `Aggregate{Count}` / `Aggregate{Frequency}` to CMS.
 pub struct BindCmsOnCount;
@@ -108,16 +108,14 @@ impl Rule for BindCmsOnCount {
 
         Some(PhysicalExpr::estimate_over_agg(
             readout,
-            SketchKind::Cms,
+            SummaryKind::Cms,
             // Heap-LESS CMS — `BindCmsOnCount` is the
             // BindCmsOnCount path (frequency / count without TopK).
             // The CMS-with-heap binding fires from
-            // `bind_cms_with_heap_on_topk` and sets `with_heap: true`.
-            SketchParams::Cms(CmsParams {
-                w,
-                d,
-                with_heap: false,
-            }),
+            // `bind_cms_with_heap_on_topk` and binds `SummaryKind::CmsWithHeap`
+            // instead (heap-bearing is a distinct kind in `SummaryKind`,
+            // not a param flag).
+            SummaryParams::Cms { width: w, depth: d },
             (**child).clone(),
         ))
     }

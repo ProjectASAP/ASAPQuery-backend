@@ -21,7 +21,6 @@
 #![allow(dead_code)]
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::sketch_algebra::params::SketchKind;
 use crate::types_v2::AccuracyTarget;
 use promql_utilities::query_logics::enums::AggregationType;
 
@@ -287,8 +286,8 @@ impl OuterAgg {
 }
 
 /// Compact, hashable handle for sketch implementation choice. Mirrors
-/// [`SketchKind`] but adds the `CmsWithHeap` and `Any` query-side
-/// concepts (which aren't sketch families, they're dispatch hints).
+/// `asap_sketch::SummaryKind` but adds the `Any` query-side wildcard
+/// (not a sketch family — a dispatch hint).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SketchKindHandle {
     DDSketch,
