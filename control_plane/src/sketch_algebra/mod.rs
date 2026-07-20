@@ -31,6 +31,7 @@
 pub mod capability;
 pub mod capability_matching;
 pub mod lower;
+pub mod matcher;
 pub mod physical_expr;
 pub mod rules;
 pub mod sketch_params;
@@ -50,6 +51,7 @@ pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
 pub use lower::{bind_query_expr, BindingError};
+pub use matcher::SummaryFamilyMatcher;
 pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
 pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
