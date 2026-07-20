@@ -8,12 +8,21 @@
 //! | `Sum`                                | `agg_type: AggregationType::Sum`       |
 //! | `Rate { .. }`                        | `agg_type: AggregationType::Increase`  |
 //! | `Increase { .. }`                    | `agg_type: AggregationType::Increase`  |
+//! | `Min` / `Max`                        | `agg_type: AggregationType::MinMax`    |
 //!
 //! `Rate` and `Increase` share the `Increase` accumulator because rate is
 //! computed as `increase / window_seconds` — a scalar division on the
 //! accumulator's output, not a separate accumulator family. The wrapping
 //! division (when needed) is the L5 emitter's responsibility, not the
 //! L4 binder's.
+//!
+//! `Min` and `Max` share the `MinMax` accumulator (min/max are exact and
+//! mergeable by construction — comparing two partial extrema needs no
+//! approximation at all) — matches ASAPController's own
+//! `crates/plan/src/boundary.rs`, which realizes `Min`/`Max` as an exact
+//! mergeable accumulator, same tier as `Sum`/`Rate`/`Increase`. See the
+//! "What this rule does NOT bind" list below for why this superseded the
+//! earlier quantile-sketch-only routing.
 //!
 //! ## What this rule does NOT bind
 //!
@@ -34,12 +43,19 @@
 //!   `HashAgg` / `SortAgg` / `SortMerge` from the deployment's
 //!   exact-physical-operator family (none of which run at the ASAP tier
 //!   today).
-//! - `AggIntent::Min` / `AggIntent::Max` — `MinMax` is already covered
-//!   by the quantile-sketch path (`quantile(0)` / `quantile(1)` via
-//!   DDSketch / KLL). Adding a separate `MinMax` ExactAgg binding
-//!   would create a competing rule; not worth the cost-model churn
-//!   until profile data shows MinMax-precompute is meaningfully
-//!   cheaper than the quantile-sketch path for some workloads.
+//! - `AggIntent::Min` / `AggIntent::Max` — previously left unbound here
+//!   on the theory that `quantile(0)`/`quantile(1)` (DDSketch/KLL)
+//!   already covered them, so a dedicated rule would just compete with
+//!   the sketch-family rules for no accuracy benefit. That theory
+//!   didn't hold: `bind_kll_quantile`/`bind_ddsketch_quantile` only
+//!   ever pattern-match `AggIntent::Quantile`, never `Min`/`Max` — no
+//!   rule actually implemented the promised coverage, so `Min`/`Max`
+//!   silently fell through to archive regardless of what
+//!   `capability_for` claimed. Now bound here instead: min/max are
+//!   exact and mergeable by construction (no approximation needed),
+//!   matching ASAPController's own treatment
+//!   (`crates/plan/src/boundary.rs`) and the data plane's existing
+//!   `MinMaxAccumulator`/`AggregationType::MinMax`.
 //!
 //! ## Priority
 //!
@@ -61,7 +77,7 @@ use crate::sketch_algebra::physical_expr::PhysicalExpr;
 use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
 
-/// Bind exact-aggregation intents (Sum / Rate / Increase / Count{Exact})
+/// Bind exact-aggregation intents (Sum / Rate / Increase / Min / Max)
 /// to `PhysicalExpr::ExactAgg`. See module doc for the mapping table.
 pub struct BindExactAgg;
 
@@ -117,6 +133,13 @@ impl Rule for BindExactAgg {
                     AggregationType::MultipleIncrease
                 } else {
                     AggregationType::Increase
+                }
+            }
+            AggIntent::Min { .. } | AggIntent::Max { .. } => {
+                if keyed {
+                    AggregationType::MultipleMinMax
+                } else {
+                    AggregationType::MinMax
                 }
             }
             // `AggIntent::Count{Exact}` (count_over_time) is intentionally
@@ -224,6 +247,16 @@ mod tests {
             Duration::from_secs(300),
             AggregationType::Increase,
         );
+    }
+
+    #[test]
+    fn binds_min_to_exact_agg_minmax() {
+        check_binds(AggIntent::Min { col: None }, AggregationType::MinMax);
+    }
+
+    #[test]
+    fn binds_max_to_exact_agg_minmax() {
+        check_binds(AggIntent::Max { col: None }, AggregationType::MinMax);
     }
 
     #[test]
@@ -343,6 +376,22 @@ mod tests {
             AggIntent::Increase,
             Duration::from_secs(300),
             AggregationType::MultipleIncrease,
+        );
+    }
+
+    #[test]
+    fn keyed_min_binds_to_multiple_minmax() {
+        check_keyed_binds(
+            AggIntent::Min { col: None },
+            AggregationType::MultipleMinMax,
+        );
+    }
+
+    #[test]
+    fn keyed_max_binds_to_multiple_minmax() {
+        check_keyed_binds(
+            AggIntent::Max { col: None },
+            AggregationType::MultipleMinMax,
         );
     }
 

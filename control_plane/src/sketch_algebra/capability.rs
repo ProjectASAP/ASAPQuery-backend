@@ -438,11 +438,11 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 /// |---|---|
 /// | `Quantile { q, accuracy }` (accuracy not `Exact`) | `Some(QuantileApprox(Any))` |
 /// | `Quantile { q, accuracy: Exact }` | `None` (exact must use HashAgg/SortAgg) |
-/// | `Min` / `Max` | `Some(QuantileApprox(Any))` — quantile sketches answer min = q(0), max = q(1) |
+/// | `Min` / `Max` | `Some(ExactAgg(MinMax))` — exact mergeable accumulator, no approximation needed |
 /// | `Cardinality { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
 /// | `Cardinality { accuracy: Exact }` | `None` |
-/// | `Count { accuracy: Exact }` | `Some(ExactAgg(Sum))` — count_over_time = sum-of-1s (PR-6 follow-up) |
-/// | `Count { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
+/// | `Count { accuracy: Exact }` | `None` — no count accumulator exists yet; routes to archive |
+/// | `Count { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` — bare per-item frequency point-query (CMS) |
 /// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
 /// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
 /// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
@@ -484,11 +484,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         }
         AggIntent::Count { accuracy } => {
             // Count is the legacy bridge — `count_over_time` lowers to
-            // `Count{accuracy:Exact}` (exact counter, no sketch). When
-            // the lowerer or callers ask for an approximate count
-            // (`distinct_over_time` / SQL `COUNT(DISTINCT)`), the
-            // accuracy is non-Exact and we hand it to the cardinality
-            // sketch path.
+            // `Count{accuracy:Exact}` (exact counter, no sketch).
             //
             // Exact count routes to archive (`None`). The PR #200/#201
             // follow-up flipped this to `ExactAgg(Sum)` on the theory
@@ -501,10 +497,28 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             // until a real `SumCountAccumulator` lands (the
             // temporal/spatial-split work) — archive counts correctly
             // in the meantime.
+            //
+            // Non-exact `Count` is a relaxed-accuracy `COUNT(*) per
+            // group` — a bare per-item frequency point-query, matching
+            // ASAPController's own `crates/plan/src/bind.rs::readout`
+            // (`AggIntent::Count => SketchQuery::PointCount`) and this
+            // repo's own `BindCmsOnCount` rule (CMS, no top-k heap).
+            // Previously mapped to `CardinalityApprox`/HLL under the
+            // theory that non-exact `Count` meant "distinct count" —
+            // but `distinct_over_time`/`COUNT(DISTINCT)` always lower to
+            // `AggIntent::Cardinality`, never to `Count`, so that
+            // premise never had a real caller; `AggIntent::Count`
+            // itself is unreachable via this repo's own PromQL frontend
+            // today regardless of accuracy (`lower.rs` only ever
+            // constructs `Count{Exact}` or the `Extension`-based
+            // `Frequency` intent), so this only affects future callers
+            // (e.g. a SQL frontend) — fixed here for consistency with
+            // `rules::dispatch` rather than because it changes any
+            // query routing today.
             if is_exact(accuracy) {
                 None
             } else {
-                Some(Capability::CardinalityApprox)
+                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
             }
         }
         AggIntent::TopK { accuracy, .. } => {
@@ -524,13 +538,6 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
                 Some(Capability::FrequencyTopk(SketchKindHandle::Any))
             }
         }
-        // ── Min / Max via quantile sketches ──────────────────────────
-        // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
-        // out of the box. No dedicated extrema sketch is needed; route
-        // these through the quantile-family handler.
-        AggIntent::Min { .. } | AggIntent::Max { .. } => {
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
-        }
         // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
         // These intents previously returned `None` and routed to the
         // archive engine. Now that the data plane carries
@@ -542,6 +549,26 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
         AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
         AggIntent::Rate | AggIntent::Increase => {
             Some(Capability::ExactAgg(AggregationType::Increase))
+        }
+        // Min / Max are exact, mergeable accumulators — comparing two
+        // partial min/maxes is exact by construction, no approximation
+        // needed at all. Previously routed through `QuantileApprox`
+        // (DDSketch/KLL answer min = quantile(0), max = quantile(1) —
+        // a strictly worse, lossy answer when an exact accumulator is
+        // just as cheap) on the theory that a dedicated `MinMax` bind
+        // rule wasn't worth the cost-model churn versus the
+        // already-existing quantile-sketch path. That premise didn't
+        // hold: `bind_kll_quantile`/`bind_ddsketch_quantile` only ever
+        // matched `AggIntent::Quantile`, never `Min`/`Max`, so no rule
+        // actually implemented the promised quantile-sketch coverage —
+        // and matches ASAPController's own `crates/plan/src/boundary.rs`
+        // (`Min`/`Max` are exact mergeable accumulators, same tier as
+        // `Sum`/`Rate`/`Increase`). The data plane already has a fully
+        // wired `MinMaxAccumulator`/`AggregationType::MinMax`, so this
+        // isn't new infrastructure — see `bind_exact_agg.rs`'s matching
+        // `AggIntent::Min | AggIntent::Max` arm.
+        AggIntent::Min { .. } | AggIntent::Max { .. } => {
+            Some(Capability::ExactAgg(AggregationType::MinMax))
         }
         // ── Avg / StdDev / Variance: still no ASAP-tier substitute ────
         // Avg = Sum / Count, which needs two separate ExactAgg policies
@@ -687,11 +714,20 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_approximate_returns_cardinality_approx() {
+    fn capability_for_count_approximate_returns_frequency_estimate() {
+        // Non-exact `Count` is a relaxed-accuracy `COUNT(*)` point query
+        // (CMS), matching ASAPController's own `bind.rs::readout`
+        // (`Count => SketchQuery::PointCount`) and this repo's
+        // `BindCmsOnCount` rule — not `CardinalityApprox`/HLL, which is
+        // `AggIntent::Cardinality`'s job (`distinct_over_time`/
+        // `COUNT(DISTINCT)` never lower to `Count`).
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
-        assert_eq!(capability_for(&intent), Some(Capability::CardinalityApprox));
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        );
     }
 
     #[test]
@@ -729,20 +765,21 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_min_returns_quantile_approx() {
-        // Min = quantile(0); DDSketch / KLL answer it directly.
+    fn capability_for_min_returns_exact_agg_minmax() {
+        // Min/Max are exact, mergeable accumulators -- no approximation
+        // needed at all -- matching ASAPController's own
+        // `crates/plan/src/boundary.rs` treatment.
         assert_eq!(
             capability_for(&AggIntent::Min { col: None }),
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::ExactAgg(AggregationType::MinMax))
         );
     }
 
     #[test]
-    fn capability_for_max_returns_quantile_approx() {
-        // Max = quantile(1); DDSketch / KLL answer it directly.
+    fn capability_for_max_returns_exact_agg_minmax() {
         assert_eq!(
             capability_for(&AggIntent::Max { col: None }),
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::ExactAgg(AggregationType::MinMax))
         );
     }
 
