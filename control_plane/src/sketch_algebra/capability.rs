@@ -432,24 +432,19 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 /// (`intent_algebra::lower::lower_parsed_query`), which is the single
 /// owner of "what does this PromQL function mean".
 ///
-/// ## Mapping table
+/// ## Delegation to `asap-plan`
 ///
-/// | `AggIntent` variant | Returns |
-/// |---|---|
-/// | `Quantile { q, accuracy }` (accuracy not `Exact`) | `Some(QuantileApprox(Any))` |
-/// | `Quantile { q, accuracy: Exact }` | `None` (exact must use HashAgg/SortAgg) |
-/// | `Min` / `Max` | `Some(ExactAgg(MinMax))` — exact mergeable accumulator, no approximation needed |
-/// | `Cardinality { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
-/// | `Cardinality { accuracy: Exact }` | `None` |
-/// | `Count { accuracy: Exact }` | `None` — no count accumulator exists yet; routes to archive |
-/// | `Count { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` — bare per-item frequency point-query (CMS) |
-/// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
-/// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
-/// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
-/// | `Sum` | `Some(ExactAgg(Sum))` — ASAP-tier exact precompute (PR-6 follow-up) |
-/// | `Rate` / `Increase` | `Some(ExactAgg(Increase))` — counter-reset-aware precompute (PR-6 follow-up) |
-/// | `Avg` | `None` — needs cross-policy join (Sum + Count); follow-up |
-/// | Every archive-only intent | `None` |
+/// Beyond the `Extension`/`Frequency` special case (deployment-specific,
+/// see below — `asap-plan` deliberately has no opinion on a shape it
+/// can't see into), every other `AggIntent` variant's capability is
+/// derived from [`asap_plan::boundary::implementation_for`] — the single
+/// upstream authority for "how would this intent be realized" — rather
+/// than a second, hand-maintained, parallel judgment kept in sync by
+/// hand. See [`implementation_to_capability`] for the
+/// `asap_sketch::SummaryKind` → `Capability` family translation this
+/// still requires (the two crates' capability vocabularies aren't the
+/// same *shape*, even once they agree on substance), and its doc comment
+/// for the one deliberate override (`Count{Exact}`).
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     if let Some(accuracy) = crate::intent_algebra::as_frequency(intent) {
         return if is_exact(&accuracy) {
@@ -467,152 +462,86 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         };
     }
-    match intent {
-        AggIntent::Quantile { accuracy, .. } => {
-            if is_exact(accuracy) {
-                None
-            } else {
+    implementation_to_capability(asap_plan::boundary::implementation_for(intent))
+}
+
+/// Translate `asap-plan`'s per-intent implementation decision into this
+/// repo's own [`Capability`] vocabulary.
+///
+/// `Implementation::Sketch`/`ExactAccumulator` both carry an
+/// `asap_sketch::SummaryKind` — this repo's `Capability` groups those
+/// into coarser families (`QuantileApprox`/`CardinalityApprox`/
+/// `FrequencyEstimate`/`FrequencyTopk` for sketches; `ExactAgg(AggregationType)`
+/// for accumulators) because that's the granularity the sketch index
+/// (`is_satisfied_by`) and the wire-shared `sketch_index::Capability`
+/// actually match on — the required side never pins a *specific*
+/// concrete implementation (`Any`), only the family. This function is
+/// exhaustive over `SummaryKind` (no wildcard fallthrough), so a new
+/// variant there fails to compile here until given an explicit mapping.
+fn implementation_to_capability(implementation: asap_plan::Implementation) -> Option<Capability> {
+    use asap_plan::Implementation;
+    use asap_sketch::SummaryKind;
+
+    match implementation {
+        Implementation::PassThrough => None,
+        Implementation::Sketch { kind, .. } => match kind {
+            SummaryKind::Kll | SummaryKind::DDSketch => {
                 Some(Capability::QuantileApprox(SketchKindHandle::Any))
             }
-        }
-        AggIntent::Cardinality { accuracy, .. } => {
-            if is_exact(accuracy) {
-                None
-            } else {
+            SummaryKind::Hll | SummaryKind::Theta | SummaryKind::Kmv => {
                 Some(Capability::CardinalityApprox)
             }
-        }
-        AggIntent::Count { accuracy } => {
-            // Count is the legacy bridge — `count_over_time` lowers to
-            // `Count{accuracy:Exact}` (exact counter, no sketch).
-            //
-            // Exact count routes to archive (`None`). The PR #200/#201
-            // follow-up flipped this to `ExactAgg(Sum)` on the theory
-            // "count = sum-of-1s" — but the data plane has no count
-            // accumulator. `SumAccumulator` only tracks `sum: f64` and
-            // its `query` returns `self.sum` for BOTH `Statistic::Sum`
-            // and `Statistic::Count`, so a `count_over_time` query
-            // matched against a `Sum` policy returns the sum of the
-            // sample VALUES, not the count of samples. Reverted here
-            // until a real `SumCountAccumulator` lands (the
-            // temporal/spatial-split work) — archive counts correctly
-            // in the meantime.
-            //
-            // Non-exact `Count` is a relaxed-accuracy `COUNT(*) per
-            // group` — a bare per-item frequency point-query, matching
-            // ASAPController's own `crates/plan/src/bind.rs::readout`
-            // (`AggIntent::Count => SketchQuery::PointCount`) and this
-            // repo's own `BindCmsOnCount` rule (CMS, no top-k heap).
-            // Previously mapped to `CardinalityApprox`/HLL under the
-            // theory that non-exact `Count` meant "distinct count" —
-            // but `distinct_over_time`/`COUNT(DISTINCT)` always lower to
-            // `AggIntent::Cardinality`, never to `Count`, so that
-            // premise never had a real caller; `AggIntent::Count`
-            // itself is unreachable via this repo's own PromQL frontend
-            // today regardless of accuracy (`lower.rs` only ever
-            // constructs `Count{Exact}` or the `Extension`-based
-            // `Frequency` intent), so this only affects future callers
-            // (e.g. a SQL frontend) — fixed here for consistency with
-            // `rules::dispatch` rather than because it changes any
-            // query routing today.
-            if is_exact(accuracy) {
-                None
-            } else {
+            SummaryKind::Cms | SummaryKind::CountSketch => {
                 Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
             }
-        }
-        AggIntent::TopK { accuracy, .. } => {
-            if is_exact(accuracy) {
-                // Exact top-k must use HashAgg+Heap; no ASAP-tier sketch.
-                None
-            } else {
-                // Top-k is intrinsically heavy-hitter — only heap-bearing
-                // handles can enumerate the items. The analyzer doesn't
-                // care which heap-bearing variant answers (CmsWithHeap or
-                // CountSketchWithHeap both work — the reducer dispatches
-                // both through `decode_cms_with_heap_from_msgpack` and
-                // produces top-k items either way). Return `Any` so
-                // `is_satisfied_by`'s `handles_compatible_for_topk`
-                // wildcard accepts whichever variant the ingest tier
-                // chose to register.
+            SummaryKind::CmsWithHeap | SummaryKind::CountSketchWithHeap => {
                 Some(Capability::FrequencyTopk(SketchKindHandle::Any))
             }
-        }
-        // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
-        // These intents previously returned `None` and routed to the
-        // archive engine. Now that the data plane carries
-        // `Capability::ExactAgg(agg_type)` on ExactAgg-backed sids,
-        // the analyzer can match them to ASAP-tier exact-precompute
-        // state instead. `is_satisfied_by` checks `agg_type` equality
-        // structurally — a sid registered as `ExactAgg(Sum)` only
-        // satisfies a required `ExactAgg(Sum)`.
-        AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
-        AggIntent::Rate | AggIntent::Increase => {
-            Some(Capability::ExactAgg(AggregationType::Increase))
-        }
-        // Min / Max are exact, mergeable accumulators — comparing two
-        // partial min/maxes is exact by construction, no approximation
-        // needed at all. Previously routed through `QuantileApprox`
-        // (DDSketch/KLL answer min = quantile(0), max = quantile(1) —
-        // a strictly worse, lossy answer when an exact accumulator is
-        // just as cheap) on the theory that a dedicated `MinMax` bind
-        // rule wasn't worth the cost-model churn versus the
-        // already-existing quantile-sketch path. That premise didn't
-        // hold: `bind_kll_quantile`/`bind_ddsketch_quantile` only ever
-        // matched `AggIntent::Quantile`, never `Min`/`Max`, so no rule
-        // actually implemented the promised quantile-sketch coverage —
-        // and matches ASAPController's own `crates/plan/src/boundary.rs`
-        // (`Min`/`Max` are exact mergeable accumulators, same tier as
-        // `Sum`/`Rate`/`Increase`). The data plane already has a fully
-        // wired `MinMaxAccumulator`/`AggregationType::MinMax`, so this
-        // isn't new infrastructure — see `bind_exact_agg.rs`'s matching
-        // `AggIntent::Min | AggIntent::Max` arm.
-        AggIntent::Min { .. } | AggIntent::Max { .. } => {
-            Some(Capability::ExactAgg(AggregationType::MinMax))
-        }
-        // ── Avg / StdDev / Variance: still no ASAP-tier substitute ────
-        // Avg = Sum / Count, which needs two separate ExactAgg policies
-        // (one for Sum, one for Count) joined at query time. The L4
-        // binder doesn't yet emit that pattern, so capability_for keeps
-        // these on the archive path for now. Follow-up.
-        AggIntent::Avg { .. } | AggIntent::StdDev { .. } | AggIntent::Variance { .. } => None,
-        // Archive-only intents — never bind to a ASAP-tier capability;
-        // routed to the cold tier (Gorilla / Thanos). Includes every
-        // intent added by the Phase 1 IR merge (none has a `Bind*` rule
-        // yet) plus the pre-existing archive-only set. `Irate` is
-        // intentionally absent — folded into `Rate` above (see
-        // `agg_intent.rs` module docs).
-        AggIntent::Absent
-        | AggIntent::AbsentOverTime
-        | AggIntent::PresentOverTime
-        | AggIntent::Delta
-        | AggIntent::Deriv
-        | AggIntent::PredictLinear { .. }
-        | AggIntent::DoubleExpSmoothing { .. }
-        | AggIntent::IDelta
-        | AggIntent::Resets
-        | AggIntent::Changes
-        | AggIntent::HistogramCount
-        | AggIntent::HistogramSum
-        | AggIntent::HistogramAvg
-        | AggIntent::HistogramStdDev
-        | AggIntent::HistogramStdVar
-        | AggIntent::HistogramFraction { .. }
-        | AggIntent::HistogramQuantile { .. }
-        | AggIntent::Math(_)
-        | AggIntent::TimeFn(_)
-        | AggIntent::Group
-        | AggIntent::CountValues { .. }
-        | AggIntent::LastOverTime
-        | AggIntent::FirstOverTime
-        | AggIntent::MadOverTime
-        | AggIntent::TsOfMinOverTime
-        | AggIntent::TsOfMaxOverTime
-        | AggIntent::TsOfFirstOverTime
-        | AggIntent::TsOfLastOverTime => None,
-        // Unrecognized Extension (not the Frequency one, guarded above) -- no
-        // binding exists for a shape core cannot even see into.
-        AggIntent::Extension { .. } => None,
+            SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate => {
+                unreachable!(
+                    "{kind:?} is an exact-accumulator SummaryKind, never returned inside \
+                     Implementation::Sketch by asap_plan::boundary::implementation_for"
+                )
+            }
+        },
+        Implementation::ExactAccumulator { kind, .. } => match kind {
+            SummaryKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+            SummaryKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
+            SummaryKind::Increase | SummaryKind::Rate => {
+                Some(Capability::ExactAgg(AggregationType::Increase))
+            }
+            // `AggregationType` (this repo's own exact-accumulator-family
+            // enum) has no `Count` variant — the data plane has no
+            // working count accumulator (`SumAccumulator` returns `sum`
+            // for both `Statistic::Sum` and `Statistic::Count`, so a
+            // `count_over_time` query matched against a `Sum` policy
+            // would silently return sum-of-values, not sample-count).
+            // `asap_plan::boundary::implementation_for` still reports
+            // `Count{Exact}` as an `ExactAccumulator` (it assumes a real
+            // count accumulator exists, which is true in ASAPController's
+            // own reference implementation) — deliberately overridden
+            // here to `None` (archive) until a real
+            // `SumCountAccumulator` lands.
+            SummaryKind::Count => None,
+            SummaryKind::Kll
+            | SummaryKind::DDSketch
+            | SummaryKind::Hll
+            | SummaryKind::Theta
+            | SummaryKind::Kmv
+            | SummaryKind::Cms
+            | SummaryKind::CmsWithHeap
+            | SummaryKind::CountSketch
+            | SummaryKind::CountSketchWithHeap => {
+                unreachable!(
+                    "{kind:?} is a sketch-family SummaryKind, never returned inside \
+                     Implementation::ExactAccumulator by asap_plan::boundary::implementation_for"
+                )
+            }
+        },
     }
 }
 

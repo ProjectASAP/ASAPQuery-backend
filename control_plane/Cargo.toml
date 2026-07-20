@@ -52,6 +52,15 @@ asap_types.workspace = true
 # Also satisfies everything Phase 2 (#395) needs -- asap-l2 (Step 4),
 # asap-plan/asap-sketch + Implementation::is_satisfied_by (Steps 8-9) --
 # 7fcaf91 is a strict descendant of every rev that PR pinned along the way.
+#
+# asap-plan owns the single authoritative AggIntent -> sketch-vs-exact
+# implementation decision (`boundary::implementation_for`, Cascades
+# "implementation rule" terminology -- see that crate's doc); capability_for
+# delegates to it instead of maintaining its own parallel judgment. asap-plan
+# depends only on asap-ir (per its own crate doc's layering invariant), so
+# this doesn't pull in datafusion or any front-end weight. asap-sketch is
+# asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
+# to translate Implementation into this repo's own Capability vocabulary.
 asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
