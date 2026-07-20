@@ -117,14 +117,14 @@ pub enum AccuracyTarget {
 
 /// Returns the aggregation types that can serve this statistic.
 ///
-/// This list is the **superset of compatibility**: every `AggregationType`
-/// that the planner's canonical map (`promql_utilities::query_logics::logics::
-/// map_statistic_to_precompute_operator`) may legally produce for this
-/// statistic — across both `Exact` and `Approximate` treatment types — must
-/// appear here. The agreement is enforced by
-/// `capability_canonical_map_agreement` in the test module: any future
-/// divergence between this table and `map_statistic_to_precompute_operator`
-/// will be caught at test-time.
+/// This list is the **superset of compatibility** and, as of the
+/// `promql_utilities` retirement, the **single source of truth** for it —
+/// there used to be a second, independently-maintained table
+/// (`promql_utilities::query_logics::logics::map_statistic_to_precompute_operator`,
+/// the planner's own canonical map) that this one had to agree with,
+/// checked by a `capability_canonical_map_agreement` test. That table was
+/// dead code (a Python-planner relic — nothing in Rust ever called it
+/// except that one test) and was deleted; this is now the only table.
 ///
 /// The runtime caller (`find_compatible_aggregation`) has no
 /// `QueryTreatmentType` to consult — `QueryRequirements` is treatment-agnostic
@@ -134,8 +134,7 @@ pub enum AccuracyTarget {
 /// `aggregation_priority` (largest window size wins).
 pub fn compatible_agg_types(stat: Statistic) -> &'static [AggregationType] {
     match stat {
-        // Sum: exact via Sum / MultipleSum; approximate via CountMinSketch
-        // (the canonical approximator picked by `map_statistic_to_precompute_operator`).
+        // Sum: exact via Sum / MultipleSum; approximate via CountMinSketch.
         // Pre-fix this list omitted CountMinSketch, so a `sum_over_time(...)`
         // query against a CMS-only config fell through capability matching
         // and onto the cold tier.
@@ -1057,69 +1056,6 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Source-of-truth agreement check.
-    //
-    // `compatible_agg_types(Statistic)` (this file) and
-    // `promql_utilities::query_logics::logics::map_statistic_to_precompute_operator`
-    // are two views onto the same `(Statistic, AggregationType)` capability
-    // table. The planner emits configs from the canonical map; capability
-    // matching dispatches queries against the compat list. They MUST agree —
-    // every canonical map output for a given Statistic must be a member of
-    // `compatible_agg_types(Statistic)` — or queries the planner configured
-    // will silently fall through capability matching to the cold-tier
-    // fallback.
-    //
-    // This test enumerates every supported `(Statistic, QueryTreatmentType)`
-    // pair, calls the canonical map, and asserts membership. Any future edit
-    // on either side that breaks the agreement fails the build.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn capability_canonical_map_agreement() {
-        use promql_utilities::query_logics::enums::QueryTreatmentType;
-        use promql_utilities::query_logics::logics::map_statistic_to_precompute_operator;
-
-        // Listed exhaustively so adding a new `Statistic` variant fails to
-        // compile here (forcing the author to decide its compat membership).
-        let stats = [
-            Statistic::Count,
-            Statistic::Sum,
-            Statistic::Cardinality,
-            Statistic::Increase,
-            Statistic::Rate,
-            Statistic::Min,
-            Statistic::Max,
-            Statistic::Quantile,
-            Statistic::Topk,
-        ];
-        let treatments = [QueryTreatmentType::Exact, QueryTreatmentType::Approximate];
-
-        for &stat in &stats {
-            let compat = compatible_agg_types(stat);
-            for &treat in &treatments {
-                match map_statistic_to_precompute_operator(stat, treat) {
-                    Ok((agg_type, _sub_type)) => {
-                        assert!(
-                            compat.contains(&agg_type),
-                            "Divergence: map_statistic_to_precompute_operator({stat:?}, {treat:?}) \
-                             returns {agg_type:?}, but compatible_agg_types({stat:?}) = {compat:?} \
-                             does not list it. Either add {agg_type:?} to compatible_agg_types or \
-                             change the canonical map. See the docstring on \
-                             compatible_agg_types for the source-of-truth invariant.",
-                        );
-                    }
-                    Err(_) => {
-                        // The canonical map declines this pair (e.g.
-                        // Quantile-Exact, Cardinality, etc.). That's fine —
-                        // capability_matching never sees a planner-emitted
-                        // config for that pair, so there's nothing to agree on.
-                    }
-                }
-            }
-        }
-    }
-
     /// Pin the canonical-approximator picks driving the ASAP-tier query path
     /// (the "five sketch types" CMS / KLL / HLL / DDSketch / CountSketch
     /// canonical statistic table from PROGRESS.md). HLL / DDSketch /
@@ -1345,8 +1281,7 @@ mod tests {
         assert_eq!(parse_storage_backend_engine_id("not_an_engine"), None);
     }
 
-    /// Source-of-truth agreement check, mirrors
-    /// `capability_canonical_map_agreement` for the storage axis.
+    /// Source-of-truth agreement check for the storage axis.
     ///
     /// For every `(Statistic, AccuracyTarget, StorageBackend)` triple
     /// the returned backend list must be non-empty and its head must
