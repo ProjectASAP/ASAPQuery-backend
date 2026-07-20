@@ -2,7 +2,26 @@ use crate::storage_engines::sketch_db::AccuracyEnvelope;
 use crate::storage_engines::types::KeyByLabelValues;
 use serde::{Deserialize, Serialize};
 
-use promql_utilities::query_logics::enums::QueryResultType;
+/// Whether a [`QueryResult`] is a PromQL instant-vector or range-vector
+/// result -- mirrors the Prometheus HTTP API's `resultType` response
+/// field. Formerly `promql_utilities::query_logics::enums::QueryResultType`;
+/// moved here (its only real production consumer) since it's an
+/// HTTP-response-shape tag with no meaning outside a query server --
+/// ASAPController has no HTTP query server and no equivalent concept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QueryResultType {
+    InstantVector,
+    RangeVector,
+}
+
+impl std::fmt::Display for QueryResultType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryResultType::InstantVector => write!(f, "instant_vector"),
+            QueryResultType::RangeVector => write!(f, "range_vector"),
+        }
+    }
+}
 
 /// Represents the result of a PromQL query
 #[derive(Debug, Clone, Serialize, Deserialize)]

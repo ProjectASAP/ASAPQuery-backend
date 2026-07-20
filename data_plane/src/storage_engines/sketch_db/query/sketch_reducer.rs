@@ -67,7 +67,7 @@ use crate::storage_engines::sketch_db::query::decoders::{
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
 };
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// Reducer wrapping a `&SketchStore`. Constructed per-query; cheap.
 pub struct SketchReducer<'a> {
@@ -478,23 +478,23 @@ impl<'a> SketchReducer<'a> {
                     cov_lo = cov_lo.min(w);
                     cov_hi = cov_hi.max(w);
                 }
-                let series_state =
-                    cumulative_hll_state(&samples_vec, precision).map_err(|e| {
-                        ASAPTierError::DeserializeFailure {
-                            sid,
-                            encoding: SketchEncoding::ProtoFull,
-                            reason: e,
-                        }
-                    })?;
+                let series_state = cumulative_hll_state(&samples_vec, precision).map_err(|e| {
+                    ASAPTierError::DeserializeFailure {
+                        sid,
+                        encoding: SketchEncoding::ProtoFull,
+                        reason: e,
+                    }
+                })?;
                 if let Some(sk) = series_state {
                     merged = Some(match merged.take() {
                         None => sk,
                         Some(mut acc) => {
-                            acc.merge(&sk).map_err(|e| ASAPTierError::DeserializeFailure {
-                                sid,
-                                encoding: SketchEncoding::ProtoFull,
-                                reason: format!("global HLL merge: {e}"),
-                            })?;
+                            acc.merge(&sk)
+                                .map_err(|e| ASAPTierError::DeserializeFailure {
+                                    sid,
+                                    encoding: SketchEncoding::ProtoFull,
+                                    reason: format!("global HLL merge: {e}"),
+                                })?;
                             acc
                         }
                     });
@@ -509,7 +509,11 @@ impl<'a> SketchReducer<'a> {
         };
         let _ = any_window;
         let estimate = merged.estimate();
-        let window_end = if cov_hi > 0 { cov_hi as i64 } else { t1_ms as i64 };
+        let window_end = if cov_hi > 0 {
+            cov_hi as i64
+        } else {
+            t1_ms as i64
+        };
         let coverage = if cov_lo <= cov_hi {
             Some((cov_lo, cov_hi))
         } else {
@@ -673,10 +677,12 @@ impl<'a> SketchReducer<'a> {
                             }
                             _ => decode_cms_with_heap_from_msgpack(&state.bytes),
                         }
-                        .map_err(|e| ASAPTierError::DeserializeFailure {
-                            sid,
-                            encoding: state.encoding,
-                            reason: e,
+                        .map_err(|e| {
+                            ASAPTierError::DeserializeFailure {
+                                sid,
+                                encoding: state.encoding,
+                                reason: e,
+                            }
                         })?;
                         for item in decoded.topk_heap_items() {
                             *summed.entry(item.key).or_insert(0.0) += item.value;
@@ -700,9 +706,8 @@ impl<'a> SketchReducer<'a> {
                     }
                     // Sort descending by summed count, take top-k.
                     let mut items: Vec<(String, f64)> = summed.into_iter().collect();
-                    items.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    items
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                     for (key, value) in items.into_iter().take(k) {
                         let mut lv = ts.series_label_values.clone();
                         lv.insert("item".to_string(), key);

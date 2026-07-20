@@ -2,14 +2,14 @@ use crate::storage_engines::types::StreamingConfig;
 use std::sync::Arc;
 
 use asap_types::query_requirements::QueryRequirements;
-use promql_utilities::data_model::KeyByLabelNames;
+use asap_types::KeyByLabelNames;
 
 #[cfg(test)]
 use crate::storage_engines::types::KeyByLabelValues;
 #[cfg(test)]
 use crate::AggregateCore;
 #[cfg(test)]
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 #[cfg(test)]
 use std::collections::HashMap;
 
@@ -916,9 +916,7 @@ impl ASAPQueryEngine {
                     .execute_range(query, start_ms, end_ms, step_ms)
                     .await
                 {
-                    return Ok(stitch_warm_and_archive(
-                        warm_qr, archive_qr, cov_lo, cov_hi,
-                    ));
+                    return Ok(stitch_warm_and_archive(warm_qr, archive_qr, cov_lo, cov_hi));
                 }
                 // Archive error → fall back to warm-only (best effort).
             }
@@ -2205,7 +2203,7 @@ mod hot_reload_phase2_tests {
     use crate::storage_engines::types::{
         AggregationType, CleanupPolicy, HotReloadStreamingConfig, StreamingConfig, WindowType,
     };
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
 
     #[test]
     fn extract_filter_value_pulls_item_value() {
@@ -2370,7 +2368,7 @@ mod aux_pushdown_tests {
         min_max_accumulator::MinMaxAccumulator, sum_accumulator::SumAccumulator,
     };
     use crate::storage_engines::types::AggregationType;
-    use promql_utilities::query_logics::enums::Statistic;
+    use asap_types::Statistic;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -4630,12 +4628,8 @@ mod hybrid_stitch_tests {
 #[cfg(test)]
 mod range_stitch_tests {
     use super::*;
-    use crate::query_engines::query_result::{
-        QueryResult, RangeVectorElement, Sample,
-    };
-    use crate::query_engines::routing::query_engine_routing::{
-        EngineCapabilities, QueryEngine,
-    };
+    use crate::query_engines::query_result::{QueryResult, RangeVectorElement, Sample};
+    use crate::query_engines::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
@@ -4768,9 +4762,7 @@ mod range_stitch_tests {
         let mid_ts = now_ms.saturating_sub(300_000) as i64;
         arch_el.samples.push(Sample::new(prefix_ts as u64, 999.0));
         arch_el.samples.push(Sample::new(mid_ts as u64, 998.0));
-        arch_el
-            .samples
-            .push(Sample::new(warm_w1_end, 1.0)); // overlap: warm should win
+        arch_el.samples.push(Sample::new(warm_w1_end, 1.0)); // overlap: warm should win
         let archive = Arc::new(FakeArchive {
             matrix: QueryResult::matrix(vec![arch_el]),
         });
@@ -4782,12 +4774,7 @@ mod range_stitch_tests {
             .with_archive_engine(archive);
 
         let result = engine
-            .execute_range_promql_modern(
-                "count_over_time(req_count[5m])",
-                start_ms,
-                end_ms,
-                15_000,
-            )
+            .execute_range_promql_modern("count_over_time(req_count[5m])", start_ms, end_ms, 15_000)
             .await
             .expect("range query must answer (stitched), not error");
 

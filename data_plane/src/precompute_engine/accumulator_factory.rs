@@ -660,9 +660,7 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
             // Σ count: one occurrence per event, regardless of value.
             TopkWeight::Count => 1.0,
         };
-        self.acc
-            .inner
-            .update(&key.to_semicolon_str(), weighted);
+        self.acc.inner.update(&key.to_semicolon_str(), weighted);
     }
 
     impl_clone_accumulator_methods!(acc);
@@ -1031,9 +1029,9 @@ mod tests {
                 agg_type,
                 sub_type.to_string(),
                 HashMap::new(),
-                promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-                promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-                promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+                asap_types::KeyByLabelNames::new(vec![]),
+                asap_types::KeyByLabelNames::new(vec![]),
+                asap_types::KeyByLabelNames::new(vec![]),
                 String::new(),
                 60,
                 0,
@@ -1125,9 +1123,9 @@ mod tests {
             AggregationType::SingleSubpopulation,
             "DatasketchesKLL".to_string(),
             params,
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             60,
             0,
@@ -1162,9 +1160,9 @@ mod tests {
             AggregationType::CountMinSketch,
             String::new(),
             params,
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             60,
             0,
@@ -1182,9 +1180,9 @@ mod tests {
             AggregationType::CountMinSketch,
             String::new(),
             HashMap::new(),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             60,
             0,
@@ -1218,12 +1216,10 @@ mod tests {
             agg_type,
             String::new(),
             params,
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
             // group-by = `host` (NOT the metric label `item`).
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![
-                "host".to_string(),
-            ]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec!["host".to_string()]),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             60,
             0,
@@ -1345,10 +1341,7 @@ mod tests {
     #[test]
     fn topk_weight_param_parses_modes() {
         assert_eq!(
-            super::topk_weight_param(&topk_config(
-                AggregationType::CountMinSketchWithHeap,
-                None
-            )),
+            super::topk_weight_param(&topk_config(AggregationType::CountMinSketchWithHeap, None)),
             TopkWeight::Value,
             "unset defaults to value-weighted"
         );

@@ -252,7 +252,7 @@ mod tests {
     use crate::storage_engines::types::{AggregationType, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
     fn sum_agg_config(id: u64) -> AggregationConfig {

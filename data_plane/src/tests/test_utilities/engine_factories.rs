@@ -13,7 +13,7 @@ use crate::storage_engines::types::{
     StreamingConfig, WindowType,
 };
 use crate::AggregateCore;
-use promql_utilities::data_model::KeyByLabelNames;
+use asap_types::KeyByLabelNames;
 use std::collections::HashMap;
 
 /// Helper for test factories — wraps the closure-mint call with a

@@ -109,9 +109,7 @@ impl PolicyFingerprint {
         for (k, v) in sorted {
             buf.extend_from_slice(k.as_bytes());
             buf.push(b'=');
-            buf.extend_from_slice(
-                serde_json::to_string(v).unwrap_or_default().as_bytes(),
-            );
+            buf.extend_from_slice(serde_json::to_string(v).unwrap_or_default().as_bytes());
             buf.push(b';');
         }
         buf.push(0);
@@ -175,7 +173,7 @@ impl std::fmt::Display for PolicyFingerprint {
 mod tests {
     use super::*;
     use crate::enums::WindowType;
-    use promql_utilities::data_model::KeyByLabelNames;
+    use crate::KeyByLabelNames;
     use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap;
 
@@ -208,28 +206,86 @@ mod tests {
 
     #[test]
     fn same_config_yields_same_fingerprint() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec!["zone"], 60, "");
-        let b = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec!["zone"], 60, "");
-        assert_eq!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec!["zone"],
+            60,
+            "",
+        );
+        let b = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec!["zone"],
+            60,
+            "",
+        );
+        assert_eq!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
     }
 
     #[test]
     fn different_metric_yields_different_fingerprint() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
-        let b = cfg("cpu_pct", AggregationType::Sum, HashMap::new(), vec![], 60, "");
-        assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
+        let b = cfg(
+            "cpu_pct",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
+        assert_ne!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
     }
 
     #[test]
     fn different_window_yields_different_fingerprint() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
-        let b = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 300, "");
-        assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
+        let b = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            300,
+            "",
+        );
+        assert_ne!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
     }
 
     #[test]
     fn different_spatial_filter_yields_different_fingerprint() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
         let b = cfg(
             "http_lat",
             AggregationType::Sum,
@@ -238,12 +294,22 @@ mod tests {
             60,
             r#"status="200""#,
         );
-        assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        assert_ne!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
     }
 
     #[test]
     fn different_group_by_yields_different_fingerprint() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec!["zone"], 60, "");
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec!["zone"],
+            60,
+            "",
+        );
         let b = cfg(
             "http_lat",
             AggregationType::Sum,
@@ -252,7 +318,10 @@ mod tests {
             60,
             "",
         );
-        assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        assert_ne!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
     }
 
     /// Pre-PR-5 the `aggregation_id` field on `AggregationConfig` was
@@ -262,7 +331,14 @@ mod tests {
     /// is needed.
     #[test]
     fn policy_fp_u64_accessor_equals_fingerprint_u64() {
-        let a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
+        let a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
         assert_eq!(
             a.policy_fp_u64(),
             PolicyFingerprint::from_config(&a).as_u64(),
@@ -271,7 +347,14 @@ mod tests {
 
     #[test]
     fn num_aggregates_to_retain_does_not_affect_fingerprint() {
-        let mut a = cfg("http_lat", AggregationType::Sum, HashMap::new(), vec![], 60, "");
+        let mut a = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec![],
+            60,
+            "",
+        );
         let mut b = a.clone();
         a.num_aggregates_to_retain = Some(100);
         b.num_aggregates_to_retain = Some(500);

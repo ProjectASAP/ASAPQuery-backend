@@ -139,7 +139,7 @@ mod tests {
     use super::*;
     use crate::storage_engines::types::AggregationConfig;
     use asap_types::enums::{AggregationType, WindowType};
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
     use std::thread;
 

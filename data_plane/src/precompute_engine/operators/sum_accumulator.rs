@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SumAccumulator {
@@ -150,7 +150,7 @@ impl AggregateCore for SumAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         _key: &Option<crate::KeyByLabelValues>,
         _query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn aux_stats_try_answer_on_sum_statistic() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let acc = SumAccumulator::with_sum(42.0);
         // Sum statistic is covered by aux without deserialising.
         assert_eq!(acc.aux_stats().try_answer(Statistic::Sum), Some(42.0));

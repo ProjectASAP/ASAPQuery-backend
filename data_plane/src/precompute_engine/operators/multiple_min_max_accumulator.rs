@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// Accumulator that maintains separate min/max values for multiple keys
 /// Allows querying min/max for specific label combinations
@@ -255,7 +255,7 @@ impl AggregateCore for MultipleMinMaxAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         key: &Option<KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {

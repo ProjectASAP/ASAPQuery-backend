@@ -20,8 +20,8 @@ use crate::query_engines::routing::{
     EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
 };
 use crate::query_engines::ASAPQueryEngine;
+use asap_types::Statistic;
 use asap_types::{AccuracyTarget, StorageBackend};
-use promql_utilities::query_logics::enums::Statistic;
 
 // ─── Control-plane-pushed precompute job registry ────────────────────────────
 //
@@ -1007,7 +1007,7 @@ async fn try_answer_freshness_probe(
 ) -> Option<Response> {
     use crate::drivers::query::adapters::QueryExecutionResult;
     use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
-    use promql_utilities::data_model::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
 
     let cache = state.probe_cache.as_ref()?;
     let (metric, range_ms) = parse_last_over_time_probe(&parsed_request.query)?;
@@ -1140,7 +1140,7 @@ async fn process_via_simple_engine(
                 query_duration.as_secs_f64() * 1000.0
             );
             let execution_result = QueryExecutionResult {
-                query_output_labels: promql_utilities::data_model::KeyByLabelNames::default(),
+                query_output_labels: asap_types::KeyByLabelNames::default(),
                 query_result,
             };
             let total_duration = start_time.elapsed();
@@ -1267,7 +1267,7 @@ async fn process_via_named_engine(
             // `process_via_router`. Default to empty so the
             // Prometheus adapter renders `metric: {}` for every
             // returned series.
-            let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
+            let query_output_labels = asap_types::KeyByLabelNames::default();
             let execution_result = QueryExecutionResult {
                 query_output_labels,
                 query_result,
@@ -1389,7 +1389,7 @@ async fn process_via_router(
             // — the Prometheus adapter renders an empty `metric: {}`,
             // which is a valid Prometheus shape (every label is just
             // unset) and matches `wrap_result`'s Phase-4 contract.
-            let query_output_labels = promql_utilities::data_model::KeyByLabelNames::default();
+            let query_output_labels = asap_types::KeyByLabelNames::default();
             let execution_result = QueryExecutionResult {
                 query_output_labels,
                 query_result,
@@ -1944,7 +1944,7 @@ async fn process_range_query_request(
                 .adapter
                 .format_range_success_response(
                     &query_result,
-                    &promql_utilities::data_model::KeyByLabelNames::default(),
+                    &asap_types::KeyByLabelNames::default(),
                 )
                 .await
             {
@@ -3045,7 +3045,7 @@ aggregations:
     ) -> (u16, std::collections::HashMap<u64, u64>) {
         use asap_types::aggregation_config::AggregationConfig;
         use asap_types::enums::{AggregationType, WindowType};
-        use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+        use asap_types::KeyByLabelNames;
         use std::collections::HashMap;
 
         let adapter_config =

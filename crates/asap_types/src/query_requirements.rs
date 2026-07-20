@@ -1,5 +1,5 @@
-use promql_utilities::data_model::KeyByLabelNames;
-use promql_utilities::query_logics::enums::Statistic;
+use crate::KeyByLabelNames;
+use crate::Statistic;
 
 /// What a query needs in order to be answered by a stored aggregation.
 #[derive(Debug, Clone)]

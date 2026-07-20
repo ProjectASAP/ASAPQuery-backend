@@ -7,7 +7,7 @@ use crate::enums::{QueryLanguage, WindowType};
 use crate::policy_fingerprint::PolicyFingerprint;
 use crate::traits::SerializableToSink;
 use crate::utils::normalize_spatial_filter;
-use promql_utilities::data_model::KeyByLabelNames;
+use crate::KeyByLabelNames;
 use promql_utilities::query_logics::enums::AggregationType;
 
 /// Per-aggregation policy carried in the streaming config.
@@ -395,18 +395,12 @@ mod tests {
     /// SAME config as a fixture without it.
     #[test]
     fn explicit_aggregation_id_in_yaml_is_ignored() {
-        let with = AggregationConfig::from_yaml_data(
-            &sample_yaml(true),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse ok");
-        let without = AggregationConfig::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse ok");
+        let with =
+            AggregationConfig::from_yaml_data(&sample_yaml(true), None, QueryLanguage::promql)
+                .expect("parse ok");
+        let without =
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+                .expect("parse ok");
         assert_eq!(
             with.policy_fingerprint(),
             without.policy_fingerprint(),
@@ -417,18 +411,10 @@ mod tests {
     /// Round-tripping the same content yields the same fingerprint.
     #[test]
     fn fingerprint_is_deterministic_per_content() {
-        let a = AggregationConfig::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse a");
-        let b = AggregationConfig::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse b");
+        let a = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            .expect("parse a");
+        let b = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            .expect("parse b");
         assert_eq!(a.policy_fingerprint(), b.policy_fingerprint());
         assert_ne!(
             a.policy_fingerprint().as_u64(),
@@ -440,24 +426,18 @@ mod tests {
     /// The `policy_fp_u64()` accessor is exactly the fingerprint u64.
     #[test]
     fn policy_fp_u64_accessor_equals_fingerprint_u64() {
-        let cfg = AggregationConfig::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse");
+        let cfg =
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+                .expect("parse");
         assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
     }
 
     /// PR 5: `serialize_to_json` no longer emits `aggregationId`.
     #[test]
     fn serialize_to_json_omits_aggregation_id() {
-        let cfg = AggregationConfig::from_yaml_data(
-            &sample_yaml(false),
-            None,
-            QueryLanguage::promql,
-        )
-        .expect("parse");
+        let cfg =
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+                .expect("parse");
         let json = cfg.serialize_to_json();
         assert!(
             json.get("aggregationId").is_none(),

@@ -40,7 +40,7 @@
 //! how to render that (warning, fall-through to exact DB, or
 //! error).
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 use crate::storage_engines::sketch_db::TimelineSegment;
 

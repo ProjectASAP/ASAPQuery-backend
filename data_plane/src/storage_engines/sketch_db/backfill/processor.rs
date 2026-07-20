@@ -404,7 +404,7 @@ mod tests {
     use crate::storage_engines::sketch_db::backfill::BackfillSource;
     use crate::storage_engines::types::StreamingConfig;
     use asap_types::enums::{AggregationType, WindowType};
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use std::sync::Arc;
 
     fn sum_config(_agg_id: u64, metric: &str, grouping: Vec<&str>) -> AggregationConfig {

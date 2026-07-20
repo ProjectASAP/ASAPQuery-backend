@@ -475,7 +475,7 @@ impl AccuracyEnvelope {
 mod tests {
     use super::*;
     use asap_types::enums::WindowType;
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use serde_json::{json, Value};
     use std::collections::HashMap;
 
@@ -523,10 +523,10 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("d".to_string(), json!(5));
         params.insert("w".to_string(), json!(256));
-        let base = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params.clone()));
+        let base =
+            AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params.clone()));
         params.insert("gos_delta_epsilon".to_string(), json!(0.05));
-        let widened =
-            AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
+        let widened = AccuracyProfile::derive(&base_config(AggregationType::CountSketch, params));
         assert!((widened.epsilon - (base.epsilon + 0.05)).abs() < 1e-12);
         assert_eq!(widened.delta, base.delta);
         assert_eq!(widened.kind, base.kind);

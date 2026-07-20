@@ -2,13 +2,13 @@ use super::config::AdapterConfig;
 use super::traits::*;
 use crate::query_engines::QueryResult;
 use crate::utils::http::{convert_query_result_to_prometheus, convert_range_result_to_prometheus};
+use asap_types::KeyByLabelNames;
 use async_trait::async_trait;
 use axum::{
     extract::{Form, Query},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
 };
-use promql_utilities::data_model::KeyByLabelNames;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;

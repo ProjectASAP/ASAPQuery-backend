@@ -281,11 +281,11 @@ impl AggregateCore for CountSketchAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         _key: &Option<KeyByLabelValues>,
         query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         // Use median-of-row estimator for a specific key when the
         // caller provides one in `query_kwargs["key"]`. Without a
         // key, fall back to summing the absolute counter values

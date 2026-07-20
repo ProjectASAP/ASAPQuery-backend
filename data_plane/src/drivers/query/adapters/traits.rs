@@ -1,3 +1,4 @@
+use asap_types::KeyByLabelNames;
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
@@ -5,7 +6,6 @@ use axum::{
     http::StatusCode,
     response::{Json, Response},
 };
-use promql_utilities::data_model::KeyByLabelNames;
 use serde_json::Value;
 use std::collections::HashMap;
 

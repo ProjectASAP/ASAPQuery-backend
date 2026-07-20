@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tracing::debug;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// KLL sketch accumulator — wraps asap_sketchlib::KllSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
@@ -314,7 +314,7 @@ impl AggregateCore for DatasketchesKLLAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         _key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {

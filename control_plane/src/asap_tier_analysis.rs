@@ -1420,8 +1420,8 @@ mod tests {
 
     mod matching {
         use super::super::*;
+        use asap_types::KeyByLabelNames;
         use asap_types::{AggregationConfig, PolicyFingerprint, PolicyRegistry};
-        use promql_utilities::data_model::KeyByLabelNames;
         use promql_utilities::query_logics::enums::AggregationType;
         use std::collections::HashMap;
 

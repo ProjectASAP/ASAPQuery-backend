@@ -335,11 +335,11 @@ impl AggregateCore for HllSketchAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         _key: &Option<KeyByLabelValues>,
         _query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         match statistic {
             // HLL's natural answer is unique-cardinality. PromQL's
             // `count_over_time(...)` and `count(...)` both surface
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn test_cardinality_is_rescaled_by_sample_p() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         // Build two accumulators with identical registers but different
         // sample_p. The sampled one (p=0.25) must report ~4× the unsampled
         // estimate. Use precision 8 (256 registers) with a spread of
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_count_statistic_also_rescaled_by_sample_p() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         // Count maps to the same cardinality estimate for HLL, so it must
         // rescale identically.
         let registers = vec![3u8; 16];
@@ -717,7 +717,7 @@ mod tests {
         use asap_sketchlib::proto::sketchlib::{
             sketch_envelope, HllVariant as ProtoVariant, HyperLogLogState, SketchEnvelope,
         };
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         use prost::Message;
 
         let registers = vec![3u8; 16];
@@ -750,7 +750,10 @@ mod tests {
         let rescaled = acc
             .query_statistic(Statistic::Cardinality, &None, &HashMap::new())
             .expect("cardinality ok");
-        assert!((rescaled - raw * 4.0).abs() < 1e-9, "expected 4×raw rescale");
+        assert!(
+            (rescaled - raw * 4.0).abs() < 1e-9,
+            "expected 4×raw rescale"
+        );
     }
 
     #[test]

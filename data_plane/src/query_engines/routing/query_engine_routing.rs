@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use asap_types::Statistic;
 use asap_types::{compatible_storage_backends, AccuracyTarget, StorageBackend};
-use promql_utilities::query_logics::enums::Statistic;
 
 use crate::query_engines::{EngineError, QueryResult};
 

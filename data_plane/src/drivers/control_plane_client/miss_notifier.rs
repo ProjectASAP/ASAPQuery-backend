@@ -178,8 +178,8 @@ pub fn spawn_capability_miss_notify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_utilities::data_model::KeyByLabelNames;
-    use promql_utilities::query_logics::enums::Statistic;
+    use asap_types::KeyByLabelNames;
+    use asap_types::Statistic;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
