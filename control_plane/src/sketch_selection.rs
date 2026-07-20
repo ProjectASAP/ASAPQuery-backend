@@ -1,6 +1,6 @@
-//! Inverse of [`capability_for`](super::capability::capability_for): given a
-//! required [`Capability`], enumerate the concrete [`SketchType`] families that
-//! can satisfy it.
+//! Inverse of [`capability_for`](crate::sketch_algebra::capability::capability_for):
+//! given a required [`Capability`], enumerate the concrete [`SketchType`]
+//! families that can satisfy it.
 //!
 //! This is the keystone of autonomous allocation. `capability_for` lowers an
 //! `AggIntent` (parsed from a query) to the *capability* it needs; this module
@@ -9,7 +9,7 @@
 //! without a hand-written workload YAML.
 //!
 //! Policy encoded here (matches `Capability::is_satisfied_by` on the matching
-//! side, capability.rs):
+//! side, `sketch_algebra::capability`):
 //!   * `QuantileApprox`   → DDSketch | KLL
 //!   * `CardinalityApprox`→ HLL
 //!   * `FrequencyEstimate`→ CountSketch | CountMinSketch   (heap-less point query)
@@ -18,8 +18,12 @@
 //!
 //! When a capability binds a *concrete* `SketchKindHandle` (not `Any`), the
 //! result is exactly that one family; `Any` expands to the full candidate set.
+//!
+//! Moved out of `sketch_algebra` (Stage 4 of the `sketch_algebra`
+//! re-layering) — this is a query-planning concern (its one caller is
+//! [`crate::query_planning`]), not L4 IR.
 
-use super::capability::{Capability, SketchKindHandle};
+use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
 use crate::types::SketchType;
 
 /// Map a sketch handle to the allocatable control-plane [`SketchType`].
@@ -52,9 +56,7 @@ pub fn sketch_type_for_handle(h: SketchKindHandle) -> Option<SketchType> {
 /// no-op (the caller routes it to cold/exact instead).
 pub fn sketch_families_for_capability(cap: &Capability) -> Vec<SketchType> {
     match cap {
-        Capability::QuantileApprox(h) => {
-            concrete_or(*h, &[SketchType::DDSketch, SketchType::KLL])
-        }
+        Capability::QuantileApprox(h) => concrete_or(*h, &[SketchType::DDSketch, SketchType::KLL]),
         Capability::CardinalityApprox => vec![SketchType::HLL],
         Capability::FrequencyEstimate(h) | Capability::FrequencyTopk(h) => {
             concrete_or(*h, &[SketchType::CountSketch, SketchType::CountMinSketch])
@@ -96,18 +98,15 @@ mod tests {
 
     #[test]
     fn quantile_any_expands_to_ddsketch_and_kll() {
-        let fams = sketch_families_for_capability(&Capability::QuantileApprox(
-            SketchKindHandle::Any,
-        ));
+        let fams =
+            sketch_families_for_capability(&Capability::QuantileApprox(SketchKindHandle::Any));
         assert_eq!(fams, vec![SketchType::DDSketch, SketchType::KLL]);
     }
 
     #[test]
     fn quantile_concrete_handle_pins_one_family() {
         assert_eq!(
-            sketch_families_for_capability(&Capability::QuantileApprox(
-                SketchKindHandle::DDSketch
-            )),
+            sketch_families_for_capability(&Capability::QuantileApprox(SketchKindHandle::DDSketch)),
             vec![SketchType::DDSketch]
         );
         assert_eq!(
@@ -128,9 +127,7 @@ mod tests {
     fn frequency_families_and_heap_collapse() {
         // bare frequency: Any -> both matrix families
         assert_eq!(
-            sketch_families_for_capability(&Capability::FrequencyEstimate(
-                SketchKindHandle::Any
-            )),
+            sketch_families_for_capability(&Capability::FrequencyEstimate(SketchKindHandle::Any)),
             vec![SketchType::CountSketch, SketchType::CountMinSketch]
         );
         // heap-bearing handles collapse to their matrix family
@@ -151,8 +148,7 @@ mod tests {
     #[test]
     fn exact_agg_allocates_no_sketch() {
         assert!(
-            sketch_families_for_capability(&Capability::ExactAgg(AggregationType::Sum))
-                .is_empty()
+            sketch_families_for_capability(&Capability::ExactAgg(AggregationType::Sum)).is_empty()
         );
     }
 

@@ -7,6 +7,7 @@ use std::time::Duration;
 pub mod delta;
 pub mod online;
 pub mod pareto;
+pub mod sketch_capability;
 pub mod tco;
 pub mod wire;
 

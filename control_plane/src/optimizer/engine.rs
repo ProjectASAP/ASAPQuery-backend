@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{ColumnRef, Predicate, QueryExpr, SetOpKind, Source};
 use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
-use crate::sketch_algebra::capability::{
+use crate::optimizer::cost::sketch_capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
 };
 use crate::types_v2::{AccuracyTarget, BindingName};
@@ -62,15 +62,17 @@ pub trait CostModel: Send + Sync {
 
 // ── Sketch capabilities ─────────────────────────────────────────────────────
 //
-// Per the Step 2a consolidation, `SketchCapability` / `SupportedIntent` and
-// the YAML-loader logic now live in `crate::sketch_algebra::capability`.
+// Per the Step 2a consolidation (later re-homed to `optimizer::cost` in
+// Stage 4 of the `sketch_algebra` re-layering — this is a cost-model
+// concern, not L4 IR), `SketchCapability` / `SupportedIntent` and the
+// YAML-loader logic live in `crate::optimizer::cost::sketch_capability`.
 // The optimizer re-exports `sketch_capability(SketchType)` and
 // `load_sketch_capabilities(path)` as thin shims so existing callers
 // (`algebra::physical`, `main.rs`) keep building while the legacy
 // `crate::types::SketchType` key continues to be the lookup key.
 
 /// Load sketch capabilities from a YAML file. Thin shim — the real
-/// loader lives in `sketch_algebra::capability::load_capability_overrides`
+/// loader lives in `optimizer::cost::sketch_capability::load_capability_overrides`
 /// and is keyed by `SketchKind`. This shim translates the result to the
 /// legacy `SketchType` key used by call sites that haven't migrated.
 ///
@@ -88,7 +90,7 @@ pub fn load_sketch_capabilities(
 }
 
 /// Built-in capability profile for a known sketch type. Thin shim —
-/// the real defaults live in `sketch_algebra::capability::default_capability_table`.
+/// the real defaults live in `optimizer::cost::sketch_capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
     use crate::sketch_algebra::params::SketchKind;
     use crate::types::SketchType;

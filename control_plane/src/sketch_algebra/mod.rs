@@ -9,9 +9,6 @@
 //! - [`SketchKind`] / [`SketchParams`] — typed sketch-family selector +
 //!   parameter payload. Convertible to the legacy `crate::types`
 //!   shape via [`SketchParams::to_legacy`] for the L5 emitter side.
-//! - [`SketchStateSchema`] — the L4 type-system primitive that mirrors
-//!   the §6.4 input/output spec table (`Sketch(SketchKind, SketchParams)`
-//!   field type + catalog-capability flags).
 //! - [`bind_query_expr`] — the L3→L4 lowering driver: bottom-up walk
 //!   that fires `Bind*` rules.
 //! - [`rules`] — the `Bind*` rule family. Each rule pattern-matches on a
@@ -36,9 +33,7 @@ pub mod capability_matching;
 pub mod lower;
 pub mod physical_expr;
 pub mod rules;
-pub mod schema;
 pub mod sketch_params;
-pub mod sketch_selection;
 
 // Back-compat alias. External call sites that imported
 // `control_plane::sketch_algebra::params::*` (and the in-tree
@@ -50,19 +45,12 @@ pub use sketch_params as params;
 mod tests;
 
 // Re-exports — `crate::sketch_algebra::*` for downstream callers.
-pub use capability::{
-    capability_for, default_capability_table, load_capability_overrides, Capability,
-    SketchCapability, SketchKindHandle, SupportedIntent,
-};
+pub use capability::{capability_for, Capability, SketchKindHandle};
 pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
 pub use lower::{bind_query_expr, BindingError};
 pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
-pub use schema::{SketchStateMetadata, SketchStateSchema};
-pub use sketch_selection::{
-    required_sketches_for_capabilities, sketch_families_for_capability, sketch_type_for_handle,
-};
 pub use sketch_params::{
     CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
 };

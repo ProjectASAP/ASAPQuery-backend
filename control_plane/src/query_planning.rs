@@ -6,7 +6,7 @@
 //!      `ASAPTierCandidate`s, each already carrying a `metric_name` and the
 //!      `required_capability` the query needs (and an `unsupported` reason for
 //!      the parts that only the cold tier can answer).
-//!   2. [`required_sketches_for_capabilities`](crate::sketch_algebra::required_sketches_for_capabilities)
+//!   2. [`required_sketches_for_capabilities`](crate::sketch_selection::required_sketches_for_capabilities)
 //!      (slice 1) maps a capability set to the `SketchType` families that satisfy it.
 //!
 //! The result, [`QuerySetPlan`], is the warm-tier half of autonomous
@@ -17,7 +17,8 @@
 use std::collections::BTreeMap;
 
 use crate::asap_tier_analysis::{analyze_promql_for_asap_tier, UnsupportedReason};
-use crate::sketch_algebra::{required_sketches_for_capabilities, Capability};
+use crate::sketch_algebra::Capability;
+use crate::sketch_selection::required_sketches_for_capabilities;
 use crate::types::SketchType;
 
 /// The sketch allocation derived for one metric across the whole query set.
@@ -142,7 +143,9 @@ mod tests {
             .find(|m| m.metric_name == "http_requests_total_latency_ms")
             .expect("metric present");
         // a quantile demands a quantile-family sketch
-        assert!(m.sketches.contains(&SketchType::DDSketch) || m.sketches.contains(&SketchType::KLL));
+        assert!(
+            m.sketches.contains(&SketchType::DDSketch) || m.sketches.contains(&SketchType::KLL)
+        );
     }
 
     #[test]
@@ -152,7 +155,10 @@ mod tests {
             "count(http_requests_total)",
         ]);
         // at least the quantile metric must appear with a quantile sketch
-        let latency = plan.per_metric.iter().find(|m| m.metric_name == "latency_ms");
+        let latency = plan
+            .per_metric
+            .iter()
+            .find(|m| m.metric_name == "latency_ms");
         assert!(latency.is_some(), "latency_ms should be planned: {plan:?}");
     }
 
@@ -177,7 +183,12 @@ mod tests {
             .find(|m| m.metric_name == "m_latency")
             .expect("metric present");
         // capabilities are de-duplicated (both queries need the same quantile cap)
-        assert_eq!(m.capabilities.len(), 1, "caps deduped: {:?}", m.capabilities);
+        assert_eq!(
+            m.capabilities.len(),
+            1,
+            "caps deduped: {:?}",
+            m.capabilities
+        );
     }
 
     #[test]
