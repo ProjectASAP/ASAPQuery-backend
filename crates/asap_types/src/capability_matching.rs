@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use promql_utilities::data_model::KeyByLabelNames;
-use promql_utilities::query_logics::enums::Statistic;
+use crate::KeyByLabelNames;
+use crate::Statistic;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -556,7 +556,7 @@ pub fn find_compatible_aggregation(
 mod tests {
     use super::*;
     use crate::utils::normalize_spatial_filter;
-    use promql_utilities::data_model::KeyByLabelNames;
+    use crate::KeyByLabelNames;
     use std::collections::HashMap;
 
     #[allow(clippy::too_many_arguments)]
@@ -1018,7 +1018,16 @@ mod tests {
     #[test]
     fn avg_finds_sum_and_count() {
         let sum = make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], "");
-        let cnt = make_config(2, "cpu", "CountMinSketch", "", 300, "tumbling", &["job"], "");
+        let cnt = make_config(
+            2,
+            "cpu",
+            "CountMinSketch",
+            "",
+            300,
+            "tumbling",
+            &["job"],
+            "",
+        );
         let mut configs = HashMap::new();
         configs.insert(sum.policy_fp_u64(), sum);
         configs.insert(cnt.policy_fp_u64(), cnt);
@@ -1039,7 +1048,16 @@ mod tests {
     fn avg_different_windows_rejected() {
         let sum = make_config(1, "cpu", "Sum", "", 300, "tumbling", &["job"], "");
         // Count config has different window_size — must be rejected
-        let cnt = make_config(2, "cpu", "CountMinSketch", "", 900, "tumbling", &["job"], "");
+        let cnt = make_config(
+            2,
+            "cpu",
+            "CountMinSketch",
+            "",
+            900,
+            "tumbling",
+            &["job"],
+            "",
+        );
         let mut configs = HashMap::new();
         configs.insert(sum.policy_fp_u64(), sum);
         configs.insert(cnt.policy_fp_u64(), cnt);
@@ -1204,8 +1222,7 @@ mod tests {
             StorageBackend::SketchStore,
             StorageBackend::DoubleWrite,
         ] {
-            let backends =
-                compatible_storage_backends(Statistic::Sum, AccuracyTarget::Exact, cfg);
+            let backends = compatible_storage_backends(Statistic::Sum, AccuracyTarget::Exact, cfg);
             assert_eq!(
                 backends,
                 vec![StorageBackend::GorillaObjectStore],
@@ -1225,11 +1242,8 @@ mod tests {
             StorageBackend::GorillaObjectStore,
             StorageBackend::DoubleWrite,
         ] {
-            let backends = compatible_storage_backends(
-                Statistic::Quantile,
-                AccuracyTarget::Approximate,
-                cfg,
-            );
+            let backends =
+                compatible_storage_backends(Statistic::Quantile, AccuracyTarget::Approximate, cfg);
             assert_eq!(
                 backends,
                 vec![

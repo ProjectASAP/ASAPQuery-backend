@@ -1,3 +1,16 @@
+//! A sorted, set-algebra-bearing label-name key.
+//!
+//! Formerly `promql_utilities::data_model::key_by_label_names` — moved
+//! here for the same reason as [`crate::Statistic`]: `asap_types`
+//! (`AggregationConfig::grouping_labels`, `PolicyFingerprint`,
+//! `PolicyRegistry`, `capability_matching`) is its real center of
+//! gravity and the shared foundation both `control_plane`'s ecosystem
+//! and `data_plane` can depend on without a cycle. Closer to a runtime
+//! index key than a planning IR node — ASAPController's
+//! `QueryExpr::Aggregate.by` is the nearest relative in spirit, but
+//! carries positional `ColumnId`s, not a sorted, deduplicated label-name
+//! set with `Vec`-style set algebra.
+
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 

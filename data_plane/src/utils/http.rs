@@ -1,4 +1,4 @@
-use promql_utilities::KeyByLabelNames;
+use asap_types::KeyByLabelNames;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 

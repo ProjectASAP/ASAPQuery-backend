@@ -389,7 +389,7 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
 fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types::StreamingConfig {
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::{AggregationType as AT, WindowType};
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 
     let cfg = AggregationConfig::new(

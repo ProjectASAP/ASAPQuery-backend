@@ -139,7 +139,7 @@ fn ddsketch_envelope_ends_up_in_backend_accumulator() {
 
     let q = acc
         .query_statistic(
-            promql_utilities::query_logics::enums::Statistic::Quantile,
+            asap_types::Statistic::Quantile,
             &None,
             &[("quantile".to_string(), "0.5".to_string())]
                 .into_iter()
@@ -151,11 +151,7 @@ fn ddsketch_envelope_ends_up_in_backend_accumulator() {
         "median estimate close to 50: got {q}"
     );
     let count = acc
-        .query_statistic(
-            promql_utilities::query_logics::enums::Statistic::Count,
-            &None,
-            &Default::default(),
-        )
+        .query_statistic(asap_types::Statistic::Count, &None, &Default::default())
         .expect("count query");
     assert_eq!(count as u64, 100);
 }

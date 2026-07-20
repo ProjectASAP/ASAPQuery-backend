@@ -3,7 +3,7 @@ use crate::precompute_engine::operators::{MultipleSumAccumulator, SumAccumulator
 use crate::storage_engines::types::{
     KeyByLabelValues, MultipleSubpopulationAggregate, SingleSubpopulationAggregate,
 };
-use promql_utilities::Statistic;
+use asap_types::Statistic;
 
 #[test]
 fn test_single_subpopulation_interface() {

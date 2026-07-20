@@ -2,7 +2,8 @@ use crate::storage_engines::types::KeyByLabelValues;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::{AggregationType, Statistic};
+use asap_types::Statistic;
+use promql_utilities::query_logics::enums::AggregationType;
 
 pub use asap_types::traits::SerializableToSink;
 

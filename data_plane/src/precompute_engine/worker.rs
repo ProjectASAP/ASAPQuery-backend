@@ -1417,13 +1417,9 @@ mod tests {
             agg_type,
             agg_sub_type.to_string(),
             HashMap::new(),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(
-                grouping.iter().map(|s| s.to_string()).collect(),
-            ),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(
-                aggregated.iter().map(|s| s.to_string()).collect(),
-            ),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(grouping.iter().map(|s| s.to_string()).collect()),
+            asap_types::KeyByLabelNames::new(aggregated.iter().map(|s| s.to_string()).collect()),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             window_secs,
             slide_secs,
@@ -2181,12 +2177,9 @@ aggregations:
             AggregationType::SingleSubpopulation,
             "Sum".to_string(),
             HashMap::new(),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![
-                "method".to_string(),
-                "status".to_string(),
-            ]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
-            promql_utilities::data_model::key_by_label_names::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec!["method".to_string(), "status".to_string()]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
             String::new(),
             60,
             0,
@@ -2893,7 +2886,12 @@ aggregations:
         let pf = PolicyFingerprint(1);
         for i in 0..5 {
             worker
-                .process_group_samples(1, pf, "", group_samples("cpu", vec![(1_000 + i * 100, 1.0)]))
+                .process_group_samples(
+                    1,
+                    pf,
+                    "",
+                    group_samples("cpu", vec![(1_000 + i * 100, 1.0)]),
+                )
                 .unwrap();
         }
 

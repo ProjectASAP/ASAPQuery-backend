@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// Local serde view of the DELTA-HEAP wire frame produced by sketchlib-go's
 /// `CountSketch.SerializeMsgpackWithHeapDelta` (encoding `MSGPACK_DELTA`).
@@ -386,7 +386,7 @@ impl AggregateCore for CountMinSketchWithHeapAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {

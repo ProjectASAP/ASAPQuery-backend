@@ -246,7 +246,7 @@ mod tests {
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowType;
-    use promql_utilities::data_model::key_by_label_names::KeyByLabelNames;
+    use asap_types::KeyByLabelNames;
     use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap;
 

@@ -116,7 +116,7 @@ impl PolicyRegistry {
 mod tests {
     use super::*;
     use crate::enums::WindowType;
-    use promql_utilities::data_model::KeyByLabelNames;
+    use crate::KeyByLabelNames;
     use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap as StdHashMap;
 

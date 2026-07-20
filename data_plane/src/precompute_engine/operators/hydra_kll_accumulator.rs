@@ -9,7 +9,7 @@ use asap_sketchlib::{HydraKllSketch, MessagePackCodec};
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// HydraKLL sketch accumulator — wraps asap_sketchlib::HydraKllSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
@@ -123,7 +123,7 @@ impl AggregateCore for HydraKllSketchAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {

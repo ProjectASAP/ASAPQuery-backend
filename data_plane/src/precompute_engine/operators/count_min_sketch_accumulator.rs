@@ -7,7 +7,7 @@ use asap_sketchlib::{CountMinSketch, CountMinSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use promql_utilities::query_logics::enums::Statistic;
+use asap_types::Statistic;
 
 /// Count-Min Sketch accumulator — wraps asap_sketchlib::CountMinSketch.
 /// Core struct, update/merge/serde logic live in `asap_sketchlib::sketches`.
@@ -511,12 +511,12 @@ impl AggregateCore for CountMinSketchAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         key: &Option<crate::KeyByLabelValues>,
         query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         use crate::storage_engines::types::MultipleSubpopulationAggregate;
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
 
         // Key-provided path: route to MultipleSubpopulationAggregate::query
         // (the canonical "what's the count of this key?" lookup).
@@ -1188,7 +1188,10 @@ mod tests {
 
         let raw = unsampled.query_key(&key);
         let rescaled = sampled.query_key(&key);
-        assert!(raw >= 10.0, "raw estimate should be >= inserted 10, got {raw}");
+        assert!(
+            raw >= 10.0,
+            "raw estimate should be >= inserted 10, got {raw}"
+        );
         assert!(
             (rescaled - raw * 4.0).abs() < 1e-9,
             "expected point-frequency rescaled ≈ 4×raw ({}), got {rescaled}",
@@ -1198,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_statistics_rescaled_by_sample_p() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         // Build a CMS with a known min-row-sum of 12 events, sampled at
         // p=0.25 → every aggregate statistic should report 12 / 0.25 = 48.
         let cms = CountMinSketchAccumulator {
@@ -1260,7 +1263,7 @@ mod tests {
         use asap_sketchlib::proto::sketchlib::{
             sketch_envelope, CountMinState, CounterType, SketchEnvelope,
         };
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         use prost::Message;
         // min-row-sum = 12 raw; sample_p 0.25 → Count = 48.
         let state = CountMinState {

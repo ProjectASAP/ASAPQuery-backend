@@ -272,11 +272,11 @@ impl AggregateCore for DDSketchAccumulator {
 
     fn query_statistic(
         &self,
-        statistic: promql_utilities::query_logics::enums::Statistic,
+        statistic: asap_types::Statistic,
         _key: &Option<KeyByLabelValues>,
         query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
 
         match statistic {
             Statistic::Quantile => {
@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_query_statistic_quantile_is_sketch_derived() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let acc = sample_accumulator();
         let mut kwargs = HashMap::new();
         kwargs.insert("quantile".to_string(), "0.5".to_string());
@@ -522,7 +522,7 @@ mod tests {
 
     #[test]
     fn test_query_statistic_count_is_bucket_derived() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let acc = sample_accumulator();
         let v = acc
             .query_statistic(Statistic::Count, &None, &HashMap::new())
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_query_statistic_sum_min_max_return_unavailable_error() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let acc = sample_accumulator();
         for stat in [Statistic::Sum, Statistic::Min, Statistic::Max] {
             let result = acc.query_statistic(stat, &None, &HashMap::new());
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn test_count_is_rescaled_by_sample_p() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let acc = DDSketchAccumulator {
             inner: DdSketch::from_raw(0.01, vec![1, 2, 3, 4], -2),
             sample_p: 0.1,
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_quantile_ignores_sample_p() {
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         let mut kwargs = HashMap::new();
         kwargs.insert("quantile".to_string(), "0.5".to_string());
         let unsampled = DDSketchAccumulator {
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn test_from_sketchlib_proto_bytes_reads_envelope_sample_p() {
         use asap_sketchlib::proto::sketchlib::{sketch_envelope, DdSketchState, SketchEnvelope};
-        use promql_utilities::query_logics::enums::Statistic;
+        use asap_types::Statistic;
         use prost::Message;
 
         let env = SketchEnvelope {
