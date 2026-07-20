@@ -39,7 +39,14 @@ asap_types.workspace = true
 # specific commit on ASAPController's main, not a tag -- ASAPController has no
 # tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
 # once one exists.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "c73c2a5099e3e0d0439e86d895f5a61a7e1231b1" }
+#
+# Bumped to 283b6ab (merge of PR #141, "convert Implementation::is_satisfied_by
+# into a Matcher trait") to pick up asap-plan::Matcher/Implementation and
+# asap-sketch::{SummaryKind, SummaryParams} for the sketch-identity
+# unification work (see scratchpad/artifacts/enum-unification-plan.md).
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "283b6ab97159233e2dfc221e575415973c73aaa7" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

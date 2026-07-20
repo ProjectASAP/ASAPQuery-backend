@@ -343,10 +343,20 @@ dependencies = [
 [[package]]
 name = "asap-ir"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=c73c2a5099e3e0d0439e86d895f5a61a7e1231b1#c73c2a5099e3e0d0439e86d895f5a61a7e1231b1"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=283b6ab97159233e2dfc221e575415973c73aaa7#283b6ab97159233e2dfc221e575415973c73aaa7"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "asap-plan"
+version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=283b6ab97159233e2dfc221e575415973c73aaa7#283b6ab97159233e2dfc221e575415973c73aaa7"
+dependencies = [
+ "asap-ir",
+ "asap-sketch",
  "thiserror 2.0.18",
 ]
 
@@ -358,6 +368,14 @@ dependencies = [
  "prost",
  "serde",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "asap-sketch"
+version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=283b6ab97159233e2dfc221e575415973c73aaa7#283b6ab97159233e2dfc221e575415973c73aaa7"
+dependencies = [
+ "asap-ir",
 ]
 
 [[package]]
@@ -762,6 +780,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-ir",
+ "asap-plan",
+ "asap-sketch",
  "asap_types",
  "axum",
  "bytes",
