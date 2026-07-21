@@ -410,7 +410,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
- "promql_utilities",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -791,7 +790,6 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "promql-parser 0.8.0",
- "promql_utilities",
  "prost",
  "prost-build",
  "reqwest 0.12.28",
@@ -1000,7 +998,6 @@ dependencies = [
  "moka",
  "prometheus",
  "promql-parser 0.5.1",
- "promql_utilities",
  "prost",
  "regex",
  "reqwest 0.11.27",
@@ -2482,19 +2479,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "promql_utilities"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "promql-parser 0.5.1",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3608,17 +3592,6 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

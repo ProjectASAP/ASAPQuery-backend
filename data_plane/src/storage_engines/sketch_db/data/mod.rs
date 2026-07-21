@@ -60,7 +60,7 @@ pub use control_plane::sketch_algebra::{Capability, SketchKindHandle};
 
 /// Re-export so callers don't need to depend on promql_utilities
 /// directly for the agg_type tag.
-pub use promql_utilities::query_logics::enums::AggregationType;
+pub use asap_types::AggregationType;
 
 // ── Payload taxonomy ────────────────────────────────────────────────────────
 

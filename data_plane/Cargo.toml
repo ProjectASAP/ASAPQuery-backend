@@ -5,7 +5,6 @@ edition.workspace = true
 
 [dependencies]
 # Internal crates (workspace)
-promql_utilities.workspace = true
 asap_types.workspace = true
 # Phase 9: the control plane is now an in-process library inside the
 # backend binary. Wiring up the in-process OpAMP server + capability-map

@@ -948,7 +948,8 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
 
     #[test]
     fn test_sum_updater() {

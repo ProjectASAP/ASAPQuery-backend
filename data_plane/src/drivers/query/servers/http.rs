@@ -2469,7 +2469,7 @@ aggregations:
             group_by_keys,
             capability: None,
             agg_kind: AggKind::ExactAgg {
-                agg_type: asap_types::enums::AggregationType::Sum,
+                agg_type: asap_types::AggregationType::Sum,
                 parameters_canonical: String::new(),
                 spatial_filter_canonical: String::new(),
             },
@@ -3044,7 +3044,8 @@ aggregations:
         active_agg_ids: &[u64],
     ) -> (u16, std::collections::HashMap<u64, u64>) {
         use asap_types::aggregation_config::AggregationConfig;
-        use asap_types::enums::{AggregationType, WindowType};
+        use asap_types::enums::WindowType;
+        use asap_types::AggregationType;
         use asap_types::KeyByLabelNames;
         use std::collections::HashMap;
 

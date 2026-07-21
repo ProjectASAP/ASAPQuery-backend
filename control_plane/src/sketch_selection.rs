@@ -94,7 +94,7 @@ fn concrete_or(h: SketchKindHandle, any_set: &[SketchType]) -> Vec<SketchType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_utilities::query_logics::enums::AggregationType;
+    use asap_types::AggregationType;
 
     #[test]
     fn quantile_any_expands_to_ddsketch_and_kll() {

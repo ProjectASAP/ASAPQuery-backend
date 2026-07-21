@@ -45,7 +45,7 @@
 use serde::{Deserialize, Serialize};
 
 use asap_types::aggregation_config::AggregationConfig;
-use promql_utilities::query_logics::enums::AggregationType;
+use asap_types::AggregationType;
 
 /// How to interpret [`AccuracyProfile::epsilon`].
 ///

@@ -22,7 +22,7 @@
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::types_v2::AccuracyTarget;
-use promql_utilities::query_logics::enums::AggregationType;
+use asap_types::AggregationType;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 

@@ -54,7 +54,7 @@
 
 use std::time::Duration;
 
-use promql_utilities::query_logics::enums::AggregationType;
+use asap_types::AggregationType;
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::physical_expr::PhysicalExpr;

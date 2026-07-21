@@ -1,3 +1,23 @@
+//! Formerly `promql_utilities::query_logics::enums::AggregationType` — moved
+//! here as the final step of retiring the `promql_utilities` crate (see
+//! `scratchpad/artifacts/retirement-plan.html` / the earlier Stage 1-3 work
+//! that already moved `Statistic`/`KeyByLabelNames`/`QueryResultType` out of
+//! it for the same reason). By the time this moved, `promql_utilities` held
+//! nothing but this one type — `asap_types` is its real center of gravity
+//! (`compatible_agg_types`, `AggregationConfig`, `PolicyFingerprint`,
+//! `capability_matching`), and is the shared foundation both
+//! `control_plane`'s ecosystem and `data_plane` can depend on without a
+//! cycle, so there was no longer a reason for a separate crate.
+//!
+//! Note: this is representation **D** in
+//! `scratchpad/artifacts/enum-unification-plan.md` — the data-plane's own
+//! `AggregationType` + `String` sub-type + untyped params bag, conflating
+//! sketch/accumulator identity with a keyed/unkeyed axis. Step 5 of that
+//! plan introduced `AccumulatorSpec` as a typed, unconflated replacement
+//! (additive so far, not yet fully replacing this type) — this move is
+//! purely about which crate `AggregationType` lives in, not a change to
+//! its shape or semantics.
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;

@@ -1370,7 +1370,8 @@ mod tests {
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
     use asap_sketchlib::KllSketch;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
 
     fn make_agg_config(
         id: u64,

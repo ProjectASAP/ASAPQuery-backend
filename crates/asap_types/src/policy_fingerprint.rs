@@ -173,8 +173,8 @@ impl std::fmt::Display for PolicyFingerprint {
 mod tests {
     use super::*;
     use crate::enums::WindowType;
+    use crate::AggregationType;
     use crate::KeyByLabelNames;
-    use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap;
 
     fn cfg(
