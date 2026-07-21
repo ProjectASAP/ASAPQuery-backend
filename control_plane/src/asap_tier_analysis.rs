@@ -319,10 +319,11 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
         QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
         // A-variants lifted in Batch 2 of the relational migration. They
         // carry no AggIntent themselves — recurse into their children to
-        // find Aggregates further down the tree.
+        // find Aggregates further down the tree. `Partition` no longer
+        // exists in the canonical IR — its keys fold into `Aggregate.by`
+        // at construction time (`intent_algebra::lower`).
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
@@ -342,6 +343,12 @@ fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
             collect_agg_intents(left, out);
             collect_agg_intents(right, out);
         }
+        // The PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
+        // WindowFunc) isn't constructed by this parser today; the
+        // single-child wrappers among them carry no `AggIntent` either
+        // way, so a no-op default is safe.
+        _ => {}
     }
 }
 
@@ -1057,19 +1064,19 @@ mod tests {
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum)
+            Capability::ExactAgg(AggregationType::Increase)
         );
     }
 
     #[test]
     fn irate_binds_to_exact_agg() {
         // `irate` shares `AggFunc::Rate` with `rate` in
-        // `query_parser::promql`; both lower to `AggIntent::Sum`.
+        // `query_parser::promql`; both lower to `AggIntent::Rate`.
         let a = analyze_promql_for_asap_tier("irate(http_requests_total[5m])");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum)
+            Capability::ExactAgg(AggregationType::Increase)
         );
     }
 
@@ -1079,7 +1086,7 @@ mod tests {
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum)
+            Capability::ExactAgg(AggregationType::Increase)
         );
     }
 
@@ -1097,14 +1104,17 @@ mod tests {
     // ── outer_fn — rate vs plain disambiguation ──────────────────────────
     //
     // Regression coverage for the PR that retired the engine's
-    // `query_contains_rate_call` raw-PromQL re-parser. The analyzer's
-    // lowerer collapses `rate(metric[r])`, `sum_over_time(metric[r])`,
-    // `sum(metric)`, and the bare selector all onto `AggIntent::Sum` /
-    // `Capability::ExactAgg(Sum)` — so the engine can't tell from the
-    // capability alone which the user wrote. The `outer_fn` field on
-    // `ASAPTierCandidate` carries the rate-vs-plain distinction so the
-    // engine's reducer dispatch is a typed branch instead of a raw-PromQL
-    // re-parse.
+    // `query_contains_rate_call` raw-PromQL re-parser. `outer_fn` is
+    // computed independently of `required_capability` — straight off the
+    // raw PromQL function name (`set_counter_fn`), not off the lowered
+    // `AggIntent` — so the engine's reducer dispatch has the rate-vs-
+    // increase-vs-plain distinction as a typed branch instead of a
+    // raw-PromQL re-parse, regardless of whether the capability
+    // computation happens to agree or differ across cases. `rate`/
+    // `irate`/`increase` now bind to distinct-from-`sum`/`sum_over_time`
+    // capabilities (`ExactAgg(Increase)` vs `ExactAgg(Sum)` — see
+    // `rate_and_increase_share_capability_but_differ_on_outer_fn` below
+    // for the pairing that still needs `outer_fn` to disambiguate).
 
     #[test]
     fn rate_candidate_carries_outer_fn_rate() {
@@ -1139,15 +1149,15 @@ mod tests {
 
     #[test]
     fn increase_candidate_carries_outer_fn_increase() {
-        // `increase(metric[r])` shares `Capability::ExactAgg(Sum)` with
-        // `rate`/`sum_over_time`; the `outer_fn` field carries the
+        // `increase(metric[r])` shares `Capability::ExactAgg(Increase)`
+        // with `rate`/`irate`; the `outer_fn` field carries the
         // distinction so the engine sums deltas in `[t-r,t]` WITHOUT the
         // rate divisor (issue #301).
         let a = analyze_promql_for_asap_tier("increase(http_requests_total[5m])");
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum),
+            Capability::ExactAgg(AggregationType::Increase),
             "{a:?}"
         );
         assert_eq!(a.candidates[0].outer_fn, OuterFn::Increase, "{a:?}");
@@ -1191,7 +1201,7 @@ mod tests {
         assert!(a.unsupported.is_none(), "{a:?}");
         assert_eq!(
             a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum),
+            Capability::ExactAgg(AggregationType::Increase),
             "{a:?}"
         );
         assert_eq!(a.candidates[0].outer_fn, OuterFn::Rate, "{a:?}");
@@ -1200,24 +1210,56 @@ mod tests {
     }
 
     #[test]
-    fn rate_and_sum_over_time_share_capability_but_differ_on_outer_fn() {
-        // Both collapse to `Capability::ExactAgg(Sum)`; the engine MUST
-        // disambiguate via the typed `outer_fn` field, not by string-
-        // parsing the raw PromQL. This test pins the asymmetry the
-        // engine's dispatch reads off.
+    fn rate_and_sum_over_time_differ_on_capability_and_outer_fn() {
+        // Pre-PromQL-frontend-semantic-retarget, `rate`/`irate`/
+        // `increase`/`sum_over_time` all collapsed onto `AggIntent::Sum`
+        // (`Capability::ExactAgg(Sum)`), so `outer_fn` was the *only*
+        // thing that told the engine `rate(...)` needed a rate-divisor
+        // step `sum_over_time(...)` didn't. `rate`/`increase` now bind to
+        // their own dedicated `AggIntent`s (`Capability::ExactAgg(
+        // Increase)`, distinct from `sum_over_time`'s `ExactAgg(Sum)`) —
+        // a strictly more precise classification, not a regression: the
+        // capability itself now carries part of the distinction
+        // `outer_fn` used to carry alone.
         let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
         let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
-        assert_eq!(
-            rate.candidates[0].required_capability, sot.candidates[0].required_capability,
-            "rate and sum_over_time should produce the same Capability"
-        );
         assert_ne!(
-            rate.candidates[0].outer_fn, sot.candidates[0].outer_fn,
-            "rate and sum_over_time MUST differ on outer_fn so the engine \
-             can dispatch correctly without re-parsing the raw PromQL"
+            rate.candidates[0].required_capability, sot.candidates[0].required_capability,
+            "rate and sum_over_time should now bind to distinct capabilities"
+        );
+        assert_eq!(
+            rate.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Increase)
+        );
+        assert_eq!(
+            sot.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Sum)
         );
         assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
         assert_eq!(sot.candidates[0].outer_fn, OuterFn::SumOverTime);
+    }
+
+    #[test]
+    fn rate_and_increase_share_capability_but_differ_on_outer_fn() {
+        // The pairing that now needs `outer_fn` to disambiguate: `rate`
+        // and `increase` both bind to `Capability::ExactAgg(Increase)`
+        // (rate = increase / range, an L4/reducer-level division, not a
+        // capability difference) — the engine still can't tell from the
+        // capability alone whether to apply the rate divisor, so
+        // `outer_fn` carries that distinction.
+        let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
+        let inc = analyze_promql_for_asap_tier("increase(http_requests_total[5m])");
+        assert_eq!(
+            rate.candidates[0].required_capability, inc.candidates[0].required_capability,
+            "rate and increase should share the same Capability"
+        );
+        assert_ne!(
+            rate.candidates[0].outer_fn, inc.candidates[0].outer_fn,
+            "rate and increase MUST differ on outer_fn so the engine can \
+             dispatch correctly without re-parsing the raw PromQL"
+        );
+        assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
+        assert_eq!(inc.candidates[0].outer_fn, OuterFn::Increase);
     }
 
     // ── outer_agg — outer aggregation operator on function results ──────

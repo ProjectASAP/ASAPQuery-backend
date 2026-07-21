@@ -93,14 +93,27 @@ pub enum Capability {
 /// `sum_over_time(metric[r])` / `sum(metric)` / bare selector WITHOUT
 /// re-parsing the raw PromQL string.
 ///
-/// Background: the lowerer collapses every `AggFunc` in
+/// Background: until the Phase 2 semantic retarget (ASAPController
+/// alignment), the lowerer collapsed every `AggFunc` in
 /// `{Sum, Rate, Increase, Delta}` onto a single `AggIntent::Sum`, which
-/// `capability_for` then maps to `Capability::ExactAgg(Sum)`. That
-/// collapse erases the rate-vs-plain distinction the engine needs to
+/// `capability_for` then mapped to `Capability::ExactAgg(Sum)` for all
+/// of them — erasing the rate-vs-plain distinction the engine needs to
 /// decide between the plain ExactAgg reducer and the rate-divisor
-/// reducer (`evaluate_exact_agg_rate`). Before this enum landed the
-/// engine re-walked the raw PromQL via a `query_contains_rate_call`
-/// helper to recover the distinction; that was a lossy-lowering smell.
+/// reducer (`evaluate_exact_agg_rate`). `OuterFn` was introduced to
+/// carry that distinction back (replacing an earlier raw-string
+/// `query_contains_rate_call` re-parse). `rate`/`increase` now bind
+/// their own `AggIntent::Rate`/`AggIntent::Increase` (matching
+/// `asap_plan::boundary::implementation_for`'s `SummaryKind::Rate`/
+/// `Increase` — ASAPController models Rate as a distinct summary
+/// family), both mapping to `Capability::ExactAgg(AggregationType::Increase)`;
+/// only `sum`/`sum by (...)`/bare selectors and `sum_over_time` still
+/// bind `AggIntent::Sum` → `ExactAgg(Sum)`. `OuterFn` still carries the
+/// PromQL-function-shape distinction `Capability` doesn't encode (e.g.
+/// which divisor/accumulation strategy `evaluate_exact_agg_rate` uses),
+/// but the sid-matching predicate is no longer purely `ExactAgg(Sum)`
+/// -- see `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
+/// how a Sum-registered sid still answers an `ExactAgg(Increase)`
+/// required capability.
 ///
 /// The walker that populates this lives in `asap_tier_analysis.rs`
 /// (`trace_from_promql`) — it picks the most-specific counter-function
@@ -111,24 +124,18 @@ pub enum Capability {
 ///
 /// Post-#299 the agent streams per-window DELTAS for counters. The four
 /// PromQL counter idioms have genuinely different semantics over those
-/// deltas, but they ALL lower to a single `Capability::ExactAgg(Sum)`
-/// (the `AggIntent::Sum` collapse erases the function name). Before
-/// #301 the engine only distinguished `Rate` from everything else, so
-/// `sum`, `sum_over_time`, `increase`, and instant-sum all hit the same
-/// reducer path and returned the same (wrong) number. This enum carries
-/// the function distinction the engine needs to dispatch correctly:
+/// deltas. Before #301 the engine only distinguished `Rate` from
+/// everything else, so `sum`, `sum_over_time`, `increase`, and
+/// instant-sum all hit the same reducer path and returned the same
+/// (wrong) number. This enum carries the function distinction the
+/// engine needs to dispatch correctly:
 ///
-/// | Variant       | PromQL                       | Engine dispatch                                   |
-/// |---------------|------------------------------|---------------------------------------------------|
-/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | accumulate ALL windows → cumulative-since-storage |
-/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
-/// | `Increase`    | `increase(c[r])`             | Σ deltas in `[t-r,t]` (one cumulative number)     |
-/// | `SumOverTime` | `sum_over_time(c[r])`        | capability-miss → archive (can't reconstruct)     |
-///
-/// The taxonomy lives on `OuterFn` (not the `Capability` algebra) so the
-/// sid-matching half stays a pure `ExactAgg(Sum)` predicate — the
-/// function distinction is a query-evaluation concern, not a stored-state
-/// one.
+/// | Variant       | PromQL                       | `required_capability`  | Engine dispatch                                   |
+/// |---------------|------------------------------|-------------------------|----------------------------------------------------|
+/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | `ExactAgg(Sum)`         | accumulate ALL windows → cumulative-since-storage |
+/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
+/// | `Increase`    | `increase(c[r])`             | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` (one cumulative number)     |
+/// | `SumOverTime` | `sum_over_time(c[r])`        | `ExactAgg(Sum)`         | capability-miss → archive (can't reconstruct)     |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
     /// No range-style counter function in the expression — bare selector,
@@ -358,10 +365,14 @@ impl Capability {
             // serving multi-pop) is NOT allowed — the single-pop
             // policy has lost the key dimension and can't recover it.
             //
-            // Cross-family ExactAgg combos (Sum vs MinMax, etc.)
-            // remain non-satisfiable: they're different operations.
+            // Cross-family ExactAgg combos are mostly non-satisfiable
+            // (Sum vs MinMax, etc. are different operations) — except
+            // Sum-family serving a required Increase/Rate capability,
+            // which IS sound; see `sum_satisfies_increase`.
             (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
-                req == have || multi_pop_satisfies_single(*req, *have)
+                req == have
+                    || multi_pop_satisfies_single(*req, *have)
+                    || sum_satisfies_increase(*req, *have)
             }
             _ => false,
         }
@@ -418,6 +429,47 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
     )
 }
 
+/// True when an available Sum-family accumulator can answer a required
+/// Increase/Rate capability.
+///
+/// `rate()`/`increase()` PromQL both lower to a required
+/// `Capability::ExactAgg(AggregationType::Increase)` (`capability_for`'s
+/// `AggIntent::Rate | AggIntent::Increase` case, matching
+/// `asap_plan::boundary::implementation_for`'s `SummaryKind::Increase |
+/// SummaryKind::Rate` — ASAPController models Rate as its own summary
+/// family). But this workspace's data plane has no storage kind distinct
+/// from Sum for it: `evaluate_exact_agg_rate` (`sketch_reducer.rs`)
+/// already reduces `Sum`/`MultipleSum`/`Increase`/`MultipleIncrease`
+/// identically — all read as `Statistic::Sum` per window, then divided
+/// by the coverage-aware elapsed range — so a Sum-registered sid's raw
+/// per-window deltas answer a rate query exactly as well as an
+/// Increase-registered one's. This is what lets counter metrics ingested
+/// as plain `Sum` (not every ingest path distinguishes Increase from
+/// Sum at registration time) still answer `rate(...)`/`increase(...)`.
+///
+/// Respects the same single/multi-population direction as
+/// [`multi_pop_satisfies_single`]: a multi-pop available (`MultipleSum`)
+/// can serve a single- or multi-pop required capability; a single-pop
+/// available (`Sum`) can only serve a single-pop required one — it has
+/// already lost the per-key breakdown a multi-pop required capability
+/// would need.
+///
+/// Deliberately does NOT apply to a required `Capability::ExactAgg(Sum)`
+/// (plain `sum_over_time`) — reconstructing Σ-of-cumulative-counter-
+/// samples from per-window deltas is unsound (issue #301); that shape is
+/// refused explicitly at the query-dispatch layer, not routed here.
+fn sum_satisfies_increase(required: AggregationType, available: AggregationType) -> bool {
+    matches!(
+        (required, available),
+        (AggregationType::Increase, AggregationType::Sum)
+            | (AggregationType::Increase, AggregationType::MultipleSum)
+            | (
+                AggregationType::MultipleIncrease,
+                AggregationType::MultipleSum
+            )
+    )
+}
+
 // ── AggIntent → Capability bridge ────────────────────────────────────────────
 
 /// Map a semantic [`AggIntent`] to the ASAP-tier [`Capability`] that can
@@ -432,24 +484,19 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
 /// (`intent_algebra::lower::lower_parsed_query`), which is the single
 /// owner of "what does this PromQL function mean".
 ///
-/// ## Mapping table
+/// ## Delegation to `asap-plan`
 ///
-/// | `AggIntent` variant | Returns |
-/// |---|---|
-/// | `Quantile { q, accuracy }` (accuracy not `Exact`) | `Some(QuantileApprox(Any))` |
-/// | `Quantile { q, accuracy: Exact }` | `None` (exact must use HashAgg/SortAgg) |
-/// | `Min` / `Max` | `Some(QuantileApprox(Any))` — quantile sketches answer min = q(0), max = q(1) |
-/// | `Cardinality { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
-/// | `Cardinality { accuracy: Exact }` | `None` |
-/// | `Count { accuracy: Exact }` | `Some(ExactAgg(Sum))` — count_over_time = sum-of-1s (PR-6 follow-up) |
-/// | `Count { accuracy }` (accuracy not `Exact`) | `Some(CardinalityApprox)` |
-/// | `TopK { k, accuracy }` (accuracy not `Exact`) | `Some(FrequencyTopk(CmsWithHeap))` |
-/// | `Frequency { accuracy }` (accuracy not `Exact`) | `Some(FrequencyEstimate(Any))` |
-/// | `Frequency { accuracy: Exact }` | `None` (exact aggregation; route to archive) |
-/// | `Sum` | `Some(ExactAgg(Sum))` — ASAP-tier exact precompute (PR-6 follow-up) |
-/// | `Rate` / `Increase` | `Some(ExactAgg(Increase))` — counter-reset-aware precompute (PR-6 follow-up) |
-/// | `Avg` | `None` — needs cross-policy join (Sum + Count); follow-up |
-/// | Every archive-only intent | `None` |
+/// Beyond the `Extension`/`Frequency` special case (deployment-specific,
+/// see below — `asap-plan` deliberately has no opinion on a shape it
+/// can't see into), every other `AggIntent` variant's capability is
+/// derived from [`asap_plan::boundary::implementation_for`] — the single
+/// upstream authority for "how would this intent be realized" — rather
+/// than a second, hand-maintained, parallel judgment kept in sync by
+/// hand. See [`implementation_to_capability`] for the
+/// `asap_sketch::SummaryKind` → `Capability` family translation this
+/// still requires (the two crates' capability vocabularies aren't the
+/// same *shape*, even once they agree on substance), and its doc comment
+/// for the one deliberate override (`Count{Exact}`).
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     if let Some(accuracy) = crate::intent_algebra::as_frequency(intent) {
         return if is_exact(&accuracy) {
@@ -467,125 +514,86 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         };
     }
-    match intent {
-        AggIntent::Quantile { accuracy, .. } => {
-            if is_exact(accuracy) {
-                None
-            } else {
+    implementation_to_capability(asap_plan::boundary::implementation_for(intent))
+}
+
+/// Translate `asap-plan`'s per-intent implementation decision into this
+/// repo's own [`Capability`] vocabulary.
+///
+/// `Implementation::Sketch`/`ExactAccumulator` both carry an
+/// `asap_sketch::SummaryKind` — this repo's `Capability` groups those
+/// into coarser families (`QuantileApprox`/`CardinalityApprox`/
+/// `FrequencyEstimate`/`FrequencyTopk` for sketches; `ExactAgg(AggregationType)`
+/// for accumulators) because that's the granularity the sketch index
+/// (`is_satisfied_by`) and the wire-shared `sketch_index::Capability`
+/// actually match on — the required side never pins a *specific*
+/// concrete implementation (`Any`), only the family. This function is
+/// exhaustive over `SummaryKind` (no wildcard fallthrough), so a new
+/// variant there fails to compile here until given an explicit mapping.
+fn implementation_to_capability(implementation: asap_plan::Implementation) -> Option<Capability> {
+    use asap_plan::Implementation;
+    use asap_sketch::SummaryKind;
+
+    match implementation {
+        Implementation::PassThrough => None,
+        Implementation::Sketch { kind, .. } => match kind {
+            SummaryKind::Kll | SummaryKind::DDSketch => {
                 Some(Capability::QuantileApprox(SketchKindHandle::Any))
             }
-        }
-        AggIntent::Cardinality { accuracy, .. } => {
-            if is_exact(accuracy) {
-                None
-            } else {
+            SummaryKind::Hll | SummaryKind::Theta | SummaryKind::Kmv => {
                 Some(Capability::CardinalityApprox)
             }
-        }
-        AggIntent::Count { accuracy } => {
-            // Count is the legacy bridge — `count_over_time` lowers to
-            // `Count{accuracy:Exact}` (exact counter, no sketch). When
-            // the lowerer or callers ask for an approximate count
-            // (`distinct_over_time` / SQL `COUNT(DISTINCT)`), the
-            // accuracy is non-Exact and we hand it to the cardinality
-            // sketch path.
-            //
-            // Exact count routes to archive (`None`). The PR #200/#201
-            // follow-up flipped this to `ExactAgg(Sum)` on the theory
-            // "count = sum-of-1s" — but the data plane has no count
-            // accumulator. `SumAccumulator` only tracks `sum: f64` and
-            // its `query` returns `self.sum` for BOTH `Statistic::Sum`
-            // and `Statistic::Count`, so a `count_over_time` query
-            // matched against a `Sum` policy returns the sum of the
-            // sample VALUES, not the count of samples. Reverted here
-            // until a real `SumCountAccumulator` lands (the
-            // temporal/spatial-split work) — archive counts correctly
-            // in the meantime.
-            if is_exact(accuracy) {
-                None
-            } else {
-                Some(Capability::CardinalityApprox)
+            SummaryKind::Cms | SummaryKind::CountSketch => {
+                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
             }
-        }
-        AggIntent::TopK { accuracy, .. } => {
-            if is_exact(accuracy) {
-                // Exact top-k must use HashAgg+Heap; no ASAP-tier sketch.
-                None
-            } else {
-                // Top-k is intrinsically heavy-hitter — only heap-bearing
-                // handles can enumerate the items. The analyzer doesn't
-                // care which heap-bearing variant answers (CmsWithHeap or
-                // CountSketchWithHeap both work — the reducer dispatches
-                // both through `decode_cms_with_heap_from_msgpack` and
-                // produces top-k items either way). Return `Any` so
-                // `is_satisfied_by`'s `handles_compatible_for_topk`
-                // wildcard accepts whichever variant the ingest tier
-                // chose to register.
+            SummaryKind::CmsWithHeap | SummaryKind::CountSketchWithHeap => {
                 Some(Capability::FrequencyTopk(SketchKindHandle::Any))
             }
-        }
-        // ── Min / Max via quantile sketches ──────────────────────────
-        // DDSketch / KLL answer min = quantile(0) and max = quantile(1)
-        // out of the box. No dedicated extrema sketch is needed; route
-        // these through the quantile-family handler.
-        AggIntent::Min { .. } | AggIntent::Max { .. } => {
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
-        }
-        // ── ExactAgg (PR-6 follow-up) ────────────────────────────────
-        // These intents previously returned `None` and routed to the
-        // archive engine. Now that the data plane carries
-        // `Capability::ExactAgg(agg_type)` on ExactAgg-backed sids,
-        // the analyzer can match them to ASAP-tier exact-precompute
-        // state instead. `is_satisfied_by` checks `agg_type` equality
-        // structurally — a sid registered as `ExactAgg(Sum)` only
-        // satisfies a required `ExactAgg(Sum)`.
-        AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
-        AggIntent::Rate | AggIntent::Increase => {
-            Some(Capability::ExactAgg(AggregationType::Increase))
-        }
-        // ── Avg / StdDev / Variance: still no ASAP-tier substitute ────
-        // Avg = Sum / Count, which needs two separate ExactAgg policies
-        // (one for Sum, one for Count) joined at query time. The L4
-        // binder doesn't yet emit that pattern, so capability_for keeps
-        // these on the archive path for now. Follow-up.
-        AggIntent::Avg { .. } | AggIntent::StdDev { .. } | AggIntent::Variance { .. } => None,
-        // Archive-only intents — never bind to a ASAP-tier capability;
-        // routed to the cold tier (Gorilla / Thanos). Includes every
-        // intent added by the Phase 1 IR merge (none has a `Bind*` rule
-        // yet) plus the pre-existing archive-only set. `Irate` is
-        // intentionally absent — folded into `Rate` above (see
-        // `agg_intent.rs` module docs).
-        AggIntent::Absent
-        | AggIntent::AbsentOverTime
-        | AggIntent::PresentOverTime
-        | AggIntent::Delta
-        | AggIntent::Deriv
-        | AggIntent::PredictLinear { .. }
-        | AggIntent::DoubleExpSmoothing { .. }
-        | AggIntent::IDelta
-        | AggIntent::Resets
-        | AggIntent::Changes
-        | AggIntent::HistogramCount
-        | AggIntent::HistogramSum
-        | AggIntent::HistogramAvg
-        | AggIntent::HistogramStdDev
-        | AggIntent::HistogramStdVar
-        | AggIntent::HistogramFraction { .. }
-        | AggIntent::HistogramQuantile { .. }
-        | AggIntent::Math(_)
-        | AggIntent::TimeFn(_)
-        | AggIntent::Group
-        | AggIntent::CountValues { .. }
-        | AggIntent::LastOverTime
-        | AggIntent::FirstOverTime
-        | AggIntent::MadOverTime
-        | AggIntent::TsOfMinOverTime
-        | AggIntent::TsOfMaxOverTime
-        | AggIntent::TsOfFirstOverTime
-        | AggIntent::TsOfLastOverTime => None,
-        // Unrecognized Extension (not the Frequency one, guarded above) -- no
-        // binding exists for a shape core cannot even see into.
-        AggIntent::Extension { .. } => None,
+            SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate => {
+                unreachable!(
+                    "{kind:?} is an exact-accumulator SummaryKind, never returned inside \
+                     Implementation::Sketch by asap_plan::boundary::implementation_for"
+                )
+            }
+        },
+        Implementation::ExactAccumulator { kind, .. } => match kind {
+            SummaryKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+            SummaryKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
+            SummaryKind::Increase | SummaryKind::Rate => {
+                Some(Capability::ExactAgg(AggregationType::Increase))
+            }
+            // `AggregationType` (this repo's own exact-accumulator-family
+            // enum) has no `Count` variant — the data plane has no
+            // working count accumulator (`SumAccumulator` returns `sum`
+            // for both `Statistic::Sum` and `Statistic::Count`, so a
+            // `count_over_time` query matched against a `Sum` policy
+            // would silently return sum-of-values, not sample-count).
+            // `asap_plan::boundary::implementation_for` still reports
+            // `Count{Exact}` as an `ExactAccumulator` (it assumes a real
+            // count accumulator exists, which is true in ASAPController's
+            // own reference implementation) — deliberately overridden
+            // here to `None` (archive) until a real
+            // `SumCountAccumulator` lands.
+            SummaryKind::Count => None,
+            SummaryKind::Kll
+            | SummaryKind::DDSketch
+            | SummaryKind::Hll
+            | SummaryKind::Theta
+            | SummaryKind::Kmv
+            | SummaryKind::Cms
+            | SummaryKind::CmsWithHeap
+            | SummaryKind::CountSketch
+            | SummaryKind::CountSketchWithHeap => {
+                unreachable!(
+                    "{kind:?} is a sketch-family SummaryKind, never returned inside \
+                     Implementation::ExactAccumulator by asap_plan::boundary::implementation_for"
+                )
+            }
+        },
     }
 }
 
@@ -687,11 +695,20 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_count_approximate_returns_cardinality_approx() {
+    fn capability_for_count_approximate_returns_frequency_estimate() {
+        // Non-exact `Count` is a relaxed-accuracy `COUNT(*)` point query
+        // (CMS), matching ASAPController's own `bind.rs::readout`
+        // (`Count => SketchQuery::PointCount`) and this repo's
+        // `BindCmsOnCount` rule — not `CardinalityApprox`/HLL, which is
+        // `AggIntent::Cardinality`'s job (`distinct_over_time`/
+        // `COUNT(DISTINCT)` never lower to `Count`).
         let intent = AggIntent::Count {
             accuracy: AccuracyTarget::Epsilon(0.01),
         };
-        assert_eq!(capability_for(&intent), Some(Capability::CardinalityApprox));
+        assert_eq!(
+            capability_for(&intent),
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        );
     }
 
     #[test]
@@ -729,20 +746,21 @@ mod tests {
     }
 
     #[test]
-    fn capability_for_min_returns_quantile_approx() {
-        // Min = quantile(0); DDSketch / KLL answer it directly.
+    fn capability_for_min_returns_exact_agg_minmax() {
+        // Min/Max are exact, mergeable accumulators -- no approximation
+        // needed at all -- matching ASAPController's own
+        // `crates/plan/src/boundary.rs` treatment.
         assert_eq!(
             capability_for(&AggIntent::Min { col: None }),
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::ExactAgg(AggregationType::MinMax))
         );
     }
 
     #[test]
-    fn capability_for_max_returns_quantile_approx() {
-        // Max = quantile(1); DDSketch / KLL answer it directly.
+    fn capability_for_max_returns_exact_agg_minmax() {
         assert_eq!(
             capability_for(&AggIntent::Max { col: None }),
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::ExactAgg(AggregationType::MinMax))
         );
     }
 
@@ -1003,6 +1021,41 @@ mod tests {
                 "ExactAgg({t:?}) should satisfy itself"
             );
         }
+    }
+
+    #[test]
+    fn is_satisfied_by_sum_family_answers_required_increase() {
+        // A Sum-registered sid's raw per-window deltas answer a
+        // rate()/increase() query exactly as well as an Increase-
+        // registered one's -- evaluate_exact_agg_rate (sketch_reducer.rs)
+        // reduces both identically. See sum_satisfies_increase's doc.
+        let required = Capability::ExactAgg(AggregationType::Increase);
+        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
+        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+
+        let required_multi = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        assert!(required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+    }
+
+    #[test]
+    fn is_satisfied_by_sum_family_does_not_answer_required_multi_increase_from_single_sum() {
+        // Same single/multi-population direction as multi_pop_satisfies_single:
+        // a single-pop available (Sum) can't serve a multi-pop required
+        // capability (MultipleIncrease) -- it already lost the per-key
+        // breakdown a multi-pop caller needs.
+        let required = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
+    }
+
+    #[test]
+    fn is_satisfied_by_increase_does_not_answer_required_sum() {
+        // The reverse direction is NOT sound: required ExactAgg(Sum) is
+        // sum_over_time semantics (Σ of raw cumulative-counter samples),
+        // which an Increase-registered sid's per-window deltas cannot
+        // reconstruct (issue #301) -- refused explicitly at the
+        // query-dispatch layer, not routed through here.
+        let required = Capability::ExactAgg(AggregationType::Sum);
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Increase)));
     }
 
     // ── capability_for: ExactAgg dormancy ────────────────────────────────

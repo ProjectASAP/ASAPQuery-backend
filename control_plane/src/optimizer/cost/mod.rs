@@ -352,9 +352,10 @@ fn apply_delta_decision_with(
 // the lint baseline clean — mirrors the module-wide allowance on
 // `intent_algebra/mod.rs` while Phase B sat consumer-less.
 #[allow(unused_imports)]
-use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Schema};
+use asap_ir::intent_algebra::{BindingName, QueryId};
+
 #[allow(unused_imports)]
-use crate::types_v2::{BindingName, QueryId};
+use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Schema};
 
 /// Bundled cost of a multi-query workload, with per-root contributions
 /// and the savings unlocked by shared-producer credit. Returned by
@@ -542,7 +543,6 @@ fn walk_children_zero_cost_bundled(
     match expr {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. } => {
@@ -618,7 +618,6 @@ fn walk_children_zero_cost_standalone(
     match expr {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Partition { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. } => {
@@ -737,7 +736,8 @@ mod workload_cost_tests {
     use crate::intent_algebra::{
         AggIntent, Column, DataType, LabelFilter, QueryExpr, Schema, Source, WindowKind,
     };
-    use crate::types_v2::{AccuracyTarget, BindingName, QueryId};
+    use crate::types_v2::AccuracyTarget;
+    use asap_ir::intent_algebra::{BindingName, QueryId};
     use std::time::Duration;
 
     fn col(name: &str, dtype: DataType) -> Column {
@@ -745,27 +745,32 @@ mod workload_cost_tests {
             name: name.into(),
             dtype,
             nullable: false,
+            table: None,
         }
     }
 
     fn ts_scan() -> QueryExpr {
+        let schema = Schema::with_time_index(
+            vec![
+                col("ts", DataType::Timestamp),
+                col("service", DataType::Utf8),
+                col("value", DataType::Float64),
+            ],
+            0,
+            vec![vec![0, 1]],
+        );
+        let lf = LabelFilter {
+            label: "service".into(),
+            equals: "api".into(),
+        };
+        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+            .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
-            schema: Schema::with_time_index(
-                vec![
-                    col("ts", DataType::Timestamp),
-                    col("service", DataType::Utf8),
-                    col("value", DataType::Float64),
-                ],
-                0,
-                vec![vec![0, 1]],
-            ),
+            predicates: vec![pred],
+            schema,
         }
     }
 
@@ -781,12 +786,13 @@ mod workload_cost_tests {
     /// Wrap `child` in `Aggregate { by: [], aggs: [Quantile{q}] }`.
     fn quantile_root(q: f64, child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(child),
         }
@@ -795,8 +801,9 @@ mod workload_cost_tests {
     /// Wrap `child` in `Aggregate { by: [], aggs: [Max] }`.
     fn max_root(child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Max { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(child),
         }
@@ -855,13 +862,13 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
 
@@ -904,13 +911,13 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         // q3 builds its own scan + window — no shared producer.
@@ -947,17 +954,17 @@ mod workload_cost_tests {
         let q1 = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q2 = quantile_root(
             0.95,
             QueryExpr::Ref {
-                name: BindingName::new("w"),
+                name: asap_ir::intent_algebra::BindingName::new("w"),
             },
         );
         let q3 = max_root(QueryExpr::Ref {
-            name: BindingName::new("w"),
+            name: asap_ir::intent_algebra::BindingName::new("w"),
         });
         let plan = WorkloadCostPlan {
             bindings: vec![(BindingName::new("w"), &shared)],
@@ -1005,7 +1012,7 @@ mod workload_cost_tests {
         let q = quantile_root(
             0.99,
             QueryExpr::Ref {
-                name: BindingName::new("missing"),
+                name: asap_ir::intent_algebra::BindingName::new("missing"),
             },
         );
         let plan = WorkloadCostPlan {

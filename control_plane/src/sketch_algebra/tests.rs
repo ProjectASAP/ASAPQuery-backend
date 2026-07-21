@@ -21,27 +21,32 @@ fn col(name: &str, dtype: DataType) -> Column {
         name: name.into(),
         dtype,
         nullable: false,
+        table: None,
     }
 }
 
 fn ts_scan() -> QueryExpr {
+    let schema = Schema::with_time_index(
+        vec![
+            col("ts", DataType::Timestamp),
+            col("service", DataType::Utf8),
+            col("value", DataType::Float64),
+        ],
+        0,
+        vec![vec![0, 1]],
+    );
+    let lf = LabelFilter {
+        label: "service".into(),
+        equals: "api".into(),
+    };
+    let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+        .expect("service column present in schema");
     QueryExpr::Scan {
         source: Source::TimeSeries {
             metric: "http_request_duration_seconds".into(),
         },
-        label_filters: vec![LabelFilter {
-            label: "service".into(),
-            equals: "api".into(),
-        }],
-        schema: Schema::with_time_index(
-            vec![
-                col("ts", DataType::Timestamp),
-                col("service", DataType::Utf8),
-                col("value", DataType::Float64),
-            ],
-            0,
-            vec![vec![0, 1]],
-        ),
+        predicates: vec![pred],
+        schema,
     }
 }
 
@@ -56,12 +61,13 @@ fn windowed_scan() -> QueryExpr {
 
 fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
-        by: vec![],
+        by: crate::intent_algebra::GroupKeys::none(),
         aggs: vec![AggIntent::Quantile {
             col: None,
             q,
             accuracy,
         }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     }
@@ -157,8 +163,9 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
 /// Build an `Aggregate{TopK{k, accuracy}}` over the windowed scan.
 fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![AggIntent::TopK { k, accuracy }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     }
@@ -274,11 +281,12 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
 #[test]
 fn bind_hll_cardinality_basic() {
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![AggIntent::Cardinality {
             col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -318,8 +326,9 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // `PhysicalExpr::ExactAgg { agg_type: Sum, .. }` so the ASAP-tier
     // exact-aggregation path can serve the intent.
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![AggIntent::Sum { col: None }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -361,12 +370,13 @@ fn bind_exact_accuracy_disables_quantile_binding() {
 #[test]
 fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![AggIntent::Quantile {
             col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -398,8 +408,9 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 #[test]
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![AggIntent::Sum { col: None }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -421,8 +432,9 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 #[test]
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
-        by: vec![1], // service column
+        by: vec![1].into(), // service column
         aggs: vec![AggIntent::Sum { col: None }],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(ts_scan()),
     };
@@ -441,8 +453,9 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 #[test]
 fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
-        by: vec![1],
+        by: vec![1].into(),
         aggs: vec![AggIntent::Rate],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -475,8 +488,9 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
         "Phase β intent must flag archive"
     );
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![intent.clone()],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -723,8 +737,9 @@ fn phase_b_e2e_topk_well_formed() {
 fn phase_b_e2e_archive_only_e2e_binding() {
     let intent = AggIntent::Absent;
     let expr = QueryExpr::Aggregate {
-        by: vec![],
+        by: vec![].into(),
         aggs: vec![intent.clone()],
+        output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     };
@@ -765,8 +780,9 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
     ];
     for intent in intents {
         let expr = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![intent.clone()],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };

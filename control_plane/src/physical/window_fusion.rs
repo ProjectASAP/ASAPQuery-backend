@@ -78,6 +78,7 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
         aggs,
         having,
         child: inner_child,
+        ..
     } = child.as_ref()
     else {
         return None;
@@ -190,10 +191,7 @@ mod tests {
     /// A canonical `Scan` leaf — built through `convert_root` so it carries
     /// the same Binder-built schema a real converted tree would.
     fn canonical_scan(metric: &str) -> QueryExpr {
-        convert_root(&LQueryExpr::Source(SourceSpec {
-            name: metric.into(),
-        }))
-        .expect("convert source")
+        convert_root(&LQueryExpr::Source(SourceSpec::new(metric))).expect("convert source")
     }
 
     /// The canonical `Window { Aggregate { by: [], aggs: [agg] } }` shape —
@@ -210,8 +208,9 @@ mod tests {
             size,
             slide,
             child: Box::new(QueryExpr::Aggregate {
-                by: Vec::new(),
+                by: crate::intent_algebra::GroupKeys::none(),
                 aggs: vec![agg],
+                output_names: Vec::new(),
                 having: None,
                 child: Box::new(canonical_scan("m")),
             }),
@@ -333,8 +332,9 @@ mod tests {
         // A canonical `Aggregate` with no enclosing `Window` is the unfused
         // sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
-            by: Vec::new(),
+            by: crate::intent_algebra::GroupKeys::none(),
             aggs: vec![AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(canonical_scan("m")),
         };
@@ -347,7 +347,7 @@ mod tests {
         let legacy = LQueryExpr::Window {
             duration: Duration::from_secs(60),
             slide: None,
-            input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+            input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
         };
         let canonical = convert_root(&legacy).expect("convert");
         assert!(recognize_windowed_sketch(&canonical).is_none());
@@ -360,17 +360,17 @@ mod tests {
         // shape the recognizer matches.
         let legacy = LQueryExpr::Aggregate {
             keys: vec![],
+            without: false,
             aggs: vec![AggItem {
-                alias: "q".into(),
+                alias: Some("q".into()),
                 func: AggFunc::Quantile(0.99),
                 col: LColumnRef::SampleValue,
-                distinct: false,
             }],
             having: None,
             input: Box::new(LQueryExpr::Window {
                 duration: Duration::from_secs(300),
                 slide: None,
-                input: Box::new(LQueryExpr::Source(SourceSpec { name: "m".into() })),
+                input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
             }),
         };
         let canonical = convert_root(&legacy).expect("convert");

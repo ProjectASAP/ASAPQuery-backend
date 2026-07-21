@@ -1,30 +1,59 @@
 //! Workload-level Common Sub-Expression Elimination.
 //!
-//! Per `control_plane/docs/design.md` §6 batched-queries example (line ~1256
-//! through ~1320). Multi-root planning hoists shared sub-DAGs into
+//! ## Phase 2 step 5 (docs/migration-plan-backend-plan.md)
+//!
+//! Relocated from `intent_algebra::cse` to `optimizer::cse` per the
+//! Phase 0 decision: ASAPController places this pass in `crates/plan`
+//! ("the cost-aware optimizer layer (L4 decisions) over the L3 intent
+//! algebra"), not alongside the L3 IR type definitions — this repo's
+//! `optimizer` module is that layer (R1-R12 in `engine.rs`, and this
+//! pass's real consumer, `optimizer::cost::workload_cost`). The
+//! algorithm is otherwise identical to `asap_plan::cse` (ASAPController's
+//! `crates/plan/src/cse.rs`) — adopted directly per the tie-break rule,
+//! including its structural-equality candidate scan (`QueryExpr:
+//! PartialEq` on a `Vec`, not a `Debug`-string-keyed `HashMap` — `{:?}`
+//! is not a guaranteed-injective, stable identity contract, this repo's
+//! pre-merge implementation's own shortcut).
+//!
+//! [`CseWorkloadPlan`] now carries `asap_ir`'s own `BindingName`/`QueryId`
+//! directly (`asap_ir::intent_algebra::{BindingName, QueryId}`), not
+//! `types_v2`'s separate wrapper types — matching `asap_plan::cse` and
+//! removing the boundary conversion the pre-merge version needed at
+//! every `QueryExpr::Ref` construction site (`asap_ir`'s `BindingName`
+//! was always the *only* type that could actually name a `Ref`/
+//! `LetBinding`; the `types_v2` copy was this pass's own bookkeeping
+//! type, not a real second identity). `optimizer::cost::WorkloadCostPlan`
+//! — the pass's real consumer — moves with it for the same reason.
+//! `types_v2::BindingName` remains the right type everywhere else it's
+//! used today (`sketch_algebra::PhysicalExpr`'s own, unrelated L4
+//! binding-name field; `pipeline.rs`'s `QueryId`) — this change is scoped
+//! to the CSE↔cost-model boundary only.
+//!
+//! ## Regression note (R8 `CommonSubexprElim`)
+//!
+//! `optimizer::engine`'s R8 rule and this pass are *not* redundant,
+//! despite both doing "common subexpression elimination": R8 dedupes
+//! `Scan` leaves across the **branches of one `Merge` node inside a
+//! single query tree**; this pass dedupes `Aggregate`-child subtrees
+//! **across the root queries of a multi-query workload**. Intra-tree vs.
+//! inter-tree — disjoint inputs, so relocating this pass doesn't change
+//! what R8 fires on or when, and both stay.
+//!
+//! Per `control_plane/docs/design.md` §6 batched-queries example (line
+//! ~1256 through ~1320). Multi-root planning hoists shared sub-DAGs into
 //! `LetBinding`s so the cost model can credit the producer once.
 //!
-//! Phase F lands the **gate + a basic implementation** that handles the
-//! literal "≥2 root queries with identical sub-expressions" case from the
-//! design — sufficient to make the workload-cost path observable end-to-
-//! end. The fully-general CSE algorithm (alpha-equivalence across
-//! `LetBinding` rebinding, schema-merge across compatible-but-not-identical
-//! shapes, cross-binding nested CSE) is deferred per design.md §6 line
-//! ~562 — it is a downstream optimisation pass, not part of the IR
-//! contract Phase F is delivering.
-//!
-//! Legality is gated by [`cse_reuse_is_legal`](super::schema::cse_reuse_is_legal):
+//! Legality is gated by [`cse_reuse_is_legal`](crate::intent_algebra::cse_reuse_is_legal):
 //! a candidate sub-DAG only becomes a `LetBinding` when its output schema
 //! has at least one `unique_keys` set (§6 line ~1356 — the field is
 //! load-bearing for this pass).
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use asap_ir::intent_algebra::{BindingName, QueryId};
 
+use crate::intent_algebra::cse_reuse_is_legal;
 use crate::intent_algebra::query_expr::QueryExpr;
-use crate::intent_algebra::schema::cse_reuse_is_legal;
-use crate::types_v2::{BindingName, QueryId};
 
 /// Multi-root container produced by the CSE pass — mirrors the shape of
 /// `types_v2::WorkloadPlan` (§6 batched-queries example) but uses the
@@ -47,12 +76,12 @@ pub struct CseWorkloadPlan {
 /// where the duplicate sub-tree used to live. Per design.md §6 line
 /// ~1272 ("a workload-level CSE pass `core::lower::workload::dedupe_subtrees`").
 ///
-/// **Phase F scope.** Implements the basic case: identifies sub-trees
-/// that appear verbatim (structural equality via `PartialEq`) in ≥2 root
-/// inputs and hoists them. Schema-equivalent-but-not-identical sub-trees,
-/// alpha-equivalence over inner `LetBinding`s, and recursive nested CSE
-/// are deferred — they are the optimisation half of the pass and live
-/// downstream of this PR.
+/// **Scope.** Implements the basic case: identifies sub-trees that
+/// appear verbatim (structural equality via `PartialEq`) in ≥2 root
+/// inputs and hoists them. Schema-equivalent-but-not-identical
+/// sub-trees, alpha-equivalence over inner `LetBinding`s, and recursive
+/// nested CSE are deferred — they are the optimisation half of the pass
+/// and live downstream of this PR.
 ///
 /// **Legality.** A candidate sub-tree is hoisted only when
 /// `cse_reuse_is_legal(&candidate.output_schema(), consumer_count)`
@@ -69,11 +98,15 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
         };
     }
 
-    // Phase F: identify candidate sub-trees that appear as the immediate
-    // child of an `Aggregate` in ≥2 roots. The batched-queries example
-    // shape — multiple `Aggregate`s sharing one `Window`-child producer
-    // — is the case Phase F lights up; richer detection is downstream.
-    let mut candidate_counts: HashMap<String, (QueryExpr, usize)> = HashMap::new();
+    // Identify candidate sub-trees that appear as the immediate child of
+    // an `Aggregate` in ≥2 roots. The batched-queries example shape —
+    // multiple `Aggregate`s sharing one `Window`-child producer — is the
+    // case this lights up; richer detection is downstream. Grouped by
+    // structural equality (`QueryExpr: PartialEq`), not `Debug` output —
+    // `{:?}` is not a guaranteed-injective, stable identity contract. The
+    // candidate set is one entry per distinct root child, so this linear
+    // scan is bounded by the number of distinct queries.
+    let mut candidate_counts: Vec<(QueryExpr, usize)> = Vec::new();
     for (_, root) in &roots {
         if let QueryExpr::Aggregate { child, .. } = root {
             // Skip already-aliased children (a `Ref` is not a candidate
@@ -81,23 +114,22 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
             if matches!(**child, QueryExpr::Ref { .. }) {
                 continue;
             }
-            // Use the Debug representation as a structural-key proxy.
-            // Cheap to compute and matches `PartialEq` for
-            // `QueryExpr` → adequate for the Phase F basic case.
-            let key = format!("{child:?}");
-            let entry = candidate_counts
-                .entry(key)
-                .or_insert_with(|| ((**child).clone(), 0));
-            entry.1 += 1;
+            match candidate_counts
+                .iter_mut()
+                .find(|(e, _)| e == child.as_ref())
+            {
+                Some(entry) => entry.1 += 1,
+                None => candidate_counts.push(((**child).clone(), 1)),
+            }
         }
     }
 
-    // Pick the most-shared legal candidate. Phase F hoists at most one
-    // binding per call; the "hoist all eligible candidates" generalisation
-    // is a follow-up. Choosing the most-shared first matches the design's
-    // priority — biggest reuse first.
+    // Pick the most-shared legal candidate. This pass hoists at most one
+    // binding per call; the "hoist all eligible candidates"
+    // generalisation is a follow-up. Choosing the most-shared first
+    // matches the design's priority — biggest reuse first.
     let mut chosen: Option<(QueryExpr, usize)> = None;
-    for (_key, (expr, count)) in candidate_counts.into_iter() {
+    for (expr, count) in candidate_counts.into_iter() {
         if count < 2 {
             continue;
         }
@@ -109,7 +141,7 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
         if cse_reuse_is_legal(&out_schema, count).is_err() {
             continue;
         }
-        // Bigger fan-in wins; ties broken arbitrarily (HashMap order).
+        // Bigger fan-in wins; ties broken by input order.
         match &chosen {
             Some((_, best_count)) if *best_count >= count => {}
             _ => chosen = Some((expr, count)),
@@ -133,11 +165,13 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
             QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child,
             } if *child == shared_expr => QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child: Box::new(QueryExpr::Ref {
                     name: binding_name.clone(),
@@ -170,27 +204,32 @@ mod tests {
             name: name.into(),
             dtype,
             nullable: false,
+            table: None,
         }
     }
 
     fn ts_scan() -> QueryExpr {
+        let schema = Schema::with_time_index(
+            vec![
+                col("ts", DataType::Timestamp),
+                col("service", DataType::Utf8),
+                col("value", DataType::Float64),
+            ],
+            0,
+            vec![vec![0, 1]],
+        );
+        let lf = LabelFilter {
+            label: "service".into(),
+            equals: "api".into(),
+        };
+        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+            .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "http_request_duration_seconds".into(),
             },
-            label_filters: vec![LabelFilter {
-                label: "service".into(),
-                equals: "api".into(),
-            }],
-            schema: Schema::with_time_index(
-                vec![
-                    col("ts", DataType::Timestamp),
-                    col("service", DataType::Utf8),
-                    col("value", DataType::Float64),
-                ],
-                0,
-                vec![vec![0, 1]],
-            ),
+            predicates: vec![pred],
+            schema,
         }
     }
 
@@ -215,12 +254,13 @@ mod tests {
     #[test]
     fn dedupe_subtrees_single_root_passthrough() {
         let q = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -230,28 +270,60 @@ mod tests {
         assert_eq!(out.roots[0].1, q);
     }
 
+    /// Issue #115 (ASAPController): CSE dedupes on `AggIntent` equality.
+    /// Before `Quantile` carried its input column, `median(a)` and
+    /// `median(b)` compared equal, so two aggregates over *different*
+    /// columns collapsed into one — a wrong answer, not just a missed
+    /// optimisation. The merged `AggIntent::Quantile { col: Option<ColumnId>, .. }`
+    /// already carries the column, so this is a regression guard, not new
+    /// behavior this repo needed to add.
+    #[test]
+    fn quantiles_over_different_columns_do_not_dedupe() {
+        let mk = |col: usize| QueryExpr::Aggregate {
+            by: vec![1].into(),
+            aggs: vec![AggIntent::Quantile {
+                col: Some(col),
+                q: 0.5,
+                accuracy: AccuracyTarget::Epsilon(0.01),
+            }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(windowed_scan()),
+        };
+        let (a, b) = (mk(2), mk(3));
+        assert_ne!(a, b, "distinct-column quantiles must not compare equal");
+
+        let out = dedupe_subtrees(vec![(QueryId::new("q1"), a), (QueryId::new("q2"), b)]);
+        assert_ne!(
+            out.roots[0].1, out.roots[1].1,
+            "aggregates over different columns must not collapse"
+        );
+    }
+
     /// design.md §6 batched-queries example basic case: two queries with
     /// identical `Window` sub-trees — the deduper hoists the shared
     /// producer into a binding and rewrites each root to reference it.
     #[test]
     fn dedupe_subtrees_basic() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![1],
+            by: vec![1].into(),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.95,
                 accuracy: AccuracyTarget::Epsilon(0.01),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
@@ -282,18 +354,19 @@ mod tests {
     #[test]
     fn dedupe_subtrees_no_shared_subexpr() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
         };
-        // q2 uses a different scan (different metric) — Debug repr
-        // differs → no hoisting.
+        // q2 uses a different scan (different metric) → structurally
+        // distinct → no hoisting.
         let other_scan = QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: "different_metric".into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::with_time_index(
                 vec![
                     col("ts", DataType::Timestamp),
@@ -305,8 +378,9 @@ mod tests {
             ),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Max { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(QueryExpr::Window {
                 kind: WindowKind::Sliding,
@@ -323,5 +397,33 @@ mod tests {
         assert!(out.bindings.is_empty(), "no shared subexpr → no binding");
         assert_eq!(out.roots[0].1, q1);
         assert_eq!(out.roots[1].1, q2);
+    }
+
+    /// Schema without `unique_keys` → CSE refuses to share even if
+    /// structurally identical (ASAPController's own regression case for
+    /// the legality gate, ported alongside the algorithm).
+    #[test]
+    fn dedupe_subtrees_no_shared_subexpr_when_unique_keys_absent() {
+        let scan_no_uk = QueryExpr::Scan {
+            source: Source::TimeSeries { metric: "m".into() },
+            predicates: vec![],
+            schema: Schema::with_time_index(
+                vec![
+                    col("ts", DataType::Timestamp),
+                    col("value", DataType::Float64),
+                ],
+                0,
+                vec![],
+            ),
+        };
+        let mk = || QueryExpr::Aggregate {
+            by: vec![].into(),
+            aggs: vec![AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(scan_no_uk.clone()),
+        };
+        let out = dedupe_subtrees(vec![(QueryId::new("q1"), mk()), (QueryId::new("q2"), mk())]);
+        assert!(out.bindings.is_empty(), "no unique_keys → no hoisting");
     }
 }

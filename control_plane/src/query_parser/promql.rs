@@ -35,15 +35,39 @@ use std::time::Duration;
 use anyhow::anyhow;
 use promql_parser::parser::{self, AggregateExpr, Call, Expr, LabelModifier, VectorSelector};
 
-use crate::intent_algebra::relational::{FilterOp, FilterVal, PartitionKeys, Predicate};
+use crate::intent_algebra::relational::{FilterOp, FilterVal, Predicate};
 
 // ── Walk context ──────────────────────────────────────────────────────────────
+
+/// PromQL `by(labels)` / `without(labels)` aggregation modifier, accumulated
+/// as we descend the AST. Control_plane-only walking state — `asap_l2`'s
+/// `relational::QueryExpr::Aggregate` has no separate `Partition` node to
+/// mirror this against (its `keys`/`without` fields live directly on
+/// `Aggregate`, see `intent_algebra::relational`'s module doc), so this
+/// folds straight into the nearest `Aggregate`/`Window` via
+/// [`fold_group_mod`] instead of wrapping a dedicated node.
+#[derive(Clone)]
+enum GroupMod {
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+impl GroupMod {
+    fn keys(&self) -> &[String] {
+        match self {
+            GroupMod::By(k) | GroupMod::Without(k) => k,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.keys().is_empty()
+    }
+}
 
 /// Context accumulated as we descend the AST.
 #[derive(Default, Clone)]
 struct WalkCtx {
     /// GROUP BY / `without` clause from an outer Aggregate node.
-    partition: Option<PartitionKeys>,
+    partition: Option<GroupMod>,
     /// Top-K k from an outer `topk` / `bottomk` operator.
     topk: Option<u64>,
     /// Whether the outer context is a `count()` aggregate (→ CountDistinct).
@@ -159,12 +183,12 @@ fn extract_number_param(param: &Option<Box<Expr>>) -> anyhow::Result<f64> {
     }
 }
 
-// ── Helpers: PartitionKeys from LabelModifier ─────────────────────────────────
+// ── Helpers: GroupMod from LabelModifier ──────────────────────────────────────
 
-fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
+fn modifier_to_partition(modifier: &LabelModifier) -> GroupMod {
     match modifier {
-        LabelModifier::Include(labels) => PartitionKeys::By(labels.labels.clone()),
-        LabelModifier::Exclude(labels) => PartitionKeys::Without(labels.labels.clone()),
+        LabelModifier::Include(labels) => GroupMod::By(labels.labels.clone()),
+        LabelModifier::Exclude(labels) => GroupMod::Without(labels.labels.clone()),
     }
 }
 
@@ -180,9 +204,11 @@ fn modifier_to_partition(modifier: &LabelModifier) -> PartitionKeys {
 // | `a op b` binary          | BinaryOp { VectorMatch }             |
 
 use crate::intent_algebra::relational::{
-    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide,
-    PartitionKeys as QePartitionKeys, QueryExpr, SourceSpec as QeSourceSpec, VectorGrouping,
-    VectorMatch, VectorMatchKind,
+    AggFunc, AggItem, BinaryOpKind, ColumnRef as QeColumnRef, GroupSide, L2SortKey, QueryExpr,
+    SourceSpec as QeSourceSpec, VectorGrouping, VectorMatch, VectorMatchKind,
+};
+use crate::intent_algebra::{
+    is_frequency_heavy_hitter, ArithOp, CompareOp, L2Expr, RankingMeasure,
 };
 use promql_parser::parser::{token::TokenType, BinaryExpr, VectorMatchCardinality};
 
@@ -232,18 +258,18 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
         // HLL-only or CMS-with-heap-only deploy).
         Expr::VectorSelector(vs) => {
             let (name, filters) = extract_vs_info(vs);
-            let source = QueryExpr::Source(QeSourceSpec { name });
+            let source = QueryExpr::Source(QeSourceSpec::new(name));
             let filtered = apply_qe_filters(source, filters);
             if ctx.outer_count || ctx.topk.is_some() {
                 Ok(filtered)
             } else {
                 Ok(QueryExpr::Aggregate {
                     keys: vec![],
+                    without: false,
                     aggs: vec![AggItem {
-                        alias: "value".into(),
+                        alias: Some("value".into()),
                         func: AggFunc::Sum,
                         col: QeColumnRef::SampleValue,
-                        distinct: false,
                     }],
                     having: None,
                     input: Box::new(filtered),
@@ -260,6 +286,21 @@ fn walk_qe(expr: &Expr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     }
 }
 
+/// Whether `expr` (a `topk`/`bottomk` argument) is `count_over_time(...)`,
+/// possibly parenthesized — the one PromQL shape ranked by
+/// `RankingMeasure::Frequency`, the only measure with a realised
+/// heavy-hitter sketch today (`agg_intent::is_frequency_heavy_hitter`).
+/// A bare `count(...)` doesn't qualify: it's a *cross-series* reduction
+/// (one value, not per-series), so ranking by it isn't a per-series
+/// heavy-hitter shape in the first place.
+fn is_count_over_time(expr: &Expr) -> bool {
+    match expr {
+        Expr::Paren(p) => is_count_over_time(p.expr.as_ref()),
+        Expr::Call(c) => c.func.name == "count_over_time",
+        _ => false,
+    }
+}
+
 fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
     let partition = agg.modifier.as_ref().map(modifier_to_partition);
     let op_name = format!("{}", agg.op);
@@ -267,21 +308,71 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
     match op_name.as_str() {
         "topk" | "bottomk" => {
             let k = extract_number_param(&agg.param)? as u64;
+            let descending = op_name == "topk";
+            // A ranking is the heavy-hitter `TopK` intent only when it
+            // takes the *top* k (`descending` — `bottomk` never
+            // qualifies) *and* ranks by a measure with a realised
+            // heavy-hitter sketch — today, unweighted frequency
+            // (`count_over_time(...)`) only. Every other measure
+            // (avg/quantile/rate/a bare selector/...) is
+            // `RankingMeasure::NonAdditive` and falls through to a
+            // generic `Sort + Limit` order-by-value below — matching
+            // ASAPController's `frontend-promql` design (issue #38: "the
+            // descending-plus-measure rule is shared with the L3
+            // canonicalize promotion so the two cannot drift"). Before
+            // this, `topk(k, <anything>)` unconditionally forced a
+            // `Count`-shaped inner regardless of what was actually being
+            // ranked — silently wrong for `topk(k, avg_over_time(...))`
+            // and friends.
+            let measure = if is_count_over_time(agg.expr.as_ref()) {
+                RankingMeasure::Frequency
+            } else {
+                RankingMeasure::NonAdditive
+            };
+            if is_frequency_heavy_hitter(descending, measure) {
+                let inner_ctx = WalkCtx {
+                    partition: partition.clone(),
+                    topk: Some(k),
+                    outer_count: false,
+                };
+                let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
+                // Don't fold the group keys into a separate wrapper here —
+                // the inner Aggregate already has them (or will, once its
+                // own construction site folds `partition` in).
+                return Ok(QueryExpr::TopK {
+                    k,
+                    by: partition
+                        .as_ref()
+                        .map(|p| p.keys().iter().cloned().map(QeColumnRef::Named).collect())
+                        .unwrap_or_default(),
+                    input: Box::new(inner),
+                });
+            }
+            // Generic order-by-value + limit: `bottomk`, and any `topk`
+            // ranking by a non-count measure. `ctx.topk` stays `None` so
+            // `build_qe_aggregate` doesn't force a `Count`-shaped inner.
             let inner_ctx = WalkCtx {
                 partition: partition.clone(),
-                topk: Some(k),
+                topk: None,
                 outer_count: false,
             };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
-            // Don't wrap with Partition here — inner Aggregate already has the keys,
-            // and the lowering pass will create the Partition when it lowers the Aggregate.
-            let result = QueryExpr::TopK {
-                k,
-                by: partition
+            let sorted = QueryExpr::Sort {
+                keys: vec![L2SortKey {
+                    expr: L2Expr::Column(QeColumnRef::SampleValue),
+                    ascending: !descending,
+                    nulls_first: false,
+                }],
+                partition_by: partition
                     .as_ref()
-                    .map(|p| p.keys().to_vec())
+                    .map(|p| p.keys().iter().cloned().map(QeColumnRef::Named).collect())
                     .unwrap_or_default(),
                 input: Box::new(inner),
+            };
+            let result = QueryExpr::Limit {
+                n: k,
+                offset: 0,
+                input: Box::new(sorted),
             };
             Ok(result)
         }
@@ -294,16 +385,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "count".into(),
+                    alias: Some("count".into()),
                     func: AggFunc::CountDistinct,
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "sum" | "avg" | "min" | "max" | "group" => {
             let inner_ctx = WalkCtx {
@@ -312,7 +403,7 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
                 outer_count: false,
             };
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
-            Ok(apply_qe_partition(inner, partition))
+            Ok(fold_group_mod(inner, partition.as_ref()))
         }
         "stddev" => {
             let inner_ctx = WalkCtx {
@@ -323,16 +414,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "stddev".into(),
+                    alias: Some("stddev".into()),
                     func: AggFunc::StdDev { population: false },
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "stdvar" => {
             let inner_ctx = WalkCtx {
@@ -343,16 +434,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "stdvar".into(),
+                    alias: Some("stdvar".into()),
                     func: AggFunc::Variance { population: false },
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         "quantile" => {
             let phi = extract_number_param(&agg.param)?;
@@ -364,16 +455,16 @@ fn walk_aggregate_qe(agg: &AggregateExpr, ctx: WalkCtx) -> anyhow::Result<QueryE
             let inner = walk_qe(agg.expr.as_ref(), inner_ctx)?;
             let result = QueryExpr::Aggregate {
                 keys: vec![],
+                without: false,
                 aggs: vec![AggItem {
-                    alias: "quantile".into(),
+                    alias: Some("quantile".into()),
                     func: AggFunc::Quantile(phi),
                     col: QeColumnRef::SampleValue,
-                    distinct: false,
                 }],
                 having: None,
                 input: Box::new(inner),
             };
-            Ok(apply_qe_partition(result, partition))
+            Ok(fold_group_mod(result, partition.as_ref()))
         }
         other => Err(anyhow!("unsupported PromQL aggregate operator: {other}")),
     }
@@ -417,8 +508,17 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             let func = AggFunc::Quantile(phi);
             Ok(build_qe_aggregate(source, filters, window, func, ctx))
         }
+        // `predict_linear(v[w], t)` — `t` (seconds into the future) is a
+        // scalar 2nd argument, so it doesn't fit `walk_call_to_op`'s
+        // `(call, ctx, window)` shape; special-cased here like
+        // `quantile_over_time`'s φ argument above.
+        "predict_linear" => {
+            let seconds = extract_call_num_arg(call, 1)?;
+            let (source, filters, window) = extract_matrix_arg(call, 0)?;
+            let func = AggFunc::PredictLinear { seconds };
+            Ok(build_qe_aggregate(source, filters, window, func, ctx))
+        }
         _ => {
-            let func = walk_call_to_op(call, &ctx)?;
             let (source, filters, window) = if call.func.name == "rate"
                 || call.func.name == "irate"
                 || call.func.name == "increase"
@@ -433,6 +533,7 @@ fn walk_call_qe(call: &Call, ctx: WalkCtx) -> anyhow::Result<QueryExpr> {
             } else {
                 extract_matrix_arg(call, 0)?
             };
+            let func = walk_call_to_op(call, &ctx, window)?;
             Ok(build_qe_aggregate(source, filters, window, func, ctx))
         }
     }
@@ -481,28 +582,37 @@ fn promql_token_to_binop(tok: TokenType) -> BinaryOpKind {
     // token::T_* are u8 constants; TokenType wraps them as TokenType(u8).
     let id = tok.id();
     match id {
-        token::T_ADD => BinaryOpKind::Add,
-        token::T_SUB => BinaryOpKind::Sub,
-        token::T_MUL => BinaryOpKind::Mul,
-        token::T_DIV => BinaryOpKind::Div,
-        token::T_MOD => BinaryOpKind::Mod,
+        token::T_ADD => BinaryOpKind::Arith(ArithOp::Add),
+        token::T_SUB => BinaryOpKind::Arith(ArithOp::Sub),
+        token::T_MUL => BinaryOpKind::Arith(ArithOp::Mul),
+        token::T_DIV => BinaryOpKind::Arith(ArithOp::Div),
+        token::T_MOD => BinaryOpKind::Arith(ArithOp::Mod),
         token::T_POW => BinaryOpKind::Pow,
-        token::T_EQLC => BinaryOpKind::Eq,
-        token::T_NEQ => BinaryOpKind::Ne,
-        token::T_LSS => BinaryOpKind::Lt,
-        token::T_LTE => BinaryOpKind::Le,
-        token::T_GTR => BinaryOpKind::Gt,
-        token::T_GTE => BinaryOpKind::Ge,
+        token::T_EQLC => BinaryOpKind::Compare(CompareOp::Eq),
+        token::T_NEQ => BinaryOpKind::Compare(CompareOp::Ne),
+        token::T_LSS => BinaryOpKind::Compare(CompareOp::Lt),
+        token::T_LTE => BinaryOpKind::Compare(CompareOp::Le),
+        token::T_GTR => BinaryOpKind::Compare(CompareOp::Gt),
+        token::T_GTE => BinaryOpKind::Compare(CompareOp::Ge),
         token::T_LAND => BinaryOpKind::And,
         token::T_LOR => BinaryOpKind::Or,
         token::T_LUNLESS => BinaryOpKind::Unless,
         token::T_ATAN2 => BinaryOpKind::Atan2,
-        _ => BinaryOpKind::Add, // unknown — default to add
+        _ => BinaryOpKind::Arith(ArithOp::Add), // unknown — default to add
     }
 }
 
 /// Map a PromQL function call to an [`AggFunc`] (Layer 2 relational operator).
-fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
+/// `window` is the range-vector's duration — only `Rate`/`Increase` carry it
+/// on the `AggFunc` itself (`asap_l2`'s design: "no separate Window node").
+/// Every other function still relies on the caller wrapping its `Aggregate`
+/// in an `L2::Window`.
+///
+/// `predict_linear` is handled separately in `walk_call_qe` (its 2nd,
+/// scalar argument doesn't fit this function's `(call, ctx, window)`
+/// shape, matching how `quantile_over_time`/`histogram_quantile`'s φ
+/// argument is already special-cased there).
+fn walk_call_to_op(call: &Call, ctx: &WalkCtx, window: Duration) -> anyhow::Result<AggFunc> {
     let name = call.func.name;
     match name {
         "quantile_over_time" => {
@@ -515,34 +625,78 @@ fn walk_call_to_op(call: &Call, ctx: &WalkCtx) -> anyhow::Result<AggFunc> {
         "stddev_over_time" => Ok(AggFunc::StdDev { population: false }),
         "stdvar_over_time" => Ok(AggFunc::Variance { population: false }),
         "count_over_time" => {
-            // Three cases, in priority order:
+            // Two cases, in priority order:
             //  * Inside `count by (...) (count_over_time(...))` →
             //    `CountDistinct` (HLL distinct counting; the outer
             //    count of inner counts is cardinality).
-            //  * Inside `topk(N, count_over_time(...))` → `Count`
-            //    (the topk wrapper expects a count-shaped inner).
-            //  * Otherwise → `Frequency` (per-series sample-count
-            //    estimation; routes to CMS / CountSketch via the
-            //    `AggFunc::Frequency → default_frequency()` lowering).
-            //    This was previously `AggFunc::Count` which the
-            //    un-grouped lowering branch pinned to
-            //    `AggIntent::Count{Exact}` → unsupported by ASAP.
+            //  * Otherwise → plain `Count`, still windowed here — the
+            //    `lower.rs::agg_func_to_intents` grouped-or-windowed
+            //    substitution recognizes the windowed shape and routes
+            //    to CMS / CountSketch (per-series sample-count
+            //    estimation), matching the pre-`asap_l2` behavior this
+            //    used to reach via a dedicated `AggFunc::Frequency`
+            //    variant that no longer exists. `topk(N, count_over_time
+            //    (...))`'s heavy-hitter fusion is handled entirely in
+            //    `walk_aggregate_qe`'s `topk`/`bottomk` arm now (it no
+            //    longer forces `Count` here via `ctx.topk`).
             Ok(if ctx.outer_count {
                 AggFunc::CountDistinct
-            } else if ctx.topk.is_some() {
-                AggFunc::Count
             } else {
-                AggFunc::Frequency
+                AggFunc::Count
             })
         }
-        "sum_over_time" | "last_over_time" | "present_over_time" | "absent_over_time" => {
-            Ok(AggFunc::Sum)
-        }
-        "delta" | "idelta" | "deriv" | "predict_linear" => Ok(AggFunc::Delta),
-        "changes" | "resets" => Ok(AggFunc::Count),
-        "rate" | "irate" => Ok(AggFunc::Rate),
-        "increase" => Ok(AggFunc::Increase),
+        "sum_over_time" => Ok(AggFunc::Sum),
+        "last_over_time" => Ok(AggFunc::LastOverTime),
+        "present_over_time" => Ok(AggFunc::PresentOverTime),
+        "absent_over_time" => Ok(AggFunc::AbsentOverTime),
+        // Each of these used to collapse onto `Delta` (delta/idelta/deriv)
+        // or `Count` (changes/resets) — a crude placeholder bucketing from
+        // before `asap_l2` gave every one of them its own dedicated
+        // `AggFunc`/`AggIntent`. All are archive-only (no ASAP-tier
+        // Bind* rule exists for any of them, same as before this fix) —
+        // the correctness gain is `capability_for` now correctly
+        // returning `None` (route to archive) instead of the wrong
+        // `Some(ExactAgg(Sum))` / `Some(CardinalityApprox))` these used
+        // to produce, which claimed the ASAP tier could answer a
+        // `deriv()`/`changes()` query it structurally cannot.
+        "delta" => Ok(AggFunc::Delta),
+        "idelta" => Ok(AggFunc::IDelta),
+        "deriv" => Ok(AggFunc::Deriv),
+        "changes" => Ok(AggFunc::Changes),
+        "resets" => Ok(AggFunc::Resets),
+        // `Rate`/`Increase` now map onto their own dedicated `AggIntent`s
+        // in `lower.rs` (`capability_for` already has a real, tested
+        // `Rate | Increase => ExactAgg(Increase)` arm — this activates
+        // it for the first time via the PromQL path; previously
+        // collapsed onto `AggIntent::Sum`, which happened to route to
+        // the same *kind* of exact-precompute capability but under the
+        // wrong classification).
+        "rate" | "irate" => Ok(AggFunc::Rate { window }),
+        "increase" => Ok(AggFunc::Increase { window }),
         other => Err(anyhow!("unsupported PromQL function: {other}")),
+    }
+}
+
+/// Short lowercase label for an `AggFunc`, used as the `AggItem` alias.
+/// `AggFunc` is foreign (from `asap_l2`) — Rust's orphan rules forbid
+/// implementing `Display` for it here, unlike this repo's pre-merge own
+/// `AggFunc`, which had one.
+fn agg_func_label(f: &AggFunc) -> String {
+    match f {
+        AggFunc::Count => "count".into(),
+        AggFunc::Sum => "sum".into(),
+        AggFunc::Avg => "avg".into(),
+        AggFunc::Min => "min".into(),
+        AggFunc::Max => "max".into(),
+        AggFunc::StdDev { .. } => "stddev".into(),
+        AggFunc::Variance { .. } => "variance".into(),
+        AggFunc::Quantile(_) => "quantile".into(),
+        AggFunc::CountDistinct => "count_distinct".into(),
+        AggFunc::HeavyHitters { .. } => "heavy_hitters".into(),
+        AggFunc::Rate { .. } => "rate".into(),
+        AggFunc::Increase { .. } => "increase".into(),
+        AggFunc::Delta => "delta".into(),
+        other => format!("{other:?}").to_lowercase(),
     }
 }
 
@@ -554,7 +708,7 @@ fn build_qe_aggregate(
     func: AggFunc,
     ctx: WalkCtx,
 ) -> QueryExpr {
-    let source = QueryExpr::Source(QeSourceSpec { name: metric });
+    let source = QueryExpr::Source(QeSourceSpec::new(metric));
     let filtered = apply_qe_filters(source, filters);
     let windowed = QueryExpr::Window {
         duration: window,
@@ -567,133 +721,155 @@ fn build_qe_aggregate(
     } else {
         func
     };
-    // Propagate partition keys into the Aggregate's GROUP BY so the lowering
-    // pass sees Count-with-GROUP-BY → Frequency (not bare Count → no sketch).
-    let group_keys: Vec<String> = ctx
-        .partition
-        .as_ref()
-        .map(|p| p.keys().to_vec())
-        .unwrap_or_default();
-    let alias = format!("{}", actual_func).to_lowercase();
-    let agg = QueryExpr::Aggregate {
-        keys: group_keys,
+    // Propagate partition keys into the Aggregate's GROUP BY so
+    // `lower.rs`'s `agg_func_to_intents` sees a grouped `Count` → the
+    // `Frequency` sketch trigger (not a bare, exact `Count`).
+    let (group_keys, without): (Vec<String>, bool) = match &ctx.partition {
+        Some(GroupMod::By(k)) => (k.clone(), false),
+        Some(GroupMod::Without(k)) => (k.clone(), true),
+        None => (Vec::new(), false),
+    };
+    let alias = agg_func_label(&actual_func);
+    QueryExpr::Aggregate {
+        keys: group_keys.into_iter().map(QeColumnRef::Named).collect(),
+        without,
         aggs: vec![AggItem {
-            alias,
+            alias: Some(alias),
             func: actual_func,
             col: QeColumnRef::SampleValue,
-            distinct: false,
         }],
         having: None,
         input: Box::new(windowed),
-    };
-    // Don't wrap with Partition separately — keys are already in the Aggregate.
-    // The lowering pass will create the Partition node when it lowers the Aggregate.
-    agg
+    }
 }
 
 fn apply_qe_filters(input: QueryExpr, filters: Vec<Predicate>) -> QueryExpr {
     if filters.is_empty() {
-        input
+        return input;
+    }
+    use crate::intent_algebra::{L2Expr, L3Scalar};
+
+    let conjuncts: Vec<L2Expr> = filters
+        .iter()
+        .map(|p| {
+            let col = L2Expr::Column(QeColumnRef::Named(p.col.clone()));
+            let val = |v: &FilterVal| match v {
+                FilterVal::Str(s) => L2Expr::Literal(L3Scalar::Utf8(s.clone())),
+                FilterVal::Num(n) => L2Expr::Literal(L3Scalar::Float64(*n)),
+                FilterVal::Int(i) => L2Expr::Literal(L3Scalar::Int64(*i)),
+                FilterVal::Null => L2Expr::Literal(L3Scalar::Null),
+            };
+            match &p.op {
+                FilterOp::Eq => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Eq,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Ne => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Ne,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Lt => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Lt,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Le => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Le,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Gt => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Gt,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Ge => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Ge,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::Regex(r) => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Regex,
+                    right: Box::new(L2Expr::Literal(L3Scalar::Utf8(r.clone()))),
+                },
+                FilterOp::NotRegex(r) => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::NotRegex,
+                    right: Box::new(L2Expr::Literal(L3Scalar::Utf8(r.clone()))),
+                },
+                FilterOp::Like => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::Like,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::NotLike => L2Expr::Compare {
+                    left: Box::new(col),
+                    op: CompareOp::NotLike,
+                    right: Box::new(val(&p.val)),
+                },
+                FilterOp::IsNull => L2Expr::IsNull(Box::new(col)),
+                FilterOp::IsNotNull => L2Expr::IsNotNull(Box::new(col)),
+            }
+        })
+        .collect();
+    let pred = if conjuncts.len() == 1 {
+        conjuncts.into_iter().next().unwrap()
     } else {
-        use crate::intent_algebra::relational::{BinaryOpKind, LiteralValue, ScalarExpr};
-        let pred = filters
-            .iter()
-            .fold(ScalarExpr::Literal(LiteralValue::Bool(true)), |acc, p| {
-                let col = ScalarExpr::Column(p.col.clone());
-                let val = match &p.val {
-                    FilterVal::Str(s) => ScalarExpr::Literal(LiteralValue::Str(s.clone())),
-                    FilterVal::Num(n) => ScalarExpr::Literal(LiteralValue::Float(*n)),
-                    FilterVal::Int(i) => ScalarExpr::Literal(LiteralValue::Int(*i)),
-                    FilterVal::Null => ScalarExpr::Literal(LiteralValue::Null),
-                };
-                let this = match &p.op {
-                    FilterOp::Eq => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Eq,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Ne => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Ne,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Lt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Lt,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Le => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Le,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Gt => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Gt,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Ge => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Ge,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::Regex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Regex,
-                        lhs: Box::new(col),
-                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
-                    },
-                    FilterOp::NotRegex(r) => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::NotRegex,
-                        lhs: Box::new(col),
-                        rhs: Box::new(ScalarExpr::Literal(LiteralValue::Str(r.clone()))),
-                    },
-                    FilterOp::Like => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::Like,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::NotLike => ScalarExpr::BinaryOp {
-                        op: BinaryOpKind::NotLike,
-                        lhs: Box::new(col),
-                        rhs: Box::new(val),
-                    },
-                    FilterOp::IsNull => ScalarExpr::IsNull {
-                        expr: Box::new(col),
-                        negated: false,
-                    },
-                    FilterOp::IsNotNull => ScalarExpr::IsNull {
-                        expr: Box::new(col),
-                        negated: true,
-                    },
-                };
-                ScalarExpr::BinaryOp {
-                    op: BinaryOpKind::And,
-                    lhs: Box::new(acc),
-                    rhs: Box::new(this),
-                }
-            });
-        QueryExpr::Filter {
-            pred,
-            input: Box::new(input),
-        }
+        L2Expr::BoolAnd(conjuncts)
+    };
+    QueryExpr::Filter {
+        pred,
+        input: Box::new(input),
     }
 }
 
-fn apply_qe_partition(input: QueryExpr, partition: Option<PartitionKeys>) -> QueryExpr {
-    match partition {
-        None => input,
-        Some(p) if p.is_empty() => input,
-        Some(keys) => {
-            // Convert PromQL by/without → PartitionKeys.
-            let qe_keys = match keys {
-                PartitionKeys::By(k) => QePartitionKeys::By(k),
-                PartitionKeys::Without(k) => QePartitionKeys::Without(k),
-            };
-            QueryExpr::Partition {
-                keys: qe_keys,
-                input: Box::new(input),
-            }
-        }
+/// Fold `group` into the nearest `Aggregate` inside `qe` — `asap_l2`'s
+/// `Aggregate` carries `keys`/`without` directly (no separate `Partition`
+/// node to wrap in; see `intent_algebra::relational`'s module doc).
+/// Mirrors `lower.rs`'s `fold_partition_keys`, one layer up (L2, not L3):
+/// handles the shapes the walker actually produces (a bare `Aggregate` or
+/// a `Window` wrapping one); anything else (`BinaryOp`, a bare `Source`)
+/// has no `Aggregate` to fold into and passes through unchanged — e.g.
+/// `sum by (host) (a or b)`, where the group modifier belongs to a
+/// `BinaryOp` composition, not a reducing aggregate.
+fn fold_group_mod(qe: QueryExpr, group: Option<&GroupMod>) -> QueryExpr {
+    let Some(group) = group else {
+        return qe;
+    };
+    if group.is_empty() {
+        return qe;
+    }
+    match qe {
+        QueryExpr::Aggregate {
+            aggs,
+            having,
+            input,
+            ..
+        } => QueryExpr::Aggregate {
+            keys: group
+                .keys()
+                .iter()
+                .cloned()
+                .map(QeColumnRef::Named)
+                .collect(),
+            without: matches!(group, GroupMod::Without(_)),
+            aggs,
+            having,
+            input,
+        },
+        QueryExpr::Window {
+            duration,
+            slide,
+            input,
+        } => QueryExpr::Window {
+            duration,
+            slide,
+            input: Box::new(fold_group_mod(*input, Some(group))),
+        },
+        other => other,
     }
 }
 
@@ -786,10 +962,17 @@ mod tests {
     // ── avg_over_time ─────────────────────────────────────────────────────────
 
     #[test]
-    fn avg_over_time_maps_to_p50() {
+    fn avg_over_time_is_exact() {
+        // `AggIntent::Avg` has no ASAP-tier sketch substitute
+        // (`capability_for` returns `None` — needs a cross-policy
+        // Sum+Count join) and ASAPController's own `asap-plan` treats it
+        // the same way (`pass_through_intents_stay_logical`), so `avg`
+        // routes through the exact/archive path like `Sum`/`Count`,
+        // not the p50-quantile-sketch approximation this used to be.
         let pq = pq("avg by (symbol) (avg_over_time(financial_last_trade_price[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
-        assert_eq!(pq.quantiles, vec![0.5]);
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.quantiles.is_empty());
+        assert!(pq.exact_required);
     }
 
     // ── min/max_over_time ─────────────────────────────────────────────────────
@@ -819,8 +1002,82 @@ mod tests {
 
     #[test]
     fn topk_avg_over_time() {
+        // `topk` ranking by a non-count measure (`avg_over_time`, here)
+        // is not a heavy-hitter shape — `RankingMeasure::NonAdditive`,
+        // per `agg_intent::is_frequency_heavy_hitter` — so this becomes
+        // a generic `Sort + Limit` over `avg_over_time`'s own exact
+        // `Aggregate{Avg}`, not a forced `Count`/`Frequency` aggregate.
+        // Before the topk/rate precision fix this incorrectly asserted
+        // `[Frequency]`; `avg_over_time` itself is exact (see
+        // `avg_over_time_is_exact`), not a p50 quantile-sketch anymore.
         let pq = pq("topk by (host) (5, avg_over_time(cpu[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Frequency]);
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.exact_required);
+    }
+
+    #[test]
+    fn topk_avg_over_time_is_sort_limit_not_topk_node() {
+        // Structural check backing `topk_avg_over_time` above: the tree
+        // must be `Limit { Sort { Aggregate{Quantile} } }`, not
+        // `QueryExpr::TopK` — confirms the non-heavy-hitter path is
+        // really taken, not just that the flattened `ParsedQuery`
+        // happens to read the same.
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("topk by (host) (5, avg_over_time(cpu[5m]))")
+            .expect("parse should succeed");
+        match &qe {
+            QueryExpr::Limit { n, input, .. } => {
+                assert_eq!(*n, 5);
+                assert!(
+                    matches!(input.as_ref(), QueryExpr::Sort { .. }),
+                    "expected Sort under Limit, got {input:?}"
+                );
+            }
+            other => panic!("expected Limit{{Sort{{...}}}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bottomk_count_over_time_is_never_heavy_hitter() {
+        // `bottomk` never qualifies as the heavy-hitter `TopK` intent
+        // even when ranking by `count_over_time` — `descending` must
+        // also hold (`is_frequency_heavy_hitter`), and `bottomk` is
+        // ascending by definition. Must still lower to `Limit{Sort{...}}`.
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("bottomk(5, count_over_time(http_requests_total[5m]))")
+            .expect("parse should succeed");
+        assert!(
+            !matches!(qe, QueryExpr::TopK { .. }),
+            "bottomk must never produce the heavy-hitter TopK node, got {qe:?}"
+        );
+        match &qe {
+            QueryExpr::Limit { n, input, .. } => {
+                assert_eq!(*n, 5);
+                match input.as_ref() {
+                    QueryExpr::Sort { keys, .. } => {
+                        assert!(keys[0].ascending, "bottomk must sort ascending");
+                    }
+                    other => panic!("expected Sort under Limit, got {other:?}"),
+                }
+            }
+            other => panic!("expected Limit{{Sort{{...}}}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topk_count_over_time_is_topk_node() {
+        // The one real heavy-hitter shape: `topk` (descending) ranking
+        // by `count_over_time` (`RankingMeasure::Frequency`).
+        use crate::intent_algebra::relational::QueryExpr;
+
+        let qe = super::parse_promql_expr("topk(5, count_over_time(http_requests_total[5m]))")
+            .expect("parse should succeed");
+        assert!(
+            matches!(qe, QueryExpr::TopK { k: 5, .. }),
+            "expected QueryExpr::TopK{{k: 5, ..}}, got {qe:?}"
+        );
     }
 
     // ── count cardinality ─────────────────────────────────────────────────────
@@ -834,10 +1091,15 @@ mod tests {
     // ── stddev_over_time ──────────────────────────────────────────────────────
 
     #[test]
-    fn stddev_over_time_iqr_proxy() {
+    fn stddev_over_time_is_exact() {
+        // `AggIntent::StdDev` has no ASAP-tier sketch substitute
+        // (`capability_for` returns `None`, same as `Avg`), so
+        // `stddev_over_time` routes exact -- no more IQR-proxy
+        // `[q(0.25), q(0.75)]` approximation.
         let pq = pq("avg by (host) (stddev_over_time(cpu[5m]))");
-        assert_eq!(pq.aggregations, vec![AggType::Quantile]);
-        assert!(pq.quantiles.contains(&0.25) && pq.quantiles.contains(&0.75));
+        assert_eq!(pq.aggregations, Vec::<AggType>::new());
+        assert!(pq.quantiles.is_empty());
+        assert!(pq.exact_required);
     }
 
     // ── sum_over_time → exact ─────────────────────────────────────────────────

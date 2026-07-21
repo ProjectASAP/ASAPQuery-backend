@@ -151,7 +151,7 @@ mod tests {
 
     fn dummy_logical() -> PhysicalExpr {
         PhysicalExpr::Logical(QueryExpr::Ref {
-            name: crate::types_v2::BindingName::new("dummy"),
+            name: asap_ir::intent_algebra::BindingName::new("dummy"),
         })
     }
 

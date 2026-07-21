@@ -23,7 +23,8 @@
 use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{ColumnRef, QueryExpr};
+use crate::intent_algebra::query_expr::QueryExpr;
+use crate::intent_algebra::schema::ColumnId;
 use crate::physical::sketch_catalog;
 use crate::physical::window_fusion::{fused_sketch_decision, recognize_windowed_sketch};
 use crate::types::{SketchParams, SketchType};
@@ -293,6 +294,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             aggs,
             having,
             child,
+            ..
         } => {
             if aggs.len() == 1 && having.is_none() {
                 if let AggIntent::TopK { k, .. } = &aggs[0] {
@@ -345,21 +347,13 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             node
         }
 
-        // ── Partition / Merge: Backend stage ────────────────────────
-        QueryExpr::Partition { keys, child } => {
-            let child = plan_node(child, config);
-            let mut node = PhysicalNode {
-                op: PhysicalOp::HashAggregate {
-                    keys: keys.keys().to_vec(),
-                },
-                placement: Placement::BackendCollector,
-                cost: PhysicalCost::default(),
-                children: vec![child],
-            };
-            insert_exchange_if_needed(&mut node);
-            node
-        }
-
+        // ── Merge: Backend stage ─────────────────────────────────────
+        //
+        // `Partition` no longer exists in the canonical IR — its keys
+        // fold into `Aggregate.by` at construction time
+        // (`intent_algebra::lower`), so the `HashAggregate { keys }` this
+        // arm used to build now comes straight out of the `Aggregate`
+        // arm above.
         QueryExpr::Merge { children } => {
             let children: Vec<PhysicalNode> =
                 children.iter().map(|c| plan_node(c, config)).collect();
@@ -445,6 +439,35 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
 
         // ── LetBinding ──────────────────────────────────────────────
         QueryExpr::LetBinding { child, .. } => plan_node(child, config),
+
+        // The PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
+        // WindowFunc) isn't constructed by this parser today. `Scalar` /
+        // `EvalTime` are leaves; every other new variant wraps exactly
+        // one child — inherit its placement, mirroring the Sort/Limit/
+        // Project arm above, until a dedicated physical op is written.
+        QueryExpr::Scalar(_) | QueryExpr::EvalTime => PhysicalNode {
+            op: PhysicalOp::Passthrough,
+            placement: Placement::QueryEngine,
+            cost: PhysicalCost::default(),
+            children: vec![],
+        },
+        QueryExpr::VectorFromScalar(child)
+        | QueryExpr::ScalarFromVector(child)
+        | QueryExpr::Relabel { child, .. }
+        | QueryExpr::InfoJoin { child, .. }
+        | QueryExpr::Sample { child, .. }
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::WindowFunc { child, .. } => {
+            let child = plan_node(child, config);
+            PhysicalNode {
+                op: PhysicalOp::Passthrough,
+                placement: child.placement.clone(),
+                cost: PhysicalCost::default(),
+                children: vec![child],
+            }
+        }
     }
 }
 
@@ -476,17 +499,15 @@ pub(crate) fn decide_sketch_placement(
 
 /// Render a `Distinct { cols }` column tuple into a human-readable display
 /// string for the `Filter { pred }` rationale. `Distinct { cols: [] }` is
-/// whole-row SQL DISTINCT and prints as `*`.
-fn display_distinct_cols(cols: &[ColumnRef]) -> String {
+/// whole-row SQL DISTINCT and prints as `*`. Canonical `cols` are
+/// positional `ColumnId`s (no name at this layer — `plan_node` has no
+/// schema in scope to resolve one), so each renders as `col#<id>`.
+fn display_distinct_cols(cols: &[ColumnId]) -> String {
     if cols.is_empty() {
         return "*".into();
     }
     cols.iter()
-        .map(|c| match c {
-            ColumnRef::Named(s) => s.clone(),
-            ColumnRef::SampleValue => "@value".into(),
-            ColumnRef::Wildcard => "*".into(),
-        })
+        .map(|id| format!("col#{id}"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -583,7 +604,7 @@ mod tests {
             source: Source::TimeSeries {
                 metric: name.into(),
             },
-            label_filters: vec![],
+            predicates: vec![],
             schema: Schema::default(),
         }
     }
@@ -592,8 +613,9 @@ mod tests {
     /// canonical fold of the legacy `SketchAgg`.
     fn sketch_agg(intent: AggIntent, metric: &str) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![intent],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(scan(metric)),
         }
@@ -673,11 +695,12 @@ mod tests {
     #[test]
     fn plan_topk_at_query_engine() {
         let expr = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(sketch_agg(default_frequency(), "m")),
         };
@@ -691,11 +714,12 @@ mod tests {
         // TopK(QueryEngine) wrapping a sketch Aggregate(Agent) → Exchange
         // between them.
         let expr = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::TopK {
                 k: 5,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(sketch_agg(default_frequency(), "m")),
         };
@@ -706,23 +730,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn plan_partition_at_backend() {
-        let expr = QueryExpr::Partition {
-            keys: crate::intent_algebra::PartitionKeys::By(vec!["region".into()]),
-            child: Box::new(sketch_agg(default_cardinality(), "m")),
-        };
-        let node = plan(&expr, &default_config());
-        assert_eq!(node.placement, Placement::BackendCollector);
-    }
+    // `plan_partition_at_backend` (a standalone `Partition` node always
+    // placing at `BackendCollector`) is removed: `Partition` no longer
+    // exists in the canonical IR — its keys fold into `Aggregate.by` at
+    // construction time (`intent_algebra::lower`), and a grouped
+    // single-intent `Aggregate` goes through the same budget-driven
+    // Agent→Backend→Precompute path as an ungrouped one (`by` isn't a
+    // placement input), so there is no direct equivalent assertion to
+    // make here.
 
     #[test]
     fn plan_multi_intent_aggregate_at_query_engine() {
         // Multi-intent Aggregate → exact HashAggregate at QueryEngine
         // (no single sketch serves multiple intents).
         let expr = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
+            output_names: Vec::new(),
             having: None,
             child: Box::new(scan("trades")),
         };
@@ -733,18 +757,20 @@ mod tests {
 
     #[test]
     fn plan_full_pipeline_has_multiple_stages() {
-        // TopK(Partition(Window(Aggregate(Scan))))
+        // TopK(Merge(Window(Aggregate(Scan)))) — `windowed_agg` fuses to
+        // Agent, `Merge` (the `Frequency` intent's sketch fan-in) sits at
+        // Backend, and the outer `TopK` intent runs at QueryEngine.
         // Should span: Agent → Backend → QueryEngine
         let expr = QueryExpr::Aggregate {
-            by: vec![],
+            by: vec![].into(),
             aggs: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],
+            output_names: Vec::new(),
             having: None,
-            child: Box::new(QueryExpr::Partition {
-                keys: crate::intent_algebra::PartitionKeys::By(vec!["svc".into()]),
-                child: Box::new(windowed_agg(default_frequency(), 60, "requests")),
+            child: Box::new(QueryExpr::Merge {
+                children: vec![windowed_agg(default_frequency(), 60, "requests")],
             }),
         };
         let node = plan(&expr, &default_config());
@@ -761,9 +787,19 @@ mod tests {
             placements.contains(&Placement::QueryEngine),
             "should have QueryEngine: {placements:?}"
         );
+        // Was `>= 2` when `Merge`'s child used to be a `Partition` node
+        // (which called `insert_exchange_if_needed` itself, contributing
+        // a second exchange on top of the outer TopK Aggregate's own).
+        // `Merge` doesn't call `insert_exchange_if_needed` on its
+        // children — it accepts heterogeneously-placed children by
+        // design (see its arm above) — so with `Partition` gone (its
+        // keys fold into `Aggregate.by` at construction time) this shape
+        // now has exactly one exchange-inserting boundary: the outer
+        // TopK Aggregate against its `Merge` child. The 3-stage span
+        // above is still the real invariant this test protects.
         assert!(
-            node.exchange_count() >= 2,
-            "should have ≥2 exchanges: {}",
+            node.exchange_count() >= 1,
+            "should have >=1 exchange: {}",
             node.exchange_count()
         );
     }

@@ -41,10 +41,13 @@
 //!   may share a `LetBinding` only when the producer's output schema
 //!   has at least one `unique_keys` set. This is the proof point that
 //!   `unique_keys` is load-bearing.
-//! - [`dedupe_subtrees`] — basic workload-level CSE pass that hoists
+//! - `dedupe_subtrees` — the basic workload-level CSE pass that hoists
 //!   structurally-identical sub-trees into shared `LetBinding`s
-//!   (`design.md` §6 batched-queries example, ~line 1256). The full
-//!   alpha-equivalence + nested-CSE algorithm is downstream.
+//!   (`design.md` §6 batched-queries example, ~line 1256) — lives in
+//!   `optimizer::cse` as of Phase 2 step 5 (ASAPController places this
+//!   pass in its cost-aware planning crate, not alongside the L3 IR type
+//!   definitions). The full alpha-equivalence + nested-CSE algorithm is
+//!   downstream.
 //!
 //! Scope reduction. The PR ships the variants the DC + PromQL deployment
 //! actually needs (`Scan`, `Window`, `Aggregate`, `LetBinding`, `Ref`).
@@ -72,7 +75,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod agg_intent;
-pub mod cse;
+pub mod expr_ir;
 pub mod query_expr;
 pub mod schema;
 
@@ -106,12 +109,12 @@ pub use agg_intent::{
     default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
-pub use cse::{dedupe_subtrees, CseWorkloadPlan};
+pub use expr_ir::{ArithOp, ColumnRef, CompareOp, Expr, L2Expr, L3Expr, L3Scalar};
 pub use query_expr::{
-    from_legacy_scalar, BinaryOpKind, BindingScope, ColumnRef, GroupSide, HavingPredicate,
-    JoinKind, LabelFilter, LiteralValue, PartitionKeys, Predicate, ProjectItem, QueryExpr,
-    QueryExprError, SetOpKind, SortKey, Source, VectorGrouping, VectorMatch, VectorMatchKind,
-    WindowKind,
+    aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,
+    BindingScope, DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate,
+    ProjectItem, QueryExpr, QueryExprError, SampleKind, SetOpKind, SortKey, Source, TimeShift,
+    VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
 
@@ -122,5 +125,5 @@ pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schem
 // at the point where they need a positional `ColumnId`.
 pub use column_resolution::{
     infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
-    resolve_column_refs, resolve_named_keys, ResolveError,
+    resolve_column_refs, resolve_expr, resolve_group_keys_promql, ResolveError,
 };

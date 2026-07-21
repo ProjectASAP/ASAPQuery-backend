@@ -21,39 +21,48 @@ use asap_sketch::{SummaryKind, SummaryParams};
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
 fn ts_scan(metric: &str, label: Option<(&str, &str)>) -> QueryExpr {
+    let schema = Schema::with_time_index(
+        vec![
+            Column {
+                name: "ts".into(),
+                dtype: DataType::Timestamp,
+                nullable: false,
+                table: None,
+            },
+            Column {
+                name: "service".into(),
+                dtype: DataType::Utf8,
+                nullable: false,
+                table: None,
+            },
+            Column {
+                name: "value".into(),
+                dtype: DataType::Float64,
+                nullable: false,
+                table: None,
+            },
+        ],
+        0,
+        vec![vec![0, 1]],
+    );
+    let predicates = label
+        .map(|(k, v)| {
+            let lf = LabelFilter {
+                label: k.into(),
+                equals: v.into(),
+            };
+            vec![
+                crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+                    .expect("label column present in schema"),
+            ]
+        })
+        .unwrap_or_default();
     QueryExpr::Scan {
         source: Source::TimeSeries {
             metric: metric.into(),
         },
-        label_filters: label
-            .map(|(k, v)| {
-                vec![LabelFilter {
-                    label: k.into(),
-                    equals: v.into(),
-                }]
-            })
-            .unwrap_or_default(),
-        schema: Schema::with_time_index(
-            vec![
-                Column {
-                    name: "ts".into(),
-                    dtype: DataType::Timestamp,
-                    nullable: false,
-                },
-                Column {
-                    name: "service".into(),
-                    dtype: DataType::Utf8,
-                    nullable: false,
-                },
-                Column {
-                    name: "value".into(),
-                    dtype: DataType::Float64,
-                    nullable: false,
-                },
-            ],
-            0,
-            vec![vec![0, 1]],
-        ),
+        predicates,
+        schema,
     }
 }
 

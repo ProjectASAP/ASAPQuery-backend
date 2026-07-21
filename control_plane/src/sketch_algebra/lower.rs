@@ -67,11 +67,13 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
     // when relevant, otherwise we wrap the L3 sub-tree in `Logical`.
     match expr {
         QueryExpr::LetBinding { name, expr, child } => PhysicalExpr::LetBinding {
-            name: name.clone(),
+            name: crate::types_v2::BindingName::new(name.as_str()),
             expr: Box::new(bind_recursive(expr, accuracy)),
             child: Box::new(bind_recursive(child, accuracy)),
         },
-        QueryExpr::Ref { name } => PhysicalExpr::Ref { name: name.clone() },
+        QueryExpr::Ref { name } => PhysicalExpr::Ref {
+            name: crate::types_v2::BindingName::new(name.as_str()),
+        },
         // The canonical L3 IR places `Window` *above* a single-statistic
         // sketchable `Aggregate` (`lower`'s window-swap).
         // The `Bind*` rules match `Aggregate` with the window as its
@@ -89,6 +91,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
             let QueryExpr::Aggregate {
                 by,
                 aggs,
+                output_names,
                 having,
                 child: agg_child,
             } = child.as_ref()
@@ -98,6 +101,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
             let pushed = QueryExpr::Aggregate {
                 by: by.clone(),
                 aggs: aggs.clone(),
+                output_names: output_names.clone(),
                 having: having.clone(),
                 child: Box::new(QueryExpr::Window {
                     kind: kind.clone(),

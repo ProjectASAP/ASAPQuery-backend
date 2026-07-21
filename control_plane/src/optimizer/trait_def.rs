@@ -70,8 +70,7 @@ mod tests {
     use super::*;
     use crate::optimizer::engine::{
         CommonSubexprElim, FilterWindowSwap, HLLDedupElim, HydraConversion, MergeLifting,
-        PartitionElim, PredicatePushDown, SetOpFusion, SubqueryDecorrelation, TopKFusion,
-        WindowMerge,
+        PredicatePushDown, SetOpFusion, TopKFusion, WindowMerge,
     };
 
     /// Every concrete `RewriteRule` in the engine surfaces a stable name and
@@ -87,13 +86,15 @@ mod tests {
             Box::new(FilterWindowSwap),
             Box::new(HLLDedupElim),
             Box::new(WindowMerge),
-            Box::new(PartitionElim),
             Box::new(TopKFusion),
             // R6 (HistogramQuantileFusion) retired in Step γ5.
+            // R7 (SubqueryDecorrelation) and R11 (PartitionElim) retired
+            // in the `asap_ir` merge — see `engine.rs`'s doc-table notes.
+            // `RuleCategory::Decorrelate` has no producer left as a
+            // result; dropped from the coverage assertion below.
             Box::new(MergeLifting),
             Box::new(SetOpFusion),
             Box::new(HydraConversion),
-            Box::new(SubqueryDecorrelation),
             Box::new(CommonSubexprElim),
         ];
         // Names are stable + non-empty.
@@ -107,7 +108,6 @@ mod tests {
         assert!(cats.contains(&RuleCategory::Fusion));
         assert!(cats.contains(&RuleCategory::Elim));
         assert!(cats.contains(&RuleCategory::Cse));
-        assert!(cats.contains(&RuleCategory::Decorrelate));
     }
 
     /// Every Phase-C bind rule in `sketch_algebra::rules` surfaces

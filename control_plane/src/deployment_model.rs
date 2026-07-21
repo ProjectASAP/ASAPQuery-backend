@@ -199,13 +199,14 @@ mod tests {
         let id = DeploymentModelId::asaplifecycle();
         assert!(reg.contains(&id));
         let m = reg.lookup(&id).expect("asaplifecycle must be registered");
-        // The default rule set carries the 11 engine rules. (R6
-        // HistogramQuantileFusion was retired in Step γ5 — see
-        // `optimizer::engine` module note.)
+        // The default rule set carries the 9 engine rules. (R6
+        // HistogramQuantileFusion was retired in Step γ5; R7
+        // SubqueryDecorrelation and R11 PartitionElim were retired in
+        // the `asap_ir` merge — see `optimizer::engine` module note.)
         assert_eq!(
             m.rules.len(),
-            11,
-            "asaplifecycle should ship the 11 engine rules"
+            9,
+            "asaplifecycle should ship the 9 engine rules"
         );
         // Emitter set carries the three demo emitters.
         assert!(m.emitters.has("opamp_edge_yaml"));
@@ -223,7 +224,9 @@ mod tests {
         assert!(cats.contains(&RuleCategory::Fusion));
         assert!(cats.contains(&RuleCategory::Elim));
         assert!(cats.contains(&RuleCategory::Cse));
-        assert!(cats.contains(&RuleCategory::Decorrelate));
+        // `RuleCategory::Decorrelate` has no producer left — R7
+        // SubqueryDecorrelation was retired in the `asap_ir` merge (see
+        // `optimizer::engine` module note).
     }
 
     #[test]
