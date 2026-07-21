@@ -16,10 +16,10 @@
 #![allow(dead_code)]
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
-use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Bind a single-intent `Aggregate{Quantile{q, accuracy}}` to KLL.
 pub struct BindKllOnQuantile;
@@ -81,8 +81,8 @@ impl Rule for BindKllOnQuantile {
 
         Some(PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q },
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k }),
+            SummaryKind::Kll,
+            SummaryParams::Kll { k },
             (**child).clone(),
         ))
     }

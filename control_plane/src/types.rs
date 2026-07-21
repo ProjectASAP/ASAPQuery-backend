@@ -194,6 +194,44 @@ impl std::fmt::Display for SketchType {
     }
 }
 
+// Moved from the retired `sketch_algebra::sketch_params` (Stage 3 of the
+// sketch-identity unification — see
+// scratchpad/artifacts/enum-unification-plan.md) when `sketch_algebra::SketchKind`
+// was replaced by `asap_sketch::SummaryKind`. `SketchType::from(SummaryKind)`
+// only covers the 5 canonical families this legacy type has room for —
+// callers (`optimizer::engine::load_sketch_capabilities`) only ever feed it
+// kinds sourced from `default_capability_table`/`load_capability_overrides`,
+// which are exhaustively those 5.
+impl From<asap_sketch::SummaryKind> for SketchType {
+    fn from(k: asap_sketch::SummaryKind) -> Self {
+        match k {
+            asap_sketch::SummaryKind::Kll => SketchType::KLL,
+            asap_sketch::SummaryKind::DDSketch => SketchType::DDSketch,
+            asap_sketch::SummaryKind::Hll => SketchType::HLL,
+            asap_sketch::SummaryKind::Cms => SketchType::CountMinSketch,
+            asap_sketch::SummaryKind::CountSketch => SketchType::CountSketch,
+            other => unreachable!(
+                "SketchType::from(SummaryKind): no legacy equivalent for {other:?} \
+                 (callers only pass the 5 canonical families)"
+            ),
+        }
+    }
+}
+
+/// Inverse of `From<SummaryKind> for SketchType`. Round-trippable for the 5
+/// canonical families: `SummaryKind::from(SketchType::from(k)) == k`.
+impl From<SketchType> for asap_sketch::SummaryKind {
+    fn from(t: SketchType) -> Self {
+        match t {
+            SketchType::KLL => asap_sketch::SummaryKind::Kll,
+            SketchType::DDSketch => asap_sketch::SummaryKind::DDSketch,
+            SketchType::HLL => asap_sketch::SummaryKind::Hll,
+            SketchType::CountMinSketch => asap_sketch::SummaryKind::Cms,
+            SketchType::CountSketch => asap_sketch::SummaryKind::CountSketch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutputMode {
     Raw,

@@ -50,7 +50,7 @@
 
 #![allow(dead_code)]
 
-use crate::sketch_algebra::params::SketchKind;
+use asap_sketch::SummaryKind;
 
 /// Query intent the user is expressing — abstracted away from the L1
 /// language (PromQL `quantile_over_time`, SQL `PERCENTILE_CONT`, etc.) and
@@ -137,9 +137,9 @@ pub enum AccuracyPreference {
 /// Muthukrishnan 2005). NB: this is the planner-side capability
 /// declaration; the backend's "top-K from CountMin state" readout path
 /// is a separate workstream — see the module-level docs.
-pub fn is_valid_pair(sketch: SketchKind, statistic: StatisticClass) -> bool {
-    use SketchKind::*;
+pub fn is_valid_pair(sketch: SummaryKind, statistic: StatisticClass) -> bool {
     use StatisticClass::*;
+    use SummaryKind::*;
     match (sketch, statistic) {
         (DDSketch, Quantile)
         | (Kll, Quantile)
@@ -167,10 +167,10 @@ pub fn is_valid_pair(sketch: SketchKind, statistic: StatisticClass) -> bool {
 /// `sketch_family_override` (treated as `QueryWorkload::sketch_type_override`
 /// at the planner-rules layer) wins over the capability-matched default —
 /// see `planner::rules::bind_workload_typed`.
-pub fn pick_family(statistic: StatisticClass, accuracy: AccuracyPreference) -> Option<SketchKind> {
+pub fn pick_family(statistic: StatisticClass, accuracy: AccuracyPreference) -> Option<SummaryKind> {
     use AccuracyPreference::*;
-    use SketchKind::*;
     use StatisticClass::*;
+    use SummaryKind::*;
     let kind = match (statistic, accuracy) {
         (Quantile, RelativeError) => DDSketch,
         (Quantile, RankError) => Kll,
@@ -220,65 +220,71 @@ mod tests {
     #[test]
     fn ddsketch_is_quantile_only() {
         assert!(is_valid_pair(
-            SketchKind::DDSketch,
+            SummaryKind::DDSketch,
             StatisticClass::Quantile
         ));
         assert!(!is_valid_pair(
-            SketchKind::DDSketch,
+            SummaryKind::DDSketch,
             StatisticClass::Cardinality
         ));
-        assert!(!is_valid_pair(SketchKind::DDSketch, StatisticClass::TopK));
+        assert!(!is_valid_pair(SummaryKind::DDSketch, StatisticClass::TopK));
         assert!(!is_valid_pair(
-            SketchKind::DDSketch,
+            SummaryKind::DDSketch,
             StatisticClass::Frequency
         ));
         assert!(!is_valid_pair(
-            SketchKind::DDSketch,
+            SummaryKind::DDSketch,
             StatisticClass::SumRateCount
         ));
     }
 
     #[test]
     fn kll_is_quantile_only() {
-        assert!(is_valid_pair(SketchKind::Kll, StatisticClass::Quantile));
-        assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::Cardinality));
-        assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::TopK));
-        assert!(!is_valid_pair(SketchKind::Kll, StatisticClass::Frequency));
+        assert!(is_valid_pair(SummaryKind::Kll, StatisticClass::Quantile));
         assert!(!is_valid_pair(
-            SketchKind::Kll,
+            SummaryKind::Kll,
+            StatisticClass::Cardinality
+        ));
+        assert!(!is_valid_pair(SummaryKind::Kll, StatisticClass::TopK));
+        assert!(!is_valid_pair(SummaryKind::Kll, StatisticClass::Frequency));
+        assert!(!is_valid_pair(
+            SummaryKind::Kll,
             StatisticClass::SumRateCount
         ));
     }
 
     #[test]
     fn hll_is_cardinality_only() {
-        assert!(is_valid_pair(SketchKind::Hll, StatisticClass::Cardinality));
-        assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::Quantile));
-        assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::TopK));
-        assert!(!is_valid_pair(SketchKind::Hll, StatisticClass::Frequency));
+        assert!(is_valid_pair(SummaryKind::Hll, StatisticClass::Cardinality));
+        assert!(!is_valid_pair(SummaryKind::Hll, StatisticClass::Quantile));
+        assert!(!is_valid_pair(SummaryKind::Hll, StatisticClass::TopK));
+        assert!(!is_valid_pair(SummaryKind::Hll, StatisticClass::Frequency));
         assert!(!is_valid_pair(
-            SketchKind::Hll,
+            SummaryKind::Hll,
             StatisticClass::SumRateCount
         ));
     }
 
     #[test]
     fn countsketch_is_topk_only() {
-        assert!(is_valid_pair(SketchKind::CountSketch, StatisticClass::TopK));
+        assert!(is_valid_pair(
+            SummaryKind::CountSketch,
+            StatisticClass::TopK
+        ));
         assert!(!is_valid_pair(
-            SketchKind::CountSketch,
+            SummaryKind::CountSketch,
             StatisticClass::Quantile
         ));
         assert!(!is_valid_pair(
-            SketchKind::CountSketch,
+            SummaryKind::CountSketch,
             StatisticClass::Cardinality
         ));
         assert!(!is_valid_pair(
-            SketchKind::CountSketch,
+            SummaryKind::CountSketch,
             StatisticClass::Frequency
         ));
         assert!(!is_valid_pair(
-            SketchKind::CountSketch,
+            SummaryKind::CountSketch,
             StatisticClass::SumRateCount
         ));
     }
@@ -287,12 +293,15 @@ mod tests {
     fn cms_supports_frequency_and_topk() {
         // CMS validly answers Frequency (point-frequency, additive bound)
         // AND TopK via the CMS-Heap pattern (Cormode & Muthukrishnan 2005).
-        assert!(is_valid_pair(SketchKind::Cms, StatisticClass::Frequency));
-        assert!(is_valid_pair(SketchKind::Cms, StatisticClass::TopK));
-        assert!(!is_valid_pair(SketchKind::Cms, StatisticClass::Quantile));
-        assert!(!is_valid_pair(SketchKind::Cms, StatisticClass::Cardinality));
+        assert!(is_valid_pair(SummaryKind::Cms, StatisticClass::Frequency));
+        assert!(is_valid_pair(SummaryKind::Cms, StatisticClass::TopK));
+        assert!(!is_valid_pair(SummaryKind::Cms, StatisticClass::Quantile));
         assert!(!is_valid_pair(
-            SketchKind::Cms,
+            SummaryKind::Cms,
+            StatisticClass::Cardinality
+        ));
+        assert!(!is_valid_pair(
+            SummaryKind::Cms,
             StatisticClass::SumRateCount
         ));
     }
@@ -306,7 +315,7 @@ mod tests {
         // TopK-shaped workload (CMS-Heap pattern, Cormode &
         // Muthukrishnan 2005).
         assert!(
-            is_valid_pair(SketchKind::Cms, StatisticClass::TopK),
+            is_valid_pair(SummaryKind::Cms, StatisticClass::TopK),
             "CMS should support TopK via the CMS-Heap pattern",
         );
     }
@@ -317,7 +326,7 @@ mod tests {
     fn pick_family_quantile_relative_picks_ddsketch() {
         assert_eq!(
             pick_family(StatisticClass::Quantile, AccuracyPreference::RelativeError),
-            Some(SketchKind::DDSketch),
+            Some(SummaryKind::DDSketch),
         );
     }
 
@@ -325,7 +334,7 @@ mod tests {
     fn pick_family_quantile_rank_picks_kll() {
         assert_eq!(
             pick_family(StatisticClass::Quantile, AccuracyPreference::RankError),
-            Some(SketchKind::Kll),
+            Some(SummaryKind::Kll),
         );
     }
 
@@ -337,7 +346,7 @@ mod tests {
         ] {
             assert_eq!(
                 pick_family(StatisticClass::Cardinality, pref),
-                Some(SketchKind::Hll),
+                Some(SummaryKind::Hll),
             );
         }
     }
@@ -346,7 +355,7 @@ mod tests {
     fn pick_family_topk_picks_countsketch() {
         assert_eq!(
             pick_family(StatisticClass::TopK, AccuracyPreference::default()),
-            Some(SketchKind::CountSketch),
+            Some(SummaryKind::CountSketch),
         );
     }
 
@@ -354,7 +363,7 @@ mod tests {
     fn pick_family_frequency_picks_cms() {
         assert_eq!(
             pick_family(StatisticClass::Frequency, AccuracyPreference::default()),
-            Some(SketchKind::Cms),
+            Some(SummaryKind::Cms),
         );
     }
 
@@ -420,17 +429,17 @@ mod tests {
         assert_eq!(classify_demo_metric(""), None);
     }
 
-    // ── End-to-end: every contract row maps to its expected SketchKind ────────
+    // ── End-to-end: every contract row maps to its expected SummaryKind ────────
 
     #[test]
     fn every_contract_metric_picks_its_contract_family() {
         let cases = [
             ("http_requests_total", None),
-            ("http_latency_ms", Some(SketchKind::DDSketch)),
-            ("request_size_bytes", Some(SketchKind::Kll)),
-            ("unique_users_per_min", Some(SketchKind::Hll)),
-            ("top_endpoint_qps", Some(SketchKind::CountSketch)),
-            ("endpoint_request_freq", Some(SketchKind::Cms)),
+            ("http_latency_ms", Some(SummaryKind::DDSketch)),
+            ("request_size_bytes", Some(SummaryKind::Kll)),
+            ("unique_users_per_min", Some(SummaryKind::Hll)),
+            ("top_endpoint_qps", Some(SummaryKind::CountSketch)),
+            ("endpoint_request_freq", Some(SummaryKind::Cms)),
         ];
         for (metric, want_kind) in cases {
             let (stat, pref) = classify_demo_metric(metric)

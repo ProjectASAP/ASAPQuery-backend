@@ -200,8 +200,8 @@ mod tests {
         BackendAggregation, BackendReadout, ExportTarget, GatewayMergeProcessor,
     };
     use crate::physical::colored_dag::stage_id::StageId;
-    use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
     use crate::sketch_algebra::physical_expr::EstimateOp;
+    use asap_sketch::{SummaryKind, SummaryParams};
     use std::collections::HashMap;
 
     fn empty_edge_cfg() -> EdgeStageConfig {
@@ -232,7 +232,7 @@ mod tests {
             otlp_receiver_port: 4317,
             merge_processors: vec![GatewayMergeProcessor {
                 processor_name: "sketchmergeprocessor".to_string(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SummaryKind::DDSketch,
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Backend),
@@ -245,8 +245,8 @@ mod tests {
                 item_label: None,
                 aggregation_id: "agg0".to_string(),
                 metric_name: "test_metric".to_string(),
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 window_secs: 60,
                 spatial_filter: String::new(),
                 grouping: Vec::new(),

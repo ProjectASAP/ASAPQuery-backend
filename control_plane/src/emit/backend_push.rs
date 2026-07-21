@@ -658,14 +658,14 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendReadout,
         };
-        use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
         use crate::sketch_algebra::physical_expr::EstimateOp;
+        use asap_sketch::{SummaryKind, SummaryParams};
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: agg_id.to_string(),
                 metric_name: metric.to_string(),
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 grouping: vec![],
                 item_label: None,
                 spatial_filter: String::new(),

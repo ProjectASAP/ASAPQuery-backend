@@ -39,7 +39,7 @@ use anyhow::{Context, Result};
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Default Prometheus remote-write URL for Mode 3 — Telegraf doesn't
 /// support OTLP-HTTP egress, so we land in the same Prometheus archive
@@ -166,39 +166,67 @@ fn emit_processors_allsketches(
         sketch_kind_tag(&sp.sketch_kind)
     ));
     match &sp.sketch_params {
-        SketchParams::Kll(p) => {
-            out.push_str(&format!("  k = {}\n", p.k));
+        SummaryParams::Kll { k } => {
+            out.push_str(&format!("  k = {k}\n"));
         }
-        SketchParams::DDSketch(p) => {
-            out.push_str(&format!("  relative_accuracy = {}\n", p.alpha));
+        SummaryParams::DDSketch { alpha } => {
+            out.push_str(&format!("  relative_accuracy = {alpha}\n"));
             out.push_str("  delta_transmission = true\n");
         }
-        SketchParams::Hll(_p) => {
+        SummaryParams::Hll { .. } => {
             out.push_str("  delta_transmission = true\n");
         }
-        SketchParams::Cms(p) => {
-            out.push_str(&format!("  rows = {}\n", p.d));
-            out.push_str(&format!("  columns = {}\n", p.w));
+        // Heap-bearing width/depth extraction is identical to the bare
+        // kind — this path never distinguished `with_heap` even before
+        // `SummaryKind` split it into its own variant.
+        SummaryParams::Cms { width, depth } | SummaryParams::CmsWithHeap { width, depth, .. } => {
+            out.push_str(&format!("  rows = {depth}\n"));
+            out.push_str(&format!("  columns = {width}\n"));
             out.push_str("  delta_transmission = true\n");
         }
-        SketchParams::CountSketch(p) => {
-            let epsilon = std::f64::consts::E / (p.w as f64);
-            let delta = 2f64.powi(-(p.d as i32));
+        SummaryParams::CountSketch { width, depth }
+        | SummaryParams::CountSketchWithHeap { width, depth, .. } => {
+            let epsilon = std::f64::consts::E / (*width as f64);
+            let delta = 2f64.powi(-(*depth as i32));
             out.push_str(&format!("  epsilon = {epsilon}\n"));
             out.push_str(&format!("  delta = {delta}\n"));
             out.push_str("  delta_transmission = true\n");
+        }
+        SummaryParams::Sum
+        | SummaryParams::Count
+        | SummaryParams::MinMax
+        | SummaryParams::Increase
+        | SummaryParams::Rate
+        | SummaryParams::Kmv { .. }
+        | SummaryParams::Theta { .. } => {
+            unreachable!(
+                "edge sketch processor config requested for a non-sketch or unsupported \
+                 SummaryKind; no Bind* rule in this repo produces one"
+            )
         }
     }
     out.push('\n');
 }
 
-fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
+fn sketch_kind_tag(kind: &SummaryKind) -> &'static str {
     match kind {
-        SketchKind::Kll => "kll",
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Hll => "hll",
-        SketchKind::Cms => "cms",
-        SketchKind::CountSketch => "count_sketch",
+        SummaryKind::Kll => "kll",
+        SummaryKind::DDSketch => "ddsketch",
+        SummaryKind::Hll => "hll",
+        SummaryKind::Cms | SummaryKind::CmsWithHeap => "cms",
+        SummaryKind::CountSketch | SummaryKind::CountSketchWithHeap => "count_sketch",
+        SummaryKind::Sum
+        | SummaryKind::Count
+        | SummaryKind::MinMax
+        | SummaryKind::Increase
+        | SummaryKind::Rate
+        | SummaryKind::Kmv
+        | SummaryKind::Theta => {
+            unreachable!(
+                "edge sketch processor config requested for a non-sketch or unsupported \
+                 SummaryKind; no Bind* rule in this repo produces one"
+            )
+        }
     }
 }
 
@@ -297,7 +325,7 @@ mod toml_minimal {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use crate::sketch_algebra::params::{DDSketchParams, KllParams};
+    use asap_sketch::{SummaryKind, SummaryParams};
 
     fn ddsketch_edge_cfg_mode1() -> EdgeStageConfig {
         EdgeStageConfig {
@@ -306,8 +334,8 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),
@@ -515,8 +543,8 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "KLL".to_string(),
-                sketch_kind: SketchKind::Kll,
-                sketch_params: SketchParams::Kll(KllParams { k: 200 }),
+                sketch_kind: SummaryKind::Kll,
+                sketch_params: SummaryParams::Kll { k: 200 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),

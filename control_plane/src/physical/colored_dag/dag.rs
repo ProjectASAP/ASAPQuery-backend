@@ -145,9 +145,9 @@ impl ColoredDag {
 mod tests {
     use super::*;
     use crate::intent_algebra::QueryExpr;
-    use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
     use crate::sketch_algebra::physical_expr::EstimateOp;
     use crate::sketch_algebra::PhysicalExpr;
+    use asap_sketch::{SummaryKind, SummaryParams};
 
     fn dummy_logical() -> PhysicalExpr {
         PhysicalExpr::Logical(QueryExpr::Ref {
@@ -157,8 +157,8 @@ mod tests {
 
     fn dummy_agg() -> PhysicalExpr {
         PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::Kll,
-            params: SketchParams::Kll(KllParams { k: 200 }),
+            sketch_type: SummaryKind::Kll,
+            params: SummaryParams::Kll { k: 200 },
             child: Box::new(dummy_logical()),
         }
     }

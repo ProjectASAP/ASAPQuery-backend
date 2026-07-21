@@ -92,18 +92,11 @@ pub fn load_sketch_capabilities(
 /// Built-in capability profile for a known sketch type. Thin shim —
 /// the real defaults live in `optimizer::cost::sketch_capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
-    use crate::sketch_algebra::params::SketchKind;
-    use crate::types::SketchType;
-    let kind: SketchKind = match st {
-        SketchType::DDSketch => SketchKind::DDSketch,
-        SketchType::KLL => SketchKind::Kll,
-        SketchType::HLL => SketchKind::Hll,
-        SketchType::CountSketch => SketchKind::CountSketch,
-        SketchType::CountMinSketch => SketchKind::Cms,
-    };
+    use asap_sketch::SummaryKind;
+    let kind: SummaryKind = st.clone().into();
     default_capability_table()
         .remove(&kind)
-        .expect("default_capability_table covers every SketchKind variant")
+        .expect("default_capability_table covers every SummaryKind variant")
 }
 
 // ── Stage budgets ───────────────────────────────────────────────────────────

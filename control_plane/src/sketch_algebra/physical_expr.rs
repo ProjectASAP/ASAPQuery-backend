@@ -17,10 +17,10 @@
 
 #![allow(dead_code)]
 
+use asap_sketch::{SummaryKind, SummaryParams};
 use serde::{Deserialize, Serialize};
 
 use crate::intent_algebra::QueryExpr;
-use crate::sketch_algebra::params::{SketchKind, SketchParams};
 use crate::types_v2::BindingName;
 use promql_utilities::query_logics::enums::AggregationType;
 
@@ -59,13 +59,18 @@ pub enum MergeAlgebra {
 
 /// L4 algebra node. See module doc for the variant subset rationale.
 ///
-/// Serde tag is `"sketch_node"` (not `"node"`) so it doesn't collide with
-/// the L3 `QueryExpr`'s `"node"` tag — `PhysicalExpr::Logical(QueryExpr)`
-/// nests a JSON-tagged enum inside an internally-tagged outer enum, and
-/// reusing the same tag would surface as a `duplicate field "node"`
-/// deserialization error.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "sketch_node", rename_all = "snake_case")]
+/// Not `Serialize`/`Deserialize` — `asap_sketch::SummaryKind`/`SummaryParams`
+/// (carried by `SketchAgg`/`RawAtEdgeSketchAtBackend`) have no serde impl
+/// (nothing in ASAPController needs one; see
+/// `scratchpad/artifacts/enum-unification-plan.md` §4 — the old
+/// `sketch_algebra::SketchKind`/`SketchParams` this replaces derived
+/// `Serialize`/`Deserialize` too, but nothing on the real emit path ever
+/// exercised it — every actual wire payload goes through a hand-written
+/// JSON/YAML builder, never a whole-struct serialize). Previously tagged
+/// `"sketch_node"` (not `"node"`, to avoid colliding with the L3
+/// `QueryExpr`'s `"node"` tag when nested via `PhysicalExpr::Logical`);
+/// that tag is dropped along with the derive.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalExpr {
     /// Logical pass-through: an L3 node that no L4 rule rewrote. A
     /// `Filter`, a row-shaped `Aggregate{Sum}`, or any other operator
@@ -78,9 +83,9 @@ pub enum PhysicalExpr {
     /// committed `(sketch_type, params)` pair.
     SketchAgg {
         /// Sketch family (KLL / DDSketch / HLL / CMS / CountSketch).
-        sketch_type: SketchKind,
+        sketch_type: SummaryKind,
         /// Sketch parameters (validated by the catalog at bind time).
-        params: SketchParams,
+        params: SummaryParams,
         /// Input sub-tree — typically `Logical(Window{...})` or
         /// `Logical(Scan{...})`.
         child: Box<PhysicalExpr>,
@@ -142,9 +147,9 @@ pub enum PhysicalExpr {
     /// this metric (Phase ε.2 implements the raw-input ingest path).
     RawAtEdgeSketchAtBackend {
         /// Sketch family the backend will build at ingest.
-        family: SketchKind,
+        family: SummaryKind,
         /// Sketch parameters (validated by the catalog at bind time).
-        params: SketchParams,
+        params: SummaryParams,
         /// Input sub-tree — typically `Logical(Window{...})` or
         /// `Logical(Scan{...})`. Mirrors `SketchAgg`'s child field so the
         /// L5 emitter's walk uniform.
@@ -187,7 +192,7 @@ pub enum PhysicalExpr {
     ///
     /// Distinct from `SketchAgg` + `SketchEstimate` in two ways:
     /// 1. No `EstimateOp` wrapper. ExactAgg is its own answer.
-    /// 2. No `SketchParams`. The `AggregationType` enum captures the
+    /// 2. No `SummaryParams`. The `AggregationType` enum captures the
     ///    parameterization (DDSketch's α etc. don't apply — exact
     ///    aggregations are parameter-free up to the accumulator
     ///    family choice).
@@ -215,8 +220,8 @@ impl PhysicalExpr {
     /// `Bind*` rule. Keeps rule call sites short.
     pub fn estimate_over_agg(
         op: EstimateOp,
-        sketch_type: SketchKind,
-        params: SketchParams,
+        sketch_type: SummaryKind,
+        params: SummaryParams,
         logical: QueryExpr,
     ) -> Self {
         PhysicalExpr::SketchEstimate {
@@ -246,9 +251,7 @@ impl PhysicalExpr {
 mod tests {
     use super::*;
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
-    use crate::sketch_algebra::params::{CountSketchParams, DDSketchParams, HllParams, KllParams};
-    use crate::types_v2::AccuracyTarget;
+    use crate::intent_algebra::{LabelFilter, QueryExpr, Schema, Source, WindowKind};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -297,8 +300,8 @@ mod tests {
     fn estimate_over_agg_ctor_shape() {
         let e = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.99 },
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
+            SummaryKind::Kll,
+            SummaryParams::Kll { k: 200 },
             windowed_scan(),
         );
         match e {
@@ -310,8 +313,8 @@ mod tests {
                         params,
                         child,
                     } => {
-                        assert_eq!(sketch_type, SketchKind::Kll);
-                        assert_eq!(params, SketchParams::Kll(KllParams { k: 200 }));
+                        assert_eq!(sketch_type, SummaryKind::Kll);
+                        assert_eq!(params, SummaryParams::Kll { k: 200 });
                         assert!(matches!(*child, PhysicalExpr::Logical(_)));
                     }
                     other => panic!("expected SketchAgg, got {other:?}"),
@@ -319,93 +322,5 @@ mod tests {
             }
             other => panic!("expected SketchEstimate, got {other:?}"),
         }
-    }
-
-    fn agg_quantile() -> QueryExpr {
-        QueryExpr::Aggregate {
-            by: vec![],
-            aggs: vec![AggIntent::Quantile {
-                col: None,
-                q: 0.99,
-                accuracy: AccuracyTarget::Epsilon(0.01),
-            }],
-            having: None,
-            child: Box::new(windowed_scan()),
-        }
-    }
-
-    #[test]
-    fn physical_expr_serde_roundtrip_logical() {
-        let e = PhysicalExpr::Logical(agg_quantile());
-        let json = serde_json::to_string(&e).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn physical_expr_serde_roundtrip_sketch_agg() {
-        let e = PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::Kll,
-            params: SketchParams::Kll(KllParams { k: 200 }),
-            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-        };
-        let json = serde_json::to_string(&e).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn physical_expr_serde_roundtrip_estimate() {
-        let e = PhysicalExpr::estimate_over_agg(
-            EstimateOp::Quantile { q: 0.95 },
-            SketchKind::DDSketch,
-            SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
-            windowed_scan(),
-        );
-        let json = serde_json::to_string(&e).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn physical_expr_serde_roundtrip_merge() {
-        let leaf = PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::Hll,
-            params: SketchParams::Hll(HllParams { precision: 14 }),
-            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-        };
-        let e = PhysicalExpr::SketchMerge {
-            algebra: MergeAlgebra::Union,
-            children: vec![leaf.clone(), leaf],
-        };
-        let json = serde_json::to_string(&e).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn physical_expr_serde_roundtrip_let_ref() {
-        let inner_agg = PhysicalExpr::SketchAgg {
-            sketch_type: SketchKind::CountSketch,
-            params: SketchParams::CountSketch(CountSketchParams {
-                w: 2048,
-                d: 5,
-                with_heap: true,
-            }),
-            child: Box::new(PhysicalExpr::Logical(windowed_scan())),
-        };
-        let e = PhysicalExpr::LetBinding {
-            name: BindingName::new("kll_state"),
-            expr: Box::new(inner_agg),
-            child: Box::new(PhysicalExpr::SketchEstimate {
-                op: EstimateOp::TopK { k: 10 },
-                child: Box::new(PhysicalExpr::Ref {
-                    name: BindingName::new("kll_state"),
-                }),
-            }),
-        };
-        let json = serde_json::to_string(&e).unwrap();
-        let back: PhysicalExpr = serde_json::from_str(&json).unwrap();
-        assert_eq!(e, back);
     }
 }

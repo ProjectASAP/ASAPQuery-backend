@@ -66,10 +66,10 @@
 
 use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::optimizer::cost::wire::WireCostTable;
-use crate::sketch_algebra::params::{CmsParams, CountSketchParams, SketchKind, SketchParams};
 use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
 use crate::sketch_algebra::rules::Rule;
 use crate::types_v2::AccuracyTarget;
+use asap_sketch::{SummaryKind, SummaryParams};
 
 /// Recall tier for a top-k binding — drives the family pick.
 ///
@@ -117,10 +117,10 @@ impl BindCountSketchOnTopK {
     ///   recall bar, so the cost model is free to pick the cheaper one.
     /// * `Tight`: only CountSketch-heap (unbiased / signed / exact-rank)
     ///   clears the bar.
-    fn candidate_families(tier: TopkRecallTier) -> &'static [SketchKind] {
+    fn candidate_families(tier: TopkRecallTier) -> &'static [SummaryKind] {
         match tier {
-            TopkRecallTier::Loose => &[SketchKind::Cms, SketchKind::CountSketch],
-            TopkRecallTier::Tight => &[SketchKind::CountSketch],
+            TopkRecallTier::Loose => &[SummaryKind::Cms, SummaryKind::CountSketch],
+            TopkRecallTier::Tight => &[SummaryKind::CountSketch],
         }
     }
 
@@ -128,14 +128,14 @@ impl BindCountSketchOnTopK {
     /// `candidates` is already filtered to the families that meet the
     /// recall SLA (see [`Self::candidate_families`]); this is the
     /// "min cost s.t. SLA" tie-break the oracle uses.
-    fn cheapest_family(candidates: &[SketchKind], table: &WireCostTable) -> SketchKind {
+    fn cheapest_family(candidates: &[SummaryKind], table: &WireCostTable) -> SummaryKind {
         candidates
             .iter()
             .min_by_key(|k| table.for_kind(k).per_flush())
             .cloned()
-            // (above: k is &&SketchKind; for_kind autoderefs to &SketchKind)
+            // (above: k is &&SummaryKind; for_kind autoderefs to &SummaryKind)
             // candidate_families never returns empty.
-            .unwrap_or(SketchKind::CountSketch)
+            .unwrap_or(SummaryKind::CountSketch)
     }
 
     /// Bind a top-k under an explicit recall tier — bypasses the
@@ -252,27 +252,38 @@ impl BindCountSketchOnTopK {
         let table = WireCostTable::default();
         let family = Self::cheapest_family(Self::candidate_families(tier), &table);
 
+        // `heap_size` — `SummaryKind::CmsWithHeap`/`CountSketchWithHeap`
+        // promotes the heap from a `SketchParams::{Cms,CountSketch}.with_heap`
+        // bool flag to a first-class identity variant carrying the real
+        // heap size. `k_topk` is the correct value (this is the requested
+        // top-k `k`); note the backend wire builder
+        // (`emit::stage_config::sketch_params_to_json`) doesn't read this
+        // field today regardless (a pre-existing gap, out of scope for
+        // this rename), so this is strictly more correct in-memory data
+        // with no observable wire-behavior change.
+        let heap_size = k_topk as u32;
+
         let (kind, params) = match family {
-            SketchKind::Cms => (
-                SketchKind::Cms,
+            SummaryKind::Cms => (
+                SummaryKind::CmsWithHeap,
                 // CMS-Heap pattern: pair the CMS matrix with a size-k
                 // heavy-hitter heap. The streaming-config emit promotes
                 // this to `CountMinSketchWithHeap` (servable as
                 // FrequencyTopk per `asap_tier_analysis`).
-                SketchParams::Cms(CmsParams {
-                    w,
-                    d,
-                    with_heap: true,
-                }),
+                SummaryParams::CmsWithHeap {
+                    width: w,
+                    depth: d,
+                    heap_size,
+                },
             ),
             // Tight tier (and any future family) → CountSketch-with-heap.
             _ => (
-                SketchKind::CountSketch,
-                SketchParams::CountSketch(CountSketchParams {
-                    w,
-                    d,
-                    with_heap: true,
-                }),
+                SummaryKind::CountSketchWithHeap,
+                SummaryParams::CountSketchWithHeap {
+                    width: w,
+                    depth: d,
+                    heap_size,
+                },
             ),
         };
 

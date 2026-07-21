@@ -68,13 +68,13 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
     };
-    use crate::sketch_algebra::params::SketchKind;
     use crate::sketch_algebra::rules::{
         bind_cms_count::BindCmsOnCount, bind_cms_topk::BindCountSketchOnTopK,
         bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_hll_cardinality::BindHllOnCardinality,
         bind_kll_quantile::BindKllOnQuantile, Rule,
     };
     use crate::types_v2::AccuracyTarget;
+    use asap_sketch::SummaryKind;
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
     // operator-supplied overrides both signal "this metric must be
@@ -121,15 +121,21 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // the statistic from the override whenever the derived one is
     // incompatible, so the override drives both family and statistic.
     if let Some(st) = w.sketch_type_override.as_ref() {
-        let ov = SketchKind::from(st.clone());
+        let ov = SummaryKind::from(st.clone());
         if !is_valid_pair(ov.clone(), statistic) {
             let (s, ap) = match ov {
-                SketchKind::DDSketch | SketchKind::Kll => {
+                SummaryKind::DDSketch | SummaryKind::Kll => {
                     (StatisticClass::Quantile, AccuracyPreference::RelativeError)
                 }
-                SketchKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
-                SketchKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
-                SketchKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
+                SummaryKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
+                SummaryKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
+                SummaryKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
+                // `ov` always comes from `SummaryKind::from(SketchType)`
+                // (`w.sketch_type_override` is the legacy 5-family enum),
+                // so only these 5 canonical families are ever reachable.
+                other => unreachable!(
+                    "sketch_type_override resolved to an unsupported SummaryKind {other:?}"
+                ),
             };
             statistic = s;
             accuracy_pref = ap;
@@ -142,7 +148,7 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
         return None;
     }
 
-    // ── Resolve the SketchKind (override > capability-matched default) ─
+    // ── Resolve the SummaryKind (override > capability-matched default) ─
     //
     // The workload-spec's `sketch_type_override` (= the spec's
     // `sketch_family_override` per orchestrator contract) wins over the
@@ -151,10 +157,10 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // workload) is silently dropped — the catalog-default family runs
     // instead so the binding never produces a nonsense (sketch, stat)
     // pair.
-    let override_kind: Option<SketchKind> = w
+    let override_kind: Option<SummaryKind> = w
         .sketch_type_override
         .as_ref()
-        .map(|st| SketchKind::from(st.clone()));
+        .map(|st| SummaryKind::from(st.clone()));
     let kind = match override_kind {
         Some(k) if is_valid_pair(k.clone(), statistic) => k,
         _ => pick_family(statistic, accuracy_pref)?,
@@ -245,7 +251,7 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // tie-break (DDSketch p=6 vs KLL p=5) cannot accidentally flip
     // `request_size_bytes`'s KLL pick to DDSketch.
     //
-    // CMS+TopK note: when the picker selected `SketchKind::Cms` for a
+    // CMS+TopK note: when the picker selected `SummaryKind::Cms` for a
     // TopK statistic (only reachable today via a `sketch_family_override:
     // CountMinSketch` on a TopK metric), we emit a CMS-with-heap binding
     // inline. The CMS-Heap pattern (Cormode & Muthukrishnan 2005) gives
@@ -254,26 +260,29 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // from CountMin state" readout path is a separate workstream — see
     // `sketch_algebra::capability_matching` module docs for the gap note.
     match (kind, statistic) {
-        (SketchKind::DDSketch, _) => BindDDSketchOnQuantile.apply(&aggregate, &accuracy),
-        (SketchKind::Kll, _) => BindKllOnQuantile.apply(&aggregate, &accuracy),
-        (SketchKind::Hll, _) => BindHllOnCardinality.apply(&aggregate, &accuracy),
+        (SummaryKind::DDSketch, _) => BindDDSketchOnQuantile.apply(&aggregate, &accuracy),
+        (SummaryKind::Kll, _) => BindKllOnQuantile.apply(&aggregate, &accuracy),
+        (SummaryKind::Hll, _) => BindHllOnCardinality.apply(&aggregate, &accuracy),
         // The capability matrix already pinned the family here, so force
         // the matching recall tier rather than re-inferring it: a
         // CountSketch pick is the unbiased canonical top-k (Tight); a CMS
         // pick on a top-k is the cheap CMS-with-heap (Loose). This keeps
         // `bind_workload_typed`'s contract-row mapping deterministic — the
         // recall-aware default lives in `dispatch()` / `Rule::apply`.
-        (SketchKind::CountSketch, _) => BindCountSketchOnTopK.apply_with_tier(
+        (SummaryKind::CountSketch, _) => BindCountSketchOnTopK.apply_with_tier(
             &aggregate,
             &accuracy,
             crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Tight,
         ),
-        (SketchKind::Cms, StatisticClass::TopK) => BindCountSketchOnTopK.apply_with_tier(
+        (SummaryKind::Cms, StatisticClass::TopK) => BindCountSketchOnTopK.apply_with_tier(
             &aggregate,
             &accuracy,
             crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Loose,
         ),
-        (SketchKind::Cms, _) => BindCmsOnCount.apply(&aggregate, &accuracy),
+        (SummaryKind::Cms, _) => BindCmsOnCount.apply(&aggregate, &accuracy),
+        // `kind` always comes from `pick_family`/`sketch_type_override`,
+        // exhaustively the 5 canonical families.
+        (other, _) => unreachable!("dispatch: unsupported SummaryKind {other:?}"),
     }
 }
 
@@ -464,13 +473,19 @@ mod tests {
     #[test]
     fn override_pins_nonquantile_family_over_misclassified_query() {
         use crate::emit::extract_root_sketch_kind;
-        use crate::sketch_algebra::params::SketchKind;
+        use asap_sketch::SummaryKind;
         for (ov, expect) in [
-            (SketchType::DDSketch, SketchKind::DDSketch),
-            (SketchType::KLL, SketchKind::Kll),
-            (SketchType::HLL, SketchKind::Hll),
-            (SketchType::CountMinSketch, SketchKind::Cms),
-            (SketchType::CountSketch, SketchKind::CountSketch),
+            (SketchType::DDSketch, SummaryKind::DDSketch),
+            (SketchType::KLL, SummaryKind::Kll),
+            (SketchType::HLL, SummaryKind::Hll),
+            (SketchType::CountMinSketch, SummaryKind::Cms),
+            // CountSketch override re-derives statistic as TopK (see the
+            // override arm below), and `bind_cms_topk` always binds the
+            // heap-bearing kind for a top-k intent — matches this
+            // fixture's pre-`SummaryKind`-split expectation, when
+            // `with_heap: true` was a params flag rather than kind
+            // identity.
+            (SketchType::CountSketch, SummaryKind::CountSketchWithHeap),
         ] {
             // Query classifies as Quantile (the mis-derived case observed
             // live for count()/topk()/count_over_time()); the override must win.
@@ -605,13 +620,13 @@ mod tests {
     // | `top_endpoint_qps`      | CountSketch  |
     // | `endpoint_request_freq` | CMS          |
 
-    use crate::sketch_algebra::params::SketchKind;
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
+    use asap_sketch::SummaryKind;
 
     /// Walk the L4 binding output and pull out the `SketchAgg`'s family.
     /// Returns `None` if no `SketchAgg` node is present (raw / pure
     /// logical pass-through).
-    fn extract_family(expr: &PhysicalExpr) -> Option<SketchKind> {
+    fn extract_family(expr: &PhysicalExpr) -> Option<SummaryKind> {
         match expr {
             PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
             PhysicalExpr::SketchEstimate { child, .. } => extract_family(child),
@@ -670,7 +685,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("http_latency_ms must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SummaryKind::DDSketch),
             "http_latency_ms should bind to DDSketch (Quantile, rel-err)",
         );
     }
@@ -685,7 +700,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("request_size_bytes must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Kll),
+            Some(SummaryKind::Kll),
             "request_size_bytes should bind to KLL (Quantile, rank-err)",
         );
     }
@@ -697,7 +712,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("unique_users_per_min must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Hll),
+            Some(SummaryKind::Hll),
             "unique_users_per_min should bind to HLL (Cardinality)",
         );
     }
@@ -712,8 +727,8 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::CountSketch),
-            "top_endpoint_qps should bind to CountSketch (TopK)",
+            Some(SummaryKind::CountSketchWithHeap),
+            "top_endpoint_qps should bind to CountSketch-with-heap (TopK)",
         );
     }
 
@@ -728,7 +743,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("endpoint_request_freq must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Cms),
+            Some(SummaryKind::Cms),
             "endpoint_request_freq should bind to CMS (Frequency)",
         );
     }
@@ -746,7 +761,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Kll),
+            Some(SummaryKind::Kll),
             "sketch_type_override=KLL should pin KLL despite the contract's DDSketch default",
         );
     }
@@ -760,7 +775,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SummaryKind::DDSketch),
             "sketch_type_override=DDSketch should pin DDSketch despite the contract's KLL default",
         );
     }
@@ -778,21 +793,22 @@ mod tests {
             bind_workload_typed(&w).expect("CountMin override on a TopK metric should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Cms),
-            "sketch_type_override=CountMinSketch on a TopK metric should pin CMS",
+            Some(SummaryKind::CmsWithHeap),
+            "sketch_type_override=CountMinSketch on a TopK metric should pin CMS-with-heap",
         );
     }
 
     #[test]
     fn planner_default_for_topk_remains_countsketch() {
         // Without any override, the canonical pick for a TopK metric
-        // stays CountSketch — CMS-Heap is opt-in via override only.
+        // stays CountSketch(-with-heap) — CMS-Heap is opt-in via
+        // override only.
         let w = workload_for("top_endpoint_qps", AggType::Frequency);
         let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::CountSketch),
-            "default TopK pick must remain CountSketch (unbiased estimator)",
+            Some(SummaryKind::CountSketchWithHeap),
+            "default TopK pick must remain CountSketch-with-heap (unbiased estimator)",
         );
     }
 
@@ -806,7 +822,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("fallback should bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SummaryKind::DDSketch),
             "invalid (HLL, Quantile) override should be rejected; planner falls back to DDSketch",
         );
     }
@@ -818,32 +834,32 @@ mod tests {
         // Single test that drives the full contract row set through
         // `bind_workload_typed` — this is the per-task acceptance test
         // ("verify each produces the expected `PhysicalExpr` family").
-        let cases: Vec<(&str, AggType, Option<SketchKind>)> = vec![
+        let cases: Vec<(&str, AggType, Option<SummaryKind>)> = vec![
             ("http_requests_total", AggType::Frequency, None),
             (
                 "http_latency_ms",
                 AggType::Quantile,
-                Some(SketchKind::DDSketch),
+                Some(SummaryKind::DDSketch),
             ),
             (
                 "request_size_bytes",
                 AggType::Quantile,
-                Some(SketchKind::Kll),
+                Some(SummaryKind::Kll),
             ),
             (
                 "unique_users_per_min",
                 AggType::Cardinality,
-                Some(SketchKind::Hll),
+                Some(SummaryKind::Hll),
             ),
             (
                 "top_endpoint_qps",
                 AggType::Frequency,
-                Some(SketchKind::CountSketch),
+                Some(SummaryKind::CountSketchWithHeap),
             ),
             (
                 "endpoint_request_freq",
                 AggType::Frequency,
-                Some(SketchKind::Cms),
+                Some(SummaryKind::Cms),
             ),
         ];
         for (metric, agg, expected) in cases {

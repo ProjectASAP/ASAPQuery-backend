@@ -655,7 +655,7 @@ impl Replanner {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
+        use asap_sketch::{SummaryKind, SummaryParams};
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
@@ -667,9 +667,9 @@ impl Replanner {
                 // these are not emitted on the wire. DDSketch is the
                 // chosen sentinel because every backend that recognises
                 // `AggregationType::FromStr` also accepts DDSketch (and
-                // we don't have a `SketchKind::None` variant today).
-                sketch_kind: SketchKind::DDSketch,
-                sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                // we don't have a `SummaryKind::None` variant today).
+                sketch_kind: SummaryKind::DDSketch,
+                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                 window_secs,
                 spatial_filter: String::new(),
                 grouping: workload.group_by_labels.clone(),
@@ -1254,7 +1254,7 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use crate::sketch_algebra::params::{DDSketchParams, SketchKind, SketchParams};
+        use asap_sketch::{SummaryKind, SummaryParams};
 
         let (url, hits) = start_repost_mock().await;
         let client = StdArc::new(BackendClient::new(url));
@@ -1304,8 +1304,8 @@ mod tests {
                         item_label: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
-                        sketch_kind: SketchKind::DDSketch,
-                        sketch_params: SketchParams::DDSketch(DDSketchParams { alpha: 0.01 }),
+                        sketch_kind: SummaryKind::DDSketch,
+                        sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
                         grouping: vec!["zone".to_string()],
                         spatial_filter: String::new(),
                         window_secs: 60,

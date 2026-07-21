@@ -273,8 +273,8 @@ mod tests {
     use super::*;
     use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{QueryExpr, Schema, Source, WindowKind};
-    use crate::sketch_algebra::params::{KllParams, SketchKind, SketchParams};
     use crate::sketch_algebra::physical_expr::EstimateOp;
+    use asap_sketch::{SummaryKind, SummaryParams};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -327,8 +327,8 @@ mod tests {
     fn three_stage_quantile_dag_basic() {
         let expr = PhysicalExpr::estimate_over_agg(
             EstimateOp::Quantile { q: 0.99 },
-            SketchKind::Kll,
-            SketchParams::Kll(KllParams { k: 200 }),
+            SummaryKind::Kll,
+            SummaryParams::Kll { k: 200 },
             windowed_scan(),
         );
         let dag = StageAllocator

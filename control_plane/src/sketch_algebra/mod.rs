@@ -6,9 +6,11 @@
 //!   deployment-independent). Single-rooted per query; multi-root
 //!   workload-level fan-in lives one layer up in
 //!   `types_v2::WorkloadPlan`.
-//! - [`SketchKind`] / [`SketchParams`] — typed sketch-family selector +
-//!   parameter payload. Convertible to the legacy `crate::types`
-//!   shape via [`SketchParams::to_legacy`] for the L5 emitter side.
+//! - `asap_sketch::SummaryKind` / `SummaryParams` — typed sketch-family
+//!   selector + parameter payload (moved out of this crate — formerly
+//!   `sketch_params::SketchKind`/`SketchParams` — Stage 3 of the
+//!   sketch-identity unification; see
+//!   `scratchpad/artifacts/enum-unification-plan.md`).
 //! - [`bind_query_expr`] — the L3→L4 lowering driver: bottom-up walk
 //!   that fires `Bind*` rules.
 //! - [`rules`] — the `Bind*` rule family. Each rule pattern-matches on a
@@ -34,13 +36,6 @@ pub mod lower;
 pub mod matcher;
 pub mod physical_expr;
 pub mod rules;
-pub mod sketch_params;
-
-// Back-compat alias. External call sites that imported
-// `control_plane::sketch_algebra::params::*` (and the in-tree
-// `crate::sketch_algebra::params::SketchKind` use sites that this
-// touch-up didn't migrate) keep compiling.
-pub use sketch_params as params;
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +48,3 @@ pub use capability_matching::{
 pub use lower::{bind_query_expr, BindingError};
 pub use matcher::SummaryFamilyMatcher;
 pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
-pub use sketch_params::{
-    CmsParams, CountSketchParams, DDSketchParams, HllParams, KllParams, SketchKind, SketchParams,
-};
