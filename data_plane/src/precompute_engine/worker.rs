@@ -1370,7 +1370,7 @@ mod tests {
     use crate::precompute_engine::output_sink::CapturingOutputSink;
     use crate::storage_engines::types::StreamingConfig;
     use asap_sketchlib::KllSketch;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
 
     fn make_agg_config(
@@ -1410,9 +1410,9 @@ mod tests {
         // streaming-config map by reading `config.policy_fp_u64()`
         // from the returned value.
         let window_type = if slide_secs == 0 || slide_secs == window_secs {
-            WindowType::Tumbling
+            WindowKind::Tumbling
         } else {
-            WindowType::Sliding
+            WindowKind::Sliding
         };
         AggregationConfig::new(
             agg_type,
@@ -2184,7 +2184,7 @@ aggregations:
             String::new(),
             60,
             0,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             "http_requests_total".to_string(),
             "http_requests_total".to_string(),
             Some(60),

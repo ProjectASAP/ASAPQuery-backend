@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use asap_types::aggregation_config::AggregationConfig;
-use asap_types::enums::WindowType;
+use asap_types::enums::WindowKind;
 use asap_types::AggregationType;
 use asap_types::KeyByLabelNames;
 use serde_json::{json, Value};
@@ -46,7 +46,7 @@ fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> Aggregation
         String::new(),
         60,
         60,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         String::new(),
         "m".to_string(),
         None,

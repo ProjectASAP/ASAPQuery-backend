@@ -116,34 +116,15 @@ impl FromStr for CleanupPolicy {
     }
 }
 
-/// Window type for streaming aggregations.
-#[derive(
-    Clone, Debug, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum WindowType {
-    #[default]
-    Tumbling,
-    Sliding,
-}
-
-impl fmt::Display for WindowType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WindowType::Tumbling => write!(f, "tumbling"),
-            WindowType::Sliding => write!(f, "sliding"),
-        }
-    }
-}
-
-impl FromStr for WindowType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "tumbling" => Ok(WindowType::Tumbling),
-            "sliding" => Ok(WindowType::Sliding),
-            _ => Err(format!("Unknown window type: '{s}'")),
-        }
-    }
-}
+/// Window lifecycle/flush semantics for streaming aggregations.
+///
+/// Formerly a local `WindowType` (`Tumbling`/`Sliding`) enum. Retired in
+/// favor of `asap_ir::intent_algebra::query_expr::WindowKind` directly —
+/// same concept, plus a `Session` variant this workspace didn't have.
+/// `Copy`/`Default`/`Hash`/`Display`/`FromStr` and
+/// `#[serde(rename_all = "snake_case")]` were added upstream
+/// (ASAPController PR #143) specifically so this re-export could replace
+/// the old local type without touching any call site's behavior: same
+/// `Tumbling` default, same lowercase `Display`/`FromStr` round-trip, same
+/// wire format.
+pub use asap_ir::intent_algebra::query_expr::WindowKind;

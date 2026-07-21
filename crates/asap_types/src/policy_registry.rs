@@ -115,7 +115,7 @@ impl PolicyRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::WindowType;
+    use crate::enums::WindowKind;
     use crate::AggregationType;
     use crate::KeyByLabelNames;
     use std::collections::HashMap as StdHashMap;
@@ -134,7 +134,7 @@ mod tests {
             String::new(),
             60,
             60,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             metric.to_string(),
             None,

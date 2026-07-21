@@ -10,7 +10,7 @@ use crate::query_engines::asap_query_engine::engine::ASAPQueryEngine;
 use crate::query_engines::query_result::InstantVectorElement;
 use crate::storage_engines::types::{
     AggregationConfig, AggregationType, KeyByLabelValues, PrecomputedOutput, QueryLanguage,
-    StreamingConfig, WindowType,
+    StreamingConfig, WindowKind,
 };
 use crate::AggregateCore;
 use asap_types::KeyByLabelNames;
@@ -99,7 +99,7 @@ pub fn create_engine_single_pop_with_aggregated(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
@@ -191,7 +191,7 @@ pub fn create_engine_dual_input(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
@@ -213,7 +213,7 @@ pub fn create_engine_dual_input(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
@@ -300,7 +300,7 @@ pub fn create_engine_two_metrics(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric_a.to_string(),
@@ -321,7 +321,7 @@ pub fn create_engine_two_metrics(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric_b.to_string(),
@@ -418,7 +418,7 @@ pub fn create_engine_three_metrics(
             original_yaml: String::new(),
             window_size: 1,
             slide_interval: 1,
-            window_type: WindowType::Tumbling,
+            window_type: WindowKind::Tumbling,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),
             metric: metric.to_string(),
@@ -492,7 +492,7 @@ pub fn create_engine_multi_timestamp(
         original_yaml: String::new(),
         window_size: 1,
         slide_interval: 1,
-        window_type: WindowType::Tumbling,
+        window_type: WindowKind::Tumbling,
         spatial_filter: String::new(),
         spatial_filter_normalized: String::new(),
         metric: metric.to_string(),
@@ -542,7 +542,7 @@ pub fn create_engine_multi_timestamp_with_window(
     data: Vec<(u64, Option<Vec<String>>, Box<dyn AggregateCore>)>,
     promql_query: &str,
     window_size: u64,
-    window_type: WindowType,
+    window_type: WindowKind,
 ) -> ASAPQueryEngine {
     let grouping_label_strings: Vec<String> =
         grouping_labels.iter().map(|s| s.to_string()).collect();

@@ -3044,7 +3044,7 @@ aggregations:
         active_agg_ids: &[u64],
     ) -> (u16, std::collections::HashMap<u64, u64>) {
         use asap_types::aggregation_config::AggregationConfig;
-        use asap_types::enums::WindowType;
+        use asap_types::enums::WindowKind;
         use asap_types::AggregationType;
         use asap_types::KeyByLabelNames;
         use std::collections::HashMap;
@@ -3075,7 +3075,7 @@ aggregations:
                 original_yaml: String::new(),
                 window_size: 1,
                 slide_interval: 1,
-                window_type: WindowType::Tumbling,
+                window_type: WindowKind::Tumbling,
                 spatial_filter: String::new(),
                 spatial_filter_normalized: String::new(),
                 metric: metric.clone(),

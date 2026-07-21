@@ -138,7 +138,7 @@ impl std::fmt::Debug for HotReloadStreamingConfig {
 mod tests {
     use super::*;
     use crate::storage_engines::types::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
@@ -155,7 +155,7 @@ mod tests {
             String::new(),
             60,
             60,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             format!("metric_{id}"),
             None,

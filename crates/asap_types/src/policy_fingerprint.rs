@@ -172,7 +172,7 @@ impl std::fmt::Display for PolicyFingerprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::WindowType;
+    use crate::enums::WindowKind;
     use crate::AggregationType;
     use crate::KeyByLabelNames;
     use std::collections::HashMap;
@@ -195,7 +195,7 @@ mod tests {
             String::new(),
             window_size,
             window_size,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             spatial_filter.to_string(),
             metric.to_string(),
             None,

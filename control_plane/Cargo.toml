@@ -39,14 +39,14 @@ asap_types.workspace = true
 # tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
 # once one exists.
 #
-# Bumped to 150ef7d (merge of PR #142, "derive PartialOrd/Ord for
-# SummaryKind") for the sketch-identity unification work (see
-# scratchpad/artifacts/enum-unification-plan.md) -- SummaryKind needs Ord
-# for the BTreeSet<SummaryKind> deterministic-emission-order contract in
-# control_plane::physical::colored_dag::emitter::EdgeStageConfig::metric_to_family.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "150ef7d0786d24286b578dfae9dbbcefc8fbac3e" }
+# Bumped to 7fcaf91 (merge of PR #143, "add serving-time traits to
+# WindowKind") for the WindowType -> WindowKind unification (see
+# scratchpad/artifacts/enum-unification-plan.md) -- WindowKind needs
+# Copy/Default/Hash/Display/FromStr + snake_case serde for
+# asap_types::enums::WindowKind to replace the backend's own WindowType.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -118,7 +118,7 @@ pub fn build_backfilled_accumulator(
 mod tests {
     use super::*;
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
@@ -134,7 +134,7 @@ mod tests {
             String::new(),
             60,
             60,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             "m".to_string(),
             None,

@@ -1442,7 +1442,7 @@ mod tests {
                 String::new(),
                 window_size,
                 window_size,
-                asap_types::enums::WindowType::Tumbling,
+                asap_types::enums::WindowKind::Tumbling,
                 spatial_filter.to_string(),
                 metric.to_string(),
                 None,

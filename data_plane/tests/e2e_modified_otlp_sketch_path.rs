@@ -38,7 +38,7 @@ use asap_sketchlib::proto::sketchlib::{
 };
 use asap_sketchlib::MessagePackCodec;
 use asap_types::aggregation_config::AggregationConfig;
-use asap_types::enums::WindowType;
+use asap_types::enums::WindowKind;
 use asap_types::AggregationType;
 use prost::Message;
 use std::collections::HashMap;
@@ -78,7 +78,7 @@ fn make_count_min_agg_config(
         String::new(),
         window_secs,
         0,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         metric.to_string(),
         metric.to_string(),
         None,
@@ -344,7 +344,7 @@ fn make_count_sketch_agg_config(
         String::new(),
         window_secs,
         0,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         metric.to_string(),
         metric.to_string(),
         None,
@@ -555,7 +555,7 @@ fn make_kll_agg_config(
         String::new(),
         window_secs,
         0,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         metric.to_string(),
         metric.to_string(),
         None,
@@ -735,7 +735,7 @@ fn make_dd_sketch_agg_config(
         String::new(),
         window_secs,
         0,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         metric.to_string(),
         metric.to_string(),
         None,
@@ -907,7 +907,7 @@ fn make_hll_agg_config(
         String::new(),
         window_secs,
         0,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         metric.to_string(),
         metric.to_string(),
         None,

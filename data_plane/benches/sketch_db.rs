@@ -388,7 +388,7 @@ fn bench_query_precomputes_by_agg(c: &mut Criterion) {
 /// case, where the per-batch reconcile is pure scan overhead.
 fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types::StreamingConfig {
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType as AT;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
@@ -403,7 +403,7 @@ fn matching_streaming_config(metric: &str) -> data_plane::storage_engines::types
         String::new(),
         60,
         60,
-        WindowType::Tumbling,
+        WindowKind::Tumbling,
         String::new(),
         metric.to_string(),
         None,
