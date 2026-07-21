@@ -7,9 +7,9 @@ use std::io::BufReader;
 use std::ops::Index;
 
 use crate::aggregation_config::AggregationConfig;
-use crate::capability_matching::StorageBackend;
 use crate::enums::QueryLanguage;
 use crate::policy_registry::PolicyRegistry;
+use crate::storage_backend::StorageBackend;
 
 /// One continuous-monitoring (CDM) threshold spec. The data-plane monitor
 /// coordinator owns the AUTHORITATIVE `tau`/`epsilon`/`window_ms` (the edge

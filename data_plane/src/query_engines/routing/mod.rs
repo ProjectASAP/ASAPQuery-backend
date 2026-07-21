@@ -17,8 +17,10 @@
 //!   engine answers a given `(query, metric_storage)` pair.
 //! * [`capability_matching`] — the storage-backend routing policy itself
 //!   (`AccuracyTarget`, `compatible_storage_backends`). Split out of
-//!   `asap_types::capability_matching` since it's a pure serving-time
-//!   decision with no `control_plane` callers.
+//!   `asap_types`'s former `capability_matching` module (now
+//!   `asap_types::storage_backend`, since only `StorageBackend` itself
+//!   stayed there) since it's a pure serving-time decision with no
+//!   `control_plane` callers.
 //!
 //! Step-1 of the JSONL deprecation refactor lifted these out of
 //! `data_model/backend_storage_routing.rs` and `query-engines/router.rs`

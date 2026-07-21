@@ -2,7 +2,7 @@
 //! and the storage tier a metric is configured for, decide which backends
 //! can serve it and in what preference order.
 //!
-//! Split out of `asap_types::capability_matching` (see
+//! Split out of `asap_types`'s former `capability_matching` module (see
 //! `scratchpad/artifacts/enum-unification-plan.md`) — `asap_types` keeps
 //! [`asap_types::StorageBackend`] (a real field on the shared
 //! `StreamingConfig` wire format both `control_plane` and `data_plane`
