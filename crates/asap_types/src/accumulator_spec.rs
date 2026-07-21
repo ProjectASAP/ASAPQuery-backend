@@ -72,7 +72,7 @@ use serde_json::Value;
 
 use crate::aggregation_config::AggregationConfig;
 use crate::key_by_label_names::KeyByLabelNames;
-use promql_utilities::query_logics::enums::AggregationType;
+use crate::AggregationType;
 
 pub use asap_sketch::{SummaryKind, SummaryParams};
 
