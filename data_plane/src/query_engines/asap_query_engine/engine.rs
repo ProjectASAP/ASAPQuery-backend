@@ -3632,6 +3632,8 @@ mod asap_tier_classify_tests {
     /// the first place.
     #[test]
     fn analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time() {
+        use crate::storage_engines::sketch_db::data::AggregationType;
+        use crate::storage_engines::sketch_db::index::Capability;
         use control_plane::asap_tier_analysis::{analyze_promql_for_asap_tier, OuterFn};
         let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
         let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
@@ -3644,18 +3646,29 @@ mod asap_tier_classify_tests {
         assert!(sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty());
         assert!(bare.unsupported.is_none() && !bare.candidates.is_empty());
 
-        // Same capability for ALL — the field that disambiguates is
-        // `outer_fn`, not `required_capability`.
+        // Whichever query has a `rate(...)` call ANYWHERE in its tree
+        // (bare `rate(...)` or composed `sum by (...) (rate(...))`) binds
+        // to `AggIntent::Rate` and now maps to `ExactAgg(Increase)` --
+        // matching `asap_plan::boundary::implementation_for`'s
+        // `SummaryKind::Rate` (ASAPController models Rate as its own
+        // summary family; see `capability_for`'s module doc and
+        // `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
+        // why a Sum-registered sid still answers it). This is a real,
+        // intentional behavior change from the Phase 2 semantic retarget
+        // (Rate/Increase used to collapse onto AggIntent::Sum) -- not a
+        // stale assertion left over from before it. `sot`/`bare` have no
+        // `rate(...)` anywhere and stay `ExactAgg(Sum)`.
         assert_eq!(
             rate.candidates[0].required_capability,
+            Capability::ExactAgg(AggregationType::Increase),
+        );
+        assert_eq!(
+            rate.candidates[0].required_capability, sum_by_rate.candidates[0].required_capability,
+            "composed `sum by (...) (rate(...))` binds the same Rate \
+             AggIntent as bare `rate(...)`",
+        );
+        assert_eq!(
             sot.candidates[0].required_capability,
-        );
-        assert_eq!(
-            rate.candidates[0].required_capability,
-            sum_by_rate.candidates[0].required_capability,
-        );
-        assert_eq!(
-            rate.candidates[0].required_capability,
             bare.candidates[0].required_capability,
         );
 
@@ -3672,11 +3685,15 @@ mod asap_tier_classify_tests {
     }
 
     /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.
-    /// The analyzer gives `Capability::ExactAgg(Sum)` with
-    /// `function="sum"` (outer), `range_seconds=300` (lifted from the
-    /// inner rate's matrix selector), AND `outer_fn=OuterFn::Rate`
+    /// The analyzer gives `Capability::ExactAgg(Increase)` (the inner
+    /// `rate(...)` binds the `AggIntent::Rate` `capability_for` reads;
+    /// see `analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time`)
+    /// with `function="sum"` (outer), `range_seconds=300` (lifted from
+    /// the inner rate's matrix selector), AND `outer_fn=OuterFn::Rate`
     /// (the analyzer's PromQL trace walker flags the inner rate call).
-    /// The engine dispatches to `evaluate_exact_agg_rate` off the
+    /// The registered sid here is `ExactAgg(Sum)` -- satisfied via
+    /// `Capability::is_satisfied_by`'s `sum_satisfies_increase`. The
+    /// engine dispatches to `evaluate_exact_agg_rate` off the
     /// typed `outer_fn` field, which folds the per-zone per-window
     /// sums and divides by 300.
     #[tokio::test]

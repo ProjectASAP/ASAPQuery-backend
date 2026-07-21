@@ -93,14 +93,27 @@ pub enum Capability {
 /// `sum_over_time(metric[r])` / `sum(metric)` / bare selector WITHOUT
 /// re-parsing the raw PromQL string.
 ///
-/// Background: the lowerer collapses every `AggFunc` in
+/// Background: until the Phase 2 semantic retarget (ASAPController
+/// alignment), the lowerer collapsed every `AggFunc` in
 /// `{Sum, Rate, Increase, Delta}` onto a single `AggIntent::Sum`, which
-/// `capability_for` then maps to `Capability::ExactAgg(Sum)`. That
-/// collapse erases the rate-vs-plain distinction the engine needs to
+/// `capability_for` then mapped to `Capability::ExactAgg(Sum)` for all
+/// of them — erasing the rate-vs-plain distinction the engine needs to
 /// decide between the plain ExactAgg reducer and the rate-divisor
-/// reducer (`evaluate_exact_agg_rate`). Before this enum landed the
-/// engine re-walked the raw PromQL via a `query_contains_rate_call`
-/// helper to recover the distinction; that was a lossy-lowering smell.
+/// reducer (`evaluate_exact_agg_rate`). `OuterFn` was introduced to
+/// carry that distinction back (replacing an earlier raw-string
+/// `query_contains_rate_call` re-parse). `rate`/`increase` now bind
+/// their own `AggIntent::Rate`/`AggIntent::Increase` (matching
+/// `asap_plan::boundary::implementation_for`'s `SummaryKind::Rate`/
+/// `Increase` — ASAPController models Rate as a distinct summary
+/// family), both mapping to `Capability::ExactAgg(AggregationType::Increase)`;
+/// only `sum`/`sum by (...)`/bare selectors and `sum_over_time` still
+/// bind `AggIntent::Sum` → `ExactAgg(Sum)`. `OuterFn` still carries the
+/// PromQL-function-shape distinction `Capability` doesn't encode (e.g.
+/// which divisor/accumulation strategy `evaluate_exact_agg_rate` uses),
+/// but the sid-matching predicate is no longer purely `ExactAgg(Sum)`
+/// -- see `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
+/// how a Sum-registered sid still answers an `ExactAgg(Increase)`
+/// required capability.
 ///
 /// The walker that populates this lives in `asap_tier_analysis.rs`
 /// (`trace_from_promql`) — it picks the most-specific counter-function
@@ -111,24 +124,18 @@ pub enum Capability {
 ///
 /// Post-#299 the agent streams per-window DELTAS for counters. The four
 /// PromQL counter idioms have genuinely different semantics over those
-/// deltas, but they ALL lower to a single `Capability::ExactAgg(Sum)`
-/// (the `AggIntent::Sum` collapse erases the function name). Before
-/// #301 the engine only distinguished `Rate` from everything else, so
-/// `sum`, `sum_over_time`, `increase`, and instant-sum all hit the same
-/// reducer path and returned the same (wrong) number. This enum carries
-/// the function distinction the engine needs to dispatch correctly:
+/// deltas. Before #301 the engine only distinguished `Rate` from
+/// everything else, so `sum`, `sum_over_time`, `increase`, and
+/// instant-sum all hit the same reducer path and returned the same
+/// (wrong) number. This enum carries the function distinction the
+/// engine needs to dispatch correctly:
 ///
-/// | Variant       | PromQL                       | Engine dispatch                                   |
-/// |---------------|------------------------------|---------------------------------------------------|
-/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | accumulate ALL windows → cumulative-since-storage |
-/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
-/// | `Increase`    | `increase(c[r])`             | Σ deltas in `[t-r,t]` (one cumulative number)     |
-/// | `SumOverTime` | `sum_over_time(c[r])`        | capability-miss → archive (can't reconstruct)     |
-///
-/// The taxonomy lives on `OuterFn` (not the `Capability` algebra) so the
-/// sid-matching half stays a pure `ExactAgg(Sum)` predicate — the
-/// function distinction is a query-evaluation concern, not a stored-state
-/// one.
+/// | Variant       | PromQL                       | `required_capability`  | Engine dispatch                                   |
+/// |---------------|------------------------------|-------------------------|----------------------------------------------------|
+/// | `Plain`       | `sum(c)` / `sum by (..) (c)` | `ExactAgg(Sum)`         | accumulate ALL windows → cumulative-since-storage |
+/// | `Rate`        | `rate(c[r])` / `irate(c[r])` | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` ÷ min(r, coverage)          |
+/// | `Increase`    | `increase(c[r])`             | `ExactAgg(Increase)`    | Σ deltas in `[t-r,t]` (one cumulative number)     |
+/// | `SumOverTime` | `sum_over_time(c[r])`        | `ExactAgg(Sum)`         | capability-miss → archive (can't reconstruct)     |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OuterFn {
     /// No range-style counter function in the expression — bare selector,
@@ -358,10 +365,14 @@ impl Capability {
             // serving multi-pop) is NOT allowed — the single-pop
             // policy has lost the key dimension and can't recover it.
             //
-            // Cross-family ExactAgg combos (Sum vs MinMax, etc.)
-            // remain non-satisfiable: they're different operations.
+            // Cross-family ExactAgg combos are mostly non-satisfiable
+            // (Sum vs MinMax, etc. are different operations) — except
+            // Sum-family serving a required Increase/Rate capability,
+            // which IS sound; see `sum_satisfies_increase`.
             (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
-                req == have || multi_pop_satisfies_single(*req, *have)
+                req == have
+                    || multi_pop_satisfies_single(*req, *have)
+                    || sum_satisfies_increase(*req, *have)
             }
             _ => false,
         }
@@ -415,6 +426,47 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
         (AggregationType::Sum, AggregationType::MultipleSum)
             | (AggregationType::Increase, AggregationType::MultipleIncrease)
             | (AggregationType::MinMax, AggregationType::MultipleMinMax)
+    )
+}
+
+/// True when an available Sum-family accumulator can answer a required
+/// Increase/Rate capability.
+///
+/// `rate()`/`increase()` PromQL both lower to a required
+/// `Capability::ExactAgg(AggregationType::Increase)` (`capability_for`'s
+/// `AggIntent::Rate | AggIntent::Increase` case, matching
+/// `asap_plan::boundary::implementation_for`'s `SummaryKind::Increase |
+/// SummaryKind::Rate` — ASAPController models Rate as its own summary
+/// family). But this workspace's data plane has no storage kind distinct
+/// from Sum for it: `evaluate_exact_agg_rate` (`sketch_reducer.rs`)
+/// already reduces `Sum`/`MultipleSum`/`Increase`/`MultipleIncrease`
+/// identically — all read as `Statistic::Sum` per window, then divided
+/// by the coverage-aware elapsed range — so a Sum-registered sid's raw
+/// per-window deltas answer a rate query exactly as well as an
+/// Increase-registered one's. This is what lets counter metrics ingested
+/// as plain `Sum` (not every ingest path distinguishes Increase from
+/// Sum at registration time) still answer `rate(...)`/`increase(...)`.
+///
+/// Respects the same single/multi-population direction as
+/// [`multi_pop_satisfies_single`]: a multi-pop available (`MultipleSum`)
+/// can serve a single- or multi-pop required capability; a single-pop
+/// available (`Sum`) can only serve a single-pop required one — it has
+/// already lost the per-key breakdown a multi-pop required capability
+/// would need.
+///
+/// Deliberately does NOT apply to a required `Capability::ExactAgg(Sum)`
+/// (plain `sum_over_time`) — reconstructing Σ-of-cumulative-counter-
+/// samples from per-window deltas is unsound (issue #301); that shape is
+/// refused explicitly at the query-dispatch layer, not routed here.
+fn sum_satisfies_increase(required: AggregationType, available: AggregationType) -> bool {
+    matches!(
+        (required, available),
+        (AggregationType::Increase, AggregationType::Sum)
+            | (AggregationType::Increase, AggregationType::MultipleSum)
+            | (
+                AggregationType::MultipleIncrease,
+                AggregationType::MultipleSum
+            )
     )
 }
 
@@ -969,6 +1021,41 @@ mod tests {
                 "ExactAgg({t:?}) should satisfy itself"
             );
         }
+    }
+
+    #[test]
+    fn is_satisfied_by_sum_family_answers_required_increase() {
+        // A Sum-registered sid's raw per-window deltas answer a
+        // rate()/increase() query exactly as well as an Increase-
+        // registered one's -- evaluate_exact_agg_rate (sketch_reducer.rs)
+        // reduces both identically. See sum_satisfies_increase's doc.
+        let required = Capability::ExactAgg(AggregationType::Increase);
+        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
+        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+
+        let required_multi = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        assert!(required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+    }
+
+    #[test]
+    fn is_satisfied_by_sum_family_does_not_answer_required_multi_increase_from_single_sum() {
+        // Same single/multi-population direction as multi_pop_satisfies_single:
+        // a single-pop available (Sum) can't serve a multi-pop required
+        // capability (MultipleIncrease) -- it already lost the per-key
+        // breakdown a multi-pop caller needs.
+        let required = Capability::ExactAgg(AggregationType::MultipleIncrease);
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
+    }
+
+    #[test]
+    fn is_satisfied_by_increase_does_not_answer_required_sum() {
+        // The reverse direction is NOT sound: required ExactAgg(Sum) is
+        // sum_over_time semantics (Σ of raw cumulative-counter samples),
+        // which an Increase-registered sid's per-window deltas cannot
+        // reconstruct (issue #301) -- refused explicitly at the
+        // query-dispatch layer, not routed through here.
+        let required = Capability::ExactAgg(AggregationType::Sum);
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Increase)));
     }
 
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
