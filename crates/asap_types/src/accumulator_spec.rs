@@ -396,7 +396,7 @@ fn param_f64(config: &AggregationConfig, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::WindowType;
+    use crate::enums::WindowKind;
     use crate::key_by_label_names::KeyByLabelNames;
     use std::collections::HashMap;
 
@@ -417,7 +417,7 @@ mod tests {
             String::new(),
             60,
             60,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             "m".to_string(),
             None,
