@@ -1,3 +1,4 @@
+pub mod accumulator_spec;
 pub mod aggregation_config;
 pub mod aggregation_type;
 pub mod enums;
@@ -9,6 +10,7 @@ pub mod query_requirements;
 pub mod traits;
 pub mod utils;
 
+pub use accumulator_spec::{AccumulatorSpec, AccumulatorSpecError, SummaryKind, SummaryParams};
 pub use aggregation_config::*;
 pub use aggregation_type::AggregationType;
 pub use enums::*;

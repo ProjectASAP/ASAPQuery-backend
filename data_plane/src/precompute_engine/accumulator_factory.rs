@@ -7,6 +7,21 @@ use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
 };
 use asap_types::aggregation_config::AggregationConfig;
+// Step 5 (sketch-identity unification, see
+// scratchpad/artifacts/enum-unification-plan.md): dispatch below is
+// driven by `AccumulatorSpec` (SummaryKind + typed SummaryParams +
+// keyed-axis grouping) instead of raw `AggregationType` +
+// `aggregation_sub_type` string matching. Numeric params come straight
+// off `spec.params` (typed, no HashMap lookups) except `cms_params`,
+// kept as a raw-`parameters` read for the one case `SummaryParams` has
+// no field for: HydraKLL's `(row, col)` tiling grid (see
+// `asap_types::accumulator_spec`'s module doc for why). `cms_params`
+// now lives there — the only place that still needs the other three
+// former local helpers (`kll_k_param`, `heap_size_param`,
+// `ddsketch_alpha_param`) is that module's own `AccumulatorSpec`
+// construction, so they aren't re-imported here.
+use asap_types::accumulator_spec::{cms_params, AccumulatorSpecError};
+use asap_types::{SummaryKind, SummaryParams};
 
 /// Generate the two boilerplate clone-based `AccumulatorUpdater` methods
 /// for updaters whose inner `acc` field implements `Clone + AggregateCore`.
@@ -340,28 +355,6 @@ impl AccumulatorUpdater for DDSketchAccumulatorUpdater {
     fn memory_usage_bytes(&self) -> usize {
         // Bucket store is variable; rough estimate matches KLL.
         std::mem::size_of::<DDSketchAccumulator>() + 4096
-    }
-}
-
-/// Pull `relativeAccuracy` (or canonical aliases) out of a
-/// streaming-config aggregation entry. Defaults to 0.01 (1% rel-
-/// err, the same default the agent's `ddsketchprocessor` uses).
-fn ddsketch_alpha_param(config: &AggregationConfig) -> f64 {
-    let parsed = config
-        .parameters
-        .get("relativeAccuracy")
-        .or_else(|| config.parameters.get("relative_accuracy"))
-        .or_else(|| config.parameters.get("alpha"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.01);
-    if parsed > 0.0 && parsed < 1.0 {
-        parsed
-    } else {
-        tracing::warn!(
-            "DDSketch relativeAccuracy {} out of (0,1); using default 0.01",
-            parsed
-        );
-        0.01
     }
 }
 
@@ -756,55 +749,6 @@ pub fn config_is_keyed(config: &AggregationConfig) -> bool {
     )
 }
 
-/// Extract the KLL `k` parameter. Capital `"K"` takes precedence over lowercase
-/// `"k"` to match the convention used by the top-level aggregation type arms.
-fn kll_k_param(config: &AggregationConfig) -> u16 {
-    config
-        .parameters
-        .get("K")
-        .or_else(|| config.parameters.get("k"))
-        .and_then(|v| v.as_u64())
-        .and_then(|v| u16::try_from(v).ok())
-        .unwrap_or(200)
-}
-
-/// Extract `(row_num, col_num)` for CMS / HydraKLL configs.
-///
-/// Reads canonical `d` (depth = rows) / `w` (width = cols) keys —
-/// matches what the control plane's `sketch_params_to_json` emits
-/// and what `sketch_config_to_params` uses for OTLP policy_fp
-/// content matching. The legacy `row_num` / `col_num` form (the
-/// only pre-PR-268 reader) was retired in lock-step with the
-/// asapcollector migration to canonical keys.
-fn cms_params(config: &AggregationConfig) -> (usize, usize) {
-    let row_num = config
-        .parameters
-        .get("d")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(4) as usize;
-    let col_num = config
-        .parameters
-        .get("w")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1000) as usize;
-    (row_num, col_num)
-}
-
-/// Top-k heap size for the `*WithHeap` configs. Reads `heap_size` /
-/// `k` from `parameters`; defaults to 20 (the heap holds the top-k
-/// candidates — it must be ≥ the largest `k` a query asks for).
-fn heap_size_param(config: &AggregationConfig) -> usize {
-    config
-        .parameters
-        .get("heap_size")
-        .or_else(|| config.parameters.get("k"))
-        .or_else(|| config.parameters.get("K"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .filter(|&v| v > 0)
-        .unwrap_or(20)
-}
-
 /// Top-k ranking quantity for the `*WithHeap` configs.
 ///
 /// Selected by `parameters["weight_mode"]` (or alias `topk_weight`):
@@ -831,75 +775,157 @@ fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
     }
 }
 
-/// Extract `(row_num, col_num, k)` for HydraKLL configs.
-fn hydra_kll_params(config: &AggregationConfig) -> (usize, usize, u16) {
-    let (row_num, col_num) = cms_params(config);
-    (row_num, col_num, kll_k_param(config))
-}
-
 // ---------------------------------------------------------------------------
 // Factory function
 // ---------------------------------------------------------------------------
 
-/// Create an appropriate `AccumulatorUpdater` from an `AggregationConfig`.
-pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn AccumulatorUpdater> {
-    let sub_type = config.aggregation_sub_type.as_str();
+/// Read the KLL `k` out of `SummaryParams::Kll`. `accumulator_spec()`
+/// always pairs `SummaryKind::Kll` with `SummaryParams::Kll`, so the
+/// other arm is unreachable from a `spec` this module builds itself.
+fn kll_k(params: &SummaryParams) -> u16 {
+    match params {
+        // Lossless: `accumulator_spec()` only ever stores a value that
+        // already fit in `u16` (via `kll_k_param`'s own `u16::try_from`
+        // fallback) widened to `u32`.
+        SummaryParams::Kll { k } => *k as u16,
+        other => unreachable!(
+            "accumulator_spec() paired SummaryKind::Kll with non-Kll params: {other:?}"
+        ),
+    }
+}
 
-    match config.aggregation_type {
-        AggregationType::SingleSubpopulation => match sub_type {
-            "Sum" | "sum" => Box::new(SumAccumulatorUpdater::new()),
-            "Min" | "min" => Box::new(MinMaxAccumulatorUpdater::new(false)),
-            "Max" | "max" => Box::new(MinMaxAccumulatorUpdater::new(true)),
-            "Increase" | "increase" => Box::new(IncreaseAccumulatorUpdater::new()),
-            "DatasketchesKLL" | "datasketches_kll" | "KLL" | "kll" => {
-                Box::new(KllAccumulatorUpdater::new(kll_k_param(config)))
-            }
-            other => {
-                tracing::warn!(
-                    "Unknown SingleSubpopulation sub_type '{}', defaulting to Sum",
-                    other
-                );
-                Box::new(SumAccumulatorUpdater::new())
-            }
-        },
-        AggregationType::MultipleSubpopulation => match sub_type {
-            "Sum" | "sum" => Box::new(MultipleSumAccumulatorUpdater::new()),
-            "Min" | "min" => Box::new(MultipleMinMaxAccumulatorUpdater::new(false)),
-            "Max" | "max" => Box::new(MultipleMinMaxAccumulatorUpdater::new(true)),
-            "Increase" | "increase" => Box::new(MultipleIncreaseAccumulatorUpdater::new()),
-            "CountMinSketch" | "count_min_sketch" | "CMS" | "cms" => {
-                let (row_num, col_num) = cms_params(config);
-                Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
-            }
-            "HydraKLL" | "hydra_kll" => {
-                let (row_num, col_num, k) = hydra_kll_params(config);
-                Box::new(HydraKllAccumulatorUpdater::new(row_num, col_num, k))
-            }
-            other => {
-                tracing::warn!(
-                    "Unknown MultipleSubpopulation sub_type '{}', defaulting to Sum",
-                    other
-                );
-                Box::new(MultipleSumAccumulatorUpdater::new())
-            }
-        },
-        AggregationType::DatasketchesKLL => {
-            Box::new(KllAccumulatorUpdater::new(kll_k_param(config)))
+/// Read `(width, depth)` out of `SummaryParams::Cms` or `::CountSketch`
+/// — same shape, different variant per bare-sketch identity.
+fn cms_dims(params: &SummaryParams) -> (usize, usize) {
+    match params {
+        SummaryParams::Cms { width, depth } | SummaryParams::CountSketch { width, depth } => {
+            (*width as usize, *depth as usize)
         }
-        AggregationType::MultipleSum => Box::new(MultipleSumAccumulatorUpdater::new()),
-        AggregationType::MultipleIncrease => Box::new(MultipleIncreaseAccumulatorUpdater::new()),
-        AggregationType::MultipleMinMax => Box::new(MultipleMinMaxAccumulatorUpdater::new(
-            sub_type.eq_ignore_ascii_case("max"),
+        other => unreachable!(
+            "accumulator_spec() paired SummaryKind::Cms/CountSketch with unexpected params: {other:?}"
+        ),
+    }
+}
+
+/// Read `(width, depth, heap_size)` out of `SummaryParams::CmsWithHeap`
+/// or `::CountSketchWithHeap`.
+fn cms_heap_dims(params: &SummaryParams) -> (usize, usize, usize) {
+    match params {
+        SummaryParams::CmsWithHeap {
+            width,
+            depth,
+            heap_size,
+        }
+        | SummaryParams::CountSketchWithHeap {
+            width,
+            depth,
+            heap_size,
+        } => (*width as usize, *depth as usize, *heap_size as usize),
+        other => unreachable!(
+            "accumulator_spec() paired a WithHeap SummaryKind with unexpected params: {other:?}"
+        ),
+    }
+}
+
+/// Read the DDSketch relative-accuracy `alpha` out of `SummaryParams::DDSketch`.
+fn ddsketch_alpha(params: &SummaryParams) -> f64 {
+    match params {
+        SummaryParams::DDSketch { alpha } => *alpha,
+        other => unreachable!(
+            "accumulator_spec() paired SummaryKind::DDSketch with non-DDSketch params: {other:?}"
+        ),
+    }
+}
+
+/// Create an appropriate `AccumulatorUpdater` from an `AggregationConfig`.
+///
+/// Dispatches on [`asap_types::AccumulatorSpec`] — `SummaryKind` identity
+/// plus the keyed/unkeyed `grouping` axis — instead of the pre-Step-5
+/// `AggregationType` + `aggregation_sub_type` string combo. See
+/// `asap_types::accumulator_spec`'s module doc for why min/max direction,
+/// HydraKLL's `(row, col)` tiling, and top-k `weight_mode` still read
+/// `config` directly rather than going through `SummaryParams` — none of
+/// those three have a field in ASAPController's upstream type to live in.
+pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn AccumulatorUpdater> {
+    let spec = match config.accumulator_spec() {
+        Ok(spec) => spec,
+        // Three fallback paths, preserved verbatim from the pre-Step-5
+        // dispatch: same warning text, same default updater per case
+        // (Single- and MultipleSubpopulation default to *different*
+        // updaters — see `AccumulatorSpecError`'s doc).
+        Err(AccumulatorSpecError::UnknownSingleSubpopulationSubType(sub_type)) => {
+            tracing::warn!(
+                "Unknown SingleSubpopulation sub_type '{}', defaulting to Sum",
+                sub_type
+            );
+            return Box::new(SumAccumulatorUpdater::new());
+        }
+        Err(AccumulatorSpecError::UnknownMultipleSubpopulationSubType(sub_type)) => {
+            tracing::warn!(
+                "Unknown MultipleSubpopulation sub_type '{}', defaulting to Sum",
+                sub_type
+            );
+            return Box::new(MultipleSumAccumulatorUpdater::new());
+        }
+        Err(AccumulatorSpecError::UnmappedAggregationType(other)) => {
+            tracing::warn!(
+                "Unknown aggregation_type '{:?}', defaulting to SingleSubpopulation Sum",
+                other
+            );
+            return Box::new(SumAccumulatorUpdater::new());
+        }
+    };
+
+    let keyed = spec.grouping.is_some();
+
+    match (&spec.kind, keyed) {
+        (SummaryKind::Sum, false) => Box::new(SumAccumulatorUpdater::new()),
+        (SummaryKind::Sum, true) => Box::new(MultipleSumAccumulatorUpdater::new()),
+
+        // Min/max direction isn't part of `SummaryParams::MinMax`
+        // (upstream models no direction axis) — read straight off
+        // `aggregation_sub_type`, exactly as the pre-Step-5 dispatch did
+        // for the direct `AggregationType::MinMax`/`MultipleMinMax`
+        // arms. `accumulator_spec()` only resolves a wrapper's sub_type
+        // to `SummaryKind::MinMax` for an exact "Min"/"min"/"Max"/"max"
+        // match, so re-deriving via `eq_ignore_ascii_case("max")` here
+        // reproduces the same true/false split for that path too.
+        (SummaryKind::MinMax, false) => Box::new(MinMaxAccumulatorUpdater::new(
+            config.aggregation_sub_type.eq_ignore_ascii_case("max"),
         )),
-        AggregationType::Sum => Box::new(SumAccumulatorUpdater::new()),
-        AggregationType::MinMax => Box::new(MinMaxAccumulatorUpdater::new(
-            sub_type.eq_ignore_ascii_case("max"),
+        (SummaryKind::MinMax, true) => Box::new(MultipleMinMaxAccumulatorUpdater::new(
+            config.aggregation_sub_type.eq_ignore_ascii_case("max"),
         )),
-        AggregationType::Increase => Box::new(IncreaseAccumulatorUpdater::new()),
-        AggregationType::CountMinSketch => {
+
+        (SummaryKind::Increase, false) => Box::new(IncreaseAccumulatorUpdater::new()),
+        (SummaryKind::Increase, true) => Box::new(MultipleIncreaseAccumulatorUpdater::new()),
+
+        (SummaryKind::Kll, false) => Box::new(KllAccumulatorUpdater::new(kll_k(&spec.params))),
+        // HydraKLL: `k` comes off the typed params like the unkeyed case,
+        // but the `(row, col)` tiling grid has no `SummaryParams::Kll`
+        // field to live in (see `asap_types::accumulator_spec`'s module
+        // doc) — read it the same way bare CMS does, via `cms_params`.
+        (SummaryKind::Kll, true) => {
             let (row_num, col_num) = cms_params(config);
+            Box::new(HydraKllAccumulatorUpdater::new(
+                row_num,
+                col_num,
+                kll_k(&spec.params),
+            ))
+        }
+
+        // Bare CMS / bare CountSketch: pre-Step-5 quirk preserved
+        // exactly — CountSketch has no dedicated heap-less accumulator,
+        // so it shares `CmsAccumulatorUpdater` with plain CMS
+        // (point-frequency only; top-k needs the heap-bearing variant
+        // below). `keyed=false` can't actually arise here today (no
+        // `AggregationType` resolves to bare Cms/CountSketch unkeyed —
+        // see accumulator_spec.rs), matched anyway as a safe default.
+        (SummaryKind::Cms, _) | (SummaryKind::CountSketch, _) => {
+            let (row_num, col_num) = cms_dims(&spec.params);
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
+
         // Heap-bearing top-k variants (raw-input ingest path): route to
         // the real `CmsHeapAccumulatorUpdater` so the per-policy top-k
         // heap is BUILT (heap-less CMS could not answer `topk(...)` —
@@ -910,35 +936,34 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // shape (heap is the distinguishing payload), so it routes here
         // too. The OTLP modified-sketch path builds the heap agent-side
         // and uses `SketchEnvelope` ingest, not this raw arm.
-        AggregationType::CountMinSketchWithHeap | AggregationType::CountSketchWithHeap => {
-            let (row_num, col_num) = cms_params(config);
+        (SummaryKind::CmsWithHeap, _) | (SummaryKind::CountSketchWithHeap, _) => {
+            let (row_num, col_num, heap_size) = cms_heap_dims(&spec.params);
             Box::new(CmsHeapAccumulatorUpdater::new(
                 row_num,
                 col_num,
-                heap_size_param(config),
+                heap_size,
                 topk_weight_param(config),
             ))
         }
-        // Heap-LESS CountSketch (raw-input ingest path): route to
-        // `CmsAccumulatorUpdater` — it handles the same `(rows, cols)`
-        // matrix shape and answers point-frequency only. CountSketch
-        // proper has no top-k heap, so `topk(...)` against it routes
-        // through the heap-bearing variant above.
-        AggregationType::CountSketch => {
-            let (row_num, col_num) = cms_params(config);
-            Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
-        }
-        AggregationType::HydraKLL => {
-            let (row_num, col_num, k) = hydra_kll_params(config);
-            Box::new(HydraKllAccumulatorUpdater::new(row_num, col_num, k))
-        }
-        AggregationType::DDSketch => Box::new(DDSketchAccumulatorUpdater::new(
-            ddsketch_alpha_param(config),
-        )),
-        other => {
+
+        (SummaryKind::DDSketch, _) => Box::new(DDSketchAccumulatorUpdater::new(ddsketch_alpha(
+            &spec.params,
+        ))),
+
+        // `SummaryKind::Hll` / `Count` / `Rate` / `Kmv` / `Theta`: no
+        // `AggregationType` resolves to one of these via
+        // `accumulator_spec()`'s `Ok` path today — HLL is caught by
+        // `AccumulatorSpecError::UnmappedAggregationType` above (see its
+        // doc for why: a pre-existing gap, not introduced here), and the
+        // other four have no `AggregationType` counterpart at all. Kept
+        // as an explicit warning fallback rather than `unreachable!()`
+        // so a future `SummaryKind` this dispatch doesn't yet know how
+        // to build fails safe instead of panicking.
+        (other_kind, keyed) => {
             tracing::warn!(
-                "Unknown aggregation_type '{:?}', defaulting to SingleSubpopulation Sum",
-                other
+                "SummaryKind {:?} (keyed={}) has no accumulator_factory mapping, defaulting to Sum",
+                other_kind,
+                keyed
             );
             Box::new(SumAccumulatorUpdater::new())
         }

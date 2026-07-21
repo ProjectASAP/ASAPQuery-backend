@@ -17,3 +17,12 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # unification (scratchpad/artifacts/enum-unification-plan.md). Pin matches
 # control_plane's -- see control_plane/Cargo.toml's comment for the rationale.
 asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
+# Step 5 of the sketch-identity unification (see
+# scratchpad/artifacts/enum-unification-plan.md): `AccumulatorSpec`
+# (accumulator_spec.rs) converges data_plane's identity representation
+# onto ASAPController's `SummaryKind`/`SummaryParams`, same as
+# control_plane already does (Stage 3, merged). Pin MUST match
+# control_plane's pin exactly (`control_plane/Cargo.toml`) -- two
+# different revs of the same git dependency in one workspace resolve
+# to two distinct Rust types that won't unify.
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
