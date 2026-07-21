@@ -6,12 +6,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::ops::Index;
 
-use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
-use crate::capability_matching::find_compatible_aggregation as common_find_compatible;
+use crate::aggregation_config::AggregationConfig;
 use crate::capability_matching::StorageBackend;
 use crate::enums::QueryLanguage;
 use crate::policy_registry::PolicyRegistry;
-use crate::query_requirements::QueryRequirements;
 
 /// One continuous-monitoring (CDM) threshold spec. The data-plane monitor
 /// coordinator owns the AUTHORITATIVE `tau`/`epsilon`/`window_ms` (the edge
@@ -186,17 +184,6 @@ impl StreamingConfig {
             }
         }
         Ok(config)
-    }
-}
-
-impl StreamingConfig {
-    /// Find a compatible aggregation for the given requirements using capability-based matching.
-    /// Delegates to `asap_types::find_compatible_aggregation`.
-    pub fn find_compatible_aggregation(
-        &self,
-        requirements: &QueryRequirements,
-    ) -> Option<AggregationIdInfo> {
-        common_find_compatible(&self.aggregation_configs, requirements)
     }
 }
 
