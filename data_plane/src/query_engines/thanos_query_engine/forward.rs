@@ -59,7 +59,7 @@ pub const DEFAULT_THANOS_QUERY_URL: &str = "http://thanos-query:10903";
 /// for explicit per-query overrides via the `X-ASAP-Engine` header
 /// or the `?engine=` query param. Pinned so dashboards / e2e
 /// scripts can byte-compare without parsing.
-pub const DATA_SOURCE_THANOS_QUERY_ID: &str = asap_types::ENGINE_ID_THANOS_QUERY;
+pub const DATA_SOURCE_THANOS_QUERY_ID: &str = crate::storage_engines::types::ENGINE_ID_THANOS_QUERY;
 
 /// Marker line every `ThanosQueryEngine` answer carries on its
 /// `infos` array. Pinned so dashboards and the upcoming Step-2.4
@@ -411,7 +411,7 @@ impl QueryEngine for ThanosQueryEngine {
             // Re-uses the archive tier slot in the routing
             // matrix; Path A2 swaps the engine answering, not the
             // tier classification. See module docstring.
-            storage_backend: asap_types::StorageBackend::GorillaObjectStore,
+            storage_backend: crate::storage_engines::types::StorageBackend::GorillaObjectStore,
             // Forwarder doesn't materialise samples locally;
             // upstream thanos-query owns the memory budget. We
             // surface a generous ceiling so the cost-aware
@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(caps.data_source_id, DATA_SOURCE_THANOS_QUERY_ID);
         assert_eq!(
             caps.storage_backend,
-            asap_types::StorageBackend::GorillaObjectStore,
+            crate::storage_engines::types::StorageBackend::GorillaObjectStore,
             "Path A2 re-uses the archive tier slot in the routing matrix",
         );
     }

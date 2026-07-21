@@ -3,15 +3,19 @@
 //! can serve it and in what preference order.
 //!
 //! Split out of `asap_types`'s former `capability_matching` module (see
-//! `scratchpad/artifacts/enum-unification-plan.md`) — `asap_types` keeps
-//! [`asap_types::StorageBackend`] (a real field on the shared
-//! `StreamingConfig` wire format both `control_plane` and `data_plane`
-//! need to agree on), but the routing *decision* below has zero
-//! `control_plane` callers; it's exercised only by this crate's own
-//! [`super::query_engine_routing`].
+//! `scratchpad/artifacts/enum-unification-plan.md`). `StorageBackend` and
+//! the `StreamingConfig` wire format it's a field of both turned out to
+//! have zero real `control_plane` dependency either — see
+//! [`crate::storage_engines::types::storage_backend`]'s module doc — so
+//! both moved into this crate; only `AccuracyTarget` and the routing
+//! *decision* below were ever split out separately, since neither has a
+//! shared-struct-field reason to exist. Exercised only by this crate's
+//! own [`super::query_engine_routing`].
 
-use asap_types::{Statistic, StorageBackend};
+use asap_types::Statistic;
 use serde::{Deserialize, Serialize};
+
+use crate::storage_engines::types::StorageBackend;
 
 /// Accuracy hint pushed by the controller at intent-binding time
 /// (`controller/docs/design.md` §6 `core::workload`). The Phase-5 capability

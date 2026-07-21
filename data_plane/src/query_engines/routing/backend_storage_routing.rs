@@ -75,7 +75,7 @@
 //! in BOTH wins from `routes:` (multi-target overrides single-target).
 //!
 //! Valid `StorageBackend` values mirror the snake-cased serde tags on
-//! `asap_types::StorageBackend`: `sketch_store`,
+//! `crate::storage_engines::types::StorageBackend`: `sketch_store`,
 //! `gorilla_object_store`, `double_write`, `prometheus_remote`. (Step-1
 //! of the JSONL deprecation refactor removed the `cold_jsonl_fallback` tag.)
 //!
@@ -97,10 +97,13 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use asap_types::{parse_storage_backend_engine_id, StorageBackend, CANONICAL_QUERY_ENGINE_IDS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tracing::{debug, info};
+
+use crate::storage_engines::types::{
+    parse_storage_backend_engine_id, StorageBackend, CANONICAL_QUERY_ENGINE_IDS,
+};
 
 // ---------------------------------------------------------------------------
 // Query-shape taxonomy

@@ -487,7 +487,7 @@ impl ASAPQueryEngine {
             )
             .map_err(|e| {
                 crate::query_engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                     format!(
                         "SketchStore topk-over-rate fallback reducer failed for `{query}`: \
                          {e:?} — failing over to archive"
@@ -661,7 +661,7 @@ impl ASAPQueryEngine {
     {
         let Some(idx) = self.sketch_index.as_ref() else {
             return Err(crate::query_engines::EngineError::capability_miss(
-                asap_types::StorageBackend::SketchStore.data_source_id(),
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!("ASAPQueryEngine: no sketch index for `{query}` — failing over"),
             ));
         };
@@ -670,7 +670,7 @@ impl ASAPQueryEngine {
 
         if let Some(reason) = &analysis.unsupported {
             return Err(crate::query_engines::EngineError::capability_miss(
-                asap_types::StorageBackend::SketchStore.data_source_id(),
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!(
                     "SketchStore analyzer rejected `{query}` for range query: \
                      {reason:?} — failing over to archive"
@@ -679,7 +679,7 @@ impl ASAPQueryEngine {
         }
         if analysis.candidates.is_empty() {
             return Err(crate::query_engines::EngineError::capability_miss(
-                asap_types::StorageBackend::SketchStore.data_source_id(),
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!(
                     "SketchStore analyzer produced no ASAP-tier candidates for \
                      `{query}` — failing over to archive"
@@ -724,7 +724,7 @@ impl ASAPQueryEngine {
             sids.extend(idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys));
             if sids.is_empty() {
                 return Err(crate::query_engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                     format!(
                         "SketchStore has no policy for metric `{}` satisfying \
                          capability {:?} — failing over to archive",
@@ -755,7 +755,7 @@ impl ASAPQueryEngine {
             }
             if hit_sids.is_empty() {
                 return Err(crate::query_engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                     format!(
                         "SketchStore has no sid satisfying capability {:?} for \
                          metric `{}` — failing over to archive",
@@ -794,7 +794,8 @@ impl ASAPQueryEngine {
                     );
                     if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore
+                                .data_source_id(),
                             format!(
                                 "SketchStore cannot answer `sum_over_time` over counter \
                                  deltas for `{query}` (issue #301) — failing over to archive"
@@ -816,7 +817,7 @@ impl ASAPQueryEngine {
                             )
                             .map_err(|e| {
                                 crate::query_engines::EngineError::capability_miss(
-                                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                                     format!(
                                         "SketchStore exact-agg rate reducer failed for `{query}` over \
                                          [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
@@ -835,7 +836,8 @@ impl ASAPQueryEngine {
                             )
                             .map_err(|e| {
                                 crate::query_engines::EngineError::capability_miss(
-                                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                                    crate::storage_engines::types::StorageBackend::SketchStore
+                                        .data_source_id(),
                                     format!(
                                         "SketchStore exact-agg reducer failed for `{query}` over \
                                          [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
@@ -865,7 +867,8 @@ impl ASAPQueryEngine {
                     )
                     .map_err(|e| {
                         crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore
+                                .data_source_id(),
                             format!(
                                 "SketchStore reducer failed for `{query}` over \
                                  [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
@@ -888,7 +891,7 @@ impl ASAPQueryEngine {
 
         let result = combined_result.ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
-                asap_types::StorageBackend::SketchStore.data_source_id(),
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!("SketchStore reducer produced no result for `{query}`"),
             )
         })?;
@@ -1328,7 +1331,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // Branch 1 — the control plane analyzer rejects the shape.
             if let Some(reason) = &analysis.unsupported {
                 return Err(crate::query_engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                     format!(
                         "SketchStore analyzer rejected `{query}`: {reason:?} — \
                          failing over to archive"
@@ -1341,7 +1344,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // when `candidates.is_empty()` but we keep the
                 // belt-and-braces miss-path for safety.
                 return Err(crate::query_engines::EngineError::capability_miss(
-                    asap_types::StorageBackend::SketchStore.data_source_id(),
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                     format!(
                         "SketchStore analyzer produced no ASAP-tier candidates for \
                          `{query}` — failing over to archive"
@@ -1429,7 +1432,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &req,
                     );
                     return Err(crate::query_engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchStore.data_source_id(),
+                        crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                         format!(
                             "SketchStore has no policy for metric `{}` \
                              with group_by_keys ⊇ {:?} satisfying capability \
@@ -1536,7 +1539,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             &req,
                         );
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore
+                                .data_source_id(),
                             format!(
                                 "SketchStore has no sid satisfying capability \
                                  {:?} for metric `{}` — failing over to archive",
@@ -1612,7 +1616,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             &req,
                         );
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore
+                                .data_source_id(),
                             format!(
                                 "SketchStore FrequencyEstimate sid for metric `{}` cannot \
                                  answer the per-item selector `{}` (CMS/CountSketch return \
@@ -1671,7 +1676,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &req,
                     );
                     return Err(crate::query_engines::EngineError::capability_miss(
-                        asap_types::StorageBackend::SketchStore.data_source_id(),
+                        crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                         format!(
                             "SketchStore cannot answer `sum_over_time` over counter \
                              deltas for metric `{}` (issue #301: Σ-of-cumulative-samples \
@@ -1780,7 +1785,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         ),
                     ) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                             format!(
                                 "SketchStore reducer does not support function `{name}` \
                                  — failing over to archive"
@@ -1791,7 +1796,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         function,
                         capability}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                             format!(
                                 "SketchStore reducer cannot answer `{function}` against \
                                  capability {capability:?} — failing over to archive"
@@ -1803,7 +1808,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         encoding,
                         reason}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                             format!(
                                 "SketchStore reducer failed to decode sketch for sid \
                                  {sid} (encoding={encoding:?}): {reason} — failing over \
@@ -1814,7 +1819,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     Err(crate::storage_engines::sketch_db::query::ASAPTierError::NoData {
                         metric_name: m}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                             format!(
                                 "SketchStore reducer found no samples for metric \
                                  `{m}` in window — failing over to archive"
@@ -1825,7 +1830,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         sid,
                         sketch_kind}) => {
                         return Err(crate::query_engines::EngineError::capability_miss(
-                            asap_types::StorageBackend::SketchStore.data_source_id(),
+                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                             format!(
                                 "SketchStore reducer cannot enumerate top-k for sid \
                                  {sid} (sketch_kind={sketch_kind:?}, no heap) — \
@@ -1917,7 +1922,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             );
         }
         Err(crate::query_engines::EngineError::capability_miss(
-            asap_types::StorageBackend::SketchStore.data_source_id(),
+            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
             format!("ASAPQueryEngine: no sketch index for `{query}` — failing over to archive"),
         ))
     }
@@ -1946,8 +1951,9 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         &self,
     ) -> crate::query_engines::routing::query_engine_routing::EngineCapabilities {
         crate::query_engines::routing::query_engine_routing::EngineCapabilities {
-            data_source_id: asap_types::StorageBackend::SketchStore.data_source_id(),
-            storage_backend: asap_types::StorageBackend::SketchStore,
+            data_source_id: crate::storage_engines::types::StorageBackend::SketchStore
+                .data_source_id(),
+            storage_backend: crate::storage_engines::types::StorageBackend::SketchStore,
             // Warm-tier sketches are O(sketch-size); call it 16 MiB ceiling
             // for buffered ops (KLL with k=200 is well below this).
             supports_streams_above_bytes: 16 * 1024 * 1024,
@@ -2627,7 +2633,7 @@ mod asap_tier_classify_tests {
             EngineError::CapabilityMiss { engine_id, .. } => {
                 assert_eq!(
                     engine_id,
-                    asap_types::StorageBackend::SketchStore.data_source_id()
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id()
                 );
             }
             other => panic!("expected CapabilityMiss, got {other:?}"),
@@ -2657,7 +2663,7 @@ mod asap_tier_classify_tests {
             EngineError::CapabilityMiss { engine_id, .. } => {
                 assert_eq!(
                     engine_id,
-                    asap_types::StorageBackend::SketchStore.data_source_id()
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id()
                 );
             }
             other => panic!("expected CapabilityMiss, got {other:?}"),
@@ -4661,8 +4667,9 @@ mod range_stitch_tests {
         }
         fn capabilities(&self) -> EngineCapabilities {
             EngineCapabilities {
-                data_source_id: asap_types::StorageBackend::GorillaObjectStore.data_source_id(),
-                storage_backend: asap_types::StorageBackend::GorillaObjectStore,
+                data_source_id: crate::storage_engines::types::StorageBackend::GorillaObjectStore
+                    .data_source_id(),
+                storage_backend: crate::storage_engines::types::StorageBackend::GorillaObjectStore,
                 supports_streams_above_bytes: usize::MAX,
             }
         }

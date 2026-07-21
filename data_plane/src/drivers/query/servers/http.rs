@@ -20,8 +20,8 @@ use crate::query_engines::routing::{
     AccuracyTarget, EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
 };
 use crate::query_engines::ASAPQueryEngine;
+use crate::storage_engines::types::StorageBackend;
 use asap_types::Statistic;
-use asap_types::StorageBackend;
 
 // ─── Control-plane-pushed precompute job registry ────────────────────────────
 //
@@ -5330,7 +5330,7 @@ async fn handle_post_streaming_config(
         }
     };
     let new_config =
-        match asap_types::streaming_config::StreamingConfig::from_yaml_data(&yaml_value) {
+        match crate::storage_engines::types::StreamingConfig::from_yaml_data(&yaml_value) {
             Ok(c) => c,
             Err(e) => {
                 let body = serde_json::json!({

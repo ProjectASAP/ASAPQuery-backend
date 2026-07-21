@@ -99,8 +99,8 @@ fn canned_plan_yaml(_agg_id: u64, metric: &str) -> String {
 fn expected_fp_for(metric: &str) -> u64 {
     let yaml = canned_plan_yaml(0, metric);
     let data: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml parses");
-    let sc =
-        asap_types::streaming_config::StreamingConfig::from_yaml_data(&data).expect("yaml decodes");
+    let sc = crate::storage_engines::types::StreamingConfig::from_yaml_data(&data)
+        .expect("yaml decodes");
     *sc.aggregation_configs
         .keys()
         .next()

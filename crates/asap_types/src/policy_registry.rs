@@ -1,10 +1,11 @@
 //! Content-addressed policy registry.
 //!
-//! Derived view over a `StreamingConfig` that maps
+//! Derived view over a collection of `AggregationConfig`s that maps
 //! [`PolicyFingerprint`] → [`AggregationConfig`]. This is the
 //! merged-sid-identity-chain replacement for the controller-allocated
-//! `aggregation_id`-keyed `HashMap` that today's `StreamingConfig`
-//! carries.
+//! `aggregation_id`-keyed `HashMap` that `data_plane`'s `StreamingConfig`
+//! carries (see `data_plane::storage_engines::types::streaming_config`'s
+//! module doc for why that type lives there, not here).
 //!
 //! ## Dual-keyed transition
 //!
@@ -25,13 +26,12 @@
 //! map produce the same fingerprint, the later one wins (last-write
 //! semantics). In practice the source should never contain duplicates;
 //! if it does, that's a control-plane bug worth surfacing in telemetry
-//! (see `PolicyRegistry::from_streaming_config_with_collisions`).
+//! (see [`PolicyRegistry::from_configs_with_collisions`]).
 
 use std::collections::HashMap;
 
 use crate::aggregation_config::AggregationConfig;
 use crate::policy_fingerprint::PolicyFingerprint;
-use crate::streaming_config::StreamingConfig;
 
 /// Content-addressed lookup table for active aggregation policies.
 #[derive(Debug, Clone, Default)]
@@ -73,17 +73,6 @@ impl PolicyRegistry {
             }
         }
         (Self { policies }, collisions)
-    }
-
-    /// Build from a `StreamingConfig`. Sugar over `from_configs` —
-    /// keeps callers from needing to walk the legacy map themselves.
-    pub fn from_streaming_config(cfg: &StreamingConfig) -> Self {
-        Self::from_configs(cfg.aggregation_configs.values().cloned())
-    }
-
-    /// `from_streaming_config` + collision count.
-    pub fn from_streaming_config_with_collisions(cfg: &StreamingConfig) -> (Self, usize) {
-        Self::from_configs_with_collisions(cfg.aggregation_configs.values().cloned())
     }
 
     /// Look up the config for a fingerprint.
@@ -175,23 +164,5 @@ mod tests {
         let (reg, collisions) = PolicyRegistry::from_configs_with_collisions(vec![a, b]);
         assert_eq!(reg.len(), 2);
         assert_eq!(collisions, 0);
-    }
-
-    #[test]
-    fn from_streaming_config_walks_the_map() {
-        let mut map = StdHashMap::new();
-        map.insert(1, cfg(1, "http_lat"));
-        map.insert(2, cfg(2, "cpu_pct"));
-        let sc = StreamingConfig::new(map);
-        let reg = PolicyRegistry::from_streaming_config(&sc);
-        assert_eq!(reg.len(), 2);
-    }
-
-    #[test]
-    fn empty_streaming_config_yields_empty_registry() {
-        let sc = StreamingConfig::new(StdHashMap::new());
-        let reg = PolicyRegistry::from_streaming_config(&sc);
-        assert!(reg.is_empty());
-        assert_eq!(reg.len(), 0);
     }
 }

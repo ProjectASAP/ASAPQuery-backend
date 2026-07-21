@@ -28,14 +28,16 @@ pub const CANONICAL_QUERY_ENGINE_IDS: &[&str] = &[ENGINE_ID_ASAP_QUERY, ENGINE_I
 /// fallback) was deleted at the same commit; the surviving
 /// failover surface is ASAP-tier sketch ↔ Thanos archive.
 ///
-/// Lives here (not `data_plane`) because it's a field on the shared
-/// `StreamingConfig` wire format both `control_plane` (which constructs it)
-/// and `data_plane` (which serves against it) need to agree on. The actual
-/// storage-backend *routing policy* — deciding which backends can serve a
-/// query and in what preference order — is a pure serving-time decision
-/// with zero `control_plane` callers; that logic (`AccuracyTarget`,
-/// `compatible_storage_backends`) lives in
-/// `data_plane::query_engines::routing::capability_matching` instead.
+/// Formerly `asap_types::capability_matching::StorageBackend` (then
+/// `asap_types::storage_backend::StorageBackend`). Moved here alongside
+/// `StreamingConfig` (see `scratchpad/artifacts/enum-unification-plan.md`)
+/// once auditing real call sites showed `control_plane` never actually
+/// depends on this type or `StreamingConfig` — it emits wire-compatible
+/// JSON by hand via its own `StreamingConfigEmitter`, never importing
+/// either. See [`super::streaming_config`]'s module doc for the fuller
+/// story. The routing *policy* (`AccuracyTarget`,
+/// `compatible_storage_backends`) already lived in
+/// `data_plane::query_engines::routing::capability_matching`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackend {

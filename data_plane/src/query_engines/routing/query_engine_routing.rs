@@ -2,7 +2,7 @@
 //! to the engine that owns the chosen storage tier.
 //!
 //! The router holds a small map keyed by
-//! [`asap_types::StorageBackend::data_source_id`]
+//! [`crate::storage_engines::types::StorageBackend::data_source_id`]
 //! and walks the ordered backend list returned by
 //! [`super::capability_matching::compatible_storage_backends`]. The first registered
 //! engine answers; on a recoverable backend failure (`EngineError::Backend`),
@@ -20,8 +20,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use crate::storage_engines::types::StorageBackend;
 use asap_types::Statistic;
-use asap_types::StorageBackend;
 
 use super::capability_matching::{compatible_storage_backends, AccuracyTarget};
 use crate::query_engines::{EngineError, QueryResult};
