@@ -17,11 +17,11 @@ use tracing::{debug, info, warn};
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::query_engines::routing::{
-    EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
+    AccuracyTarget, EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
 };
 use crate::query_engines::ASAPQueryEngine;
 use asap_types::Statistic;
-use asap_types::{AccuracyTarget, StorageBackend};
+use asap_types::StorageBackend;
 
 // ─── Control-plane-pushed precompute job registry ────────────────────────────
 //

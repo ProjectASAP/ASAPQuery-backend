@@ -13,8 +13,8 @@ pub mod utils;
 pub use aggregation_config::*;
 pub use aggregation_type::AggregationType;
 pub use capability_matching::{
-    compatible_storage_backends, parse_storage_backend_engine_id, AccuracyTarget, StorageBackend,
-    CANONICAL_QUERY_ENGINE_IDS, ENGINE_ID_ASAP_QUERY, ENGINE_ID_THANOS_QUERY,
+    parse_storage_backend_engine_id, StorageBackend, CANONICAL_QUERY_ENGINE_IDS,
+    ENGINE_ID_ASAP_QUERY, ENGINE_ID_THANOS_QUERY,
 };
 pub use enums::*;
 pub use key_by_label_names::KeyByLabelNames;
