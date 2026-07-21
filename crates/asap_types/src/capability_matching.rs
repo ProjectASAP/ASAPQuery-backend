@@ -10,7 +10,7 @@ use crate::aggregation_config::{AggregationConfig, AggregationIdInfo};
 use crate::enums::WindowType;
 use crate::query_requirements::QueryRequirements;
 use crate::utils::normalize_spatial_filter;
-use promql_utilities::query_logics::enums::AggregationType;
+use crate::AggregationType;
 
 pub const ENGINE_ID_ASAP_QUERY: &str = "asap_query";
 pub const ENGINE_ID_THANOS_QUERY: &str = "thanos_query";

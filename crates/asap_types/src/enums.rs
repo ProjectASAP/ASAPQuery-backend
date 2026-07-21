@@ -2,9 +2,6 @@ use std::fmt;
 use std::str::FromStr;
 use tracing::debug;
 
-// Re-export AggregationType from promql_utilities (defined there to avoid circular deps).
-pub use promql_utilities::query_logics::enums::AggregationType;
-
 /// The scalar value a serving-time query wants out of an already-built
 /// accumulator: "given a live `AggregateCore` implementation, which
 /// number do you want?" Every accumulator's `AggregateCore::query_statistic`

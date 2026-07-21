@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/promql_utilities",
     "crates/asap_otel_proto",
     "crates/asap_types",
     "data_plane",
@@ -44,7 +43,6 @@ tokio = { version = "1.0", features = ["full"] }
 arc-swap = "1.7"
 
 # Internal crates
-promql_utilities = { path = "crates/promql_utilities" }
 asap_types = { path = "crates/asap_types" }
 asap_otel_proto = { path = "crates/asap_otel_proto" }
 indexmap = { version = "2.0", features = ["serde"] }

@@ -651,7 +651,7 @@ fn duration_to_seconds(d: Duration) -> u64 {
 /// serve any ASAP-tier candidate" and skip.
 pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capability> {
     use crate::sketch_algebra::capability::SketchKindHandle;
-    use promql_utilities::query_logics::enums::AggregationType;
+    use asap_types::AggregationType;
     match cfg.aggregation_type {
         // Exact-aggregation families — the ASAP-tier ExactAgg path.
         AggregationType::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
@@ -735,7 +735,7 @@ pub fn find_policy_by_content(
     registry: &asap_types::PolicyRegistry,
     metric: &str,
     group_by_keys: &BTreeSet<String>,
-    agg_type: promql_utilities::query_logics::enums::AggregationType,
+    agg_type: asap_types::AggregationType,
     expected_params: &std::collections::HashMap<String, serde_json::Value>,
 ) -> Option<asap_types::PolicyFingerprint> {
     let mut hit: Option<asap_types::PolicyFingerprint> = None;
@@ -833,7 +833,7 @@ pub fn find_matching_policies(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use promql_utilities::query_logics::enums::AggregationType;
+    use asap_types::AggregationType;
 
     fn keys(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -1420,9 +1420,9 @@ mod tests {
 
     mod matching {
         use super::super::*;
+        use asap_types::AggregationType;
         use asap_types::KeyByLabelNames;
         use asap_types::{AggregationConfig, PolicyFingerprint, PolicyRegistry};
-        use promql_utilities::query_logics::enums::AggregationType;
         use std::collections::HashMap;
 
         fn cfg(

@@ -329,7 +329,8 @@ mod tests {
     };
     use crate::storage_engines::types::StreamingConfig;
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::sync::Mutex;
 

@@ -11,8 +11,8 @@ use prost::Message;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use asap_types::AggregationType;
 use asap_types::Statistic;
-use promql_utilities::query_logics::enums::AggregationType;
 
 /// Accumulator that stores a serialized `SketchEnvelope` protobuf.
 ///

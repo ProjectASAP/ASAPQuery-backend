@@ -1726,9 +1726,9 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// fails the (rare) defensive path explicitly.
 fn aggregation_type_for_sketch_handle(
     handle: crate::storage_engines::sketch_db::index::SketchKindHandle,
-) -> Option<promql_utilities::query_logics::enums::AggregationType> {
+) -> Option<asap_types::AggregationType> {
     use crate::storage_engines::sketch_db::index::SketchKindHandle;
-    use promql_utilities::query_logics::enums::AggregationType;
+    use asap_types::AggregationType;
     match handle {
         SketchKindHandle::DDSketch => Some(AggregationType::DDSketch),
         SketchKindHandle::Kll => Some(AggregationType::DatasketchesKLL),
@@ -2898,7 +2898,7 @@ mod policy_fp_lookup_tests {
     use super::*;
     use crate::storage_engines::sketch_db::data::SketchConfig;
     use crate::storage_engines::sketch_db::index::SketchKindHandle;
-    use promql_utilities::query_logics::enums::AggregationType;
+    use asap_types::AggregationType;
 
     #[test]
     fn handle_to_agg_type_round_trips_canonical_kinds() {
@@ -4003,7 +4003,8 @@ mod sid_bucketing_tests {
         Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
     use std::sync::Arc;

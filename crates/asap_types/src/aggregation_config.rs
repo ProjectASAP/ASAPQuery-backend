@@ -7,8 +7,8 @@ use crate::enums::{QueryLanguage, WindowType};
 use crate::policy_fingerprint::PolicyFingerprint;
 use crate::traits::SerializableToSink;
 use crate::utils::normalize_spatial_filter;
+use crate::AggregationType;
 use crate::KeyByLabelNames;
-use promql_utilities::query_logics::enums::AggregationType;
 
 /// Per-aggregation policy carried in the streaming config.
 ///

@@ -29,8 +29,8 @@ use std::collections::HashMap;
 
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::enums::WindowType;
+use asap_types::AggregationType;
 use asap_types::KeyByLabelNames;
-use promql_utilities::query_logics::enums::AggregationType;
 use serde_json::{json, Value};
 
 use crate::storage_engines::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};

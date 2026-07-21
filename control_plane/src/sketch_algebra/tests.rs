@@ -327,7 +327,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     match bound {
         PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
             agg_type,
-            promql_utilities::query_logics::enums::AggregationType::Sum,
+            asap_types::AggregationType::Sum,
             "Sum should bind to ExactAgg(Sum)"
         ),
         other => panic!("expected ExactAgg, got {other:?}"),
@@ -405,10 +405,9 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
-            agg_type,
-            promql_utilities::query_logics::enums::AggregationType::Sum,
-        ),
+        PhysicalExpr::ExactAgg { agg_type, .. } => {
+            assert_eq!(agg_type, asap_types::AggregationType::Sum,)
+        }
         other => panic!("expected ExactAgg(Sum), got {other:?}"),
     }
 }
@@ -429,10 +428,9 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
-            agg_type,
-            promql_utilities::query_logics::enums::AggregationType::MultipleSum,
-        ),
+        PhysicalExpr::ExactAgg { agg_type, .. } => {
+            assert_eq!(agg_type, asap_types::AggregationType::MultipleSum,)
+        }
         other => panic!("expected ExactAgg(MultipleSum), got {other:?}"),
     }
 }
@@ -450,10 +448,9 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
-            agg_type,
-            promql_utilities::query_logics::enums::AggregationType::MultipleIncrease,
-        ),
+        PhysicalExpr::ExactAgg { agg_type, .. } => {
+            assert_eq!(agg_type, asap_types::AggregationType::MultipleIncrease,)
+        }
         other => panic!("expected ExactAgg(MultipleIncrease), got {other:?}"),
     }
 }

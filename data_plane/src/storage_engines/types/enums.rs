@@ -1,5 +1,5 @@
 pub use asap_types::enums::{CleanupPolicy, QueryLanguage, WindowType};
-pub use promql_utilities::query_logics::enums::AggregationType;
+pub use asap_types::AggregationType;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 pub enum QueryProtocol {

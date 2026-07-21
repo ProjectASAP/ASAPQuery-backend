@@ -116,8 +116,8 @@ impl PolicyRegistry {
 mod tests {
     use super::*;
     use crate::enums::WindowType;
+    use crate::AggregationType;
     use crate::KeyByLabelNames;
-    use promql_utilities::query_logics::enums::AggregationType;
     use std::collections::HashMap as StdHashMap;
 
     fn cfg(_id: u64, metric: &str) -> AggregationConfig {

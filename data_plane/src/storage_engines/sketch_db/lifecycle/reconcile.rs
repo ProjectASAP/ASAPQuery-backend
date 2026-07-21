@@ -276,7 +276,8 @@ mod tests {
     use std::collections::HashMap;
 
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
 
     use crate::storage_engines::sketch_db::data::AggKind;

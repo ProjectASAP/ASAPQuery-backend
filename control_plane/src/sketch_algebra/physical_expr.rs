@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::intent_algebra::QueryExpr;
 use crate::types_v2::BindingName;
-use promql_utilities::query_logics::enums::AggregationType;
+use asap_types::AggregationType;
 
 /// Readout operation extracted from a built sketch state. Inverse of
 /// `SketchAgg`. Mirrors design.md §6 line ~607 — `SketchEstimate` plus

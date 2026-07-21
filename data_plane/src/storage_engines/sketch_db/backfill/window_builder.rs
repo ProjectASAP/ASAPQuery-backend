@@ -118,7 +118,8 @@ pub fn build_backfilled_accumulator(
 mod tests {
     use super::*;
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::{AggregationType, WindowType};
+    use asap_types::enums::WindowType;
+    use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
 

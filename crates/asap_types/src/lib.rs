@@ -1,4 +1,5 @@
 pub mod aggregation_config;
+pub mod aggregation_type;
 pub mod capability_matching;
 pub mod enums;
 pub mod key_by_label_names;
@@ -10,6 +11,7 @@ pub mod traits;
 pub mod utils;
 
 pub use aggregation_config::*;
+pub use aggregation_type::AggregationType;
 pub use capability_matching::{
     compatible_storage_backends, find_compatible_aggregation, parse_storage_backend_engine_id,
     AccuracyTarget, StorageBackend, CANONICAL_QUERY_ENGINE_IDS, ENGINE_ID_ASAP_QUERY,

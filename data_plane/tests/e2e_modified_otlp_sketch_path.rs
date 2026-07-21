@@ -38,7 +38,8 @@ use asap_sketchlib::proto::sketchlib::{
 };
 use asap_sketchlib::MessagePackCodec;
 use asap_types::aggregation_config::AggregationConfig;
-use asap_types::enums::{AggregationType, WindowType};
+use asap_types::enums::WindowType;
+use asap_types::AggregationType;
 use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
