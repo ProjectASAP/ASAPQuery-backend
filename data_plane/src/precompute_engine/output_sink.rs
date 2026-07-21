@@ -245,7 +245,7 @@ mod tests {
     use crate::storage_engines::sketch_db::index::{AggKind, SidLookup};
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
@@ -266,7 +266,7 @@ mod tests {
             original_yaml: String::new(),
             window_size: 1,
             slide_interval: 1,
-            window_type: WindowType::Tumbling,
+            window_type: WindowKind::Tumbling,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),
             metric: metric.to_string(),

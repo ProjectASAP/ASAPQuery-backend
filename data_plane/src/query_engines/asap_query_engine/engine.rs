@@ -2201,7 +2201,7 @@ mod sketch_query_tests {
 mod hot_reload_phase2_tests {
     use super::*;
     use crate::storage_engines::types::{
-        AggregationType, CleanupPolicy, HotReloadStreamingConfig, StreamingConfig, WindowType,
+        AggregationType, CleanupPolicy, HotReloadStreamingConfig, StreamingConfig, WindowKind,
     };
     use asap_types::KeyByLabelNames;
 
@@ -2242,7 +2242,7 @@ mod hot_reload_phase2_tests {
             String::new(),
             60,
             60,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             metric.to_string(),
             None,

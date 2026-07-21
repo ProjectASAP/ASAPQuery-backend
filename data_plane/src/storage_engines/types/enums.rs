@@ -1,4 +1,4 @@
-pub use asap_types::enums::{CleanupPolicy, QueryLanguage, WindowType};
+pub use asap_types::enums::{CleanupPolicy, QueryLanguage, WindowKind};
 pub use asap_types::AggregationType;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]

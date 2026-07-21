@@ -343,7 +343,7 @@ dependencies = [
 [[package]]
 name = "asap-ir"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=150ef7d0786d24286b578dfae9dbbcefc8fbac3e#150ef7d0786d24286b578dfae9dbbcefc8fbac3e"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=7fcaf914d87e71407c3a6d7ccac613b867f9c11b#7fcaf914d87e71407c3a6d7ccac613b867f9c11b"
 dependencies = [
  "serde",
  "serde_json",
@@ -353,7 +353,7 @@ dependencies = [
 [[package]]
 name = "asap-plan"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=150ef7d0786d24286b578dfae9dbbcefc8fbac3e#150ef7d0786d24286b578dfae9dbbcefc8fbac3e"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=7fcaf914d87e71407c3a6d7ccac613b867f9c11b#7fcaf914d87e71407c3a6d7ccac613b867f9c11b"
 dependencies = [
  "asap-ir",
  "asap-sketch",
@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "asap-sketch"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=150ef7d0786d24286b578dfae9dbbcefc8fbac3e#150ef7d0786d24286b578dfae9dbbcefc8fbac3e"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=7fcaf914d87e71407c3a6d7ccac613b867f9c11b#7fcaf914d87e71407c3a6d7ccac613b867f9c11b"
 dependencies = [
  "asap-ir",
 ]
@@ -409,6 +409,7 @@ name = "asap_types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asap-ir",
  "clap 4.6.1",
  "serde",
  "serde_json",

@@ -276,7 +276,7 @@ mod tests {
     use std::collections::HashMap;
 
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
 
@@ -298,7 +298,7 @@ mod tests {
             String::new(),
             1,
             1,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             metric.to_string(),
             None,

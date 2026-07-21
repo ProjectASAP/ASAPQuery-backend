@@ -948,7 +948,7 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
 
     #[test]
@@ -1036,7 +1036,7 @@ mod tests {
                 String::new(),
                 60,
                 0,
-                WindowType::Tumbling,
+                WindowKind::Tumbling,
                 "m".to_string(),
                 "m".to_string(),
                 None,
@@ -1130,7 +1130,7 @@ mod tests {
             String::new(),
             60,
             0,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             "m".to_string(),
             "m".to_string(),
             None,
@@ -1167,7 +1167,7 @@ mod tests {
             String::new(),
             60,
             0,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             "m".to_string(),
             "m".to_string(),
             None,
@@ -1187,7 +1187,7 @@ mod tests {
             String::new(),
             60,
             0,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             "m".to_string(),
             "m".to_string(),
             None,
@@ -1224,7 +1224,7 @@ mod tests {
             String::new(),
             60,
             0,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             "cpu".to_string(),
             "cpu".to_string(),
             None,

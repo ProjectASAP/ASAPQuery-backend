@@ -4003,7 +4003,7 @@ mod sid_bucketing_tests {
         Metric as PbMetric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
     use asap_types::aggregation_config::AggregationConfig;
-    use asap_types::enums::WindowType;
+    use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
@@ -4030,7 +4030,7 @@ mod sid_bucketing_tests {
             String::new(),
             10,
             10,
-            WindowType::Tumbling,
+            WindowKind::Tumbling,
             String::new(),
             metric.to_string(),
             None,

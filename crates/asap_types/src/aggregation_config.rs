@@ -3,7 +3,7 @@ use serde_json::Value;
 use serde_yaml;
 use std::collections::HashMap;
 
-use crate::enums::{QueryLanguage, WindowType};
+use crate::enums::{QueryLanguage, WindowKind};
 use crate::policy_fingerprint::PolicyFingerprint;
 use crate::traits::SerializableToSink;
 use crate::utils::normalize_spatial_filter;
@@ -33,7 +33,7 @@ pub struct AggregationConfig {
 
     pub window_size: u64,        // Window size in seconds (e.g., 900s for 15m)
     pub slide_interval: u64,     // Slide/hop interval in seconds (e.g., 30s)
-    pub window_type: WindowType, // Tumbling or Sliding
+    pub window_type: WindowKind, // Tumbling or Sliding
 
     pub spatial_filter: String,
     pub spatial_filter_normalized: String,
@@ -86,7 +86,7 @@ impl AggregationConfig {
         original_yaml: String,
         window_size: u64,
         slide_interval: u64,
-        window_type: WindowType,
+        window_type: WindowKind,
         spatial_filter: String,
         metric: String,
         num_aggregates_to_retain: Option<u64>,
@@ -176,7 +176,7 @@ impl AggregationConfig {
             .get("windowType")
             .and_then(|v| v.as_str())
             .unwrap_or("tumbling")
-            .parse::<WindowType>()
+            .parse::<WindowKind>()
             .unwrap_or_default();
 
         let slide_interval = data
@@ -296,7 +296,7 @@ impl AggregationConfig {
             .get("windowType")
             .and_then(|v| v.as_str())
             .unwrap_or("tumbling")
-            .parse::<WindowType>()
+            .parse::<WindowKind>()
             .unwrap_or_default();
 
         let slide_interval = aggregation_data
