@@ -22,12 +22,11 @@
 //! on whatever node carries it, not inside the kind — see
 //! `crates/asap_types/src/key_by_label_names.rs`'s module doc for the same
 //! design call made on the data-plane side), so a two-`Implementation`
-//! `Matcher` cannot correctly answer that question. That richer,
-//! grouping-aware matching already exists as production code in
-//! `asap_types::capability_matching::find_compatible_aggregation`, which
-//! checks `AggregationType` compatibility (analogous to `SummaryFamily`
-//! here) *and* `grouping_labels` subset-compatibility side by side — the
-//! two checks compose at the caller, not inside a single `Matcher::is_satisfied_by`.
+//! `Matcher` cannot correctly answer that question. A caller needing that
+//! richer, grouping-aware answer must check `AggregationType` compatibility
+//! (analogous to `SummaryFamily` here) *and* `grouping_labels`
+//! subset-compatibility side by side, composed at the call site rather than
+//! inside a single `Matcher::is_satisfied_by`.
 
 use asap_plan::{Implementation, Matcher};
 use asap_sketch::SummaryKind;
