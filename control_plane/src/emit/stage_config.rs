@@ -62,9 +62,9 @@ use crate::physical::colored_dag::emitter::{
 // archive-tier metric lists). Importing them at module scope produced an
 // unused-import warning on every non-test build, so they're scoped into the
 // test module's `use super::*` instead (P2-5).
+use crate::intent_algebra::ColumnRef;
 use crate::physical::colored_dag::stage_id::StageId;
-use crate::sketch_algebra::physical_expr::EstimateOp;
-use asap_sketch::{SummaryKind, SummaryParams};
+use asap_sketch::{SketchQuery, SummaryKind, SummaryParams};
 
 // ── YAML structural types ─────────────────────────────────────────────────────
 //
@@ -3031,21 +3031,37 @@ fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
 /// `aggregations` list by the same `PolicyFingerprint` recipe.
 fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
     match &r.op {
-        EstimateOp::Quantile { q } => json!({
+        SketchQuery::Quantile { q } => json!({
             "op": "quantile",
             "q": q,
         }),
-        EstimateOp::Cardinality => json!({
+        SketchQuery::Cardinality => json!({
             "op": "cardinality",
         }),
-        EstimateOp::PointCount { key } => json!({
+        SketchQuery::PointCount { key } => json!({
             "op": "point_count",
-            "key": key,
+            "key": column_ref_to_wire_key(key),
         }),
-        EstimateOp::TopK { k } => json!({
+        SketchQuery::TopK { k } => json!({
             "op": "topk",
             "k": k,
         }),
+    }
+}
+
+/// The wire-string key for a `SketchQuery::PointCount` readout.
+///
+/// `SampleValue` and `Wildcard` both wire to the legacy `"*"` sentinel
+/// (`sketch_algebra::rules::bind_cms_count`, retired by Step B, used the
+/// literal string `"*"` to mean "all rows / no specific key"; the L5
+/// emitter's per-group resolution already special-cases that string) —
+/// there's no real queryable column for a plain `Count`/`Frequency`
+/// readout in either case, so both collapse to the same sentinel.
+fn column_ref_to_wire_key(col: &ColumnRef) -> String {
+    match col {
+        ColumnRef::Named(name) => name.clone(),
+        ColumnRef::Qualified { table, name } => format!("{table}.{name}"),
+        ColumnRef::SampleValue | ColumnRef::Wildcard => "*".to_string(),
     }
 }
 
@@ -3518,11 +3534,11 @@ mod tests {
             readouts: vec![
                 BackendReadout {
                     aggregation_id: "agg0".into(),
-                    op: EstimateOp::Quantile { q: 0.99 },
+                    op: SketchQuery::Quantile { q: 0.99 },
                 },
                 BackendReadout {
                     aggregation_id: "agg1".into(),
-                    op: EstimateOp::Cardinality,
+                    op: SketchQuery::Cardinality,
                 },
             ],
         };
@@ -3591,12 +3607,12 @@ mod tests {
             readouts: vec![
                 BackendReadout {
                     aggregation_id: "agg0".into(),
-                    op: EstimateOp::TopK { k: 10 },
+                    op: SketchQuery::TopK { k: 10 },
                 },
                 BackendReadout {
                     aggregation_id: "agg1".into(),
-                    op: EstimateOp::PointCount {
-                        key: "user_42".into(),
+                    op: SketchQuery::PointCount {
+                        key: ColumnRef::Named("user_42".into()),
                     },
                 },
             ],
@@ -3679,11 +3695,11 @@ mod tests {
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".into(),
                 op: match kind {
-                    SummaryKind::DDSketch | SummaryKind::Kll => EstimateOp::Quantile { q: 0.99 },
-                    SummaryKind::Hll => EstimateOp::Cardinality,
-                    SummaryKind::CountSketch => EstimateOp::TopK { k: 10 },
-                    SummaryKind::Cms => EstimateOp::PointCount {
-                        key: "user_42".into(),
+                    SummaryKind::DDSketch | SummaryKind::Kll => SketchQuery::Quantile { q: 0.99 },
+                    SummaryKind::Hll => SketchQuery::Cardinality,
+                    SummaryKind::CountSketch => SketchQuery::TopK { k: 10 },
+                    SummaryKind::Cms => SketchQuery::PointCount {
+                        key: ColumnRef::Named("user_42".into()),
                     },
                     other => unreachable!(
                         "backend_cfg_with_kind: unsupported test fixture kind {other:?}"
@@ -4134,7 +4150,7 @@ mod tests {
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "phase_b_agg0".into(),
-                op: EstimateOp::Quantile { q: 0.99 },
+                op: SketchQuery::Quantile { q: 0.99 },
             }],
         };
         let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");
@@ -5901,7 +5917,7 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
         };
-        use crate::sketch_algebra::physical_expr::EstimateOp;
+        use asap_sketch::SketchQuery;
 
         let cfg = BackendStageConfig {
             aggregations: vec![BackendAggregation {
@@ -5918,7 +5934,7 @@ mod tests {
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".to_string(),
-                op: EstimateOp::Quantile { q: 0.99 },
+                op: SketchQuery::Quantile { q: 0.99 },
             }],
         };
         let v = emit_backend_streaming_config_json(&cfg, &[]).expect("emit ok");

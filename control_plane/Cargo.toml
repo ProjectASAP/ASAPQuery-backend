@@ -61,10 +61,10 @@ asap_types.workspace = true
 # this doesn't pull in datafusion or any front-end weight. asap-sketch is
 # asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
 # to translate Implementation into this repo's own Capability vocabulary.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "7fcaf914d87e71407c3a6d7ccac613b867f9c11b" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

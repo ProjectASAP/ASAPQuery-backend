@@ -32,6 +32,7 @@
 
 pub mod capability;
 pub mod capability_matching;
+pub mod cost_model;
 pub mod lower;
 pub mod matcher;
 pub mod physical_expr;
@@ -47,4 +48,4 @@ pub use capability_matching::{
 };
 pub use lower::{bind_query_expr, BindingError};
 pub use matcher::SummaryFamilyMatcher;
-pub use physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
+pub use physical_expr::{L4Plan, PhysicalExpr};

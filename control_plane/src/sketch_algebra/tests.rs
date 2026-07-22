@@ -1,18 +1,18 @@
-//! Integration tests for the L4 IR + `Bind*` rules.
+//! Integration tests for the L4 IR + L3→L4 binding.
 
 #![cfg(test)]
 
+use std::rc::Rc;
 use std::time::Duration;
 
+use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
+
 use crate::intent_algebra::schema::{Column, DataType};
-use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Schema, Source, WindowKind};
+use crate::intent_algebra::{AggIntent, BindingScope, LabelFilter, QueryExpr, Schema, Source, WindowKind};
+use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
-use crate::sketch_algebra::physical_expr::{EstimateOp, MergeAlgebra, PhysicalExpr};
-use crate::sketch_algebra::rules::{
-    bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_kll_quantile::BindKllOnQuantile, Rule,
-};
-use crate::types_v2::{AccuracyTarget, BindingName};
-use asap_sketch::{SummaryKind, SummaryParams};
+use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::types_v2::AccuracyTarget;
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -73,55 +73,113 @@ fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     }
 }
 
+/// Walk a `PhysicalExpr` tree and report whether any node's `SummaryExpr`
+/// wraps an archive-only `AggIntent` in an unbound `Logical(Aggregate)`.
+/// Mirrors `emit::mod.rs`'s classification: `Logical`-wrapped aggregates
+/// whose sole intent is `archive_only()` route the L5 emitter to the
+/// cold-store tier.
+fn binding_is_archive(expr: &PhysicalExpr) -> bool {
+    match expr {
+        PhysicalExpr::Committed(plan) => plan_is_archive(plan),
+        PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => plan_is_archive(child),
+        PhysicalExpr::RawAtEdgePrometheusArchive { .. } => false,
+    }
+}
+
+fn plan_is_archive(plan: &L4Plan) -> bool {
+    match plan {
+        L4Plan::Summary(node) => node_is_archive(node),
+        L4Plan::LetBinding { expr, child, .. } => plan_is_archive(expr) || plan_is_archive(child),
+        L4Plan::Ref { .. } => false,
+    }
+}
+
+fn node_is_archive(node: &Rc<L4Node>) -> bool {
+    match &node.expr {
+        SummaryExpr::Logical(qe) => match qe.as_ref() {
+            QueryExpr::Aggregate { aggs, .. } => {
+                aggs.iter().any(crate::intent_algebra::archive_only)
+            }
+            _ => false,
+        },
+        SummaryExpr::SummaryAgg { child, .. } => node_is_archive(child),
+        SummaryExpr::SummaryEstimate { sketch_input, .. } => node_is_archive(sketch_input),
+        SummaryExpr::SummaryMerge { children } => children.iter().any(node_is_archive),
+        SummaryExpr::SummaryJoin { outer, inner, .. } => {
+            node_is_archive(outer) || node_is_archive(inner)
+        }
+        SummaryExpr::SummarySubtract { left, right } => {
+            node_is_archive(left) || node_is_archive(right)
+        }
+        SummaryExpr::SummaryDelete { sketch_input, .. } => node_is_archive(sketch_input),
+    }
+}
+
 // ── Bind rule tests ───────────────────────────────────────────────────────────
 
 #[test]
 fn bind_kll_quantile_basic() {
-    // The KLL rule on its own (priority 5) — DDSketch (priority 6) wins
-    // the dispatcher tie-break, so test the KLL rule's `apply` directly.
+    // The retired `BindKllOnQuantile` rule struct's direct `.apply()`
+    // call is replaced by forcing the Kll family via
+    // `ForcedFamilyCostModel` — bypassing the DDSketch/KLL dispatcher
+    // tie-break exercised separately by
+    // `bind_picks_ddsketch_over_kll_when_eps_explicit` below.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
-    let bound = BindKllOnQuantile
-        .apply(&expr, &AccuracyTarget::Epsilon(0.01))
-        .expect("KLL rule should bind a Quantile{0.99, ε=0.01}");
-    match bound {
-        PhysicalExpr::SketchEstimate { op, child } => {
-            assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
-            match *child {
-                PhysicalExpr::SketchAgg {
-                    sketch_type,
+    let cost_model = ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::Kll);
+    let node = asap_plan::bind::implement_tree_in_with(
+        &expr,
+        &BindingScope::default(),
+        &cost_model,
+    )
+    .expect("KLL should bind a Quantile{0.99, ε=0.01}");
+    match &node.expr {
+        SummaryExpr::SummaryEstimate {
+            query,
+            sketch_input,
+        } => {
+            assert!(matches!(query, SketchQuery::Quantile { q } if *q == 0.99));
+            match &sketch_input.expr {
+                SummaryExpr::SummaryAgg {
+                    sketch,
                     params,
                     child,
+                    ..
                 } => {
-                    assert_eq!(sketch_type, SummaryKind::Kll);
-                    assert_eq!(params, SummaryParams::Kll { k: 200 });
-                    assert!(matches!(
-                        *child,
-                        PhysicalExpr::Logical(QueryExpr::Window { .. })
-                    ));
+                    assert_eq!(sketch, &SummaryKind::Kll);
+                    assert_eq!(params, &SummaryParams::Kll { k: 200 });
+                    assert!(matches!(child.expr, SummaryExpr::Logical(_)));
                 }
-                other => panic!("expected SketchAgg, got {other:?}"),
+                other => panic!("expected SummaryAgg, got {other:?}"),
             }
         }
-        other => panic!("expected SketchEstimate, got {other:?}"),
+        other => panic!("expected SummaryEstimate, got {other:?}"),
     }
 }
 
 #[test]
 fn bind_ddsketch_quantile_basic() {
+    // Same shape as `bind_kll_quantile_basic`, forcing DDSketch instead
+    // of the retired `BindDDSketchOnQuantile` rule struct.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
-    let bound = BindDDSketchOnQuantile
-        .apply(&expr, &AccuracyTarget::Epsilon(0.01))
-        .expect("DDSketch rule should bind a Quantile{0.99, ε=0.01}");
-    match bound {
-        PhysicalExpr::SketchEstimate { op, child } => {
-            assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
-            match *child {
-                PhysicalExpr::SketchAgg {
-                    sketch_type,
-                    params,
-                    ..
+    let cost_model =
+        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::DDSketch);
+    let node = asap_plan::bind::implement_tree_in_with(
+        &expr,
+        &BindingScope::default(),
+        &cost_model,
+    )
+    .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
+    match &node.expr {
+        SummaryExpr::SummaryEstimate {
+            query,
+            sketch_input,
+        } => {
+            assert!(matches!(query, SketchQuery::Quantile { q } if *q == 0.99));
+            match &sketch_input.expr {
+                SummaryExpr::SummaryAgg {
+                    sketch, params, ..
                 } => {
-                    assert_eq!(sketch_type, SummaryKind::DDSketch);
+                    assert_eq!(sketch, &SummaryKind::DDSketch);
                     match params {
                         SummaryParams::DDSketch { alpha } => {
                             assert!((alpha - 0.01).abs() < 1e-12)
@@ -129,34 +187,37 @@ fn bind_ddsketch_quantile_basic() {
                         other => panic!("expected DDSketch params, got {other:?}"),
                     }
                 }
-                other => panic!("expected SketchAgg, got {other:?}"),
+                other => panic!("expected SummaryAgg, got {other:?}"),
             }
         }
-        other => panic!("expected SketchEstimate, got {other:?}"),
+        other => panic!("expected SummaryEstimate, got {other:?}"),
     }
 }
 
 /// Cost-aware rule selection: the dispatcher should pick DDSketch over
-/// KLL for an explicit ε-driven Quantile because DDSketch has higher
-/// `priority()` (6 vs 5) — that matches the legacy
-/// `algebra::directory::sketch_type_for_agg` default for SP-2/SP-4.
+/// KLL for an explicit ε-driven Quantile — `ControlPlaneCostModel::rank_candidates`
+/// statically reorders DDSketch first (see its doc comment), matching the
+/// legacy `algebra::directory::sketch_type_for_agg` default for SP-2/SP-4.
 #[test]
 fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
         .expect("bind_query_expr should not error");
     match bound {
-        PhysicalExpr::SketchEstimate { child, .. } => match *child {
-            PhysicalExpr::SketchAgg { sketch_type, .. } => {
-                assert_eq!(
-                    sketch_type,
-                    SummaryKind::DDSketch,
-                    "dispatcher should pick DDSketch (priority 6) over KLL (priority 5) on ε-driven Quantile"
-                );
-            }
-            other => panic!("expected SketchAgg, got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryEstimate { sketch_input, .. } => match &sketch_input.expr {
+                SummaryExpr::SummaryAgg { sketch, .. } => {
+                    assert_eq!(
+                        sketch,
+                        &SummaryKind::DDSketch,
+                        "dispatcher should pick DDSketch over KLL on ε-driven Quantile"
+                    );
+                }
+                other => panic!("expected SummaryAgg, got {other:?}"),
+            },
+            other => panic!("expected SummaryEstimate, got {other:?}"),
         },
-        other => panic!("expected SketchEstimate, got {other:?}"),
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
@@ -173,33 +234,37 @@ fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
 
 /// Pull the bound `(SummaryKind, w, d)` out of a top-k binding.
 /// `SummaryKind` (unlike the retired `sketch_algebra::SketchKind`)
-/// promotes `with_heap` to kind identity — `bind_cms_topk` always binds
-/// `CmsWithHeap`/`CountSketchWithHeap` for a top-k intent, never the
-/// bare kind, so there's no separate heap flag to return anymore.
+/// promotes `with_heap` to kind identity — the top-k cost model always
+/// binds `CmsWithHeap`/`CountSketchWithHeap` for a top-k intent, never
+/// the bare kind, so there's no separate heap flag to return anymore.
 fn topk_binding_family(bound: &PhysicalExpr) -> (SummaryKind, u32, u32) {
     match bound {
-        PhysicalExpr::SketchEstimate { op, child } => {
-            assert_eq!(*op, EstimateOp::TopK { k: 10 });
-            match &**child {
-                PhysicalExpr::SketchAgg {
-                    sketch_type,
-                    params,
-                    ..
-                } => match params {
-                    SummaryParams::CmsWithHeap { width, depth, .. } => {
-                        (sketch_type.clone(), *width, *depth)
-                    }
-                    SummaryParams::CountSketchWithHeap { width, depth, .. } => {
-                        (sketch_type.clone(), *width, *depth)
-                    }
-                    other => {
-                        panic!("expected CmsWithHeap/CountSketchWithHeap params, got {other:?}")
-                    }
-                },
-                other => panic!("expected SketchAgg, got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryEstimate {
+                query,
+                sketch_input,
+            } => {
+                assert!(matches!(query, SketchQuery::TopK { k } if *k == 10));
+                match &sketch_input.expr {
+                    SummaryExpr::SummaryAgg {
+                        sketch, params, ..
+                    } => match params {
+                        SummaryParams::CmsWithHeap { width, depth, .. } => {
+                            (sketch.clone(), *width, *depth)
+                        }
+                        SummaryParams::CountSketchWithHeap { width, depth, .. } => {
+                            (sketch.clone(), *width, *depth)
+                        }
+                        other => {
+                            panic!("expected CmsWithHeap/CountSketchWithHeap params, got {other:?}")
+                        }
+                    },
+                    other => panic!("expected SummaryAgg, got {other:?}"),
+                }
             }
-        }
-        other => panic!("expected SketchEstimate, got {other:?}"),
+            other => panic!("expected SummaryEstimate, got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
@@ -224,14 +289,30 @@ fn bind_cms_topk_loose_recall_picks_cms_heap() {
     assert!(d >= 1);
 }
 
-/// (b) A **tight / exact-recall** top-k (the intent carries
-/// `AccuracyTarget::Exact`) binds the unbiased **CountSketch-with-heap** —
-/// the family that supports exact rank / signed estimates.
+/// (b) A **tight / exact-recall** top-k binds the unbiased
+/// **CountSketch-with-heap** — the family that supports exact rank /
+/// signed estimates.
+///
+/// NOTE — behavior change forced by the new binder, not just a rename:
+/// the old fixture used `AggIntent::TopK{accuracy: Exact}` (the intent's
+/// OWN accuracy) to signal "tight/exact-recall". Under
+/// `asap_plan::boundary::implementation_for_with`, the per-intent
+/// sketch-vs-exact boundary decision checks the intent's own `accuracy`
+/// field FIRST: `TopK{accuracy: Exact}` now declines to bind at all
+/// (`SummaryExpr::Logical`) rather than reaching the cost model's
+/// family-selection logic at all — see `topk_exact_accuracy_declines_to_bind`
+/// above (a REAL, accepted behavior change — ASAPController#151 — per
+/// this migration's design notes, not a bug to route around). "Tight
+/// recall" (→ CountSketchWithHeap) is still live logic in
+/// `ControlPlaneCostModel::topk_family_order` — it fires off the
+/// WORKLOAD-level accuracy (not the intent's own) being `Exact`, which
+/// still lets the intent itself bind.
 #[test]
 fn bind_cms_topk_tight_recall_picks_countsketch() {
-    // Intent requests Exact rank; the policy-level target is non-exact.
-    let expr = agg_topk(10, AccuracyTarget::Exact);
-    let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
+    // Intent requests a normal (non-exact) rank so binding still
+    // happens; the workload-level policy demands exact recall.
+    let expr = agg_topk(10, AccuracyTarget::Epsilon(0.01));
+    let bound = bind_query_expr(&expr, AccuracyTarget::Exact)
         .expect("bind_query_expr should not error");
     let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
@@ -292,39 +373,47 @@ fn bind_hll_cardinality_basic() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
     match bound {
-        PhysicalExpr::SketchEstimate { op, child } => {
-            assert_eq!(op, EstimateOp::Cardinality);
-            match *child {
-                PhysicalExpr::SketchAgg {
-                    sketch_type,
-                    params,
-                    ..
-                } => {
-                    assert_eq!(sketch_type, SummaryKind::Hll);
-                    match params {
-                        SummaryParams::Hll { precision } => {
-                            assert!(
-                                precision >= 12,
-                                "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
-                            );
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryEstimate {
+                query,
+                sketch_input,
+            } => {
+                assert!(matches!(query, SketchQuery::Cardinality));
+                match &sketch_input.expr {
+                    SummaryExpr::SummaryAgg {
+                        sketch, params, ..
+                    } => {
+                        assert_eq!(sketch, &SummaryKind::Hll);
+                        match params {
+                            SummaryParams::Hll { precision } => {
+                                assert!(
+                                    *precision >= 12,
+                                    "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
+                                );
+                            }
+                            other => panic!("expected HllParams, got {other:?}"),
                         }
-                        other => panic!("expected HllParams, got {other:?}"),
                     }
+                    other => panic!("expected SummaryAgg, got {other:?}"),
                 }
-                other => panic!("expected SketchAgg, got {other:?}"),
             }
-        }
-        other => panic!("expected SketchEstimate, got {other:?}"),
+            other => panic!("expected SummaryEstimate, got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
 #[test]
 fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
-    // Pre-PR-6-follow-up: `Sum` had no `Bind*` rule and passed through
-    // as `PhysicalExpr::Logical`. The L4 binder rule `BindExactAgg`
-    // (added in the PR-6 follow-up) now matches and emits
-    // `PhysicalExpr::ExactAgg { agg_type: Sum, .. }` so the ASAP-tier
-    // exact-aggregation path can serve the intent.
+    // `AggIntent::Sum` binds to a bare `SummaryAgg` with `sketch:
+    // SummaryKind::Sum` and no `SummaryEstimate` wrapper (the partial
+    // state *is* the value — see `asap_plan::bind`'s module docs). The
+    // old locally-defined `PhysicalExpr::ExactAgg { agg_type, .. }`
+    // variant (and `asap_types::AggregationType`) no longer exist at
+    // the L4 IR level: `asap_sketch::SummaryExpr` unifies exact
+    // accumulators and approximate sketches into the same `SummaryAgg`
+    // node shape, keyed by `SummaryKind` (see `physical_expr.rs`'s
+    // module docs).
     let expr = QueryExpr::Aggregate {
         by: vec![].into(),
         aggs: vec![AggIntent::Sum { col: None }],
@@ -334,12 +423,14 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => assert_eq!(
-            agg_type,
-            asap_types::AggregationType::Sum,
-            "Sum should bind to ExactAgg(Sum)"
-        ),
-        other => panic!("expected ExactAgg, got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryAgg { sketch, params, .. } => {
+                assert_eq!(sketch, &SummaryKind::Sum, "Sum should bind to SummaryAgg(Sum)");
+                assert_eq!(params, &SummaryParams::Sum);
+            }
+            other => panic!("expected bare SummaryAgg(Sum), got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
@@ -350,10 +441,16 @@ fn bind_exact_accuracy_disables_quantile_binding() {
     // ~1254 — "the sketch path is selected, not mandated".)
     let expr = agg_quantile(0.99, AccuracyTarget::Exact);
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
-    assert!(
-        matches!(bound, PhysicalExpr::Logical(QueryExpr::Aggregate { .. })),
-        "Exact accuracy should disable sketch binding and pass through as Logical"
-    );
+    match bound {
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+            assert!(
+                matches!(&node.expr, SummaryExpr::Logical(qe) if matches!(**qe, QueryExpr::Aggregate { .. })),
+                "Exact accuracy should disable sketch binding and pass through as Logical, got {:?}",
+                node.expr
+            );
+        }
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
+    }
 }
 
 // ── Phase β: pattern-migration coverage ───────────────────────────────────────
@@ -366,7 +463,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
 /// `ONLY_TEMPORAL` — `quantile_over_time(0.99, m[5m])`.
 /// asap-planner-rs path: ONLY_TEMPORAL pattern 1 → KLL/DDSketch sketch.
 /// Control plane path: `Aggregate{Quantile{0.99}}` over `Window` →
-/// `BindKllOnQuantile` (or DDSketch) → `SketchAgg{KLL/DDSketch}`.
+/// binds a quantile-capable family → `SummaryAgg{KLL/DDSketch}`.
 #[test]
 fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
@@ -382,29 +479,35 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::SketchEstimate { op, child } => {
-            assert!(matches!(op, EstimateOp::Quantile { .. }));
-            match *child {
-                PhysicalExpr::SketchAgg { sketch_type, .. } => {
-                    assert!(matches!(
-                        sketch_type,
-                        SummaryKind::Kll | SummaryKind::DDSketch
-                    ));
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryEstimate {
+                query,
+                sketch_input,
+            } => {
+                assert!(matches!(query, SketchQuery::Quantile { .. }));
+                match &sketch_input.expr {
+                    SummaryExpr::SummaryAgg { sketch, .. } => {
+                        assert!(matches!(
+                            sketch,
+                            SummaryKind::Kll | SummaryKind::DDSketch
+                        ));
+                    }
+                    other => panic!("expected SummaryAgg under SummaryEstimate, got {other:?}"),
                 }
-                other => panic!("expected SketchAgg under SketchEstimate, got {other:?}"),
             }
-        }
-        other => panic!("expected SketchEstimate, got {other:?}"),
+            other => panic!("expected SummaryEstimate, got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
 /// `ONLY_TEMPORAL` — `sum_over_time(m[5m])` (and the count/avg/min/max
 /// variants that legacy `single_query.rs` accepts).
 ///
-/// Control plane path (post PR-6 follow-up): `Aggregate{Sum}` over
-/// `Window` → `BindExactAgg` fires → `PhysicalExpr::ExactAgg{Sum}`.
-/// Pre-follow-up this fell through to `Logical` because no rule
-/// matched Sum; the L5 emitter routed it to the archive engine.
+/// Control plane path: `Aggregate{Sum}` over `Window` → binds to a bare
+/// `SummaryAgg{sketch: SummaryKind::Sum}` (an exact mergeable
+/// accumulator — see `sum_now_binds_to_exact_agg_after_pr_6_followup`'s
+/// doc comment for the `ExactAgg` → `SummaryAgg` unification).
 #[test]
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
@@ -416,19 +519,24 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => {
-            assert_eq!(agg_type, asap_types::AggregationType::Sum,)
-        }
-        other => panic!("expected ExactAgg(Sum), got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryAgg { sketch, .. } => {
+                assert_eq!(sketch, &SummaryKind::Sum);
+            }
+            other => panic!("expected SummaryAgg(Sum), got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
 /// `ONLY_SPATIAL` — `sum by (host) (m)`.
 /// Control plane path: `Aggregate{Sum, by=[host]}` over a bare `Scan`.
-/// Post keyed-ExactAgg follow-up, `BindExactAgg` lowers this to
-/// `PhysicalExpr::ExactAgg { agg_type: MultipleSum, .. }` — the
-/// multi-pop accumulator family the data plane uses for keyed
-/// per-group sums.
+///
+/// The old locally-defined `AggregationType::MultipleSum` (keyed vs
+/// unkeyed sum) identity no longer exists at the L4 IR level —
+/// `SummaryKind::Sum` covers both; the keyed/unkeyed distinction now
+/// lives on `SummaryAgg::by` (non-empty ⇒ the old "MultipleSum" shape),
+/// per `emit::mod.rs`'s exact-accumulator classification notes.
 #[test]
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
@@ -440,16 +548,28 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => {
-            assert_eq!(agg_type, asap_types::AggregationType::MultipleSum,)
-        }
-        other => panic!("expected ExactAgg(MultipleSum), got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryAgg { sketch, by, .. } => {
+                assert_eq!(sketch, &SummaryKind::Sum);
+                assert_eq!(
+                    by,
+                    &vec![1],
+                    "keyed sum must carry the group-by column (the MultipleSum-equivalent signal)"
+                );
+            }
+            other => panic!("expected SummaryAgg(Sum, by=[1]), got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
 /// `ONE_TEMPORAL_ONE_SPATIAL` — `sum by (host) (rate(m[5m]))`.
-/// Post keyed-ExactAgg follow-up: `Rate` keyed by `host` lowers to
-/// `MultipleIncrease`.
+/// `bind_query_expr` (not `implement_tree` directly) rewrites
+/// `AggIntent::Rate` to `AggIntent::Increase` before binding (see
+/// `lower.rs`'s `rewrite_rate_to_increase` — this deployment's data
+/// plane has no Rate accumulator). The old
+/// `AggregationType::MultipleIncrease` identity is now
+/// `SummaryKind::Increase` with a non-empty `by`.
 #[test]
 fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
@@ -461,18 +581,21 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::ExactAgg { agg_type, .. } => {
-            assert_eq!(agg_type, asap_types::AggregationType::MultipleIncrease,)
-        }
-        other => panic!("expected ExactAgg(MultipleIncrease), got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::SummaryAgg { sketch, by, .. } => {
+                assert_eq!(sketch, &SummaryKind::Increase);
+                assert_eq!(by, &vec![1]);
+            }
+            other => panic!("expected SummaryAgg(Increase, by=[1]), got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
 /// Phase β archive-only intent: any of the no-ASAP-tier-family entries
-/// (`Absent`, `Present`, `Delta`, …) matches `BindArchiveOnly` → `Logical`
-/// pass-through, and the L5 emitter / Phase α routing reads
-/// `AggIntent::archive_only() == true` to flag the StreamingConfig entry
-/// for the archive tier.
+/// (`Absent`, `Present`, `Delta`, …) binds to a `Logical` pass-through,
+/// and the L5 emitter / Phase α routing reads `AggIntent::archive_only()
+/// == true` to flag the StreamingConfig entry for the archive tier.
 ///
 /// `histogram_quantile(...)` was previously an L3 intent here but is no
 /// longer — it's a PromQL/MetricsQL language-level operator that the
@@ -498,10 +621,16 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     // The archive-only rule's output is a Logical pass-through carrying
     // the original Aggregate. Downstream emitters check archive_only().
     match bound {
-        PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
-            assert_eq!(aggs, vec![intent]);
-        }
-        other => panic!("expected Logical(Aggregate(Absent)), got {other:?}"),
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::Logical(qe) => match qe.as_ref() {
+                QueryExpr::Aggregate { aggs, .. } => {
+                    assert_eq!(aggs, &vec![intent]);
+                }
+                other => panic!("expected Aggregate, got {other:?}"),
+            },
+            other => panic!("expected Logical(Aggregate(Absent)), got {other:?}"),
+        },
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }
 
@@ -530,95 +659,21 @@ fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
     bind_query_expr(&qe, accuracy).unwrap_or_else(|e| panic!("bind {query}: {e}"))
 }
 
-/// Walk a `PhysicalExpr` and collect every `SketchAgg`'s sketch_kind. The
-/// number of entries + the kind set is the wire-equivalent of
-/// asap-planner-rs's "aggregation_id rows in StreamingConfig output".
-fn collect_sketch_kinds(expr: &PhysicalExpr) -> Vec<SummaryKind> {
-    let mut out = Vec::new();
-    fn walk(e: &PhysicalExpr, out: &mut Vec<SummaryKind>) {
-        match e {
-            PhysicalExpr::SketchAgg {
-                sketch_type, child, ..
-            } => {
-                out.push(sketch_type.clone());
-                walk(child, out);
-            }
-            PhysicalExpr::SketchEstimate { child, .. } => walk(child, out),
-            PhysicalExpr::SketchMerge { children, .. } => {
-                for c in children {
-                    walk(c, out);
-                }
-            }
-            PhysicalExpr::LetBinding { expr, child, .. } => {
-                walk(expr, out);
-                walk(child, out);
-            }
-            PhysicalExpr::Logical(_) | PhysicalExpr::Ref { .. } => {}
-            // Phase ε.1 — the new placement variants don't carry a
-            // SketchAgg child the legacy walk recognises. Mode 2 records
-            // its own family directly; Mode 3 has no sketch at all.
-            PhysicalExpr::RawAtEdgeSketchAtBackend { family, child, .. } => {
-                out.push(family.clone());
-                walk(child, out);
-            }
-            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => {}
-            // ExactAgg has no SummaryKind to collect; its child may
-            // carry one transitively (rare but possible if nested).
-            PhysicalExpr::ExactAgg { child, .. } => walk(child, out),
-        }
-    }
-    walk(expr, &mut out);
-    out
-}
-
-/// Walk a `PhysicalExpr` and detect whether the binding ended in a
-/// `Logical`-wrapped `Aggregate` carrying an archive-only intent. This is
-/// the L4 signal that the L5 emitter routes the StreamingConfig entry
-/// to the cold tier rather than the warm one.
-fn binding_is_archive(expr: &PhysicalExpr) -> bool {
-    match expr {
-        PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
-            aggs.iter().any(crate::intent_algebra::archive_only)
-        }
-        PhysicalExpr::Logical(_) => false,
-        PhysicalExpr::SketchEstimate { child, .. } => binding_is_archive(child),
-        PhysicalExpr::SketchAgg { child, .. } => binding_is_archive(child),
-        PhysicalExpr::SketchMerge { children, .. } => children.iter().any(binding_is_archive),
-        PhysicalExpr::LetBinding { expr, child, .. } => {
-            binding_is_archive(expr) || binding_is_archive(child)
-        }
-        PhysicalExpr::Ref { .. } => false,
-        // Phase ε.1 — Mode 3 routes to the prometheus_remote engine
-        // (its own engine ID), which the L5 emitter handles via
-        // emit_backend_storage_routing rather than the warm-vs-archive
-        // gate this helper guards. Treat as not-archive: this helper is
-        // about cold-tier scan-vs-ASAP-tier-sketch decisions, not Mode 3.
-        PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => binding_is_archive(child),
-        PhysicalExpr::RawAtEdgePrometheusArchive { .. } => false,
-        // ExactAgg is a ASAP-tier exact-aggregation accumulator, NOT
-        // an archive route. The L5 emitter writes the result through
-        // the precompute output sink, same path as SketchAgg.
-        PhysicalExpr::ExactAgg { .. } => false,
-    }
-}
-
 /// `quantile_over_time.yaml` — the asap-planner-rs `quantile_over_time`
 /// fixture maps to a KLL or DDSketch StreamingConfig row. The control plane
 /// path: L1 PromQL parse → L3 `Aggregate{Quantile{0.99}}` over `Window` →
-/// L4 `BindKllOnQuantile` (default) or `BindDDSketchOnQuantile`. Either
-/// is functionally equivalent — both are quantile sketches.
+/// L4 bind picks Kll (default) or DDSketch. Either is functionally
+/// equivalent — both are quantile sketches.
 #[test]
 fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
     let bound = pipeline_l1_to_l4(
         "quantile_over_time(0.99, http_request_duration_seconds[5m])",
         AccuracyTarget::Epsilon(0.01),
     );
-    let kinds = collect_sketch_kinds(&bound);
-    assert_eq!(kinds.len(), 1, "expected 1 sketch agg, got {kinds:?}");
+    let kind = crate::emit::extract_root_sketch_kind(&bound);
     assert!(
-        matches!(kinds[0], SummaryKind::Kll | SummaryKind::DDSketch),
-        "expected quantile sketch family, got {:?}",
-        kinds[0]
+        matches!(kind, Some(SummaryKind::Kll) | Some(SummaryKind::DDSketch)),
+        "expected quantile sketch family, got {kind:?}"
     );
     assert!(
         !binding_is_archive(&bound),
@@ -628,41 +683,43 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
 
 /// `sum_over_time.yaml` — the legacy planner produces an exact-sum
 /// aggregation row (no sketch). Control plane path: `Aggregate{Sum}` over
-/// `Window` → no ASAP-tier rule fires → `Logical` pass-through.
-/// Functional equivalence: both produce a single non-sketch row.
+/// `Window` → binds to an exact accumulator (`SummaryAgg{Sum}`), which is
+/// neither an approximate sketch (so `extract_root_sketch_kind`, which
+/// excludes exact accumulators — see its doc comment — returns `None`)
+/// nor archive-routed.
 #[test]
 fn phase_b_e2e_sum_over_time_falls_through_to_logical() {
     let bound = pipeline_l1_to_l4(
         "sum_over_time(http_requests_total[5m])",
         AccuracyTarget::Epsilon(0.01),
     );
-    let kinds = collect_sketch_kinds(&bound);
     assert!(
-        kinds.is_empty(),
-        "sum_over_time should not produce a sketch agg, got {kinds:?}"
+        crate::emit::extract_root_sketch_kind(&bound).is_none(),
+        "sum_over_time should not produce an approximate sketch"
     );
     assert!(
         !binding_is_archive(&bound),
-        "Sum is exact-warm, not archive — bind output should stay Logical without archive flag"
+        "Sum is exact-warm, not archive"
     );
 }
 
 /// `sum_by.yaml` — `sum by (label) (sum_over_time(...))`. Spatial-and-
 /// temporal aggregation; the legacy planner emits an exact-sum row keyed
 /// on the by-label. Control plane path: `Aggregate{Sum, by=[…]}` over
-/// `Window` → no ASAP-tier rule fires → `Logical` pass-through. The
-/// by-label is preserved on the L3 group-by-id list, which Phase α's
-/// routing emit reads to build the per-label rollup partition.
+/// `Window` → binds to an exact accumulator (`SummaryAgg{Sum, by=[…]}`) —
+/// no approximate sketch family. The by-label is preserved on the L3
+/// group-by-id list, which Phase α's routing emit reads to build the
+/// per-label rollup partition.
 #[test]
 fn phase_b_e2e_sum_by_preserves_grouping_label() {
     let bound = pipeline_l1_to_l4(
         "sum by (instance) (sum_over_time(http_requests_total[5m]))",
         AccuracyTarget::Epsilon(0.01),
     );
-    // No sketch family for plain Sum.
-    assert!(collect_sketch_kinds(&bound).is_empty());
-    // The end shape may be Logical(Aggregate{by, ...}) when the Aggregate
-    // node survives the lowering, or Logical(Window{...}) when the
+    // No approximate sketch family for plain Sum.
+    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
+    // The end shape may carry `Logical(Aggregate{by, ...})` beneath a
+    // `SummaryAgg{Sum}` wrapper, or `Logical(Window{...})` when the
     // ParsedQuery → QueryExpr lowering drops the Aggregate (legacy
     // ParsedQuery only carries `aggregations: Vec<AggType>` not the
     // by-axis directly). In either case the metric name + label survive
@@ -683,16 +740,17 @@ fn phase_b_e2e_sum_by_preserves_grouping_label() {
 
 /// `rate_increase.yaml` — the legacy planner emits a MultipleIncrease
 /// (counter-reset adjusted) row. Control plane path: `Aggregate{Rate}` over
-/// `Window` → no streaming-rate sketch family today → `Logical`. Both
-/// paths produce a single non-sketch streaming row; the L5 emitter is
-/// the one that picks the actual MultipleIncrease processor.
+/// `Window` → `bind_query_expr` rewrites `Rate` to `Increase` and binds an
+/// exact accumulator (`SummaryAgg{Increase}`) — no approximate sketch
+/// family. Both paths produce a single non-sketch streaming row; the L5
+/// emitter is the one that picks the actual MultipleIncrease processor.
 #[test]
 fn phase_b_e2e_rate_falls_through_to_logical() {
     let bound = pipeline_l1_to_l4(
         "rate(http_requests_total[5m])",
         AccuracyTarget::Epsilon(0.01),
     );
-    assert!(collect_sketch_kinds(&bound).is_empty());
+    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
     assert!(
         !binding_is_archive(&bound),
         "Rate is ASAP-tier, not archive"
@@ -718,7 +776,7 @@ fn phase_b_e2e_topk_well_formed() {
     // Logical pass-through (engine handles it). Both are accepted L4
     // shapes — Phase β's contract is just "doesn't panic, produces a
     // legitimate PhysicalExpr".
-    let _ = collect_sketch_kinds(&bound);
+    let _ = crate::emit::extract_root_sketch_kind(&bound);
 }
 
 /// Archive-only routing through the full L1→L3→L4 pipeline. Asserts the
@@ -748,8 +806,8 @@ fn phase_b_e2e_archive_only_e2e_binding() {
         binding_is_archive(&bound),
         "archive-only intent must surface archive flag through L4 binding"
     );
-    // No ASAP-tier sketch fires for archive-only intents.
-    assert!(collect_sketch_kinds(&bound).is_empty());
+    // No approximate sketch fires for archive-only intents.
+    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
 }
 
 /// Cross-cutting: every Phase β archive-only intent reaches
@@ -789,14 +847,72 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         let bound =
             bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("bind should succeed");
         match bound {
-            PhysicalExpr::Logical(QueryExpr::Aggregate { aggs, .. }) => {
-                assert_eq!(aggs.len(), 1);
-                assert!(
-                    crate::intent_algebra::archive_only(&aggs[0]),
-                    "{intent:?} should preserve archive_only() flag through bind"
-                );
-            }
-            other => panic!("expected Logical(Aggregate({intent:?})), got {other:?}"),
+            PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+                SummaryExpr::Logical(qe) => match qe.as_ref() {
+                    QueryExpr::Aggregate { aggs, .. } => {
+                        assert_eq!(aggs.len(), 1);
+                        assert!(
+                            crate::intent_algebra::archive_only(&aggs[0]),
+                            "{intent:?} should preserve archive_only() flag through bind"
+                        );
+                    }
+                    other => panic!("expected Aggregate({intent:?}), got {other:?}"),
+                },
+                other => panic!("expected Logical(Aggregate({intent:?})), got {other:?}"),
+            },
+            other => panic!("expected Committed(Summary(_)) for {intent:?}, got {other:?}"),
         }
+    }
+}
+
+// ── Deliberate behavior changes (ASAPController#150 / #151) ──────────────────
+//
+// `AggIntent::Extension` (this deployment's `Frequency` point-query,
+// built via `crate::intent_algebra::frequency(accuracy)`) and
+// `AggIntent::TopK { accuracy: Exact }` both now decline to bind
+// (`SummaryExpr::Logical`) rather than sketch — a REAL, accepted
+// behavior change introduced by this migration (core's
+// `boundary::implementation_for` maps every `Extension` to
+// `PassThrough` unconditionally, and `TopK{Exact}`'s `exact_realization`
+// has no accumulator form for it either — see `lower.rs`'s module docs
+// and `cost_model.rs`'s module docs). Mirrors the pattern already used in
+// `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`.
+
+#[test]
+fn frequency_extension_declines_pending_upstream_extension_support() {
+    let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01));
+    let expr = QueryExpr::Aggregate {
+        by: vec![].into(),
+        aggs: vec![intent],
+        output_names: Vec::new(),
+        having: None,
+        child: Box::new(windowed_scan()),
+    };
+    let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
+    match bound {
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+            assert!(
+                matches!(&node.expr, SummaryExpr::Logical(_)),
+                "Frequency (AggIntent::Extension) should decline pending ASAPController#150, got {:?}",
+                node.expr
+            );
+        }
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
+    }
+}
+
+#[test]
+fn topk_exact_accuracy_declines_to_bind() {
+    let expr = agg_topk(10, AccuracyTarget::Exact);
+    let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
+    match bound {
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+            assert!(
+                matches!(&node.expr, SummaryExpr::Logical(_)),
+                "TopK{{accuracy: Exact}} should decline pending ASAPController#151, got {:?}",
+                node.expr
+            );
+        }
+        other => panic!("expected Committed(Summary(_)), got {other:?}"),
     }
 }

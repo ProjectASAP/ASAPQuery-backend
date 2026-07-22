@@ -68,11 +68,7 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
     };
-    use crate::sketch_algebra::rules::{
-        bind_cms_count::BindCmsOnCount, bind_cms_topk::BindCountSketchOnTopK,
-        bind_ddsketch_quantile::BindDDSketchOnQuantile, bind_hll_cardinality::BindHllOnCardinality,
-        bind_kll_quantile::BindKllOnQuantile, Rule,
-    };
+    use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
     use asap_sketch::SummaryKind;
 
@@ -244,48 +240,54 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
         child: Box::new(windowed),
     };
 
-    // ── Drive the picked family-specific `Bind*` rule ─────────────────
+    // ── Drive the picked family directly, bypassing selection ─────────
     //
-    // Bypass the priority-based dispatcher: we have a definitive family
-    // pick from the capability matrix (or the `sketch_type_override`),
-    // so route directly to the rule that produces that family. This
-    // keeps the contract-row mapping deterministic — the dispatcher's
-    // tie-break (DDSketch p=6 vs KLL p=5) cannot accidentally flip
-    // `request_size_bytes`'s KLL pick to DDSketch.
+    // We have a definitive family pick from the capability matrix (or the
+    // `sketch_type_override`), so force it via `ForcedFamilyCostModel`
+    // instead of letting `ControlPlaneCostModel::rank_candidates` choose.
+    // This keeps the contract-row mapping deterministic — the normal
+    // dispatcher's tie-break (DDSketch p=6 vs KLL p=5) cannot accidentally
+    // flip `request_size_bytes`'s KLL pick to DDSketch.
     //
     // CMS+TopK note: when the picker selected `SummaryKind::Cms` for a
     // TopK statistic (only reachable today via a `sketch_family_override:
-    // CountMinSketch` on a TopK metric), we emit a CMS-with-heap binding
-    // inline. The CMS-Heap pattern (Cormode & Muthukrishnan 2005) gives
+    // CountMinSketch` on a TopK metric), this forces the CMS-with-heap
+    // variant. The CMS-Heap pattern (Cormode & Muthukrishnan 2005) gives
     // a valid heavy-hitter sketch; the unbiased CountSketch remains the
     // canonical pick when no override is supplied. The backend's "top-K
     // from CountMin state" readout path is a separate workstream — see
     // `sketch_algebra::capability_matching` module docs for the gap note.
-    match (kind, statistic) {
-        (SummaryKind::DDSketch, _) => BindDDSketchOnQuantile.apply(&aggregate, &accuracy),
-        (SummaryKind::Kll, _) => BindKllOnQuantile.apply(&aggregate, &accuracy),
-        (SummaryKind::Hll, _) => BindHllOnCardinality.apply(&aggregate, &accuracy),
-        // The capability matrix already pinned the family here, so force
-        // the matching recall tier rather than re-inferring it: a
-        // CountSketch pick is the unbiased canonical top-k (Tight); a CMS
-        // pick on a top-k is the cheap CMS-with-heap (Loose). This keeps
-        // `bind_workload_typed`'s contract-row mapping deterministic — the
-        // recall-aware default lives in `dispatch()` / `Rule::apply`.
-        (SummaryKind::CountSketch, _) => BindCountSketchOnTopK.apply_with_tier(
-            &aggregate,
-            &accuracy,
-            crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Tight,
-        ),
-        (SummaryKind::Cms, StatisticClass::TopK) => BindCountSketchOnTopK.apply_with_tier(
-            &aggregate,
-            &accuracy,
-            crate::sketch_algebra::rules::bind_cms_topk::TopkRecallTier::Loose,
-        ),
-        (SummaryKind::Cms, _) => BindCmsOnCount.apply(&aggregate, &accuracy),
-        // `kind` always comes from `pick_family`/`sketch_type_override`,
-        // exhaustively the 5 canonical families.
-        (other, _) => unreachable!("dispatch: unsupported SummaryKind {other:?}"),
+    //
+    // `StatisticClass::Frequency` (the `endpoint_request_freq` contract
+    // row) is `AggIntent::Extension`-shaped — `asap_plan::boundary::implementation_for`
+    // maps every `Extension` to `PassThrough` unconditionally (a core-vs-
+    // deployment-specific-shape gap, filed as ASAPController#150), so this
+    // now returns `None` for that one contract row until the upstream gap
+    // closes; the caller already falls back to the legacy `plan()` output
+    // in that case.
+    let forced = match kind {
+        SummaryKind::CountSketch => SummaryKind::CountSketchWithHeap,
+        SummaryKind::Cms if statistic == StatisticClass::TopK => SummaryKind::CmsWithHeap,
+        other => other,
+    };
+    let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
+    let node = asap_plan::bind::implement_tree_in_with(
+        &aggregate,
+        &crate::intent_algebra::BindingScope::default(),
+        &cost_model,
+    )
+    .ok()?;
+    // `implement_tree_in_with` never *errors* on "nothing bound" — an
+    // intent `boundary::implementation_for` can't realize (e.g. the
+    // `Extension`/Frequency PassThrough case above) still returns
+    // `Ok(Rc<L4Node>)`, just wrapping the input as `SummaryExpr::Logical`
+    // unchanged. `bind_workload_typed`'s own contract is `None` for
+    // "typed path doesn't support this shape yet" — translate the two
+    // by checking whether anything actually got committed.
+    if matches!(node.expr, asap_sketch::SummaryExpr::Logical(_)) {
+        return None;
     }
+    Some(crate::sketch_algebra::physical_expr::PhysicalExpr::committed(node))
 }
 
 pub struct RulesPlanner {
@@ -480,7 +482,6 @@ mod tests {
             (SketchType::DDSketch, SummaryKind::DDSketch),
             (SketchType::KLL, SummaryKind::Kll),
             (SketchType::HLL, SummaryKind::Hll),
-            (SketchType::CountMinSketch, SummaryKind::Cms),
             // CountSketch override re-derives statistic as TopK (see the
             // override arm below), and `bind_cms_topk` always binds the
             // heap-bearing kind for a top-k intent — matches this
@@ -501,6 +502,22 @@ mod tests {
                 "override {ov:?} should pin family {expect:?}, not fall back to DDSketch",
             );
         }
+
+        // `CountMinSketch` re-derives statistic to `Frequency`, which is
+        // `AggIntent::Extension`-shaped (this deployment's point-frequency
+        // query) — `asap_plan::boundary::implementation_for` maps every
+        // `Extension` to `PassThrough` unconditionally, regardless of
+        // which `CostModel` is plugged in (ASAPController#150), so this
+        // override can no longer bind at all pending the upstream gap
+        // closing. Same accepted regression as the plain
+        // `endpoint_request_freq` contract row (see
+        // `typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`).
+        let mut w = workload(vec![AggType::Quantile]);
+        w.sketch_type_override = Some(SketchType::CountMinSketch);
+        assert!(
+            bind_workload_typed(&w).is_none(),
+            "CountMinSketch override should decline pending ASAPController#150",
+        );
     }
 
     #[test]
@@ -625,24 +642,12 @@ mod tests {
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
     use asap_sketch::SummaryKind;
 
-    /// Walk the L4 binding output and pull out the `SketchAgg`'s family.
-    /// Returns `None` if no `SketchAgg` node is present (raw / pure
-    /// logical pass-through).
+    /// Walk the L4 binding output and pull out the approximate sketch
+    /// family. Returns `None` if no sketch node is present (raw / pure
+    /// logical pass-through, or an exact accumulator — see
+    /// `emit::extract_root_sketch_kind`, whose logic this mirrors).
     fn extract_family(expr: &PhysicalExpr) -> Option<SummaryKind> {
-        match expr {
-            PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
-            PhysicalExpr::SketchEstimate { child, .. } => extract_family(child),
-            PhysicalExpr::SketchMerge { children, .. } => children.iter().find_map(extract_family),
-            PhysicalExpr::LetBinding { expr, child, .. } => {
-                extract_family(expr).or_else(|| extract_family(child))
-            }
-            PhysicalExpr::Logical(_) | PhysicalExpr::Ref { .. } => None,
-            PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
-            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
-            // ExactAgg has no sketch family — it produces an exact
-            // aggregation accumulator, not a sketch state.
-            PhysicalExpr::ExactAgg { .. } => None,
-        }
+        crate::emit::extract_root_sketch_kind(expr)
     }
 
     /// Build a workload with the given metric name + reasonable
@@ -735,18 +740,22 @@ mod tests {
     }
 
     #[test]
-    fn typed_binding_endpoint_request_freq_picks_cms() {
-        // Contract: `endpoint_request_freq` → CMS (Frequency).
-        // The legacy AggType default for Frequency is *also* CMS via
-        // BindCmsOnCount, but the metric-name path goes through the
-        // capability-matching picker first — both produce CMS, the
-        // contract row ratifies it.
+    fn typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support() {
+        // Contract used to be: `endpoint_request_freq` → CMS (Frequency).
+        // `Frequency` is `AggIntent::Extension`-shaped;
+        // `asap_plan::boundary::implementation_for` maps every `Extension`
+        // to `PassThrough` unconditionally (core has no realization
+        // opinion for a deployment-specific shape it doesn't know — see
+        // ASAPController#150). Step B of the plan-shaped-serving
+        // migration adopted `implement_tree_in_with` here without a local
+        // Frequency-binding workaround, so this contract row now declines
+        // the typed path (falls back to the legacy `plan()` output) until
+        // #150 lands an extension point.
         let w = workload_for("endpoint_request_freq", AggType::Frequency);
-        let bound = bind_workload_typed(&w).expect("endpoint_request_freq must bind");
-        assert_eq!(
-            extract_family(&bound),
-            Some(SummaryKind::Cms),
-            "endpoint_request_freq should bind to CMS (Frequency)",
+        let bound = bind_workload_typed(&w);
+        assert!(
+            bound.is_none(),
+            "endpoint_request_freq should decline pending ASAPController#150; got {bound:?}",
         );
     }
 
@@ -858,11 +867,9 @@ mod tests {
                 AggType::Frequency,
                 Some(SummaryKind::CountSketchWithHeap),
             ),
-            (
-                "endpoint_request_freq",
-                AggType::Frequency,
-                Some(SummaryKind::Cms),
-            ),
+            // `Extension`/Frequency PassThrough gap — ASAPController#150,
+            // see `typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`.
+            ("endpoint_request_freq", AggType::Frequency, None),
         ];
         for (metric, agg, expected) in cases {
             let w = workload_for(metric, agg);

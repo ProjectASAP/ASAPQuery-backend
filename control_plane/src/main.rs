@@ -595,32 +595,58 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // is no `query_string`.
     let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
     let budgets = StageResourceBudgets::from_workload_chars(&wc);
-    let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
-    let mut plan_summary = None;
-    if let Some(ref qs) = query_string {
-        match parse_query_expr_canonical(qs) {
-            Err(e) => {
-                warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
-            }
-            Ok(qe) => {
-                let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
-                let (opt_qe, _) =
-                    QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
-                // L4 sketch binding: lower the optimised L3 tree to the
-                // sketch-bound `PhysicalExpr` IR — the typed L5's input.
-                let accuracy = if workload.accuracy_sla >= 1.0 {
-                    control_plane::types_v2::AccuracyTarget::Exact
-                } else {
-                    control_plane::types_v2::AccuracyTarget::Epsilon(1.0 - workload.accuracy_sla)
-                };
-                bound_physical =
-                    control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
-                // Cost summary for the JSON response.
-                let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(opt_qe);
-                plan_summary = Some(plan_node.summarise(raw_bps));
+    // Everything that touches `sketch_algebra::PhysicalExpr` (which
+    // carries `Rc<asap_sketch::L4Node>` since Step B of the
+    // plan-shaped-serving migration adopted ASAPController's own
+    // `Rc`-based DAG sharing) is scoped to this block and resolved down
+    // to Send-safe outputs (`Option<PlanSummary>`,
+    // `Option<HashMap<StageId, StageConfig>>`) *before* any `.await`
+    // below — an `Rc` alive in this `async fn`'s generator state at a
+    // yield point would make its `Future` `!Send`, breaking
+    // `axum::Handler`.
+    let (plan_summary, stage_configs) = {
+        let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
+        let mut plan_summary = None;
+        if let Some(ref qs) = query_string {
+            match parse_query_expr_canonical(qs) {
+                Err(e) => {
+                    warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
+                }
+                Ok(qe) => {
+                    let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
+                    let (opt_qe, _) =
+                        QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
+                    // L4 sketch binding: lower the optimised L3 tree to the
+                    // sketch-bound `PhysicalExpr` IR — the typed L5's input.
+                    let accuracy = if workload.accuracy_sla >= 1.0 {
+                        control_plane::types_v2::AccuracyTarget::Exact
+                    } else {
+                        control_plane::types_v2::AccuracyTarget::Epsilon(1.0 - workload.accuracy_sla)
+                    };
+                    bound_physical =
+                        control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
+                    // Cost summary for the JSON response.
+                    let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(opt_qe);
+                    plan_summary = Some(plan_node.summarise(raw_bps));
+                }
             }
         }
-    }
+
+        let stage_configs: Option<
+            std::collections::HashMap<
+                crate::physical::colored_dag::StageId,
+                crate::physical::colored_dag::StageConfig,
+            >,
+        > = if physical::stage_split::typed_stage_split_enabled() {
+            let physical_expr =
+                bound_physical.or_else(|| optimizer::rules::bind_workload_typed(&workload));
+            physical_expr.and_then(|pe| physical::stage_split::split_typed_three_stage(&pe))
+        } else {
+            None
+        };
+
+        (plan_summary, stage_configs)
+    };
 
     plan.precompute = build_precompute_engine_jobs(&workload, "data-plane:4317");
     // B2 (metric, role): derive the role from the request's
@@ -679,11 +705,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // parse), there is no L3 tree to bind, so we fall back to
     // `bind_workload_typed`, which lowers the flat `QueryWorkload`
     // summary to a `PhysicalExpr` directly.
-    if physical::stage_split::typed_stage_split_enabled() {
-        let physical_expr =
-            bound_physical.or_else(|| optimizer::rules::bind_workload_typed(&workload));
-        if let Some(physical_expr) = physical_expr {
-            if let Some(configs) = physical::stage_split::split_typed_three_stage(&physical_expr) {
+    if let Some(configs) = stage_configs {
                 for (stage_id, stage_cfg) in configs {
                     match stage_cfg {
                         crate::physical::colored_dag::StageConfig::Edge(mut edge) => {
@@ -818,14 +840,12 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                         }
                     }
                 }
-            } else {
-                warn!(
-                    metric = %workload.metric_name,
-                    "[USE_TYPED_STAGE_SPLIT] split_typed_three_stage returned None; \
-                     legacy plan output unaffected"
-                );
-            }
-        }
+    } else if physical::stage_split::typed_stage_split_enabled() {
+        warn!(
+            metric = %workload.metric_name,
+            "[USE_TYPED_STAGE_SPLIT] split_typed_three_stage returned None; \
+             legacy plan output unaffected"
+        );
     }
 
     // ── Update scrape-endpoint sketch types and agent→(metric, role) mapping ──

@@ -51,10 +51,12 @@ pub use trait_def::{
 pub use crate::workload::WorkloadRegistry;
 
 use crate::physical::colored_dag::emitter::EdgeStageConfig;
+use crate::sketch_algebra::physical_expr::L4Plan;
 use crate::sketch_algebra::PhysicalExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
-use asap_sketch::SummaryKind;
+use asap_sketch::{L4Node, SummaryExpr, SummaryKind};
+use std::rc::Rc;
 
 /// Phase ε.1.5 — which edge runtime an agent identifies as.
 ///
@@ -292,24 +294,55 @@ fn apply_cold_format_from_env(edge_cfg: &mut EdgeStageConfig) {
 /// which is correct.
 pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SummaryKind> {
     match expr {
-        PhysicalExpr::SketchAgg { sketch_type, .. } => Some(sketch_type.clone()),
+        PhysicalExpr::Committed(plan) => extract_from_plan(plan),
         PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
-        PhysicalExpr::SketchEstimate { child, .. } => extract_root_sketch_kind(child),
-        PhysicalExpr::SketchMerge { children, .. } => {
-            children.iter().find_map(extract_root_sketch_kind)
+        PhysicalExpr::RawAtEdgePrometheusArchive { .. } => None,
+    }
+}
+
+fn extract_from_plan(plan: &L4Plan) -> Option<SummaryKind> {
+    match plan {
+        L4Plan::Summary(node) => extract_from_node(node),
+        L4Plan::LetBinding { expr, child, .. } => {
+            extract_from_plan(expr).or_else(|| extract_from_plan(child))
         }
-        PhysicalExpr::LetBinding { expr, child, .. } => {
-            extract_root_sketch_kind(expr).or_else(|| extract_root_sketch_kind(child))
+        L4Plan::Ref { .. } => None,
+    }
+}
+
+/// Is `kind` an exact accumulator (Sum/Count/MinMax/Increase/Rate) rather
+/// than an approximate sketch? Exact accumulators have no sketch family
+/// for the 5-sketch routing connector to route on — same as the old,
+/// now-retired `PhysicalExpr::ExactAgg` variant, which this function
+/// treated as `None`.
+fn is_exact_accumulator(kind: &SummaryKind) -> bool {
+    matches!(
+        kind,
+        SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate
+    )
+}
+
+fn extract_from_node(node: &Rc<L4Node>) -> Option<SummaryKind> {
+    match &node.expr {
+        SummaryExpr::SummaryAgg { sketch, .. } if !is_exact_accumulator(sketch) => {
+            Some(sketch.clone())
         }
-        PhysicalExpr::Logical(_)
-        | PhysicalExpr::Ref { .. }
-        | PhysicalExpr::RawAtEdgePrometheusArchive { .. }
-        // ExactAgg has no sketch family — it produces an exact
-        // aggregation accumulator, not a sketch state. The
-        // routing emitter routes these to the
-        // `metrics/raw_passthrough` / exact-precompute pipeline
-        // alongside Logical pass-throughs.
-        | PhysicalExpr::ExactAgg { .. } => None,
+        // An exact accumulator has no sketch family beneath it (its own
+        // child is always a plain `Logical` leaf) — same as the old
+        // `ExactAgg` case.
+        SummaryExpr::SummaryAgg { .. } => None,
+        SummaryExpr::SummaryEstimate { sketch_input, .. } => extract_from_node(sketch_input),
+        SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
+        // Not surfaced by any `Bind*` path yet (gated on rules that
+        // haven't landed — see `physical_expr.rs`'s module docs).
+        SummaryExpr::SummaryJoin { .. }
+        | SummaryExpr::SummarySubtract { .. }
+        | SummaryExpr::SummaryDelete { .. }
+        | SummaryExpr::Logical(_) => None,
     }
 }
 
@@ -990,10 +1023,11 @@ mod runtime_tests {
                 "top_endpoint_qps",
                 Some(BTreeSet::from([SummaryKind::CountSketchWithHeap])),
             ),
-            (
-                "endpoint_request_freq",
-                Some(BTreeSet::from([SummaryKind::Cms])),
-            ),
+            // `CountMinSketch` override re-derives statistic to
+            // `Frequency`, `AggIntent::Extension`-shaped — declines to
+            // bind pending ASAPController#150 (see
+            // `optimizer::rules::tests::typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`).
+            ("endpoint_request_freq", None),
         ];
         for (metric, want) in &expected {
             let got = map.get(*metric).cloned();
@@ -1003,11 +1037,12 @@ mod runtime_tests {
                  full map: {map:?}",
             );
         }
-        // Routing table covers all 5 sketched metrics.
+        // Routing table covers the 4 sketched metrics (endpoint_request_freq
+        // and http_requests_total both decline — see above).
         assert_eq!(
             map.len(),
-            5,
-            "routing table should have 5 entries (5 sketches; raw declines), got: {map:?}"
+            4,
+            "routing table should have 4 entries (4 sketches; raw + Extension both decline), got: {map:?}"
         );
     }
 
@@ -1177,11 +1212,20 @@ mod runtime_tests {
             mk(AggType::Cardinality, Some(SketchType::HLL), Vec::new()),
             WorkloadCharacteristics::default(),
         );
-        // Frequency → CMS (capability-matched default for Frequency).
+        // TopK → CountSketch-with-heap. Not plain `Frequency, None`
+        // (capability-matched CMS default) any more — `Frequency`'s
+        // capability-matched default is `AggIntent::Extension`-shaped,
+        // which `asap_plan::boundary::implementation_for` maps to
+        // `PassThrough` unconditionally (ASAPController#150), so it no
+        // longer contributes a family to the union at all. Use a
+        // `CountSketch` override instead — it re-derives the statistic to
+        // `TopK` (not `Extension`-shaped), so it still binds, and still
+        // exercises "3 distinct capabilities on one metric → union of 3
+        // distinct families".
         store.set(
             METRIC,
             AggRole::Other,
-            mk(AggType::Frequency, None, Vec::new()),
+            mk(AggType::Frequency, Some(SketchType::CountSketch), Vec::new()),
             WorkloadCharacteristics::default(),
         );
 
@@ -1192,7 +1236,11 @@ mod runtime_tests {
             .unwrap_or_else(|| panic!("http_requests must be in the map\nmap: {map:?}"));
         assert_eq!(
             got,
-            BTreeSet::from([SummaryKind::DDSketch, SummaryKind::Hll, SummaryKind::Cms]),
+            BTreeSet::from([
+                SummaryKind::DDSketch,
+                SummaryKind::Hll,
+                SummaryKind::CountSketchWithHeap
+            ]),
             "a metric queried by 3 capabilities must accumulate 3 families (UNION, not first-wins)\nmap: {map:?}"
         );
     }

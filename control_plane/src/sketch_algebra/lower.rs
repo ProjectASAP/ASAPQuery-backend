@@ -1,87 +1,80 @@
-//! L3 → L4 lowering — `QueryExpr` walk that fires `Bind*` rules.
+//! L3 → L4/L5 lowering — `QueryExpr` walk that adopts
+//! `asap_plan::bind::implement_tree_in_with` for the sketch algebra
+//! itself (Step B of the plan-shaped-serving migration), with
+//! `crate::sketch_algebra::cost_model::ControlPlaneCostModel` plugged in
+//! for family selection + parameter sizing.
 //!
-//! Per `control_plane/docs/design.md` §6 sketch_algebra (line ~616): "the
-//! optimizer's job is to selectively replace logical aggregates / joins
-//! with their sketch-bound variants when a binding rule fires; everything
-//! else stays inside `PhysicalExpr::Logical(…)`."
+//! Per `control_plane/docs/design.md` §6: "the optimizer's job is to
+//! selectively replace logical aggregates / joins with their sketch-bound
+//! variants when a binding rule fires; everything else stays inside
+//! `Logical(…)`."
 //!
-//! Phase C ships the bottom-up walk — every `QueryExpr` sub-tree is
-//! offered to the rule dispatcher; if a rule fires, its output replaces
-//! the sub-tree; otherwise we recurse into the children and wrap the
-//! result in `PhysicalExpr::Logical`.
-//!
-//! `LetBinding` / `Ref` survive the lowering: the bound expression is
-//! lowered to L4, the child is lowered against the same workload-level
-//! accuracy target, and the result is a `PhysicalExpr::LetBinding` /
-//! `PhysicalExpr::Ref` with the L4-bound payload.
+//! Two node shapes are rewritten *before* delegating to
+//! `implement_tree_in_with`, because `asap_plan::boundary::implementation_for`
+//! actively binds them to an `Implementation` this deployment's data plane
+//! doesn't (or, deliberately, shouldn't) serve — not something the
+//! `CostModel` hook can reach, since the decision of *whether* to call
+//! into `rank_candidates`/`size_params` at all is made before the
+//! `CostModel` is ever consulted. See each helper's docs for the specific
+//! reason. Everything else — including `AggIntent::Extension` (the
+//! `Frequency` point-query) and `AggIntent::TopK { accuracy: Exact }`,
+//! both of which `implementation_for` maps to `PassThrough` — is left to
+//! fall through to `implement_tree_in_with`'s own `Logical` fallback
+//! unchanged: both are genuine `asap-plan` coverage gaps, not something
+//! this deployment can or should route around locally (filed upstream —
+//! see ASAPController#150, #151).
 
 #![allow(dead_code)]
 
+use std::rc::Rc;
+
+use asap_plan::bind::implement_tree_in_with;
 use thiserror::Error;
 
-use crate::intent_algebra::QueryExpr;
-use crate::sketch_algebra::physical_expr::PhysicalExpr;
-use crate::sketch_algebra::rules::dispatch;
-use crate::types_v2::AccuracyTarget;
+use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr};
+use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
+use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::types_v2::{AccuracyTarget, BindingName};
 
-/// Errors surfaced by the `bind_query_expr` lowering. Reserved — Phase C
-/// has no bind-time errors that aren't expressible as "no rule fires"
-/// (the dispatcher returns `None` and the caller wraps the input in
-/// `PhysicalExpr::Logical`). Defined now so future rules that *can* fail
-/// at bind time (catalog mismatch, parameter overflow) plug in without
-/// an API break.
+/// Errors surfaced by the `bind_query_expr` lowering.
 #[derive(Debug, Error)]
 pub enum BindingError {
-    /// Carried for downstream consumers — Phase C has no producers yet.
-    #[error("binding failed: {0}")]
-    Other(String),
+    /// L3 schema derivation failed while lifting an edge to `L4Schema` —
+    /// forwarded from `asap_plan::bind`.
+    #[error("L3->L4 implementation failed: {0}")]
+    Implement(#[from] asap_plan::ImplementError),
 }
 
-/// Lower an L3 `QueryExpr` to an L4 [`PhysicalExpr`] under the supplied
-/// workload-level accuracy target. Bottom-up walk; `Bind*` rules consult
-/// the `accuracy` param + the per-intent `accuracy` field on each
-/// `Aggregate` and pick the tighter of the two.
-///
-/// Return value: `Ok(PhysicalExpr)` always — Phase C never errors. The
-/// caller observes "no binding" via the returned `PhysicalExpr::Logical`
-/// at the matched sub-tree position.
+/// Lower an L3 `QueryExpr` to L4/L5 under the supplied workload-level
+/// accuracy target. The result is always [`PhysicalExpr::Committed`] —
+/// this walk never picks a Phase ε.1 backend/archive placement; that's a
+/// separate, later L5 decision (`optimizer::cost::wire`).
 pub fn bind_query_expr(
     expr: &QueryExpr,
     accuracy: AccuracyTarget,
 ) -> Result<PhysicalExpr, BindingError> {
-    Ok(bind_recursive(expr, &accuracy))
+    Ok(PhysicalExpr::Committed(bind_recursive(expr, &accuracy)?))
 }
 
-fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
-    // Try the rule dispatcher first — if a `Bind*` rule fires, its
-    // output replaces the matched sub-tree wholesale. The rule's output
-    // already wraps the L3 child in `PhysicalExpr::Logical(...)` per the
-    // `estimate_over_agg` constructor.
-    if let Some(bound) = dispatch(expr, accuracy) {
-        return bound;
-    }
-
-    // No rule matched — recurse into the children to find sub-trees that
-    // bind. For pass-through nodes (`Scan`, `Window`, `LetBinding`,
-    // `Ref`) we surface the recursive structure in `PhysicalExpr` directly
-    // when relevant, otherwise we wrap the L3 sub-tree in `Logical`.
+fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan, BindingError> {
     match expr {
-        QueryExpr::LetBinding { name, expr, child } => PhysicalExpr::LetBinding {
-            name: crate::types_v2::BindingName::new(name.as_str()),
-            expr: Box::new(bind_recursive(expr, accuracy)),
-            child: Box::new(bind_recursive(child, accuracy)),
-        },
-        QueryExpr::Ref { name } => PhysicalExpr::Ref {
-            name: crate::types_v2::BindingName::new(name.as_str()),
-        },
+        QueryExpr::LetBinding { name, expr, child } => Ok(L4Plan::LetBinding {
+            name: BindingName::new(name.as_str()),
+            expr: Rc::new(bind_recursive(expr, accuracy)?),
+            child: Rc::new(bind_recursive(child, accuracy)?),
+        }),
+        QueryExpr::Ref { name } => Ok(L4Plan::Ref {
+            name: BindingName::new(name.as_str()),
+        }),
+
         // The canonical L3 IR places `Window` *above* a single-statistic
-        // sketchable `Aggregate` (`lower`'s window-swap).
-        // The `Bind*` rules match `Aggregate` with the window as its
-        // *child*, so push the window down under the aggregate and
-        // re-dispatch — the window then rides along inside the bound
-        // node's `Logical(...)` child, exactly as it did when the
-        // aggregate sat on top. A `Window` over anything else stays a
-        // logical pass-through.
+        // sketchable `Aggregate` (`lower`'s window-swap). `implement_tree_in_with`
+        // only recurses through the `Aggregate` spine (see its module
+        // docs' "conservative fallbacks" — a logical parent above a
+        // bindable aggregate subsumes it unbound), so push the window
+        // down under the aggregate and re-dispatch, exactly as the old
+        // hand-written walk did — the window then rides along inside the
+        // bound node's `Logical(...)` child.
         QueryExpr::Window {
             kind,
             size,
@@ -112,18 +105,79 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> PhysicalExpr {
             };
             bind_recursive(&pushed, accuracy)
         }
-        // For `Aggregate`, the rule dispatcher already had a chance and
-        // declined. For `Scan` and a `Window` over a non-`Aggregate`
-        // child, no binding rule applies — wrap the L3 sub-tree as a
-        // logical pass-through.
-        QueryExpr::Aggregate { .. } | QueryExpr::Scan { .. } | QueryExpr::Window { .. } => {
-            PhysicalExpr::Logical(expr.clone())
+
+        // `AggIntent::Count { accuracy: Exact }` — `boundary::implementation_for`'s
+        // `exact_realization` actively binds this to `SummaryKind::Count`,
+        // but this deployment's data plane has no count accumulator: its
+        // `SumAccumulator` only tracks `sum: f64`, so a `Count`
+        // accumulator would silently return the sum of sample VALUES, not
+        // the sample count (PR #200/#201, reverted — see the retired
+        // `bind_exact_agg.rs`). Force the same fallback `implement_tree_in_with`
+        // uses for unbound shapes, via the public `bind::logical`
+        // ASAPController exposes for exactly this "deployment knows
+        // better" case — no local schema-lift duplication needed. Stays
+        // on archive, matching today's behavior.
+        QueryExpr::Aggregate {
+            aggs, having: None, ..
+        } if matches!(
+            aggs.as_slice(),
+            [AggIntent::Count {
+                accuracy: AccuracyTarget::Exact
+            }]
+        ) =>
+        {
+            Ok(L4Plan::Summary(asap_plan::bind::logical(
+                expr,
+                &BindingScope::default(),
+            )?))
         }
-        // A-variants lifted in Batch 2 of the relational migration. No
-        // sketch binding rule applies to these shapes today — wrap as a
-        // logical pass-through, matching the policy for `Aggregate` /
-        // `Scan` / `Window`. Rule extensions can specialise individual
-        // variants as the catalog grows.
-        _ => PhysicalExpr::Logical(expr.clone()),
+
+        _ => {
+            let rewritten = rewrite_rate_to_increase(expr);
+            let cost_model = ControlPlaneCostModel::new(accuracy.clone());
+            let node = implement_tree_in_with(&rewritten, &BindingScope::default(), &cost_model)?;
+            Ok(L4Plan::Summary(node))
+        }
+    }
+}
+
+/// Rewrite every `AggIntent::Rate` reachable via the `Aggregate` spine
+/// (nested `Aggregate.child` chains — the only shape `implement_tree_in_with`
+/// itself recurses through; see its "conservative fallbacks" docs) to
+/// `AggIntent::Increase`.
+///
+/// `boundary::implementation_for` gives `Rate` its own `SummaryKind::Rate`;
+/// this deployment's data plane has no accumulator family for it — rate is
+/// computed as `increase / window_seconds`, a scalar division on the
+/// `Increase` accumulator's output applied at readout, not a separate
+/// accumulator (see the retired `bind_exact_agg.rs`, which bound both to
+/// the same accumulator for the same reason). Representing `Rate` as
+/// `Increase` up through L4 preserves that — the L5 emitter is still the
+/// one that knows to apply the division.
+fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
+    match expr {
+        QueryExpr::Aggregate {
+            by,
+            aggs,
+            output_names,
+            having,
+            child,
+        } => QueryExpr::Aggregate {
+            by: by.clone(),
+            aggs: aggs
+                .iter()
+                .map(|intent| {
+                    if matches!(intent, AggIntent::Rate) {
+                        AggIntent::Increase
+                    } else {
+                        intent.clone()
+                    }
+                })
+                .collect(),
+            output_names: output_names.clone(),
+            having: having.clone(),
+            child: Box::new(rewrite_rate_to_increase(child)),
+        },
+        other => other.clone(),
     }
 }
