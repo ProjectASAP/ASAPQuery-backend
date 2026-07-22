@@ -33,8 +33,95 @@ use serde::{Deserialize, Serialize};
 
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::physical_expr::{EstimateOp, PhysicalExpr};
-use asap_sketch::{SummaryKind, SummaryParams};
+use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::types_v2::BindingName;
+use asap_sketch::{SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
+
+/// Flattened view of one [`ColoredNode`](crate::physical::colored_dag::dag::ColoredNode)'s
+/// `PhysicalExpr`, for the tuple-style `(&node.expr, node.stage)` matching
+/// this file uses throughout. Mirrors the shape the old, locally-defined
+/// flat `PhysicalExpr` had before Step B folded most of its variants into
+/// `asap_sketch::SummaryExpr` — see `sketch_algebra::physical_expr`'s
+/// module docs.
+enum NodeKind<'a> {
+    Logical(&'a crate::intent_algebra::QueryExpr),
+    /// An approximate sketch — the old `SketchAgg`. Exact accumulators
+    /// (Sum/Count/MinMax/Increase/Rate) are classified as [`Self::ExactAgg`]
+    /// instead, matching the old `PhysicalExpr::ExactAgg`'s separate shape.
+    SketchAgg {
+        sketch_type: &'a SummaryKind,
+        params: &'a SummaryParams,
+    },
+    /// An exact accumulator — the old `PhysicalExpr::ExactAgg`. This
+    /// emitter has never had a match arm for it (falls through to the
+    /// catch-all below, same as before Step B — a pre-existing gap, not
+    /// introduced by this migration).
+    ExactAgg,
+    SketchEstimate { query: &'a SketchQuery },
+    SketchMerge,
+    LetBinding { name: &'a BindingName },
+    Ref { name: &'a BindingName },
+    RawAtEdgeSketchAtBackend {
+        family: &'a SummaryKind,
+        params: &'a SummaryParams,
+    },
+    RawAtEdgePrometheusArchive {
+        metric: &'a str,
+        window: Option<std::time::Duration>,
+        label_proj: &'a [String],
+    },
+    /// `SummaryJoin` / `SummarySubtract` / `SummaryDelete` — not surfaced
+    /// by any `Bind*` path yet (gated on rules that haven't landed).
+    Other,
+}
+
+/// Is `kind` an exact accumulator (Sum/Count/MinMax/Increase/Rate) rather
+/// than an approximate sketch?
+fn is_exact_accumulator(kind: &SummaryKind) -> bool {
+    matches!(
+        kind,
+        SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate
+    )
+}
+
+fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
+    match expr {
+        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            SummaryExpr::Logical(qe) => NodeKind::Logical(qe),
+            SummaryExpr::SummaryAgg { sketch, params, .. } if is_exact_accumulator(sketch) => {
+                let _ = params;
+                NodeKind::ExactAgg
+            }
+            SummaryExpr::SummaryAgg { sketch, params, .. } => NodeKind::SketchAgg {
+                sketch_type: sketch,
+                params,
+            },
+            SummaryExpr::SummaryEstimate { query, .. } => NodeKind::SketchEstimate { query },
+            SummaryExpr::SummaryMerge { .. } => NodeKind::SketchMerge,
+            SummaryExpr::SummaryJoin { .. }
+            | SummaryExpr::SummarySubtract { .. }
+            | SummaryExpr::SummaryDelete { .. } => NodeKind::Other,
+        },
+        PhysicalExpr::Committed(L4Plan::LetBinding { name, .. }) => NodeKind::LetBinding { name },
+        PhysicalExpr::Committed(L4Plan::Ref { name }) => NodeKind::Ref { name },
+        PhysicalExpr::RawAtEdgeSketchAtBackend { family, params, .. } => {
+            NodeKind::RawAtEdgeSketchAtBackend { family, params }
+        }
+        PhysicalExpr::RawAtEdgePrometheusArchive {
+            metric,
+            window,
+            label_proj,
+        } => NodeKind::RawAtEdgePrometheusArchive {
+            metric,
+            window: *window,
+            label_proj,
+        },
+    }
+}
 
 /// Errors surfaced by [`Emitter::emit_per_stage`].
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -73,7 +160,9 @@ pub trait Emitter {
 /// The variants are deliberately struct-shaped (named fields) so future
 /// downstream consumers can pattern-match without relying on tuple-index
 /// stability.
-#[derive(Debug, Clone, PartialEq)]
+/// Not `PartialEq` — `Backend` carries `BackendStageConfig`, which isn't
+/// `PartialEq` either (see its doc comment).
+#[derive(Debug, Clone)]
 pub enum StageConfig {
     /// Edge agent's logical config — what the OpAMP push for this
     /// agent will need to materialise into OTel collector YAML.
@@ -529,7 +618,14 @@ pub struct GatewayMergeProcessor {
 }
 
 /// Logical content of the backend `StreamingConfig`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Not `PartialEq` — `readouts: Vec<BackendReadout>` carries
+/// `asap_sketch::SketchQuery`, which (like `SummaryExpr`/`L4Node`) has no
+/// `PartialEq` impl upstream. Nothing on the real emit path compares
+/// whole `BackendStageConfig`/`BackendReadout` values — every actual
+/// wire payload goes through `build_backend_readout_json`'s hand-written
+/// JSON builder, never a whole-struct comparison.
+#[derive(Debug, Clone)]
 pub struct BackendStageConfig {
     /// One entry per readout query the backend must serve. The
     /// `aggregation_id` in each routing entry is the backend's
@@ -641,12 +737,15 @@ pub enum AggregationInput {
 }
 
 /// One readout entry — what the backend's inference YAML asks for.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Not `PartialEq`/`Serialize`/`Deserialize` — `op: SketchQuery` has none
+/// of those upstream (see `BackendStageConfig`'s doc comment).
+#[derive(Debug, Clone)]
 pub struct BackendReadout {
     /// Aggregation this readout reads from.
     pub aggregation_id: String,
-    /// Readout op (mirror of `PhysicalExpr::SketchEstimate::op`).
-    pub op: EstimateOp,
+    /// Readout op (mirror of `SummaryExpr::SummaryEstimate::query`).
+    pub op: SketchQuery,
 }
 
 /// Abstract OTLP / HTTP endpoint description. Phase E does not resolve
@@ -762,7 +861,7 @@ impl Emitter for ThreeStageEmitter {
         // `label_filters` — so the Pass 2 arm that also calls it
         // remains correct (no double-counting).
         for node in &dag.nodes {
-            if let (PhysicalExpr::Logical(qe), StageId::Edge) = (&node.expr, node.stage) {
+            if let (NodeKind::Logical(qe), StageId::Edge) = (classify(&node.expr), node.stage) {
                 extract_edge_facts(qe, &mut edge);
             }
         }
@@ -771,7 +870,8 @@ impl Emitter for ThreeStageEmitter {
         // SketchAgg up-front so SketchMerge / SketchEstimate emission
         // (pass 2) can resolve them regardless of node-table order.
         for node in &dag.nodes {
-            if let (PhysicalExpr::SketchAgg { .. }, StageId::Edge) = (&node.expr, node.stage) {
+            if let (NodeKind::SketchAgg { .. }, StageId::Edge) = (classify(&node.expr), node.stage)
+            {
                 let aggregation_id = format!("agg{next_agg_index}");
                 next_agg_index += 1;
                 sketch_agg_ids.insert(node.id.0, aggregation_id);
@@ -780,19 +880,18 @@ impl Emitter for ThreeStageEmitter {
 
         // Pass 2 — emit per-stage facts.
         for node in &dag.nodes {
-            match (&node.expr, node.stage) {
+            match (classify(&node.expr), node.stage) {
                 // Edge: source metric + label filters from Logical
                 // — the wrapped L3 sub-tree may be Scan, Window{Scan},
                 // Aggregate{Window{Scan}} etc., so descend recursively.
-                (PhysicalExpr::Logical(qe), StageId::Edge) => {
+                (NodeKind::Logical(qe), StageId::Edge) => {
                     extract_edge_facts(qe, &mut edge);
                 }
                 // Edge: SketchAgg becomes one EdgeSketchProcessor.
                 (
-                    PhysicalExpr::SketchAgg {
+                    NodeKind::SketchAgg {
                         sketch_type,
                         params,
-                        ..
                     },
                     StageId::Edge,
                 ) => {
@@ -831,7 +930,7 @@ impl Emitter for ThreeStageEmitter {
                 // (looked up via the DAG's edges table so identical
                 // child sub-trees don't collide on a position-by-expr
                 // search).
-                (PhysicalExpr::SketchMerge { .. }, StageId::Gateway) => {
+                (NodeKind::SketchMerge, StageId::Gateway) => {
                     if let Some((kind, aid)) =
                         first_sketch_child_via_edges(dag, node.id, &sketch_agg_ids)
                     {
@@ -845,12 +944,12 @@ impl Emitter for ThreeStageEmitter {
                 // Backend: SketchEstimate → one readout entry. The
                 // matching aggregation_id comes from the descendant
                 // SketchAgg (resolved by walking the DAG edges table).
-                (PhysicalExpr::SketchEstimate { op, .. }, StageId::Backend) => {
+                (NodeKind::SketchEstimate { query }, StageId::Backend) => {
                     let aid = resolve_descendant_agg_id_via_edges(dag, node.id, &sketch_agg_ids)
                         .unwrap_or_else(|| format!("agg{}", readouts.len()));
                     readouts.push(BackendReadout {
                         aggregation_id: aid,
-                        op: op.clone(),
+                        op: query.clone(),
                     });
                 }
                 // ── Phase ε.1 Mode 3: edge raw → Prometheus OTLP receiver.
@@ -859,7 +958,7 @@ impl Emitter for ThreeStageEmitter {
                 // pipeline. Backend gets a `prometheus_remote` storage
                 // routing target (no aggregation entry).
                 (
-                    PhysicalExpr::RawAtEdgePrometheusArchive {
+                    NodeKind::RawAtEdgePrometheusArchive {
                         metric,
                         window,
                         label_proj,
@@ -868,9 +967,9 @@ impl Emitter for ThreeStageEmitter {
                 ) => {
                     edge.prometheus_archive_metrics
                         .push(PrometheusArchiveMetric {
-                            metric: metric.clone(),
+                            metric: metric.to_string(),
                             window_secs: window.map(|d| d.as_secs()),
-                            label_proj: label_proj.clone(),
+                            label_proj: label_proj.to_vec(),
                         });
                     // Phase 3.2.5 (Bug a): Mode-3 metrics also land in
                     // the Gorilla-S3 archive so the ASAP-tier
@@ -879,7 +978,7 @@ impl Emitter for ThreeStageEmitter {
                     // is emitted by the L5 emitter when this list is
                     // non-empty.
                     edge.archive_tier_metrics.push(ArchiveTierMetric {
-                        metric: metric.clone(),
+                        metric: metric.to_string(),
                         window_secs: window.map(|d| d.as_secs()),
                     });
                 }
@@ -888,7 +987,7 @@ impl Emitter for ThreeStageEmitter {
                 // BackendAggregation with the family the backend will
                 // build at ingest. The aggregation_input=raw flag is
                 // emitted by `emit_backend_streaming_config_json`.
-                (PhysicalExpr::RawAtEdgeSketchAtBackend { family, params, .. }, StageId::Edge) => {
+                (NodeKind::RawAtEdgeSketchAtBackend { family, params }, StageId::Edge) => {
                     let aid = format!("agg{next_agg_index}");
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
@@ -1097,25 +1196,25 @@ fn first_sketch_child_via_edges(
 ) -> Option<(SummaryKind, String)> {
     for cid in children_of(dag, parent) {
         let cnode = dag.nodes.get(cid.0)?;
-        match &cnode.expr {
-            PhysicalExpr::SketchAgg { sketch_type, .. } => {
+        match classify(&cnode.expr) {
+            NodeKind::SketchAgg { sketch_type, .. } => {
                 if let Some(aid) = sketch_agg_ids.get(&cid.0) {
                     return Some((sketch_type.clone(), aid.clone()));
                 }
             }
-            PhysicalExpr::LetBinding { .. } | PhysicalExpr::SketchMerge { .. } => {
+            NodeKind::LetBinding { .. } | NodeKind::SketchMerge => {
                 if let Some(found) = first_sketch_child_via_edges(dag, cid, sketch_agg_ids) {
                     return Some(found);
                 }
             }
-            PhysicalExpr::Ref { name } => {
+            NodeKind::Ref { name } => {
                 // Resolve the ref to its binding's expr id, then recurse.
                 if let Some(bid) = dag
                     .nodes
                     .iter()
                     .enumerate()
-                    .find_map(|(i, n)| match &n.expr {
-                        PhysicalExpr::LetBinding { name: n2, .. } if n2 == name => Some(i),
+                    .find_map(|(i, n)| match classify(&n.expr) {
+                        NodeKind::LetBinding { name: n2 } if n2 == name => Some(i),
                         _ => None,
                     })
                 {

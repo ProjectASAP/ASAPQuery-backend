@@ -37,9 +37,13 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::rc::Rc;
+
+use asap_sketch::{L4Node, SummaryExpr};
 
 use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
+use crate::sketch_algebra::physical_expr::L4Plan;
 use crate::sketch_algebra::PhysicalExpr;
 use crate::types_v2::BindingName;
 
@@ -96,40 +100,101 @@ impl ThreeStageWalker {
     /// Recursively visit `expr`, append its colored node to the DAG,
     /// and return its `(NodeId, StageId)`.
     fn visit(&mut self, expr: &PhysicalExpr) -> Result<(NodeId, StageId), AllocateError> {
-        // Reserve a slot for this node up-front so child IDs are
-        // strictly larger than the parent's; downstream `cut_edges`
-        // analysis assumes parents come before children in `nodes`.
-        let id = NodeId(self.dag.nodes.len());
-        self.dag.nodes.push(ColoredNode {
-            id,
-            expr: expr.clone(),
-            // Placeholder — overwritten below once children are coloured.
-            stage: StageId::Edge,
-        });
+        match expr {
+            PhysicalExpr::Committed(plan) => self.visit_plan(plan),
 
-        let stage = match expr {
+            // ── Phase ε.1 Mode 2: raw at edge, sketch built at backend.
+            // Edge ships raw OTLP — we stage as Edge so the L5 emitter's
+            // edge-side YAML pipeline picks it up; the sketch construction
+            // itself happens at the backend (no edge sketch processor).
+            PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => {
+                let id = self.reserve_node(expr.clone());
+                let (cid, _) = self.visit_plan(child)?;
+                self.dag.edges.push((id, cid));
+                self.finish_node(id, StageId::Edge)
+            }
+
+            // ── Phase ε.1 Mode 3: raw at edge, ships directly to
+            // Prometheus's native OTLP receiver. The agent pipeline picks
+            // this up via `asap.mode=prometheus_archive` routing.
+            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => {
+                let id = self.reserve_node(expr.clone());
+                self.finish_node(id, StageId::Edge)
+            }
+        }
+    }
+
+    /// Recursively visit an [`L4Plan`] — the "what to compute" layer.
+    /// [`L4Plan::Summary`] delegates the actual per-node granularity to
+    /// [`Self::visit_l4node`] (walking `asap_sketch::L4Node`'s own DAG
+    /// shape); [`L4Plan::LetBinding`] / [`L4Plan::Ref`] are this crate's
+    /// own named-binding sharing mechanism, unchanged from before Step B.
+    fn visit_plan(&mut self, plan: &L4Plan) -> Result<(NodeId, StageId), AllocateError> {
+        match plan {
+            L4Plan::Summary(node) => self.visit_l4node(node),
+
+            // ── LetBinding: colour by the bound expression's stage,
+            // and bring the binding into scope before walking the body.
+            L4Plan::LetBinding { name, expr, child } => {
+                let id = self.reserve_node(PhysicalExpr::Committed(plan.clone()));
+                let (eid, expr_stage) = self.visit_plan(expr)?;
+                self.dag.edges.push((id, eid));
+                self.scope.insert(name.as_str().to_string(), expr_stage);
+                let (bid, _) = self.visit_plan(child)?;
+                self.dag.edges.push((id, bid));
+                self.finish_node(id, expr_stage)
+            }
+
+            // ── Ref: colour matches the binding's stage. Unresolved
+            // refs bubble up as `AllocateError::UnresolvedRef`.
+            L4Plan::Ref { name } => {
+                let id = self.reserve_node(PhysicalExpr::Committed(plan.clone()));
+                let stage = self
+                    .scope
+                    .get(name.as_str())
+                    .copied()
+                    .ok_or_else(|| AllocateError::UnresolvedRef(name.as_str().to_string()))?;
+                self.finish_node(id, stage)
+            }
+        }
+    }
+
+    /// Recursively visit one `asap_sketch::L4Node` — the sketch algebra
+    /// itself, owned upstream. Every semantic node gets its own
+    /// [`ColoredNode`] (matching the granularity the old, locally-defined
+    /// `PhysicalExpr::{SketchAgg,SketchEstimate,SketchMerge}` had),
+    /// stored back as `PhysicalExpr::Committed(L4Plan::Summary(..))`
+    /// wrapping just that sub-node, so downstream consumers
+    /// (`colored_dag::emitter`, `emit::mod`) keep pattern-matching
+    /// against the same `PhysicalExpr` shape.
+    fn visit_l4node(&mut self, node: &Rc<L4Node>) -> Result<(NodeId, StageId), AllocateError> {
+        let id = self.reserve_node(PhysicalExpr::committed(Rc::clone(node)));
+
+        let stage = match &node.expr {
             // ── Logical pass-through — colour by inspecting the wrapped
             // L3 QueryExpr. `Scan` / `Window` always land on edge;
             // `Aggregate{exact}` lands on edge if its child is an edge
             // (scrape locality); `Ref` resolves through the lexical
             // scope map.
-            PhysicalExpr::Logical(qe) => self.colour_logical(qe)?,
+            SummaryExpr::Logical(qe) => self.colour_logical(qe)?,
 
-            // ── SketchAgg: always edge per design.md §6 batched-queries
-            // table. The "SketchAgg whose child is a Scan MUST be on
-            // Edge" invariant is automatically satisfied.
-            PhysicalExpr::SketchAgg { child, .. } => {
-                let (cid, _) = self.visit(child)?;
+            // ── SummaryAgg: always edge per design.md §6 batched-queries
+            // table — true for both approximate sketches (the old
+            // `SketchAgg`) and exact accumulators (the old `ExactAgg`);
+            // `SummaryKind` unifies both into the same node shape, and
+            // both landed on Edge before this migration too.
+            SummaryExpr::SummaryAgg { child, .. } => {
+                let (cid, _) = self.visit_l4node(child)?;
                 self.dag.edges.push((id, cid));
                 StageId::Edge
             }
 
-            // ── SketchEstimate: always backend per design.md §6.
+            // ── SummaryEstimate: always backend per design.md §6.
             // The "SketchEstimate MUST be on the same stage as its
             // consumers (typically Backend)" invariant is satisfied
-            // because consumers above SketchEstimate are also backend.
-            PhysicalExpr::SketchEstimate { child, .. } => {
-                let (cid, child_stage) = self.visit(child)?;
+            // because consumers above SummaryEstimate are also backend.
+            SummaryExpr::SummaryEstimate { sketch_input, .. } => {
+                let (cid, child_stage) = self.visit_l4node(sketch_input)?;
                 self.dag.edges.push((id, cid));
                 // If child is on edge or gateway, this is a cross-stage
                 // edge — that's expected (the wire-format hop).
@@ -137,66 +202,68 @@ impl ThreeStageWalker {
                 StageId::Backend
             }
 
-            // ── SketchMerge: gateway under three-stage. Children are
-            // edge SketchAgg outputs.
-            PhysicalExpr::SketchMerge { children, .. } => {
+            // ── SummaryMerge: gateway under three-stage. Children are
+            // edge SummaryAgg outputs.
+            SummaryExpr::SummaryMerge { children } => {
                 for child in children {
-                    let (cid, _) = self.visit(child)?;
+                    let (cid, _) = self.visit_l4node(child)?;
                     self.dag.edges.push((id, cid));
                 }
                 StageId::Gateway
             }
 
-            // ── LetBinding: colour by the bound expression's stage,
-            // and bring the binding into scope before walking the body.
-            PhysicalExpr::LetBinding { name, expr, child } => {
-                let (eid, expr_stage) = self.visit(expr)?;
-                self.dag.edges.push((id, eid));
-                self.scope.insert(name.as_str().to_string(), expr_stage);
-                let (bid, _) = self.visit(child)?;
-                self.dag.edges.push((id, bid));
-                expr_stage
+            // ── SummaryJoin / SummarySubtract / SummaryDelete: not
+            // surfaced by any `Bind*` path yet (gated on rules that
+            // haven't landed — see `physical_expr.rs`'s module docs'
+            // predecessor note). Conservative default matching
+            // SummaryMerge's multi-input-combination shape until a real
+            // consumer picks a placement.
+            SummaryExpr::SummaryJoin { outer, inner, .. } => {
+                let (oid, _) = self.visit_l4node(outer)?;
+                self.dag.edges.push((id, oid));
+                let (iid, _) = self.visit_l4node(inner)?;
+                self.dag.edges.push((id, iid));
+                StageId::Gateway
             }
-
-            // ── Ref: colour matches the binding's stage. Unresolved
-            // refs bubble up as `AllocateError::UnresolvedRef`.
-            PhysicalExpr::Ref { name } => self
-                .scope
-                .get(name.as_str())
-                .copied()
-                .ok_or_else(|| AllocateError::UnresolvedRef(name.as_str().to_string()))?,
-
-            // ── Phase ε.1 Mode 2: raw at edge, sketch built at backend.
-            // Edge ships raw OTLP — we stage as Edge so the L5 emitter's
-            // edge-side YAML pipeline picks it up; the sketch construction
-            // itself happens at the backend (no edge sketch processor).
-            PhysicalExpr::RawAtEdgeSketchAtBackend { child, .. } => {
-                let (cid, _) = self.visit(child)?;
-                self.dag.edges.push((id, cid));
-                StageId::Edge
+            SummaryExpr::SummarySubtract { left, right } => {
+                let (lid, _) = self.visit_l4node(left)?;
+                self.dag.edges.push((id, lid));
+                let (rid, _) = self.visit_l4node(right)?;
+                self.dag.edges.push((id, rid));
+                StageId::Gateway
             }
-
-            // ── Phase ε.1 Mode 3: raw at edge, ships directly to
-            // Prometheus's native OTLP receiver. The agent pipeline picks
-            // this up via `asap.mode=prometheus_archive` routing.
-            PhysicalExpr::RawAtEdgePrometheusArchive { .. } => StageId::Edge,
-
-            // ── ExactAgg (PR-6 follow-up): same shape as SketchAgg —
-            // produces typed state at the edge. The accumulator runs on
-            // the edge precompute pipeline; the backend's
-            // `SketchStoreSink::append_to_index` writes the final
-            // (sid, window, accumulator) tuples it ships. Coloured
-            // Edge to match the sketch path's locality.
-            PhysicalExpr::ExactAgg { child, .. } => {
-                let (cid, _) = self.visit(child)?;
+            SummaryExpr::SummaryDelete { sketch_input, .. } => {
+                let (cid, _) = self.visit_l4node(sketch_input)?;
                 self.dag.edges.push((id, cid));
-                StageId::Edge
+                StageId::Gateway
             }
         };
 
-        // Patch in the resolved stage now that children have been visited.
-        self.dag.nodes[id.0].stage = stage;
+        self.finish_node(id, stage)
+    }
 
+    /// Reserve a slot for a node up-front so child IDs are strictly
+    /// larger than the parent's; downstream `cut_edges` analysis assumes
+    /// parents come before children in `nodes`.
+    fn reserve_node(&mut self, expr: PhysicalExpr) -> NodeId {
+        let id = NodeId(self.dag.nodes.len());
+        self.dag.nodes.push(ColoredNode {
+            id,
+            expr,
+            // Placeholder — overwritten by `finish_node` once children
+            // have been coloured.
+            stage: StageId::Edge,
+        });
+        id
+    }
+
+    /// Patch in the resolved stage now that children have been visited.
+    fn finish_node(
+        &mut self,
+        id: NodeId,
+        stage: StageId,
+    ) -> Result<(NodeId, StageId), AllocateError> {
+        self.dag.nodes[id.0].stage = stage;
         Ok((id, stage))
     }
 
@@ -263,7 +330,9 @@ impl ThreeStageWalker {
 // stage lookup keyed by binding name.
 pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<StageId> {
     dag.nodes.iter().find_map(|n| match &n.expr {
-        PhysicalExpr::LetBinding { name: n2, .. } if n2 == name => Some(n.stage),
+        PhysicalExpr::Committed(L4Plan::LetBinding { name: n2, .. }) if n2 == name => {
+            Some(n.stage)
+        }
         _ => None,
     })
 }
@@ -274,9 +343,7 @@ pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<Stag
 mod tests {
     use super::*;
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{QueryExpr, Schema, Source, WindowKind};
-    use crate::sketch_algebra::physical_expr::EstimateOp;
-    use asap_sketch::{SummaryKind, SummaryParams};
+    use crate::intent_algebra::{BindingScope, QueryExpr, Schema, Source, WindowKind};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -317,7 +384,9 @@ mod tests {
 
     #[test]
     fn allocate_unsupported_topology_errors() {
-        let leaf = PhysicalExpr::Logical(ts_scan());
+        let leaf = PhysicalExpr::committed(
+            asap_plan::bind::logical(&ts_scan(), &BindingScope::default()).unwrap(),
+        );
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
@@ -329,18 +398,25 @@ mod tests {
 
     #[test]
     fn three_stage_quantile_dag_basic() {
-        let expr = PhysicalExpr::estimate_over_agg(
-            EstimateOp::Quantile { q: 0.99 },
-            SummaryKind::Kll,
-            SummaryParams::Kll { k: 200 },
-            windowed_scan(),
-        );
+        let q = QueryExpr::Aggregate {
+            by: crate::intent_algebra::GroupKeys::none(),
+            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+                col: None,
+                q: 0.99,
+                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(windowed_scan()),
+        };
+        let node = asap_plan::bind::implement_tree(&q).unwrap();
+        let expr = PhysicalExpr::committed(node);
         let dag = StageAllocator
             .allocate(&expr, Topology::ThreeStage)
             .unwrap();
-        // root = SketchEstimate → Backend
+        // root = SummaryEstimate → Backend
         assert_eq!(dag.root().unwrap().stage, StageId::Backend);
-        // node 1 = SketchAgg → Edge
+        // node 1 = SummaryAgg → Edge
         assert_eq!(dag.nodes[1].stage, StageId::Edge);
         // node 2 = Logical(Window) → Edge
         assert_eq!(dag.nodes[2].stage, StageId::Edge);

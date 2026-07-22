@@ -1,130 +1,72 @@
-//! Layer 4 IR — `PhysicalExpr` DAG.
+//! Layer 4/5 IR — `L4Plan` / `PhysicalExpr`.
 //!
-//! Per `control_plane/docs/design.md` §6 "`core::sketch_algebra` — Layer 4 IR
-//! (`PhysicalExpr`)" (around line ~565).
+//! Per `control_plane/docs/design.md` §6 "`core::sketch_algebra` — Layer 4 IR"
+//! and the L4/L5 layer-spine invariant: "sketch binding is already
+//! committed by L4; L5 is about stage allocation + emission."
 //!
-//! Two-IR split: L3 [`crate::intent_algebra::QueryExpr`] is intent-only;
-//! L4 [`PhysicalExpr`] is sketch-bound. `Bind*` rules consume the L3 IR
-//! and produce the L4 IR with the sketch family + parameters committed.
+//! Step B of the plan-shaped-serving migration retires this crate's own
+//! `PhysicalExpr`-as-L4-algebra (the old `Logical` / `SketchAgg` /
+//! `SketchEstimate` / `SketchMerge` / `ExactAgg` variants) in favor of
+//! ASAPController's canonical L4 IR, `asap_sketch::{SummaryExpr, L4Node}`
+//! — the same move Step 3 of the enum-unification made for
+//! `SketchKind → SummaryKind`, one layer up. `implement_promql_for_asap_tier`
+//! (`asap_tier_implement.rs`, Step A) already builds `Rc<L4Node>` trees via
+//! `asap_plan::bind::implement_tree_in_with`; this module gives the rest of
+//! the crate (optimizer, physical, emit) the same IR shape.
 //!
-//! The variant set ships the subset DC + PromQL needs (the orchestrator's
-//! current scope-reduction). `SketchJoin`, `SketchSubtract`, `SketchDelete`
-//! from design.md §6 are intentionally *not* surfaced yet — they're
-//! gated on rules that haven't landed (no `Bind*OnJoin`, no subtract /
-//! delete consumer) and the orchestrator's spec restricts Phase C to
-//! `SketchAgg / SketchEstimate / SketchMerge / Logical`. Adding them
-//! later is a purely additive enum extension.
+//! Two things `asap_sketch::L4Node` genuinely doesn't have, kept here:
+//!
+//! - **`LetBinding` / `Ref`** — named fan-in sharing (SQL
+//!   `WITH name AS (expr) ...` / a `SketchAgg` shared by two `SketchEstimate`
+//!   readouts). `L4Node`'s own DAG sharing is structural (multiple `Rc`
+//!   references to the same node), not named — but the rule-firing walk in
+//!   this crate discovers sharing incrementally, per-node, so it still needs
+//!   a name to thread a bound value across sibling calls. This is a
+//!   deployment-specific mechanism, not a fact about the sketch algebra
+//!   itself — L4 concern (it's still "what to compute", just with sharing),
+//!   hence `L4Plan` rather than `PhysicalExpr`.
+//! - **`RawAtEdgeSketchAtBackend` / `RawAtEdgePrometheusArchive`** — Phase
+//!   ε.1's placement decisions (where the sketch gets built, not what it
+//!   is). Genuinely L5 — see `optimizer::cost::wire::BindMode`, which names
+//!   the same three modes.
+//!
+//! `SketchAgg` / `SketchEstimate` / `SketchMerge` / `Logical` / `ExactAgg`
+//! don't get their own variants anymore — `asap_sketch::SummaryExpr`
+//! already unifies all of them (including "exact accumulator" and "sketch"
+//! as the same `SummaryAgg` node, with or without a wrapping
+//! `SummaryEstimate`) inside a single `L4Plan::Summary(Rc<L4Node>)`.
 
 #![allow(dead_code)]
 
-use asap_sketch::{SummaryKind, SummaryParams};
-use serde::{Deserialize, Serialize};
+use std::rc::Rc;
+use std::time::Duration;
 
-use crate::intent_algebra::QueryExpr;
+use asap_sketch::{L4Node, SummaryKind, SummaryParams};
+
 use crate::types_v2::BindingName;
-use asap_types::AggregationType;
 
-/// Readout operation extracted from a built sketch state. Inverse of
-/// `SketchAgg`. Mirrors design.md §6 line ~607 — `SketchEstimate` plus
-/// the readout `query` that says what to extract from the state.
-///
-/// PromQL convention: a `Quantile` op carries the φ; a `PointCount` op
-/// carries the key; `Cardinality` and `TopK` need no payload beyond the
-/// ones already on the producing `SketchAgg` (cardinality ops are
-/// parameter-free; the TopK `k` rides on the `SketchAgg` for
-/// CountSketch-with-heap).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-pub enum EstimateOp {
-    /// φ-th quantile readout — KLL / DDSketch / t-digest input.
-    Quantile { q: f64 },
-    /// Approximate cardinality (count-distinct) — HLL / theta-sketch input.
-    Cardinality,
-    /// Approximate point count for a key — CMS input.
-    PointCount { key: String },
-    /// Heavy-hitter top-k extraction — CountSketch-with-heap / Misra-Gries.
-    TopK { k: usize },
-}
-
-/// Algebra of a `SketchMerge` node — at L4 today this is always a union
-/// of mergeable sketch states. The enum-shape is forward-compatible with
-/// future merge algebras (weighted union for sampling sketches, etc.).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MergeAlgebra {
-    /// Set-union of two or more sketch states — `KLL ∪ KLL`, `HLL ∪ HLL`,
-    /// etc. The catalog `mergeable` flag must be true on all inputs.
-    Union,
-}
-
-/// L4 algebra node. See module doc for the variant subset rationale.
-///
-/// Not `Serialize`/`Deserialize` — `asap_sketch::SummaryKind`/`SummaryParams`
-/// (carried by `SketchAgg`/`RawAtEdgeSketchAtBackend`) have no serde impl
-/// (nothing in ASAPController needs one; see
-/// `scratchpad/artifacts/enum-unification-plan.md` §4 — the old
-/// `sketch_algebra::SketchKind`/`SketchParams` this replaces derived
-/// `Serialize`/`Deserialize` too, but nothing on the real emit path ever
-/// exercised it — every actual wire payload goes through a hand-written
-/// JSON/YAML builder, never a whole-struct serialize). Previously tagged
-/// `"sketch_node"` (not `"node"`, to avoid colliding with the L3
-/// `QueryExpr`'s `"node"` tag when nested via `PhysicalExpr::Logical`);
-/// that tag is dropped along with the derive.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PhysicalExpr {
-    /// Logical pass-through: an L3 node that no L4 rule rewrote. A
-    /// `Filter`, a row-shaped `Aggregate{Sum}`, or any other operator
-    /// whose semantics are unchanged by the sketch-binding pass lives
-    /// here unchanged.
-    Logical(QueryExpr),
-
-    /// Sketch aggregation — produces a sketch state on its output edge.
-    /// The L3 `AggIntent` was lowered by a `Bind*` rule into the
-    /// committed `(sketch_type, params)` pair.
-    SketchAgg {
-        /// Sketch family (KLL / DDSketch / HLL / CMS / CountSketch).
-        sketch_type: SummaryKind,
-        /// Sketch parameters (validated by the catalog at bind time).
-        params: SummaryParams,
-        /// Input sub-tree — typically `Logical(Window{...})` or
-        /// `Logical(Scan{...})`.
-        child: Box<PhysicalExpr>,
-    },
-
-    /// Read out a query result from a built sketch state. Inverse of
-    /// `SketchAgg`. The `op` says what to extract — a quantile φ, the
-    /// approximate cardinality, the top-k heavy hitters.
-    SketchEstimate {
-        /// Readout operation (see [`EstimateOp`]).
-        op: EstimateOp,
-        /// Sketch-state-bearing sub-tree (a `SketchAgg`, a `SketchMerge`,
-        /// or a `Ref` to one).
-        child: Box<PhysicalExpr>,
-    },
-
-    /// Merge multiple sketches into one — set-union under
-    /// [`MergeAlgebra::Union`]. The L4 type checker rejects mismatched
-    /// families / params at plan time (design.md §6.4 invariant 1).
-    SketchMerge {
-        /// Merge algebra — currently always `Union`.
-        algebra: MergeAlgebra,
-        /// Sketch-state-bearing inputs. All must agree on `(kind, params)`.
-        children: Vec<PhysicalExpr>,
-    },
+/// L4 IR — "what to compute". Wraps `asap_sketch::L4Node` (the sketch
+/// algebra itself, owned upstream) and adds only the named-binding sharing
+/// mechanism `asap_sketch` doesn't have. See module docs.
+#[derive(Debug, Clone)]
+pub enum L4Plan {
+    /// A committed L4 sub-tree — `SummaryAgg` / `SummaryEstimate` /
+    /// `SummaryMerge` / `Logical`, whatever `implement_tree_in_with` (or a
+    /// deployment-specific pre-pass) produced.
+    Summary(Rc<L4Node>),
 
     /// SQL `WITH name AS (expr) SELECT ... FROM name` / sketch-state
-    /// fan-in: name a sub-expression so multiple parents can reference
-    /// it. `PhysicalExpr::LetBinding` carries the two-tier fan-in described
-    /// in design.md §1339 — outer let names a `Window` output, inner let
-    /// names a `SketchAgg{KLL}` shared by two `SketchEstimate` parents
-    /// reading different quantiles.
+    /// fan-in: name a sub-expression so multiple parents can reference it.
+    /// Carries the two-tier fan-in described in design.md §1339 — outer
+    /// let names a `Window` output, inner let names a `SummaryAgg{Kll}`
+    /// shared by two `SummaryEstimate` parents reading different quantiles.
     LetBinding {
         /// Binding name; must be unique within the surrounding scope.
         name: BindingName,
         /// Bound sub-expression.
-        expr: Box<PhysicalExpr>,
+        expr: Rc<L4Plan>,
         /// In-scope sub-tree — references the binding via `Ref`.
-        child: Box<PhysicalExpr>,
+        child: Rc<L4Plan>,
     },
 
     /// Reference a `LetBinding` by name. Resolution is lexical (scope
@@ -133,31 +75,36 @@ pub enum PhysicalExpr {
         /// Bound name.
         name: BindingName,
     },
+}
 
-    // ── Phase ε.1: three-mode placement variants ────────────────────────
-    //
-    // Phase ε.1 collapses the planner's raw-vs-sketch + edge-vs-backend
-    // axes into a single tri-mode selector. The two new variants name
-    // the two new placements; the existing `SketchAgg` corresponds to
-    // Mode 1 (sketch at edge). See `planner::wire_cost::BindMode`.
-    /// Mode 2 (Phase ε.1): no sketch processor at the edge — raw OTLP
+/// L5 IR — "where/how". Wraps an already-committed [`L4Plan`] (sketch
+/// binding is final by the time anything reaches here) with placement
+/// info: build at the edge (the common case — `Committed` needs no extra
+/// annotation since the `L4Plan` itself is the whole story), or one of
+/// Phase ε.1's two backend/archive placements.
+#[derive(Debug, Clone)]
+pub enum PhysicalExpr {
+    /// Sketch built at the edge — the default placement. The committed
+    /// `L4Plan` alone determines the output.
+    Committed(L4Plan),
+
+    /// Phase ε.1 Mode 2: no sketch processor at the edge — raw OTLP
     /// forwards to the backend, which builds the sketch at ingest. The
     /// `family` and `params` are the sketch the backend will build, so
     /// the backend's `StreamingConfig` `aggregation_input` is `raw` for
-    /// this metric (Phase ε.2 implements the raw-input ingest path).
+    /// this metric.
     RawAtEdgeSketchAtBackend {
         /// Sketch family the backend will build at ingest.
         family: SummaryKind,
         /// Sketch parameters (validated by the catalog at bind time).
         params: SummaryParams,
-        /// Input sub-tree — typically `Logical(Window{...})` or
-        /// `Logical(Scan{...})`. Mirrors `SketchAgg`'s child field so the
-        /// L5 emitter's walk uniform.
-        child: Box<PhysicalExpr>,
+        /// Input sub-tree — typically `Summary(Logical(Window{...}))` or
+        /// `Summary(Logical(Scan{...}))`.
+        child: Box<L4Plan>,
     },
 
-    /// Mode 3 (Phase ε.1): no sketch processor at the edge — raw OTLP
-    /// ships directly to Prometheus's native OTLP receiver at
+    /// Phase ε.1 Mode 3: no sketch processor at the edge — raw OTLP ships
+    /// directly to Prometheus's native OTLP receiver at
     /// `/api/v1/otlp/v1/metrics`. The backend HTTP-forwards queries to
     /// Prometheus's `/api/v1/query` endpoint (the `prometheus_remote`
     /// engine). Accuracy is exact (ε = 0) — Prometheus owns the raw
@@ -174,7 +121,7 @@ pub enum PhysicalExpr {
         /// metric into windowed scrape data. Prometheus stores the raw
         /// stream regardless; the field is informational for the L5
         /// emitter so it can size scrape intervals consistently.
-        window: Option<std::time::Duration>,
+        window: Option<Duration>,
         /// Label projection — labels promoted from OTLP resource
         /// attributes by Prometheus's
         /// `otlp.promote_resource_attributes` config. Default
@@ -182,66 +129,13 @@ pub enum PhysicalExpr {
         /// — see `deploy/configs/prometheus-otlp-receiver.yml`.
         label_proj: Vec<String>,
     },
-
-    /// Exact-aggregation node — produces the exact aggregation result
-    /// (Sum / Count-as-Sum / Increase / MinMax / …) directly. The L4
-    /// counterpart to the data-plane `AggPayload::ExactAgg` shape:
-    /// state at the ASAP-tier sid is a typed accumulator (not a
-    /// sketch byte buffer), and there's no separate readout step —
-    /// the accumulator's value IS the answer.
-    ///
-    /// Distinct from `SketchAgg` + `SketchEstimate` in two ways:
-    /// 1. No `EstimateOp` wrapper. ExactAgg is its own answer.
-    /// 2. No `SummaryParams`. The `AggregationType` enum captures the
-    ///    parameterization (DDSketch's α etc. don't apply — exact
-    ///    aggregations are parameter-free up to the accumulator
-    ///    family choice).
-    ///
-    /// Emitted by `bind_exact_agg` for `AggIntent::Sum` /
-    /// `AggIntent::Rate` / `AggIntent::Increase` /
-    /// `AggIntent::Count{Exact}` once the analyzer flips them (PR 6
-    /// follow-up). Until that PR, the variant existed dormant in the
-    /// data plane's `AggKind::ExactAgg`; this brings the L4 algebra
-    /// in line.
-    ExactAgg {
-        /// Which exact-aggregation family (Sum / Increase / MinMax /
-        /// SetAggregator / DeltaSetAggregator / HLL — the same enum
-        /// the data plane keys on at `AggKind::ExactAgg.agg_type`).
-        agg_type: AggregationType,
-        /// Input sub-tree — typically `Logical(Window{...})` or
-        /// `Logical(Scan{...})`. Same shape as `SketchAgg::child`.
-        child: Box<PhysicalExpr>,
-    },
 }
 
 impl PhysicalExpr {
-    /// Convenience constructor for the canonical
-    /// `SketchEstimate{SketchAgg{Logical(qe)}}` shape produced by every
-    /// `Bind*` rule. Keeps rule call sites short.
-    pub fn estimate_over_agg(
-        op: EstimateOp,
-        sketch_type: SummaryKind,
-        params: SummaryParams,
-        logical: QueryExpr,
-    ) -> Self {
-        PhysicalExpr::SketchEstimate {
-            op,
-            child: Box::new(PhysicalExpr::SketchAgg {
-                sketch_type,
-                params,
-                child: Box::new(PhysicalExpr::Logical(logical)),
-            }),
-        }
-    }
-
-    /// Convenience constructor for `ExactAgg{Logical(qe)}` — the exact
-    /// counterpart to [`Self::estimate_over_agg`]. No estimate wrapper
-    /// because ExactAgg produces the answer directly.
-    pub fn exact_agg_over_logical(agg_type: AggregationType, logical: QueryExpr) -> Self {
-        PhysicalExpr::ExactAgg {
-            agg_type,
-            child: Box::new(PhysicalExpr::Logical(logical)),
-        }
+    /// Convenience constructor for the common case: a committed
+    /// `L4Node` sketch-built at the edge, no placement wrapper.
+    pub fn committed(node: Rc<L4Node>) -> Self {
+        PhysicalExpr::Committed(L4Plan::Summary(node))
     }
 }
 
@@ -304,30 +198,38 @@ mod tests {
     }
 
     #[test]
-    fn estimate_over_agg_ctor_shape() {
-        let e = PhysicalExpr::estimate_over_agg(
-            EstimateOp::Quantile { q: 0.99 },
-            SummaryKind::Kll,
-            SummaryParams::Kll { k: 200 },
-            windowed_scan(),
-        );
+    fn committed_wraps_an_implement_tree_result() {
+        let q = QueryExpr::Aggregate {
+            by: crate::intent_algebra::GroupKeys::none(),
+            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+                col: None,
+                q: 0.99,
+                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(windowed_scan()),
+        };
+        let node = asap_plan::bind::implement_tree(&q).expect("implements");
+        let e = PhysicalExpr::committed(node);
         match e {
-            PhysicalExpr::SketchEstimate { op, child } => {
-                assert_eq!(op, EstimateOp::Quantile { q: 0.99 });
-                match *child {
-                    PhysicalExpr::SketchAgg {
-                        sketch_type,
-                        params,
-                        child,
-                    } => {
-                        assert_eq!(sketch_type, SummaryKind::Kll);
-                        assert_eq!(params, SummaryParams::Kll { k: 200 });
-                        assert!(matches!(*child, PhysicalExpr::Logical(_)));
+            PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+                asap_sketch::SummaryExpr::SummaryEstimate { query, sketch_input } => {
+                    assert!(matches!(query, asap_sketch::SketchQuery::Quantile { q } if *q == 0.99));
+                    match &sketch_input.expr {
+                        asap_sketch::SummaryExpr::SummaryAgg {
+                            sketch, params, child, ..
+                        } => {
+                            assert_eq!(sketch, &SummaryKind::Kll);
+                            assert_eq!(params, &SummaryParams::Kll { k: 200 });
+                            assert!(matches!(child.expr, asap_sketch::SummaryExpr::Logical(_)));
+                        }
+                        other => panic!("expected SummaryAgg, got {other:?}"),
                     }
-                    other => panic!("expected SketchAgg, got {other:?}"),
                 }
-            }
-            other => panic!("expected SketchEstimate, got {other:?}"),
+                other => panic!("expected SummaryEstimate, got {other:?}"),
+            },
+            other => panic!("expected Committed(Summary(_)), got {other:?}"),
         }
     }
 }

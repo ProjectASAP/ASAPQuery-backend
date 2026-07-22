@@ -658,7 +658,7 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendReadout,
         };
-        use crate::sketch_algebra::physical_expr::EstimateOp;
+        use asap_sketch::SketchQuery;
         use asap_sketch::{SummaryKind, SummaryParams};
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
@@ -675,7 +675,7 @@ mod tests {
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: agg_id.to_string(),
-                op: EstimateOp::Quantile { q: 0.99 },
+                op: SketchQuery::Quantile { q: 0.99 },
             }],
         }
     }

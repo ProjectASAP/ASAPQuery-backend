@@ -200,7 +200,7 @@ mod tests {
         BackendAggregation, BackendReadout, ExportTarget, GatewayMergeProcessor,
     };
     use crate::physical::colored_dag::stage_id::StageId;
-    use crate::sketch_algebra::physical_expr::EstimateOp;
+    use asap_sketch::SketchQuery;
     use asap_sketch::{SummaryKind, SummaryParams};
     use std::collections::HashMap;
 
@@ -256,7 +256,7 @@ mod tests {
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".to_string(),
-                op: EstimateOp::Quantile { q: 0.99 },
+                op: SketchQuery::Quantile { q: 0.99 },
             }],
         }
     }

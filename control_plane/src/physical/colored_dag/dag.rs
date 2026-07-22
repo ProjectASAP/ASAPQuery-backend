@@ -46,7 +46,7 @@ impl std::fmt::Display for NodeId {
 /// [`ColoredDag::edges`]). Test-friendly variant: when callers want the
 /// full sub-tree they can rebuild from the original `PhysicalExpr` using
 /// `NodeId` as the index.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ColoredNode {
     /// Position-based identifier — index into `ColoredDag::nodes`.
     pub id: NodeId,
@@ -144,30 +144,70 @@ impl ColoredDag {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::QueryExpr;
-    use crate::sketch_algebra::physical_expr::EstimateOp;
+    use crate::intent_algebra::schema::{Column, DataType};
+    use crate::intent_algebra::{BindingScope, QueryExpr, Schema, Source};
     use crate::sketch_algebra::PhysicalExpr;
-    use asap_sketch::{SummaryKind, SummaryParams};
+
+    // These three dummies only need to be *structurally valid* and
+    // distinct `PhysicalExpr` values — the tests below only inspect
+    // `ColoredNode::stage`, never `expr`'s internal shape.
+    fn dummy_scan() -> QueryExpr {
+        QueryExpr::Scan {
+            source: Source::TimeSeries {
+                metric: "dummy_metric".into(),
+            },
+            predicates: vec![],
+            schema: Schema::with_time_index(
+                vec![
+                    Column {
+                        name: "ts".into(),
+                        dtype: DataType::Timestamp,
+                        nullable: false,
+                        table: None,
+                    },
+                    Column {
+                        name: "value".into(),
+                        dtype: DataType::Float64,
+                        nullable: false,
+                        table: None,
+                    },
+                ],
+                0,
+                vec![vec![0]],
+            ),
+        }
+    }
 
     fn dummy_logical() -> PhysicalExpr {
-        PhysicalExpr::Logical(QueryExpr::Ref {
-            name: asap_ir::intent_algebra::BindingName::new("dummy"),
-        })
+        PhysicalExpr::committed(
+            asap_plan::bind::logical(&dummy_scan(), &BindingScope::default()).unwrap(),
+        )
     }
 
     fn dummy_agg() -> PhysicalExpr {
-        PhysicalExpr::SketchAgg {
-            sketch_type: SummaryKind::Kll,
-            params: SummaryParams::Kll { k: 200 },
-            child: Box::new(dummy_logical()),
-        }
+        let q = QueryExpr::Aggregate {
+            by: crate::intent_algebra::GroupKeys::none(),
+            aggs: vec![crate::intent_algebra::AggIntent::Sum { col: None }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(dummy_scan()),
+        };
+        PhysicalExpr::committed(asap_plan::bind::implement_tree(&q).unwrap())
     }
 
     fn dummy_estimate() -> PhysicalExpr {
-        PhysicalExpr::SketchEstimate {
-            op: EstimateOp::Quantile { q: 0.99 },
-            child: Box::new(dummy_agg()),
-        }
+        let q = QueryExpr::Aggregate {
+            by: crate::intent_algebra::GroupKeys::none(),
+            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+                col: None,
+                q: 0.99,
+                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
+            }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(dummy_scan()),
+        };
+        PhysicalExpr::committed(asap_plan::bind::implement_tree(&q).unwrap())
     }
 
     #[test]

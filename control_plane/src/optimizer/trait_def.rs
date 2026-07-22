@@ -110,30 +110,37 @@ mod tests {
         assert!(cats.contains(&RuleCategory::Cse));
     }
 
-    /// Every Phase-C bind rule in `sketch_algebra::rules` surfaces
+    /// Any `sketch_algebra::rules::Rule` implementor surfaces
     /// `RuleCategory::Bind` through its `OptimizerRule` blanket impl.
+    ///
+    /// Step B of the plan-shaped-serving migration retired the seven
+    /// concrete `Bind*` rule structs this test used to exercise (KLL /
+    /// DDSketch / HLL / CMS-count / CMS-topk / exact-agg / archive-only)
+    /// in favor of `asap_plan::bind::implement_tree_in_with` +
+    /// `sketch_algebra::cost_model::ControlPlaneCostModel` — see
+    /// `sketch_algebra::lower`. The `Rule` trait and its blanket impl stay
+    /// (a real, if currently unused, extension point — see
+    /// `sketch_algebra::rules`'s module docs), so this test now pins the
+    /// blanket impl itself via a minimal local implementor rather than
+    /// the retired structs.
     #[test]
-    fn sketch_algebra_bind_rules_carry_bind_category() {
-        use crate::sketch_algebra::rules::{
-            bind_archive_only::BindArchiveOnly, bind_cms_count::BindCmsOnCount,
-            bind_cms_topk::BindCountSketchOnTopK, bind_ddsketch_quantile::BindDDSketchOnQuantile,
-            bind_hll_cardinality::BindHllOnCardinality, bind_kll_quantile::BindKllOnQuantile,
-        };
-        let rules: Vec<Box<dyn OptimizerRule>> = vec![
-            Box::new(BindKllOnQuantile),
-            Box::new(BindDDSketchOnQuantile),
-            Box::new(BindCmsOnCount),
-            Box::new(BindCountSketchOnTopK),
-            Box::new(BindHllOnCardinality),
-            Box::new(BindArchiveOnly),
-        ];
-        for r in &rules {
-            assert_eq!(
-                r.category(),
-                RuleCategory::Bind,
-                "rule {} should carry Bind category",
-                r.name()
-            );
+    fn rule_blanket_impl_carries_bind_category() {
+        use crate::intent_algebra::QueryExpr;
+        use crate::sketch_algebra::physical_expr::PhysicalExpr;
+        use crate::sketch_algebra::rules::Rule;
+        use crate::types_v2::AccuracyTarget;
+
+        struct NoOpRule;
+        impl Rule for NoOpRule {
+            fn name(&self) -> &'static str {
+                "no_op_rule"
+            }
+            fn apply(&self, _expr: &QueryExpr, _accuracy: &AccuracyTarget) -> Option<PhysicalExpr> {
+                None
+            }
         }
+
+        let rule: Box<dyn OptimizerRule> = Box::new(NoOpRule);
+        assert_eq!(rule.category(), RuleCategory::Bind);
     }
 }
