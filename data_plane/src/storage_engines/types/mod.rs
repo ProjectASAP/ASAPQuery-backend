@@ -11,6 +11,8 @@ pub mod hot_reload_config;
 pub mod key_by_label_values;
 pub mod measurement;
 pub mod precomputed_output;
+pub mod storage_backend;
+pub mod streaming_config;
 pub mod traits;
 
 pub use enums::*;
@@ -18,13 +20,14 @@ pub use hot_reload_config::*;
 pub use key_by_label_values::*;
 pub use measurement::*;
 pub use precomputed_output::*;
+pub use storage_backend::*;
+pub use streaming_config::*;
 pub use traits::*;
 
-// Cross-module re-exports of asap_types data types so callers can
-// write `crate::storage_engines::types::StreamingConfig` instead of reaching
-// across crates.
+// Cross-module re-export of asap_types data types so callers can
+// write `crate::storage_engines::types::AggregationConfig` instead of
+// reaching across crates.
 pub use asap_types::aggregation_config::*;
-pub use asap_types::streaming_config::*;
 
 // Re-export the query-side routing surface so existing call sites
 // like `crate::storage_engines::types::BackendStorageRouting` keep compiling.

@@ -215,7 +215,7 @@ mod tests {
     fn streaming_entry_deserializes_as_monitor_spec() {
         // The emitted JSON must round-trip into the backend's MonitorSpec.
         let entry = streaming_config_monitor_entry(&sum_intent());
-        let spec: asap_types::streaming_config::MonitorSpec =
+        let spec: asap_types::MonitorSpec =
             serde_json::from_value(entry).expect("MonitorSpec deserialize");
         assert_eq!(spec.agg_id, agg_id_for_metric("bytes_sent"));
         assert_eq!(spec.tau, 100.0);

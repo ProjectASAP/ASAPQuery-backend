@@ -6,55 +6,24 @@ use std::fs::File;
 use std::io::BufReader;
 use std::ops::Index;
 
-use crate::aggregation_config::AggregationConfig;
-use crate::capability_matching::StorageBackend;
-use crate::enums::QueryLanguage;
-use crate::policy_registry::PolicyRegistry;
+use asap_types::enums::QueryLanguage;
+use asap_types::{AggregationConfig, MonitorSpec, PolicyRegistry};
 
-/// One continuous-monitoring (CDM) threshold spec. The data-plane monitor
-/// coordinator owns the AUTHORITATIVE `tau`/`epsilon`/`window_ms` (the edge
-/// copy is advisory), keyed by the same content-addressed `agg_id` the edge and
-/// coordinator share. `key` is the CMS point-frequency key for point monitors
-/// (empty for Sum / whole-stream). See
-/// `ASAPCollector/docs/continuous-monitoring-tumbling-cost-analysis.md`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MonitorSpec {
-    pub agg_id: u64,
-    /// Additive readout the edge reports: "sum" (default), "cms_point", "f2".
-    /// Pass-through metadata so the edge can auto-learn its reporting mode from
-    /// the pushed config; the coordinator allocation is value-driven and does not
-    /// branch on it (p_i ∝ √(value/rate) is the F2 allocation when value=‖f‖²).
-    #[serde(default)]
-    pub functional: String,
-    /// CMS point-frequency key x; empty (default) for Sum / whole-stream / F2.
-    #[serde(default)]
-    pub key: String,
-    /// Threshold τ (authoritative here, not at the edge).
-    pub tau: f64,
-    /// Relative tolerance ε; the alert fires when the estimate reaches (1−ε)τ.
-    #[serde(default = "default_monitor_epsilon")]
-    pub epsilon: f64,
-    /// Tumbling epoch length in ms; MUST match the edge window for this agg_id.
-    pub window_ms: u64,
-    /// Count-Sketch depth (rows) for whole-sketch `functional="f2"` monitors.
-    /// 0 (default) for scalar monitors; MUST match the edge's Count-Sketch for
-    /// this agg when F2 (both sides square/merge the same cell matrix).
-    #[serde(default)]
-    pub d: usize,
-    /// Count-Sketch width (buckets/row) for F2 monitors; 0 for scalar.
-    #[serde(default)]
-    pub w: usize,
-    /// F2 monitoring variant: "distributed" (default, ship every window) or
-    /// "geometric" (Sharfman–Schuster–Keren safe-zone, ship on local violation).
-    /// Ignored by scalar monitors.
-    #[serde(default)]
-    pub mode: String,
-}
+use super::storage_backend::StorageBackend;
 
-fn default_monitor_epsilon() -> f64 {
-    0.05
-}
-
+/// The backend's active streaming policy config: every `AggregationConfig`
+/// currently pushed by the controller, plus the storage-backend pin and CDM
+/// monitor specs.
+///
+/// Formerly `asap_types::streaming_config::StreamingConfig` — moved here
+/// (see `scratchpad/artifacts/enum-unification-plan.md`) because
+/// `control_plane` never actually depended on this type: its own
+/// `StreamingConfigEmitter` hand-builds wire-compatible JSON independently,
+/// and `PolicyRegistry::from_streaming_config` (the only thing that made
+/// `asap_types::PolicyRegistry` -- genuinely shared -- look coupled to this
+/// type) had exactly one real caller, this struct's own `policy_registry()`
+/// method below. `asap_types` keeps the lower-level `PolicyRegistry::
+/// from_configs` primitive this method now calls directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamingConfig {
     pub aggregation_configs: HashMap<u64, AggregationConfig>,
@@ -120,7 +89,7 @@ impl StreamingConfig {
     }
 
     /// Derived content-addressed view. Builds a [`PolicyRegistry`] keyed
-    /// on [`crate::PolicyFingerprint`] — the merged-sid-identity-chain
+    /// on [`asap_types::PolicyFingerprint`] — the merged-sid-identity-chain
     /// replacement for the `aggregation_id`-keyed lookup. Cheap (O(N)
     /// over `aggregation_configs.len()`); call at swap time, not per
     /// query, if it shows up in hot-path profiles.
@@ -130,7 +99,7 @@ impl StreamingConfig {
     /// one at a time. The two views are derived from the same source —
     /// they can never disagree.
     pub fn policy_registry(&self) -> PolicyRegistry {
-        PolicyRegistry::from_streaming_config(self)
+        PolicyRegistry::from_configs(self.aggregation_configs.values().cloned())
     }
 
     pub fn from_yaml_file(yaml_file: &str) -> Result<Self> {

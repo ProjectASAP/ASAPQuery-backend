@@ -35,8 +35,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::storage_engines::types::StreamingConfig;
 use asap_types::aggregation_config::AggregationConfig;
-use asap_types::streaming_config::StreamingConfig;
 
 use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 use crate::storage_engines::sketch_db::index::SketchStore;

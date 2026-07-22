@@ -17,11 +17,11 @@ use tracing::{debug, info, warn};
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
 use crate::query_engines::routing::{
-    EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
+    AccuracyTarget, EngineRouter, EngineRouterError, FreshnessProbeCache, QueryEngine,
 };
 use crate::query_engines::ASAPQueryEngine;
+use crate::storage_engines::types::StorageBackend;
 use asap_types::Statistic;
-use asap_types::{AccuracyTarget, StorageBackend};
 
 // ─── Control-plane-pushed precompute job registry ────────────────────────────
 //
@@ -5330,7 +5330,7 @@ async fn handle_post_streaming_config(
         }
     };
     let new_config =
-        match asap_types::streaming_config::StreamingConfig::from_yaml_data(&yaml_value) {
+        match crate::storage_engines::types::StreamingConfig::from_yaml_data(&yaml_value) {
             Ok(c) => c,
             Err(e) => {
                 let body = serde_json::json!({

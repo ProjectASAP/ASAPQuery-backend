@@ -27,7 +27,7 @@
 use async_trait::async_trait;
 use tracing::info;
 
-use asap_types::StorageBackend;
+use crate::storage_engines::types::StorageBackend;
 
 use crate::query_engines::routing::{EngineCapabilities, QueryEngine};
 use crate::query_engines::{EngineError, QueryResult};
@@ -67,7 +67,7 @@ impl QueryEngine for NoDataArchiveEngine {
 
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
-            data_source_id: asap_types::ENGINE_ID_THANOS_QUERY,
+            data_source_id: crate::storage_engines::types::ENGINE_ID_THANOS_QUERY,
             // Register under the canonical archive query-engine id so
             // archive entries dispatch here transparently when no real
             // ThanosQueryEngine is configured.
@@ -97,7 +97,10 @@ mod tests {
     fn capabilities_use_no_data_archive_id() {
         let engine = NoDataArchiveEngine::new();
         let caps = engine.capabilities();
-        assert_eq!(caps.data_source_id, asap_types::ENGINE_ID_THANOS_QUERY);
+        assert_eq!(
+            caps.data_source_id,
+            crate::storage_engines::types::ENGINE_ID_THANOS_QUERY
+        );
         assert_eq!(caps.storage_backend, StorageBackend::GorillaObjectStore);
     }
 }

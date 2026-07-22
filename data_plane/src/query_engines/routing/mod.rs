@@ -13,8 +13,14 @@
 //! * [`query_engine_routing`] — the engine dispatcher. Holds a small map
 //!   of `data_source_id → Arc<dyn QueryEngine>` and walks the
 //!   compatibility list returned by
-//!   [`asap_types::compatible_storage_backends`] to pick which
+//!   [`capability_matching::compatible_storage_backends`] to pick which
 //!   engine answers a given `(query, metric_storage)` pair.
+//! * [`capability_matching`] — the storage-backend routing policy itself
+//!   (`AccuracyTarget`, `compatible_storage_backends`). Split out of
+//!   `asap_types`'s former `capability_matching` module. `StorageBackend`
+//!   itself later moved into this crate too, alongside `StreamingConfig`
+//!   (see `crate::storage_engines::types::storage_backend`'s module doc) —
+//!   `control_plane` turned out to have zero real dependency on either.
 //!
 //! Step-1 of the JSONL deprecation refactor lifted these out of
 //! `data_model/backend_storage_routing.rs` and `query-engines/router.rs`
@@ -23,8 +29,11 @@
 //! instead of straddling two unrelated module trees.
 
 pub mod backend_storage_routing;
+pub mod capability_matching;
 pub mod freshness_probe_cache;
 pub mod query_engine_routing;
+
+pub use capability_matching::{compatible_storage_backends, AccuracyTarget};
 
 pub use backend_storage_routing::{
     classify_query_shape, routing_table_hash, BackendStorageRouting,
