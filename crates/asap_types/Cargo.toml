@@ -16,4 +16,4 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # via this crate): WindowType -> asap_ir::intent_algebra::query_expr::WindowKind
 # unification (scratchpad/artifacts/enum-unification-plan.md). Pin matches
 # control_plane's -- see control_plane/Cargo.toml's comment for the rationale.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "12482fd77945ab5771a021c6112750fd9284f8ed" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "01745cceac857be21fd1d80584c045e6f932ebfc" }
