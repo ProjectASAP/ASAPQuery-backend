@@ -21,7 +21,9 @@
 #![allow(dead_code)]
 
 use crate::intent_algebra::agg_intent::AggIntent;
+use crate::sketch_algebra::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
+use asap_sketch::SummaryKind;
 use asap_types::AggregationType;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
@@ -327,21 +329,36 @@ impl Capability {
     /// `indexed` is the **available** capability (from the sketch
     /// index). The backend's ASAP-tier hook reads both and routes the
     /// query to whichever sids satisfy.
+    ///
+    /// The four sketch-family variants (`QuantileApprox`,
+    /// `CardinalityApprox`, `FrequencyEstimate`, `FrequencyTopk`)
+    /// delegate their family-compatibility logic to
+    /// [`sketch_family_satisfied`] — the same rule
+    /// `sketch_algebra::matcher::SummaryFamilyMatcher` applies to
+    /// `asap_plan::Implementation` values (`enum-unification-plan.md`
+    /// §5/§8 Step 4) — via [`resolve_handle`], which picks a concrete
+    /// per-family stand-in for the `Any` wildcard since `SummaryKind`
+    /// has no wildcard concept of its own; family-matching subsumes it.
+    /// `ExactAgg` is intentionally NOT routed through this path — see
+    /// [`multi_pop_satisfies_single`]'s doc for why.
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
-            // Quantile family: Any matches any concrete handle; concrete
-            // handles must match exactly.
             (Capability::QuantileApprox(req), Capability::QuantileApprox(have)) => {
-                handles_compatible(*req, *have)
+                sketch_kinds_compatible(*req, SummaryKind::Kll, *have, SummaryKind::Kll)
             }
             // Cardinality has no inner handle; family match is total.
             (Capability::CardinalityApprox, Capability::CardinalityApprox) => true,
-            // Top-k family: only heap-bearing handles (CmsWithHeap or
-            // CountSketchWithHeap) qualify on the available side. `Any`
-            // required matches either; a concrete required handle must
-            // match exactly.
+            // Top-k: the `Any` stand-in on EITHER side must be the
+            // heap-bearing `CmsWithHeap`, not bare `Cms` — a bare
+            // stand-in would let a heap-less available sketch wrongly
+            // satisfy a top-k requirement (see `resolve_handle`'s doc).
             (Capability::FrequencyTopk(req), Capability::FrequencyTopk(have)) => {
-                is_heap_bearing(*have) && handles_compatible_for_topk(*req, *have)
+                sketch_kinds_compatible(
+                    *req,
+                    SummaryKind::CmsWithHeap,
+                    *have,
+                    SummaryKind::CmsWithHeap,
+                )
             }
             // Bare frequency: any frequency-family handle works on the
             // available side — heap-LESS (CountMin / CountSketch) AND
@@ -350,10 +367,10 @@ impl Capability {
             // the sketch matrix). A heap-bearing `FrequencyTopk` indexed
             // capability ALSO satisfies a bare-frequency required capability.
             (Capability::FrequencyEstimate(req), Capability::FrequencyEstimate(have)) => {
-                is_frequency_family(*have) && handles_compatible(*req, *have)
+                sketch_kinds_compatible(*req, SummaryKind::Cms, *have, SummaryKind::Cms)
             }
             (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
-                is_heap_bearing(*have) && handles_compatible(*req, *have)
+                sketch_kinds_compatible(*req, SummaryKind::Cms, *have, SummaryKind::CmsWithHeap)
             }
             // Exact-aggregation family: the agg_type must match
             // exactly OR be the single-pop ⇆ multi-pop equivalent. A
@@ -379,38 +396,115 @@ impl Capability {
     }
 }
 
-/// True when the required handle is `Any` (wildcard) or matches the
-/// available handle exactly. Used by [`Capability::is_satisfied_by`].
-fn handles_compatible(required: SketchKindHandle, available: SketchKindHandle) -> bool {
-    matches!(required, SketchKindHandle::Any) || required == available
+/// Map a concrete [`SketchKindHandle`] to its [`SummaryKind`]
+/// equivalent. `Any` has no single equivalent by design — resolve it to
+/// a concrete per-family stand-in via [`resolve_handle`] before calling
+/// this.
+fn to_summary_kind(h: SketchKindHandle) -> Option<SummaryKind> {
+    match h {
+        SketchKindHandle::DDSketch => Some(SummaryKind::DDSketch),
+        SketchKindHandle::Kll => Some(SummaryKind::Kll),
+        SketchKindHandle::Hll => Some(SummaryKind::Hll),
+        SketchKindHandle::CountSketch => Some(SummaryKind::CountSketch),
+        SketchKindHandle::CountMin => Some(SummaryKind::Cms),
+        SketchKindHandle::CmsWithHeap => Some(SummaryKind::CmsWithHeap),
+        SketchKindHandle::CountSketchWithHeap => Some(SummaryKind::CountSketchWithHeap),
+        // Defensive: `Any` should never reach this function directly —
+        // every call site resolves it via `resolve_handle` first. `None`
+        // here means "does not satisfy anything", the safe default.
+        SketchKindHandle::Any => None,
+    }
 }
 
-/// `Any` required for top-k means "any heap-bearing handle"; concrete
-/// required must match exactly.
-fn handles_compatible_for_topk(required: SketchKindHandle, available: SketchKindHandle) -> bool {
-    matches!(required, SketchKindHandle::Any) || required == available
+/// Resolve a [`SketchKindHandle`] to the [`SummaryKind`] fed into
+/// [`sketch_family_satisfied`]. `Any` (the query-side "any
+/// implementation in this family satisfies" wildcard) resolves to
+/// `any_stand_in` — a concrete per-family placeholder — because
+/// `SummaryKind`/`SummaryFamilyMatcher` has no wildcard concept of its
+/// own; `sketch_family_satisfied`'s same-family-satisfies rule already
+/// treats every member of a family as interchangeable, so picking ANY
+/// concrete family member as the stand-in reproduces the wildcard's
+/// effect (`enum-unification-plan.md` §8 Step 4's investigation note).
+///
+/// The one place this needs care: [`Capability::FrequencyTopk`]'s stand-in
+/// must be the heap-bearing `CmsWithHeap`, never bare `Cms` — bare `Cms`
+/// and `CmsWithHeap` are the SAME family (`Frequency`/`FrequencyTopk` are
+/// related by the asymmetric "heap satisfies bare" rule, not equal), so a
+/// bare stand-in would let a heap-less available sketch wrongly satisfy a
+/// top-k requirement. Every `FrequencyTopk` call site in this module
+/// passes `SummaryKind::CmsWithHeap` as `any_stand_in` for exactly this
+/// reason.
+fn resolve_handle(h: SketchKindHandle, any_stand_in: SummaryKind) -> Option<SummaryKind> {
+    match h {
+        SketchKindHandle::Any => Some(any_stand_in),
+        other => to_summary_kind(other),
+    }
 }
 
-/// True when the handle carries a heavy-hitter heap (i.e. it can
-/// enumerate top-k items without an external item list).
-fn is_heap_bearing(h: SketchKindHandle) -> bool {
-    matches!(
-        h,
-        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap
-    )
+/// Resolve both sides of a handle comparison and delegate to
+/// [`sketch_family_satisfied`]. `false` if either side fails to resolve
+/// (only possible today via the defensive `to_summary_kind` fallback,
+/// since `resolve_handle` always resolves `Any`).
+fn sketch_kinds_compatible(
+    required: SketchKindHandle,
+    required_any_stand_in: SummaryKind,
+    available: SketchKindHandle,
+    available_any_stand_in: SummaryKind,
+) -> bool {
+    match (
+        resolve_handle(required, required_any_stand_in),
+        resolve_handle(available, available_any_stand_in),
+    ) {
+        (Some(r), Some(a)) => sketch_family_satisfied(&r, &a),
+        _ => false,
+    }
 }
 
-/// True when the handle belongs to the frequency family — any of
-/// `CountMin` / `CountSketch` (heap-less) or `CmsWithHeap` /
-/// `CountSketchWithHeap` (heap-bearing).
-fn is_frequency_family(h: SketchKindHandle) -> bool {
-    matches!(
-        h,
-        SketchKindHandle::CountMin
-            | SketchKindHandle::CountSketch
-            | SketchKindHandle::CmsWithHeap
-            | SketchKindHandle::CountSketchWithHeap
-    )
+/// Identity-axis mapping from data-plane's `AggregationType` (which
+/// conflates identity + keyed/unkeyed — see
+/// `crates/promql_utilities/src/query_logics/enums.rs`) onto
+/// ASAPController's `SummaryKind` exact-accumulator variants (identity
+/// only; grouping is a sibling axis, not modeled here — see
+/// `crates/asap_types/src/key_by_label_names.rs`'s module doc for the
+/// same design call made on the data-plane side).
+///
+/// **Not** wired into [`Capability::ExactAgg`] — doing so would silently
+/// drop the keyed-vs-unkeyed asymmetric matching rule
+/// ([`multi_pop_satisfies_single`]) that `ExactAgg`'s `is_satisfied_by`
+/// arm depends on: `SummaryKind` alone can't distinguish "this was
+/// originally a multi-population policy" once the mapping collapses
+/// `Sum`/`MultipleSum` onto the same variant. Fixing that properly needs
+/// a grouping sibling field on whatever replaces `Capability::ExactAgg`'s
+/// payload (mirroring the plan's `AccumulatorSpec.grouping` proposal for
+/// the data-plane side, §7) — that's Step 5's territory
+/// (`aggregation_config.rs`), out of scope for this change. This mapping
+/// is a documented, tested building block for that future wiring.
+///
+/// Sketch-shaped `AggregationType` variants (`DatasketchesKLL`,
+/// `CountMinSketch`, `HLL`, `DDSketch`, ...) have no `ExactAgg`
+/// equivalent — `ExactAgg` is specifically the exact/non-approximate
+/// family — and map to `None`, as do the two legacy string-sub-type
+/// wrapper variants (`SingleSubpopulation`/`MultipleSubpopulation`),
+/// which need the accompanying `aggregation_sub_type: String` (not
+/// available at this enum-only mapping level) to resolve.
+pub fn exact_summary_kind_for(agg_type: AggregationType) -> Option<SummaryKind> {
+    match agg_type {
+        AggregationType::Sum | AggregationType::MultipleSum => Some(SummaryKind::Sum),
+        AggregationType::Increase | AggregationType::MultipleIncrease => {
+            Some(SummaryKind::Increase)
+        }
+        AggregationType::MinMax | AggregationType::MultipleMinMax => Some(SummaryKind::MinMax),
+        AggregationType::DatasketchesKLL
+        | AggregationType::HydraKLL
+        | AggregationType::CountMinSketch
+        | AggregationType::CountMinSketchWithHeap
+        | AggregationType::CountSketch
+        | AggregationType::CountSketchWithHeap
+        | AggregationType::HLL
+        | AggregationType::DDSketch
+        | AggregationType::SingleSubpopulation
+        | AggregationType::MultipleSubpopulation => None,
+    }
 }
 
 /// True when `available` is the multi-population equivalent of
@@ -857,12 +951,30 @@ mod tests {
     }
 
     #[test]
-    fn is_satisfied_by_concrete_kind_must_match_exact() {
+    fn is_satisfied_by_concrete_kind_matches_same_family() {
+        // Intentional broadening vs. this module's pre-`SummaryFamilyMatcher`
+        // behavior: a concrete required handle used to need an EXACT
+        // available match (only `Any` unlocked family-level matching).
+        // Delegating to `sketch_family_satisfied` (the same rule
+        // `sketch_algebra::matcher::SummaryFamilyMatcher` already applies
+        // to `Implementation` values) makes family membership the only
+        // thing that matters, matching enum-unification-plan.md §5's
+        // table ("Kll or DDSketch | the other one | yes ... either
+        // answers a quantile requirement not pinned to a concrete kind") —
+        // that rule isn't conditioned on whether the requirement happened
+        // to spell out `Any` or a concrete kind. Harmless in practice:
+        // `capability_for` never emits a concrete `QuantileApprox` handle
+        // (always `Any`), so this path is exercised only defensively.
         let required = Capability::QuantileApprox(SketchKindHandle::DDSketch);
         let indexed_dd = Capability::QuantileApprox(SketchKindHandle::DDSketch);
         let indexed_kll = Capability::QuantileApprox(SketchKindHandle::Kll);
         assert!(required.is_satisfied_by(&indexed_dd));
-        assert!(!required.is_satisfied_by(&indexed_kll));
+        assert!(required.is_satisfied_by(&indexed_kll));
+
+        // Still cross-family-incompatible: a concrete quantile requirement
+        // is never satisfied by a cardinality-family available handle.
+        let indexed_hll = Capability::QuantileApprox(SketchKindHandle::Hll);
+        assert!(!required.is_satisfied_by(&indexed_hll));
     }
 
     #[test]
@@ -1058,6 +1170,63 @@ mod tests {
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Increase)));
     }
 
+    // ── exact_summary_kind_for: AggregationType → SummaryKind identity ───
+
+    #[test]
+    fn exact_summary_kind_for_maps_bare_identity_variants() {
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::Sum),
+            Some(SummaryKind::Sum)
+        );
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::Increase),
+            Some(SummaryKind::Increase)
+        );
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::MinMax),
+            Some(SummaryKind::MinMax)
+        );
+    }
+
+    #[test]
+    fn exact_summary_kind_for_maps_keyed_siblings_onto_the_same_kind() {
+        // The keyed axis is deliberately ignored here — see the function
+        // doc for why (it's not wired into `Capability::ExactAgg`, which
+        // still needs the keyed/unkeyed distinction for
+        // `multi_pop_satisfies_single`).
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::MultipleSum),
+            Some(SummaryKind::Sum)
+        );
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::MultipleIncrease),
+            Some(SummaryKind::Increase)
+        );
+        assert_eq!(
+            exact_summary_kind_for(AggregationType::MultipleMinMax),
+            Some(SummaryKind::MinMax)
+        );
+    }
+
+    #[test]
+    fn exact_summary_kind_for_rejects_sketch_shaped_variants() {
+        // These belong to the approximate family, not `ExactAgg`.
+        for t in [
+            AggregationType::DatasketchesKLL,
+            AggregationType::HydraKLL,
+            AggregationType::CountMinSketch,
+            AggregationType::CountMinSketchWithHeap,
+            AggregationType::CountSketch,
+            AggregationType::CountSketchWithHeap,
+            AggregationType::HLL,
+            AggregationType::DDSketch,
+            AggregationType::SingleSubpopulation,
+            AggregationType::MultipleSubpopulation,
+        ] {
+            assert_eq!(exact_summary_kind_for(t), None, "{t:?}");
+        }
+    }
+
     // ── capability_for: ExactAgg dormancy ────────────────────────────────
 
     #[test]
@@ -1097,12 +1266,26 @@ mod tests {
         let cap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
         let required = Capability::FrequencyTopk(SketchKindHandle::Any);
         assert!(required.is_satisfied_by(&cap));
-        // And the concrete-against-concrete must match exactly.
+        // And the concrete-against-concrete (same handle) case matches.
         let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
         assert!(required_concrete.is_satisfied_by(&cap));
-        // A different concrete heap-bearing handle must NOT match.
+        // Intentional broadening vs. this module's pre-`SummaryFamilyMatcher`
+        // behavior: CMS and CountSketch are the SAME frequency family in
+        // `sketch_algebra::matcher`'s reference rule table (both bare and
+        // heap-bearing — see `SummaryFamilyMatcher`'s
+        // `cms_and_count_sketch_are_the_same_frequency_family` test), so a
+        // `CmsWithHeap` requirement IS now satisfied by a
+        // `CountSketchWithHeap` available (both heap-bearing, same
+        // family), not just an exact-handle match. Harmless in practice:
+        // `capability_for` always emits `Any` for `FrequencyTopk`, never a
+        // concrete handle, so this exact combination never arises from a
+        // real query.
         let required_cms = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        assert!(!required_cms.is_satisfied_by(&cap));
+        assert!(required_cms.is_satisfied_by(&cap));
+        // Still cross-family-incompatible: a heap-bearing requirement is
+        // never satisfied by a bare (heap-less) available handle.
+        let bare = Capability::FrequencyTopk(SketchKindHandle::CountMin);
+        assert!(!required_cms.is_satisfied_by(&bare));
     }
 
     // ── OuterAgg fold semantics ──────────────────────────────────────────

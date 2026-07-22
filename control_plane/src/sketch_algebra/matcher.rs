@@ -63,12 +63,27 @@ impl Matcher for SummaryFamilyMatcher {
             (
                 Implementation::Sketch { kind: required, .. },
                 Implementation::Sketch { kind: have, .. },
-            ) => match (summary_family(required), summary_family(have)) {
-                (Some(req_family), Some(have_family)) => req_family.satisfied_by(have_family),
-                _ => false,
-            },
+            ) => sketch_family_satisfied(required, have),
             _ => false,
         }
+    }
+}
+
+/// Pure `SummaryKind`-to-`SummaryKind` family-compatibility check — the
+/// same rule [`SummaryFamilyMatcher::is_satisfied_by`] applies in its
+/// `Sketch` arm, exposed directly for callers that only have bare kinds
+/// (no [`asap_sketch::SummaryParams`]) to compare.
+/// `control_plane::sketch_algebra::capability::Capability::is_satisfied_by`
+/// is the first such caller: its `SketchKindHandle` query-side dispatch
+/// tag never carries params, so constructing a full
+/// `Implementation::Sketch{kind, params}` just to discard the params
+/// would mean fabricating meaningless param values. See that module's
+/// doc for why `Capability`/`SketchKindHandle` themselves aren't deleted
+/// outright (`scratchpad/artifacts/enum-unification-plan.md` §8 Step 4).
+pub fn sketch_family_satisfied(required: &SummaryKind, available: &SummaryKind) -> bool {
+    match (summary_family(required), summary_family(available)) {
+        (Some(req_family), Some(have_family)) => req_family.satisfied_by(have_family),
+        _ => false,
     }
 }
 
@@ -263,5 +278,44 @@ mod tests {
         let m = SummaryFamilyMatcher;
         assert!(!m.is_satisfied_by(&sketch(SummaryKind::Kll), &Implementation::PassThrough));
         assert!(!m.is_satisfied_by(&accumulator(SummaryKind::Sum), &Implementation::PassThrough));
+    }
+
+    // ── sketch_family_satisfied (the bare-kind entry point) ──────────────
+
+    #[test]
+    fn sketch_family_satisfied_matches_is_satisfied_by_on_the_sketch_arm() {
+        // The free function is meant to be exactly the logic
+        // `SummaryFamilyMatcher::is_satisfied_by` applies to its `Sketch`
+        // arm, just without needing `SummaryParams` to call it.
+        assert!(sketch_family_satisfied(
+            &SummaryKind::Kll,
+            &SummaryKind::DDSketch
+        ));
+        assert!(sketch_family_satisfied(
+            &SummaryKind::Cms,
+            &SummaryKind::CmsWithHeap
+        ));
+        assert!(!sketch_family_satisfied(
+            &SummaryKind::CmsWithHeap,
+            &SummaryKind::Cms
+        ));
+        assert!(!sketch_family_satisfied(
+            &SummaryKind::Kll,
+            &SummaryKind::Hll
+        ));
+    }
+
+    #[test]
+    fn sketch_family_satisfied_rejects_exact_accumulator_kinds() {
+        // Exact-accumulator kinds have no family (`summary_family` returns
+        // `None` for them) — never satisfied by anything via this path.
+        assert!(!sketch_family_satisfied(
+            &SummaryKind::Sum,
+            &SummaryKind::Sum
+        ));
+        assert!(!sketch_family_satisfied(
+            &SummaryKind::Kll,
+            &SummaryKind::Sum
+        ));
     }
 }
