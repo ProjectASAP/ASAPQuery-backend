@@ -95,6 +95,11 @@ pub mod workload;
 /// the module docs for the full PromQL shape coverage matrix.
 pub mod asap_tier_analysis;
 
+/// PromQL → compositional L4 plan via `asap_plan::bind::implement_tree`.
+/// Step A of the plan-shaped-serving scoping (see module doc) -- not yet
+/// wired into the live serving path.
+pub mod asap_tier_implement;
+
 /// Crate-wide test-only utilities for serialising access to process-global
 /// state (environment variables).
 ///
