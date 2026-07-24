@@ -15,6 +15,42 @@ phase-by-phase execution plan). Read that doc first.
 > inputs here — every number below was re-measured against current source
 > on 2026-07-17.
 
+> **Status as of 2026-07-24.** This plan has not executed as written —
+> tracking here so the phase table below isn't trusted at face value the
+> same way this doc warned against trusting the old
+> `ASAPController/docs/migration-plan.md`.
+> - **Phase 1** was not done as scoped: #391 (the literal Phase 1 PR,
+>   in-tree `agg_intent.rs` copy-merge) was closed unmerged. #392
+>   ("Phase 1b — depend on asap-ir for real, not a copy") replaced it with
+>   a structurally bigger move: `control_plane` now git-deps directly on
+>   ASAPController's `asap-ir`/`asap-l2`/`asap-sketch`/`asap-plan` (pinned
+>   rev in `control_plane/Cargo.toml`) instead of vendoring the vocabulary.
+>   Phase 2 (#393-#395) landed on top of that foundation, not the
+>   originally-planned one.
+> - **Phase 3** is substantially done, but not via this plan's sequencing:
+>   `capability_for()` (`control_plane/src/sketch_algebra/capability.rs`)
+>   already routes `Sum`/`Min`/`Max`/`Rate`/`Increase` to exact-agg
+>   capabilities instead of `UnsupportedAggIntent` (see
+>   `capability_for_sum_routes_to_exact_agg_sum` and neighboring tests).
+>   Exact (non-sketch) `TopK` is still explicitly unsupported
+>   (`capability_for_topk_exact_returns_none`) — that D1-D5 row is still
+>   open. The blocker noted below (missing `analyzer_parity_tests` corpus)
+>   is **still unresolved** as of this note — re-verified, still not found.
+> - **Phases 4-5 have not started** — no `BackendPlan`/`RoutingIndex`/
+>   `ExactAggregate` type exists anywhere in the repo yet.
+> - **A parallel, unplanned thread has since grown alongside this one**:
+>   #407 (Step A, merged) and #408 (Step B, merged) adopt
+>   `asap_plan::bind::implement_tree`/`asap_sketch::L4Node` directly in
+>   `control_plane`; #409 (Step C, open) designs `data_plane`'s
+>   serving-time `SummaryExecutor` implementation. This thread overlaps
+>   with what Phases 4-5 were meant to deliver — see
+>   `design-backend-plan-wire-format.md` §6's 2026-07-24 reconciliation
+>   note (landed on #389) for how `RoutingIndex` and
+>   `SummaryExecutor::find_candidates` relate. **Re-scope Phases 4-5
+>   against what Step A/B/C actually deliver before executing them as
+>   written below** — do not treat the phase table as current guidance
+>   for that part of the plan.
+
 ## Premise
 
 - **Direction**: `control_plane` (in `ASAPQuery-backend`) adopts
