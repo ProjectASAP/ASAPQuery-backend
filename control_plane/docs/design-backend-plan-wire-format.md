@@ -208,6 +208,46 @@ exactly this, just deferred ("initial migration skips this").
 
 ## 6. `RoutingIndex`: query-time structural matching in data_plane
 
+> **2026-07-24 reconciliation note.** This section was written four days
+> before `data_plane/docs/l4node-plan-executor-design.md` (Step C, #409,
+> itself following Step A/#407 and Step B/#408 — the `asap_sketch::L4Node`
+> adoption) and does not account for it; neither doc has referenced the
+> other until now. §6 as originally written assumes a *flat* model — one
+> query resolves to one `Capability` resolves to one winning
+> `Materialization` — which predates `L4Node`'s tree shape and Step C's
+> `SummaryExecutor::find_candidates` (`asap-sketch`'s serving-time
+> counterpart to this section, ASAPController#155). The two are **not**
+> interchangeable as originally specified — see the corrected match
+> algorithm and consumption-mode split below — but they resolve into one
+> mechanism once corrected. Do not implement §6 as originally written;
+> read this note first.
+>
+> Concretely, three things must change:
+> 1. **Granularity.** `find_candidates` is called once per `SummaryAgg`
+>    *leaf*, and `execute()` may call it multiple times per query for a
+>    nested `L4Node` (e.g. `quantile(0.9, sum by (job) (m))` has two
+>    leaves — see #409's topology section). A single flat per-query
+>    resolution can't drive that; `RoutingIndex`'s Tier-2 lookup needs to
+>    be invocable per-leaf, from inside `find_candidates`, not only once
+>    at the top of query handling.
+> 2. **Match precision.** Step 5 below (`Capability::is_satisfied_by`) is
+>    family-level only — it doesn't see `SketchParams`. `find_candidates`'s
+>    contract requires exact `(SummaryKind, SummaryParams)` agreement
+>    (`AccumulatorSpec`, #401) precisely *because* family-level matching
+>    can't guarantee two candidates are actually mergeable
+>    (`SummaryMerge`'s precondition — asap-sketch gap 3 in #409). Any code
+>    path that can feed a `SummaryMerge` must use the exact-match form of
+>    step 5, not the family-level form as originally written.
+> 3. **Selection semantics.** Step 6 below picks one ranked winner — correct
+>    for resolving "which single materialization answers this whole flat
+>    query" (the legacy-analyzer-replacement role this section was
+>    originally scoped for), but wrong for `find_candidates`, which must
+>    return **every** exact-match candidate so `execute()` can fold them
+>    via `merge_states` — picking one winner there would silently drop
+>    sids that should have been merged. `RoutingIndex` therefore needs two
+>    read modes: pick-one (step 6, unchanged, for whole-query fallback
+>    resolution) and return-all-exact-matches (new, for `find_candidates`).
+
 Two-tier lookup, built fresh (and atomically swapped, `arc-swap`) each time
 a new `BackendPlan` is pushed.
 
@@ -249,12 +289,23 @@ Match algorithm on Tier-1 miss:
    rather than reimplementing it.
 4. Filter remaining rows for filter *subsumption* (materialization's
    baked-in filter ⊆ query's filter — not equality).
-5. Call the existing `Capability::is_satisfied_by(query_agg_intent,
-   accuracy)` on what's left.
-6. If more than one candidate survives, rank by error bound / storage-tier
-   cost (same tie-break principle as the existing "closest-pane" logic
-   noted in `TODO.md`'s 2026-05-01 entry).
-7. No survivors → existing archive/Thanos fallback routing, unchanged.
+5. Match precision depends on the caller (see the 2026-07-24 note above):
+   - **Whole-query resolution** (legacy-analyzer replacement): call
+     `Capability::is_satisfied_by(query_agg_intent, accuracy)` — family-level,
+     as originally written.
+   - **`find_candidates`** (per-`L4Node`-leaf, from `SummaryExecutor`): match
+     exact `(SummaryKind, SummaryParams)` via `AccumulatorSpec` instead —
+     required for anything that can feed a `SummaryMerge`.
+6. **Whole-query resolution only:** if more than one candidate survives,
+   rank by error bound / storage-tier cost (same tie-break principle as the
+   existing "closest-pane" logic noted in `TODO.md`'s 2026-05-01 entry) and
+   return the single winner.
+   **`find_candidates` only:** skip ranking — return every row that
+   survived step 5's exact match, so `execute()` can fold them all via
+   `merge_states`.
+7. No survivors → existing archive/Thanos fallback routing (whole-query
+   mode), or `ExecError::NoCandidates` (`find_candidates` mode) — unchanged
+   either way, just two different callers of the same "empty" outcome.
 
 ### 6.1 Why columnar + interned ids, not nested `HashMap<Vec<LabelName>, Vec<_>>`
 
@@ -345,3 +396,15 @@ not by itself fix the gap. Two more changes are required:
   before `RoutingIndex` step 2 can be implemented as described.
 - **`MaterializationPayload` extensibility.** Deferred per §6.1 — revisit
   only if a real need for pluggable, non-recompiled sketch kinds emerges.
+- **`RoutingIndex` vs. `SummaryExecutor::find_candidates` (added
+  2026-07-24).** Resolved — see the reconciliation note at the top of §6.
+  They are not competing implementations of the same lookup: `find_candidates`
+  is scoped to a single already-bound `L4Node` leaf and must return every
+  exact match for merging; `RoutingIndex`'s original whole-query mode picks
+  one ranked winner for the legacy-analyzer-replacement case. Both modes can
+  share the same underlying columnar/interned Tier-2 structure (§6.1) —
+  only the match precision (step 5) and return shape (step 6) differ by
+  caller. Sequencing implication: prototype the `find_candidates`-shaped
+  read path first (it's what #409/Step C needs immediately); the
+  whole-query pick-one path can follow once `BackendPlan`/`RoutingEntry`
+  (§5, still unimplemented as of this note) actually exist to populate it.
