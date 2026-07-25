@@ -10,6 +10,7 @@
 //! the JSONL leg has been deleted).
 
 pub mod engine;
+pub mod summary_executor;
 
 // Phase-5 reorg: ASAP-tier reducer moved to `sketch_db::query`. The
 // engine still consumes it via that canonical path.
