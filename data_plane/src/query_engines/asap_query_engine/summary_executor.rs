@@ -4,20 +4,22 @@
 //!
 //! ## Scope of this first cut
 //!
-//! Covers **cumulative (instant) quantile/cardinality queries only** —
-//! the `DdSketch`/`Kll`/`Hll` families `RollingState`
-//! (`storage_engines::sketch_db::query::delta_apply`) already covers,
-//! read out once per group over a `[t0, t1]` range with real cross-sid
-//! merging via [`super::super::super::storage_engines::sketch_db::query::delta_apply::cumulative_rolling_state`]
-//! (generalized from the HLL-only global-cardinality rollup for this).
+//! Covers **quantile/cardinality queries, both cumulative (instant) and
+//! per-window (matrix/range)** — the `DdSketch`/`Kll`/`Hll` families
+//! `RollingState` (`storage_engines::sketch_db::query::delta_apply`)
+//! already covers. Both modes do real cross-sid merging:
+//! - Cumulative: `delta_apply::cumulative_rolling_state` folds a
+//!   group's whole `[t0, t1]` into one answer (generalized from the
+//!   HLL-only global-cardinality rollup for this).
+//! - Per-window: `delta_apply::per_window_rolling_states`
+//!   reconstructs each sid's own per-window states, then this module
+//!   merges same-window states *across* the group's sids before
+//!   evaluating each window — one merged answer per window, not one
+//!   merged answer for the whole range.
 //!
 //! Explicitly **not** covered yet, and left as follow-up rather than
 //! silently mishandled — `readout` returns
 //! [`SummaryExecutorError::Unsupported`] for all of these:
-//! - Per-window / matrix (range-query) output. `cumulative_rolling_state`
-//!   folds a group's whole `[t0, t1]` into one answer; a per-window
-//!   cross-sid analog (mirroring `delta_apply::per_window_evaluate`, but
-//!   merging across sids per window instead of per sid) doesn't exist yet.
 //! - The Frequency family (`TopK`/`PointCount`, i.e. CMS/CountSketch) —
 //!   `RollingState` doesn't cover these; they decode via a different path
 //!   (`sketch_reducer.rs`'s `decode_frequency_total`/
@@ -41,7 +43,7 @@ use control_plane::sketch_algebra::capability::SketchKindHandle;
 use crate::storage_engines::sketch_db::data::SketchConfig;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::delta_apply::{
-    cumulative_rolling_state, DeltaSketchKind, RollingState,
+    cumulative_rolling_state, per_window_rolling_states, DeltaSketchKind, RollingState,
 };
 
 /// Per-query, per-call execution context — constructed fresh for each
@@ -57,9 +59,9 @@ pub struct QueryExecutionContext<'a> {
     pub t0_ms: u64,
     pub t1_ms: u64,
     /// `true` for `quantile_over_time`/`count_distinct_over_time`-shaped
-    /// instant queries (fold the whole range into one answer); `false`
-    /// for a per-window matrix. Only `true` is implemented so far — see
-    /// the module doc.
+    /// instant queries (fold the whole range into one answer, via
+    /// `readout_cumulative`); `false` for a per-window matrix (one merged
+    /// answer per window, via `readout_per_window`).
     pub is_cumulative: bool,
 }
 
@@ -211,11 +213,27 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         state: &Self::State,
         query: &SketchQuery,
     ) -> Result<Self::Value, Self::Error> {
-        if !self.is_cumulative {
-            return Err(SummaryExecutorError::Unsupported(
-                "per-window (matrix) readout not yet implemented -- only cumulative/instant queries",
-            ));
+        if self.is_cumulative {
+            self.readout_cumulative(state, query)
+        } else {
+            self.readout_per_window(state, query)
         }
+    }
+
+    fn logical(&self, _expr: &QueryExpr) -> Result<Self::Value, Self::Error> {
+        Err(SummaryExecutorError::Logical)
+    }
+}
+
+impl<'a> QueryExecutionContext<'a> {
+    /// Fold a group's whole `[t0, t1]` into one merged state and read out
+    /// one scalar -- `quantile_over_time`/`count_distinct_over_time`-
+    /// shaped instant queries.
+    fn readout_cumulative(
+        &self,
+        state: &GroupState,
+        query: &SketchQuery,
+    ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
         let mut merged: Option<RollingState> = None;
         let mut latest_window_end: i64 = self.t1_ms as i64;
         for &sid in &state.sids {
@@ -248,20 +266,83 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         let Some(merged) = merged else {
             return Err(SummaryExecutorError::NoCandidates);
         };
-        let value = match query {
-            SketchQuery::Quantile { q } => merged.quantile(*q),
-            SketchQuery::Cardinality => merged.cardinality(),
-            SketchQuery::PointCount { .. } | SketchQuery::TopK { .. } => {
-                return Err(SummaryExecutorError::Unsupported(
-                    "Frequency-family (PointCount/TopK) readout not yet implemented",
-                ));
-            }
-        };
+        let value = sketch_query_value(&merged, query)?;
         Ok(vec![(latest_window_end, value)])
     }
 
-    fn logical(&self, _expr: &QueryExpr) -> Result<Self::Value, Self::Error> {
-        Err(SummaryExecutorError::Logical)
+    /// Per-window matrix/range-query readout: reconstruct each of the
+    /// group's sids' own per-window states
+    /// (`delta_apply::per_window_rolling_states`), then merge same-window
+    /// states *across* sids before evaluating each window -- one merged
+    /// answer per window, not one merged answer for the whole range.
+    /// Windows are unioned across sids (mirrors `SummaryMerge`'s "fold
+    /// whatever's present" semantics from ASAPController#161 -- a sid
+    /// that's missing a particular window just doesn't contribute to it,
+    /// rather than the whole window being dropped).
+    fn readout_per_window(
+        &self,
+        state: &GroupState,
+        query: &SketchQuery,
+    ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
+        let mut by_window: BTreeMap<i64, RollingState> = BTreeMap::new();
+        // `SketchStore::query_range` may splice in a carry-in Full
+        // snapshot ending BEFORE `t0_ms` so the delta-apply walk can
+        // establish a rolling base for a delta-only leading window (see
+        // `delta_apply.rs`'s module doc). That base must not surface as
+        // an output point in the requested `[t0, t1]` range -- mirrors
+        // `sketch_reducer.rs`'s `evaluate_core`'s identical filter on the
+        // legacy path.
+        let lo = self.t0_ms as i64;
+        for &sid in &state.sids {
+            for ts in self.index.query_range(sid, self.t0_ms, self.t1_ms) {
+                let samples_vec: Vec<(
+                    i64,
+                    &crate::storage_engines::sketch_db::index::SketchSampleState,
+                )> = ts
+                    .samples
+                    .iter()
+                    .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
+                    .collect();
+                let (per_window, _skipped) =
+                    per_window_rolling_states(&samples_vec, state.delta_kind)
+                        .map_err(SummaryExecutorError::Decode)?;
+                for (w_end, rs) in per_window {
+                    if w_end < lo {
+                        continue;
+                    }
+                    match by_window.get_mut(&w_end) {
+                        Some(acc) => acc
+                            .merge_same_family(&rs)
+                            .map_err(SummaryExecutorError::Decode)?,
+                        None => {
+                            by_window.insert(w_end, rs);
+                        }
+                    }
+                }
+            }
+        }
+        if by_window.is_empty() {
+            return Err(SummaryExecutorError::NoCandidates);
+        }
+        by_window
+            .into_iter()
+            .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
+            .collect()
+    }
+}
+
+/// Read one scalar out of a merged `RollingState` for the requested
+/// `SketchQuery` -- shared by both the cumulative and per-window readout
+/// paths.
+fn sketch_query_value(rs: &RollingState, query: &SketchQuery) -> Result<f64, SummaryExecutorError> {
+    match query {
+        SketchQuery::Quantile { q } => Ok(rs.quantile(*q)),
+        SketchQuery::Cardinality => Ok(rs.cardinality()),
+        SketchQuery::PointCount { .. } | SketchQuery::TopK { .. } => {
+            Err(SummaryExecutorError::Unsupported(
+                "Frequency-family (PointCount/TopK) readout not yet implemented",
+            ))
+        }
     }
 }
 
@@ -545,6 +626,15 @@ mod tests {
         }
     }
 
+    fn matrix_ctx(index: &SketchStore) -> QueryExecutionContext<'_> {
+        QueryExecutionContext {
+            index,
+            t0_ms: T0,
+            t1_ms: T1,
+            is_cumulative: false,
+        }
+    }
+
     #[test]
     fn single_kll_sid_quantile_readout() {
         let idx = SketchStore::new();
@@ -783,5 +873,169 @@ mod tests {
                 other.is_ok()
             ),
         }
+    }
+
+    #[test]
+    fn per_window_matrix_produces_multiple_points_for_one_sid() {
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(kll_meta(sid, "latency_ms", &[]));
+        let w1_end = T0 + 100_000;
+        let w2_end = T0 + 200_000;
+        let items_w1: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        let items_w2: Vec<f64> = (901..=1000).map(|i| i as f64).collect();
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, w1_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items_w1),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (w1_end, w2_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items_w2),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+
+        let child = scan_node("latency_ms", None);
+        let tree = estimate_node(
+            kll_agg_node(child, vec![]),
+            SketchQuery::Quantile { q: 0.5 },
+        );
+
+        let exec = matrix_ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        assert_eq!(v.len(), 1, "ungrouped query produces exactly one group");
+        let (_group, mut samples) = v.into_iter().next().unwrap();
+        samples.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(
+            samples.len(),
+            2,
+            "two distinct windows must produce two output points, not one collapsed answer"
+        );
+        assert_eq!(samples[0].0, w1_end as i64);
+        assert_eq!(samples[1].0, w2_end as i64);
+        assert!(
+            (20.0..=30.0).contains(&samples[0].1),
+            "window 1 median {} should be ~25 (items 1..=50)",
+            samples[0].1
+        );
+        assert!(
+            (940.0..=960.0).contains(&samples[1].1),
+            "window 2 median {} should be ~950 (items 901..=1000)",
+            samples[1].1
+        );
+    }
+
+    #[test]
+    fn per_window_matrix_merges_across_sids_per_window() {
+        // Two sids in the SAME group, both contributing a frame to the
+        // SAME window_end -- the per-window answer for that window must
+        // reflect BOTH sids merged, not just one (the cross-sid analog of
+        // `two_sids_same_group_actually_merge_not_just_first`, but for
+        // one window instead of the whole cumulative range).
+        let idx = SketchStore::new();
+        idx.register(kll_meta(1, "latency_ms", &[]));
+        idx.register(kll_meta(2, "latency_ms", &[]));
+        let w_end = T0 + 100_000;
+        let items1: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        let items2: Vec<f64> = (51..=100).map(|i| i as f64).collect();
+        idx.append_sample(
+            1,
+            BTreeMap::new(),
+            (T0, w_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items1),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            BTreeMap::new(),
+            (T0, w_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items2),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+
+        let child = scan_node("latency_ms", None);
+        let tree = estimate_node(
+            kll_agg_node(child, vec![]),
+            SketchQuery::Quantile { q: 0.5 },
+        );
+
+        let exec = matrix_ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, samples) = v.into_iter().next().unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "both sids share one window_end -> one output point"
+        );
+        let (ts, median) = samples[0];
+        assert_eq!(ts, w_end as i64);
+        assert!(
+            (40.0..=60.0).contains(&median),
+            "merged per-window median {median} should be ~50 (both sids' data combined)"
+        );
+    }
+
+    #[test]
+    fn per_window_matrix_drops_carry_in_base_before_t0() {
+        // `SketchStore::query_range` may splice in a carry-in Full ending
+        // BEFORE `t0_ms` to seed the delta-apply walk. That base must not
+        // surface as an output point.
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(kll_meta(sid, "latency_ms", &[]));
+        let carry_in_end = T0 - 50_000; // before t0
+        let in_range_end = T0 + 100_000;
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0 - 100_000, carry_in_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &[1.0, 2.0, 3.0]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (carry_in_end, in_range_end),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &[10.0, 20.0, 30.0]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+
+        let child = scan_node("latency_ms", None);
+        let tree = estimate_node(
+            kll_agg_node(child, vec![]),
+            SketchQuery::Quantile { q: 0.5 },
+        );
+
+        let exec = matrix_ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, samples) = v.into_iter().next().unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "the carry-in-base window (ending before t0) must not appear in output"
+        );
+        assert_eq!(samples[0].0, in_range_end as i64);
     }
 }

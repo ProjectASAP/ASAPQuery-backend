@@ -367,10 +367,12 @@ pub fn cumulative_hll_state(
     precision: u32,
 ) -> Result<Option<HllSketch>, String> {
     let kind = DeltaSketchKind::Hll { precision };
-    Ok(cumulative_rolling_state(samples, kind)?.and_then(|rs| match rs {
-        RollingState::Hll(sk) => Some(sk),
-        _ => None,
-    }))
+    Ok(
+        cumulative_rolling_state(samples, kind)?.and_then(|rs| match rs {
+            RollingState::Hll(sk) => Some(sk),
+            _ => None,
+        }),
+    )
 }
 
 /// Walk a sorted-by-window-end slice of samples in time order and
@@ -421,7 +423,30 @@ pub fn per_window_evaluate<E>(
 where
     E: Fn(&RollingState) -> f64,
 {
-    let mut out: Vec<(i64, f64)> = Vec::new();
+    let (states, skipped) = per_window_rolling_states(samples, kind)?;
+    Ok((
+        states.into_iter().map(|(w, rs)| (w, eval(&rs))).collect(),
+        skipped,
+    ))
+}
+
+/// Walk a sorted-by-window-end slice of samples in time order and
+/// reconstruct ONE sid's per-window `RollingState` (same per-window-reset
+/// walk as [`per_window_evaluate`], generalized to return the
+/// reconstructed state itself instead of an already-evaluated scalar).
+/// The per-sid building block for cross-sid per-window merging (unlike
+/// [`cumulative_rolling_state`], which folds a whole `[t0, t1]` range
+/// into one answer, this keeps each window separate so a caller can
+/// merge same-window states across several sids before evaluating --
+/// needed for a matrix/range-query answer, where each output point is
+/// itself a cross-sid merge for that one window).
+///
+/// Returns `Ok((per_window_states, skipped))`.
+pub fn per_window_rolling_states(
+    samples: &[(i64, &SketchSampleState)],
+    kind: DeltaSketchKind,
+) -> Result<(Vec<(i64, RollingState)>, usize), String> {
+    let mut out: Vec<(i64, RollingState)> = Vec::new();
     let mut skipped = 0usize;
 
     // Rolling state for the CURRENT window only. Reset to None whenever
@@ -432,12 +457,11 @@ where
 
     for (window_end, state) in samples {
         // Window boundary: flush the previous window's final accumulated
-        // value, then reset the base so this window starts from empty.
+        // state, then reset the base so this window starts from empty.
         if cur_end != Some(*window_end) {
-            if let (Some(prev_end), Some(rs)) = (cur_end, rolling.as_ref()) {
-                out.push((prev_end, eval(rs)));
+            if let (Some(prev_end), Some(rs)) = (cur_end, rolling.take()) {
+                out.push((prev_end, rs));
             }
-            rolling = None;
             cur_end = Some(*window_end);
         }
 
@@ -462,8 +486,8 @@ where
     }
 
     // Flush the final window.
-    if let (Some(prev_end), Some(rs)) = (cur_end, rolling.as_ref()) {
-        out.push((prev_end, eval(rs)));
+    if let (Some(prev_end), Some(rs)) = (cur_end, rolling.take()) {
+        out.push((prev_end, rs));
     }
 
     Ok((out, skipped))
@@ -933,10 +957,8 @@ mod tests {
             let bytes = sk.compute_delta(&empty, 0);
             frames.push((((w as u64) + 1) * 1000, delta(bytes)));
         }
-        let samples: Vec<(i64, &SketchSampleState)> = frames
-            .iter()
-            .map(|(t, s)| (*t as i64, s))
-            .collect();
+        let samples: Vec<(i64, &SketchSampleState)> =
+            frames.iter().map(|(t, s)| (*t as i64, s)).collect();
 
         let kind = DeltaSketchKind::Hll { precision };
         let (out, skipped) =
