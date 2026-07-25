@@ -431,10 +431,10 @@ impl<'a> SketchReducer<'a> {
         t0_ms: u64,
         t1_ms: u64,
     ) -> Result<ASAPTierResult, ASAPTierError> {
-        use super::delta_apply::{cumulative_rolling_state, DeltaSketchKind, RollingState};
+        use super::delta_apply::{cumulative_rolling_state, DeltaSketchKind, SummaryState};
         use crate::storage_engines::sketch_db::data::SketchConfig;
 
-        let mut merged: Option<RollingState> = None;
+        let mut merged: Option<SummaryState> = None;
         let mut metric_name_for_err = String::new();
         let mut cov_lo: u64 = u64::MAX;
         let mut cov_hi: u64 = 0;
@@ -765,7 +765,7 @@ impl<'a> SketchReducer<'a> {
                 .copied()
                 .filter(|q| (0.0..=1.0).contains(q))
                 .unwrap_or(0.99);
-            let evaluator: Box<dyn Fn(&super::delta_apply::RollingState) -> f64> = match family {
+            let evaluator: Box<dyn Fn(&super::delta_apply::SummaryState) -> f64> = match family {
                 QueryFamily::Quantile => Box::new(move |rs| rs.quantile(q)),
                 QueryFamily::Cardinality => Box::new(|rs| rs.cardinality()),
                 _ => unreachable!(),

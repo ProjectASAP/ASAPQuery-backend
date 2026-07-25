@@ -6,24 +6,33 @@
 //!
 //! ## Scope
 //!
-//! Covers **quantile/cardinality queries, both cumulative (instant) and
-//! per-window (matrix/range)** — the `DdSketch`/`Kll`/`Hll` families
-//! `RollingState` (`storage_engines::sketch_db::query::delta_apply`)
-//! covers. Both modes do real cross-sid merging:
-//! - Cumulative: `delta_apply::cumulative_rolling_state` folds a
-//!   group's whole `[t0, t1]` into one answer.
-//! - Per-window: `delta_apply::per_window_rolling_states` reconstructs
-//!   each sid's own per-window states, then this module merges
-//!   same-window states *across* the group's sids before evaluating
-//!   each window — one merged answer per window, not one merged answer
-//!   for the whole range.
+//! Covers **quantile/cardinality queries** (DDSketch/Kll/Hll) **and the
+//! Frequency family's bare total** (CMS/CountSketch/CMS-with-heap/
+//! CountSketch-with-heap, `count`/`sum` with no specific item key), both
+//! cumulative (instant) and per-window (matrix/range). All modes do real
+//! cross-sid merging via `delta_apply::SummaryState`: reconstruct each
+//! candidate sid's own state over the range (or per window), then merge
+//! same-window/same-range states *across* sids before reading out one
+//! answer per group (or per group per window).
 //!
 //! Not covered, and reported as an explicit `Unsupported` error rather
 //! than silently mishandled:
-//! - The Frequency family (`TopK`/`PointCount`, i.e. CMS/CountSketch) —
-//!   `RollingState` doesn't cover these; they decode via a different path
-//!   (`sketch_reducer.rs`'s `decode_frequency_total`/
-//!   `decode_cms_with_heap_from_msgpack` etc.).
+//! - `SketchQuery::TopK`. Its answer is fundamentally shaped differently
+//!   from everything else this executor reads out — K `(item, count)`
+//!   pairs per timestamp, not one scalar — so it doesn't fit
+//!   `Self::Value = Vec<(i64, f64)>`. Forcing it into that shape (e.g.
+//!   returning only the top item) would silently drop data rather than
+//!   error; that needs a `Value` type redesign, a separate decision from
+//!   this executor's rollout.
+//! - `SketchQuery::PointCount` with a *named* item key (a point lookup
+//!   for one specific item, e.g. `count(cms_metric{item="x"})`). The
+//!   *value* to look up isn't carried by `SketchQuery` or available in
+//!   `readout`'s signature — `PointCount{key: ColumnRef}` names which
+//!   *column* is being queried, not the value to filter for, which would
+//!   come from a `Filter` predicate elsewhere in the tree. Resolving
+//!   that is a separate problem from this trait's scope.
+//!   `PointCount{key: ColumnRef::SampleValue}` (no specific item — the
+//!   bare bucket total) is covered.
 //! - `ExactAgg` intents (`Sum`/`Rate`/`Increase`/`MinMax`/exact `Count`).
 //!   These don't reach `readout` at all — `asap_plan::bind` never wraps
 //!   an `ExactAccumulator` implementation in a `SummaryEstimate`
@@ -43,7 +52,7 @@ use control_plane::sketch_algebra::capability::SketchKindHandle;
 use crate::storage_engines::sketch_db::data::{SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
-    cumulative_rolling_state, per_window_rolling_states, DeltaSketchKind, RollingState,
+    cumulative_rolling_state, per_window_rolling_states, DeltaSketchKind, SummaryState,
 };
 
 /// Per-query, per-call execution context — constructed fresh for each
@@ -75,16 +84,15 @@ pub struct QueryExecutionContext<'a> {
 #[derive(Debug, Clone)]
 pub struct SidHandle {
     series: Rc<SketchTimeSeries>,
-    delta_kind: DeltaSketchKind,
+    kind: DeltaSketchKind,
 }
 
-/// One group's accumulated candidates. `readout` only receives
-/// `&Self::State`, not the `SummaryKind`/`SummaryParams` that produced
-/// it, so `delta_kind` rides along here instead of being re-derived.
+/// One group's accumulated candidates, all sharing one `DeltaSketchKind`
+/// (guaranteed by `find_candidates`'s exact-match contract).
 #[derive(Debug, Clone)]
 pub struct GroupState {
     entries: Vec<SidHandle>,
-    delta_kind: DeltaSketchKind,
+    kind: DeltaSketchKind,
 }
 
 #[derive(Debug)]
@@ -101,8 +109,8 @@ pub enum SummaryExecutorError {
     /// child's schema.
     UnresolvedColumn(ColumnId),
     /// A candidate sid claims a `SummaryKind` this executor doesn't
-    /// implement cross-sid merge for (Frequency family) or the sid's
-    /// on-disk `SketchConfig` didn't decode into a `DeltaSketchKind`.
+    /// implement cross-sid merge for, or the sid's on-disk
+    /// `SketchConfig` didn't decode into a `DeltaSketchKind`.
     UnsupportedFamily,
     /// Decode/merge failure surfaced from `delta_apply`/`asap_sketchlib`.
     Decode(String),
@@ -145,14 +153,14 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         let candidate_sids = self.index.instances_matching(&metric, &required_keys);
         let mut out = Vec::new();
         for sid in candidate_sids {
-            let delta_kind = self.index.with_instance(sid, |m| {
+            let candidate_kind = self.index.with_instance(sid, |m| {
                 let kind = m.sketch_kind()?;
                 let config = m.sketch_config()?;
                 summary_params_match(sketch, params, kind, config)
                     .then(|| to_delta_kind(kind, config))
                     .flatten()
             });
-            let Some(delta_kind) = delta_kind.flatten() else {
+            let Some(candidate_kind) = candidate_kind.flatten() else {
                 continue;
             };
 
@@ -181,7 +189,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                 group_key,
                 SidHandle {
                     series: Rc::new(series),
-                    delta_kind,
+                    kind: candidate_kind,
                 },
             ));
         }
@@ -195,7 +203,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
 
     fn fetch_state(&self, handle: &Self::Handle) -> Result<Self::State, Self::Error> {
         Ok(GroupState {
-            delta_kind: handle.delta_kind,
+            kind: handle.kind,
             entries: vec![handle.clone()],
         })
     }
@@ -240,7 +248,7 @@ fn readout_cumulative(
     query: &SketchQuery,
     t1_ms: i64,
 ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
-    let mut merged: Option<RollingState> = None;
+    let mut merged: Option<SummaryState> = None;
     let mut latest_window_end: Option<i64> = None;
     for entry in &state.entries {
         let samples_vec: Vec<(i64, &SketchSampleState)> = entry
@@ -252,7 +260,7 @@ fn readout_cumulative(
         if let Some((w, _)) = samples_vec.last() {
             latest_window_end = Some(latest_window_end.map_or(*w, |prev| prev.max(*w)));
         }
-        let rs = cumulative_rolling_state(&samples_vec, state.delta_kind)
+        let rs = cumulative_rolling_state(&samples_vec, state.kind)
             .map_err(SummaryExecutorError::Decode)?;
         if let Some(rs) = rs {
             merged = Some(match merged.take() {
@@ -283,7 +291,7 @@ fn readout_per_window(
     query: &SketchQuery,
     t0_ms: i64,
 ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
-    let mut by_window: BTreeMap<i64, RollingState> = BTreeMap::new();
+    let mut by_window: BTreeMap<i64, SummaryState> = BTreeMap::new();
     for entry in &state.entries {
         let samples_vec: Vec<(i64, &SketchSampleState)> = entry
             .series
@@ -291,7 +299,7 @@ fn readout_per_window(
             .iter()
             .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
             .collect();
-        let (per_window, _skipped) = per_window_rolling_states(&samples_vec, state.delta_kind)
+        let (per_window, _skipped) = per_window_rolling_states(&samples_vec, state.kind)
             .map_err(SummaryExecutorError::Decode)?;
         for (w_end, rs) in per_window {
             // `SketchStore::query_range` may splice in a carry-in Full
@@ -321,18 +329,27 @@ fn readout_per_window(
         .collect()
 }
 
-/// Read one scalar out of a merged `RollingState` for the requested
+/// Read one scalar out of a merged `SummaryState` for the requested
 /// `SketchQuery` -- shared by both the cumulative and per-window readout
 /// paths.
-fn sketch_query_value(rs: &RollingState, query: &SketchQuery) -> Result<f64, SummaryExecutorError> {
+fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, SummaryExecutorError> {
     match query {
         SketchQuery::Quantile { q } => Ok(rs.quantile(*q)),
         SketchQuery::Cardinality => Ok(rs.cardinality()),
-        SketchQuery::PointCount { .. } | SketchQuery::TopK { .. } => {
-            Err(SummaryExecutorError::Unsupported(
-                "Frequency-family (PointCount/TopK) readout not yet implemented",
-            ))
-        }
+        // `key: ColumnRef::SampleValue` means "no specific item" -- the
+        // bare bucket total. Any other column names an item to look up
+        // by VALUE, which isn't carried by `SketchQuery` -- see the
+        // module doc.
+        SketchQuery::PointCount {
+            key: ColumnRef::SampleValue,
+        } => Ok(rs.total()),
+        SketchQuery::PointCount { .. } => Err(SummaryExecutorError::Unsupported(
+            "PointCount for a named item key needs a filter value this trait doesn't carry",
+        )),
+        SketchQuery::TopK { .. } => Err(SummaryExecutorError::Unsupported(
+            "TopK's answer shape (K items per timestamp) doesn't fit this executor's \
+             Value = Vec<(i64, f64)> -- needs a Value type redesign",
+        )),
     }
 }
 
@@ -349,6 +366,13 @@ fn summary_params_match(
     kind: SketchKindHandle,
     config: &SketchConfig,
 ) -> bool {
+    // `SummaryParams::{Cms,CmsWithHeap,CountSketch,CountSketchWithHeap}`
+    // use width=cols/depth=rows (matches the control-plane wire
+    // convention -- see `sketch_config_to_json`'s comment). `SketchConfig`
+    // has no `heap_size` field at all (heap-bearing kinds reuse their
+    // heap-less base's config shape for identity -- see
+    // `base_sketch_kind_handle`'s doc in `drivers/ingest/otel.rs`), so
+    // heap_size can't be part of this match; width/depth are.
     match (sketch, params, kind, config) {
         (
             SummaryKind::DDSketch,
@@ -368,16 +392,45 @@ fn summary_params_match(
             SketchKindHandle::Hll,
             SketchConfig::Hll { precision: sid_p },
         ) => u32::from(*precision) == *sid_p,
+        (
+            SummaryKind::Cms,
+            SummaryParams::Cms { width, depth },
+            SketchKindHandle::CountMin,
+            SketchConfig::CountMin { rows, cols },
+        ) => *depth as i32 == *rows && *width as i32 == *cols,
+        (
+            SummaryKind::CountSketch,
+            SummaryParams::CountSketch { width, depth },
+            SketchKindHandle::CountSketch,
+            SketchConfig::CountSketch { rows, cols },
+        ) => *depth as i32 == *rows && *width as i32 == *cols,
+        (
+            SummaryKind::CmsWithHeap,
+            SummaryParams::CmsWithHeap { width, depth, .. },
+            SketchKindHandle::CmsWithHeap,
+            SketchConfig::CountMin { rows, cols },
+        ) => *depth as i32 == *rows && *width as i32 == *cols,
+        (
+            SummaryKind::CountSketchWithHeap,
+            SummaryParams::CountSketchWithHeap { width, depth, .. },
+            SketchKindHandle::CountSketchWithHeap,
+            SketchConfig::CountSketch { rows, cols },
+        ) => *depth as i32 == *rows && *width as i32 == *cols,
         _ => false,
     }
 }
 
 /// `SketchConfig` (data_plane's per-sid stored params) -> `DeltaSketchKind`
-/// (`delta_apply`'s decode/merge parameter carrier) for the three
-/// families `RollingState` covers. `None` for CMS/CountSketch (the
-/// Frequency family -- not yet supported by this executor, see the
-/// module doc).
+/// (`delta_apply`'s decode/merge parameter carrier).
 fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaSketchKind> {
+    // Default heap_size when bootstrapping an empty Heap state for a
+    // delta-from-empty leading window -- `SketchConfig` carries no
+    // heap_size (see `summary_params_match`'s doc), so this only matters
+    // transiently: `CountMinSketchWithHeap::merge` takes `min(self,
+    // other)`, so it converges to the real decoded value as soon as any
+    // actual frame merges in. Matches this codebase's existing
+    // heap_size-absent default (`accuracy.rs`).
+    const DEFAULT_HEAP_SIZE: usize = 100;
     match (kind, config) {
         (SketchKindHandle::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => {
             Some(DeltaSketchKind::DDSketch {
@@ -388,6 +441,26 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
         (SketchKindHandle::Hll, SketchConfig::Hll { precision }) => Some(DeltaSketchKind::Hll {
             precision: *precision,
         }),
+        (SketchKindHandle::CountMin, SketchConfig::CountMin { rows, cols }) => {
+            Some(DeltaSketchKind::Cms {
+                rows: *rows as usize,
+                cols: *cols as usize,
+            })
+        }
+        (SketchKindHandle::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
+            Some(DeltaSketchKind::CountSketch {
+                rows: *rows as usize,
+                cols: *cols as usize,
+            })
+        }
+        (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols })
+        | (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
+            Some(DeltaSketchKind::Heap {
+                rows: *rows as usize,
+                cols: *cols as usize,
+                heap_size: DEFAULT_HEAP_SIZE,
+            })
+        }
         _ => None,
     }
 }
@@ -604,6 +677,58 @@ mod tests {
         sk.to_msgpack().expect("encode HLL msgpack")
     }
 
+    fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::CountMin,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    /// Encode a CMS msgpack frame whose row-0 total is `total_weight`
+    /// (`update`s a single synthetic key `total_weight` times -- row 0's
+    /// sum equals the number of insertions regardless of hashing, since
+    /// every insertion touches every row including row 0).
+    fn encode_cms_with_total(rows: usize, cols: usize, total_weight: usize) -> Vec<u8> {
+        use asap_sketchlib::{CountMinSketch, MessagePackCodec};
+        let mut sk = CountMinSketch::new(rows, cols);
+        for _ in 0..total_weight {
+            sk.update("k", 1.0);
+        }
+        sk.to_msgpack().expect("encode CountMinSketch msgpack")
+    }
+
+    fn cms_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
+        Rc::new(L4Node {
+            expr: SummaryExpr::SummaryAgg {
+                child,
+                sketch: SummaryKind::Cms,
+                params: SummaryParams::Cms {
+                    width: 256,
+                    depth: 4,
+                },
+                col: ColumnRef::SampleValue,
+                by: vec![],
+            },
+            schema: L4Schema {
+                fields: vec![],
+                time_index: None,
+            },
+        })
+    }
+
     const T0: u64 = 1_000_000;
     const T1: u64 = 2_000_000;
 
@@ -807,6 +932,113 @@ mod tests {
             (3.0..=7.0).contains(&card),
             "cardinality {card} should be ~5"
         );
+    }
+
+    #[test]
+    fn single_cms_sid_total_readout() {
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_meta(sid, "requests_total"));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_total(4, 256, 42),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_total", None);
+        let tree = estimate_node(
+            cms_agg_node(child),
+            SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+            },
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, samples) = &v[0];
+        let (_ts, total) = samples[0];
+        assert_eq!(
+            total, 42.0,
+            "bare total must equal the number of insertions"
+        );
+    }
+
+    #[test]
+    fn two_cms_sids_same_group_totals_actually_merge() {
+        // Cross-sid merge for the Frequency family: two sids' totals must
+        // ADD (matrix merge then row-0 sum), not just report one of them.
+        let idx = SketchStore::new();
+        idx.register(cms_meta(1, "requests_total"));
+        idx.register(cms_meta(2, "requests_total"));
+        idx.append_sample(
+            1,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_total(4, 256, 30),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_total(4, 256, 12),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_total", None);
+        let tree = estimate_node(
+            cms_agg_node(child),
+            SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+            },
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, samples) = &v[0];
+        let (_ts, total) = samples[0];
+        assert_eq!(
+            total, 42.0,
+            "merged total must be the SUM of both sids (30 + 12)"
+        );
+    }
+
+    #[test]
+    fn topk_query_is_explicitly_unsupported_not_silently_wrong() {
+        // TopK's answer shape (K items per timestamp) doesn't fit this
+        // executor's Value = Vec<(i64, f64)> -- must error, not silently
+        // return a truncated/wrong scalar.
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_meta(sid, "requests_total"));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_total(4, 256, 1),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        let child = scan_node("requests_total", None);
+        let tree = estimate_node(cms_agg_node(child), SketchQuery::TopK { k: 5 });
+        let exec = ctx(&idx);
+        match execute(&tree, &exec) {
+            Err(asap_sketch::exec::ExecError::Executor(SummaryExecutorError::Unsupported(_))) => {}
+            other => panic!("expected Unsupported, got {}", other.is_ok()),
+        }
     }
 
     #[test]
