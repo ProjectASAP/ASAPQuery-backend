@@ -20,6 +20,8 @@ use asap_sketchlib::CountMinSketchDelta;
 use asap_sketchlib::CountMinSketchWithHeap;
 use asap_sketchlib::CountSketch;
 use asap_sketchlib::CountSketchDelta;
+use asap_sketchlib::CountSketchWithHeap;
+use asap_sketchlib::CsHeapItem;
 use asap_sketchlib::MessagePackCodec;
 
 use crate::precompute_engine::operators::count_min_sketch_with_heap_accumulator::CountMinSketchWithHeapAccumulator;
@@ -184,6 +186,16 @@ pub fn decode_cms_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountMinSketch
         .map_err(|e| format!("deserialize CountMinSketchWithHeap msgpack: {e}"))
 }
 
+/// Decode a `CountSketchWithHeap` (median-estimator, Count Sketch family)
+/// from msgpack bytes. Distinct wire type from `CountMinSketchWithHeap`
+/// (min-estimator, Count-Min family) even though both are heap-bearing
+/// frequency sketches — see `asap_sketchlib::CountSketchWithHeap`.
+/// Delegates to `asap_sketchlib::CountSketchWithHeap::from_msgpack`.
+pub fn decode_cs_with_heap_from_msgpack(buffer: &[u8]) -> Result<CountSketchWithHeap, String> {
+    CountSketchWithHeap::from_msgpack(buffer)
+        .map_err(|e| format!("deserialize CountSketchWithHeap msgpack: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Delta decoders. Under the per-window-reset (PWR) contract
 // (`asap-precompute-go/window.go`: a delta is that window's own state
@@ -307,4 +319,64 @@ pub fn decode_cms_with_heap_from_msgpack_delta(
     let acc = CountMinSketchWithHeapAccumulator::from_msgpack_heap_delta_bytes(buffer)
         .map_err(|e| format!("reconstruct CountMinSketchWithHeap from delta: {e}"))?;
     Ok(acc.inner)
+}
+
+/// Decode a heap-bearing CountSketch (median-estimator) MSGPACK_DELTA frame
+/// into a FULL `asap_sketchlib::CountSketchWithHeap` by applying the sparse
+/// matrix delta + full heap onto an empty base of the frame's declared
+/// dimensions. Same DELTA-HEAP wire shape as the CmsWithHeap delta frame
+/// (see `HeapDeltaWire`/`MatrixDeltaWire` in
+/// `count_min_sketch_with_heap_accumulator.rs`), decoded here directly
+/// with `rmp_serde` since there is no CountSketchWithHeap ingest
+/// accumulator to delegate to. No `asap_sketchlib` delta API needed — the
+/// public `from_legacy_matrix` rebuilds both the matrix and heap.
+pub fn decode_cs_with_heap_from_msgpack_delta(
+    buffer: &[u8],
+) -> Result<CountSketchWithHeap, String> {
+    #[derive(serde::Deserialize)]
+    struct HeapDeltaWire {
+        is_delta: bool,
+        matrix_delta: MatrixDeltaWire,
+        topk_heap: Vec<(String, f64)>,
+        heap_size: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct MatrixDeltaWire {
+        rows: u32,
+        cols: u32,
+        cells: Vec<(u32, u32, i64)>,
+    }
+
+    let wire: HeapDeltaWire = rmp_serde::from_slice(buffer)
+        .map_err(|e| format!("decode CountSketchWithHeap delta msgpack: {e}"))?;
+    if !wire.is_delta {
+        return Err("CountSketchWithHeap delta frame has is_delta=false".to_string());
+    }
+    let rows = wire.matrix_delta.rows as usize;
+    let cols = wire.matrix_delta.cols as usize;
+    if rows == 0 || cols == 0 {
+        return Err(format!(
+            "CountSketchWithHeap delta frame has zero dims (rows={rows}, cols={cols})"
+        ));
+    }
+    let mut matrix = vec![vec![0.0; cols]; rows];
+    for (r, c, dc) in &wire.matrix_delta.cells {
+        let (r, c) = (*r as usize, *c as usize);
+        if r >= rows || c >= cols {
+            continue;
+        }
+        matrix[r][c] += *dc as f64;
+    }
+    let heap: Vec<CsHeapItem> = wire
+        .topk_heap
+        .into_iter()
+        .map(|(key, value)| CsHeapItem { key, value })
+        .collect();
+    Ok(CountSketchWithHeap::from_legacy_matrix(
+        matrix,
+        heap,
+        rows,
+        cols,
+        wire.heap_size as usize,
+    ))
 }

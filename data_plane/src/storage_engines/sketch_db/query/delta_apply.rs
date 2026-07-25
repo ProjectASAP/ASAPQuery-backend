@@ -33,6 +33,7 @@
 use asap_sketchlib::CountMinSketch;
 use asap_sketchlib::CountMinSketchWithHeap;
 use asap_sketchlib::CountSketch;
+use asap_sketchlib::CountSketchWithHeap;
 use asap_sketchlib::DdSketch;
 use asap_sketchlib::HllSketch;
 use asap_sketchlib::HllVariant;
@@ -44,6 +45,7 @@ use crate::storage_engines::sketch_db::query::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
     decode_cms_with_heap_from_msgpack, decode_cms_with_heap_from_msgpack_delta,
     decode_cs_from_msgpack, decode_cs_from_proto, decode_cs_from_proto_delta,
+    decode_cs_with_heap_from_msgpack, decode_cs_with_heap_from_msgpack_delta,
 };
 
 /// Which sketch family a candidate is, and the parameters needed to
@@ -73,17 +75,15 @@ pub enum DeltaSketchKind {
         rows: usize,
         cols: usize,
     },
-    /// `CmsWithHeap` and `CountSketchWithHeap` share one wire
-    /// representation (`CountMinSketchWithHeap` -- `asap_sketchlib` has
-    /// no separate `CountSketchWithHeap` type) and today's reducer reads
-    /// both out identically (CMS-style estimate over the shared matrix).
-    /// Kept as two distinct variants anyway, not one shared `Heap`: a
-    /// CMS-substrate heap and a CountSketch-substrate heap are different
-    /// algorithms that happen to share a storage shape, and merging one
-    /// into the other would be mathematically invalid even though it
-    /// type-checks. Two variants make `merge_same_family` reject that
-    /// case the same way it already rejects e.g. merging a `Cms` into a
-    /// `Kll`.
+    /// `CmsWithHeap` wraps `asap_sketchlib::CountMinSketchWithHeap`
+    /// (min-over-rows estimator) and `CountSketchWithHeap` wraps the
+    /// distinct `asap_sketchlib::CountSketchWithHeap` (median-of-signed-rows
+    /// estimator) -- different algorithms that happen to share a storage
+    /// shape. Kept as two variants (not one shared `Heap`) so
+    /// `merge_same_family` rejects merging one into the other the same
+    /// way it already rejects e.g. merging a `Cms` into a `Kll`; now the
+    /// type system enforces it too, since the two variants hold different
+    /// Rust types.
     CmsWithHeap {
         rows: usize,
         cols: usize,
@@ -123,7 +123,7 @@ impl DeltaSketchKind {
                 rows,
                 cols,
                 heap_size,
-            } => SummaryState::CountSketchWithHeap(CountMinSketchWithHeap::new(
+            } => SummaryState::CountSketchWithHeap(CountSketchWithHeap::new(
                 *rows, *cols, *heap_size,
             )),
         }
@@ -191,7 +191,7 @@ fn decode_full(
             DeltaSketchKind::CountSketchWithHeap { .. },
             SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull,
         ) => Ok(SummaryState::CountSketchWithHeap(
-            decode_cms_with_heap_from_msgpack(bytes)?,
+            decode_cs_with_heap_from_msgpack(bytes)?,
         )),
         (_, e) => Err(format!("decode_full called with non-Full encoding {e:?}")),
     }
@@ -207,9 +207,9 @@ pub enum SummaryState {
     Cms(CountMinSketch),
     CountSketch(CountSketch),
     /// See `DeltaSketchKind::CmsWithHeap`/`CountSketchWithHeap` for why
-    /// these are two variants despite sharing one underlying type.
+    /// these are two variants holding two different sketchlib types.
     CmsWithHeap(CountMinSketchWithHeap),
-    CountSketchWithHeap(CountMinSketchWithHeap),
+    CountSketchWithHeap(CountSketchWithHeap),
 }
 
 impl SummaryState {
@@ -388,9 +388,9 @@ impl SummaryState {
             }
             SummaryState::CountSketchWithHeap(sk) => {
                 let other = if encoding == SketchEncoding::MsgpackDelta {
-                    decode_cms_with_heap_from_msgpack_delta(bytes)?
+                    decode_cs_with_heap_from_msgpack_delta(bytes)?
                 } else {
-                    decode_cms_with_heap_from_msgpack(bytes)?
+                    decode_cs_with_heap_from_msgpack(bytes)?
                 };
                 sk.merge(&other)
                     .map_err(|e| format!("merge CountSketchWithHeap delta: {e}"))
@@ -421,9 +421,8 @@ impl SummaryState {
         let matrix = match self {
             SummaryState::Cms(c) => c.sketch(),
             SummaryState::CountSketch(c) => c.sketch().clone(),
-            SummaryState::CmsWithHeap(h) | SummaryState::CountSketchWithHeap(h) => {
-                h.sketch_matrix()
-            }
+            SummaryState::CmsWithHeap(h) => h.sketch_matrix(),
+            SummaryState::CountSketchWithHeap(h) => h.sketch_matrix(),
             _ => return 0.0,
         };
         matrix
@@ -439,7 +438,13 @@ impl SummaryState {
     /// no heap at all.
     pub fn topk_items(&self) -> Option<Vec<(String, f64)>> {
         match self {
-            SummaryState::CmsWithHeap(h) | SummaryState::CountSketchWithHeap(h) => Some(
+            SummaryState::CmsWithHeap(h) => Some(
+                h.topk_heap_items()
+                    .into_iter()
+                    .map(|item| (item.key, item.value))
+                    .collect(),
+            ),
+            SummaryState::CountSketchWithHeap(h) => Some(
                 h.topk_heap_items()
                     .into_iter()
                     .map(|item| (item.key, item.value))
@@ -464,11 +469,12 @@ impl SummaryState {
     /// Merge `other` into `self` in place — both must be the same sketch
     /// family. Used to combine several sids' reconstructed states
     /// (`cumulative_summary_state`/`per_window_summary_states`) into one
-    /// cross-sid answer. `CmsWithHeap`/`CountSketchWithHeap` are
-    /// distinct arms here (not one shared arm) so merging across them is
-    /// rejected the same as merging any other mismatched family, even
-    /// though they'd type-check against the same underlying
-    /// `CountMinSketchWithHeap::merge` call — see their doc.
+    /// cross-sid answer. `CmsWithHeap`/`CountSketchWithHeap` fall through
+    /// to the catch-all mismatch arm below like any other mixed pair —
+    /// and since the two variants now hold distinct sketchlib types
+    /// (`CountMinSketchWithHeap` vs `CountSketchWithHeap`), there is no
+    /// arm that could accidentally match them together — see their doc
+    /// on `DeltaSketchKind`.
     pub fn merge_same_family(&mut self, other: &SummaryState) -> Result<(), String> {
         match (self, other) {
             (SummaryState::Dd(a), SummaryState::Dd(b)) => {
@@ -1149,27 +1155,29 @@ mod tests {
         }
     }
 
-    /// `CmsWithHeap` and `CountSketchWithHeap` share one underlying wire
-    /// type (`CountMinSketchWithHeap`) but are different sketch
+    /// `CmsWithHeap` (min-over-rows estimator, `CountMinSketchWithHeap`)
+    /// and `CountSketchWithHeap` (median-of-signed-rows estimator, the
+    /// distinct `CountSketchWithHeap` type) are different sketch
     /// algorithms that merely happen to share a storage shape — merging
     /// one into the other must be rejected as a family mismatch, the
-    /// same as merging a `Cms` into a `Kll` would be, even though both
-    /// sides would type-check against the same `CountMinSketchWithHeap::merge`
-    /// call if they shared one enum variant.
+    /// same as merging a `Cms` into a `Kll` would be. Since the two
+    /// `SummaryState` variants now hold genuinely different Rust types,
+    /// this is also enforced at compile time — there is no arm in
+    /// `merge_same_family` that type-checks a mixed pair together.
     #[test]
     fn cms_with_heap_and_count_sketch_with_heap_are_not_the_same_family() {
-        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
+        use asap_sketchlib::{CountMinSketchWithHeap, CountSketchWithHeap, MessagePackCodec};
 
         let mut cms_heap = CountMinSketchWithHeap::new(4, 256, 10);
         cms_heap.update("a", 1.0);
-        let mut cs_heap = CountMinSketchWithHeap::new(4, 256, 10);
+        let mut cs_heap = CountSketchWithHeap::new(4, 256, 10);
         cs_heap.update("b", 1.0);
 
         let mut a = SummaryState::CmsWithHeap(
             CountMinSketchWithHeap::from_msgpack(&cms_heap.to_msgpack().unwrap()).unwrap(),
         );
         let b = SummaryState::CountSketchWithHeap(
-            CountMinSketchWithHeap::from_msgpack(&cs_heap.to_msgpack().unwrap()).unwrap(),
+            CountSketchWithHeap::from_msgpack(&cs_heap.to_msgpack().unwrap()).unwrap(),
         );
 
         match a.merge_same_family(&b) {
@@ -1180,6 +1188,119 @@ mod tests {
             Ok(()) => panic!(
                 "CmsWithHeap must not merge with CountSketchWithHeap -- \
                  different algorithms sharing only a storage shape"
+            ),
+        }
+    }
+
+    fn encode_delta_heap(
+        rows: u32,
+        cols: u32,
+        cells: &[(u32, u32, i64)],
+        heap: &[(&str, f64)],
+        heap_size: u64,
+    ) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct W<'a>(
+            bool,
+            (u32, u32, &'a [(u32, u32, i64)]),
+            Vec<(String, f64)>,
+            u64,
+        );
+        let heap_owned: Vec<(String, f64)> =
+            heap.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        let w = W(true, (rows, cols, cells), heap_owned, heap_size);
+        rmp_serde::to_vec(&w).expect("encode delta-heap")
+    }
+
+    /// `SummaryState::CountSketchWithHeap` must decode both FULL and
+    /// DELTA-HEAP msgpack frames through the genuine
+    /// `asap_sketchlib::CountSketchWithHeap` (median-of-signed-rows
+    /// estimator) rather than the CMS-family `CountMinSketchWithHeap`
+    /// (min-over-rows estimator) it used to alias — the bug this split
+    /// fixed. Built via real `update()` calls (not a hand-crafted matrix)
+    /// so the sign-hashed row semantics are genuinely exercised, then
+    /// checks both decode paths reproduce the same matrix and the same
+    /// `estimate()` as the in-memory sketch they were encoded from.
+    #[test]
+    fn count_sketch_with_heap_full_and_delta_decode_via_new_asap_sketchlib_type() {
+        use asap_sketchlib::{CountSketchWithHeap, MessagePackCodec};
+
+        let mut built = CountSketchWithHeap::new(4, 64, 10);
+        for _ in 0..50 {
+            built.update("k", 1.0);
+        }
+        let expected_matrix = built.sketch_matrix();
+        let expected_estimate = built.estimate("k");
+
+        // FULL path.
+        let full_bytes = built.to_msgpack().expect("encode full CountSketchWithHeap");
+        let full_state = decode_full(
+            &DeltaSketchKind::CountSketchWithHeap {
+                rows: 4,
+                cols: 64,
+                heap_size: 10,
+            },
+            &full_bytes,
+            SketchEncoding::MsgpackFull,
+        )
+        .expect("decode_full CountSketchWithHeap");
+        match full_state {
+            SummaryState::CountSketchWithHeap(inner) => {
+                assert_eq!(inner.sketch_matrix(), expected_matrix);
+                assert_eq!(inner.estimate("k"), expected_estimate);
+            }
+            other => panic!(
+                "expected CountSketchWithHeap state, got {}",
+                other.family_name()
+            ),
+        }
+
+        // DELTA-HEAP path: same cells + heap against an empty base (PWR
+        // contract), encoded the way the Go producer does.
+        let cells: Vec<(u32, u32, i64)> = expected_matrix
+            .iter()
+            .enumerate()
+            .flat_map(|(r, row)| {
+                row.iter().enumerate().filter_map(move |(c, v)| {
+                    if *v != 0.0 {
+                        Some((r as u32, c as u32, *v as i64))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let heap_pairs: Vec<(String, f64)> = built
+            .topk_heap_items()
+            .into_iter()
+            .map(|item| (item.key, item.value))
+            .collect();
+        assert!(!heap_pairs.is_empty(), "expected \"k\" in the top-k heap");
+        let heap_refs: Vec<(&str, f64)> =
+            heap_pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let delta_bytes = encode_delta_heap(4, 64, &cells, &heap_refs, 10);
+
+        let mut rolling = DeltaSketchKind::CountSketchWithHeap {
+            rows: 4,
+            cols: 64,
+            heap_size: 10,
+        }
+        .bootstrap_empty();
+        rolling
+            .apply_delta_bytes(&delta_bytes, SketchEncoding::MsgpackDelta)
+            .expect("apply CountSketchWithHeap delta");
+        match rolling {
+            SummaryState::CountSketchWithHeap(inner) => {
+                assert_eq!(
+                    inner.sketch_matrix(),
+                    expected_matrix,
+                    "delta path must reconstruct the identical matrix"
+                );
+                assert_eq!(inner.estimate("k"), expected_estimate);
+            }
+            other => panic!(
+                "expected CountSketchWithHeap state, got {}",
+                other.family_name()
             ),
         }
     }
