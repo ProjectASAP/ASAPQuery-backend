@@ -431,7 +431,7 @@ impl<'a> SketchReducer<'a> {
         t0_ms: u64,
         t1_ms: u64,
     ) -> Result<ASAPTierResult, ASAPTierError> {
-        use super::delta_apply::{cumulative_rolling_state, DeltaSketchKind, SummaryState};
+        use super::delta_apply::{cumulative_summary_state, DeltaSketchKind, SummaryState};
         use crate::storage_engines::sketch_db::data::SketchConfig;
 
         let mut merged: Option<SummaryState> = None;
@@ -478,7 +478,7 @@ impl<'a> SketchReducer<'a> {
                     cov_hi = cov_hi.max(w);
                 }
                 let series_state =
-                    cumulative_rolling_state(&samples_vec, DeltaSketchKind::Hll { precision })
+                    cumulative_summary_state(&samples_vec, DeltaSketchKind::Hll { precision })
                         .map_err(|e| ASAPTierError::DeserializeFailure {
                             sid,
                             encoding: SketchEncoding::ProtoFull,

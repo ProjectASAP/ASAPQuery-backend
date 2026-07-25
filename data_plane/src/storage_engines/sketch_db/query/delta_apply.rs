@@ -73,11 +73,23 @@ pub enum DeltaSketchKind {
         rows: usize,
         cols: usize,
     },
-    /// Covers both `CmsWithHeap` and `CountSketchWithHeap` — both share
-    /// one wire representation (`CountMinSketchWithHeap`) and are read
-    /// out identically (CMS-style estimate over the shared matrix); the
-    /// heap substrate distinction doesn't affect decode/merge/bootstrap.
-    Heap {
+    /// `CmsWithHeap` and `CountSketchWithHeap` share one wire
+    /// representation (`CountMinSketchWithHeap` -- `asap_sketchlib` has
+    /// no separate `CountSketchWithHeap` type) and today's reducer reads
+    /// both out identically (CMS-style estimate over the shared matrix).
+    /// Kept as two distinct variants anyway, not one shared `Heap`: a
+    /// CMS-substrate heap and a CountSketch-substrate heap are different
+    /// algorithms that happen to share a storage shape, and merging one
+    /// into the other would be mathematically invalid even though it
+    /// type-checks. Two variants make `merge_same_family` reject that
+    /// case the same way it already rejects e.g. merging a `Cms` into a
+    /// `Kll`.
+    CmsWithHeap {
+        rows: usize,
+        cols: usize,
+        heap_size: usize,
+    },
+    CountSketchWithHeap {
         rows: usize,
         cols: usize,
         heap_size: usize,
@@ -102,11 +114,18 @@ impl DeltaSketchKind {
             DeltaSketchKind::CountSketch { rows, cols } => {
                 SummaryState::CountSketch(CountSketch::new(*rows, *cols))
             }
-            DeltaSketchKind::Heap {
+            DeltaSketchKind::CmsWithHeap {
                 rows,
                 cols,
                 heap_size,
-            } => SummaryState::Heap(CountMinSketchWithHeap::new(*rows, *cols, *heap_size)),
+            } => SummaryState::CmsWithHeap(CountMinSketchWithHeap::new(*rows, *cols, *heap_size)),
+            DeltaSketchKind::CountSketchWithHeap {
+                rows,
+                cols,
+                heap_size,
+            } => SummaryState::CountSketchWithHeap(CountMinSketchWithHeap::new(
+                *rows, *cols, *heap_size,
+            )),
         }
     }
 }
@@ -162,11 +181,18 @@ fn decode_full(
         // deployment; `decode_cms_with_heap_from_msgpack` is the same
         // "Full" decoder the reducer's existing per-frame dispatch falls
         // through to for any non-MsgpackDelta encoding.
-        (DeltaSketchKind::Heap { .. }, SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull) => {
-            Ok(SummaryState::Heap(decode_cms_with_heap_from_msgpack(
-                bytes,
-            )?))
-        }
+        (
+            DeltaSketchKind::CmsWithHeap { .. },
+            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull,
+        ) => Ok(SummaryState::CmsWithHeap(
+            decode_cms_with_heap_from_msgpack(bytes)?,
+        )),
+        (
+            DeltaSketchKind::CountSketchWithHeap { .. },
+            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull,
+        ) => Ok(SummaryState::CountSketchWithHeap(
+            decode_cms_with_heap_from_msgpack(bytes)?,
+        )),
         (_, e) => Err(format!("decode_full called with non-Full encoding {e:?}")),
     }
 }
@@ -180,9 +206,10 @@ pub enum SummaryState {
     Kll(KllSketch),
     Cms(CountMinSketch),
     CountSketch(CountSketch),
-    /// Shared representation for `CmsWithHeap`/`CountSketchWithHeap` —
-    /// see `DeltaSketchKind::Heap`.
-    Heap(CountMinSketchWithHeap),
+    /// See `DeltaSketchKind::CmsWithHeap`/`CountSketchWithHeap` for why
+    /// these are two variants despite sharing one underlying type.
+    CmsWithHeap(CountMinSketchWithHeap),
+    CountSketchWithHeap(CountMinSketchWithHeap),
 }
 
 impl SummaryState {
@@ -346,7 +373,7 @@ impl SummaryState {
                 sk.merge(&other)
                     .map_err(|e| format!("merge CountSketch delta: {e}"))
             }
-            SummaryState::Heap(sk) => {
+            SummaryState::CmsWithHeap(sk) => {
                 // Matches the existing per-frame reducer dispatch: only
                 // MsgpackDelta gets true delta treatment; ProtoDelta (not
                 // produced for this family in this deployment) falls
@@ -357,7 +384,16 @@ impl SummaryState {
                     decode_cms_with_heap_from_msgpack(bytes)?
                 };
                 sk.merge(&other)
-                    .map_err(|e| format!("merge CountMinSketchWithHeap delta: {e}"))
+                    .map_err(|e| format!("merge CmsWithHeap delta: {e}"))
+            }
+            SummaryState::CountSketchWithHeap(sk) => {
+                let other = if encoding == SketchEncoding::MsgpackDelta {
+                    decode_cms_with_heap_from_msgpack_delta(bytes)?
+                } else {
+                    decode_cms_with_heap_from_msgpack(bytes)?
+                };
+                sk.merge(&other)
+                    .map_err(|e| format!("merge CountSketchWithHeap delta: {e}"))
             }
         }
     }
@@ -385,7 +421,9 @@ impl SummaryState {
         let matrix = match self {
             SummaryState::Cms(c) => c.sketch(),
             SummaryState::CountSketch(c) => c.sketch().clone(),
-            SummaryState::Heap(h) => h.sketch_matrix(),
+            SummaryState::CmsWithHeap(h) | SummaryState::CountSketchWithHeap(h) => {
+                h.sketch_matrix()
+            }
             _ => return 0.0,
         };
         matrix
@@ -395,13 +433,13 @@ impl SummaryState {
     }
 
     /// Top-k `(key, value)` pairs from the heap, descending by value.
-    /// `None` for anything other than `Heap` — the heap-less Frequency
-    /// states (`Cms`/`CountSketch`) carry no item universe to
-    /// enumerate, and the quantile/cardinality states have no heap at
-    /// all.
+    /// `None` for anything other than a heap-bearing state — the
+    /// heap-less Frequency states (`Cms`/`CountSketch`) carry no item
+    /// universe to enumerate, and the quantile/cardinality states have
+    /// no heap at all.
     pub fn topk_items(&self) -> Option<Vec<(String, f64)>> {
         match self {
-            SummaryState::Heap(h) => Some(
+            SummaryState::CmsWithHeap(h) | SummaryState::CountSketchWithHeap(h) => Some(
                 h.topk_heap_items()
                     .into_iter()
                     .map(|item| (item.key, item.value))
@@ -425,8 +463,12 @@ impl SummaryState {
 
     /// Merge `other` into `self` in place — both must be the same sketch
     /// family. Used to combine several sids' reconstructed states
-    /// (`cumulative_rolling_state`/`per_window_rolling_states`) into one
-    /// cross-sid answer.
+    /// (`cumulative_summary_state`/`per_window_summary_states`) into one
+    /// cross-sid answer. `CmsWithHeap`/`CountSketchWithHeap` are
+    /// distinct arms here (not one shared arm) so merging across them is
+    /// rejected the same as merging any other mismatched family, even
+    /// though they'd type-check against the same underlying
+    /// `CountMinSketchWithHeap::merge` call — see their doc.
     pub fn merge_same_family(&mut self, other: &SummaryState) -> Result<(), String> {
         match (self, other) {
             (SummaryState::Dd(a), SummaryState::Dd(b)) => {
@@ -444,9 +486,12 @@ impl SummaryState {
             (SummaryState::CountSketch(a), SummaryState::CountSketch(b)) => {
                 a.merge(b).map_err(|e| format!("merge CountSketch: {e}"))
             }
-            (SummaryState::Heap(a), SummaryState::Heap(b)) => a
+            (SummaryState::CmsWithHeap(a), SummaryState::CmsWithHeap(b)) => {
+                a.merge(b).map_err(|e| format!("merge CmsWithHeap: {e}"))
+            }
+            (SummaryState::CountSketchWithHeap(a), SummaryState::CountSketchWithHeap(b)) => a
                 .merge(b)
-                .map_err(|e| format!("merge CountMinSketchWithHeap: {e}")),
+                .map_err(|e| format!("merge CountSketchWithHeap: {e}")),
             (a, _) => Err(format!(
                 "SummaryState family mismatch in merge_same_family (self is {})",
                 a.family_name()
@@ -462,7 +507,8 @@ impl SummaryState {
             SummaryState::Kll(_) => "Kll",
             SummaryState::Cms(_) => "Cms",
             SummaryState::CountSketch(_) => "CountSketch",
-            SummaryState::Heap(_) => "Heap",
+            SummaryState::CmsWithHeap(_) => "CmsWithHeap",
+            SummaryState::CountSketchWithHeap(_) => "CountSketchWithHeap",
         }
     }
 }
@@ -473,7 +519,7 @@ impl SummaryState {
 /// per-sid building block for a cross-sid answer: reconstruct each
 /// candidate sid's state this way, then merge them (`merge_same_family`)
 /// before reading out a quantile/cardinality over the combined data.
-pub fn cumulative_rolling_state(
+pub fn cumulative_summary_state(
     samples: &[(i64, &SketchSampleState)],
     kind: DeltaSketchKind,
 ) -> Result<Option<SummaryState>, String> {
@@ -551,7 +597,7 @@ pub fn per_window_evaluate<E>(
 where
     E: Fn(&SummaryState) -> f64,
 {
-    let (states, skipped) = per_window_rolling_states(samples, kind)?;
+    let (states, skipped) = per_window_summary_states(samples, kind)?;
     Ok((
         states.into_iter().map(|(w, rs)| (w, eval(&rs))).collect(),
         skipped,
@@ -563,14 +609,14 @@ where
 /// walk as [`per_window_evaluate`], generalized to return the
 /// reconstructed state itself instead of an already-evaluated scalar).
 /// The per-sid building block for cross-sid per-window merging (unlike
-/// [`cumulative_rolling_state`], which folds a whole `[t0, t1]` range
+/// [`cumulative_summary_state`], which folds a whole `[t0, t1]` range
 /// into one answer, this keeps each window separate so a caller can
 /// merge same-window states across several sids before evaluating --
 /// needed for a matrix/range-query answer, where each output point is
 /// itself a cross-sid merge for that one window).
 ///
 /// Returns `Ok((per_window_states, skipped))`.
-pub fn per_window_rolling_states(
+pub fn per_window_summary_states(
     samples: &[(i64, &SketchSampleState)],
     kind: DeltaSketchKind,
 ) -> Result<(Vec<(i64, SummaryState)>, usize), String> {
@@ -1100,6 +1146,41 @@ mod tests {
                 rel < 0.15,
                 "window {i}: HLL est={est} truth={n} rel={rel} (each window independent)"
             );
+        }
+    }
+
+    /// `CmsWithHeap` and `CountSketchWithHeap` share one underlying wire
+    /// type (`CountMinSketchWithHeap`) but are different sketch
+    /// algorithms that merely happen to share a storage shape — merging
+    /// one into the other must be rejected as a family mismatch, the
+    /// same as merging a `Cms` into a `Kll` would be, even though both
+    /// sides would type-check against the same `CountMinSketchWithHeap::merge`
+    /// call if they shared one enum variant.
+    #[test]
+    fn cms_with_heap_and_count_sketch_with_heap_are_not_the_same_family() {
+        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
+
+        let mut cms_heap = CountMinSketchWithHeap::new(4, 256, 10);
+        cms_heap.update("a", 1.0);
+        let mut cs_heap = CountMinSketchWithHeap::new(4, 256, 10);
+        cs_heap.update("b", 1.0);
+
+        let mut a = SummaryState::CmsWithHeap(
+            CountMinSketchWithHeap::from_msgpack(&cms_heap.to_msgpack().unwrap()).unwrap(),
+        );
+        let b = SummaryState::CountSketchWithHeap(
+            CountMinSketchWithHeap::from_msgpack(&cs_heap.to_msgpack().unwrap()).unwrap(),
+        );
+
+        match a.merge_same_family(&b) {
+            Err(msg) => assert!(
+                msg.contains("family mismatch"),
+                "expected a family-mismatch error, got: {msg}"
+            ),
+            Ok(()) => panic!(
+                "CmsWithHeap must not merge with CountSketchWithHeap -- \
+                 different algorithms sharing only a storage shape"
+            ),
         }
     }
 }

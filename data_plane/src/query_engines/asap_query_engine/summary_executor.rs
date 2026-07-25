@@ -52,7 +52,7 @@ use control_plane::sketch_algebra::capability::SketchKindHandle;
 use crate::storage_engines::sketch_db::data::{SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
-    cumulative_rolling_state, per_window_rolling_states, DeltaSketchKind, SummaryState,
+    cumulative_summary_state, per_window_summary_states, DeltaSketchKind, SummaryState,
 };
 
 /// Per-query, per-call execution context — constructed fresh for each
@@ -209,7 +209,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
     }
 
     fn merge_states(&self, states: Vec<Self::State>) -> Result<Self::State, Self::Error> {
-        // The actual decode/merge math (`cumulative_rolling_state`/
+        // The actual decode/merge math (`cumulative_summary_state`/
         // `merge_same_family`) happens in `readout`, not here: it needs
         // to distinguish cumulative vs. per-window mode
         // (`self.is_cumulative`), which only `readout` is positioned to
@@ -260,7 +260,7 @@ fn readout_cumulative(
         if let Some((w, _)) = samples_vec.last() {
             latest_window_end = Some(latest_window_end.map_or(*w, |prev| prev.max(*w)));
         }
-        let rs = cumulative_rolling_state(&samples_vec, state.kind)
+        let rs = cumulative_summary_state(&samples_vec, state.kind)
             .map_err(SummaryExecutorError::Decode)?;
         if let Some(rs) = rs {
             merged = Some(match merged.take() {
@@ -299,7 +299,7 @@ fn readout_per_window(
             .iter()
             .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
             .collect();
-        let (per_window, _skipped) = per_window_rolling_states(&samples_vec, state.kind)
+        let (per_window, _skipped) = per_window_summary_states(&samples_vec, state.kind)
             .map_err(SummaryExecutorError::Decode)?;
         for (w_end, rs) in per_window {
             // `SketchStore::query_range` may splice in a carry-in Full
@@ -453,9 +453,15 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
                 cols: *cols as usize,
             })
         }
-        (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols })
-        | (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
-            Some(DeltaSketchKind::Heap {
+        (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => {
+            Some(DeltaSketchKind::CmsWithHeap {
+                rows: *rows as usize,
+                cols: *cols as usize,
+                heap_size: DEFAULT_HEAP_SIZE,
+            })
+        }
+        (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
+            Some(DeltaSketchKind::CountSketchWithHeap {
                 rows: *rows as usize,
                 cols: *cols as usize,
                 heap_size: DEFAULT_HEAP_SIZE,
