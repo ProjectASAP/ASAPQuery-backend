@@ -7,13 +7,18 @@
 //! ## Scope
 //!
 //! Covers **quantile/cardinality queries** (DDSketch/Kll/Hll) **and the
-//! Frequency family's bare total** (CMS/CountSketch/CMS-with-heap/
-//! CountSketch-with-heap, `count`/`sum` with no specific item key), both
-//! cumulative (instant) and per-window (matrix/range). All modes do real
-//! cross-sid merging via `delta_apply::SummaryState`: reconstruct each
-//! candidate sid's own state over the range (or per window), then merge
-//! same-window/same-range states *across* sids before reading out one
-//! answer per group (or per group per window).
+//! Frequency family** — both the bare total (`count`/`sum` with no
+//! specific item key) and a per-item point lookup (`count(cms_metric
+//! {item="x"})`, `SketchQuery::PointCount{key: Named(_), value: Some(_)}`
+//! — `value` is where the filter's actual value lives; see
+//! `asap_sketch::SketchQuery::PointCount`'s doc for why `readout` can't
+//! resolve it itself from a `Filter` predicate) — for CMS/CountSketch/
+//! CMS-with-heap/CountSketch-with-heap, both cumulative (instant) and
+//! per-window (matrix/range). All modes do real cross-sid merging via
+//! `delta_apply::SummaryState`: reconstruct each candidate sid's own
+//! state over the range (or per window), then merge same-window/
+//! same-range states *across* sids before reading out one answer per
+//! group (or per group per window).
 //!
 //! `Self::Value` (`SummaryValue`) carries two shapes: `Points` (one
 //! scalar per timestamp — everything but `TopK`) and `TopK` (one ranked
@@ -29,15 +34,12 @@
 //! - `SketchQuery::TopK` against a heap-less family (`Dd`/`Hll`/`Kll`/
 //!   `Cms`/`CountSketch`) — a family limitation (no item universe to
 //!   rank), not an unimplemented-query limitation; see `topk_ranked`.
-//! - `SketchQuery::PointCount` with a *named* item key (a point lookup
-//!   for one specific item, e.g. `count(cms_metric{item="x"})`). The
-//!   *value* to look up isn't carried by `SketchQuery` or available in
-//!   `readout`'s signature — `PointCount{key: ColumnRef}` names which
-//!   *column* is being queried, not the value to filter for, which would
-//!   come from a `Filter` predicate elsewhere in the tree. Resolving
-//!   that is a separate problem from this trait's scope.
-//!   `PointCount{key: ColumnRef::SampleValue}` (no specific item — the
-//!   bare bucket total) is covered.
+//! - `SketchQuery::PointCount` against a heap-less-*and*-quantile/
+//!   cardinality family (`Dd`/`Hll`/`Kll` have no item universe at all)
+//!   — a family limitation, not an unimplemented-query limitation.
+//! - A `PointCount` whose `key`/`value` combination isn't one of the two
+//!   expected shapes (`SampleValue` + `None`, or `Named`/`Qualified` +
+//!   `Some(_)`) — reported rather than silently guessed at.
 //! - `ExactAgg` intents (`Sum`/`Rate`/`Increase`/`MinMax`/exact `Count`).
 //!   These don't reach `readout` at all — `asap_plan::bind` never wraps
 //!   an `ExactAccumulator` implementation in a `SummaryEstimate`
@@ -368,15 +370,27 @@ fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, Sum
     match query {
         SketchQuery::Quantile { q } => Ok(rs.quantile(*q)),
         SketchQuery::Cardinality => Ok(rs.cardinality()),
-        // `key: ColumnRef::SampleValue` means "no specific item" -- the
-        // bare bucket total. Any other column names an item to look up
-        // by VALUE, which isn't carried by `SketchQuery` -- see the
-        // module doc.
+        // `key: ColumnRef::SampleValue, value: None` means "no specific
+        // item" -- the bare bucket total. `key: Named(_), value: Some(v)`
+        // is a per-item point lookup (e.g. `count(cms_metric{item="x"})`)
+        // -- `value` is where the filter's actual value lives (see
+        // `asap_sketch::SketchQuery::PointCount`'s doc for why `readout`
+        // can't resolve it itself). Any other combination (e.g. a `Named`
+        // key with no value, or `SampleValue` with a value) is a shape
+        // this executor doesn't expect to see and reports rather than
+        // silently misreading.
         SketchQuery::PointCount {
             key: ColumnRef::SampleValue,
+            value: None,
         } => Ok(rs.total()),
+        SketchQuery::PointCount {
+            key: ColumnRef::Named(_) | ColumnRef::Qualified { .. },
+            value: Some(v),
+        } => rs.estimate(v).ok_or(SummaryExecutorError::Unsupported(
+            "PointCount by key requires a Frequency-family sketch (Cms/CountSketch/..WithHeap)",
+        )),
         SketchQuery::PointCount { .. } => Err(SummaryExecutorError::Unsupported(
-            "PointCount for a named item key needs a filter value this trait doesn't carry",
+            "unrecognized PointCount shape (key/value combination not expected)",
         )),
         // Both readout callers branch on `TopK` before ever calling this
         // function (see `readout_cumulative`/`readout_per_window`), so
@@ -774,6 +788,17 @@ mod tests {
         sk.to_msgpack().expect("encode CountMinSketch msgpack")
     }
 
+    /// Encode a CMS msgpack frame with one `update` of `weight` for a
+    /// single named `key` -- unlike `encode_cms_with_total`'s synthetic
+    /// "k", this lets a test control which key a `PointCount` query looks
+    /// up.
+    fn encode_cms_with_item(rows: usize, cols: usize, key: &str, weight: f64) -> Vec<u8> {
+        use asap_sketchlib::{CountMinSketch, MessagePackCodec};
+        let mut sk = CountMinSketch::new(rows, cols);
+        sk.update(key, weight);
+        sk.to_msgpack().expect("encode CountMinSketch msgpack")
+    }
+
     fn cms_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
@@ -1090,6 +1115,7 @@ mod tests {
             cms_agg_node(child),
             SketchQuery::PointCount {
                 key: ColumnRef::SampleValue,
+                value: None,
             },
         );
 
@@ -1139,6 +1165,7 @@ mod tests {
             cms_agg_node(child),
             SketchQuery::PointCount {
                 key: ColumnRef::SampleValue,
+                value: None,
             },
         );
 
@@ -1154,6 +1181,97 @@ mod tests {
         assert_eq!(
             total, 42.0,
             "merged total must be the SUM of both sids (30 + 12)"
+        );
+    }
+
+    #[test]
+    fn single_cms_sid_named_key_point_estimate() {
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_meta(sid, "requests_by_route"));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_item(4, 256, "checkout", 17.0),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(
+            cms_agg_node(child),
+            SketchQuery::PointCount {
+                key: ColumnRef::Named("item".to_string()),
+                value: Some("checkout".to_string()),
+            },
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
+        let (_ts, estimate) = samples[0];
+        assert_eq!(
+            estimate, 17.0,
+            "named-key point estimate must equal that key's own insertions"
+        );
+    }
+
+    #[test]
+    fn two_cms_sids_same_group_named_key_estimate_merges_cross_sid() {
+        // Cross-sid merge for a NAMED-KEY point lookup: the same key's
+        // weight contributed by two different sids must ADD (matrix merge
+        // then keyed estimate), not just report one sid's contribution --
+        // the point-lookup analog of `two_cms_sids_same_group_totals_actually_merge`.
+        let idx = SketchStore::new();
+        idx.register(cms_meta(1, "requests_by_route"));
+        idx.register(cms_meta(2, "requests_by_route"));
+        idx.append_sample(
+            1,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_item(4, 256, "checkout", 30.0),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_item(4, 256, "checkout", 12.0),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(
+            cms_agg_node(child),
+            SketchQuery::PointCount {
+                key: ColumnRef::Named("item".to_string()),
+                value: Some("checkout".to_string()),
+            },
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
+        let (_ts, estimate) = samples[0];
+        assert_eq!(
+            estimate, 42.0,
+            "merged named-key estimate must be the SUM of both sids (30 + 12)"
         );
     }
 

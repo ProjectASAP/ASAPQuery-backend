@@ -431,6 +431,21 @@ impl SummaryState {
             .unwrap_or(0.0)
     }
 
+    /// Per-key point estimate — `count(metric{item="x"})`-shaped queries.
+    /// Unlike [`Self::topk_items`], no heap is needed: all four Frequency
+    /// variants (heap-bearing or not) already carry a keyed `estimate`
+    /// over their matrix. `None` for the quantile/cardinality states,
+    /// which have no item universe at all.
+    pub fn estimate(&self, key: &str) -> Option<f64> {
+        match self {
+            SummaryState::Cms(c) => Some(c.estimate(key)),
+            SummaryState::CountSketch(c) => Some(c.estimate(key)),
+            SummaryState::CmsWithHeap(h) => Some(h.estimate(key)),
+            SummaryState::CountSketchWithHeap(h) => Some(h.estimate(key)),
+            _ => None,
+        }
+    }
+
     /// Top-k `(key, value)` pairs from the heap, descending by value.
     /// `None` for anything other than a heap-bearing state — the
     /// heap-less Frequency states (`Cms`/`CountSketch`) carry no item
