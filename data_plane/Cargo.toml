@@ -13,6 +13,24 @@ asap_types.workspace = true
 # compile in the workspace and importable from main.rs.
 control_plane = { path = "../control_plane" }
 
+# Step C (data_plane/docs/l4node-plan-executor-design.md): data_plane
+# implements `asap_sketch::exec::SummaryExecutor`, which means naming
+# `asap_sketch::{L4Node, SketchQuery, exec::*}` types directly -- not
+# reachable through `control_plane::asap_tier_implement`'s public
+# `Vec<Rc<L4Node>>` return type alone (Rust requires importing a type's
+# defining crate to implement traits on it or match its variants, even
+# when a dependency's function already returns that type). Pin MUST
+# match control_plane's `asap-sketch` pin exactly -- same rule as
+# `crates/asap_types/Cargo.toml`'s existing pin comment: two revs of the
+# same git dependency in one workspace resolve to two distinct Rust
+# types that won't unify.
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+# `asap_sketch::L4Node`'s own fields (`SummaryExpr::Logical(Box<QueryExpr>)`,
+# `SummaryAgg { col: ColumnRef, by: Vec<ColumnId>, .. }`) are `asap-ir`
+# types, not re-exported by `asap-sketch` -- `find_candidates` needs to
+# walk/match them directly. Same pin-must-match rule as `asap-sketch` above.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+
 # Shared external (workspace)
 serde.workspace = true
 serde_json.workspace = true
