@@ -1,30 +1,29 @@
-//! `data_plane`'s `asap_sketch::exec::SummaryExecutor` implementation —
-//! Step C of the plan-shaped-serving migration
-//! (`data_plane/docs/l4node-plan-executor-design.md`).
+//! `data_plane`'s implementation of `asap_sketch::exec::SummaryExecutor`
+//! — the serving-time interface that resolves an `L4Node` plan tree
+//! against whatever is actually materialized right now. See
+//! `data_plane/docs/l4node-plan-executor-design.md` for the surrounding
+//! design.
 //!
-//! ## Scope of this first cut
+//! ## Scope
 //!
 //! Covers **quantile/cardinality queries, both cumulative (instant) and
 //! per-window (matrix/range)** — the `DdSketch`/`Kll`/`Hll` families
 //! `RollingState` (`storage_engines::sketch_db::query::delta_apply`)
-//! already covers. Both modes do real cross-sid merging:
+//! covers. Both modes do real cross-sid merging:
 //! - Cumulative: `delta_apply::cumulative_rolling_state` folds a
-//!   group's whole `[t0, t1]` into one answer (generalized from the
-//!   HLL-only global-cardinality rollup for this).
-//! - Per-window: `delta_apply::per_window_rolling_states`
-//!   reconstructs each sid's own per-window states, then this module
-//!   merges same-window states *across* the group's sids before
-//!   evaluating each window — one merged answer per window, not one
-//!   merged answer for the whole range.
+//!   group's whole `[t0, t1]` into one answer.
+//! - Per-window: `delta_apply::per_window_rolling_states` reconstructs
+//!   each sid's own per-window states, then this module merges
+//!   same-window states *across* the group's sids before evaluating
+//!   each window — one merged answer per window, not one merged answer
+//!   for the whole range.
 //!
-//! Explicitly **not** covered yet, and left as follow-up rather than
-//! silently mishandled — `readout` returns
-//! [`SummaryExecutorError::Unsupported`] for all of these:
+//! Not covered, and reported as an explicit `Unsupported` error rather
+//! than silently mishandled:
 //! - The Frequency family (`TopK`/`PointCount`, i.e. CMS/CountSketch) —
 //!   `RollingState` doesn't cover these; they decode via a different path
 //!   (`sketch_reducer.rs`'s `decode_frequency_total`/
-//!   `decode_cms_with_heap_from_msgpack` etc.) that would need its own
-//!   analogous cross-sid-merge generalization.
+//!   `decode_cms_with_heap_from_msgpack` etc.).
 //! - `ExactAgg` intents (`Sum`/`Rate`/`Increase`/`MinMax`/exact `Count`).
 //!   These don't reach `readout` at all — `asap_plan::bind` never wraps
 //!   an `ExactAccumulator` implementation in a `SummaryEstimate`
@@ -33,6 +32,7 @@
 //!   the final value out of that `State` itself, not through this trait.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
 use asap_ir::intent_algebra::{ColumnId, ColumnRef, QueryExpr, Source};
 use asap_sketch::exec::SummaryExecutor;
@@ -40,8 +40,8 @@ use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use control_plane::sketch_algebra::capability::SketchKindHandle;
 
-use crate::storage_engines::sketch_db::data::SketchConfig;
-use crate::storage_engines::sketch_db::index::SketchStore;
+use crate::storage_engines::sketch_db::data::{SketchConfig, SketchTimeSeries};
+use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_rolling_state, per_window_rolling_states, DeltaSketchKind, RollingState,
 };
@@ -65,13 +65,25 @@ pub struct QueryExecutionContext<'a> {
     pub is_cumulative: bool,
 }
 
-/// One group's accumulated candidate sids, plus enough to reconstruct
-/// each sid's `RollingState` at readout time — `readout` only receives
+/// One candidate sid, already carrying its `[t0, t1]` data and decode
+/// parameters. `find_candidates` fetches this once per candidate (it
+/// needs the sid's label values to build the group key anyway); folding
+/// it into the handle means `fetch_state`/`readout` reuse it instead of
+/// re-querying the same `(sid, t0, t1)` range a second time. `Rc` keeps
+/// clones of the handle cheap (a refcount bump, not a re-fetch or a
+/// re-clone of the sample bytes).
+#[derive(Debug, Clone)]
+pub struct SidHandle {
+    series: Rc<SketchTimeSeries>,
+    delta_kind: DeltaSketchKind,
+}
+
+/// One group's accumulated candidates. `readout` only receives
 /// `&Self::State`, not the `SummaryKind`/`SummaryParams` that produced
-/// it (per the trait), so the state has to self-describe.
+/// it, so `delta_kind` rides along here instead of being re-derived.
 #[derive(Debug, Clone)]
 pub struct GroupState {
-    sids: Vec<u64>,
+    entries: Vec<SidHandle>,
     delta_kind: DeltaSketchKind,
 }
 
@@ -82,14 +94,14 @@ pub enum SummaryExecutorError {
     /// contract; the caller fails over to archive.
     NoCandidates,
     /// Couldn't recover a metric name by walking the `SummaryAgg`'s
-    /// child subtree (an unsupported/CSE-`Ref`-shaped `QueryExpr` this
-    /// first cut doesn't walk through).
+    /// child subtree — an unsupported/CSE-`Ref`-shaped `QueryExpr` this
+    /// executor doesn't walk through.
     NoMetricFound,
     /// A requested `by` `ColumnId` doesn't resolve to a name against the
     /// child's schema.
     UnresolvedColumn(ColumnId),
     /// A candidate sid claims a `SummaryKind` this executor doesn't
-    /// implement cross-sid merge for yet (Frequency family) or the sid's
+    /// implement cross-sid merge for (Frequency family) or the sid's
     /// on-disk `SketchConfig` didn't decode into a `DeltaSketchKind`.
     UnsupportedFamily,
     /// Decode/merge failure surfaced from `delta_apply`/`asap_sketchlib`.
@@ -97,12 +109,12 @@ pub enum SummaryExecutorError {
     /// A `SummaryExpr::Logical` node — nothing committed at L4. Same
     /// meaning as today's "no candidate bound"; the caller fails over.
     Logical,
-    /// Scoped out of this first cut — see the module doc.
+    /// A query shape not covered by this executor — see the module doc.
     Unsupported(&'static str),
 }
 
 impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
-    type Handle = u64;
+    type Handle = SidHandle;
     type State = GroupState;
     type Value = Vec<(i64, f64)>;
     type Error = SummaryExecutorError;
@@ -133,23 +145,23 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         let candidate_sids = self.index.instances_matching(&metric, &required_keys);
         let mut out = Vec::new();
         for sid in candidate_sids {
-            let matched = self.index.with_instance(sid, |m| {
+            let delta_kind = self.index.with_instance(sid, |m| {
                 let kind = m.sketch_kind()?;
                 let config = m.sketch_config()?;
-                summary_params_match(sketch, params, kind, config).then_some(())
+                summary_params_match(sketch, params, kind, config)
+                    .then(|| to_delta_kind(kind, config))
+                    .flatten()
             });
-            if matched.flatten().is_none() {
+            let Some(delta_kind) = delta_kind.flatten() else {
                 continue;
-            }
+            };
 
-            // Project this sid's actual label values onto `by` for the
-            // group key. Needs `query_range` (the only place per-sid
-            // label values live) rather than `SketchInstanceMetadata`
-            // alone (which only carries the group-by KEY names, not
-            // values) -- a real per-candidate cost worth optimizing
-            // later (this is exactly what
-            // design-backend-plan-wire-format.md's RoutingIndex Tier-2
-            // columnar index is for), not attempted in this first cut.
+            // Fetching the series here (rather than just checking
+            // membership) is what lets `fetch_state`/`readout` skip a
+            // second identical `query_range` call later -- see
+            // `SidHandle`'s doc. The label values it carries are also
+            // the only place a group's actual values live (metadata only
+            // has the group-by KEY names, not values).
             let series = self.index.query_range(sid, self.t0_ms, self.t1_ms);
             let Some(series) = series.into_iter().next() else {
                 continue;
@@ -165,7 +177,13 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     (k.clone(), v)
                 })
                 .collect();
-            out.push((group_key, sid));
+            out.push((
+                group_key,
+                SidHandle {
+                    series: Rc::new(series),
+                    delta_kind,
+                },
+            ));
         }
         // Empty is NOT an error here -- `asap_sketch::exec::execute()`
         // itself checks `find_candidates`'s result for emptiness and
@@ -176,34 +194,23 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
     }
 
     fn fetch_state(&self, handle: &Self::Handle) -> Result<Self::State, Self::Error> {
-        let sid = *handle;
-        let delta_kind = self
-            .index
-            .with_instance(sid, |m| match (m.sketch_kind(), m.sketch_config()) {
-                (Some(kind), Some(config)) => to_delta_kind(kind, config),
-                _ => None,
-            })
-            .flatten()
-            .ok_or(SummaryExecutorError::UnsupportedFamily)?;
         Ok(GroupState {
-            sids: vec![sid],
-            delta_kind,
+            delta_kind: handle.delta_kind,
+            entries: vec![handle.clone()],
         })
     }
 
     fn merge_states(&self, states: Vec<Self::State>) -> Result<Self::State, Self::Error> {
-        // Deliberately lazy: concatenate sid lists rather than eagerly
-        // decoding+merging here. The real merge math needs the query's
-        // time range (`self.t0_ms`/`t1_ms`), which `merge_states` isn't
-        // given -- `readout` is the first point in the trait that has
-        // both the state and (via `self`) the range, so that's where
-        // the actual `cumulative_rolling_state`/`merge_same_family` work
-        // happens. `merge_states` and `fetch_state` together just build
-        // up "the list of sids this group's answer must be built from."
+        // The actual decode/merge math (`cumulative_rolling_state`/
+        // `merge_same_family`) happens in `readout`, not here: it needs
+        // to distinguish cumulative vs. per-window mode
+        // (`self.is_cumulative`), which only `readout` is positioned to
+        // do generically for both callers. `merge_states` and
+        // `fetch_state` just assemble the group's full candidate list.
         let mut states = states.into_iter();
         let mut acc = states.next().ok_or(SummaryExecutorError::NoCandidates)?;
         for s in states {
-            acc.sids.extend(s.sids);
+            acc.entries.extend(s.entries);
         }
         Ok(acc)
     }
@@ -214,9 +221,9 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         query: &SketchQuery,
     ) -> Result<Self::Value, Self::Error> {
         if self.is_cumulative {
-            self.readout_cumulative(state, query)
+            readout_cumulative(state, query, self.t1_ms as i64)
         } else {
-            self.readout_per_window(state, query)
+            readout_per_window(state, query, self.t0_ms as i64)
         }
     }
 
@@ -225,110 +232,93 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
     }
 }
 
-impl<'a> QueryExecutionContext<'a> {
-    /// Fold a group's whole `[t0, t1]` into one merged state and read out
-    /// one scalar -- `quantile_over_time`/`count_distinct_over_time`-
-    /// shaped instant queries.
-    fn readout_cumulative(
-        &self,
-        state: &GroupState,
-        query: &SketchQuery,
-    ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
-        let mut merged: Option<RollingState> = None;
-        let mut latest_window_end: i64 = self.t1_ms as i64;
-        for &sid in &state.sids {
-            for ts in self.index.query_range(sid, self.t0_ms, self.t1_ms) {
-                let samples_vec: Vec<(
-                    i64,
-                    &crate::storage_engines::sketch_db::index::SketchSampleState,
-                )> = ts
-                    .samples
-                    .iter()
-                    .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
-                    .collect();
-                if let Some((w, _)) = samples_vec.last() {
-                    latest_window_end = *w;
-                }
-                let rs = cumulative_rolling_state(&samples_vec, state.delta_kind)
-                    .map_err(SummaryExecutorError::Decode)?;
-                if let Some(rs) = rs {
-                    merged = Some(match merged.take() {
-                        None => rs,
-                        Some(mut acc) => {
-                            acc.merge_same_family(&rs)
-                                .map_err(SummaryExecutorError::Decode)?;
-                            acc
-                        }
-                    });
-                }
-            }
+/// Fold a group's whole `[t0, t1]` into one merged state and read out one
+/// scalar -- `quantile_over_time`/`count_distinct_over_time`-shaped
+/// instant queries.
+fn readout_cumulative(
+    state: &GroupState,
+    query: &SketchQuery,
+    t1_ms: i64,
+) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
+    let mut merged: Option<RollingState> = None;
+    let mut latest_window_end: Option<i64> = None;
+    for entry in &state.entries {
+        let samples_vec: Vec<(i64, &SketchSampleState)> = entry
+            .series
+            .samples
+            .iter()
+            .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
+            .collect();
+        if let Some((w, _)) = samples_vec.last() {
+            latest_window_end = Some(latest_window_end.map_or(*w, |prev| prev.max(*w)));
         }
-        let Some(merged) = merged else {
-            return Err(SummaryExecutorError::NoCandidates);
-        };
-        let value = sketch_query_value(&merged, query)?;
-        Ok(vec![(latest_window_end, value)])
-    }
-
-    /// Per-window matrix/range-query readout: reconstruct each of the
-    /// group's sids' own per-window states
-    /// (`delta_apply::per_window_rolling_states`), then merge same-window
-    /// states *across* sids before evaluating each window -- one merged
-    /// answer per window, not one merged answer for the whole range.
-    /// Windows are unioned across sids (mirrors `SummaryMerge`'s "fold
-    /// whatever's present" semantics from ASAPController#161 -- a sid
-    /// that's missing a particular window just doesn't contribute to it,
-    /// rather than the whole window being dropped).
-    fn readout_per_window(
-        &self,
-        state: &GroupState,
-        query: &SketchQuery,
-    ) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
-        let mut by_window: BTreeMap<i64, RollingState> = BTreeMap::new();
-        // `SketchStore::query_range` may splice in a carry-in Full
-        // snapshot ending BEFORE `t0_ms` so the delta-apply walk can
-        // establish a rolling base for a delta-only leading window (see
-        // `delta_apply.rs`'s module doc). That base must not surface as
-        // an output point in the requested `[t0, t1]` range -- mirrors
-        // `sketch_reducer.rs`'s `evaluate_core`'s identical filter on the
-        // legacy path.
-        let lo = self.t0_ms as i64;
-        for &sid in &state.sids {
-            for ts in self.index.query_range(sid, self.t0_ms, self.t1_ms) {
-                let samples_vec: Vec<(
-                    i64,
-                    &crate::storage_engines::sketch_db::index::SketchSampleState,
-                )> = ts
-                    .samples
-                    .iter()
-                    .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
-                    .collect();
-                let (per_window, _skipped) =
-                    per_window_rolling_states(&samples_vec, state.delta_kind)
+        let rs = cumulative_rolling_state(&samples_vec, state.delta_kind)
+            .map_err(SummaryExecutorError::Decode)?;
+        if let Some(rs) = rs {
+            merged = Some(match merged.take() {
+                None => rs,
+                Some(mut acc) => {
+                    acc.merge_same_family(&rs)
                         .map_err(SummaryExecutorError::Decode)?;
-                for (w_end, rs) in per_window {
-                    if w_end < lo {
-                        continue;
-                    }
-                    match by_window.get_mut(&w_end) {
-                        Some(acc) => acc
-                            .merge_same_family(&rs)
-                            .map_err(SummaryExecutorError::Decode)?,
-                        None => {
-                            by_window.insert(w_end, rs);
-                        }
-                    }
+                    acc
+                }
+            });
+        }
+    }
+    let Some(merged) = merged else {
+        return Err(SummaryExecutorError::NoCandidates);
+    };
+    let value = sketch_query_value(&merged, query)?;
+    Ok(vec![(latest_window_end.unwrap_or(t1_ms), value)])
+}
+
+/// Per-window matrix/range-query readout: reconstruct each of the
+/// group's sids' own per-window states, then merge same-window states
+/// *across* sids before evaluating each window -- one merged answer per
+/// window, not one merged answer for the whole range. Windows are
+/// unioned across sids: a sid that's missing a particular window just
+/// doesn't contribute to it, rather than the whole window being dropped.
+fn readout_per_window(
+    state: &GroupState,
+    query: &SketchQuery,
+    t0_ms: i64,
+) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
+    let mut by_window: BTreeMap<i64, RollingState> = BTreeMap::new();
+    for entry in &state.entries {
+        let samples_vec: Vec<(i64, &SketchSampleState)> = entry
+            .series
+            .samples
+            .iter()
+            .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
+            .collect();
+        let (per_window, _skipped) = per_window_rolling_states(&samples_vec, state.delta_kind)
+            .map_err(SummaryExecutorError::Decode)?;
+        for (w_end, rs) in per_window {
+            // `SketchStore::query_range` may splice in a carry-in Full
+            // snapshot ending before the requested range so the
+            // delta-apply walk can establish a rolling base for a
+            // delta-only leading window; that base must not surface as
+            // an output point.
+            if w_end < t0_ms {
+                continue;
+            }
+            match by_window.get_mut(&w_end) {
+                Some(acc) => acc
+                    .merge_same_family(&rs)
+                    .map_err(SummaryExecutorError::Decode)?,
+                None => {
+                    by_window.insert(w_end, rs);
                 }
             }
         }
-        if by_window.is_empty() {
-            return Err(SummaryExecutorError::NoCandidates);
-        }
-        by_window
-            .into_iter()
-            .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
-            .collect()
     }
+    if by_window.is_empty() {
+        return Err(SummaryExecutorError::NoCandidates);
+    }
+    by_window
+        .into_iter()
+        .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
+        .collect()
 }
 
 /// Read one scalar out of a merged `RollingState` for the requested
@@ -673,9 +663,8 @@ mod tests {
 
     #[test]
     fn two_sids_same_group_actually_merge_not_just_first() {
-        // The gap #409 flagged: two sids covering the SAME group must be
-        // MERGED (one combined answer), not silently duplicated /
-        // one-of-them-dropped.
+        // Two sids covering the SAME group must be MERGED into one
+        // combined answer, not silently duplicated or one-of-them-dropped.
         let idx = SketchStore::new();
         idx.register(kll_meta(1, "latency_ms", &[]));
         idx.register(kll_meta(2, "latency_ms", &[]));
@@ -725,8 +714,8 @@ mod tests {
 
     #[test]
     fn two_sids_different_groups_produce_two_series_not_one_merged_blob() {
-        // ASAPController#159: `quantile by (zone) (...)` must produce one
-        // output series per zone, not one series merging both zones.
+        // `quantile by (zone) (...)` must produce one output series per
+        // zone, not one series merging both zones together.
         let idx = SketchStore::new();
         idx.register(kll_meta(1, "latency_ms", &["zone"]));
         idx.register(kll_meta(2, "latency_ms", &["zone"]));

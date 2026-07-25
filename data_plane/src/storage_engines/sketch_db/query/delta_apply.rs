@@ -281,14 +281,9 @@ impl RollingState {
     }
 
     /// Merge `other` into `self` in place — both must be the same sketch
-    /// family (mirrors `SummaryMerge`'s `(SummaryKind, SummaryParams)`
-    /// agreement requirement one layer up, in
-    /// `asap_sketch::exec::SummaryExecutor`). The cross-sid building block
-    /// for `SummaryExecutor::merge_states`: reconstruct each candidate
-    /// sid's own `RollingState` via [`cumulative_rolling_state`], then
-    /// fold them together with this method — the same
-    /// decode/merge primitives [`cumulative_hll_state`] already used for
-    /// the HLL-only global rollup, generalized to DD/KLL too.
+    /// family. Used to combine several sids' reconstructed states
+    /// (`cumulative_rolling_state`/`per_window_rolling_states`) into one
+    /// cross-sid answer.
     pub fn merge_same_family(&mut self, other: &RollingState) -> Result<(), String> {
         match (self, other) {
             (RollingState::Dd(a), RollingState::Dd(b)) => {
@@ -319,12 +314,10 @@ impl RollingState {
 
 /// Fold every in-range window's frames for ONE series into a single
 /// merged `RollingState` (cumulative over `[t0, t1]`), returning `None`
-/// if no Full frame ever landed (every sample was a leading delta).
-/// Generalizes [`cumulative_hll_state`]'s HLL-only walk to all three
-/// `RollingState` families — the per-sid building block for
-/// `SummaryExecutor::merge_states`/`readout`, which need to reconstruct
-/// several sids' states and merge them into one before reading out a
-/// cross-sid answer (quantile/cardinality over multiple matching sids).
+/// if no Full frame ever landed (every sample was a leading delta). The
+/// per-sid building block for a cross-sid answer: reconstruct each
+/// candidate sid's state this way, then merge them (`merge_same_family`)
+/// before reading out a quantile/cardinality over the combined data.
 pub fn cumulative_rolling_state(
     samples: &[(i64, &SketchSampleState)],
     kind: DeltaSketchKind,
@@ -353,26 +346,6 @@ pub fn cumulative_rolling_state(
         }
     }
     Ok(rolling)
-}
-
-/// Fold every in-range window's frames for ONE series into a single merged
-/// `HllSketch` (cumulative over `[t0, t1]`), returning `None` if no Full
-/// HLL frame ever landed (every sample was a leading delta). This is the
-/// per-series building block for the GLOBAL `count(hll_metric)` rollup: the
-/// reducer merges the returned sketches across series (register-wise max)
-/// before estimating, so the answer is the distinct UNION cardinality, not
-/// the sum of per-series cardinalities.
-pub fn cumulative_hll_state(
-    samples: &[(i64, &SketchSampleState)],
-    precision: u32,
-) -> Result<Option<HllSketch>, String> {
-    let kind = DeltaSketchKind::Hll { precision };
-    Ok(
-        cumulative_rolling_state(samples, kind)?.and_then(|rs| match rs {
-            RollingState::Hll(sk) => Some(sk),
-            _ => None,
-        }),
-    )
 }
 
 /// Walk a sorted-by-window-end slice of samples in time order and

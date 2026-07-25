@@ -431,11 +431,10 @@ impl<'a> SketchReducer<'a> {
         t0_ms: u64,
         t1_ms: u64,
     ) -> Result<ASAPTierResult, ASAPTierError> {
-        use super::delta_apply::cumulative_hll_state;
+        use super::delta_apply::{cumulative_rolling_state, DeltaSketchKind, RollingState};
         use crate::storage_engines::sketch_db::data::SketchConfig;
-        use asap_sketchlib::HllSketch;
 
-        let mut merged: Option<HllSketch> = None;
+        let mut merged: Option<RollingState> = None;
         let mut metric_name_for_err = String::new();
         let mut cov_lo: u64 = u64::MAX;
         let mut cov_hi: u64 = 0;
@@ -478,23 +477,24 @@ impl<'a> SketchReducer<'a> {
                     cov_lo = cov_lo.min(w);
                     cov_hi = cov_hi.max(w);
                 }
-                let series_state = cumulative_hll_state(&samples_vec, precision).map_err(|e| {
-                    ASAPTierError::DeserializeFailure {
-                        sid,
-                        encoding: SketchEncoding::ProtoFull,
-                        reason: e,
-                    }
-                })?;
+                let series_state =
+                    cumulative_rolling_state(&samples_vec, DeltaSketchKind::Hll { precision })
+                        .map_err(|e| ASAPTierError::DeserializeFailure {
+                            sid,
+                            encoding: SketchEncoding::ProtoFull,
+                            reason: e,
+                        })?;
                 if let Some(sk) = series_state {
                     merged = Some(match merged.take() {
                         None => sk,
                         Some(mut acc) => {
-                            acc.merge(&sk)
-                                .map_err(|e| ASAPTierError::DeserializeFailure {
+                            acc.merge_same_family(&sk).map_err(|e| {
+                                ASAPTierError::DeserializeFailure {
                                     sid,
                                     encoding: SketchEncoding::ProtoFull,
                                     reason: format!("global HLL merge: {e}"),
-                                })?;
+                                }
+                            })?;
                             acc
                         }
                     });
@@ -508,7 +508,7 @@ impl<'a> SketchReducer<'a> {
             });
         };
         let _ = any_window;
-        let estimate = merged.estimate();
+        let estimate = merged.cardinality();
         let window_end = if cov_hi > 0 {
             cov_hi as i64
         } else {
