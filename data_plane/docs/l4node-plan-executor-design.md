@@ -2,7 +2,18 @@
 
 Planning doc, not an implementation — same spirit as
 [`sketchindex-sid-unification-plan.md`](./sketchindex-sid-unification-plan.md).
-Status: not started.
+
+> **Status (2026-07-25).** `impl SummaryExecutor for QueryExecutionContext`
+> is implemented and tested (#411, unmerged pending review) for
+> quantile/cardinality over the DDSketch/Kll/Hll families, both cumulative
+> (instant) and per-window (matrix/range) queries. Real cross-sid merging
+> is wired in for both modes. Not yet covered: the Frequency family
+> (`TopK`/`PointCount`, i.e. CMS/CountSketch — in progress) and `ExactAgg`
+> readout (`Sum`/`Rate`/`Increase`/`MinMax`/exact `Count`, which never
+> reaches `SummaryExecutor::readout` at all — see below). `execute()`
+> isn't wired into `ASAPQueryEngine::execute()`'s live serving path yet;
+> the sections below describe the target design, some of which turned out
+> to differ from what actually got built — see the inline corrections.
 
 ## Today
 
@@ -60,17 +71,32 @@ does the recursive walk and enforces the structural rules generically
 nesting depth). See `docs/l4node-execution-model.md` in ASAPController for
 the full design; this doc only covers what's specific to `data_plane`.
 
-`data_plane`'s job is one `impl SummaryExecutor for ASAPQueryEngine` (or a
-small wrapper around it):
+`data_plane`'s implementation (`summary_executor.rs`) is
+`impl SummaryExecutor for QueryExecutionContext`, a small per-query
+context — not `ASAPQueryEngine` directly, since the trait carries no
+time-range parameter and `ASAPQueryEngine` is called concurrently;
+`QueryExecutionContext` is constructed fresh per query with `t0_ms`/
+`t1_ms`/`is_cumulative` as plain fields:
 
 | `SummaryExecutor` method | `data_plane` implementation |
 |---|---|
-| `Handle` | `u64` (sid) |
-| `State` | decoded sketch bytes / `Box<dyn AggregateCore>`, per family |
-| `find_candidates(sketch, params, col, by, child)` | walk `child` to recover the metric (same shape as today's `extract_edge_facts`), then `instances_matching(metric, by)` filtered to sids whose `AccumulatorSpec` is exactly `(sketch, params)` — **not** the looser family-only `Capability::is_satisfied_by` check `data_plane` uses today; `AccumulatorSpec` (landed) is what makes the exact check possible |
-| `merge_states` | `AggregateCore::merge_with` for `ExactAgg` kinds; per-family `asap_sketchlib` merge for sketch kinds (KLL/DDSketch/CMS/HLL) — the part that's genuinely new (gap 2) |
-| `readout` | `evaluate_core`'s existing per-family decode blocks, re-homed |
-| `logical` | `Err(CapabilityMiss)` — same meaning as "no candidate bound" today, lets `EngineRouter` fail over to archive |
+| `Handle` | `SidHandle` — a sid plus its already-fetched `Rc<SketchTimeSeries>` and decode params, not a bare `u64`. `find_candidates` needs to fetch the series anyway (to read label values for the group key), so the handle carries it forward instead of `fetch_state`/`readout` re-fetching the same `(sid, t0, t1)` range a second time. |
+| `GroupKey` | `BTreeMap<String, String>` — the sid's own label values projected onto the query's `by` columns. |
+| `State` | `GroupState` — the group's accumulated `SidHandle`s plus the shared decode kind. Decode/merge is deliberately lazy: `fetch_state`/`merge_states` just assemble the candidate list; the actual `RollingState` reconstruction and merge happens in `readout`, which is where cumulative-vs-per-window mode is known. |
+| `find_candidates(sketch, params, col, by, child)` | walks `child` down to a `Scan{source: Source::TimeSeries{metric}, ..}` to recover the metric, then `instances_matching(metric, by)` filtered to sids whose `(SketchKindHandle, SketchConfig)` is exactly `(sketch, params)` — not the looser family-only `Capability::is_satisfied_by` check the legacy analyzer path uses. |
+| `merge_states` | Lazy — see `State` above. |
+| `readout` | Real cross-sid merge via `delta_apply::cumulative_rolling_state`/`per_window_rolling_states` + `RollingState::merge_same_family`, covering the DDSketch/Kll/Hll families. CMS/CountSketch (Frequency family) and `ExactAgg` are not covered — see the status note above. |
+| `logical` | `Err(SummaryExecutorError::Logical)` — same meaning as "no candidate bound" today, lets `EngineRouter` fail over to archive. |
+
+`AggregateCore::merge_with`/per-family `asap_sketchlib` merge turned out to
+be two genuinely separate things, not one shared mechanism: `ExactAgg`
+readout never reaches `SummaryExecutor::readout` at all (`asap_plan::bind`
+never wraps an `ExactAccumulator` implementation in a `SummaryEstimate`,
+so `execute()` on such a tree returns `ExecOutcome::State` at the root —
+a caller-side concern, not something this trait implementation handles),
+while the sketch-family merge (gap 2) is what's actually implemented here,
+via `RollingState::merge_same_family` rather than `asap_sketchlib` calls
+made directly in this module.
 
 Because `find_candidates` is now contractually required to return only
 exact-`(kind, params)` matches (`asap-sketch`'s trait doc), gap 3 (nothing
@@ -110,21 +136,30 @@ actually *occurs* in a three-stage (edge/gateway/backend) topology:
 
 ## Remaining open questions
 
-1. **Tree source**: does `data_plane` call `asap_plan::bind::implement_tree_in_with`
-   directly, or through a `control_plane`-side seam (matching how it already
-   depends on `control_plane::sketch_algebra::Capability` rather than
-   `asap_sketch` directly)? Leaning toward the seam.
-2. **`SummaryMerge` for sketch families**: per-family merge (KLL/DDSketch/
-   CMS/HLL) via `asap_sketchlib` is genuinely new work, not a port. Does
-   merging change a `SummaryEstimate`'s accuracy math (a merged multi-sid
-   sketch can have different error bounds than a single-sid one)? What
-   happens when `find_candidates` can't find *any* sid with exactly
-   matching params for part of a group — drop it (partial coverage) or
-   miss the whole group? No resize/downsample path exists for any sketch
-   family here.
-3. **`topk`/`rate` post-processing**: keep the raw-AST fallbacks as-is, or
-   add a `control_plane`-side pre-pass that strips `Sort{Limit{...}}`,
-   binds the inner aggregate for real, and carries rank/limit as metadata
-   alongside the `L4Node` for the executor to apply after evaluation?
-4. **Rollout**: parallel path behind an env-var gate (matching
-   `USE_TYPED_STAGE_SPLIT`), or replace `execute()`'s loop directly?
+1. **Tree source — resolved, and it's both.** `implement_promql_for_asap_tier`
+   (Step A) is the seam for planning-time tree construction, as leaned
+   toward. But `data_plane` turned out to need a *direct* `asap-sketch`
+   (and `asap-ir`) dependency too, pinned to match `control_plane`'s exactly
+   — implementing `SummaryExecutor` and matching `L4Node`/`SketchQuery`
+   variants requires importing their defining crate directly; consuming a
+   function that merely returns those types isn't enough for Rust's trait/
+   pattern-matching rules. So this isn't purely "through the seam" as
+   originally envisioned — it's the seam for tree construction, plus a
+   direct dependency for everything serving-time.
+2. **`SummaryMerge` for sketch families — partially resolved.**
+   KLL/DDSketch/HLL merge is implemented via `RollingState::merge_same_family`
+   (generalized from an existing HLL-only global-cardinality special case,
+   not built from scratch against raw `asap_sketchlib` calls). CMS/CountSketch
+   still open (Frequency family, in progress as a follow-up). Partial
+   coverage — a group missing a sid for one part — is resolved as "fold
+   whatever's present," not "miss the whole group" (mirrors
+   `SummaryMerge`'s own semantics, ASAPController#159/#161). Accuracy-math
+   and resize/downsample questions remain genuinely open, not yet
+   investigated.
+3. **`topk`/`rate` post-processing**: still open, unrelated to what's been
+   built so far — the Frequency-family follow-up doesn't address the
+   `try_topk_over_rate_fallback`/`try_rate_over_frequency_fallback` raw-AST
+   paths in `engine.rs`.
+4. **Rollout**: still open. `execute()` isn't wired into `ASAPQueryEngine`'s
+   live serving path yet at all — this question doesn't arise until that
+   wiring is attempted.
