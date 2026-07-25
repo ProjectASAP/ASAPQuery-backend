@@ -44,13 +44,15 @@ asap_types.workspace = true
 # tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
 # once one exists.
 #
-# Bumped to fc09c3a (main tip, "feat(sketch): SummaryExecutor --
-# serving-time execution model for L4Node", #155) to pick up
-# `asap_sketch::exec::{SummaryExecutor, execute}` -- the serving-time
-# counterpart to `asap_plan::bind`'s planning-time L4Node construction,
-# needed for data_plane/docs/l4node-plan-executor-design.md (Step C).
-# fc09c3a is a strict descendant of 7fcaf91 (the previous pin, "add
-# serving-time traits to WindowKind" / Phase 2 #395), so nothing this
+# Bumped to d4c1756 (main tip) to pick up `asap_sketch::exec::{SummaryExecutor,
+# execute}` (#155) -- the serving-time counterpart to `asap_plan::bind`'s
+# planning-time L4Node construction, needed for
+# data_plane/docs/l4node-plan-executor-design.md (Step C) -- plus #159/#161's
+# fix giving `SummaryExecutor::execute()` a grouping model (a query like
+# `quantile by (zone) (...)` needs one output series per zone; the
+# as-merged #155 shape would have silently merged every zone's state into
+# one blob). d4c1756 is a strict descendant of 7fcaf91 (the previous pin,
+# "add serving-time traits to WindowKind" / Phase 2 #395), so nothing this
 # repo already consumes from that revision moves.
 #
 # asap-plan owns the single authoritative AggIntent -> sketch-vs-exact
@@ -61,10 +63,10 @@ asap_types.workspace = true
 # this doesn't pull in datafusion or any front-end weight. asap-sketch is
 # asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
 # to translate Implementation into this repo's own Capability vocabulary.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
