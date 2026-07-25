@@ -63,6 +63,7 @@ use crate::storage_engines::sketch_db::query::decoders::{
     decode_cms_from_msgpack, decode_cms_from_proto, decode_cms_from_proto_delta,
     decode_cms_with_heap_from_msgpack, decode_cms_with_heap_from_msgpack_delta,
     decode_cs_from_msgpack, decode_cs_from_proto, decode_cs_from_proto_delta,
+    decode_cs_with_heap_from_msgpack, decode_cs_with_heap_from_msgpack_delta,
 };
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_evaluate, per_window_evaluate, DeltaSketchKind,
@@ -667,25 +668,66 @@ impl<'a> SketchReducer<'a> {
                     let mut summed: std::collections::HashMap<String, f64> =
                         std::collections::HashMap::new();
                     let mut any_frame = false;
+                    // Both heap-bearing kinds share a byte-identical wire
+                    // shape and `topk_heap_items()` just reads back the
+                    // agent-stored `(key, value)` pairs (no re-estimation
+                    // happens here — see the comment above), so decoding
+                    // either through `decode_cms_with_heap_from_msgpack*`
+                    // produces the same items. Still dispatch on the sid's
+                    // actual kind and decode through its own
+                    // `asap_sketchlib` type, matching the other frequency
+                    // paths, so this can't silently paper over a real
+                    // divergence if one is ever introduced here.
+                    let is_count_sketch = matches!(
+                        meta.sketch_kind()
+                            .expect("ASAP-tier reducer only handles sketch-backed sids"),
+                        SketchKindHandle::CountSketchWithHeap
+                    );
                     for state in frames {
                         // A FULL frame deserializes directly; a MSGPACK_DELTA
                         // frame is reconstructed by applying its sparse matrix
                         // delta + full heap onto an empty base (per-window-reset).
-                        let decoded = match state.encoding {
-                            SketchEncoding::MsgpackDelta => {
-                                decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                        let items: Vec<(String, f64)> = if is_count_sketch {
+                            let decoded = match state.encoding {
+                                SketchEncoding::MsgpackDelta => {
+                                    decode_cs_with_heap_from_msgpack_delta(&state.bytes)
+                                }
+                                _ => decode_cs_with_heap_from_msgpack(&state.bytes),
                             }
-                            _ => decode_cms_with_heap_from_msgpack(&state.bytes),
-                        }
-                        .map_err(|e| {
-                            ASAPTierError::DeserializeFailure {
-                                sid,
-                                encoding: state.encoding,
-                                reason: e,
+                            .map_err(|e| {
+                                ASAPTierError::DeserializeFailure {
+                                    sid,
+                                    encoding: state.encoding,
+                                    reason: e,
+                                }
+                            })?;
+                            decoded
+                                .topk_heap_items()
+                                .into_iter()
+                                .map(|item| (item.key, item.value))
+                                .collect()
+                        } else {
+                            let decoded = match state.encoding {
+                                SketchEncoding::MsgpackDelta => {
+                                    decode_cms_with_heap_from_msgpack_delta(&state.bytes)
+                                }
+                                _ => decode_cms_with_heap_from_msgpack(&state.bytes),
                             }
-                        })?;
-                        for item in decoded.topk_heap_items() {
-                            *summed.entry(item.key).or_insert(0.0) += item.value;
+                            .map_err(|e| {
+                                ASAPTierError::DeserializeFailure {
+                                    sid,
+                                    encoding: state.encoding,
+                                    reason: e,
+                                }
+                            })?;
+                            decoded
+                                .topk_heap_items()
+                                .into_iter()
+                                .map(|item| (item.key, item.value))
+                                .collect()
+                        };
+                        for (key, value) in items {
+                            *summed.entry(key).or_insert(0.0) += value;
                         }
                         any_frame = true;
                     }
@@ -1528,12 +1570,17 @@ fn decode_frequency_total(
             };
             Ok(row0_sum_cs(&cs))
         }
-        // Heap-bearing variants: decode via the CMS-with-heap envelope
-        // and read the underlying CMS matrix the same way. A FULL frame
+        // Heap-bearing variants: the bucket TOTAL is a row-0 sum of the raw
+        // matrix, which is estimator-agnostic (unlike the per-key point
+        // estimate below), but each kind is still decoded through its own
+        // `asap_sketchlib` type — `CmsWithHeap` via `CountMinSketchWithHeap`,
+        // `CountSketchWithHeap` via the distinct `CountSketchWithHeap` —
+        // so a future field added to one family's decode/matrix layout
+        // can't silently leak into the other's arm. A FULL frame
         // (MSGPACK / PROTO) deserializes directly; a MSGPACK_DELTA frame
         // (the delta-heap wire form) is reconstructed by applying the
         // sparse matrix delta + full heap onto an empty base.
-        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
+        SketchKindHandle::CmsWithHeap => {
             let heap = match state.encoding {
                 SketchEncoding::MsgpackDelta => {
                     decode_cms_with_heap_from_msgpack_delta(&state.bytes)
@@ -1542,8 +1589,18 @@ fn decode_frequency_total(
                 _ => decode_cms_with_heap_from_msgpack(&state.bytes)
                     .map_err(|e| to_err(e, state.encoding))?,
             };
-            let matrix = heap.sketch_matrix();
-            Ok(row0_sum_from_matrix(&matrix))
+            Ok(row0_sum_from_matrix(&heap.sketch_matrix()))
+        }
+        SketchKindHandle::CountSketchWithHeap => {
+            let heap = match state.encoding {
+                SketchEncoding::MsgpackDelta => {
+                    decode_cs_with_heap_from_msgpack_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?
+                }
+                _ => decode_cs_with_heap_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+            };
+            Ok(row0_sum_from_matrix(&heap.sketch_matrix()))
         }
         // Quantile / cardinality handles can't answer frequency — caller
         // should have rejected at `require_capability`. Defensive arm.
@@ -1614,7 +1671,10 @@ fn decode_frequency_estimate(
             };
             Ok(cs.estimate(key).max(0.0))
         }
-        SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
+        // CMS-with-heap: min-over-rows estimator, via `CountMinSketchWithHeap`
+        // directly — no need to rebuild a bare `CountMinSketch` wrapper, the
+        // heap type's own `estimate` already does the CMS math.
+        SketchKindHandle::CmsWithHeap => {
             let heap = match state.encoding {
                 SketchEncoding::MsgpackDelta => {
                     decode_cms_with_heap_from_msgpack_delta(&state.bytes)
@@ -1623,11 +1683,24 @@ fn decode_frequency_estimate(
                 _ => decode_cms_with_heap_from_msgpack(&state.bytes)
                     .map_err(|e| to_err(e, state.encoding))?,
             };
-            let matrix = heap.sketch_matrix();
-            let rows = matrix.len();
-            let cols = matrix.first().map(|r| r.len()).unwrap_or(0);
-            let cms = CountMinSketch::from_legacy_matrix(matrix, rows, cols);
-            Ok(cms.estimate(key).max(0.0))
+            Ok(heap.estimate(key).max(0.0))
+        }
+        // CountSketch-with-heap: median-of-signed-rows estimator, via the
+        // distinct `asap_sketchlib::CountSketchWithHeap`. Previously this
+        // arm was collapsed with `CmsWithHeap` above and always rebuilt a
+        // `CountMinSketch` (min-over-rows) regardless of family — silently
+        // wrong for any CountSketchWithHeap sid. Fixed the same way as
+        // `SummaryState::CountSketchWithHeap` in `delta_apply.rs`.
+        SketchKindHandle::CountSketchWithHeap => {
+            let heap = match state.encoding {
+                SketchEncoding::MsgpackDelta => {
+                    decode_cs_with_heap_from_msgpack_delta(&state.bytes)
+                        .map_err(|e| to_err(e, state.encoding))?
+                }
+                _ => decode_cs_with_heap_from_msgpack(&state.bytes)
+                    .map_err(|e| to_err(e, state.encoding))?,
+            };
+            Ok(heap.estimate(key).max(0.0))
         }
         other => Err(ASAPTierError::UnsupportedCapability {
             function: "frequency_estimate".to_string(),
@@ -1651,4 +1724,55 @@ fn row0_sum_from_matrix(matrix: &[Vec<f64>]) -> f64 {
         .first()
         .map(|row| row.iter().copied().sum::<f64>())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod frequency_heap_tests {
+    use super::*;
+    use asap_sketchlib::{CountMinSketchWithHeap, CountSketchWithHeap, MessagePackCodec};
+
+    /// `decode_frequency_estimate`'s heap-bearing arm used to always decode
+    /// through `CountMinSketchWithHeap` (min-over-rows) regardless of
+    /// whether the sid was actually `CmsWithHeap` or `CountSketchWithHeap`.
+    /// Built via real `update()` calls (not a hand-crafted matrix, whose
+    /// per-row sign bits `estimate()` would reinterpret unpredictably), so
+    /// each kind's own `estimate("k")` is a ground truth captured before
+    /// encoding. Proves `decode_frequency_estimate` routes each sid kind
+    /// through its own `asap_sketchlib` type and reproduces that truth —
+    /// previously the `CountSketchWithHeap` sid would have silently gone
+    /// through `CountMinSketchWithHeap::estimate` instead.
+    #[test]
+    fn decode_frequency_estimate_uses_each_kinds_own_estimator() {
+        let mut cms_heap = CountMinSketchWithHeap::new(4, 64, 10);
+        for _ in 0..50 {
+            cms_heap.update("k", 1.0);
+        }
+        let cms_truth = cms_heap.estimate("k");
+        let cms_state = SketchSampleState {
+            bytes: cms_heap.to_msgpack().expect("encode CmsWithHeap"),
+            encoding: SketchEncoding::MsgpackFull,
+        };
+        let cms_estimate =
+            decode_frequency_estimate(1, SketchKindHandle::CmsWithHeap, &cms_state, "k")
+                .expect("decode CmsWithHeap estimate");
+        assert_eq!(cms_estimate, cms_truth.max(0.0));
+
+        let mut cs_heap = CountSketchWithHeap::new(4, 64, 10);
+        for _ in 0..50 {
+            cs_heap.update("k", 1.0);
+        }
+        let cs_truth = cs_heap.estimate("k");
+        let cs_state = SketchSampleState {
+            bytes: cs_heap.to_msgpack().expect("encode CountSketchWithHeap"),
+            encoding: SketchEncoding::MsgpackFull,
+        };
+        let cs_estimate =
+            decode_frequency_estimate(2, SketchKindHandle::CountSketchWithHeap, &cs_state, "k")
+                .expect("decode CountSketchWithHeap estimate");
+        assert_eq!(
+            cs_estimate,
+            cs_truth.max(0.0),
+            "must be CountSketch's own median-of-rows estimate, not CMS's min-over-rows"
+        );
+    }
 }
