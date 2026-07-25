@@ -5,10 +5,13 @@
 use std::rc::Rc;
 use std::time::Duration;
 
+use asap_ir::intent_algebra::expr_ir::ColumnRef;
 use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use crate::intent_algebra::schema::{Column, DataType};
-use crate::intent_algebra::{AggIntent, BindingScope, LabelFilter, QueryExpr, Schema, Source, WindowKind};
+use crate::intent_algebra::{
+    AggIntent, BindingScope, LabelFilter, QueryExpr, Schema, Source, WindowKind,
+};
 use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
@@ -126,12 +129,9 @@ fn bind_kll_quantile_basic() {
     // `bind_picks_ddsketch_over_kll_when_eps_explicit` below.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model = ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::Kll);
-    let node = asap_plan::bind::implement_tree_in_with(
-        &expr,
-        &BindingScope::default(),
-        &cost_model,
-    )
-    .expect("KLL should bind a Quantile{0.99, ε=0.01}");
+    let node =
+        asap_plan::bind::implement_tree_in_with(&expr, &BindingScope::default(), &cost_model)
+            .expect("KLL should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
             query,
@@ -163,12 +163,9 @@ fn bind_ddsketch_quantile_basic() {
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
         ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::DDSketch);
-    let node = asap_plan::bind::implement_tree_in_with(
-        &expr,
-        &BindingScope::default(),
-        &cost_model,
-    )
-    .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
+    let node =
+        asap_plan::bind::implement_tree_in_with(&expr, &BindingScope::default(), &cost_model)
+            .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
             query,
@@ -176,9 +173,7 @@ fn bind_ddsketch_quantile_basic() {
         } => {
             assert!(matches!(query, SketchQuery::Quantile { q } if *q == 0.99));
             match &sketch_input.expr {
-                SummaryExpr::SummaryAgg {
-                    sketch, params, ..
-                } => {
+                SummaryExpr::SummaryAgg { sketch, params, .. } => {
                     assert_eq!(sketch, &SummaryKind::DDSketch);
                     match params {
                         SummaryParams::DDSketch { alpha } => {
@@ -246,9 +241,7 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SummaryKind, u32, u32) {
             } => {
                 assert!(matches!(query, SketchQuery::TopK { k } if *k == 10));
                 match &sketch_input.expr {
-                    SummaryExpr::SummaryAgg {
-                        sketch, params, ..
-                    } => match params {
+                    SummaryExpr::SummaryAgg { sketch, params, .. } => match params {
                         SummaryParams::CmsWithHeap { width, depth, .. } => {
                             (sketch.clone(), *width, *depth)
                         }
@@ -312,8 +305,8 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
     // Intent requests a normal (non-exact) rank so binding still
     // happens; the workload-level policy demands exact recall.
     let expr = agg_topk(10, AccuracyTarget::Epsilon(0.01));
-    let bound = bind_query_expr(&expr, AccuracyTarget::Exact)
-        .expect("bind_query_expr should not error");
+    let bound =
+        bind_query_expr(&expr, AccuracyTarget::Exact).expect("bind_query_expr should not error");
     let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
         kind,
@@ -380,9 +373,7 @@ fn bind_hll_cardinality_basic() {
             } => {
                 assert!(matches!(query, SketchQuery::Cardinality));
                 match &sketch_input.expr {
-                    SummaryExpr::SummaryAgg {
-                        sketch, params, ..
-                    } => {
+                    SummaryExpr::SummaryAgg { sketch, params, .. } => {
                         assert_eq!(sketch, &SummaryKind::Hll);
                         match params {
                             SummaryParams::Hll { precision } => {
@@ -425,7 +416,11 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg { sketch, params, .. } => {
-                assert_eq!(sketch, &SummaryKind::Sum, "Sum should bind to SummaryAgg(Sum)");
+                assert_eq!(
+                    sketch,
+                    &SummaryKind::Sum,
+                    "Sum should bind to SummaryAgg(Sum)"
+                );
                 assert_eq!(params, &SummaryParams::Sum);
             }
             other => panic!("expected bare SummaryAgg(Sum), got {other:?}"),
@@ -487,10 +482,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
                 assert!(matches!(query, SketchQuery::Quantile { .. }));
                 match &sketch_input.expr {
                     SummaryExpr::SummaryAgg { sketch, .. } => {
-                        assert!(matches!(
-                            sketch,
-                            SummaryKind::Kll | SummaryKind::DDSketch
-                        ));
+                        assert!(matches!(sketch, SummaryKind::Kll | SummaryKind::DDSketch));
                     }
                     other => panic!("expected SummaryAgg under SummaryEstimate, got {other:?}"),
                 }
@@ -879,7 +871,10 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
 // `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`.
 
 #[test]
-fn frequency_extension_declines_pending_upstream_extension_support() {
+fn frequency_extension_binds_cms() {
+    // `ControlPlaneCostModel::realize_extension`/`readout_extension`
+    // (ASAPController#150) now realize `AggIntent::Extension{"frequency"}`
+    // as a real `Cms` sketch instead of declining to `Logical`.
     let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01));
     let expr = QueryExpr::Aggregate {
         by: vec![].into(),
@@ -891,10 +886,34 @@ fn frequency_extension_declines_pending_upstream_extension_support() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+            let SummaryExpr::SummaryEstimate {
+                sketch_input,
+                query,
+            } = &node.expr
+            else {
+                panic!("expected SummaryEstimate, got {:?}", node.expr);
+            };
             assert!(
-                matches!(&node.expr, SummaryExpr::Logical(_)),
-                "Frequency (AggIntent::Extension) should decline pending ASAPController#150, got {:?}",
-                node.expr
+                matches!(
+                    &sketch_input.expr,
+                    SummaryExpr::SummaryAgg {
+                        sketch: SummaryKind::Cms,
+                        ..
+                    }
+                ),
+                "expected a Cms SummaryAgg, got {:?}",
+                sketch_input.expr
+            );
+            assert!(
+                matches!(
+                    query,
+                    SketchQuery::PointCount {
+                        key: ColumnRef::SampleValue,
+                        value: None
+                    }
+                ),
+                "no filter value threaded through yet (ASAPQuery-backend Phase 3) -- \
+                 should read out as the bare bucket total, got {query:?}",
             );
         }
         other => panic!("expected Committed(Summary(_)), got {other:?}"),

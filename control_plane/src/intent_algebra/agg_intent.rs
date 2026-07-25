@@ -57,7 +57,13 @@ pub use asap_ir::intent_algebra::{
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::types_v2::AccuracyTarget;
 
-const FREQUENCY_EXT_KIND: &str = "frequency";
+/// `ext_kind` tag for control_plane's point-frequency-via-CMS intent.
+/// `pub(crate)` (not just module-private) so
+/// `sketch_algebra::cost_model::ControlPlaneCostModel`'s
+/// `realize_extension`/`readout_extension` can match on it directly --
+/// those take `(ext_kind: &str, payload: &serde_json::Value)`, not a
+/// whole `AggIntent`, so they can't call [`as_frequency`] itself.
+pub(crate) const FREQUENCY_EXT_KIND: &str = "frequency";
 
 /// Construct control_plane's point-frequency-via-CMS intent. See module
 /// docs for why this is an `Extension`, not a shared first-class variant.

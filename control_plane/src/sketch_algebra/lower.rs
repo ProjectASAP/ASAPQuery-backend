@@ -16,13 +16,18 @@
 //! `CostModel` hook can reach, since the decision of *whether* to call
 //! into `rank_candidates`/`size_params` at all is made before the
 //! `CostModel` is ever consulted. See each helper's docs for the specific
-//! reason. Everything else — including `AggIntent::Extension` (the
-//! `Frequency` point-query) and `AggIntent::TopK { accuracy: Exact }`,
-//! both of which `implementation_for` maps to `PassThrough` — is left to
+//! reason.
+//!
+//! `AggIntent::Extension` (the `Frequency` point-query) needs no such
+//! pre-pass anymore: `ControlPlaneCostModel::realize_extension`/
+//! `readout_extension` (ASAPController#150) now realize it as a real
+//! `CountSketch`, so the catch-all arm below commits it via
+//! `implement_tree_in_with` like any other intent.
+//! `AggIntent::TopK { accuracy: Exact }` is the one remaining case left to
 //! fall through to `implement_tree_in_with`'s own `Logical` fallback
-//! unchanged: both are genuine `asap-plan` coverage gaps, not something
-//! this deployment can or should route around locally (filed upstream —
-//! see ASAPController#150, #151).
+//! unchanged — a genuine, still-open `asap-plan` coverage gap (filed
+//! upstream — see ASAPController#151), not something this deployment
+//! should route around locally.
 
 #![allow(dead_code)]
 
