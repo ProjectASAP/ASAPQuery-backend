@@ -279,6 +279,80 @@ impl RollingState {
             _ => None,
         }
     }
+
+    /// Merge `other` into `self` in place — both must be the same sketch
+    /// family (mirrors `SummaryMerge`'s `(SummaryKind, SummaryParams)`
+    /// agreement requirement one layer up, in
+    /// `asap_sketch::exec::SummaryExecutor`). The cross-sid building block
+    /// for `SummaryExecutor::merge_states`: reconstruct each candidate
+    /// sid's own `RollingState` via [`cumulative_rolling_state`], then
+    /// fold them together with this method — the same
+    /// decode/merge primitives [`cumulative_hll_state`] already used for
+    /// the HLL-only global rollup, generalized to DD/KLL too.
+    pub fn merge_same_family(&mut self, other: &RollingState) -> Result<(), String> {
+        match (self, other) {
+            (RollingState::Dd(a), RollingState::Dd(b)) => {
+                a.merge(b).map_err(|e| format!("merge DDSketch: {e}"))
+            }
+            (RollingState::Hll(a), RollingState::Hll(b)) => {
+                a.merge(b).map_err(|e| format!("merge HLL: {e}"))
+            }
+            (RollingState::Kll(a), RollingState::Kll(b)) => {
+                a.merge(b).map_err(|e| format!("merge KLL: {e}"))
+            }
+            (a, _) => Err(format!(
+                "RollingState family mismatch in merge_same_family (self is {})",
+                a.family_name()
+            )),
+        }
+    }
+
+    /// Diagnostic family name for error messages — not used for dispatch.
+    fn family_name(&self) -> &'static str {
+        match self {
+            RollingState::Dd(_) => "DDSketch",
+            RollingState::Hll(_) => "Hll",
+            RollingState::Kll(_) => "Kll",
+        }
+    }
+}
+
+/// Fold every in-range window's frames for ONE series into a single
+/// merged `RollingState` (cumulative over `[t0, t1]`), returning `None`
+/// if no Full frame ever landed (every sample was a leading delta).
+/// Generalizes [`cumulative_hll_state`]'s HLL-only walk to all three
+/// `RollingState` families — the per-sid building block for
+/// `SummaryExecutor::merge_states`/`readout`, which need to reconstruct
+/// several sids' states and merge them into one before reading out a
+/// cross-sid answer (quantile/cardinality over multiple matching sids).
+pub fn cumulative_rolling_state(
+    samples: &[(i64, &SketchSampleState)],
+    kind: DeltaSketchKind,
+) -> Result<Option<RollingState>, String> {
+    let mut rolling: Option<RollingState> = None;
+    for (_window_end, state) in samples {
+        match state.encoding {
+            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
+                let new_state = decode_full(&kind, &state.bytes, state.encoding)?;
+                rolling = Some(match rolling.take() {
+                    None => new_state,
+                    Some(mut prev) => {
+                        prev.merge_same_family(&new_state)?;
+                        prev
+                    }
+                });
+            }
+            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
+                if rolling.is_none() {
+                    rolling = Some(kind.bootstrap_empty());
+                }
+                if let Some(rs) = rolling.as_mut() {
+                    rs.apply_delta_bytes(&state.bytes, state.encoding)?;
+                }
+            }
+        }
+    }
+    Ok(rolling)
 }
 
 /// Fold every in-range window's frames for ONE series into a single merged
@@ -293,31 +367,7 @@ pub fn cumulative_hll_state(
     precision: u32,
 ) -> Result<Option<HllSketch>, String> {
     let kind = DeltaSketchKind::Hll { precision };
-    let mut rolling: Option<RollingState> = None;
-    for (_window_end, state) in samples {
-        match state.encoding {
-            SketchEncoding::ProtoFull | SketchEncoding::MsgpackFull => {
-                let new_state = decode_full(&kind, &state.bytes, state.encoding)?;
-                rolling = Some(match (rolling.take(), new_state) {
-                    (None, n) => n,
-                    (Some(RollingState::Hll(mut a)), RollingState::Hll(b)) => {
-                        a.merge(&b).map_err(|e| format!("cum merge HLL: {e}"))?;
-                        RollingState::Hll(a)
-                    }
-                    (Some(prev), _) => prev,
-                });
-            }
-            SketchEncoding::ProtoDelta | SketchEncoding::MsgpackDelta => {
-                if rolling.is_none() {
-                    rolling = Some(kind.bootstrap_empty());
-                }
-                if let Some(rs) = rolling.as_mut() {
-                    rs.apply_delta_bytes(&state.bytes, state.encoding)?;
-                }
-            }
-        }
-    }
-    Ok(rolling.and_then(|rs| match rs {
+    Ok(cumulative_rolling_state(samples, kind)?.and_then(|rs| match rs {
         RollingState::Hll(sk) => Some(sk),
         _ => None,
     }))
