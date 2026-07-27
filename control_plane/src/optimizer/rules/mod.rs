@@ -63,6 +63,24 @@ pub fn typed_sketch_algebra_enabled() -> bool {
 /// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
 pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::PhysicalExpr> {
+    bind_workload_typed_with_item_filter(w, None)
+}
+
+/// Like [`bind_workload_typed`], but for a `Frequency` statistic, `item_filter`
+/// (a `(label, value)` pair, e.g. `("item", "checkout")`) threads the
+/// query's actual per-item filter value through to the bound
+/// `SketchQuery::PointCount` -- `None` (what `bind_workload_typed` itself
+/// passes) gives the bare bucket total, same as before this parameter
+/// existed. `QueryWorkload` itself carries no `item_label` field (adding
+/// one would break its 30+ struct-literal construction sites across the
+/// crate), so callers that know a metric's item_label -- e.g.
+/// `emit::collect_metric_to_family`'s loop, which already has `entry:
+/// &WorkloadEntry` and `workload.label_filters` in scope -- pass it in
+/// directly instead.
+pub fn bind_workload_typed_with_item_filter(
+    w: &QueryWorkload,
+    item_filter: Option<(&str, &str)>,
+) -> Option<crate::sketch_algebra::PhysicalExpr> {
     use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source, WindowKind};
     use crate::sketch_algebra::capability_matching::{
@@ -187,7 +205,10 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
             col: None,
             accuracy: intent_accuracy,
         },
-        StatisticClass::Frequency => crate::intent_algebra::frequency(intent_accuracy),
+        StatisticClass::Frequency => crate::intent_algebra::frequency(
+            intent_accuracy,
+            item_filter.map(|(label, value)| (label.to_string(), value.to_string())),
+        ),
         StatisticClass::TopK => L3AggIntent::TopK {
             k: 10,
             accuracy: intent_accuracy,
@@ -643,6 +664,7 @@ mod tests {
     // | `endpoint_request_freq` | CMS          |
 
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
+    use asap_ir::intent_algebra::expr_ir::ColumnRef;
     use asap_sketch::SummaryKind;
 
     /// Walk the L4 binding output and pull out the approximate sketch
@@ -651,6 +673,22 @@ mod tests {
     /// `emit::extract_root_sketch_kind`, whose logic this mirrors).
     fn extract_family(expr: &PhysicalExpr) -> Option<SummaryKind> {
         crate::emit::extract_root_sketch_kind(expr)
+    }
+
+    /// Pull the `SketchQuery` out of a bound `PhysicalExpr`'s top-level
+    /// `SummaryEstimate` -- unlike `extract_family`, this needs the
+    /// readout itself (to check `PointCount`'s `key`/`value`), not just
+    /// the sketch family underneath it.
+    fn extract_query(expr: &PhysicalExpr) -> Option<asap_sketch::SketchQuery> {
+        let PhysicalExpr::Committed(crate::sketch_algebra::physical_expr::L4Plan::Summary(node)) =
+            expr
+        else {
+            return None;
+        };
+        match &node.expr {
+            asap_sketch::SummaryExpr::SummaryEstimate { query, .. } => Some(query.clone()),
+            _ => None,
+        }
     }
 
     /// Build a workload with the given metric name + reasonable
@@ -759,6 +797,41 @@ mod tests {
             Some(SummaryKind::Cms),
             "endpoint_request_freq should bind to Cms (Frequency)",
         );
+    }
+
+    #[test]
+    fn bind_workload_typed_with_item_filter_threads_the_actual_value() {
+        // `bind_workload_typed` itself (no item filter) must still read
+        // out as the bare bucket total -- unchanged behavior.
+        let w = workload_for("endpoint_request_freq", AggType::Frequency);
+        let bound = bind_workload_typed(&w).expect("must bind");
+        assert!(
+            matches!(
+                extract_query(&bound),
+                Some(asap_sketch::SketchQuery::PointCount {
+                    key: ColumnRef::SampleValue,
+                    value: None
+                })
+            ),
+            "no item filter given -> bare bucket total, got {:?}",
+            extract_query(&bound)
+        );
+
+        // With an item filter, the SAME workload must read out as a
+        // per-item point lookup carrying the actual value.
+        let bound_filtered =
+            bind_workload_typed_with_item_filter(&w, Some(("endpoint", "checkout")))
+                .expect("must bind");
+        match extract_query(&bound_filtered) {
+            Some(asap_sketch::SketchQuery::PointCount {
+                key: ColumnRef::Named(label),
+                value: Some(value),
+            }) => {
+                assert_eq!(label, "endpoint");
+                assert_eq!(value, "checkout");
+            }
+            other => panic!("expected PointCount{{key: Named(\"endpoint\"), value: Some(\"checkout\")}}, got {other:?}"),
+        }
     }
 
     // ── sketch_type_override (= sketch_family_override) wins ──────────────────

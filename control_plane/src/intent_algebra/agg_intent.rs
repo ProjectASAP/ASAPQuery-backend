@@ -67,17 +67,30 @@ pub(crate) const FREQUENCY_EXT_KIND: &str = "frequency";
 
 /// Construct control_plane's point-frequency-via-CMS intent. See module
 /// docs for why this is an `Extension`, not a shared first-class variant.
-pub fn frequency(accuracy: AccuracyTarget) -> AggIntent {
+///
+/// `item` is `Some((label, value))` for a per-item point lookup (e.g.
+/// `count(cms_metric{item="checkout"})` -> `("item", "checkout")`) --
+/// `sketch_algebra::cost_model::ControlPlaneCostModel::readout_extension`
+/// reads these same `item_label`/`item_value` payload keys back out to
+/// build `SketchQuery::PointCount{key: Named(label), value: Some(value)}`.
+/// `None` for a bare frequency total (no specific item), which reads out
+/// as `PointCount{key: SampleValue, value: None}`.
+pub fn frequency(accuracy: AccuracyTarget, item: Option<(String, String)>) -> AggIntent {
+    let mut payload = serde_json::json!({ "accuracy": accuracy });
+    if let Some((label, value)) = item {
+        payload["item_label"] = serde_json::Value::String(label);
+        payload["item_value"] = serde_json::Value::String(value);
+    }
     AggIntent::Extension {
         ext_kind: FREQUENCY_EXT_KIND.to_string(),
-        payload: serde_json::json!({ "accuracy": accuracy }),
+        payload,
     }
 }
 
-/// Default `Frequency` intent — `accuracy = e / 2000`. Unchanged default
-/// from before the merge.
+/// Default `Frequency` intent — `accuracy = e / 2000`, no item filter.
+/// Unchanged default from before the merge.
 pub fn default_frequency() -> AggIntent {
-    frequency(AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0))
+    frequency(AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0), None)
 }
 
 /// If `intent` is control_plane's `Frequency` extension, extract its
