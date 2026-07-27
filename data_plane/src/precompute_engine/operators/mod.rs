@@ -1,6 +1,7 @@
 pub mod count_min_sketch_accumulator;
 pub mod count_min_sketch_with_heap_accumulator;
 pub mod count_sketch_accumulator;
+pub mod count_sketch_with_heap_accumulator;
 pub mod datasketches_kll_accumulator;
 pub mod dd_sketch_accumulator;
 pub mod edge_runtime_adapter;
@@ -17,6 +18,7 @@ pub mod sum_accumulator;
 pub use count_min_sketch_accumulator::*;
 pub use count_min_sketch_with_heap_accumulator::*;
 pub use count_sketch_accumulator::*;
+pub use count_sketch_with_heap_accumulator::*;
 pub use datasketches_kll_accumulator::*;
 pub use dd_sketch_accumulator::*;
 pub use hll_sketch_accumulator::*;

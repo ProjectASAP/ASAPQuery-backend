@@ -1,7 +1,8 @@
 use crate::precompute_engine::operators::{
-    CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, DDSketchAccumulator,
-    DatasketchesKLLAccumulator, HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator,
-    MultipleIncreaseAccumulator, MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
+    CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
+    CountSketchWithHeapAccumulator, DDSketchAccumulator, DatasketchesKLLAccumulator,
+    HydraKllSketchAccumulator, IncreaseAccumulator, MinMaxAccumulator, MultipleIncreaseAccumulator,
+    MultipleMinMaxAccumulator, MultipleSumAccumulator, SumAccumulator,
 };
 use crate::storage_engines::types::{
     AggregateCore, AggregationType, KeyByLabelValues, Measurement,
@@ -675,6 +676,120 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
 }
 
 // ---------------------------------------------------------------------------
+// CountSketchAccumulatorUpdater (real median-of-signed-rows CountSketch)
+// ---------------------------------------------------------------------------
+
+/// Keyed point-frequency updater backed by a real `asap_sketchlib::CountSketch`
+/// (signed rows, median-of-rows estimator) — distinct math from
+/// `CmsAccumulatorUpdater`'s CMS (min-of-rows). Closes, on the raw-metric
+/// ingest path, the conflation bug where `SummaryKind::CountSketch` silently
+/// shared `CmsAccumulatorUpdater` with bare CMS.
+pub struct CountSketchAccumulatorUpdater {
+    acc: CountSketchAccumulator,
+    row_num: usize,
+    col_num: usize,
+}
+
+impl CountSketchAccumulatorUpdater {
+    pub fn new(row_num: usize, col_num: usize) -> Self {
+        Self {
+            acc: CountSketchAccumulator::new(row_num, col_num),
+            row_num,
+            col_num,
+        }
+    }
+}
+
+impl AccumulatorUpdater for CountSketchAccumulatorUpdater {
+    fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
+        debug_assert!(
+            false,
+            "update_single called on keyed updater; use update_keyed"
+        );
+    }
+
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+        self.acc.inner.update(&key.to_semicolon_str(), value);
+    }
+
+    impl_clone_accumulator_methods!(acc);
+
+    fn reset(&mut self) {
+        self.acc = CountSketchAccumulator::new(self.row_num, self.col_num);
+    }
+
+    fn is_keyed(&self) -> bool {
+        true
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of::<CountSketchAccumulator>()
+            + self.row_num * self.col_num * std::mem::size_of::<f64>()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CountSketchWithHeapAccumulatorUpdater (real CountSketch + top-k heap)
+// ---------------------------------------------------------------------------
+
+/// Keyed top-k updater backed by a real `CountSketchWithHeap` (signed-row
+/// CountSketch matrix PLUS a size-`heap_size` top-k heap). Distinct math from
+/// `CmsHeapAccumulatorUpdater`'s CMS-with-heap (min-of-rows); shares the same
+/// [`TopkWeight`] semantics and heap payload shape.
+pub struct CountSketchWithHeapAccumulatorUpdater {
+    acc: CountSketchWithHeapAccumulator,
+    row_num: usize,
+    col_num: usize,
+    heap_size: usize,
+    weight: TopkWeight,
+}
+
+impl CountSketchWithHeapAccumulatorUpdater {
+    pub fn new(row_num: usize, col_num: usize, heap_size: usize, weight: TopkWeight) -> Self {
+        Self {
+            acc: CountSketchWithHeapAccumulator::new(row_num, col_num, heap_size),
+            row_num,
+            col_num,
+            heap_size,
+            weight,
+        }
+    }
+}
+
+impl AccumulatorUpdater for CountSketchWithHeapAccumulatorUpdater {
+    fn update_single(&mut self, _value: f64, _timestamp_ms: i64) {
+        debug_assert!(
+            false,
+            "update_single called on keyed updater; use update_keyed"
+        );
+    }
+
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+        let weighted = match self.weight {
+            TopkWeight::Value => value,
+            TopkWeight::Count => 1.0,
+        };
+        self.acc.inner.update(&key.to_semicolon_str(), weighted);
+    }
+
+    impl_clone_accumulator_methods!(acc);
+
+    fn reset(&mut self) {
+        self.acc = CountSketchWithHeapAccumulator::new(self.row_num, self.col_num, self.heap_size);
+    }
+
+    fn is_keyed(&self) -> bool {
+        true
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        std::mem::size_of::<CountSketchWithHeapAccumulator>()
+            + self.row_num * self.col_num * std::mem::size_of::<f64>()
+            + self.heap_size * (std::mem::size_of::<asap_sketchlib::CsHeapItem>() + 32)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HydraKllAccumulatorUpdater
 // ---------------------------------------------------------------------------
 
@@ -914,31 +1029,48 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             ))
         }
 
-        // Bare CMS / bare CountSketch: pre-Step-5 quirk preserved
-        // exactly — CountSketch has no dedicated heap-less accumulator,
-        // so it shares `CmsAccumulatorUpdater` with plain CMS
-        // (point-frequency only; top-k needs the heap-bearing variant
-        // below). `keyed=false` can't actually arise here today (no
-        // `AggregationType` resolves to bare Cms/CountSketch unkeyed —
-        // see accumulator_spec.rs), matched anyway as a safe default.
-        (SummaryKind::Cms, _) | (SummaryKind::CountSketch, _) => {
+        // Bare CMS: point-frequency only, min-of-rows estimator. `keyed=false`
+        // can't actually arise here today (no `AggregationType` resolves to
+        // bare Cms unkeyed — see accumulator_spec.rs), matched anyway as a
+        // safe default.
+        (SummaryKind::Cms, _) => {
             let (row_num, col_num) = cms_dims(&spec.params);
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
 
-        // Heap-bearing top-k variants (raw-input ingest path): route to
-        // the real `CmsHeapAccumulatorUpdater` so the per-policy top-k
-        // heap is BUILT (heap-less CMS could not answer `topk(...)` —
-        // recall 0). Keyed by the configured group-by `aggregated_labels`
-        // (e.g. `host`), ranked by Σ value per key by default
-        // (`weight_mode: value`), or Σ count for genuine frequency-top-k
-        // (`weight_mode: count`). `CountSketchWithHeap` shares the wire
-        // shape (heap is the distinguishing payload), so it routes here
-        // too. The OTLP modified-sketch path builds the heap agent-side
-        // and uses `SketchEnvelope` ingest, not this raw arm.
-        (SummaryKind::CmsWithHeap, _) | (SummaryKind::CountSketchWithHeap, _) => {
+        // Bare CountSketch: real median-of-signed-rows estimator, via the
+        // dedicated `CountSketchAccumulatorUpdater` (previously conflated
+        // with `CmsAccumulatorUpdater`'s CMS min-math — see that struct's
+        // doc).
+        (SummaryKind::CountSketch, _) => {
+            let (row_num, col_num) = cms_dims(&spec.params);
+            Box::new(CountSketchAccumulatorUpdater::new(row_num, col_num))
+        }
+
+        // Heap-bearing top-k variant (raw-input ingest path): route to the
+        // real `CmsHeapAccumulatorUpdater` so the per-policy top-k heap is
+        // BUILT (heap-less CMS could not answer `topk(...)` — recall 0).
+        // Keyed by the configured group-by `aggregated_labels` (e.g. `host`),
+        // ranked by Σ value per key by default (`weight_mode: value`), or Σ
+        // count for genuine frequency-top-k (`weight_mode: count`). The OTLP
+        // modified-sketch path builds the heap agent-side and uses
+        // `SketchEnvelope` ingest, not this raw arm.
+        (SummaryKind::CmsWithHeap, _) => {
             let (row_num, col_num, heap_size) = cms_heap_dims(&spec.params);
             Box::new(CmsHeapAccumulatorUpdater::new(
+                row_num,
+                col_num,
+                heap_size,
+                topk_weight_param(config),
+            ))
+        }
+
+        // Heap-bearing top-k variant, real CountSketch math (previously
+        // conflated with `CmsHeapAccumulatorUpdater`'s CMS-with-heap — see
+        // `CountSketchWithHeapAccumulatorUpdater`'s doc).
+        (SummaryKind::CountSketchWithHeap, _) => {
+            let (row_num, col_num, heap_size) = cms_heap_dims(&spec.params);
+            Box::new(CountSketchWithHeapAccumulatorUpdater::new(
                 row_num,
                 col_num,
                 heap_size,
@@ -1275,6 +1407,23 @@ mod tests {
         items.into_iter().map(|i| (i.key, i.value)).collect()
     }
 
+    /// Same as `ranked_topk`, but for the real `CountSketchWithHeapAccumulator`
+    /// (median-of-signed-rows) built by `SummaryKind::CountSketchWithHeap` —
+    /// no longer conflated with the CMS-family accumulator above.
+    fn ranked_topk_cs(acc: &dyn AggregateCore) -> Vec<(String, f64)> {
+        let heap = acc
+            .as_any()
+            .downcast_ref::<CountSketchWithHeapAccumulator>()
+            .expect("CountSketchWithHeap config must build a CountSketchWithHeapAccumulator");
+        let mut items = heap.inner.topk_heap_items();
+        items.sort_by(|a, b| {
+            b.value
+                .partial_cmp(&a.value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        items.into_iter().map(|i| (i.key, i.value)).collect()
+    }
+
     fn host_key(h: &str) -> KeyByLabelValues {
         KeyByLabelValues::new_with_labels(vec![h.to_string()])
     }
@@ -1353,13 +1502,15 @@ mod tests {
 
     #[test]
     fn countsketch_with_heap_also_routes_to_value_weighted_heap() {
-        // CountSketchWithHeap shares the heap path — same value-weighted default.
+        // CountSketchWithHeap gets its OWN dedicated updater/accumulator
+        // (real median-of-signed-rows math) — same value-weighted default
+        // as the CMS-family heap path, but no longer conflated with it.
         let config = topk_config(AggregationType::CountSketchWithHeap, None);
         let mut updater = create_accumulator_updater(&config);
         feed_stream(&mut *updater);
         let acc = updater.take_accumulator();
-        assert_eq!(acc.type_name(), "CountMinSketchWithHeapAccumulator");
-        let ranked = ranked_topk(&*acc);
+        assert_eq!(acc.type_name(), "CountSketchWithHeapAccumulator");
+        let ranked = ranked_topk_cs(&*acc);
         assert_eq!(ranked[0].0, "host-a");
         assert_eq!(ranked[0].1, 100.0);
     }

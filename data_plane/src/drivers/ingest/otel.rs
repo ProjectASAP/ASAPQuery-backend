@@ -2153,12 +2153,20 @@ fn decode_modified_otlp_sketch_bytes(
                 // frame applies its matrix delta + heap onto a heap
                 // accumulator. Fall back to the plain CountSketch decode for
                 // heap-less msgpack frames (byte-parity path, PR I).
-                use asap_sketchlib::CountMinSketchWithHeap;
-                if let Ok(heap) = CountMinSketchWithHeap::from_msgpack(bytes) {
+                //
+                // Uses the real `CountSketchWithHeap` (median-of-signed-rows),
+                // NOT `CountMinSketchWithHeap` — the two share the same wire
+                // envelope shape (structural peek only), but decoding a real
+                // CountSketch's matrix through the CMS wrapper would silently
+                // apply CMS's min-of-rows math to CountSketch data forever
+                // after (the same conflation bug fixed on the write side in
+                // `accumulator_factory.rs`).
+                use asap_sketchlib::CountSketchWithHeap;
+                if let Ok(heap) = CountSketchWithHeap::from_msgpack(bytes) {
                     if !heap.topk_heap_items().is_empty() {
-                        use crate::precompute_engine::operators::CountMinSketchWithHeapAccumulator;
+                        use crate::precompute_engine::operators::CountSketchWithHeapAccumulator;
                         return Ok(Box::new(
-                            CountMinSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
+                            CountSketchWithHeapAccumulator::from_msgpack_with_heap_bytes(bytes)?,
                         ));
                     }
                 }
@@ -2216,7 +2224,7 @@ fn empty_accumulator_for_delta_bootstrap(
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
     use crate::precompute_engine::operators::{
-        CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
+        CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         HllSketchAccumulator,
     };
     use crate::storage_engines::sketch_db::index::SketchConfig;
@@ -2237,14 +2245,14 @@ fn empty_accumulator_for_delta_bootstrap(
         (SketchKind::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
             // A heap-bearing DELTA-HEAP frame must reconstruct onto a heap
             // accumulator (the apply path downcasts to
-            // `CountMinSketchWithHeapAccumulator`); a plain matrix delta
+            // `CountSketchWithHeapAccumulator`); a plain matrix delta
             // reconstructs onto a vanilla CountSketch. Pick the base shape
             // from the encoding so the subsequent
             // `apply_modified_otlp_delta_bytes` downcast succeeds.
             if encoding == ENCODING_MSGPACK_DELTA {
                 // heap_size 0 is fine — the DELTA-HEAP apply REPLACES the
                 // heap wholesale from the frame's full heap.
-                Some(Box::new(CountMinSketchWithHeapAccumulator::new(
+                Some(Box::new(CountSketchWithHeapAccumulator::new(
                     *rows as usize,
                     *cols as usize,
                     0,
@@ -2290,7 +2298,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
     bytes: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::precompute_engine::operators::{
-        CountMinSketchAccumulator, CountMinSketchWithHeapAccumulator, CountSketchAccumulator,
+        CountMinSketchAccumulator, CountSketchAccumulator, CountSketchWithHeapAccumulator,
         DDSketchAccumulator, HllSketchAccumulator,
     };
 
@@ -2349,13 +2357,14 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
             // window boundary, so applying the delta reconstructs the
             // window's own matrix and replaces the heap. Decoded generically
             // in `apply_msgpack_heap_delta_bytes` (rmp_serde, no
-            // `asap_sketchlib` delta API).
+            // `asap_sketchlib` delta API). Real `CountSketchWithHeapAccumulator`
+            // (median-of-signed-rows), not the CMS-family wrapper.
             let heap = existing
                 .as_any_mut()
-                .downcast_mut::<CountMinSketchWithHeapAccumulator>()
+                .downcast_mut::<CountSketchWithHeapAccumulator>()
                 .ok_or(
                     "apply_modified_otlp_delta_bytes: existing accumulator is \
-                     not a CountMinSketchWithHeapAccumulator (heap-bearing \
+                     not a CountSketchWithHeapAccumulator (heap-bearing \
                      CountSketch delta requires a heap base — the window-1 \
                      full frame must have promoted the sid)",
                 )?;

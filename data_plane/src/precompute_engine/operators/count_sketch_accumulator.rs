@@ -13,18 +13,23 @@
 //!     `asap_sketchlib::proto::sketchlib::CountSketchState`). Mirrors
 //!     the CountMin decoder in PR B.
 //!
-//! Query semantics (median-of-estimators heavy-hitter tracking,
-//! `TopKState` integration) are intentionally deferred — queries
-//! against stored CountSketch data return a placeholder error today.
-//! The wire format carries the matrix losslessly, so the merge + store
-//! round-trip works end-to-end without that richer query surface.
+//! Per-key point queries go through `query_key`/`MultipleSubpopulationAggregate`,
+//! which delegate to `asap_sketchlib::CountSketch::estimate` (the real,
+//! hash-spec-compatible median-of-signed-rows estimator) — this used to
+//! be a hand-rolled, non-compatible hash (fixed alongside the raw-metric
+//! ingest dispatch bug, see `accumulator_factory.rs`). Top-k heap
+//! tracking (a distinct capability from a bare median estimate) is a
+//! separate concern — see `count_sketch_with_heap_accumulator.rs`.
 
 use crate::storage_engines::types::{
-    AggregateCore, AggregationType, KeyByLabelValues, SerializableToSink,
+    AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
+    MultipleSubpopulationAggregate, SerializableToSink,
 };
 use asap_sketchlib::{CountSketch, CountSketchDelta, MessagePackCodec};
 use serde_json::Value;
 use std::collections::HashMap;
+
+use asap_types::Statistic;
 
 /// Count Sketch accumulator — inner matrix of signed counts.
 #[derive(Debug, Clone)]
@@ -37,6 +42,14 @@ impl CountSketchAccumulator {
         Self {
             inner: CountSketch::new(row_num, col_num),
         }
+    }
+
+    /// Median-of-signed-rows point estimate for `key`, via the real
+    /// `asap_sketchlib::CountSketch::estimate` — the canonical, hash-spec-
+    /// compatible estimator (see `AggregateCore::query_statistic`'s doc for
+    /// why this replaced a hand-rolled, non-compatible hash).
+    pub fn query_key(&self, key: &KeyByLabelValues) -> f64 {
+        self.inner.estimate(&key.to_semicolon_str())
     }
 
     /// Decode from the modified OTLP wire format's
@@ -282,28 +295,34 @@ impl AggregateCore for CountSketchAccumulator {
     fn query_statistic(
         &self,
         statistic: asap_types::Statistic,
-        _key: &Option<KeyByLabelValues>,
+        key: &Option<KeyByLabelValues>,
         query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         use asap_types::Statistic;
-        // Use median-of-row estimator for a specific key when the
-        // caller provides one in `query_kwargs["key"]`. Without a
-        // key, fall back to summing the absolute counter values
-        // (rough total-volume signal — useful for sanity checks
-        // but not a heavy-hitter answer). Hash compatibility note:
-        // this relies on the agent and backend using the
-        // sketchlib HashSpec; sketchlib-go's `portableHashSpec`
-        // is the canonical seed list, and `asap_sketchlib::CountSketch`
-        // hashes against the same spec.
+        // Key-provided path: route to MultipleSubpopulationAggregate::query
+        // (the canonical "what's the count of this key?" lookup), same
+        // pattern as CountMinSketchAccumulator. Fixed from a hand-rolled
+        // `DefaultHasher`-based estimator that did NOT use the sketchlib
+        // hash spec (its own doc admitted this — "not the sketchlib hash
+        // spec... the canonical compatibility path requires plumbing the
+        // sketchlib seeds through") — `asap_sketchlib::CountSketch::estimate`
+        // already hashes against the correct portable spec, so this is a
+        // genuine correctness fix, not just a refactor.
+        if let Some(key_val) = key.as_ref() {
+            return self.query(statistic, key_val, Some(query_kwargs));
+        }
+        if let Some(k) = query_kwargs.get("key") {
+            let key_val = KeyByLabelValues::new_with_labels(vec![k.clone()]);
+            return self.query(statistic, &key_val, Some(query_kwargs));
+        }
+        // No-key path: unchanged from before this fix -- CountSketch's
+        // signed rows have no CMS-style "min-row-sum = true total"
+        // property, so these are documented approximations, not a
+        // heavy-hitter answer. Not touched by this fix (only the
+        // key-provided path above had the hash-compatibility bug).
         match statistic {
             Statistic::Topk | Statistic::Count => {
                 let matrix = self.inner.sketch();
-                if let Some(key) = query_kwargs.get("key") {
-                    return Ok(count_sketch_query_key(matrix, key));
-                }
-                // No key → return total absolute volume across the
-                // sketch as a rough activity proxy. Better than
-                // erroring out; documented limitation.
                 let total: f64 = matrix.iter().flatten().map(|v| v.abs()).sum();
                 let rows = matrix.len() as f64;
                 Ok(if rows > 0.0 { total / rows } else { 0.0 })
@@ -323,49 +342,93 @@ impl AggregateCore for CountSketchAccumulator {
     }
 }
 
-/// Median-of-row count estimator for CountSketch. Computes one
-/// signed estimate per row at `key`'s hash position and returns
-/// the median (canonical CountSketch query).
-///
-/// Hash compatibility with the agent is via the sketchlib hash
-/// spec; the agent's `sketchlib-go::CountSketch` and the
-/// backend's `asap_sketchlib::CountSketch` must use
-/// the same seed list (sketchlib's `portableHashSpec` /
-/// `default_hash_spec`).
-fn count_sketch_query_key(matrix: &Vec<Vec<f64>>, key: &str) -> f64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    if matrix.is_empty() {
-        return 0.0;
+impl MultipleSubpopulationAggregate for CountSketchAccumulator {
+    fn query(
+        &self,
+        _statistic: Statistic,
+        key: &KeyByLabelValues,
+        _query_kwargs: Option<&HashMap<String, String>>,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.query_key(key))
     }
-    let cols = matrix[0].len();
-    if cols == 0 {
-        return 0.0;
+
+    fn clone_boxed(&self) -> Box<dyn MultipleSubpopulationAggregate> {
+        Box::new(self.clone())
     }
-    let mut estimates: Vec<f64> = Vec::with_capacity(matrix.len());
-    for (i, row) in matrix.iter().enumerate() {
-        let mut hasher = DefaultHasher::new();
-        // Salt with the row index so each row uses a distinct
-        // hash. Note: this is *not* the sketchlib hash spec — the
-        // canonical compatibility path requires plumbing the
-        // sketchlib seeds through to the backend (tracked as a
-        // follow-up; the wire format already carries the seed
-        // list, but the accumulator drops it on decode today).
-        i.hash(&mut hasher);
-        key.hash(&mut hasher);
-        let h = hasher.finish() as usize;
-        let col = h % cols;
-        // Sign hash: +1 / -1 alternating by a second hash bit.
-        let sign = if (h >> 32) & 1 == 0 { 1.0 } else { -1.0 };
-        estimates.push(sign * row[col]);
+}
+
+impl MergeableAccumulator<CountSketchAccumulator> for CountSketchAccumulator {
+    fn merge_accumulators(
+        accumulators: Vec<CountSketchAccumulator>,
+    ) -> Result<CountSketchAccumulator, Box<dyn std::error::Error + Send + Sync>> {
+        if accumulators.is_empty() {
+            return Err("No accumulators to merge".into());
+        }
+        let mut iter = accumulators.into_iter();
+        let mut merged = iter.next().unwrap();
+        for acc in iter {
+            merged.inner.merge(&acc.inner)?;
+        }
+        Ok(merged)
     }
-    estimates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    estimates[estimates.len() / 2]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_query_key_uses_real_sketchlib_estimator() {
+        // Regression: query_key/MultipleSubpopulationAggregate used to go
+        // through a hand-rolled DefaultHasher-based estimator that did NOT
+        // use the sketchlib hash spec (its own doc admitted this). Fixed
+        // to delegate to `asap_sketchlib::CountSketch::estimate` directly
+        // -- prove `query_key` and `.inner.estimate(..)` now agree exactly.
+        let mut cs = CountSketchAccumulator::new(4, 1000);
+        let key = KeyByLabelValues::new_with_labels(vec!["web".to_string()]);
+        cs.inner.update(&key.to_semicolon_str(), 10.0);
+        assert_eq!(
+            cs.query_key(&key),
+            cs.inner.estimate(&key.to_semicolon_str())
+        );
+    }
+
+    #[test]
+    fn test_multiple_subpopulation_aggregate_query() {
+        let mut cs = CountSketchAccumulator::new(4, 1000);
+        let key = KeyByLabelValues::new_with_labels(vec!["checkout".to_string()]);
+        cs.inner.update(&key.to_semicolon_str(), 25.0);
+
+        let multi_trait: &dyn MultipleSubpopulationAggregate = &cs;
+        let result = multi_trait.query(Statistic::Sum, &key, None).unwrap();
+        assert_eq!(result, cs.query_key(&key));
+
+        // query_statistic (the AggregateCore entry point) must route a
+        // provided key through the same path.
+        let core: &dyn AggregateCore = &cs;
+        let via_core = core
+            .query_statistic(Statistic::Sum, &Some(key.clone()), &HashMap::new())
+            .unwrap();
+        assert_eq!(via_core, cs.query_key(&key));
+    }
+
+    #[test]
+    fn test_mergeable_accumulator_merge_accumulators() {
+        let cs1 = CountSketchAccumulator {
+            inner: CountSketch::from_legacy_matrix(vec![vec![1.0, -2.0], vec![3.0, -4.0]], 2, 2),
+        };
+        let cs2 = CountSketchAccumulator {
+            inner: CountSketch::from_legacy_matrix(vec![vec![-1.0, 2.0], vec![-3.0, 4.0]], 2, 2),
+        };
+        let merged = CountSketchAccumulator::merge_accumulators(vec![cs1, cs2]).unwrap();
+        assert_eq!(merged.inner.sketch(), &vec![vec![0.0, 0.0], vec![0.0, 0.0]]);
+    }
+
+    #[test]
+    fn test_mergeable_accumulator_rejects_empty() {
+        let result = CountSketchAccumulator::merge_accumulators(vec![]);
+        assert!(result.is_err());
+    }
 
     fn encode_state(
         rows: u32,
