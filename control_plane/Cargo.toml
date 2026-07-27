@@ -62,18 +62,16 @@ asap_types.workspace = true
 # asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
 # to translate Implementation into this repo's own Capability vocabulary.
 #
-# Bumped to e4cea66 (branch `feat/extension-realization-hook`,
-# ASAPController#162, NOT YET MERGED) to pick up
+# Bumped to 64df20d (main tip, "feat(plan): pluggable AggIntent::Extension
+# realization + readout hook", #162) to pick up
 # `CostModel::{realize_extension, readout_extension}` -- the pluggable
 # `AggIntent::Extension` hook this repo's `Extension{"frequency"}` intent
-# needs (ASAPController#150). Re-pin to the merged main-tip commit once
-# #162 lands; this is a temporary pre-merge pin, same pattern as the
-# fc09c3a -> d4c1756 bump in `data_plane/Cargo.toml` before ASAPController#161
-# merged.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
+# needs (ASAPController#150). 64df20d is a strict descendant of d4c1756
+# (the previous pin), so nothing this repo already consumes moves.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
