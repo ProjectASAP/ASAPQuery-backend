@@ -353,16 +353,6 @@ dependencies = [
 [[package]]
 name = "asap-ir"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=d4c175633f6ce46b801ca2115c00fa757d5b6240#d4c175633f6ce46b801ca2115c00fa757d5b6240"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "asap-ir"
-version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPController?rev=fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4#fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4"
 dependencies = [
  "serde",
@@ -406,14 +396,6 @@ version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPController?rev=64df20d90c3ddd519c726dea45c05e1fe5225ce6#64df20d90c3ddd519c726dea45c05e1fe5225ce6"
 dependencies = [
  "asap-ir 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=64df20d90c3ddd519c726dea45c05e1fe5225ce6)",
-]
-
-[[package]]
-name = "asap-sketch"
-version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=d4c175633f6ce46b801ca2115c00fa757d5b6240#d4c175633f6ce46b801ca2115c00fa757d5b6240"
-dependencies = [
- "asap-ir 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=d4c175633f6ce46b801ca2115c00fa757d5b6240)",
 ]
 
 [[package]]
@@ -1025,9 +1007,9 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow",
- "asap-ir 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=d4c175633f6ce46b801ca2115c00fa757d5b6240)",
+ "asap-ir 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=64df20d90c3ddd519c726dea45c05e1fe5225ce6)",
  "asap-precompute-rs",
- "asap-sketch 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=d4c175633f6ce46b801ca2115c00fa757d5b6240)",
+ "asap-sketch 0.1.0 (git+https://github.com/ProjectASAP/ASAPController?rev=64df20d90c3ddd519c726dea45c05e1fe5225ce6)",
  "asap_otel_proto",
  "asap_sketchlib",
  "asap_types",

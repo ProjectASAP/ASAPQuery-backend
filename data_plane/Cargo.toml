@@ -24,12 +24,17 @@ control_plane = { path = "../control_plane" }
 # `crates/asap_types/Cargo.toml`'s existing pin comment: two revs of the
 # same git dependency in one workspace resolve to two distinct Rust
 # types that won't unify.
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+#
+# Bumped to 64df20d (main tip, ASAPController#162, merged -- matches
+# control_plane's own pin) to pick up
+# `SketchQuery::PointCount.value: Option<String>`, needed for the
+# named-key PointCount readout.
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 # `asap_sketch::L4Node`'s own fields (`SummaryExpr::Logical(Box<QueryExpr>)`,
 # `SummaryAgg { col: ColumnRef, by: Vec<ColumnId>, .. }`) are `asap-ir`
 # types, not re-exported by `asap-sketch` -- `find_candidates` needs to
 # walk/match them directly. Same pin-must-match rule as `asap-sketch` above.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "d4c175633f6ce46b801ca2115c00fa757d5b6240" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 
 # Shared external (workspace)
 serde.workspace = true
