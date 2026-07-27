@@ -23,10 +23,11 @@
 //! yet — they're gated on rules that haven't landed. Adding them is
 //! purely additive.
 //!
-//! Wire-up state. The typed path is opt-in via the
-//! `USE_TYPED_SKETCH_ALGEBRA` env var consulted by `planner::rules`;
-//! existing call sites continue to use the legacy untyped binding path.
-//! Phase E (stage_split) is the natural migration point.
+//! Wire-up state. `bind_query_expr` runs unconditionally from `main.rs`
+//! — there is no env-gate on this L3→L4 binding step itself. The one env
+//! var in this area, `USE_TYPED_STAGE_SPLIT`
+//! (`physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT`), gates the
+//! *downstream* L4→L5 stage-split step, not this module.
 
 #![allow(dead_code, unused_imports)]
 

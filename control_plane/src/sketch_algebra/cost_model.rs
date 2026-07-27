@@ -26,11 +26,12 @@
 //!
 //! - `AggIntent::TopK { accuracy: AccuracyTarget::Exact, .. }` — routes to
 //!   `exact_realization`, which has no accumulator form for `TopK` and
-//!   returns `PassThrough`, even though control_plane's own
-//!   `BindCountSketchOnTopK` still binds this shape (Tight recall tier →
-//!   `CountSketchWithHeap`). Still intercepted in `lower.rs` *before*
-//!   `implement_tree_in_with` runs — see that module's `bind_recursive`
-//!   for the pre-pass (ASAPController#151, still open).
+//!   returns `PassThrough`, so `implement_tree_in_with` falls through to
+//!   its own `Logical` fallback for this shape unchanged. There is no
+//!   local pre-pass binding it: the `BindCountSketchOnTopK` rule that
+//!   once did was deleted (see `lower.rs`'s module doc) — this is a
+//!   genuine, still-open `asap-plan` coverage gap (ASAPController#151),
+//!   not something this deployment routes around locally.
 
 #![allow(dead_code)]
 

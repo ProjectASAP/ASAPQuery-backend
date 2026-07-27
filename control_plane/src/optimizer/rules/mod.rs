@@ -5,29 +5,6 @@ use crate::types::*;
 
 pub const DEFAULT_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// Env-var that opts the planner into the typed L4 binding path
-/// (`sketch_algebra::bind_query_expr`). Additive — when unset, the
-/// existing untyped `algebra::directory::sketch_type_for_agg` path runs
-/// unchanged. Phase E (stage_split refactor) is the natural migration
-/// point at which the typed path becomes the only path.
-///
-/// Set `USE_TYPED_SKETCH_ALGEBRA=1` to opt in.
-#[allow(dead_code)]
-pub const ENV_USE_TYPED_SKETCH_ALGEBRA: &str = "USE_TYPED_SKETCH_ALGEBRA";
-
-/// Whether the typed L4 binding path is enabled for this process.
-/// Reads the env var once per call (cheap; called per `plan()` invocation
-/// at most). Phase C is additive — both code paths produce the same
-/// `CollectionPlan` shape; the typed path is a *parallel* binding that
-/// the planner can compare against the legacy path during development.
-#[allow(dead_code)]
-pub fn typed_sketch_algebra_enabled() -> bool {
-    matches!(
-        std::env::var(ENV_USE_TYPED_SKETCH_ALGEBRA).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
-}
-
 /// Bind a `QueryWorkload` into the typed L4 [`crate::sketch_algebra::PhysicalExpr`]
 /// IR, when callers want to inspect the typed binding alongside the
 /// legacy `CollectionPlan` output.
