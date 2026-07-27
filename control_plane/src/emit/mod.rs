@@ -392,8 +392,22 @@ pub fn collect_metric_to_family(
         // samples fan into each per-family pipeline at the agent and the
         // backend serves every (metric, capability) the workload needs.
         for (_, workload, _wc) in workload_store.get_all_for_metric(&entry.metric_name) {
-            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed(&workload)
-            else {
+            // If this metric declares an `item_label` (its inner
+            // high-cardinality dimension, e.g. "endpoint") and the
+            // parsed query's own label filters name a value for it (e.g.
+            // `{endpoint="checkout"}`), thread that through as the
+            // `Frequency` intent's actual per-item filter -- see
+            // `bind_workload_typed_with_item_filter`'s doc.
+            let item_filter = entry.item_label.as_deref().and_then(|label| {
+                workload
+                    .label_filters
+                    .get(label)
+                    .map(|v| (label, v.as_str()))
+            });
+            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed_with_item_filter(
+                &workload,
+                item_filter,
+            ) else {
                 continue;
             };
             if let Some(kind) = extract_root_sketch_kind(&physical_expr) {

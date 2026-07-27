@@ -897,7 +897,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01));
+        let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -906,10 +906,13 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_delta_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::EpsilonDelta {
-            epsilon: 0.01,
-            delta: 0.001,
-        });
+        let intent = crate::intent_algebra::frequency(
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.01,
+                delta: 0.001,
+            },
+            None,
+        );
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -920,7 +923,7 @@ mod tests {
     fn frequency_estimate_with_exact_returns_none() {
         // Exact aggregation routes to archive (sketch fallback only
         // meaningful when raw counters aren't kept).
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Exact);
+        let intent = crate::intent_algebra::frequency(AccuracyTarget::Exact, None);
         assert_eq!(capability_for(&intent), None);
     }
 

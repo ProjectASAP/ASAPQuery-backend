@@ -860,7 +860,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
 // ── Deliberate behavior changes (ASAPController#150 / #151) ──────────────────
 //
 // `AggIntent::Extension` (this deployment's `Frequency` point-query,
-// built via `crate::intent_algebra::frequency(accuracy)`) now binds to a
+// built via `crate::intent_algebra::frequency(accuracy, item)`) now binds to a
 // real `Cms` sketch via `ControlPlaneCostModel::realize_extension`/
 // `readout_extension` (ASAPController#150) — see `frequency_extension_binds_cms`
 // below and `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_binds_cms`.
@@ -876,7 +876,7 @@ fn frequency_extension_binds_cms() {
     // `ControlPlaneCostModel::realize_extension`/`readout_extension`
     // (ASAPController#150) now realize `AggIntent::Extension{"frequency"}`
     // as a real `Cms` sketch instead of declining to `Logical`.
-    let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01));
+    let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
     let expr = QueryExpr::Aggregate {
         by: vec![].into(),
         aggs: vec![intent],
