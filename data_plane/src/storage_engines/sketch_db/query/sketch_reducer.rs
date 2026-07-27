@@ -368,7 +368,11 @@ impl<'a> SketchReducer<'a> {
     /// `is_cumulative` is the only genuinely function-name-derived
     /// signal (per-window vs `*_over_time` rollup), so the engine — which
     /// knows the original outer function — passes it explicitly. The
-    /// string [`Self::evaluate`] entry is retained for legacy callers.
+    /// string [`Self::evaluate`] entry has no production callers today —
+    /// `engine.rs` calls this typed entry exclusively — but is kept
+    /// because the query-path test suite (`tests.rs`) still exercises it
+    /// via PromQL function-name strings; it's a live test fixture, not
+    /// dead code.
     ///
     /// Returns `UnsupportedCapability` for `Capability::ExactAgg(_)`
     /// (served by the exact-agg dispatch path, not the sketch reducer)
@@ -746,10 +750,15 @@ impl<'a> SketchReducer<'a> {
                     if w_end_u64 > cov_hi {
                         cov_hi = w_end_u64;
                     }
-                    // Sort descending by summed count, take top-k.
+                    // Sort descending by summed count, take top-k. Tie-break
+                    // on key so equal counts don't depend on `summed`'s
+                    // HashMap iteration order (non-deterministic across runs).
                     let mut items: Vec<(String, f64)> = summed.into_iter().collect();
-                    items
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    items.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
                     for (key, value) in items.into_iter().take(k) {
                         let mut lv = ts.series_label_values.clone();
                         lv.insert("item".to_string(), key);
