@@ -860,15 +860,16 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
 // ── Deliberate behavior changes (ASAPController#150 / #151) ──────────────────
 //
 // `AggIntent::Extension` (this deployment's `Frequency` point-query,
-// built via `crate::intent_algebra::frequency(accuracy)`) and
-// `AggIntent::TopK { accuracy: Exact }` both now decline to bind
+// built via `crate::intent_algebra::frequency(accuracy)`) now binds to a
+// real `Cms` sketch via `ControlPlaneCostModel::realize_extension`/
+// `readout_extension` (ASAPController#150) — see `frequency_extension_binds_cms`
+// below and `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_binds_cms`.
+// `AggIntent::TopK { accuracy: Exact }` still declines to bind
 // (`SummaryExpr::Logical`) rather than sketch — a REAL, accepted
-// behavior change introduced by this migration (core's
-// `boundary::implementation_for` maps every `Extension` to
-// `PassThrough` unconditionally, and `TopK{Exact}`'s `exact_realization`
-// has no accumulator form for it either — see `lower.rs`'s module docs
-// and `cost_model.rs`'s module docs). Mirrors the pattern already used in
-// `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`.
+// behavior change from this migration that remains open
+// (`TopK{Exact}`'s `exact_realization` has no accumulator form for it —
+// see `lower.rs`'s module docs and `cost_model.rs`'s module docs,
+// ASAPController#151, still open).
 
 #[test]
 fn frequency_extension_binds_cms() {
