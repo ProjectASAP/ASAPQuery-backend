@@ -363,7 +363,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     let Some(series) = series.into_iter().next() else {
                         continue;
                     };
-                    let group_key = project_group_key(&by_names, &series.series_label_values);
+                    let group_key = sketch_group_key(&by_names, &series.series_label_values);
                     out.push((
                         group_key,
                         SidHandle::Sketch {
@@ -761,12 +761,15 @@ fn exact_agg_kind_match(
 }
 
 /// Project a full label-values map down to the requested `by` columns --
-/// shared by the `Sketch`/`ExactAgg` branches of `find_candidates` (both
-/// build a group key the same way from whatever label map their own
-/// range-query returns). Missing keys become empty strings so a sid
-/// registered with a subset of the requested keys still groups
-/// deterministically (mirrors `sketch_reducer.rs::evaluate_exact_agg`'s
-/// same projection).
+/// used by the `ExactAgg` branch of `find_candidates`. Missing keys
+/// become empty strings so a sid registered with a subset of the
+/// requested keys still groups deterministically (mirrors
+/// `sketch_reducer.rs::evaluate_exact_agg`'s identical projection,
+/// including its `by=[]` behavior: Sum/Increase are additive PromQL
+/// aggregation operators, so an empty `by` legitimately means "reduce
+/// fully" -- every matching sid collapses to ONE group and gets summed
+/// together, which is the correct `sum(metric)`/`increase(metric[r])`
+/// answer, not a bug to route around).
 fn project_group_key(
     by_names: &[String],
     label_values: &BTreeMap<String, String>,
@@ -775,6 +778,47 @@ fn project_group_key(
         .iter()
         .map(|k| (k.clone(), label_values.get(k).cloned().unwrap_or_default()))
         .collect()
+}
+
+/// Group-key construction for the `Sketch` branch of `find_candidates`.
+///
+/// Deliberately NOT the same as `project_group_key` above -- confirmed by
+/// directly inspecting the `L4Node` tree for `quantile_over_time(0.99,
+/// http_latency_ms[10s])` (a bare per-series range function, no PromQL
+/// `by(...)` or label selector referencing "service" at all): the L3/L4
+/// schema derivation has genuinely NO KNOWLEDGE of the "service" column,
+/// since planning happens with "no reference to what's actually stored
+/// anywhere" (this crate's own L4 design doc) -- `by` ends up `[]` not as
+/// a deliberate "reduce everything" choice, but because there was nothing
+/// in the query text to resolve a column against. Naively projecting onto
+/// an empty `by` (what `project_group_key` does) would collapse every
+/// matching sid's group key to the SAME empty map `{}` -- which doesn't
+/// just lose labels, it makes `execute()`'s own `by_group: BTreeMap<GroupKey,
+/// Vec<Handle>>` fold MULTIPLE DISTINCT series into ONE merged answer
+/// whenever more than one sid/series matches. Confirmed via a real e2e
+/// shadow-mode run: the legacy `sketch_reducer.rs::evaluate_core` path
+/// never has this problem because it doesn't project through `by` at all
+/// for this family -- it passes each series' own `series_label_values`
+/// straight through (`ts.series_label_values`, unconditionally), so
+/// distinct series always stay distinct rows.
+///
+/// So: when `by_names` is empty, use the sid's own FULL label map
+/// (matching `evaluate_core`'s behavior exactly -- keep every series
+/// distinct); when non-empty, an explicit grouping WAS resolvable from
+/// the query (e.g. `quantile by (zone) (...)`), so project onto it as
+/// requested, same as `project_group_key`. `ExactAgg`'s `by=[]` keeps its
+/// OWN, opposite-looking-but-independently-correct meaning ("reduce
+/// fully") -- see `project_group_key`'s doc for why that's not the same
+/// question.
+fn sketch_group_key(
+    by_names: &[String],
+    label_values: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if by_names.is_empty() {
+        label_values.clone()
+    } else {
+        project_group_key(by_names, label_values)
+    }
 }
 
 /// `SketchConfig` (data_plane's per-sid stored params) -> `DeltaSketchKind`
@@ -1388,6 +1432,89 @@ mod tests {
         assert!(
             (70.0..=80.0).contains(&west_median),
             "us-west median {west_median} should reflect only sid 2's data (~75)"
+        );
+    }
+
+    #[test]
+    fn bare_per_series_query_keeps_distinct_series_separate_even_with_no_by() {
+        // The exact bug `sketch_group_key` fixes, confirmed against a real
+        // e2e shadow-mode run for `quantile_over_time(m[r])` (a bare
+        // per-series range function -- no PromQL `by(...)`, no label
+        // selector, so the L4Node's `by` is empty because the query text
+        // gives it nothing to resolve, NOT because the user asked to merge
+        // everything). Two sids with DIFFERENT real labels ("zone") but an
+        // UNGROUPED query (`by: vec![]`, mirroring `kll_agg_node`'s
+        // no-grouping call shape) must still produce TWO separate output
+        // series -- naively projecting onto an empty `by` would collapse
+        // both sids' group keys to the SAME `{}` and silently merge two
+        // unrelated distributions into one wrong answer.
+        let idx = SketchStore::new();
+        idx.register(kll_meta(1, "latency_ms", &["zone"]));
+        idx.register(kll_meta(2, "latency_ms", &["zone"]));
+        let items1: Vec<f64> = (1..=50).map(|i| i as f64).collect();
+        let items2: Vec<f64> = (51..=100).map(|i| i as f64).collect();
+        let mut labels_east = BTreeMap::new();
+        labels_east.insert("zone".to_string(), "us-east".to_string());
+        let mut labels_west = BTreeMap::new();
+        labels_west.insert("zone".to_string(), "us-west".to_string());
+        idx.append_sample(
+            1,
+            labels_east,
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items1),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            labels_west,
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &items2),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+
+        // No `by` requested at all -- mirrors `quantile_over_time(0.99,
+        // latency_ms[r])` with no `by(...)`/label selector.
+        let child = scan_node("latency_ms", Some("zone"));
+        let tree = estimate_node(
+            kll_agg_node(child, vec![]),
+            SketchQuery::Quantile { q: 0.5 },
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(mut v) = execute(&tree, &exec).expect("execute should succeed")
+        else {
+            panic!("expected a value");
+        };
+        assert_eq!(
+            v.len(),
+            2,
+            "two distinct series must stay separate even with no explicit `by` -- \
+             got {v:?}"
+        );
+        v.sort_by(|a, b| a.0.get("zone").cmp(&b.0.get("zone")));
+        let (east_group, east_value) = &v[0];
+        let (west_group, west_value) = &v[1];
+        assert_eq!(east_group.get("zone").map(String::as_str), Some("us-east"));
+        assert_eq!(west_group.get("zone").map(String::as_str), Some("us-west"));
+        let SummaryValue::Points(east_samples, _coverage) = east_value else {
+            panic!("expected Points, got {east_value:?}");
+        };
+        let SummaryValue::Points(west_samples, _coverage) = west_value else {
+            panic!("expected Points, got {west_value:?}");
+        };
+        assert!(
+            (20.0..=30.0).contains(&east_samples[0].1),
+            "us-east median {} should reflect only sid 1's data (~25), not a merge with sid 2",
+            east_samples[0].1
+        );
+        assert!(
+            (70.0..=80.0).contains(&west_samples[0].1),
+            "us-west median {} should reflect only sid 2's data (~75), not a merge with sid 1",
+            west_samples[0].1
         );
     }
 

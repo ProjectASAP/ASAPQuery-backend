@@ -160,17 +160,19 @@ fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64, u64)>) {
 /// and log via `tracing` -- `warn!` on a real discrepancy, `debug!` on a
 /// clean match. Never returns anything the caller could act on.
 ///
-/// KNOWN, understood noise source (confirmed against a real e2e query
-/// during development, not theoretical): for a bare per-series range
-/// function with no PromQL `by(...)` (e.g. `quantile_over_time(m[r])`,
-/// as opposed to a true grouping aggregate like `quantile(0.9, sum by
-/// (job)(m))`), the legacy path preserves the underlying series' full
-/// label set, while the new path's `find_candidates` projects onto the
-/// query's `by` columns -- empty here -- collapsing to `{}`. This is a
-/// group-KEY-shape gap, not a value-computation bug (the values agree);
-/// `single_ungrouped_series` below detects exactly this one-row-both-sides
-/// shape and logs it distinctly so it doesn't drown out real mismatches
-/// in the noise, without pretending it's already resolved.
+/// `single_ungrouped_series` below used to be the primary explanation for
+/// a real, confirmed gap: a bare per-series range function with no PromQL
+/// `by(...)` (e.g. `quantile_over_time(m[r])`) got an empty `{}` group key
+/// from `find_candidates`, losing (and for multiple matching series,
+/// silently MERGING) the underlying sid's own labels. That's now fixed at
+/// the root in `find_candidates`/`sketch_group_key` (see its doc), which
+/// falls back to the sid's own full label map instead of projecting onto
+/// an empty `by`. This function's group-set check stays as a defensive
+/// classifier for whatever OTHER shape might still produce a genuine
+/// one-row-both-sides mismatch (e.g. a true global-merge aggregate like
+/// `count(hll_metric)`, which isn't modeled by `summary_executor.rs` at
+/// all yet) -- if it fires now, treat it as a real, unclassified
+/// discrepancy worth investigating, not the old known gap.
 fn diff_and_log(
     query: &str,
     old: &ASAPTierResult,
@@ -184,11 +186,14 @@ fn diff_and_log(
 
     if old_by_group.keys().collect::<Vec<_>>() != new_by_group.keys().collect::<Vec<_>>() {
         if single_ungrouped_series(old, new_series) {
-            tracing::debug!(
+            tracing::warn!(
                 query,
                 old_group = ?old.series[0].0,
-                "shadow: known gap -- new path's empty by() group key doesn't carry the \
-                 series' own labels for a bare per-series range function (values not compared)"
+                "shadow mismatch: one row on each side but new path's group key is empty -- \
+                 the known per-series-range-function gap was fixed in find_candidates/ \
+                 sketch_group_key, so this shape firing now means an UNCLASSIFIED gap \
+                 (e.g. a true global-merge aggregate not yet modeled by summary_executor.rs), \
+                 not the old known one"
             );
             return;
         }
@@ -236,11 +241,12 @@ fn diff_and_log(
 }
 
 /// Detects the specific "one row on each side, new path's key is `{}`"
-/// shape -- see `diff_and_log`'s doc for why this is a known group-key
-/// gap, not a real mismatch, when it happens to hold. Deliberately does
-/// NOT compare values here: if the group keys differ, comparing the
-/// vectors would be comparing two potentially-unrelated series by
-/// coincidence of list position, not by any real correspondence.
+/// shape -- see `diff_and_log`'s doc: this used to classify a known,
+/// now-fixed gap; it's kept as a distinct classifier for whatever else
+/// might still produce this shape, not because it's expected to fire.
+/// Deliberately does NOT compare values here: if the group keys differ,
+/// comparing the vectors would be comparing two potentially-unrelated
+/// series by coincidence of list position, not by any real correspondence.
 fn single_ungrouped_series(old: &ASAPTierResult, new_series: &SeriesRows) -> bool {
     old.series.len() == 1 && new_series.len() == 1 && new_series[0].0.is_empty()
 }
