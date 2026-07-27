@@ -3038,9 +3038,10 @@ fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
         SketchQuery::Cardinality => json!({
             "op": "cardinality",
         }),
-        SketchQuery::PointCount { key } => json!({
+        SketchQuery::PointCount { key, value } => json!({
             "op": "point_count",
             "key": column_ref_to_wire_key(key),
+            "value": value,
         }),
         SketchQuery::TopK { k } => json!({
             "op": "topk",
@@ -3613,6 +3614,7 @@ mod tests {
                     aggregation_id: "agg1".into(),
                     op: SketchQuery::PointCount {
                         key: ColumnRef::Named("user_42".into()),
+                        value: None,
                     },
                 },
             ],
@@ -3700,6 +3702,7 @@ mod tests {
                     SummaryKind::CountSketch => SketchQuery::TopK { k: 10 },
                     SummaryKind::Cms => SketchQuery::PointCount {
                         key: ColumnRef::Named("user_42".into()),
+                        value: None,
                     },
                     other => unreachable!(
                         "backend_cfg_with_kind: unsupported test fixture kind {other:?}"

@@ -61,10 +61,17 @@ asap_types.workspace = true
 # this doesn't pull in datafusion or any front-end weight. asap-sketch is
 # asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
 # to translate Implementation into this repo's own Capability vocabulary.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "fc09c3aa0b0cf0297ee415d1ed49f7cdc0cc55e4" }
+#
+# Bumped to 64df20d (main tip, "feat(plan): pluggable AggIntent::Extension
+# realization + readout hook", #162) to pick up
+# `CostModel::{realize_extension, readout_extension}` -- the pluggable
+# `AggIntent::Extension` hook this repo's `Extension{"frequency"}` intent
+# needs (ASAPController#150). 64df20d is a strict descendant of d4c1756
+# (the previous pin), so nothing this repo already consumes moves.
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

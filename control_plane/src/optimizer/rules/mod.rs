@@ -259,12 +259,13 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     // `sketch_algebra::capability_matching` module docs for the gap note.
     //
     // `StatisticClass::Frequency` (the `endpoint_request_freq` contract
-    // row) is `AggIntent::Extension`-shaped — `asap_plan::boundary::implementation_for`
-    // maps every `Extension` to `PassThrough` unconditionally (a core-vs-
-    // deployment-specific-shape gap, filed as ASAPController#150), so this
-    // now returns `None` for that one contract row until the upstream gap
-    // closes; the caller already falls back to the legacy `plan()` output
-    // in that case.
+    // row) is `AggIntent::Extension`-shaped. This used to always decline
+    // (return `None`) here, because `asap_plan::boundary::implementation_for`
+    // mapped every `Extension` to `PassThrough` unconditionally (a core-
+    // vs-deployment-specific-shape gap, ASAPController#150). Now that
+    // `ForcedFamilyCostModel::realize_extension`/`readout_extension`
+    // delegate to `ControlPlaneCostModel`'s own `"frequency"` handling,
+    // this contract row commits like any other.
     let forced = match kind {
         SummaryKind::CountSketch => SummaryKind::CountSketchWithHeap,
         SummaryKind::Cms if statistic == StatisticClass::TopK => SummaryKind::CmsWithHeap,
@@ -278,12 +279,13 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
     )
     .ok()?;
     // `implement_tree_in_with` never *errors* on "nothing bound" — an
-    // intent `boundary::implementation_for` can't realize (e.g. the
-    // `Extension`/Frequency PassThrough case above) still returns
-    // `Ok(Rc<L4Node>)`, just wrapping the input as `SummaryExpr::Logical`
-    // unchanged. `bind_workload_typed`'s own contract is `None` for
-    // "typed path doesn't support this shape yet" — translate the two
-    // by checking whether anything actually got committed.
+    // intent `boundary::implementation_for`/`CostModel::realize_extension`
+    // can't realize (e.g. `TopK { accuracy: Exact }`, ASAPController#151,
+    // still open) still returns `Ok(Rc<L4Node>)`, just wrapping the input
+    // as `SummaryExpr::Logical` unchanged. `bind_workload_typed`'s own
+    // contract is `None` for "typed path doesn't support this shape yet"
+    // — translate the two by checking whether anything actually got
+    // committed.
     if matches!(node.expr, asap_sketch::SummaryExpr::Logical(_)) {
         return None;
     }
@@ -505,18 +507,19 @@ mod tests {
 
         // `CountMinSketch` re-derives statistic to `Frequency`, which is
         // `AggIntent::Extension`-shaped (this deployment's point-frequency
-        // query) — `asap_plan::boundary::implementation_for` maps every
-        // `Extension` to `PassThrough` unconditionally, regardless of
-        // which `CostModel` is plugged in (ASAPController#150), so this
-        // override can no longer bind at all pending the upstream gap
-        // closing. Same accepted regression as the plain
-        // `endpoint_request_freq` contract row (see
-        // `typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`).
+        // query). `ControlPlaneCostModel::realize_extension`/
+        // `readout_extension` (ASAPController#150) now realize it as
+        // `SummaryKind::Cms` — matching `capability_matching::pick_family`'s
+        // own `Frequency -> Cms` mapping — so this override binds like any
+        // other now.
         let mut w = workload(vec![AggType::Quantile]);
         w.sketch_type_override = Some(SketchType::CountMinSketch);
-        assert!(
-            bind_workload_typed(&w).is_none(),
-            "CountMinSketch override should decline pending ASAPController#150",
+        let pe = bind_workload_typed(&w)
+            .unwrap_or_else(|| panic!("CountMinSketch override should bind (ASAPController#150)"));
+        assert_eq!(
+            extract_root_sketch_kind(&pe),
+            Some(SummaryKind::Cms),
+            "CountMinSketch override should pin Cms (Frequency's family), not decline",
         );
     }
 
@@ -740,22 +743,21 @@ mod tests {
     }
 
     #[test]
-    fn typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support() {
-        // Contract used to be: `endpoint_request_freq` → CMS (Frequency).
-        // `Frequency` is `AggIntent::Extension`-shaped;
-        // `asap_plan::boundary::implementation_for` maps every `Extension`
-        // to `PassThrough` unconditionally (core has no realization
-        // opinion for a deployment-specific shape it doesn't know — see
-        // ASAPController#150). Step B of the plan-shaped-serving
-        // migration adopted `implement_tree_in_with` here without a local
-        // Frequency-binding workaround, so this contract row now declines
-        // the typed path (falls back to the legacy `plan()` output) until
-        // #150 lands an extension point.
+    fn typed_binding_endpoint_request_freq_binds_cms() {
+        // Contract: `endpoint_request_freq` → CMS (Frequency). `Frequency`
+        // is `AggIntent::Extension`-shaped; this used to decline the typed
+        // path entirely (`asap_plan::boundary::implementation_for` mapped
+        // every `Extension` to `PassThrough` unconditionally — core has no
+        // realization opinion for a deployment-specific shape it doesn't
+        // know, ASAPController#150). Now that
+        // `ControlPlaneCostModel::realize_extension`/`readout_extension`
+        // handle `"frequency"`, this contract row binds like any other.
         let w = workload_for("endpoint_request_freq", AggType::Frequency);
-        let bound = bind_workload_typed(&w);
-        assert!(
-            bound.is_none(),
-            "endpoint_request_freq should decline pending ASAPController#150; got {bound:?}",
+        let bound = bind_workload_typed(&w).expect("endpoint_request_freq must bind");
+        assert_eq!(
+            extract_family(&bound),
+            Some(SummaryKind::Cms),
+            "endpoint_request_freq should bind to Cms (Frequency)",
         );
     }
 
@@ -867,9 +869,14 @@ mod tests {
                 AggType::Frequency,
                 Some(SummaryKind::CountSketchWithHeap),
             ),
-            // `Extension`/Frequency PassThrough gap — ASAPController#150,
-            // see `typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`.
-            ("endpoint_request_freq", AggType::Frequency, None),
+            // `Extension`/Frequency now binds via `ControlPlaneCostModel`'s
+            // `realize_extension` (ASAPController#150) — see
+            // `typed_binding_endpoint_request_freq_binds_cms`.
+            (
+                "endpoint_request_freq",
+                AggType::Frequency,
+                Some(SummaryKind::Cms),
+            ),
         ];
         for (metric, agg, expected) in cases {
             let w = workload_for(metric, agg);

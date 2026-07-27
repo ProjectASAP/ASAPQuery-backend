@@ -1024,10 +1024,13 @@ mod runtime_tests {
                 Some(BTreeSet::from([SummaryKind::CountSketchWithHeap])),
             ),
             // `CountMinSketch` override re-derives statistic to
-            // `Frequency`, `AggIntent::Extension`-shaped — declines to
-            // bind pending ASAPController#150 (see
-            // `optimizer::rules::tests::typed_binding_endpoint_request_freq_declines_pending_upstream_extension_support`).
-            ("endpoint_request_freq", None),
+            // `Frequency`, `AggIntent::Extension`-shaped — now binds via
+            // `ControlPlaneCostModel::realize_extension` (ASAPController#150,
+            // see `optimizer::rules::tests::typed_binding_endpoint_request_freq_binds_cms`).
+            (
+                "endpoint_request_freq",
+                Some(BTreeSet::from([SummaryKind::Cms])),
+            ),
         ];
         for (metric, want) in &expected {
             let got = map.get(*metric).cloned();
@@ -1037,12 +1040,12 @@ mod runtime_tests {
                  full map: {map:?}",
             );
         }
-        // Routing table covers the 4 sketched metrics (endpoint_request_freq
-        // and http_requests_total both decline — see above).
+        // Routing table covers the 5 sketched metrics (only
+        // http_requests_total declines, as raw passthrough).
         assert_eq!(
             map.len(),
-            4,
-            "routing table should have 4 entries (4 sketches; raw + Extension both decline), got: {map:?}"
+            5,
+            "routing table should have 5 entries (5 sketches; only raw passthrough declines), got: {map:?}"
         );
     }
 
@@ -1225,7 +1228,11 @@ mod runtime_tests {
         store.set(
             METRIC,
             AggRole::Other,
-            mk(AggType::Frequency, Some(SketchType::CountSketch), Vec::new()),
+            mk(
+                AggType::Frequency,
+                Some(SketchType::CountSketch),
+                Vec::new(),
+            ),
             WorkloadCharacteristics::default(),
         );
 

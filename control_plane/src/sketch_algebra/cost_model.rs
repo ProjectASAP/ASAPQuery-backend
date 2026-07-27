@@ -13,29 +13,33 @@
 //! walk itself (schema derivation, `col`/`by` computation, DAG
 //! construction) can be `asap_plan::bind`'s rather than a forked copy.
 //!
-//! Two shapes `implement_tree_in_with` cannot realize even with this
-//! `CostModel` plugged in, because the decision of *whether* to call into
-//! `rank_candidates`/`size_params` at all is made upstream, before the
-//! `CostModel` is ever consulted:
+//! `AggIntent::Extension` (control_plane's `Frequency` point-query) used
+//! to be one of two shapes `implement_tree_in_with` couldn't realize even
+//! with this `CostModel` plugged in — `boundary::implementation_for_with`
+//! now consults [`ControlPlaneCostModel::realize_extension`]/
+//! [`readout_extension`](CostModel::readout_extension) for it instead of
+//! hardcoding `PassThrough` (ASAPController#150).
 //!
-//! - `AggIntent::Extension` (control_plane's `Frequency` point-query) —
-//!   `boundary::implementation_for` maps every `Extension` to
-//!   `PassThrough` unconditionally, by design (core has no realization
-//!   opinion for a deployment-specific shape it doesn't know).
+//! One shape remains genuinely unreachable via this `CostModel`, because
+//! the decision of *whether* to call into `rank_candidates`/`size_params`
+//! at all is made upstream, before the `CostModel` is ever consulted:
+//!
 //! - `AggIntent::TopK { accuracy: AccuracyTarget::Exact, .. }` — routes to
 //!   `exact_realization`, which has no accumulator form for `TopK` and
-//!   also returns `PassThrough`, even though control_plane's own
+//!   returns `PassThrough`, even though control_plane's own
 //!   `BindCountSketchOnTopK` still binds this shape (Tight recall tier →
-//!   `CountSketchWithHeap`).
-//!
-//! Both are intercepted in `lower.rs` *before* `implement_tree_in_with`
-//! runs — see that module's `bind_recursive` for the pre-pass.
+//!   `CountSketchWithHeap`). Still intercepted in `lower.rs` *before*
+//!   `implement_tree_in_with` runs — see that module's `bind_recursive`
+//!   for the pre-pass (ASAPController#151, still open).
 
 #![allow(dead_code)]
 
+use asap_ir::intent_algebra::expr_ir::ColumnRef;
+use asap_plan::boundary::Implementation;
 use asap_plan::CostModel;
-use asap_sketch::{SummaryKind, SummaryParams};
+use asap_sketch::{SketchQuery, SummaryKind, SummaryParams};
 
+use crate::intent_algebra::agg_intent::FREQUENCY_EXT_KIND;
 use crate::intent_algebra::AggIntent;
 use crate::optimizer::cost::wire::WireCostTable;
 use crate::types_v2::AccuracyTarget;
@@ -64,17 +68,19 @@ impl ControlPlaneCostModel {
         match (&self.workload_accuracy, intent_accuracy) {
             (AccuracyTarget::Exact, _) | (_, AccuracyTarget::Exact) => None,
             (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => Some((a.min(*b), 0.01)),
+            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { epsilon, delta })
+            | (AccuracyTarget::EpsilonDelta { epsilon, delta }, AccuracyTarget::Epsilon(a)) => {
+                Some((a.min(*epsilon), *delta))
+            }
             (
-                AccuracyTarget::Epsilon(a),
-                AccuracyTarget::EpsilonDelta { epsilon, delta },
-            )
-            | (
-                AccuracyTarget::EpsilonDelta { epsilon, delta },
-                AccuracyTarget::Epsilon(a),
-            ) => Some((a.min(*epsilon), *delta)),
-            (
-                AccuracyTarget::EpsilonDelta { epsilon: a, delta: da },
-                AccuracyTarget::EpsilonDelta { epsilon: b, delta: db },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: a,
+                    delta: da,
+                },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: b,
+                    delta: db,
+                },
             ) => Some((a.min(*b), da.min(*db))),
         }
     }
@@ -95,17 +101,19 @@ impl ControlPlaneCostModel {
                 AccuracyTarget::Exact => (0.01, 0.01),
             },
             (AccuracyTarget::Epsilon(a), AccuracyTarget::Epsilon(b)) => (a.min(*b), 0.01),
+            (AccuracyTarget::Epsilon(a), AccuracyTarget::EpsilonDelta { epsilon, delta })
+            | (AccuracyTarget::EpsilonDelta { epsilon, delta }, AccuracyTarget::Epsilon(a)) => {
+                (a.min(*epsilon), *delta)
+            }
             (
-                AccuracyTarget::Epsilon(a),
-                AccuracyTarget::EpsilonDelta { epsilon, delta },
-            )
-            | (
-                AccuracyTarget::EpsilonDelta { epsilon, delta },
-                AccuracyTarget::Epsilon(a),
-            ) => (a.min(*epsilon), *delta),
-            (
-                AccuracyTarget::EpsilonDelta { epsilon: a, delta: da },
-                AccuracyTarget::EpsilonDelta { epsilon: b, delta: db },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: a,
+                    delta: da,
+                },
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: b,
+                    delta: db,
+                },
             ) => (a.min(*b), da.min(*db)),
         }
     }
@@ -237,6 +245,79 @@ impl CostModel for ControlPlaneCostModel {
             }
         }
     }
+
+    /// Realize control_plane's `Frequency` (`ext_kind: "frequency"`)
+    /// point-query intent (ASAPController#150). `SummaryKind::Cms` (heap-
+    /// less — a point lookup needs no heap, unlike `TopK`) matches
+    /// `capability_matching::pick_family`'s own `Frequency → Cms` mapping
+    /// (and its `is_valid_pair` truth table, which declares `(Cms,
+    /// Frequency)` valid and has no `(CountSketch, Frequency)` entry) —
+    /// the newer, tested, currently-authoritative source of truth for this
+    /// choice, not the older `sketch_catalog::sketch_type_for_op`'s
+    /// `SketchType::CountSketch` (a genuinely different sketch algorithm
+    /// under a same-ish name — `SketchType` has separate `CountSketch`
+    /// and `CountMinSketch` variants; that mapping predates
+    /// `capability_matching` and disagrees with it). Sized the same
+    /// `e/eps` width / `ln(1/delta)` depth way every other CMS-family kind
+    /// here is. `PassThrough` for any other `ext_kind` (none exist yet)
+    /// or an unparseable/`Exact` accuracy, matching every other
+    /// approximate-capable intent's `Exact ⇒ no sketch form` policy.
+    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
+        if ext_kind != FREQUENCY_EXT_KIND {
+            return Implementation::PassThrough;
+        }
+        let Some(accuracy) = payload
+            .get("accuracy")
+            .and_then(|v| serde_json::from_value::<AccuracyTarget>(v.clone()).ok())
+        else {
+            return Implementation::PassThrough;
+        };
+        let Some((eps, delta)) = self.combined_eps_delta(&accuracy) else {
+            return Implementation::PassThrough;
+        };
+        let (width, depth) = Self::cms_width_depth(eps, delta);
+        Implementation::Sketch {
+            kind: SummaryKind::Cms,
+            params: SummaryParams::Cms {
+                width: width.next_power_of_two(),
+                depth,
+            },
+        }
+    }
+
+    /// Build the `SketchQuery` readout for `Frequency`. `item_label`/
+    /// `item_value` are populated by `intent_algebra::agg_intent::frequency`
+    /// once the filter value is threaded through (ASAPQuery-backend Phase
+    /// 3 — not yet); until then `payload` never has them, so this
+    /// correctly falls back to the bare bucket total
+    /// (`key: SampleValue, value: None`) — the same answer a `Frequency`
+    /// intent with no item filter should give either way.
+    fn readout_extension(
+        &self,
+        ext_kind: &str,
+        payload: &serde_json::Value,
+        _col: &ColumnRef,
+    ) -> SketchQuery {
+        debug_assert_eq!(
+            ext_kind, FREQUENCY_EXT_KIND,
+            "readout_extension called for an ext_kind realize_extension never realizes as Sketch"
+        );
+        let item_label = payload.get("item_label").and_then(|v| v.as_str());
+        let item_value = payload
+            .get("item_value")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        match item_label {
+            Some(label) => SketchQuery::PointCount {
+                key: ColumnRef::Named(label.to_string()),
+                value: item_value,
+            },
+            None => SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+                value: None,
+            },
+        }
+    }
 }
 
 /// A `CostModel` that forces a single family for whichever intent it's
@@ -260,7 +341,11 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
-    fn rank_candidates(&self, _intent: &AggIntent, _candidates: &[SummaryKind]) -> Vec<SummaryKind> {
+    fn rank_candidates(
+        &self,
+        _intent: &AggIntent,
+        _candidates: &[SummaryKind],
+    ) -> Vec<SummaryKind> {
         vec![self.forced.clone()]
     }
 
@@ -272,6 +357,25 @@ impl CostModel for ForcedFamilyCostModel {
         delta: f64,
     ) -> SummaryParams {
         self.inner.size_params(kind, intent, eps, delta)
+    }
+
+    // `realize_extension`/`readout_extension` delegate to `inner` rather
+    // than falling back to the trait's default `PassThrough` — otherwise
+    // `bind_workload_typed`'s `Frequency` contract row (which binds via
+    // `ForcedFamilyCostModel`, already knowing its family pick from the
+    // capability matrix) would still decline pending #150 even after
+    // `ControlPlaneCostModel` itself learned to realize it.
+    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
+        self.inner.realize_extension(ext_kind, payload)
+    }
+
+    fn readout_extension(
+        &self,
+        ext_kind: &str,
+        payload: &serde_json::Value,
+        col: &ColumnRef,
+    ) -> SketchQuery {
+        self.inner.readout_extension(ext_kind, payload, col)
     }
 }
 
@@ -325,7 +429,10 @@ mod tests {
     #[test]
     fn quantile_always_prefers_ddsketch_over_kll() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.1));
-        let ranked = model.rank_candidates(&default_quantile(0.99), &[SummaryKind::Kll, SummaryKind::DDSketch]);
+        let ranked = model.rank_candidates(
+            &default_quantile(0.99),
+            &[SummaryKind::Kll, SummaryKind::DDSketch],
+        );
         assert_eq!(ranked, vec![SummaryKind::DDSketch, SummaryKind::Kll]);
     }
 
@@ -359,7 +466,10 @@ mod tests {
             k: 5,
             accuracy: eps(0.01),
         };
-        let ranked = model.rank_candidates(&intent, &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap]);
+        let ranked = model.rank_candidates(
+            &intent,
+            &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap],
+        );
         assert_eq!(ranked, vec![SummaryKind::CountSketchWithHeap]);
     }
 
@@ -370,7 +480,10 @@ mod tests {
             k: 5,
             accuracy: eps(0.01),
         };
-        let ranked = model.rank_candidates(&intent, &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap]);
+        let ranked = model.rank_candidates(
+            &intent,
+            &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap],
+        );
         assert_eq!(ranked[0], SummaryKind::CmsWithHeap);
     }
 
@@ -382,7 +495,10 @@ mod tests {
             accuracy: eps(0.01),
         };
         let params = model.size_params(SummaryKind::CmsWithHeap, &intent, 0.0, 0.0);
-        let SummaryParams::CmsWithHeap { width, heap_size, .. } = params else {
+        let SummaryParams::CmsWithHeap {
+            width, heap_size, ..
+        } = params
+        else {
             panic!("expected CmsWithHeap params");
         };
         assert!(width.is_power_of_two());
