@@ -896,6 +896,14 @@ impl ASAPQueryEngine {
             )
         })?;
 
+        // Shadow-mode comparison against the new SummaryExecutor path —
+        // see `data_plane/docs/l4node-plan-executor-design.md`'s
+        // "Rollout" section. No-op unless `ASAP_SHADOW_SUMMARY_EXECUTOR`
+        // is set; never affects `result`/the response below.
+        crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
+            idx, query, start_ms, end_ms, false, &result,
+        );
+
         // Matrix shape — the range_query wire format requires it.
         let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
 
@@ -1883,15 +1891,24 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // adapter's `format_success_response` rejects with
                 // a 500 ”shape mismatch” / empty-body response.
                 let _ = any_range_candidate;
+                let stitch_t0 = if combined_t0 == u64::MAX {
+                    now_ms.saturating_sub(DEFAULT_LOOKBACK_MS)
+                } else {
+                    combined_t0
+                };
+                // Shadow-mode comparison against the new SummaryExecutor
+                // path — see
+                // `data_plane/docs/l4node-plan-executor-design.md`'s
+                // "Rollout" section. No-op unless
+                // `ASAP_SHADOW_SUMMARY_EXECUTOR` is set; never affects
+                // `result`/the response below.
+                crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
+                    idx, query, stitch_t0, now_ms, true, &result,
+                );
                 let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
                 {
-                    let stitch_t0 = if combined_t0 == u64::MAX {
-                        now_ms.saturating_sub(DEFAULT_LOOKBACK_MS)
-                    } else {
-                        combined_t0
-                    };
                     if cov_lo > stitch_t0 || cov_hi < now_ms {
                         let archive_qr = archive.execute(query).await;
                         if let Ok(archive_qr) = archive_qr {
