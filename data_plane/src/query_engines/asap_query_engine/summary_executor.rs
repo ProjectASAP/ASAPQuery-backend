@@ -15,15 +15,20 @@
 //! same-window/same-range states *across* sids before reading out one
 //! answer per group (or per group per window).
 //!
+//! `Self::Value` (`SummaryValue`) carries two shapes: `Points` (one
+//! scalar per timestamp — everything but `TopK`) and `TopK` (one ranked
+//! `(item, count)` list per timestamp). Both cumulative and per-window
+//! readout merge cross-sid the same way regardless of which shape the
+//! query needs — top-k merge reuses `SummaryState::topk_items` plus the
+//! same `merge_same_family` pipeline (`asap_sketchlib`'s heap `merge`
+//! already re-reconciles the heap against the merged matrix), no separate
+//! merge logic.
+//!
 //! Not covered, and reported as an explicit `Unsupported` error rather
 //! than silently mishandled:
-//! - `SketchQuery::TopK`. Its answer is fundamentally shaped differently
-//!   from everything else this executor reads out — K `(item, count)`
-//!   pairs per timestamp, not one scalar — so it doesn't fit
-//!   `Self::Value = Vec<(i64, f64)>`. Forcing it into that shape (e.g.
-//!   returning only the top item) would silently drop data rather than
-//!   error; that needs a `Value` type redesign, a separate decision from
-//!   this executor's rollout.
+//! - `SketchQuery::TopK` against a heap-less family (`Dd`/`Hll`/`Kll`/
+//!   `Cms`/`CountSketch`) — a family limitation (no item universe to
+//!   rank), not an unimplemented-query limitation; see `topk_ranked`.
 //! - `SketchQuery::PointCount` with a *named* item key (a point lookup
 //!   for one specific item, e.g. `count(cms_metric{item="x"})`). The
 //!   *value* to look up isn't carried by `SketchQuery` or available in
@@ -121,10 +126,21 @@ pub enum SummaryExecutorError {
     Unsupported(&'static str),
 }
 
+/// A query answer: one scalar per point (`Points` — everything but
+/// `TopK`), or one ranked `(item, count)` list per point (`TopK` only).
+/// Which variant a query produces is determined entirely by the
+/// `SketchQuery` issued (`TopK` vs everything else); callers match on
+/// their own query to know which variant to expect.
+#[derive(Debug, Clone)]
+pub enum SummaryValue {
+    Points(Vec<(i64, f64)>),
+    TopK(Vec<(i64, Vec<(String, f64)>)>),
+}
+
 impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
     type Handle = SidHandle;
     type State = GroupState;
-    type Value = Vec<(i64, f64)>;
+    type Value = SummaryValue;
     type Error = SummaryExecutorError;
     type GroupKey = BTreeMap<String, String>;
 
@@ -247,7 +263,7 @@ fn readout_cumulative(
     state: &GroupState,
     query: &SketchQuery,
     t1_ms: i64,
-) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
+) -> Result<SummaryValue, SummaryExecutorError> {
     let mut merged: Option<SummaryState> = None;
     let mut latest_window_end: Option<i64> = None;
     for entry in &state.entries {
@@ -276,8 +292,15 @@ fn readout_cumulative(
     let Some(merged) = merged else {
         return Err(SummaryExecutorError::NoCandidates);
     };
-    let value = sketch_query_value(&merged, query)?;
-    Ok(vec![(latest_window_end.unwrap_or(t1_ms), value)])
+    let w_end = latest_window_end.unwrap_or(t1_ms);
+    if let SketchQuery::TopK { k } = query {
+        Ok(SummaryValue::TopK(vec![(w_end, topk_ranked(&merged, *k)?)]))
+    } else {
+        Ok(SummaryValue::Points(vec![(
+            w_end,
+            sketch_query_value(&merged, query)?,
+        )]))
+    }
 }
 
 /// Per-window matrix/range-query readout: reconstruct each of the
@@ -290,7 +313,7 @@ fn readout_per_window(
     state: &GroupState,
     query: &SketchQuery,
     t0_ms: i64,
-) -> Result<Vec<(i64, f64)>, SummaryExecutorError> {
+) -> Result<SummaryValue, SummaryExecutorError> {
     let mut by_window: BTreeMap<i64, SummaryState> = BTreeMap::new();
     for entry in &state.entries {
         let samples_vec: Vec<(i64, &SketchSampleState)> = entry
@@ -323,10 +346,19 @@ fn readout_per_window(
     if by_window.is_empty() {
         return Err(SummaryExecutorError::NoCandidates);
     }
-    by_window
-        .into_iter()
-        .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
-        .collect()
+    if let SketchQuery::TopK { k } = query {
+        let points = by_window
+            .into_iter()
+            .map(|(w_end, rs)| topk_ranked(&rs, *k).map(|items| (w_end, items)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SummaryValue::TopK(points))
+    } else {
+        let points = by_window
+            .into_iter()
+            .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SummaryValue::Points(points))
+    }
 }
 
 /// Read one scalar out of a merged `SummaryState` for the requested
@@ -346,11 +378,37 @@ fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, Sum
         SketchQuery::PointCount { .. } => Err(SummaryExecutorError::Unsupported(
             "PointCount for a named item key needs a filter value this trait doesn't carry",
         )),
+        // Both readout callers branch on `TopK` before ever calling this
+        // function (see `readout_cumulative`/`readout_per_window`), so
+        // this arm is unreachable in practice; kept for match
+        // exhaustiveness (`SketchQuery` has no `#[non_exhaustive]`) and to
+        // fail loudly rather than panic if that invariant is ever broken.
         SketchQuery::TopK { .. } => Err(SummaryExecutorError::Unsupported(
-            "TopK's answer shape (K items per timestamp) doesn't fit this executor's \
-             Value = Vec<(i64, f64)> -- needs a Value type redesign",
+            "TopK must be read out via topk_ranked, not sketch_query_value",
         )),
     }
+}
+
+/// Rank a merged `SummaryState`'s top-k heap items descending by value and
+/// cap at the requested `k`. The sort is load-bearing, not defensive
+/// polish: `SummaryState::topk_items` reads back a bounded min-heap's
+/// backing array as-is (`HHHeap::heap()`, asap_sketchlib) -- it does NOT
+/// actually guarantee order despite its own doc wording. Errors for a
+/// heap-less family (`Dd`/`Hll`/`Kll`/`Cms`/`CountSketch` -- no item
+/// universe to rank), not for an empty heap (a heap-bearing family that
+/// simply never received any updates yields `Ok(vec![])`, not an error).
+fn topk_ranked(rs: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, SummaryExecutorError> {
+    let mut items = rs.topk_items().ok_or(SummaryExecutorError::Unsupported(
+        "TopK requires a heap-bearing family (CmsWithHeap/CountSketchWithHeap) -- \
+         this state's family carries no item universe to rank",
+    ))?;
+    items.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0)) // deterministic tie-break for equal counts
+    });
+    items.truncate(k);
+    Ok(items)
 }
 
 /// Exact `(SummaryKind, SummaryParams)` match against a sid's own
@@ -735,6 +793,63 @@ mod tests {
         })
     }
 
+    fn cms_with_heap_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
+        let cfg = SketchConfig::CountMin { rows: 4, cols: 256 };
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
+                kind: SketchKindHandle::CmsWithHeap,
+                config: cfg.clone(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: Some(AccuracyBound::from_config(&cfg)),
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    /// Encode a `CmsWithHeap` msgpack frame with one `update` per
+    /// `(key, weight)` pair.
+    fn encode_cms_with_heap_items(
+        rows: usize,
+        cols: usize,
+        heap_size: usize,
+        items: &[(&str, f64)],
+    ) -> Vec<u8> {
+        use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
+        let mut sk = CountMinSketchWithHeap::new(rows, cols, heap_size);
+        for (key, weight) in items {
+            sk.update(key, *weight);
+        }
+        sk.to_msgpack()
+            .expect("encode CountMinSketchWithHeap msgpack")
+    }
+
+    fn cms_with_heap_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
+        Rc::new(L4Node {
+            expr: SummaryExpr::SummaryAgg {
+                child,
+                sketch: SummaryKind::CmsWithHeap,
+                params: SummaryParams::CmsWithHeap {
+                    width: 256,
+                    depth: 4,
+                    heap_size: 10,
+                },
+                col: ColumnRef::SampleValue,
+                by: vec![],
+            },
+            schema: L4Schema {
+                fields: vec![],
+                time_index: None,
+            },
+        })
+    }
+
     const T0: u64 = 1_000_000;
     const T1: u64 = 2_000_000;
 
@@ -783,7 +898,10 @@ mod tests {
             panic!("expected a value");
         };
         assert_eq!(v.len(), 1, "ungrouped query produces exactly one group");
-        let (_group, samples) = &v[0];
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
         let (_ts, median) = samples[0];
         // Median of 1..=100 is ~50.
         assert!(
@@ -834,7 +952,10 @@ mod tests {
             panic!("expected a value");
         };
         assert_eq!(v.len(), 1);
-        let (_group, samples) = &v[0];
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
         let (_ts, median) = samples[0];
         assert!(
             (40.0..=60.0).contains(&median),
@@ -893,10 +1014,16 @@ mod tests {
             "two zones must produce two output series, not one merged blob"
         );
         v.sort_by(|a, b| a.0.get("zone").cmp(&b.0.get("zone")));
-        let (east_group, east_samples) = &v[0];
-        let (west_group, west_samples) = &v[1];
+        let (east_group, east_value) = &v[0];
+        let (west_group, west_value) = &v[1];
         assert_eq!(east_group.get("zone").map(String::as_str), Some("us-east"));
         assert_eq!(west_group.get("zone").map(String::as_str), Some("us-west"));
+        let SummaryValue::Points(east_samples) = east_value else {
+            panic!("expected Points, got {east_value:?}");
+        };
+        let SummaryValue::Points(west_samples) = west_value else {
+            panic!("expected Points, got {west_value:?}");
+        };
         let east_median = east_samples[0].1;
         let west_median = west_samples[0].1;
         assert!(
@@ -932,7 +1059,10 @@ mod tests {
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
             panic!("expected a value");
         };
-        let (_group, samples) = &v[0];
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
         let (_ts, card) = samples[0];
         assert!(
             (3.0..=7.0).contains(&card),
@@ -967,7 +1097,10 @@ mod tests {
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
             panic!("expected a value");
         };
-        let (_group, samples) = &v[0];
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
         let (_ts, total) = samples[0];
         assert_eq!(
             total, 42.0,
@@ -1013,7 +1146,10 @@ mod tests {
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
             panic!("expected a value");
         };
-        let (_group, samples) = &v[0];
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points, got {value:?}");
+        };
         let (_ts, total) = samples[0];
         assert_eq!(
             total, 42.0,
@@ -1022,10 +1158,12 @@ mod tests {
     }
 
     #[test]
-    fn topk_query_is_explicitly_unsupported_not_silently_wrong() {
-        // TopK's answer shape (K items per timestamp) doesn't fit this
-        // executor's Value = Vec<(i64, f64)> -- must error, not silently
-        // return a truncated/wrong scalar.
+    fn topk_query_against_non_heap_sketch_is_unsupported() {
+        // A heap-less family (Cms/CountSketch/Dd/Hll/Kll) carries no item
+        // universe to rank -- TopK must still error for it. This is a
+        // FAMILY limitation (see `topk_ranked`), not "TopK is
+        // unimplemented" -- contrast with the heap-bearing TopK tests
+        // below, which succeed.
         let idx = SketchStore::new();
         let sid = 1u64;
         idx.register(cms_meta(sid, "requests_total"));
@@ -1045,6 +1183,151 @@ mod tests {
             Err(asap_sketch::exec::ExecError::Executor(SummaryExecutorError::Unsupported(_))) => {}
             other => panic!("expected Unsupported, got {}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn single_cms_with_heap_sid_topk_readout_sorted_and_capped() {
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_with_heap_meta(sid, "requests_by_route"));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(
+                    4,
+                    256,
+                    10,
+                    &[
+                        ("a", 10.0),
+                        ("b", 20.0),
+                        ("c", 30.0),
+                        ("d", 40.0),
+                        ("e", 50.0),
+                    ],
+                ),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 3 });
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = &v[0];
+        let SummaryValue::TopK(points) = value else {
+            panic!("expected TopK, got {value:?}");
+        };
+        assert_eq!(points.len(), 1, "cumulative query produces one point");
+        let (_ts, items) = &points[0];
+        assert_eq!(items.len(), 3, "must be capped at k=3");
+        let keys: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["e", "d", "c"],
+            "must be sorted descending by value (50, 40, 30), not heap-insertion order"
+        );
+    }
+
+    #[test]
+    fn two_cms_with_heap_sids_same_group_topk_merges_cross_sid() {
+        // Two sids in the same group with DISJOINT key sets -- the merged
+        // top-k must contain BOTH sids' keys, proving the readout actually
+        // merges cross-sid (via `merge_same_family`/`asap_sketchlib`'s heap
+        // reconciliation) rather than just reading out one sid's heap.
+        let idx = SketchStore::new();
+        idx.register(cms_with_heap_meta(1, "requests_by_route"));
+        idx.register(cms_with_heap_meta(2, "requests_by_route"));
+        idx.append_sample(
+            1,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(4, 256, 10, &[("a", 30.0)]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(4, 256, 10, &[("b", 40.0)]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = &v[0];
+        let SummaryValue::TopK(points) = value else {
+            panic!("expected TopK, got {value:?}");
+        };
+        let (_ts, items) = &points[0];
+        let keys: std::collections::BTreeSet<&str> =
+            items.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            keys.contains("a") && keys.contains("b"),
+            "merged top-k must contain both sids' keys, got {items:?}"
+        );
+    }
+
+    #[test]
+    fn per_window_matrix_topk_produces_per_window_ranked_lists() {
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_with_heap_meta(sid, "requests_by_route"));
+        let w1_end = T0 + 100_000;
+        let w2_end = T0 + 200_000;
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, w1_end),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(4, 256, 10, &[("x", 100.0)]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (w1_end, w2_end),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(4, 256, 10, &[("y", 200.0)]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 2 });
+
+        let exec = matrix_ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = &v[0];
+        let SummaryValue::TopK(mut points) = value.clone() else {
+            panic!("expected TopK, got {value:?}");
+        };
+        points.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(
+            points.len(),
+            2,
+            "two distinct windows must produce two independently-ranked points"
+        );
+        assert_eq!(points[0].0, w1_end as i64);
+        assert_eq!(points[1].0, w2_end as i64);
+        assert_eq!(points[0].1[0].0, "x", "window 1's top key is x");
+        assert_eq!(points[1].1[0].0, "y", "window 2's top key is y");
     }
 
     #[test]
@@ -1141,7 +1424,10 @@ mod tests {
             panic!("expected a value");
         };
         assert_eq!(v.len(), 1, "ungrouped query produces exactly one group");
-        let (_group, mut samples) = v.into_iter().next().unwrap();
+        let (_group, value) = v.into_iter().next().unwrap();
+        let SummaryValue::Points(mut samples) = value else {
+            panic!("expected Points");
+        };
         samples.sort_by_key(|(ts, _)| *ts);
         assert_eq!(
             samples.len(),
@@ -1204,7 +1490,10 @@ mod tests {
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
             panic!("expected a value");
         };
-        let (_group, samples) = v.into_iter().next().unwrap();
+        let (_group, value) = v.into_iter().next().unwrap();
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points");
+        };
         assert_eq!(
             samples.len(),
             1,
@@ -1257,7 +1546,10 @@ mod tests {
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
             panic!("expected a value");
         };
-        let (_group, samples) = v.into_iter().next().unwrap();
+        let (_group, value) = v.into_iter().next().unwrap();
+        let SummaryValue::Points(samples) = value else {
+            panic!("expected Points");
+        };
         assert_eq!(
             samples.len(),
             1,
