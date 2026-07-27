@@ -40,15 +40,28 @@
 //! - A `PointCount` whose `key`/`value` combination isn't one of the two
 //!   expected shapes (`SampleValue` + `None`, or `Named`/`Qualified` +
 //!   `Some(_)`) — reported rather than silently guessed at.
-//! - `ExactAgg` intents (`Sum`/`Rate`/`Increase`/`MinMax`/exact `Count`).
-//!   These don't reach `readout` at all — `asap_plan::bind` never wraps
-//!   an `ExactAccumulator` implementation in a `SummaryEstimate`
-//!   (`estimate = false` in `bind_summary_agg`), so `execute()` on such a
-//!   tree returns `ExecOutcome::State` at the root; the caller must read
-//!   the final value out of that `State` itself, not through this trait.
+//!
+//! `find_candidates`/`fetch_state`/`merge_states` ALSO recognize
+//! `AggKind::ExactAgg` sids for `SummaryKind::{Sum, Increase}` (see
+//! `exact_agg_kind_match`'s doc for why `MinMax`/`Count`/`Rate` aren't
+//! matched) — one sid is one aggregation, read out directly, with no
+//! special-casing of exact-vs-approximate at the `find_candidates`/merge
+//! level. But `readout`/`SketchQuery` NEVER see these: `asap_plan::bind`
+//! never wraps an `ExactAccumulator` implementation in a
+//! `SummaryEstimate` (`estimate = false` in `bind_summary_agg`), so
+//! `execute()` on such a tree returns `ExecOutcome::State` at the root
+//! rather than calling `readout`. `GroupState::exact_value` is the
+//! ExactAgg analog of `readout_cumulative` — a future caller reads the
+//! final value out of `ExecOutcome::State`'s `GroupState` by calling it
+//! directly, not through this trait.
+//!
+//! Not covered here either: stacking an outer statistic (avg/stddev/...)
+//! on top of a sketch or exact-agg readout ("outer-agg-fold") — out of
+//! scope by explicit design choice, not an oversight.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use asap_ir::intent_algebra::{ColumnId, ColumnRef, QueryExpr, Source};
 use asap_sketch::exec::SummaryExecutor;
@@ -56,11 +69,12 @@ use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use control_plane::sketch_algebra::capability::SketchKindHandle;
 
-use crate::storage_engines::sketch_db::data::{SketchConfig, SketchTimeSeries};
+use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_summary_state, per_window_summary_states, DeltaSketchKind, SummaryState,
 };
+use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues};
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -88,18 +102,117 @@ pub struct QueryExecutionContext<'a> {
 /// re-querying the same `(sid, t0, t1)` range a second time. `Rc` keeps
 /// clones of the handle cheap (a refcount bump, not a re-fetch or a
 /// re-clone of the sample bytes).
-#[derive(Debug, Clone)]
-pub struct SidHandle {
-    series: Rc<SketchTimeSeries>,
-    kind: DeltaSketchKind,
+///
+/// `ExactAgg` mirrors `Sketch` structurally (one sid's already-decoded
+/// `[t0, t1]` data, `Rc`-shared) rather than getting a special exact-vs-
+/// approximate treatment — see this module's doc. Its payload is already
+/// `Arc<dyn AggregateCore>` per window (from
+/// `SketchStore::query_exact_agg_range`, which decodes eagerly, unlike
+/// the sketch path's lazy raw-bytes-until-readout), so there's no
+/// decode-parameter analog of `DeltaSketchKind` to carry.
+#[derive(Clone)]
+pub enum SidHandle {
+    Sketch {
+        series: Rc<SketchTimeSeries>,
+        kind: DeltaSketchKind,
+    },
+    ExactAgg {
+        windows: Rc<BTreeMap<i64, Arc<dyn AggregateCore>>>,
+        agg_type: AggregationType,
+    },
 }
 
-/// One group's accumulated candidates, all sharing one `DeltaSketchKind`
-/// (guaranteed by `find_candidates`'s exact-match contract).
-#[derive(Debug, Clone)]
-pub struct GroupState {
-    entries: Vec<SidHandle>,
-    kind: DeltaSketchKind,
+// Manual `Debug` -- `dyn AggregateCore` doesn't implement it, so
+// `#[derive(Debug)]` can't reach through `ExactAgg`'s `windows` field.
+impl std::fmt::Debug for SidHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SidHandle::Sketch { series, kind } => f
+                .debug_struct("SidHandle::Sketch")
+                .field("series", series)
+                .field("kind", kind)
+                .finish(),
+            SidHandle::ExactAgg { windows, agg_type } => f
+                .debug_struct("SidHandle::ExactAgg")
+                .field("window_count", &windows.len())
+                .field("agg_type", agg_type)
+                .finish(),
+        }
+    }
+}
+
+/// One group's accumulated candidates. `Sketch` entries all share one
+/// `DeltaSketchKind`; `ExactAgg` entries all share one `AggregationType`
+/// (both guaranteed by `find_candidates`'s exact-match contract) — a
+/// group is never a mix of the two (`merge_states` errors if it somehow
+/// were).
+#[derive(Clone)]
+pub enum GroupState {
+    Sketch {
+        entries: Vec<Rc<SketchTimeSeries>>,
+        kind: DeltaSketchKind,
+    },
+    ExactAgg {
+        entries: Vec<Rc<BTreeMap<i64, Arc<dyn AggregateCore>>>>,
+        agg_type: AggregationType,
+    },
+}
+
+impl std::fmt::Debug for GroupState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GroupState::Sketch { entries, kind } => f
+                .debug_struct("GroupState::Sketch")
+                .field("entry_count", &entries.len())
+                .field("kind", kind)
+                .finish(),
+            GroupState::ExactAgg { entries, agg_type } => f
+                .debug_struct("GroupState::ExactAgg")
+                .field("entry_count", &entries.len())
+                .field("agg_type", agg_type)
+                .finish(),
+        }
+    }
+}
+
+impl GroupState {
+    /// Merge this group's ExactAgg accumulators — across every sid AND
+    /// every window in `[t0, t1]` (there's no per-window concept exposed
+    /// here; a future caller that needs one issues a narrower query) —
+    /// into one combined value, then read out the statistic `agg_type`
+    /// implies. The ExactAgg analog of `readout_cumulative`, but called
+    /// directly by a future caller reading `ExecOutcome::State` (see this
+    /// module's doc for why `readout()`/`SketchQuery` never see these).
+    ///
+    /// `None` for a `Sketch` state, a group with no windows in range, or
+    /// a merge/query failure. `AggregationType::MinMax` (and any other
+    /// type `exact_agg_kind_match` doesn't match) can't reach a
+    /// `GroupState::ExactAgg` via `find_candidates` in the first place —
+    /// the fallback arm here is defensive, not a real path.
+    pub fn exact_value(&self, key: &Option<KeyByLabelValues>) -> Option<f64> {
+        let GroupState::ExactAgg { entries, agg_type } = self else {
+            return None;
+        };
+        let stat = match agg_type {
+            AggregationType::Sum
+            | AggregationType::MultipleSum
+            | AggregationType::Increase
+            | AggregationType::MultipleIncrease => asap_types::Statistic::Sum,
+            _ => return None,
+        };
+        let mut merged: Option<Box<dyn AggregateCore>> = None;
+        for windows in entries {
+            for acc in windows.values() {
+                merged = Some(match merged.take() {
+                    None => acc.clone_boxed_core(),
+                    Some(m) => m.merge_with(acc.as_ref()).ok()?,
+                });
+            }
+        }
+        merged?
+            .query_statistic(stat, key, &std::collections::HashMap::new())
+            .ok()
+    }
 }
 
 #[derive(Debug)]
@@ -133,10 +246,49 @@ pub enum SummaryExecutorError {
 /// Which variant a query produces is determined entirely by the
 /// `SketchQuery` issued (`TopK` vs everything else); callers match on
 /// their own query to know which variant to expect.
+///
+/// Both variants carry a trailing `coverage: Option<(u64, u64)>` — this
+/// GROUP's own `(min_window_end_ms, max_window_end_ms)` observed across
+/// the windows its readout actually walked. `None` only when a group
+/// somehow produced a value with zero windows observed (shouldn't
+/// happen in practice: `NoCandidates` fires first).
+///
+/// Mirrors `ASAPTierResult.coverage`'s ACTUAL semantics (see
+/// `sketch_reducer.rs`'s doc and `evaluate_core`/`evaluate_cardinality_global`):
+/// despite that field's doc naming it "min_window_start_ms", the sketch
+/// path stores no window-start at all (`SketchTimeSeries::samples` is
+/// keyed by window-END only — see that struct's doc), so both bounds
+/// are folded from window-END timestamps. Also, like the legacy
+/// per-window path, this is computed from RAW window-ends *before* the
+/// `w_end < t0_ms` carry-in-base filter — a carry-in Full spliced in by
+/// `SketchStore::query_range` to seed a leading delta never appears as
+/// an output point, but its window-end still legitimately extends this
+/// group's covered range further back than the first in-range point.
 #[derive(Debug, Clone)]
 pub enum SummaryValue {
-    Points(Vec<(i64, f64)>),
-    TopK(Vec<(i64, Vec<(String, f64)>)>),
+    Points(Vec<(i64, f64)>, Option<(u64, u64)>),
+    TopK(Vec<(i64, Vec<(String, f64)>)>, Option<(u64, u64)>),
+}
+
+impl SummaryValue {
+    pub fn coverage(&self) -> Option<(u64, u64)> {
+        match self {
+            SummaryValue::Points(_, coverage) | SummaryValue::TopK(_, coverage) => *coverage,
+        }
+    }
+}
+
+/// Fold `w_end` (a raw window-end timestamp, may be negative pre-epoch
+/// in principle) into a running `(min, max)` coverage accumulator —
+/// shared by `readout_cumulative`/`readout_per_window` so both compute
+/// coverage identically. Mirrors `sketch_reducer.rs`'s repeated
+/// `cov_lo`/`cov_hi` fold (see `SummaryValue`'s doc).
+fn fold_coverage(coverage: &mut Option<(u64, u64)>, w_end: i64) {
+    let w = if w_end >= 0 { w_end as u64 } else { 0 };
+    *coverage = Some(match *coverage {
+        Some((lo, hi)) => (lo.min(w), hi.max(w)),
+        None => (w, w),
+    });
 }
 
 impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
@@ -168,48 +320,79 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         }
         let required_keys: BTreeSet<String> = by_names.iter().cloned().collect();
 
+        // Which family a matching sid resolved to, carrying just enough
+        // to build its `SidHandle` -- kept local to this function since
+        // nothing outside needs a candidate BEFORE it's turned into a
+        // handle.
+        enum Candidate {
+            Sketch(DeltaSketchKind),
+            ExactAgg(AggregationType),
+        }
+
         let candidate_sids = self.index.instances_matching(&metric, &required_keys);
         let mut out = Vec::new();
         for sid in candidate_sids {
-            let candidate_kind = self.index.with_instance(sid, |m| {
-                let kind = m.sketch_kind()?;
-                let config = m.sketch_config()?;
-                summary_params_match(sketch, params, kind, config)
-                    .then(|| to_delta_kind(kind, config))
-                    .flatten()
-            });
-            let Some(candidate_kind) = candidate_kind.flatten() else {
+            let candidate = self
+                .index
+                .with_instance(sid, |m| match &m.agg_kind {
+                    AggKind::Sketch { kind, config, .. } => {
+                        summary_params_match(sketch, params, *kind, config)
+                            .then(|| to_delta_kind(*kind, config))
+                            .flatten()
+                            .map(Candidate::Sketch)
+                    }
+                    AggKind::ExactAgg { agg_type, .. } => {
+                        exact_agg_kind_match(sketch, params, *agg_type)
+                            .then_some(Candidate::ExactAgg(*agg_type))
+                    }
+                })
+                .flatten();
+            let Some(candidate) = candidate else {
                 continue;
             };
 
-            // Fetching the series here (rather than just checking
-            // membership) is what lets `fetch_state`/`readout` skip a
-            // second identical `query_range` call later -- see
-            // `SidHandle`'s doc. The label values it carries are also
-            // the only place a group's actual values live (metadata only
-            // has the group-by KEY names, not values).
-            let series = self.index.query_range(sid, self.t0_ms, self.t1_ms);
-            let Some(series) = series.into_iter().next() else {
-                continue;
-            };
-            let group_key: BTreeMap<String, String> = by_names
-                .iter()
-                .map(|k| {
-                    let v = series
-                        .series_label_values
-                        .get(k)
-                        .cloned()
-                        .unwrap_or_default();
-                    (k.clone(), v)
-                })
-                .collect();
-            out.push((
-                group_key,
-                SidHandle {
-                    series: Rc::new(series),
-                    kind: candidate_kind,
-                },
-            ));
+            match candidate {
+                Candidate::Sketch(candidate_kind) => {
+                    // Fetching the series here (rather than just checking
+                    // membership) is what lets `fetch_state`/`readout` skip a
+                    // second identical `query_range` call later -- see
+                    // `SidHandle`'s doc. The label values it carries are also
+                    // the only place a group's actual values live (metadata
+                    // only has the group-by KEY names, not values).
+                    let series = self.index.query_range(sid, self.t0_ms, self.t1_ms);
+                    let Some(series) = series.into_iter().next() else {
+                        continue;
+                    };
+                    let group_key = project_group_key(&by_names, &series.series_label_values);
+                    out.push((
+                        group_key,
+                        SidHandle::Sketch {
+                            series: Rc::new(series),
+                            kind: candidate_kind,
+                        },
+                    ));
+                }
+                Candidate::ExactAgg(agg_type) => {
+                    // `query_exact_agg_range` decodes eagerly (returns
+                    // `Arc<dyn AggregateCore>` per window already merged
+                    // in-memory + disk) -- no raw-bytes/delta-frame
+                    // handling analogous to the sketch path is needed.
+                    let series_list = self
+                        .index
+                        .query_exact_agg_range(sid, self.t0_ms, self.t1_ms);
+                    let Some((label_values, windows)) = series_list.into_iter().next() else {
+                        continue;
+                    };
+                    let group_key = project_group_key(&by_names, &label_values);
+                    out.push((
+                        group_key,
+                        SidHandle::ExactAgg {
+                            windows: Rc::new(windows),
+                            agg_type,
+                        },
+                    ));
+                }
+            }
         }
         // Empty is NOT an error here -- `asap_sketch::exec::execute()`
         // itself checks `find_candidates`'s result for emptiness and
@@ -220,9 +403,15 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
     }
 
     fn fetch_state(&self, handle: &Self::Handle) -> Result<Self::State, Self::Error> {
-        Ok(GroupState {
-            kind: handle.kind,
-            entries: vec![handle.clone()],
+        Ok(match handle {
+            SidHandle::Sketch { series, kind } => GroupState::Sketch {
+                kind: *kind,
+                entries: vec![series.clone()],
+            },
+            SidHandle::ExactAgg { windows, agg_type } => GroupState::ExactAgg {
+                agg_type: *agg_type,
+                entries: vec![windows.clone()],
+            },
         })
     }
 
@@ -233,10 +422,27 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         // (`self.is_cumulative`), which only `readout` is positioned to
         // do generically for both callers. `merge_states` and
         // `fetch_state` just assemble the group's full candidate list.
+        // ExactAgg has no such split (`GroupState::exact_value` always
+        // folds the whole range), but still just accumulates entries here.
         let mut states = states.into_iter();
         let mut acc = states.next().ok_or(SummaryExecutorError::NoCandidates)?;
         for s in states {
-            acc.entries.extend(s.entries);
+            match (&mut acc, s) {
+                (GroupState::Sketch { entries, .. }, GroupState::Sketch { entries: more, .. }) => {
+                    entries.extend(more);
+                }
+                (
+                    GroupState::ExactAgg { entries, .. },
+                    GroupState::ExactAgg { entries: more, .. },
+                ) => {
+                    entries.extend(more);
+                }
+                // `find_candidates`'s exact-match contract never produces a
+                // mixed group (a `(SummaryKind, SummaryParams)` query
+                // matches either sketch-family sids or ExactAgg sids, never
+                // both) -- defensive, not a real path.
+                _ => return Err(SummaryExecutorError::UnsupportedFamily),
+            }
         }
         Ok(acc)
     }
@@ -246,10 +452,18 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         state: &Self::State,
         query: &SketchQuery,
     ) -> Result<Self::Value, Self::Error> {
+        // `ExactAgg` states never reach here in practice -- see this
+        // module's doc (`asap_plan::bind` never wraps an ExactAccumulator
+        // in a `SummaryEstimate`, so `execute()` stops at
+        // `ExecOutcome::State` before ever calling `readout`). Defensive,
+        // not a real path.
+        let GroupState::Sketch { entries, kind } = state else {
+            return Err(SummaryExecutorError::UnsupportedFamily);
+        };
         if self.is_cumulative {
-            readout_cumulative(state, query, self.t1_ms as i64)
+            readout_cumulative(entries, *kind, query, self.t1_ms as i64)
         } else {
-            readout_per_window(state, query, self.t0_ms as i64)
+            readout_per_window(entries, *kind, query, self.t0_ms as i64)
         }
     }
 
@@ -262,15 +476,16 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
 /// scalar -- `quantile_over_time`/`count_distinct_over_time`-shaped
 /// instant queries.
 fn readout_cumulative(
-    state: &GroupState,
+    entries: &[Rc<SketchTimeSeries>],
+    kind: DeltaSketchKind,
     query: &SketchQuery,
     t1_ms: i64,
 ) -> Result<SummaryValue, SummaryExecutorError> {
     let mut merged: Option<SummaryState> = None;
     let mut latest_window_end: Option<i64> = None;
-    for entry in &state.entries {
+    let mut coverage: Option<(u64, u64)> = None;
+    for entry in entries {
         let samples_vec: Vec<(i64, &SketchSampleState)> = entry
-            .series
             .samples
             .iter()
             .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
@@ -278,8 +493,11 @@ fn readout_cumulative(
         if let Some((w, _)) = samples_vec.last() {
             latest_window_end = Some(latest_window_end.map_or(*w, |prev| prev.max(*w)));
         }
-        let rs = cumulative_summary_state(&samples_vec, state.kind)
-            .map_err(SummaryExecutorError::Decode)?;
+        for (w, _) in &samples_vec {
+            fold_coverage(&mut coverage, *w);
+        }
+        let rs =
+            cumulative_summary_state(&samples_vec, kind).map_err(SummaryExecutorError::Decode)?;
         if let Some(rs) = rs {
             merged = Some(match merged.take() {
                 None => rs,
@@ -296,12 +514,15 @@ fn readout_cumulative(
     };
     let w_end = latest_window_end.unwrap_or(t1_ms);
     if let SketchQuery::TopK { k } = query {
-        Ok(SummaryValue::TopK(vec![(w_end, topk_ranked(&merged, *k)?)]))
+        Ok(SummaryValue::TopK(
+            vec![(w_end, topk_ranked(&merged, *k)?)],
+            coverage,
+        ))
     } else {
-        Ok(SummaryValue::Points(vec![(
-            w_end,
-            sketch_query_value(&merged, query)?,
-        )]))
+        Ok(SummaryValue::Points(
+            vec![(w_end, sketch_query_value(&merged, query)?)],
+            coverage,
+        ))
     }
 }
 
@@ -312,20 +533,26 @@ fn readout_cumulative(
 /// unioned across sids: a sid that's missing a particular window just
 /// doesn't contribute to it, rather than the whole window being dropped.
 fn readout_per_window(
-    state: &GroupState,
+    entries: &[Rc<SketchTimeSeries>],
+    kind: DeltaSketchKind,
     query: &SketchQuery,
     t0_ms: i64,
 ) -> Result<SummaryValue, SummaryExecutorError> {
     let mut by_window: BTreeMap<i64, SummaryState> = BTreeMap::new();
-    for entry in &state.entries {
+    // Tracked from RAW window-ends, before the `w_end < t0_ms` carry-in
+    // filter below -- see `SummaryValue`'s doc for why.
+    let mut coverage: Option<(u64, u64)> = None;
+    for entry in entries {
         let samples_vec: Vec<(i64, &SketchSampleState)> = entry
-            .series
             .samples
             .iter()
             .flat_map(|(t, frames)| frames.iter().map(move |s| (*t, s)))
             .collect();
-        let (per_window, _skipped) = per_window_summary_states(&samples_vec, state.kind)
-            .map_err(SummaryExecutorError::Decode)?;
+        for (w, _) in &samples_vec {
+            fold_coverage(&mut coverage, *w);
+        }
+        let (per_window, _skipped) =
+            per_window_summary_states(&samples_vec, kind).map_err(SummaryExecutorError::Decode)?;
         for (w_end, rs) in per_window {
             // `SketchStore::query_range` may splice in a carry-in Full
             // snapshot ending before the requested range so the
@@ -353,13 +580,13 @@ fn readout_per_window(
             .into_iter()
             .map(|(w_end, rs)| topk_ranked(&rs, *k).map(|items| (w_end, items)))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(SummaryValue::TopK(points))
+        Ok(SummaryValue::TopK(points, coverage))
     } else {
         let points = by_window
             .into_iter()
             .map(|(w_end, rs)| sketch_query_value(&rs, query).map(|v| (w_end, v)))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(SummaryValue::Points(points))
+        Ok(SummaryValue::Points(points, coverage))
     }
 }
 
@@ -490,6 +717,64 @@ fn summary_params_match(
         ) => *depth as i32 == *rows && *width as i32 == *cols,
         _ => false,
     }
+}
+
+/// Exact-agg analog of `summary_params_match`, for `AggKind::ExactAgg`
+/// sids. `SummaryParams::{Sum, Count, MinMax, Increase, Rate}` are unit
+/// variants (no tuning parameters — see `asap-sketch`'s `SummaryParams`
+/// doc), so this is a pure kind-identity check against the sid's
+/// `AggregationType`, mirroring the canonical `AggregationType ->
+/// SummaryKind` mapping `asap_types::accumulator_spec` uses on the write
+/// side (`Sum|MultipleSum -> SummaryKind::Sum`, `Increase|MultipleIncrease
+/// -> SummaryKind::Increase` — confirmed against that module's own
+/// dispatch table rather than invented here).
+///
+/// `SummaryKind::MinMax` is deliberately NOT matched: `AggregationType`
+/// carries no min-vs-max DIRECTION (that lives in the write-side
+/// `AggregationConfig::aggregation_sub_type` string, which this sid's
+/// `AggKind::ExactAgg` metadata doesn't retain), so there's no honest way
+/// for `GroupState::exact_value` to know which statistic to compute --
+/// matching it here would force a later caller to silently guess a
+/// direction. `SummaryKind::Count`/`Rate` are ALSO not matched: no
+/// `AggregationType` variant resolves to either today (mirrors
+/// `sketch_reducer.rs::evaluate_exact_agg`'s own `stat` mapping, which
+/// only handles `Sum`/`Increase` for the same reason); `Rate` in
+/// particular is "outer-agg-fold" territory the user has explicitly
+/// deferred pending a design conversation with ASAPController.
+fn exact_agg_kind_match(
+    sketch: &SummaryKind,
+    params: &SummaryParams,
+    agg_type: AggregationType,
+) -> bool {
+    matches!(
+        (sketch, params, agg_type),
+        (
+            SummaryKind::Sum,
+            SummaryParams::Sum,
+            AggregationType::Sum | AggregationType::MultipleSum,
+        ) | (
+            SummaryKind::Increase,
+            SummaryParams::Increase,
+            AggregationType::Increase | AggregationType::MultipleIncrease,
+        )
+    )
+}
+
+/// Project a full label-values map down to the requested `by` columns --
+/// shared by the `Sketch`/`ExactAgg` branches of `find_candidates` (both
+/// build a group key the same way from whatever label map their own
+/// range-query returns). Missing keys become empty strings so a sid
+/// registered with a subset of the requested keys still groups
+/// deterministically (mirrors `sketch_reducer.rs::evaluate_exact_agg`'s
+/// same projection).
+fn project_group_key(
+    by_names: &[String],
+    label_values: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    by_names
+        .iter()
+        .map(|k| (k.clone(), label_values.get(k).cloned().unwrap_or_default()))
+        .collect()
 }
 
 /// `SketchConfig` (data_plane's per-sid stored params) -> `DeltaSketchKind`
@@ -875,6 +1160,46 @@ mod tests {
         })
     }
 
+    // ── ExactAgg (Sum) fixtures ────────────────────────────────────────
+
+    fn sum_exact_agg_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
+        SketchInstanceMetadata {
+            sid,
+            metric_name: metric.to_string(),
+            group_by_keys: group_by
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+            agg_kind: crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Sum,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: asap_types::PolicyFingerprint::UNSET,
+        }
+    }
+
+    fn sum_agg_node(child: Rc<L4Node>, by: Vec<ColumnId>) -> Rc<L4Node> {
+        Rc::new(L4Node {
+            expr: SummaryExpr::SummaryAgg {
+                child,
+                sketch: SummaryKind::Sum,
+                params: SummaryParams::Sum,
+                col: ColumnRef::SampleValue,
+                by,
+            },
+            schema: L4Schema {
+                fields: vec![],
+                time_index: None,
+            },
+        })
+    }
+
     const T0: u64 = 1_000_000;
     const T1: u64 = 2_000_000;
 
@@ -924,9 +1249,14 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "ungrouped query produces exactly one group");
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
+        assert_eq!(
+            *coverage,
+            Some((T0 + 1000, T0 + 1000)),
+            "cumulative readout's coverage must reflect the single window observed"
+        );
         let (_ts, median) = samples[0];
         // Median of 1..=100 is ~50.
         assert!(
@@ -978,7 +1308,7 @@ mod tests {
         };
         assert_eq!(v.len(), 1);
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, median) = samples[0];
@@ -1043,10 +1373,10 @@ mod tests {
         let (west_group, west_value) = &v[1];
         assert_eq!(east_group.get("zone").map(String::as_str), Some("us-east"));
         assert_eq!(west_group.get("zone").map(String::as_str), Some("us-west"));
-        let SummaryValue::Points(east_samples) = east_value else {
+        let SummaryValue::Points(east_samples, _coverage) = east_value else {
             panic!("expected Points, got {east_value:?}");
         };
-        let SummaryValue::Points(west_samples) = west_value else {
+        let SummaryValue::Points(west_samples, _coverage) = west_value else {
             panic!("expected Points, got {west_value:?}");
         };
         let east_median = east_samples[0].1;
@@ -1085,7 +1415,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, card) = samples[0];
@@ -1124,7 +1454,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, total) = samples[0];
@@ -1174,7 +1504,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, total) = samples[0];
@@ -1213,7 +1543,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, estimate) = samples[0];
@@ -1265,7 +1595,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points, got {value:?}");
         };
         let (_ts, estimate) = samples[0];
@@ -1337,7 +1667,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::TopK(points) = value else {
+        let SummaryValue::TopK(points, _coverage) = value else {
             panic!("expected TopK, got {value:?}");
         };
         assert_eq!(points.len(), 1, "cumulative query produces one point");
@@ -1387,7 +1717,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::TopK(points) = value else {
+        let SummaryValue::TopK(points, _coverage) = value else {
             panic!("expected TopK, got {value:?}");
         };
         let (_ts, items) = &points[0];
@@ -1433,7 +1763,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = &v[0];
-        let SummaryValue::TopK(mut points) = value.clone() else {
+        let SummaryValue::TopK(mut points, _coverage) = value.clone() else {
             panic!("expected TopK, got {value:?}");
         };
         points.sort_by_key(|(ts, _)| *ts);
@@ -1543,9 +1873,14 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "ungrouped query produces exactly one group");
         let (_group, value) = v.into_iter().next().unwrap();
-        let SummaryValue::Points(mut samples) = value else {
+        let SummaryValue::Points(mut samples, coverage) = value else {
             panic!("expected Points");
         };
+        assert_eq!(
+            coverage,
+            Some((w1_end, w2_end)),
+            "fully-covered group's coverage must bracket every window-end observed"
+        );
         samples.sort_by_key(|(ts, _)| *ts);
         assert_eq!(
             samples.len(),
@@ -1609,7 +1944,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = v.into_iter().next().unwrap();
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points");
         };
         assert_eq!(
@@ -1665,7 +2000,7 @@ mod tests {
             panic!("expected a value");
         };
         let (_group, value) = v.into_iter().next().unwrap();
-        let SummaryValue::Points(samples) = value else {
+        let SummaryValue::Points(samples, _coverage) = value else {
             panic!("expected Points");
         };
         assert_eq!(
@@ -1674,5 +2009,217 @@ mod tests {
             "the carry-in-base window (ending before t0) must not appear in output"
         );
         assert_eq!(samples[0].0, in_range_end as i64);
+    }
+
+    #[test]
+    fn per_window_matrix_coverage_includes_carry_in_base_before_t0() {
+        // A GENUINE carry-in splice (unlike the test above, whose earlier
+        // window is Full-encoded and simply falls outside `query_range`'s
+        // overlap scan entirely): `SketchStore::query_range` splices in the
+        // most-recent Full snapshot ending before `t0_ms` when the
+        // earliest IN-WINDOW frame is a Delta, so the delta-apply walk has
+        // a rolling base to apply onto (see `query_range`'s doc). That
+        // splice must not surface as its own output point (existing
+        // behavior), but its window-end DOES extend this group's observed
+        // coverage further back than the first in-range point -- coverage
+        // is folded from RAW window-ends before the `w_end < t0_ms` output
+        // filter (see `SummaryValue`'s doc).
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(cms_with_heap_meta(sid, "requests_by_route"));
+
+        let carry_in_end = T0 - 50_000; // strictly before t0 -- Full base
+        let delta_window_end = T0 + 50_000; // in-range -- Delta, needs the base
+
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0 - 100_000, carry_in_end),
+            SketchSampleState {
+                bytes: encode_cms_with_heap_items(4, 256, 10, &[("a", 5.0)]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        // Real DELTA-HEAP wire shape (`(is_delta, (rows, cols, cells),
+        // heap, heap_size)`, see `delta_apply.rs`'s `encode_delta_heap`
+        // test helper) -- zero matrix cells (no change), heap replaces
+        // wholesale with `{b: 3.0}`.
+        #[derive(serde::Serialize)]
+        struct DeltaHeapFrame<'a>(
+            bool,
+            (u32, u32, &'a [(u32, u32, i64)]),
+            Vec<(String, f64)>,
+            u64,
+        );
+        let cells: Vec<(u32, u32, i64)> = vec![];
+        let delta_bytes = rmp_serde::to_vec(&DeltaHeapFrame(
+            true,
+            (4, 256, &cells),
+            vec![("b".to_string(), 3.0)],
+            10,
+        ))
+        .expect("encode delta-heap frame");
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (carry_in_end, delta_window_end),
+            SketchSampleState {
+                bytes: delta_bytes,
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackDelta,
+            },
+        );
+
+        let child = scan_node("requests_by_route", None);
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
+
+        let exec = matrix_ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        let (_group, value) = v.into_iter().next().unwrap();
+        let SummaryValue::TopK(points, coverage) = value else {
+            panic!("expected TopK, got {value:?}");
+        };
+        assert_eq!(
+            points.len(),
+            1,
+            "the carry-in base must not appear as its own output point"
+        );
+        assert_eq!(points[0].0, delta_window_end as i64);
+        assert_eq!(
+            coverage,
+            Some((carry_in_end, delta_window_end)),
+            "coverage must extend back to the carry-in base's window-end, even \
+             though it never appears as an output point itself"
+        );
+    }
+
+    // ── ExactAgg (Sum) support ──────────────────────────────────────────
+
+    #[test]
+    fn single_sum_exactagg_sid_exact_value_merges_windows() {
+        // A bare `SummaryAgg` over an ExactAgg(Sum) sid resolves to
+        // `ExecOutcome::State` directly (never `Value` -- see this
+        // module's doc), and `GroupState::exact_value` must fold every
+        // window in range into one combined sum.
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(sum_exact_agg_meta(sid, "bytes_total", &[]));
+        idx.append_precompute(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(10.0)),
+        );
+        idx.append_precompute(
+            sid,
+            BTreeMap::new(),
+            (T0 + 1000, T0 + 2000),
+            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(15.0)),
+        );
+
+        let child = scan_node("bytes_total", None);
+        let tree = sum_agg_node(child, vec![]);
+
+        let exec = ctx(&idx);
+        let ExecOutcome::State(groups) = execute(&tree, &exec).expect("execute should succeed")
+        else {
+            panic!("expected State, not Value -- ExactAgg never reaches readout");
+        };
+        assert_eq!(
+            groups.len(),
+            1,
+            "ungrouped query produces exactly one group"
+        );
+        let (_key, state, kind, params) = &groups[0];
+        assert_eq!(*kind, SummaryKind::Sum);
+        assert_eq!(*params, SummaryParams::Sum);
+        assert_eq!(
+            state.exact_value(&None),
+            Some(25.0),
+            "exact_value must merge both windows' sums (10 + 15)"
+        );
+    }
+
+    #[test]
+    fn two_sum_exactagg_sids_same_group_merge_cross_sid() {
+        // Cross-sid merge for ExactAgg: two sids in the same (ungrouped)
+        // group must ADD, not just report one of them -- the ExactAgg
+        // analog of `two_cms_sids_same_group_totals_actually_merge`.
+        let idx = SketchStore::new();
+        idx.register(sum_exact_agg_meta(1, "bytes_total", &[]));
+        idx.register(sum_exact_agg_meta(2, "bytes_total", &[]));
+        idx.append_precompute(
+            1,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(30.0)),
+        );
+        idx.append_precompute(
+            2,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(12.0)),
+        );
+
+        let child = scan_node("bytes_total", None);
+        let tree = sum_agg_node(child, vec![]);
+
+        let exec = ctx(&idx);
+        let ExecOutcome::State(groups) = execute(&tree, &exec).expect("execute should succeed")
+        else {
+            panic!("expected State, not Value -- ExactAgg never reaches readout");
+        };
+        assert_eq!(groups.len(), 1);
+        let (_key, state, ..) = &groups[0];
+        assert_eq!(
+            state.exact_value(&None),
+            Some(42.0),
+            "merged exact_value must be the SUM of both sids (30 + 12)"
+        );
+    }
+
+    #[test]
+    fn minmax_exactagg_sid_is_not_matched() {
+        // `SummaryKind::MinMax` is deliberately NOT matched against
+        // ExactAgg sids (see `exact_agg_kind_match`'s doc: no direction
+        // info survives to `AggKind::ExactAgg`) -- must fail over as
+        // NoCandidates, not silently guess a direction.
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        let mut meta = sum_exact_agg_meta(sid, "latency_max_ms", &[]);
+        meta.agg_kind = crate::storage_engines::sketch_db::index::AggKind::ExactAgg {
+            agg_type: asap_types::AggregationType::MinMax,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        };
+        meta.capability = Some(Capability::ExactAgg(asap_types::AggregationType::MinMax));
+        idx.register(meta);
+        idx.append_precompute(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            Box::new(crate::precompute_engine::operators::MinMaxAccumulator::new_min()),
+        );
+
+        let child = scan_node("latency_max_ms", None);
+        let tree = Rc::new(L4Node {
+            expr: SummaryExpr::SummaryAgg {
+                child,
+                sketch: SummaryKind::MinMax,
+                params: SummaryParams::MinMax,
+                col: ColumnRef::SampleValue,
+                by: vec![],
+            },
+            schema: L4Schema {
+                fields: vec![],
+                time_index: None,
+            },
+        });
+        let exec = ctx(&idx);
+        match execute(&tree, &exec) {
+            Err(asap_sketch::exec::ExecError::NoCandidates) => {}
+            other => panic!("expected NoCandidates, got {}", other.is_ok()),
+        }
     }
 }
