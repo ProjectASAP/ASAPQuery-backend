@@ -25,18 +25,16 @@ control_plane = { path = "../control_plane" }
 # same git dependency in one workspace resolve to two distinct Rust
 # types that won't unify.
 #
-# Bumped to e4cea66 (branch `feat/extension-realization-hook`,
-# ASAPController#162, NOT YET MERGED -- matches control_plane's own pin,
-# bumped in the same way for the same reason) to pick up
+# Bumped to 64df20d (main tip, ASAPController#162, merged -- matches
+# control_plane's own pin) to pick up
 # `SketchQuery::PointCount.value: Option<String>`, needed for the
-# named-key PointCount readout. Re-pin to the merged main-tip commit once
-# #162 lands.
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
+# named-key PointCount readout.
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 # `asap_sketch::L4Node`'s own fields (`SummaryExpr::Logical(Box<QueryExpr>)`,
 # `SummaryAgg { col: ColumnRef, by: Vec<ColumnId>, .. }`) are `asap-ir`
 # types, not re-exported by `asap-sketch` -- `find_candidates` needs to
 # walk/match them directly. Same pin-must-match rule as `asap-sketch` above.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "e4cea66101d7921ba385f5f8e0be909a5d6c4dcd" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "64df20d90c3ddd519c726dea45c05e1fe5225ce6" }
 
 # Shared external (workspace)
 serde.workspace = true
