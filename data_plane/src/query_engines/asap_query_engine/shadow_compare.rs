@@ -8,12 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use asap_sketch::exec::{execute, ExecOutcome};
-
-use crate::query_engines::asap_query_engine::l4_lowering::lower_promql_to_l4node;
-use crate::query_engines::asap_query_engine::summary_executor::{
-    QueryExecutionContext, SummaryValue,
-};
+use crate::query_engines::asap_query_engine::l4_readout::{execute_l4_readout, SeriesRows};
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::ASAPTierResult;
 
@@ -31,10 +26,6 @@ const SHADOW_ACCURACY: control_plane::types_v2::AccuracyTarget =
 /// (a bug in one path or the other), not sketch estimation error. A small
 /// tolerance absorbs floating-point summation-order differences only.
 const RELATIVE_TOLERANCE: f64 = 1e-6;
-
-/// Mirrors `ASAPTierResult.series`'s row shape -- `(label_values, samples)`
-/// where `samples` is `(window_end_unix_ms, value)`.
-type SeriesRows = Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>;
 
 /// Whether shadow-mode comparison is enabled for this process. Mirrors
 /// `ASAP_LEGACY_DUAL_WRITE`'s exact mechanics (`drivers/ingest/otel.rs`) --
@@ -66,94 +57,16 @@ pub fn maybe_shadow_compare(
         return;
     }
 
-    let node = match lower_promql_to_l4node(query, SHADOW_ACCURACY) {
-        Ok(node) => node,
-        Err(skip) => {
-            tracing::debug!(query, ?skip, "shadow: query not comparable, skipping");
-            return;
-        }
-    };
-
-    let ctx = QueryExecutionContext {
-        index,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-    };
-
-    let new_series = match execute(&node, &ctx) {
-        Ok(ExecOutcome::Value(values)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, value) in &values {
-                fold_coverage(&mut coverage, value.coverage());
-                series.extend(summary_value_to_series(group_key, value));
+    let outcome =
+        match execute_l4_readout(index, query, t0_ms, t1_ms, is_cumulative, SHADOW_ACCURACY) {
+            Ok(outcome) => outcome,
+            Err(skip) => {
+                tracing::debug!(query, ?skip, "shadow: query not comparable, skipping");
+                return;
             }
-            (series, coverage)
-        }
-        Ok(ExecOutcome::State(groups)) => {
-            let mut series = Vec::new();
-            for (group_key, state, _kind, _params) in &groups {
-                let Some(value) = state.exact_value(&None) else {
-                    tracing::debug!(
-                        query,
-                        ?group_key,
-                        "shadow: ExactAgg group had no comparable value, skipping group"
-                    );
-                    continue;
-                };
-                series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
-            }
-            (series, None)
-        }
-        Err(e) => {
-            tracing::debug!(query, error = ?e, "shadow: execute() failed, skipping");
-            return;
-        }
-    };
+        };
 
-    diff_and_log(query, old, &new_series.0, new_series.1);
-}
-
-/// `SummaryValue::Points`/`TopK` -> `ASAPTierResult.series`'s row shape.
-/// `TopK`'s ranked-list-per-timestamp shape is pivoted into one row per
-/// item (each row = the group's label map plus an `item` label, one point
-/// per timestamp that item appeared in the ranked list) -- the SAME
-/// convention `sketch_reducer.rs`'s own topk arm already uses, not a new
-/// one invented here.
-fn summary_value_to_series(
-    group_key: &BTreeMap<String, String>,
-    value: &SummaryValue,
-) -> SeriesRows {
-    match value {
-        SummaryValue::Points(points, _coverage) => {
-            vec![(group_key.clone(), points.clone())]
-        }
-        SummaryValue::TopK(ranked_per_ts, _coverage) => {
-            let mut by_item: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
-            for (ts, items) in ranked_per_ts {
-                for (item, val) in items {
-                    by_item.entry(item.clone()).or_default().push((*ts, *val));
-                }
-            }
-            by_item
-                .into_iter()
-                .map(|(item, points)| {
-                    let mut lv = group_key.clone();
-                    lv.insert("item".to_string(), item);
-                    (lv, points)
-                })
-                .collect()
-        }
-    }
-}
-
-fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64, u64)>) {
-    let Some((lo, hi)) = next else { return };
-    *coverage = Some(match *coverage {
-        Some((clo, chi)) => (clo.min(lo), chi.max(hi)),
-        None => (lo, hi),
-    });
+    diff_and_log(query, old, &outcome.series, outcome.coverage);
 }
 
 /// Diff the new path's series/coverage against the old `ASAPTierResult`

@@ -11,6 +11,8 @@
 
 pub mod engine;
 pub mod l4_lowering;
+pub mod l4_readout;
+pub mod live_serve;
 pub mod shadow_compare;
 pub mod summary_executor;
 

@@ -1,5 +1,6 @@
-//! PromQL string → `asap_sketch::L4Node` bridge for shadow-mode
-//! `SummaryExecutor` comparison. See
+//! PromQL string → `asap_sketch::L4Node` bridge, shared by both
+//! shadow-mode comparison (`shadow_compare.rs`) and the actual serving
+//! cutover (`live_serve.rs`, via `l4_readout.rs`). See
 //! `data_plane/docs/l4node-plan-executor-design.md`'s "Rollout" section
 //! for the full design and why this calls
 //! `control_plane::sketch_algebra::lower::bind_query_expr`
@@ -20,10 +21,13 @@ use control_plane::sketch_algebra::capability::OuterFn;
 use control_plane::sketch_algebra::{BindingError, L4Plan, PhysicalExpr};
 use control_plane::types_v2::AccuracyTarget;
 
-/// Why `lower_promql_to_l4node` didn't produce a comparable `L4Node`.
+/// Why a query couldn't be answered through the `L4Node`/`SummaryExecutor`
+/// path — covers both `lower_promql_to_l4node`'s own failure to produce a
+/// tree, AND (via `l4_readout.rs`'s `execute_l4_readout`) a failure of
+/// `asap_sketch::exec::execute()` on a tree that DID lower successfully.
 /// None of these are errors in the alarming sense — every variant is an
 /// expected, frequent outcome for *some* fraction of live traffic; the
-/// caller's only obligation is "don't attempt a shadow comparison," never
+/// caller's only obligation is "fall back to the legacy path," never
 /// "log this as a problem."
 #[derive(Debug)]
 pub enum LoweringSkip {
@@ -60,6 +64,13 @@ pub enum LoweringSkip {
     /// outcome, just detected one step earlier so the caller can skip
     /// without even constructing a `QueryExecutionContext`.
     NotRealized,
+    /// The tree lowered successfully, but `asap_sketch::exec::execute()`
+    /// itself returned `Err` (`NoCandidates`, `MergeKindParamsMismatch`,
+    /// a decode/merge failure surfaced from `summary_executor.rs`, ...).
+    /// Always safe to just fall back — this means "can't answer this way
+    /// right now" (e.g. the sid catalog doesn't have an exact
+    /// `(SummaryKind, SummaryParams)` match), never "answered wrong."
+    ExecuteFailed(String),
 }
 
 /// Lower a raw PromQL query string to the `L4Node` tree
