@@ -1,35 +1,47 @@
-# Step C: a recursive `L4Node` plan-executor for `ASAPQueryEngine`
+# L4 serving-time execution — design
 
-Planning doc, not an implementation — same spirit as
+Design doc, not an implementation log — same spirit as
 [`sketchindex-sid-unification-plan.md`](./sketchindex-sid-unification-plan.md).
+This describes the target architecture for `data_plane`'s serving-time query
+execution and the interfaces it's built against, so that work on it (and
+discussion of open questions) has a stable reference independent of which
+piece has landed on which day.
 
-> **Status (2026-07-27).** `impl SummaryExecutor for QueryExecutionContext`
-> (`summary_executor.rs`) now covers quantile/cardinality (DDSketch/Kll/Hll),
-> the Frequency family (CMS/CountSketch/CmsWithHeap/CountSketchWithHeap —
-> bare total, per-item point lookup, top-k), both cumulative (instant) and
-> per-window (matrix/range) queries, real cross-sid merging for all of the
-> above, per-group coverage tracking (`SummaryValue::coverage`), and
-> `AggKind::ExactAgg` candidate matching for `Sum`/`Increase` (#411, #412,
-> #414, #415, #417 — all merged). `ExactAgg` readout still never reaches
-> `SummaryExecutor::readout`/`SketchQuery` at all (unchanged from the
-> original design below) — `GroupState::exact_value` is the accessor a
-> caller uses instead. `MinMax`/`Count`/`Rate` are deliberately NOT matched
-> for `ExactAgg` (no direction info survives to `AggKind::ExactAgg`'s
-> metadata for `MinMax`; no `AggregationType` resolves to `Count`/`Rate`
-> today) — see `summary_executor.rs`'s own module doc and
-> `exact_agg_kind_match`.
->
-> `execute()` is **still not wired into `ASAPQueryEngine::execute()`'s live
-> serving path** — see "Rollout" below, which now has a concrete plan
-> (shadow mode) rather than being an open question. The sections below
-> describe the target design; some turned out to differ from what actually
-> got built — see the inline corrections.
+## Scope and motivation
 
-## Architecture reference: planning vs. serving-time execution
+`data_plane` today answers queries through `SketchReducer`
+(`storage_engines/sketch_db/query/sketch_reducer.rs`), a flat, per-capability
+dispatcher: `engine.rs` collects a `Vec<ASAPTierCandidate>` from
+`analyze_promql_for_asap_tier` and calls one `SketchReducer` method per
+candidate. This has three structural limitations baked into its shape,
+independent of any particular bug:
 
-This doc is the `data_plane`-specific instance of what ASAPController's own
-design doc calls out as a first-class split — see
-[ASAPController `docs/design.md` § "Serving-time execution"](https://github.com/ProjectASAP/ASAPController/blob/097f440079f851a560cc6927f50eb7f56a49e6c/docs/design.md#serving-time-execution):
+- **No real tree.** A candidate is a flat `(metric, capability, group_by_keys,
+  outer_fn, outer_agg, ...)` record, not a composable plan. Nested
+  compositions (`quantile(0.9, sum by (job) (m))`, cross-stage sketch merges)
+  aren't representable as a single structure the reducer walks; they're
+  handled — when they're handled at all — by ad hoc, PromQL-string-level
+  fallbacks in `engine.rs` (`try_topk_over_rate_fallback`,
+  `try_rate_over_frequency_fallback`, `apply_outer_agg_fold`).
+- **No generic cross-sid merge.** Merging multiple sids that answer the same
+  logical group exists for `ExactAgg` (`evaluate_exact_agg`'s own
+  `AggregateCore::merge_with` fold) and, separately, as one bespoke special
+  case for global HLL cardinality (`evaluate_cardinality_global`). Every
+  other grouped sketch case has no generic merge path.
+- **No compile-time contract.** Nothing enforces that candidates merged
+  together actually agree on sketch family and parameters; that's discovered
+  (or not) at read time.
+
+The redesign is to route serving through `asap_sketch::exec::execute()` and
+the `SummaryExecutor` trait it defines — the counterpart, upstream, to the
+planning-time `asap_plan::bind` interface — trading the flat-candidate model
+for a real recursive tree walk with structural guarantees enforced generically
+by `asap-sketch`, not re-implemented per deployment.
+
+## Architecture: planning vs. serving-time execution
+
+ASAPController's own design doc treats this as a first-class split — see
+[`docs/design.md` § "Serving-time execution"](https://github.com/ProjectASAP/ASAPController/blob/097f440079f851a560cc6927f50eb7f56a49e6c/docs/design.md#serving-time-execution):
 
 > Everything above (L1-L5) is the **planning** pipeline: turning a query
 > string into a plan. This section is different in kind — it's what
@@ -39,232 +51,395 @@ design doc calls out as a first-class split — see
 > `asap_plan` (planning-time binder) and `SummaryExecutor` (serving-time
 > executor).
 
-Concretely, for this deployment:
+For this deployment:
 
-- **Planning** (`L3 QueryExpr → L4 L4Node`) is `control_plane`'s job —
-  `asap_plan::bind`/`implement_tree_in_with`, plugged with a `CostModel`.
-  `control_plane` runs **in-process** with `data_plane` in this deployment
-  (the "Phase 9" comment in `data_plane/Cargo.toml`), so this is a
-  same-binary library call, not a network hop or a second planning
-  implementation living in `data_plane`.
-- **Serving** (`L4Node → Value`, "walk the already-decided tree against
-  whatever is actually materialized right now") is `data_plane`'s job —
-  `impl SummaryExecutor for QueryExecutionContext` (`summary_executor.rs`),
-  covered by the rest of this doc.
+- **Planning** (`L3 QueryExpr → L4 L4Node`) is `control_plane`'s
+  responsibility — `asap_plan::bind`/`implement_tree_in_with`, parameterized
+  by a `CostModel`. Planning has, by design, no reference to what's actually
+  materialized anywhere — it symbolically picks a summary family and
+  parameters from the query shape and an accuracy target alone.
+- **Serving** (`L4Node → Value`: walk the already-decided tree against
+  whatever is actually materialized right now) is `data_plane`'s
+  responsibility — an `impl SummaryExecutor` type, covered below. Serving
+  needs its own error vocabulary distinct from planning's, because reality
+  can diverge from the plan in ways planning never sees: missing data,
+  multiple instances needing a merge, instances that disagree on parameters.
 
-The one thing this deployment's topology adds that the upstream doc doesn't
-need to say: because both halves run in the same process, `data_plane` CAN
-call `control_plane`'s planning function directly at request time (see
-"Rollout" below) rather than needing a wire protocol to receive an
-already-built plan from a separately-deployed control plane. This is a
-deployment-specific convenience, not something `asap-plan`/`asap-sketch`
-assume.
+`control_plane` runs **in-process** with `data_plane` in this deployment (see
+`data_plane/Cargo.toml`'s dependency comment), so calling `control_plane`'s
+planning entry point directly from `data_plane` at request time is a
+same-binary library call, not a network hop or a second planning
+implementation living in `data_plane`. That's a deployment-specific
+convenience this topology affords, not something `asap-plan`/`asap-sketch`
+assume of every deployment.
 
-## Today
-
-`ASAPQueryEngine::execute()` (`asap_query_engine/engine.rs:1264-1923`) has no
-tree. It gets a flat `Vec<ASAPTierCandidate>` from
-`analyze_promql_for_asap_tier` and loops:
-
+```mermaid
+flowchart LR
+    Q["PromQL query string"] --> P["control_plane planning\n(bind_query_expr, ControlPlaneCostModel)"]
+    P --> L4["L4Node tree"]
+    L4 --> E["data_plane serving\n(SummaryExecutor::execute)"]
+    E --> V["Value"]
 ```
-for candidate in candidates {
-    sids = instances_matching(metric, group_by).filter(|sid| required.is_satisfied_by(sid.capability));
-    result = evaluate_exact_agg / evaluate_for_capability(sids, ...);
-    combined_result = Some(result);   // ← overwrites, never folds
+
+### Which planning entry point
+
+Two `control_plane` functions can turn a PromQL string into an `L4Node`, and
+they are **not interchangeable**:
+
+- `control_plane::sketch_algebra::lower::bind_query_expr` — parameterized by
+  `ControlPlaneCostModel`: real accuracy-bound-driven parameter sizing, and,
+  via `boundary::implementation_for_with` + `realize_extension`/
+  `readout_extension`, correct realization of the `Extension`/`Frequency`
+  intent (CMS/CountSketch). This is the function `main.rs`'s own production
+  planning pipeline calls.
+- `control_plane::asap_tier_implement::implement_promql_for_asap_tier` —
+  parameterized by the naive `asap_plan::DefaultCostModel`: no accuracy-driven
+  sizing, and a documented inability to realize the `Frequency` intent at all
+  (falls back to `SummaryExpr::Logical` for the entire CMS/CountSketch
+  family — see that module's own doc).
+
+Serving-time tree construction must use `bind_query_expr`. `implement_promql_for_asap_tier`
+exists for a narrower purpose (finding realizable `Aggregate` subtrees
+anywhere in a query tree, not just at the root) and is not a drop-in
+substitute for planning a whole query for serving.
+
+`bind_query_expr(expr: &QueryExpr, accuracy: AccuracyTarget) -> Result<PhysicalExpr, BindingError>`
+always returns `PhysicalExpr::Committed(L4Plan::Summary(Rc<L4Node>))` per its
+own contract (it never picks a Phase ε.1 edge/backend placement), so
+extracting the tree is a simple pattern match; any other `PhysicalExpr` shape
+is a signal this deployment doesn't yet handle that binding outcome.
+
+`ControlPlaneCostModel::new(accuracy)` takes only an `AccuracyTarget` — no
+live server or catalog state — so it's constructible standalone wherever
+`control_plane` is reachable as a library.
+
+**Design consequence — sizing is not guaranteed to match what's stored.** A
+freshly-computed `SummaryParams` (width/depth/k/precision) from planning is
+not guaranteed to exactly match whatever a given sid was actually provisioned
+with (registration happens at a different time, potentially under a
+different accuracy target or cost-model version). Since `find_candidates`'s
+contract is an *exact* `(SummaryKind, SummaryParams)` match, a mismatch here
+simply yields no candidates for that sid — a capability miss, not a wrong
+answer. Any rollout strategy needs to account for how often this drift
+occurs before relying on serving-time re-planning as the sole tree source.
+
+## The `SummaryExecutor` interface
+
+`asap-sketch`'s `exec` module defines the shared, deployment-agnostic
+contract:
+
+```rust
+trait SummaryExecutor {
+    type Handle: Clone;
+    type State;
+    type Value;
+    type Error;
+    type GroupKey: Clone + Ord + Default;
+
+    fn find_candidates(
+        &self,
+        sketch: &SummaryKind,
+        params: &SummaryParams,
+        col: &ColumnRef,
+        by: &[ColumnId],
+        child: &L4Node,
+    ) -> Result<Vec<(Self::GroupKey, Self::Handle)>, Self::Error>;
+
+    fn fetch_state(&self, handle: &Self::Handle) -> Result<Self::State, Self::Error>;
+    fn merge_states(&self, states: Vec<Self::State>) -> Result<Self::State, Self::Error>;
+    fn readout(&self, state: &Self::State, query: &SketchQuery) -> Result<Self::Value, Self::Error>;
+    fn logical(&self, expr: &QueryExpr) -> Result<Self::Value, Self::Error>;
 }
 ```
 
-Four real gaps this left (as of the original version of this doc):
+`execute(node, exec)` (upstream, not deployment code) does the recursive
+walk and owns the *structural* rules generically:
 
-1. **No fold.** The loop overwrites instead of combining — fine today because
-   real queries only ever produce ≤1 candidate, but there's no existing
-   multi-node behavior to be "faithful to" once that's no longer true.
-   Still true of the legacy `SketchReducer` path — unaffected by anything
-   below, since none of it has been wired into `engine.rs` yet.
-2. **Merge only existed for `ExactAgg`** on the legacy path. ~~Every other
-   grouped sketch case silently emits duplicate un-merged series today.~~
-   **Resolved on the new path**: `summary_executor.rs`'s `readout_cumulative`/
-   `readout_per_window` do real cross-sid merging generically for every
-   sketch family via `SummaryState::merge_same_family`, not an `ExactAgg`-only
-   special case. Still an open bug on the legacy `SketchReducer` path itself,
-   which this doc's plan doesn't touch.
-3. **Sketch merge needs exact param match, and nothing checked that on the
-   legacy path.** ~~`AccumulatorSpec` now carries the params `data_plane`
-   needs for this check; nothing wires it into merge-candidate selection
-   yet.~~ **Resolved on the new path** — see "resolved by construction"
-   below.
-4. **Two raw-AST fallbacks exist** (`try_topk_over_rate_fallback`,
-   `try_rate_over_frequency_fallback`) for compositions the flat `Capability`
-   vocabulary can't express. Still true, still unaddressed by anything on
-   this doc's plan — see "Remaining open questions" #3.
+- A `SummaryAgg` leaf resolves via `find_candidates`, groups the returned
+  `(GroupKey, Handle)` pairs by `GroupKey`, and folds each group's handles
+  independently via `fetch_state`+`merge_states` — a group's state is never
+  combined with another group's.
+- A `SummaryMerge` requires every child to agree on `(SummaryKind,
+  SummaryParams)` before folding their states together across children,
+  key-by-key.
+- A `SummaryEstimate` calls `readout` on the state its child produced.
+- Nesting composes: `execute()`'s own recursion handles arbitrary depth
+  (`SummaryAgg`-of-`SummaryAgg`, `SummaryMerge`-of-`SummaryMerge`, ...); the
+  deployment only ever sees one level at a time through the trait methods.
 
-The canonical tree (`asap_sketch::{SummaryExpr, L4Node}`) already exists and
-can be built control-plane-side — see "Remaining open questions" #1 below
-for exactly which function does this correctly (it turned out to matter
-which one).
+The deployment supplies storage, summary math, and readout; `asap-sketch`
+enforces which nestings are structurally valid and propagates the
+`(SummaryKind, SummaryParams)` agreement check through arbitrary nesting
+depth — a deployment implementing this trait does not need its own
+merge-precondition check layered on top.
 
-## The executor is now a common interface, not a bespoke walk
+## Data model
 
-ASAPController#155 (`crates/sketch/src/exec.rs`) adds `SummaryExecutor` +
-`execute()` upstream: a deployment implements the trait, `asap-sketch`
-does the recursive walk and enforces the structural rules generically
-(which nestings are valid, that `SummaryMerge` children must agree on
-`(SummaryKind, SummaryParams)`, propagated correctly through arbitrary
-nesting depth). See `docs/l4-summary-bound-ir.md` in ASAPController for
-the full design; this doc only covers what's specific to `data_plane`.
+`QueryExecutionContext<'a>` is the `SummaryExecutor` implementer — a small,
+per-query, stack-local value (`index: &SketchStore`, `t0_ms`, `t1_ms`,
+`is_cumulative`), constructed fresh per incoming query rather than carried on
+`ASAPQueryEngine` itself: the trait carries no time-range parameter, and
+`ASAPQueryEngine` is called concurrently, so threading a query's range through
+shared mutable engine state would race.
 
-`data_plane`'s implementation (`summary_executor.rs`) is
-`impl SummaryExecutor for QueryExecutionContext`, a small per-query
-context — not `ASAPQueryEngine` directly, since the trait carries no
-time-range parameter and `ASAPQueryEngine` is called concurrently;
-`QueryExecutionContext` is constructed fresh per query with `t0_ms`/
-`t1_ms`/`is_cumulative` as plain fields:
-
-| `SummaryExecutor` method | `data_plane` implementation |
+| Interface type | Design |
 |---|---|
-| `Handle` | `SidHandle` — an **enum**: `Sketch { series: Rc<SketchTimeSeries>, kind: DeltaSketchKind }` or `ExactAgg { windows: Rc<BTreeMap<i64, Arc<dyn AggregateCore>>>, agg_type: AggregationType }`. `find_candidates` needs to fetch the series/windows anyway (to read label values for the group key), so the handle carries it forward instead of `fetch_state`/`readout` re-fetching the same `(sid, t0, t1)` range a second time. |
-| `GroupKey` | `BTreeMap<String, String>` — the sid's own label values projected onto the query's `by` columns. |
-| `State` | `GroupState` — also an enum, mirroring `SidHandle`'s two variants. Decode/merge is deliberately lazy for the `Sketch` variant: `fetch_state`/`merge_states` just assemble the candidate list; the actual `SummaryState` reconstruction and merge happens in `readout`, which is where cumulative-vs-per-window mode is known. `ExactAgg`'s value extraction (`GroupState::exact_value`) is eager-ish but still only runs when a caller asks. |
-| `find_candidates(sketch, params, col, by, child)` | walks `child` down to a `Scan{source: Source::TimeSeries{metric}, ..}` to recover the metric, then `instances_matching(metric, by)` filtered to sids whose `AggKind` is either `Sketch{kind, config, ..}` with `(SketchKindHandle, SketchConfig)` exactly `(sketch, params)`, or `ExactAgg{agg_type, ..}` matching `exact_agg_kind_match(sketch, params, agg_type)` — not the looser family-only `Capability::is_satisfied_by` check the legacy analyzer path uses. |
-| `merge_states` | Lazy for `Sketch` — see `State` above. Errors (`UnsupportedFamily`) if a group somehow mixes `Sketch` and `ExactAgg` entries (shouldn't happen; `find_candidates`'s per-`(kind,params)` exactness makes this defensive, not a real path). |
-| `readout` | Real cross-sid merge via `delta_apply::cumulative_summary_state`/`per_window_summary_states` + `SummaryState::merge_same_family`, covering DDSketch/Kll/Hll/Cms/CmsWithHeap/CountSketch/CountSketchWithHeap. Returns `SummaryExecutorError::UnsupportedFamily` for an `ExactAgg` state (defensive — see below, `readout` is never actually called for one in practice). |
-| `logical` | `Err(SummaryExecutorError::Logical)` — same meaning as "no candidate bound" today, lets `EngineRouter` fail over to archive. |
+| `GroupKey` | `BTreeMap<String, String>` — the output row's label identity. See "Grouping semantics" below; this is the type with the least-settled design. |
+| `Handle` | A sid plus its already-fetched `[t0, t1]` data, carried through from `find_candidates` so `fetch_state`/`readout` don't re-query the same range. Structured as an enum over the two payload shapes a sid can carry: a sketch series (`Rc<SketchTimeSeries>` + a decode-parameter tag) or an exact-aggregation window map (`Rc<BTreeMap<i64, Arc<dyn AggregateCore>>>` + the `AggregationType`). One sid answers one aggregation — there is no special-cased "is this exact or approximate" branch anywhere above this data-shape distinction; both payload kinds sit inside the same `find_candidates`/`fetch_state`/`merge_states` machinery. |
+| `State` | Mirrors `Handle`'s two-variant shape: an accumulated list of sketch entries sharing one decode kind, or an accumulated list of exact-aggregation window maps sharing one `AggregationType`. Decode/merge for the sketch variant is deliberately lazy — `fetch_state`/`merge_states` only assemble the candidate list; reconstruction and merge happen in `readout`, which is the one place that knows cumulative-vs-per-window mode. |
+| `Value` | Carries two shapes driven purely by the `SketchQuery` issued: `Points` (one scalar per timestamp) or `TopK` (one ranked `(item, value)` list per timestamp). Both variants carry the group's own observed `(min_window_end_ms, max_window_end_ms)` coverage alongside the payload — see "Coverage" below. |
+| `Error` | Distinguishes: no candidate found (→ failover), an unresolved `by` column, a family this executor can't merge/decode, a decode/merge failure surfaced from lower layers, a bare `Logical` node (nothing committed at this point in the tree — same meaning as "no candidate bound," lets the caller fail over to archive), and a query shape outside this executor's covered scope. Each is a distinct, matchable variant, not a single opaque error string — callers (today: tests; eventually: `engine.rs`) need to tell these apart to decide whether to fail over to archive, log a bug, or something else.
 
-`AggregateCore::merge_with`/per-family `asap_sketchlib` merge turned out to
-be two genuinely separate things, not one shared mechanism: `ExactAgg`
-readout never reaches `SummaryExecutor::readout` at all (`asap_plan::bind`
-never wraps an `ExactAccumulator` implementation in a `SummaryEstimate`,
-so `execute()` on such a tree returns `ExecOutcome::State` at the root —
-a caller-side concern, not something this trait implementation handles),
-while the sketch-family merge is what's actually implemented in `readout`,
-via `SummaryState::merge_same_family` rather than `asap_sketchlib` calls
-made directly in this module. `GroupState::exact_value(&self, key)` is the
-`ExactAgg` analog of `readout_cumulative` — folds every window/sid in the
-group via `AggregateCore::merge_with`, then reads out the statistic
-`agg_type` implies — called directly by whatever future caller reads an
-`ExecOutcome::State`'s contents (see "Rollout" below for the first such
-caller).
+### `find_candidates`
 
-Because `find_candidates` is now contractually required to return only
-exact-`(kind, params)` matches (`asap-sketch`'s trait doc), gap 3 above
-(nothing checked param agreement on the legacy path) is resolved by
-construction for anything routed through `execute()` — `data_plane` no
-longer needs its own merge-precondition check, `asap-sketch`'s does it for
-`SummaryMerge` children, and `find_candidates`'s contract does it for a
-single `SummaryAgg`'s candidate set.
+Walks the `L4Node` subtree (`child`) down to a `Scan{source:
+TimeSeries{metric}, ..}` to recover the metric name (`SummaryAgg` itself
+carries no metric/source field), then looks up sids by `(metric,
+required_keys)` and filters to the sids whose stored kind is an *exact*
+match: for a sketch-backed sid, `(SketchKindHandle, SketchConfig)` equal to
+`(sketch, params)`; for an exact-aggregation-backed sid, an `AggregationType`
+that maps unambiguously onto `(sketch, params)` (see "ExactAgg" below for
+which mappings are unambiguous and which aren't). This is a strictly exact
+match, not the family-only `Capability::is_satisfied_by` check the legacy
+flat-candidate path uses — `SummaryMerge`'s precondition (every child agrees
+on kind AND params) is satisfied by construction for anything this executor
+produces, rather than needing a second check layered on top.
+
+### Grouping semantics
+
+`by: &[ColumnId]` names the output columns the caller wants each row keyed
+by. The natural design is: project each matched sid's own label values onto
+exactly those columns to get the row's `GroupKey`; sids that project to the
+same key merge (via `merge_states`); sids that project to different keys stay
+distinct rows.
+
+This is correct and sufficient whenever `by` is a genuine, resolvable
+requirement — e.g. `quantile by (zone) (...)`, where the query explicitly
+asks for one row per `zone`. It is **not sufficient on its own** when `by` is
+empty, because an empty `by` is ambiguous between two genuinely different
+intents that the current `L4Node` shape cannot distinguish:
+
+1. **No reduction concept applies.** A bare per-series function with no
+   PromQL `by(...)` and no label selector at all (e.g. `quantile_over_time(q,
+   m[r])`) has no grouping syntax to begin with — planning has nothing in
+   the query text to resolve a label column against, so the schema simply
+   doesn't carry one. The correct output here is one row *per underlying
+   series*, each keeping its own full label identity — never merging series
+   that happen to share no explicit `by`.
+2. **An explicit, empty reduction was requested.** A genuine PromQL
+   aggregation operator invoked with no `by(...)` (e.g. `count(hll_metric)`,
+   `sum(exact_metric)`) means "reduce every matching series into one." The
+   correct output here is exactly one row, merging every matched sid
+   together, regardless of what labels they individually carry.
+
+Both cases produce the identical `SummaryAgg{by: []}` shape — confirmed by
+inspecting the bound tree for each directly. The distinction (an aggregation
+operator's own, possibly-empty `by(...)` vs. a construct with no grouping
+concept at all) exists at the PromQL/L1 surface and is not preserved through
+the L2→L3 canonicalization that unifies both into the same `Aggregate`
+node shape.
+
+**Two families with different, independently-correct defaults today:**
+
+- **`ExactAgg`** (`Sum`/`Increase`): these `AggregationType`s map *only* from
+  genuine PromQL aggregation operators (`sum()`, `increase()`) — there is no
+  bare-range-function path into this family with the ambiguity described
+  above (`sum_over_time`/`avg_over_time` map to different, currently-unmatched
+  intents). So an empty `by` here is unambiguous: reduce fully. Projection
+  onto `by` (empty producing one shared key) is correct as-is.
+- **Sketch families** (`DDSketch`/`Kll`/`Hll`/`Cms`/`CountSketch`, with or
+  without a heap): each of these families is reachable through *both* a bare
+  range function (case 1) and a genuine aggregation operator (case 2) —
+  `quantile_over_time(...)` and `quantile(...)`/`count(hll_metric)` both
+  bind to the same `SummaryKind`. The conservative, always-safe default is
+  case 1's behavior: when `by` is empty, use the sid's own full label
+  identity rather than collapsing to a shared empty key — this can never
+  silently merge two series that weren't meant to be merged, at the cost of
+  under-serving case 2 (a true full-reduction query gets one row per sid
+  instead of one merged row).
+
+**Open design question — resolving case 2 generally.** Under-serving case 2
+is not a narrow, single-metric special case to work around locally; every
+sketch family has this same ambiguity whenever `by` is empty. A general
+resolution needs one of:
+
+- An upstream signal on `SummaryAgg` (or an adjacent structure) distinguishing
+  "this by is empty because the query has no grouping syntax at all" from
+  "this by is empty because an aggregation operator explicitly reduced
+  everything" — surviving the L2→L3 canonicalization that currently discards
+  it. This is an `asap-ir`/`asap-plan` design question, not one `data_plane`
+  can resolve unilaterally.
+- Equivalently, a caller-supplied signal threaded alongside the tree at
+  serving time (mirroring how `engine.rs`'s flat-candidate path already
+  carries an independent `outer_agg`/`by_labels` derived directly from the
+  original PromQL AST, entirely outside the `L4Node`/`Capability` vocabulary).
+  Note that a full reduction over a non-additive statistic (cardinality is
+  the concrete example: HLL registers must be merged *before* estimating,
+  not estimated-then-summed, or overlapping members get double-counted) is
+  exactly the kind of "merge these states together, then read out once"
+  operation this executor's own `find_candidates`→`merge_states`→`readout`
+  pipeline already performs for any group sharing one key — the missing
+  piece is purely which sids belong in that one group, not new merge math.
+
+Until one of these lands, full-reduction queries with an empty, ambiguous
+`by` over one of the sketch families are not generally answerable through
+this executor — they remain the flat legacy path's responsibility (which
+resolves the ambiguity today via bespoke, capability-specific special cases,
+e.g. HLL's own global-cardinality dispatch).
+
+### Readout
+
+Two modes, both doing real cross-sid merging rather than reporting one
+sid's data or the first match found:
+
+- **Cumulative** (`quantile_over_time`/`count_distinct_over_time`-shaped
+  instant queries): fold each group's whole `[t0, t1]` range into one merged
+  state per group, then read out one scalar (or one ranked list, for
+  `SketchQuery::TopK`).
+- **Per-window** (matrix/range queries): reconstruct each group's sids' own
+  per-window states, merge same-window states *across* sids, then evaluate
+  each window independently — one merged answer per window, not one merged
+  answer for the whole range. Windows union across sids: a sid missing a
+  particular window simply doesn't contribute to it, rather than dropping
+  the whole window.
+
+Cross-sid merge for both modes goes through a shared "merge same summary
+family" operation — the sketch-family analog of `AggregateCore::merge_with`,
+generalized from what was originally a single family-specific special case
+into a mechanism that covers every sketch family this executor supports,
+including heap-bearing (top-k) variants. Partial coverage — a group missing
+a sid for one part of the range — folds whatever is present rather than
+dropping the whole group, matching `SummaryMerge`'s own semantics upstream.
+
+### Coverage
+
+Each readout carries the group's own observed `(min_window_end_ms,
+max_window_end_ms)` alongside its value — the signal a caller needs to
+decide whether warm-tier data alone answers a query or whether an archive
+tier must also be consulted and the two answers stitched. This mirrors the
+legacy tier result's own coverage field, including a subtlety worth being
+explicit about: despite that field's naming, no window-*start* is available
+on the sketch storage path at all (samples are keyed by window-*end* only)
+— both coverage bounds are folded from window-end timestamps observed across
+the group's own windows, not true window starts. Coverage is folded from
+*every* window observed, including any carry-in base spliced in to seed a
+leading delta-only window — that base never surfaces as an output point, but
+its window-end legitimately extends the group's covered range.
+
+### ExactAgg
+
+Exact-aggregation-backed sids (`Sum`, `Increase` today) participate in
+`find_candidates`/`fetch_state`/`merge_states` as first-class candidates,
+matched by the same one-sid-one-aggregation contract as sketches — no
+"is this exact or approximate" branch anywhere in the matching logic.
+
+`MinMax` is deliberately **not** matched: `AggregationType` carries no
+min-vs-max direction, so there is no honest way to resolve which statistic a
+readout should compute from an `ExactAgg` sid's stored metadata alone —
+matching it would force a guess. `Count`/`Rate` are also not matched: no
+`AggregationType` resolves to either today (`Rate` in particular is reached
+by rewriting to `Increase` before an accumulator is chosen at all, so the
+distinct concept never reaches storage).
+
+`readout`/`SketchQuery` never see an `ExactAgg` state in practice:
+`asap_plan::bind` never wraps an exact-accumulator implementation in a
+`SummaryEstimate` (an intent's `estimate` flag is false for these), so
+`execute()` on a tree rooted in one of these intents returns
+`ExecOutcome::State` directly rather than reaching a `SummaryEstimate`
+node — a caller-side concern, not something this trait implementation
+handles. The value-extraction entry point for this case lives on the state
+type itself (folding every window/sid in the group via
+`AggregateCore::merge_with`, then reading out the statistic the
+`AggregationType` implies) — called directly by whatever code reads an
+`ExecOutcome::State`'s contents once the caller side of that path exists.
 
 ## Nested queries in this deployment's topology
 
-`execute()`'s recursion handles arbitrary nesting depth already (see the
-ASAPController doc) — the deployment-specific question is what nesting
-actually *occurs* in a three-stage (edge/gateway/backend) topology:
+`execute()`'s recursion handles arbitrary nesting depth already; the
+deployment-specific question is what nesting actually *occurs* in a
+three-stage (edge/gateway/backend) topology:
 
-- **`SummaryAgg`-of-`SummaryAgg`** (`quantile(0.9, sum by (job) (m))`):
-  edge builds per-job sums; backend's KLL is built over that sum stream.
-  Already a valid, tested shape upstream — no new work here beyond
-  `find_candidates` correctly walking past the inner `SummaryAgg` to find
-  the metric.
-- **`SummaryMerge`-of-`SummaryMerge`**: a plausible real shape once
-  merging isn't `ExactAgg`-only — e.g. per-zone edge sketches merge at a
-  regional gateway, regional merges merge again at the backend. `execute()`
-  already handles this (the `(kind, params)` check is transitive), so this
-  is a rollout/topology question, not a design gap: does this deployment's
-  stage allocator ever actually *produce* a two-level merge cascade today,
-  or does everything currently collapse to one gateway hop? Worth checking
-  against `physical/colored_dag`'s stage-allocation output before assuming
-  the two-level case needs dedicated testing. Still unresolved — no new
-  information this round.
+- **`SummaryAgg`-of-`SummaryAgg`** (`quantile(0.9, sum by (job) (m))`): edge
+  builds per-job sums, backend's sketch is built over that sum stream.
+  Already a valid, structurally-supported shape — `find_candidates` walking
+  past the inner `SummaryAgg` to find the metric is the only requirement.
+- **`SummaryMerge`-of-`SummaryMerge`**: a plausible real shape once merging
+  isn't `ExactAgg`-only — e.g. per-zone edge sketches merge at a regional
+  gateway, regional merges merge again at the backend. `execute()`'s
+  `(kind, params)` agreement check is transitive through this nesting, so
+  this is a rollout/topology question, not a structural gap: does this
+  deployment's stage allocator ever actually *produce* a two-level merge
+  cascade, or does everything currently collapse to one gateway hop? Worth
+  checking against the stage-allocation output before assuming the
+  two-level case needs dedicated testing.
 - **`SummaryAgg`-over-`SummaryEstimate`**: flagged upstream as an open,
-  unresolved question (building a new summary from another summary's
-  query-time readout). `data_plane`'s `SketchStore` only ever serves
+  unresolved question in general (building a new summary from another
+  summary's query-time readout). `data_plane`'s storage only ever serves
   summaries built at ingest time from raw samples — if `find_candidates`
   ever receives a `child` whose subtree bottoms out in a `SummaryEstimate`
-  rather than raw `Logical`/`SummaryAgg`, that's this shape, and the
-  right answer today is `Err` (unsupported), not a guess. Still unresolved.
+  rather than raw `Logical`/`SummaryAgg`, the right answer is `Err`
+  (unsupported), not a guess.
 
-## Rollout
+## Rollout design
 
-`execute()` isn't wired into `ASAPQueryEngine`'s live serving path yet at
-all. This round's plan (see the tracked plan file / PR for the actual
-implementation) is a **shadow-mode** first phase, not a cutover:
+Because planning-time re-derivation can drift from what's actually stored
+(see "sizing is not guaranteed to match" above) and because the grouping
+ambiguity above means some query shapes aren't yet generally answerable,
+cutting serving over to this executor outright is not a safe first step.
+The intended rollout shape is **shadow mode**: compute the new answer
+alongside whatever the legacy path already produces, diff the two, log
+discrepancies, and always return the legacy answer — mirroring
+`docs/design-sketch-db-roadmap.md` § 13.2's documented (previously
+unimplemented) pattern for exactly this kind of migration:
 
-1. **Tree source, corrected.** The previous version of this doc said
-   `implement_promql_for_asap_tier` (`control_plane::asap_tier_implement`,
-   Step A) "is the seam for planning-time tree construction." That's
-   *incomplete* — that function uses the naive `asap_plan::DefaultCostModel`
-   (no real accuracy-driven parameter sizing) and has its own documented,
-   tracked gap: it cannot realize `AggIntent::Extension`/`Frequency`
-   (CMS/CountSketch) at all — falls back to `SummaryExpr::Logical` for the
-   entire Frequency family (see that module's own doc, "Known gap:
-   Extension/Frequency under-realizes"). The correct seam is
-   `control_plane::sketch_algebra::lower::bind_query_expr` — the function
-   `main.rs`'s real production planning pipeline calls, using
-   `ControlPlaneCostModel` (real accuracy-bound sizing, and, via
-   `boundary::implementation_for_with` + `realize_extension`/
-   `readout_extension`, ASAPController#150, correct Frequency realization
-   too). `ControlPlaneCostModel::new(accuracy)` takes only an
-   `AccuracyTarget` — no live server/catalog state — so it's constructible
-   standalone from `data_plane`, matching the "same-binary library call"
-   framing in "Architecture reference" above. `bind_query_expr` always
-   returns `PhysicalExpr::Committed(L4Plan::Summary(Rc<L4Node>))` per its
-   own doc (never picks a Phase ε.1 edge/backend placement), so extracting
-   the tree is a simple pattern match.
-2. **Sizing drift is expected, not a bug to fix first.** A freshly-computed
-   `SummaryParams` (width/depth/k/precision) from step 1 is NOT guaranteed
-   to exactly match what's actually registered in `SketchStore` right now
-   — `find_candidates`'s contract is an exact match, so a mismatch just
-   means `NoCandidates`/an empty group, not a wrong answer. This is exactly
-   what shadow mode is for: surface how often/how badly this happens before
-   ever trying to close the gap.
-3. **`rate()`/topk-over-rate/outer-agg-fold are excluded from the shadow
-   comparison entirely**, not just deprioritized. `lower.rs`'s
-   `bind_recursive` rewrites `AggIntent::Rate → Increase` before binding
-   (so a `rate()` query DOES bind to a valid `SummaryAgg{Increase}` tree),
-   but `summary_executor.rs` has no rate-division logic (dividing by a
-   coverage-clamped range is `sketch_reducer.rs::evaluate_exact_agg_rate`/
-   `evaluate_frequency_rate`'s job) — so the new path would produce a
-   semantically wrong (un-divided) answer for `rate()` if compared naively.
-   Detected and skipped before ever calling into `control_plane` for this
-   phase, using the same raw-AST inspection `engine.rs`'s existing
-   fallbacks already do.
-4. **Shadow, not cutover.** Compute the new answer alongside the old
-   (`SketchReducer`), diff, log discrepancies, always return the old
-   answer — see `docs/design-sketch-db-roadmap.md` § 13.2 "Shadow mode"
-   for the pattern this follows (already documented there, unimplemented
-   until now). `ASAP_LEGACY_DUAL_WRITE`
-   (`data_plane/src/drivers/ingest/otel.rs:891-895`) is the closest
-   actually-shipped env-var mechanics to mirror for the flag itself;
-   `control_plane`'s `USE_TYPED_STAGE_SPLIT` is a single-path selector, not
-   a shadow/diff pattern, so it's the wrong template despite being more
-   prominent in this codebase.
+```rust
+let old = legacy_path.evaluate(...);
+if shadow_mode_enabled() {
+    let new = new_executor.execute(...);
+    log_diff(old, new); // never affects what's returned
+}
+old
+```
 
-Actually switching what's served, and retiring `sketch_reducer.rs`, both
-require confidence data this phase doesn't yet produce, plus a resolution
-for the rate/outer-fold gap (which needs its own cross-repo design
-conversation with ASAPController, not a unilateral local decision) —
-neither is in scope for the shadow-mode phase.
+A query shape known to bind successfully but answer *differently* under the
+two paths (rather than simply not binding) must be excluded from the
+comparison rather than compared naively — e.g. `rate()`/`irate()` bind to a
+valid tree (the underlying intent is rewritten to `Increase` before
+accumulator choice), but this executor has no rate-division step, so a naive
+comparison would show a spurious, not a real, discrepancy.
 
-## Remaining open questions
+Actually switching what's served, and retiring the legacy reducer path
+entirely, both require: confidence data from shadow mode about how often
+planning-time re-derivation disagrees with what's stored, a resolution for
+the grouping ambiguity above (at least for the query shapes real traffic
+exercises), and a resolution for the outer-fold family of gaps below — none
+of which shadow mode alone produces; it only makes the size and shape of
+those gaps observable.
 
-1. **Tree source — see "Rollout" above**, now resolved with a correction
-   to the original answer (`bind_query_expr`, not
-   `implement_promql_for_asap_tier`). `data_plane` still needs a *direct*
-   `asap-sketch` (and `asap-ir`) dependency, pinned to match `control_plane`'s
-   exactly — implementing `SummaryExecutor` and matching `L4Node`/
-   `SketchQuery` variants requires importing their defining crate directly;
-   consuming a function that merely returns those types isn't enough for
-   Rust's trait/pattern-matching rules.
-2. **`SummaryMerge` for sketch families — resolved.** KLL/DDSketch/HLL/
-   CMS/CountSketch (bare and heap-bearing) merge are all implemented via
-   `SummaryState::merge_same_family`. Partial coverage (a group missing a
-   sid for one part) is resolved as "fold whatever's present," not "miss
-   the whole group" (mirrors `SummaryMerge`'s own semantics,
-   ASAPController#159/#161). Accuracy-math and resize/downsample questions
-   remain genuinely open, not yet investigated.
-3. **`topk`/`rate` post-processing**: still open. `try_topk_over_rate_fallback`/
-   `try_rate_over_frequency_fallback` in `engine.rs` remain
-   `SketchReducer`-only; the shadow-mode rollout explicitly excludes these
-   shapes rather than attempting them (see "Rollout" #3) pending the
-   cross-repo design conversation on outer-agg-fold.
-4. **Rollout — no longer just an open question**, see "Rollout" above for
-   the concrete shadow-mode plan.
+## Open design questions
+
+1. **Grouping ambiguity for empty, sketch-family `by`** — see "Grouping
+   semantics" above. Affects every sketch family; needs either an upstream
+   IR signal or a caller-supplied one, not a per-metric special case.
+2. **Outer-fold family of gaps.** Two PromQL compositions the flat
+   `Capability`/`by` vocabulary can't express are handled today only by
+   bespoke, PromQL-string-level fallbacks outside the reducer proper:
+   `topk(K, sum by (...) (rate(m[r])))` (ranking by a non-additive measure
+   over a rate) and stacking an outer exact statistic (avg/stddev/count/
+   group/min/max) on top of an already-computed sketch or exact-agg readout.
+   Neither has an equivalent in this executor; resolving either is explicitly
+   out of scope for a single deployment to decide unilaterally — it needs a
+   cross-repo design conversation, since it's really a question about what
+   `asap-sketch`'s IR should be able to express, not a `data_plane`-local gap.
+3. **`rate(cms_metric[r])` / bare frequency-family rate.** Same "outer fold"
+   category as above, specific to the Frequency family.
+4. **`SummaryMerge`-of-`SummaryMerge` in practice** — see "Nested queries"
+   above; whether this deployment's topology ever produces the two-level
+   case is unconfirmed.
+5. **`SummaryAgg`-over-`SummaryEstimate`** — flagged upstream as open in
+   general; this deployment's answer (reject, don't guess) is a local
+   default, not a resolution of the upstream question.
+6. **Sizing drift** — how often and how badly a freshly-planned
+   `SummaryParams` fails to match what's actually registered; only
+   measurable empirically once serving-time re-planning is exercised against
+   real traffic.
