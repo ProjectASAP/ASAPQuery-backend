@@ -2406,7 +2406,7 @@ mod tests {
         );
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
         let exec = ctx(&idx);
@@ -2421,7 +2421,7 @@ mod tests {
                 &SummaryKind::Kll,
                 &SummaryParams::Kll { k: 200 },
                 &ColumnRef::SampleValue,
-                &[],
+                &Reduction::by(vec![]),
                 &scan_node("latency_ms", None),
             )
             .expect("find_candidates should succeed");

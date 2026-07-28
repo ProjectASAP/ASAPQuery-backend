@@ -2554,19 +2554,23 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     );
 }
 
-// ── Test — the live serving cutover falls back correctly on the known ──────
-//    ambiguous global-merge shape (ASAPController#163)
+// ── Test — the live serving cutover MERGES the global-merge shape ─────────
+//    correctly, end to end (ASAPController#163/#165)
 //
 // `count(hll_metric)` with NO `by (...)` and MULTIPLE distinct-service HLL
-// sids is exactly the ambiguous shape the design doc's "Grouping
-// semantics" section describes: `SummaryAgg{by: []}` can't tell "no
-// grouping concept" from "reduce everything." `live_serve.rs`'s
-// `ambiguous_merge_risk` gate must decline to serve this from the new
-// path even with the flag on, falling back to the legacy
-// `evaluate_cardinality_global` special case (which already merges the
-// registers correctly) -- so the end-to-end answer must still succeed.
+// sids used to be the ambiguous shape the design doc's "Grouping
+// semantics" section described: `SummaryAgg{by: []}` couldn't tell "no
+// grouping concept" from "reduce everything," so `live_serve.rs`'s
+// `ambiguous_merge_risk` gate DECLINED to serve it from the new path and
+// fell back to the legacy `evaluate_cardinality_global` special case.
+//
+// `Reduction` (ASAPController#165) resolves that: `count(...)` is a
+// genuine aggregation operator, so it lowers to `Reduce([])` and
+// `resolve_group_key` gives both sids the same group key -- the new path
+// merges them itself. The gate is gone; this now exercises the new
+// path serving the shape directly, not a fallback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn live_serve_ambiguous_hll_global_count_falls_back_correctly() {
+async fn live_serve_hll_global_count_merges_across_sids() {
     let _live = LiveServeEnvGuard::enable();
 
     let stack = start_full_stack(19_595, 19_596).await;
@@ -2640,8 +2644,7 @@ async fn live_serve_ambiguous_hll_global_count_falls_back_correctly() {
     assert_eq!(
         response["status"].as_str().unwrap_or("(missing)"),
         "success",
-        "the ambiguous global-merge shape must still succeed via legacy fallback \
-         with live-serve on. Response:\n{}",
+        "the global-merge shape must succeed with live-serve on. Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 
@@ -2649,8 +2652,14 @@ async fn live_serve_ambiguous_hll_global_count_falls_back_correctly() {
         .as_array()
         .and_then(|r| extract_first_scalar(&JsonValue::Array(r.clone())))
         .expect("expected a scalar cardinality result");
+    // Each service set exactly ONE distinct non-zero register, and the two
+    // are disjoint -- a correct cross-sid merge estimates ~2, whereas
+    // serving only one sid's state would estimate ~1. The assertion is
+    // loose (HLL at precision 10 is approximate) but still distinguishes
+    // "merged both" from "dropped one."
     assert!(
-        value.is_finite() && value > 0.0,
-        "expected a valid merged cardinality estimate, got {value}"
+        value.is_finite() && value >= 1.5,
+        "expected the MERGED cardinality across both services (~2), got {value} -- \
+         a value near 1 means only one sid's registers were counted"
     );
 }

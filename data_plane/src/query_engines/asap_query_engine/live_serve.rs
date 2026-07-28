@@ -35,11 +35,17 @@ pub fn summary_executor_live_enabled() -> bool {
 
 /// Try to serve `query` entirely from `SummaryExecutor`. Returns `None`
 /// whenever the caller should fall back to the legacy path exactly as
-/// it does today (flag off, lowering/execution failed, or the
-/// grouping-ambiguity gate tripped — see `L4ReadoutOutcome::ambiguous_merge_risk`'s
-/// doc) — `None` here is indistinguishable from Phase 1's shadow-only
-/// behavior. `Some(...)` means the new path answered and the caller
-/// must NOT also call the legacy reducer for this candidate.
+/// it does today (flag off, or lowering/execution failed) — `None` here
+/// is indistinguishable from Phase 1's shadow-only behavior. `Some(...)`
+/// means the new path answered and the caller must NOT also call the
+/// legacy reducer for this candidate.
+///
+/// This used to carry a third fallback reason: a grouping-ambiguity gate
+/// that declined any empty-`by` shape producing >1 group
+/// (ASAPController#163). That gate is gone — `Reduction`
+/// (ASAPController#165) lets `summary_executor.rs` resolve both halves of
+/// the ambiguity correctly on its own, so there is no longer a shape to
+/// decline. See `L4ReadoutOutcome`'s doc for the full reasoning.
 pub fn try_serve_from_summary_executor(
     index: &SketchStore,
     query: &str,
@@ -63,14 +69,6 @@ pub fn try_serve_from_summary_executor(
             return None;
         }
     };
-
-    if outcome.ambiguous_merge_risk {
-        tracing::debug!(
-            query,
-            "live: ambiguous global-merge shape (ASAPController#163), falling back to legacy path"
-        );
-        return None;
-    }
 
     tracing::debug!(query, "live: served from SummaryExecutor");
     Some(ASAPTierResult {
@@ -227,16 +225,34 @@ mod tests {
     }
 
     #[test]
-    fn flag_on_ambiguous_shape_falls_back() {
+    fn flag_on_global_merge_shape_is_served_merged_not_declined() {
+        // Previously `flag_on_ambiguous_shape_falls_back`, asserting
+        // `result.is_none()`: the grouping-ambiguity gate declined this
+        // shape because an empty `by` couldn't be told apart from "reduce
+        // everything" (ASAPController#163). With `Reduction` (#165) the
+        // executor resolves it -- `count(...)` lowers to `Reduce([])`, both
+        // sids share one group key, and the new path serves the correctly
+        // merged answer instead of falling back.
         let _guard = set_live_env("1");
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let result =
             try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true);
+        let result = result.expect(
+            "global-merge shape is no longer ambiguous -- it must be served, not declined",
+        );
+        assert_eq!(
+            result.series.len(),
+            1,
+            "a by-less count() must merge both sids into ONE series, got {:?}",
+            result.series
+        );
+        // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.
+        let card = result.series[0].1[0].1;
         assert!(
-            result.is_none(),
-            "ambiguous global-merge shape must fall back to legacy, not serve a possibly-wrong answer"
+            (4.0..=8.0).contains(&card),
+            "merged cardinality {card} should be ~6 (both sids), not ~3 (one sid)"
         );
     }
 

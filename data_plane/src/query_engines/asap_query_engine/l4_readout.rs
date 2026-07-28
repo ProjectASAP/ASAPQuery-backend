@@ -26,22 +26,36 @@ pub type SeriesRows = Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>;
 /// (`ExecOutcome::Value`) or `ExactAgg` (`ExecOutcome::State`) side —
 /// callers that only care about "did this answer the query, and is it
 /// safe to trust" don't need to know which.
+/// NOTE — this used to carry an `ambiguous_merge_risk` flag, and
+/// `live_serve.rs` used it to DECLINE to serve an ambiguous shape.
+/// That gate is now removed, because the ambiguity it guarded against no
+/// longer exists.
+///
+/// It existed because an empty `by: Vec<ColumnId>` was indistinguishable
+/// between "no grouping concept applies" (the group split is correct) and
+/// "an aggregation operator asked to reduce everything" (the groups
+/// should have been merged) — exactly
+/// [ASAPController#163](https://github.com/ProjectASAP/ASAPController/issues/163).
+/// Unable to tell which, the safe move was to fall back to the legacy
+/// path whenever an empty `by` produced >1 group.
+///
+/// ASAPController#165 removed that ambiguity at the source by making the
+/// reduction kind explicit (`Reduction::{PerEntity, Reduce(GroupKeys)}`),
+/// and `summary_executor.rs::resolve_group_key` now acts on it directly.
+/// Both branches are resolved correctly BEFORE reaching here:
+///
+/// * `PerEntity` — the multi-group split is definitionally right (one row
+///   per entity, never merged), so it was never a "risk" to begin with.
+/// * `Reduce([])` — every candidate shares one group key, so the outcome
+///   has exactly ONE group and the old `values.len() > 1` trigger cannot
+///   fire at all.
+///
+/// The flag would therefore be unconditionally `false` today; keeping it
+/// would mean keeping a heuristic that can only ever misfire (declining
+/// correct `PerEntity` answers) now that the real signal is available.
 pub struct L4ReadoutOutcome {
     pub series: SeriesRows,
     pub coverage: Option<(u64, u64)>,
-    /// `true` only for a sketch-family (`ExecOutcome::Value`) outcome
-    /// whose tree's root `SummaryAgg` had an empty `by` AND produced more
-    /// than one group. This is exactly the ambiguous shape
-    /// [ASAPController#163](https://github.com/ProjectASAP/ASAPController/issues/163)
-    /// describes — an empty `by` is indistinguishable between "no
-    /// grouping concept applies" (this group split is correct) and "an
-    /// aggregation operator asked to reduce everything" (these groups
-    /// should have been merged into one). Always `false` for `ExactAgg`
-    /// (`Sum`/`Increase` map only from genuine aggregation operators, so
-    /// their empty `by` is unambiguous — see the design doc's "Grouping
-    /// semantics"/"ExactAgg" sections) and for any sketch outcome with a
-    /// non-empty `by` or ≤1 resulting group (nothing to disagree about).
-    pub ambiguous_merge_risk: bool,
 }
 
 /// Lower `query`, execute it against `index` over `[t0_ms, t1_ms]`, and
@@ -58,7 +72,6 @@ pub fn execute_l4_readout(
     accuracy: AccuracyTarget,
 ) -> Result<L4ReadoutOutcome, LoweringSkip> {
     let node = lower_promql_to_l4node(query, accuracy)?;
-    let by_is_empty = root_summary_agg_by_is_empty(&node);
 
     let ctx = QueryExecutionContext {
         index,
@@ -75,12 +88,7 @@ pub fn execute_l4_readout(
                 fold_coverage(&mut coverage, value.coverage());
                 series.extend(summary_value_to_series(group_key, value));
             }
-            let ambiguous_merge_risk = by_is_empty.unwrap_or(false) && values.len() > 1;
-            Ok(L4ReadoutOutcome {
-                series,
-                coverage,
-                ambiguous_merge_risk,
-            })
+            Ok(L4ReadoutOutcome { series, coverage })
         }
         Ok(ExecOutcome::State(groups)) => {
             let mut coverage: Option<(u64, u64)> = None;
@@ -92,34 +100,9 @@ pub fn execute_l4_readout(
                 };
                 series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
             }
-            Ok(L4ReadoutOutcome {
-                series,
-                coverage,
-                ambiguous_merge_risk: false,
-            })
+            Ok(L4ReadoutOutcome { series, coverage })
         }
         Err(e) => Err(LoweringSkip::ExecuteFailed(format!("{e:?}"))),
-    }
-}
-
-/// Walk down to the tree's `SummaryAgg` node (through a `SummaryEstimate`
-/// wrapper if present, and through the first child of a `SummaryMerge` —
-/// its children agree on `(SummaryKind, SummaryParams)` by construction,
-/// so their `by` agrees too) and report whether its `by` list is empty.
-/// `None` for a bare `Logical` root (shouldn't happen here —
-/// `lower_promql_to_l4node` already rejects that via `NotRealized` — kept
-/// exhaustive and defensive rather than assumed unreachable).
-fn root_summary_agg_by_is_empty(node: &L4Node) -> Option<bool> {
-    match &node.expr {
-        SummaryExpr::SummaryAgg { by, .. } => Some(by.is_empty()),
-        SummaryExpr::SummaryEstimate { sketch_input, .. } => {
-            root_summary_agg_by_is_empty(sketch_input)
-        }
-        SummaryExpr::SummaryMerge { children } => children
-            .first()
-            .and_then(|c| root_summary_agg_by_is_empty(c)),
-        SummaryExpr::Logical(_) => None,
-        _ => None,
     }
 }
 
@@ -262,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn unambiguous_sketch_query_is_not_flagged() {
+    fn bare_range_function_keeps_one_series_per_entity() {
         let idx = ddsketch_fixture();
         let outcome = execute_l4_readout(
             &idx,
@@ -273,34 +256,48 @@ mod tests {
             accuracy(),
         )
         .expect("should execute");
-        assert!(
-            !outcome.ambiguous_merge_risk,
-            "a single-series bare range function must not be flagged ambiguous"
-        );
         assert_eq!(outcome.series.len(), 1);
     }
 
     #[test]
-    fn ambiguous_global_merge_shape_is_flagged() {
+    fn global_merge_shape_now_merges_instead_of_being_declined() {
         // The exact ASAPController#163 shape: two HLL sids, no explicit
-        // by(), an aggregation-operator query -- find_candidates can't
-        // tell whether these two groups should have been merged.
+        // by(), an aggregation-operator query. This test previously
+        // asserted `ambiguous_merge_risk == true` and TWO unmerged series
+        // -- i.e. it pinned the old workaround, where an empty `by` left
+        // `find_candidates` unable to tell "reduce everything" apart from
+        // "no grouping concept," so `live_serve` declined to serve the
+        // shape at all.
+        //
+        // With `Reduction` (ASAPController#165) that ambiguity is gone:
+        // `count(...)` is a genuine aggregation operator, so it lowers to
+        // `Reduce([])` and `resolve_group_key` gives every candidate the
+        // SAME group key -- the two sids MERGE into one answer, which is
+        // what the query actually asked for. No gate, no fallback.
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let outcome =
             execute_l4_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
                 .expect("should execute");
-        assert!(
-            outcome.ambiguous_merge_risk,
-            "two distinct-service HLL groups under a by-less count() must be flagged, got {:?}",
+        assert_eq!(
+            outcome.series.len(),
+            1,
+            "a by-less count() is a full reduction -- both HLL sids must merge into ONE \
+             series, not stay split (and not be declined), got {:?}",
             outcome.series
         );
-        assert_eq!(outcome.series.len(), 2);
+        // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.
+        let (_group, points) = &outcome.series[0];
+        let card = points[0].1;
+        assert!(
+            (4.0..=8.0).contains(&card),
+            "merged cardinality {card} should be ~6 (both sids' disjoint items), not ~3"
+        );
     }
 
     #[test]
-    fn exact_agg_outcome_is_never_flagged_ambiguous() {
+    fn exact_agg_outcome_reports_window_end_coverage() {
         let idx = SketchStore::new();
         idx.register(
             crate::storage_engines::sketch_db::index::SketchInstanceMetadata {
@@ -328,7 +325,6 @@ mod tests {
         );
         let outcome = execute_l4_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy())
             .expect("should execute");
-        assert!(!outcome.ambiguous_merge_risk);
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --
         // same semantics as `SummaryValue::coverage()`, reconfirmed for
