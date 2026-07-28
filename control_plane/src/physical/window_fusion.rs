@@ -46,7 +46,10 @@ pub struct FusedWindowSketch<'a> {
     pub window_size: Duration,
     /// Outer `Window`'s `slide` (`Some` only for `Sliding`).
     pub window_slide: Option<Duration>,
-    /// The inner `Aggregate`'s `by` columns.
+    /// The inner `Aggregate`'s grouping columns -- empty both when it's a
+    /// genuine empty-`by` reduction and when it's per-entity (no grouping
+    /// concept at all, ASAPController#163/#165); this field doesn't
+    /// distinguish the two, since nothing downstream currently needs to.
     pub by: &'a [ColumnId],
     /// The subtree below the inner `Aggregate` — the sketch's input.
     pub inner_child: &'a QueryExpr,
@@ -74,7 +77,7 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
         return None;
     };
     let QueryExpr::Aggregate {
-        by,
+        reduction,
         aggs,
         having,
         child: inner_child,
@@ -88,6 +91,10 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
     if aggs.len() != 1 || having.is_some() {
         return None;
     }
+    let by: &[ColumnId] = reduction
+        .group_keys()
+        .map(|keys| keys.keys())
+        .unwrap_or(&[]);
     Some(FusedWindowSketch {
         agg: &aggs[0],
         window_kind: kind.clone(),
@@ -208,7 +215,7 @@ mod tests {
             size,
             slide,
             child: Box::new(QueryExpr::Aggregate {
-                by: crate::intent_algebra::GroupKeys::none(),
+                reduction: crate::intent_algebra::Reduction::by(vec![]),
                 aggs: vec![agg],
                 output_names: Vec::new(),
                 having: None,
@@ -332,7 +339,7 @@ mod tests {
         // A canonical `Aggregate` with no enclosing `Window` is the unfused
         // sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::by(vec![]),
             aggs: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,

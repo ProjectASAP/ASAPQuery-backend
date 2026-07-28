@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{Predicate, QueryExpr, Source};
-use crate::intent_algebra::{CompareOp, L3Expr, L3Scalar};
+use crate::intent_algebra::{ColumnId, CompareOp, L3Expr, L3Scalar};
 use crate::types::AggType;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
@@ -242,14 +242,20 @@ impl QeCollector {
                 self.visit(child, schema);
             }
             QueryExpr::Aggregate {
-                by, aggs, child, ..
+                reduction,
+                aggs,
+                child,
+                ..
             } => {
                 // The canonical IR folds legacy SketchAgg / WindowedAgg-inner
                 // / TopK / Aggregate into one variant carrying `AggIntent`s.
                 // `by` is positional — recover the group-by label *names*
                 // from the Binder schema (the legacy `Aggregate.keys` were
                 // names; multi-agg aggregates reach here with a non-empty
-                // `by` after the Binder resolves them).
+                // `by` after the Binder resolves them). A per-entity
+                // reduction (ASAPController#163/#165) has no `by` at all —
+                // same as an empty one here, no label names to recover.
+                let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
                 if let Some(s) = schema {
                     for &id in by {
                         if let Some(col) = s.columns.get(id) {
@@ -562,7 +568,7 @@ mod doc_verify_all {
     // `Aggregate { by: [], .. }` stacked forms.
     use super::parse_query_expr_canonical;
     use crate::intent_algebra::query_expr::QueryExpr;
-    use crate::intent_algebra::AggIntent;
+    use crate::intent_algebra::{AggIntent, Reduction};
 
     #[test]
     fn example4_promql_quantile() {
@@ -571,11 +577,15 @@ mod doc_verify_all {
         )
         .unwrap();
         // Canonical fold of the legacy `WindowedAgg { Quantile }`:
-        // `Window { Aggregate { by: [], [Quantile] } }`.
+        // `Window { Aggregate { reduction: PerEntity, [Quantile] } }` — no
+        // explicit `by()`, and windowed with a single non-per-series intent,
+        // so there's no grouping concept at all (see #165's `Reduction`).
         match &expr {
             QueryExpr::Window { child, .. } => match child.as_ref() {
-                QueryExpr::Aggregate { by, aggs, .. } => {
-                    assert!(by.is_empty());
+                QueryExpr::Aggregate {
+                    reduction, aggs, ..
+                } => {
+                    assert!(matches!(reduction, Reduction::PerEntity));
                     assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
                 }
                 other => panic!("expected Aggregate under Window, got {other:?}"),

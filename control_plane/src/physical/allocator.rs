@@ -40,9 +40,8 @@
 
 use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::GroupKeys;
 use crate::intent_algebra::relational::agg_is_exact;
-use crate::intent_algebra::QueryExpr;
+use crate::intent_algebra::{QueryExpr, Reduction};
 use crate::types::{SketchType, StageResourceBudgets};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
@@ -202,7 +201,7 @@ impl SketchAllocator {
             //   * single other intent, no HAVING → budget-driven sketch
             //   * multi-intent or HAVING → general exact Aggregate at Db
             QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having,
@@ -214,7 +213,7 @@ impl SketchAllocator {
                         let child = self.alloc_node(*child, budget);
                         return PlanNode {
                             expr: QueryExpr::Aggregate {
-                                by,
+                                reduction,
                                 aggs,
                                 output_names,
                                 having,
@@ -239,14 +238,14 @@ impl SketchAllocator {
                     }
                     // Single non-TopK intent → budget-driven sketch agg.
                     let child = self.alloc_node(*child, budget);
-                    return self.alloc_sketch_agg(by, aggs, output_names, child, budget);
+                    return self.alloc_sketch_agg(reduction, aggs, output_names, child, budget);
                 }
                 // General multi-intent / HAVING aggregate → Db (exact).
                 let child = self.alloc_node(*child, budget);
                 let kinds: Vec<&'static str> = aggs.iter().map(canonical_intent_kind_str).collect();
                 PlanNode {
                     expr: QueryExpr::Aggregate {
-                        by,
+                        reduction,
                         aggs,
                         output_names,
                         having,
@@ -609,7 +608,7 @@ impl SketchAllocator {
     /// `aggs.len() == 1` and that the single intent is not `TopK`.
     fn alloc_sketch_agg(
         &self,
-        by: GroupKeys,
+        reduction: Reduction,
         aggs: Vec<AggIntent>,
         output_names: Vec<String>,
         child: PlanNode,
@@ -621,7 +620,7 @@ impl SketchAllocator {
         if matches!(intent, AggIntent::Avg { .. }) {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
-                    by,
+                    reduction,
                     aggs,
                     output_names,
                     having: None,
@@ -645,7 +644,7 @@ impl SketchAllocator {
         if agg_is_exact(&intent) {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
-                    by,
+                    reduction,
                     aggs,
                     output_names,
                     having: None,
@@ -675,7 +674,7 @@ impl SketchAllocator {
             budget.consume_agent(mem);
             return PlanNode {
                 expr: QueryExpr::Aggregate {
-                    by,
+                    reduction,
                     aggs,
                     output_names,
                     having: None,
@@ -703,7 +702,7 @@ impl SketchAllocator {
             budget.consume_backend(mem);
             return PlanNode {
                 expr: QueryExpr::Aggregate {
-                    by,
+                    reduction,
                     aggs,
                     output_names,
                     having: None,
@@ -731,7 +730,7 @@ impl SketchAllocator {
         // Both Agent and Backend budgets exceeded → Precompute.
         PlanNode {
             expr: QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having: None,
@@ -845,7 +844,7 @@ mod tests {
     /// `Scan` — the canonical shape the legacy `SketchAgg` folded into.
     fn agg(intent: AggIntent) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![intent],
             output_names: Vec::new(),
             having: None,
@@ -1006,7 +1005,7 @@ mod tests {
     #[test]
     fn multi_intent_aggregate_goes_to_db() {
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,

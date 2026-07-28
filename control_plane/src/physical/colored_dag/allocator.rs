@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn three_stage_quantile_dag_basic() {
         let q = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::PerEntity,
             aggs: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,

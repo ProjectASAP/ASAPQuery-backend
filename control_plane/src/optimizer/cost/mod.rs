@@ -355,7 +355,7 @@ fn apply_delta_decision_with(
 use asap_ir::intent_algebra::{BindingName, QueryId};
 
 #[allow(unused_imports)]
-use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Schema};
+use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr, QueryExprError, Reduction, Schema};
 
 /// Bundled cost of a multi-query workload, with per-root contributions
 /// and the savings unlocked by shared-producer credit. Returned by
@@ -503,10 +503,14 @@ fn subtree_cost_bundled(
             Ok(node_cost_window(&in_schema) + cs)
         }
         QueryExpr::Aggregate {
-            by, aggs, child, ..
+            reduction,
+            aggs,
+            child,
+            ..
         } => {
             let cs = subtree_cost_bundled(child, binding_costs, schema_scope)?;
             let in_schema = child.output_schema_in(schema_scope)?;
+            let by = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
             Ok(node_cost_aggregate(by, aggs, &in_schema) + cs)
         }
         QueryExpr::LetBinding { name, expr, child } => {
@@ -589,10 +593,14 @@ fn subtree_cost_standalone(
             Ok(node_cost_window(&in_schema) + cs)
         }
         QueryExpr::Aggregate {
-            by, aggs, child, ..
+            reduction,
+            aggs,
+            child,
+            ..
         } => {
             let cs = subtree_cost_standalone(child, binding_costs, schema_scope)?;
             let in_schema = child.output_schema_in(schema_scope)?;
+            let by = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
             Ok(node_cost_aggregate(by, aggs, &in_schema) + cs)
         }
         QueryExpr::LetBinding { name, expr, child } => {
@@ -783,10 +791,18 @@ mod workload_cost_tests {
         }
     }
 
-    /// Wrap `child` in `Aggregate { by: [], aggs: [Quantile{q}] }`.
+    /// Wrap `child` in `Aggregate { reduction: [], aggs: [Quantile{q}] }`
+    /// — no `by()`, so `reduction` follows `lower.rs`'s own rule:
+    /// `PerEntity` when `child` is itself a `Window` (matches a bare
+    /// `quantile_over_time(...)`), `Reduce([])` otherwise.
     fn quantile_root(q: f64, child: QueryExpr) -> QueryExpr {
+        let reduction = if matches!(child, QueryExpr::Window { .. }) {
+            Reduction::PerEntity
+        } else {
+            Reduction::by(vec![])
+        };
         QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction,
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q,
@@ -798,10 +814,16 @@ mod workload_cost_tests {
         }
     }
 
-    /// Wrap `child` in `Aggregate { by: [], aggs: [Max] }`.
+    /// Wrap `child` in `Aggregate { reduction: [], aggs: [Max] }` — same
+    /// `PerEntity`-when-windowed rule as `quantile_root`.
     fn max_root(child: QueryExpr) -> QueryExpr {
+        let reduction = if matches!(child, QueryExpr::Window { .. }) {
+            Reduction::PerEntity
+        } else {
+            Reduction::by(vec![])
+        };
         QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction,
             aggs: vec![AggIntent::Max { col: None }],
             output_names: Vec::new(),
             having: None,

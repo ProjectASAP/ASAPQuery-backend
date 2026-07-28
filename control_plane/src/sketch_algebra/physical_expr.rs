@@ -200,7 +200,7 @@ mod tests {
     #[test]
     fn committed_wraps_an_implement_tree_result() {
         let q = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::by(vec![]),
             aggs: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,

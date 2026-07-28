@@ -87,7 +87,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan,
             child,
         } if matches!(child.as_ref(), QueryExpr::Aggregate { .. }) => {
             let QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having,
@@ -97,7 +97,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan,
                 unreachable!("guarded by the `matches!` above")
             };
             let pushed = QueryExpr::Aggregate {
-                by: by.clone(),
+                reduction: reduction.clone(),
                 aggs: aggs.clone(),
                 output_names: output_names.clone(),
                 having: having.clone(),
@@ -162,13 +162,13 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan,
 fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
     match expr {
         QueryExpr::Aggregate {
-            by,
+            reduction,
             aggs,
             output_names,
             having,
             child,
         } => QueryExpr::Aggregate {
-            by: by.clone(),
+            reduction: reduction.clone(),
             aggs: aggs
                 .iter()
                 .map(|intent| {

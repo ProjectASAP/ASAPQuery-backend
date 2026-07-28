@@ -121,7 +121,7 @@ use crate::intent_algebra::column_resolution::{
 };
 use crate::intent_algebra::query_expr::{
     GroupKeys, L3Scalar, Predicate, ProjectItem as CProjectItem, QueryExpr as CQueryExpr,
-    QueryExprError, SortKey as CSortKey, Source, WindowKind as CWindowKind,
+    QueryExprError, Reduction, SortKey as CSortKey, Source, WindowKind as CWindowKind,
 };
 use crate::intent_algebra::relational::{AggFunc, QueryExpr as LQueryExpr};
 use crate::intent_algebra::schema::Schema;
@@ -270,6 +270,21 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                 let item = &aggs[0];
                 let intents = agg_func_to_intents(&item.func, frequency_trigger);
                 if !intents.is_empty() {
+                    // Per-entity (issue ASAPController#163/#165): a single
+                    // intent, no `by`/`without` at all, whose intent is
+                    // inherently per-series or whose child is a range
+                    // window (`windowed`, computed above -- this repo's L3
+                    // shape keeps `Window` *above* the `Aggregate` rather
+                    // than a `TimeRange` child inside it, unlike
+                    // ASAPController's current canonical shape, but it's
+                    // the same structural marker for "this is a bare range
+                    // reduction with no grouping syntax to begin with").
+                    // `by.is_without()` is never true here -- `without` PromQL
+                    // grouping always resolves via the `without` bool above,
+                    // which only ever produces `GroupKeys::without` with a
+                    // concrete (possibly empty) exclusion list, and that
+                    // path already implies a genuine reduction regardless.
+                    let per_entity_base = by.is_empty() && !by.is_without();
                     let nodes: Vec<CQueryExpr> = match input.as_ref() {
                         LQueryExpr::Window {
                             duration,
@@ -284,17 +299,26 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                             let win_child = convert(win_input, schema)?;
                             intents
                                 .into_iter()
-                                .map(|intent| CQueryExpr::Window {
-                                    kind: kind.clone(),
-                                    size: *duration,
-                                    slide: *slide,
-                                    child: Box::new(CQueryExpr::Aggregate {
-                                        by: by.clone(),
-                                        aggs: vec![intent],
-                                        output_names: Vec::new(),
-                                        having: None,
-                                        child: Box::new(win_child.clone()),
-                                    }),
+                                .map(|intent| {
+                                    let reduction = if per_entity_base
+                                        && (intent.is_per_series() || windowed)
+                                    {
+                                        Reduction::PerEntity
+                                    } else {
+                                        Reduction::Reduce(by.clone())
+                                    };
+                                    CQueryExpr::Window {
+                                        kind: kind.clone(),
+                                        size: *duration,
+                                        slide: *slide,
+                                        child: Box::new(CQueryExpr::Aggregate {
+                                            reduction,
+                                            aggs: vec![intent],
+                                            output_names: Vec::new(),
+                                            having: None,
+                                            child: Box::new(win_child.clone()),
+                                        }),
+                                    }
                                 })
                                 .collect()
                         }
@@ -302,12 +326,21 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                             let child = convert(other, schema)?;
                             intents
                                 .into_iter()
-                                .map(|intent| CQueryExpr::Aggregate {
-                                    by: by.clone(),
-                                    aggs: vec![intent],
-                                    output_names: Vec::new(),
-                                    having: None,
-                                    child: Box::new(child.clone()),
+                                .map(|intent| {
+                                    let reduction = if per_entity_base
+                                        && (intent.is_per_series() || windowed)
+                                    {
+                                        Reduction::PerEntity
+                                    } else {
+                                        Reduction::Reduce(by.clone())
+                                    };
+                                    CQueryExpr::Aggregate {
+                                        reduction,
+                                        aggs: vec![intent],
+                                        output_names: Vec::new(),
+                                        having: None,
+                                        child: Box::new(child.clone()),
+                                    }
                                 })
                                 .collect()
                         }
@@ -338,7 +371,11 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
                 .map(|h| resolve_expr(h, schema).map(Predicate))
                 .transpose()?;
             CQueryExpr::Aggregate {
-                by,
+                // Always a genuine reduction: this branch is multi-intent,
+                // HAVING-bearing, or a (structurally unreachable) unmapped
+                // AggFunc -- per-entity reductions are always the single,
+                // HAVING-less intent handled above.
+                reduction: Reduction::Reduce(by),
                 aggs: intents,
                 output_names: Vec::new(),
                 having,
@@ -372,7 +409,9 @@ pub fn convert(legacy: &LQueryExpr, schema: &Schema) -> Result<CQueryExpr, Conve
             // see `topk_bridge` module doc.
             let by: GroupKeys = resolve_group_keys_promql(by, schema)?.into();
             CQueryExpr::Aggregate {
-                by,
+                // A ranking always reduces (empty by ranks the whole
+                // input, never per-entity).
+                reduction: Reduction::Reduce(by),
                 aggs: vec![AggIntent::TopK {
                     k: *k as usize,
                     accuracy: AccuracyTarget::Epsilon(0.05),
@@ -745,8 +784,13 @@ mod tests {
     fn single_aggregate_folds_to_canonical_aggregate() {
         let legacy = agg(vec![], false, vec![agg_item("s", AggFunc::Sum)], src("m"));
         match convert_root(&legacy).unwrap() {
-            CQueryExpr::Aggregate { by, aggs, .. } => {
-                assert!(by.is_empty(), "no GROUP BY → empty `by`: {by:?}");
+            CQueryExpr::Aggregate {
+                reduction, aggs, ..
+            } => {
+                assert!(
+                    matches!(&reduction, Reduction::Reduce(k) if k.is_empty()),
+                    "no GROUP BY, unwindowed, non-per-series intent → global reduce: {reduction:?}"
+                );
                 assert!(matches!(aggs.as_slice(), [AggIntent::Sum { col: None }]));
             }
             other => panic!("expected Aggregate, got {other:?}"),
@@ -822,7 +866,9 @@ mod tests {
             src("trades"),
         );
         match convert_root(&legacy).unwrap() {
-            CQueryExpr::Aggregate { by, .. } => assert!(by.is_empty()),
+            CQueryExpr::Aggregate { reduction, .. } => {
+                assert!(matches!(&reduction, Reduction::Reduce(k) if k.is_empty()))
+            }
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }
@@ -844,8 +890,8 @@ mod tests {
                 assert_eq!(kind, CWindowKind::Tumbling);
                 assert!(matches!(
                     *child,
-                    CQueryExpr::Aggregate { ref by, ref aggs, .. }
-                        if by.is_empty()
+                    CQueryExpr::Aggregate { ref reduction, ref aggs, .. }
+                        if matches!(reduction, Reduction::PerEntity)
                             && matches!(aggs.as_slice(), [AggIntent::Quantile { .. }])
                 ));
             }
@@ -939,8 +985,10 @@ mod tests {
             input: Box::new(src("m")),
         };
         match convert_root(&legacy).unwrap() {
-            CQueryExpr::Aggregate { by, aggs, .. } => {
-                assert!(by.is_empty());
+            CQueryExpr::Aggregate {
+                reduction, aggs, ..
+            } => {
+                assert!(matches!(&reduction, Reduction::Reduce(k) if k.is_empty()));
                 assert!(matches!(aggs.as_slice(), [AggIntent::TopK { k: 5, .. }]));
             }
             other => panic!("expected Aggregate, got {other:?}"),

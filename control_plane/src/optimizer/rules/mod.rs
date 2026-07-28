@@ -231,7 +231,12 @@ pub fn bind_workload_typed_with_item_filter(
         child: Box::new(scan),
     };
     let aggregate = QueryExpr::Aggregate {
-        by: crate::intent_algebra::GroupKeys::none(),
+        // Synthetic probe only -- `boundary::implementation_for` (what
+        // this shape actually drives) keys off `AggIntent`/accuracy alone,
+        // never `Reduction`, so this value doesn't affect the family pick.
+        // `PerEntity` is the representative choice for a windowed shape
+        // with no `by` (ASAPController#163/#165).
+        reduction: crate::intent_algebra::Reduction::PerEntity,
         aggs: vec![intent],
         output_names: Vec::new(),
         having: None,

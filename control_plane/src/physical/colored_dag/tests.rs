@@ -13,7 +13,7 @@ use std::time::Duration;
 use asap_sketch::{L4Node, L4Schema, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use crate::intent_algebra::{
-    BindingScope, ColumnRef, GroupKeys, LabelFilter, QueryExpr, Schema, Source, WindowKind,
+    BindingScope, ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source, WindowKind,
 };
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::physical::colored_dag::allocator::StageAllocator;
@@ -111,7 +111,7 @@ fn sketch_agg_l4(sketch: SummaryKind, params: SummaryParams, child: Rc<L4Node>) 
             sketch,
             params,
             col: ColumnRef::SampleValue,
-            by: vec![],
+            reduction: Reduction::by(vec![]),
         },
         schema: dummy_l4_schema(),
     })
@@ -164,7 +164,7 @@ fn is_ref(expr: &PhysicalExpr) -> bool {
 /// `boundary::summary_candidates`).
 fn quantile_kll_dag() -> PhysicalExpr {
     let q = QueryExpr::Aggregate {
-        by: GroupKeys::none(),
+        reduction: Reduction::by(vec![]),
         aggs: vec![crate::intent_algebra::AggIntent::Quantile {
             col: None,
             q: 0.99,

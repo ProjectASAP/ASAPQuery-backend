@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use asap_ir::intent_algebra::BindingName;
 
 use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{GroupKeys, QueryExpr, SetOpKind, Source};
+use crate::intent_algebra::query_expr::{QueryExpr, Reduction, SetOpKind, Source};
 use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::optimizer::cost::sketch_capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
@@ -396,7 +396,7 @@ impl RewriteRule for MergeLifting {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Aggregate {
-                ref by,
+                ref reduction,
                 ref aggs,
                 ref having,
                 ref child,
@@ -406,7 +406,7 @@ impl RewriteRule for MergeLifting {
                     let new_children: Vec<QueryExpr> = children
                         .iter()
                         .map(|branch| QueryExpr::Aggregate {
-                            by: by.clone(),
+                            reduction: reduction.clone(),
                             aggs: aggs.clone(),
                             output_names: Vec::new(),
                             having: None,
@@ -440,7 +440,7 @@ impl RewriteRule for HLLDedupElim {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having: None,
@@ -448,7 +448,7 @@ impl RewriteRule for HLLDedupElim {
             } if aggs.len() == 1 && matches!(&aggs[0], AggIntent::Cardinality { .. }) => {
                 if let QueryExpr::Distinct { child: inner, .. } = *child {
                     return Some(QueryExpr::Aggregate {
-                        by,
+                        reduction,
                         aggs,
                         output_names,
                         having: None,
@@ -523,7 +523,7 @@ impl RewriteRule for TopKFusion {
                     // Only fuse when all keys are DESC (top-k semantics).
                     if !keys.is_empty() && keys.iter().all(|k| !k.ascending) {
                         return Some(QueryExpr::Aggregate {
-                            by: GroupKeys::none(),
+                            reduction: Reduction::by(vec![]),
                             aggs: vec![AggIntent::TopK {
                                 k: n,
                                 accuracy: AccuracyTarget::Epsilon(0.05),
@@ -861,7 +861,7 @@ impl QueryOptimizer {
                 )
             }
             QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having,
@@ -870,7 +870,7 @@ impl QueryOptimizer {
                 let (new_child, c) = recurse!(child);
                 (
                     QueryExpr::Aggregate {
-                        by,
+                        reduction,
                         aggs,
                         output_names,
                         having,
@@ -1165,7 +1165,7 @@ impl OptimizerRule for CommonSubexprElim {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::query_expr::Predicate;
+    use crate::intent_algebra::query_expr::{GroupKeys, Predicate};
     use crate::intent_algebra::relational::{default_cardinality, default_quantile};
     use crate::intent_algebra::{
         BinaryOpKind, L3Expr, L3Scalar, Schema, SortKey, Source, WindowKind,
@@ -1187,7 +1187,7 @@ mod tests {
     /// the legacy `SketchAgg`.
     fn sketch_agg(intent: AggIntent, child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: GroupKeys::none(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![intent],
             output_names: Vec::new(),
             having: None,

@@ -10,7 +10,7 @@ use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{
-    AggIntent, BindingScope, LabelFilter, QueryExpr, Schema, Source, WindowKind,
+    AggIntent, BindingScope, LabelFilter, QueryExpr, Reduction, Schema, Source, WindowKind,
 };
 use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
@@ -64,7 +64,10 @@ fn windowed_scan() -> QueryExpr {
 
 fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
-        by: crate::intent_algebra::GroupKeys::none(),
+        // No `by()` and windowed (child is `Window`) — the shape
+        // `quantile_over_time(...)` lowers to: per-series, not a
+        // cross-series reduction (see #165's `Reduction`).
+        reduction: Reduction::PerEntity,
         aggs: vec![AggIntent::Quantile {
             col: None,
             q,
@@ -219,7 +222,9 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
 /// Build an `Aggregate{TopK{k, accuracy}}` over the windowed scan.
 fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
     QueryExpr::Aggregate {
-        by: vec![].into(),
+        // A ranking always reduces — empty `by` ranks the whole input,
+        // never per-entity (see `lower.rs`'s `LQueryExpr::TopK` handling).
+        reduction: Reduction::by(vec![]),
         aggs: vec![AggIntent::TopK { k, accuracy }],
         output_names: Vec::new(),
         having: None,
@@ -355,7 +360,7 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
 #[test]
 fn bind_hll_cardinality_basic() {
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![AggIntent::Cardinality {
             col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
@@ -406,7 +411,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // node shape, keyed by `SummaryKind` (see `physical_expr.rs`'s
     // module docs).
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
@@ -462,7 +467,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
 #[test]
 fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![AggIntent::Quantile {
             col: None,
             q: 0.99,
@@ -503,7 +508,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 #[test]
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
@@ -532,7 +537,7 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 #[test]
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
-        by: vec![1].into(), // service column
+        reduction: Reduction::by(vec![1]), // service column
         aggs: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
@@ -541,11 +546,13 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { sketch, by, .. } => {
+            SummaryExpr::SummaryAgg {
+                sketch, reduction, ..
+            } => {
                 assert_eq!(sketch, &SummaryKind::Sum);
                 assert_eq!(
-                    by,
-                    &vec![1],
+                    reduction.group_keys().map(|k| k.keys()),
+                    Some(&[1][..]),
                     "keyed sum must carry the group-by column (the MultipleSum-equivalent signal)"
                 );
             }
@@ -565,7 +572,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 #[test]
 fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
-        by: vec![1].into(),
+        reduction: Reduction::by(vec![1]),
         aggs: vec![AggIntent::Rate],
         output_names: Vec::new(),
         having: None,
@@ -574,9 +581,11 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { sketch, by, .. } => {
+            SummaryExpr::SummaryAgg {
+                sketch, reduction, ..
+            } => {
                 assert_eq!(sketch, &SummaryKind::Increase);
-                assert_eq!(by, &vec![1]);
+                assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
             }
             other => panic!("expected SummaryAgg(Increase, by=[1]), got {other:?}"),
         },
@@ -603,7 +612,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
         "Phase β intent must flag archive"
     );
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![intent.clone()],
         output_names: Vec::new(),
         having: None,
@@ -787,7 +796,7 @@ fn phase_b_e2e_topk_well_formed() {
 fn phase_b_e2e_archive_only_e2e_binding() {
     let intent = AggIntent::Absent;
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![intent.clone()],
         output_names: Vec::new(),
         having: None,
@@ -830,7 +839,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
     ];
     for intent in intents {
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::PerEntity,
             aggs: vec![intent.clone()],
             output_names: Vec::new(),
             having: None,
@@ -878,7 +887,7 @@ fn frequency_extension_binds_cms() {
     // as a real `Cms` sketch instead of declining to `Logical`.
     let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
     let expr = QueryExpr::Aggregate {
-        by: vec![].into(),
+        reduction: Reduction::PerEntity,
         aggs: vec![intent],
         output_names: Vec::new(),
         having: None,
