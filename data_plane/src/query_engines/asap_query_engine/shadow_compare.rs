@@ -164,15 +164,21 @@ fn fold_coverage(coverage: &mut Option<(u64, u64)>, next: Option<(u64, u64)>) {
 /// a real, confirmed gap: a bare per-series range function with no PromQL
 /// `by(...)` (e.g. `quantile_over_time(m[r])`) got an empty `{}` group key
 /// from `find_candidates`, losing (and for multiple matching series,
-/// silently MERGING) the underlying sid's own labels. That's now fixed at
-/// the root in `find_candidates`/`sketch_group_key` (see its doc), which
-/// falls back to the sid's own full label map instead of projecting onto
-/// an empty `by`. This function's group-set check stays as a defensive
+/// silently MERGING) the underlying sid's own labels.
+///
+/// Both halves of that ambiguity are now fixed at the root, in
+/// `find_candidates`/`resolve_group_key` (see its doc), which reads L3/L4's
+/// own `Reduction` (ASAPController#163/#164/#165) instead of inferring
+/// intent from an empty `by`: `PerEntity` keeps each sid's own full label
+/// map (the per-series-range-function case above), while `Reduce([])`
+/// deliberately shares one group key across every candidate -- so a true
+/// global-merge aggregate like `count(hll_metric)`, previously called out
+/// here as "not modeled at all yet," is now handled correctly too.
+///
+/// This function's group-set check therefore stays only as a defensive
 /// classifier for whatever OTHER shape might still produce a genuine
-/// one-row-both-sides mismatch (e.g. a true global-merge aggregate like
-/// `count(hll_metric)`, which isn't modeled by `summary_executor.rs` at
-/// all yet) -- if it fires now, treat it as a real, unclassified
-/// discrepancy worth investigating, not the old known gap.
+/// one-row-both-sides mismatch -- if it fires now, treat it as a real,
+/// unclassified discrepancy worth investigating, not either known gap.
 fn diff_and_log(
     query: &str,
     old: &ASAPTierResult,
@@ -190,10 +196,10 @@ fn diff_and_log(
                 query,
                 old_group = ?old.series[0].0,
                 "shadow mismatch: one row on each side but new path's group key is empty -- \
-                 the known per-series-range-function gap was fixed in find_candidates/ \
-                 sketch_group_key, so this shape firing now means an UNCLASSIFIED gap \
-                 (e.g. a true global-merge aggregate not yet modeled by summary_executor.rs), \
-                 not the old known one"
+                 both the per-series-range-function gap AND the global-merge-aggregate gap \
+                 are now fixed in find_candidates/resolve_group_key (driven by L3/L4's \
+                 Reduction), so this shape firing now means an UNCLASSIFIED gap, \
+                 not either known one"
             );
             return;
         }

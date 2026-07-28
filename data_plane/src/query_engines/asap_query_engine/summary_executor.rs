@@ -63,7 +63,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use asap_ir::intent_algebra::{ColumnId, ColumnRef, QueryExpr, Source};
+use asap_ir::intent_algebra::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 use asap_sketch::exec::SummaryExecutor;
 use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
@@ -303,11 +303,12 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         sketch: &SummaryKind,
         params: &SummaryParams,
         _col: &ColumnRef,
-        by: &[ColumnId],
+        reduction: &Reduction,
         child: &L4Node,
     ) -> Result<Vec<(Self::GroupKey, Self::Handle)>, Self::Error> {
         let metric = find_metric(child).ok_or(SummaryExecutorError::NoMetricFound)?;
 
+        let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
         let mut by_names: Vec<String> = Vec::with_capacity(by.len());
         for &col_id in by {
             let name = child
@@ -363,7 +364,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     let Some(series) = series.into_iter().next() else {
                         continue;
                     };
-                    let group_key = sketch_group_key(&by_names, &series.series_label_values);
+                    let group_key = resolve_group_key(reduction, &by_names, &series.series_label_values);
                     out.push((
                         group_key,
                         SidHandle::Sketch {
@@ -383,7 +384,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     let Some((label_values, windows)) = series_list.into_iter().next() else {
                         continue;
                     };
-                    let group_key = project_group_key(&by_names, &label_values);
+                    let group_key = resolve_group_key(reduction, &by_names, &label_values);
                     out.push((
                         group_key,
                         SidHandle::ExactAgg {
@@ -780,44 +781,50 @@ fn project_group_key(
         .collect()
 }
 
-/// Group-key construction for the `Sketch` branch of `find_candidates`.
+/// Group-key construction for `find_candidates`, shared by both the
+/// `Sketch` and `ExactAgg` branches -- driven directly by L3/L4's own
+/// `Reduction` (ASAPController#163/#164/#165), not inferred from whether
+/// `by` happens to be empty.
 ///
-/// Deliberately NOT the same as `project_group_key` above -- confirmed by
-/// directly inspecting the `L4Node` tree for `quantile_over_time(0.99,
-/// http_latency_ms[10s])` (a bare per-series range function, no PromQL
-/// `by(...)` or label selector referencing "service" at all): the L3/L4
-/// schema derivation has genuinely NO KNOWLEDGE of the "service" column,
-/// since planning happens with "no reference to what's actually stored
-/// anywhere" (this crate's own L4 design doc) -- `by` ends up `[]` not as
-/// a deliberate "reduce everything" choice, but because there was nothing
-/// in the query text to resolve a column against. Naively projecting onto
-/// an empty `by` (what `project_group_key` does) would collapse every
-/// matching sid's group key to the SAME empty map `{}` -- which doesn't
-/// just lose labels, it makes `execute()`'s own `by_group: BTreeMap<GroupKey,
-/// Vec<Handle>>` fold MULTIPLE DISTINCT series into ONE merged answer
-/// whenever more than one sid/series matches. Confirmed via a real e2e
-/// shadow-mode run: the legacy `sketch_reducer.rs::evaluate_core` path
-/// never has this problem because it doesn't project through `by` at all
-/// for this family -- it passes each series' own `series_label_values`
-/// straight through (`ts.series_label_values`, unconditionally), so
-/// distinct series always stay distinct rows.
+/// This replaces the old family-specific split (`sketch_group_key` vs.
+/// `project_group_key` used bare): before `Reduction` existed on
+/// `SummaryAgg`, an empty `by: Vec<ColumnId>` was genuinely ambiguous --
+/// it could mean either "no explicit grouping was even resolvable" (a
+/// bare per-series range function like `quantile_over_time(0.99,
+/// http_latency_ms[10s])`, where L3/L4 planning has no reference to any
+/// label column at all) or "a real cross-series reduction with zero
+/// grouping columns" (`count(hll_metric)`, `sum(...)`-shaped). Those two
+/// cases need OPPOSITE group-key behavior and the old `by: &[ColumnId]`
+/// signature could not tell them apart -- `sketch_group_key`'s heuristic
+/// (treat empty `by` as "keep every series distinct" for the Sketch
+/// family only) fixed the first case but could not fix the second, since
+/// by the time `find_candidates` saw a bare `[]`, the distinction was
+/// already lost.
 ///
-/// So: when `by_names` is empty, use the sid's own FULL label map
-/// (matching `evaluate_core`'s behavior exactly -- keep every series
-/// distinct); when non-empty, an explicit grouping WAS resolvable from
-/// the query (e.g. `quantile by (zone) (...)`), so project onto it as
-/// requested, same as `project_group_key`. `ExactAgg`'s `by=[]` keeps its
-/// OWN, opposite-looking-but-independently-correct meaning ("reduce
-/// fully") -- see `project_group_key`'s doc for why that's not the same
-/// question.
-fn sketch_group_key(
+/// `Reduction` restores it directly:
+/// - `PerEntity`: no grouping concept at all -- use the sid's own FULL
+///   label map, matching the legacy `sketch_reducer.rs::evaluate_core`
+///   path's behavior exactly (it passes `series_label_values` straight
+///   through, unconditionally), so distinct series always stay distinct
+///   rows. Applies uniformly to both families now (previously
+///   `ExactAgg`'s `project_group_key` had no equivalent, since `Sum`/
+///   `Increase`-shaped exact aggregations only ever reach an unqualified
+///   PromQL aggregation operator, which is never `PerEntity`).
+/// - `Reduce(by)`: a genuine reduction. Project onto `by_names` as
+///   before -- when `by_names` is empty this naturally returns the SAME
+///   `{}` key for every matching candidate, correctly merging them into
+///   one group (the fix for the `count(hll_metric)`-style case the old
+///   `by: &[ColumnId]` signature couldn't resolve). When non-empty, an
+///   explicit grouping was resolvable from the query (e.g. `quantile by
+///   (zone) (...)`), so project onto it as requested.
+fn resolve_group_key(
+    reduction: &Reduction,
     by_names: &[String],
     label_values: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    if by_names.is_empty() {
-        label_values.clone()
-    } else {
-        project_group_key(by_names, label_values)
+    match reduction {
+        Reduction::PerEntity => label_values.clone(),
+        Reduction::Reduce(_) => project_group_key(by_names, label_values),
     }
 }
 
@@ -970,14 +977,14 @@ mod tests {
         })
     }
 
-    fn kll_agg_node(child: Rc<L4Node>, by: Vec<ColumnId>) -> Rc<L4Node> {
+    fn kll_agg_node(child: Rc<L4Node>, reduction: Reduction) -> Rc<L4Node> {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
                 sketch: SummaryKind::Kll,
                 params: SummaryParams::Kll { k: 200 },
                 col: ColumnRef::SampleValue,
-                by,
+                reduction,
             },
             schema: L4Schema {
                 fields: vec![],
@@ -987,13 +994,17 @@ mod tests {
     }
 
     fn hll_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
+        hll_agg_node_with(child, Reduction::by(vec![]))
+    }
+
+    fn hll_agg_node_with(child: Rc<L4Node>, reduction: Reduction) -> Rc<L4Node> {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
                 sketch: SummaryKind::Hll,
                 params: SummaryParams::Hll { precision: 10 },
                 col: ColumnRef::SampleValue,
-                by: vec![],
+                reduction,
             },
             schema: L4Schema {
                 fields: vec![],
@@ -1138,7 +1149,7 @@ mod tests {
                     depth: 4,
                 },
                 col: ColumnRef::SampleValue,
-                by: vec![],
+                reduction: Reduction::by(vec![]),
             },
             schema: L4Schema {
                 fields: vec![],
@@ -1195,7 +1206,7 @@ mod tests {
                     heap_size: 10,
                 },
                 col: ColumnRef::SampleValue,
-                by: vec![],
+                reduction: Reduction::by(vec![]),
             },
             schema: L4Schema {
                 fields: vec![],
@@ -1235,7 +1246,10 @@ mod tests {
                 sketch: SummaryKind::Sum,
                 params: SummaryParams::Sum,
                 col: ColumnRef::SampleValue,
-                by,
+                // Sum is a genuine PromQL aggregation operator -- an empty
+                // `by` always means "reduce fully," never `PerEntity` (see
+                // `resolve_group_key`'s doc).
+                reduction: Reduction::by(by),
             },
             schema: L4Schema {
                 fields: vec![],
@@ -1283,7 +1297,7 @@ mod tests {
 
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -1342,7 +1356,7 @@ mod tests {
 
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -1398,7 +1412,7 @@ mod tests {
         let child = scan_node("latency_ms", Some("zone"));
         // "zone" is field index 1 in `scan_node`'s schema (0 = value).
         let tree = estimate_node(
-            kll_agg_node(child, vec![1]),
+            kll_agg_node(child, Reduction::by(vec![1])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -1437,17 +1451,18 @@ mod tests {
 
     #[test]
     fn bare_per_series_query_keeps_distinct_series_separate_even_with_no_by() {
-        // The exact bug `sketch_group_key` fixes, confirmed against a real
-        // e2e shadow-mode run for `quantile_over_time(m[r])` (a bare
-        // per-series range function -- no PromQL `by(...)`, no label
-        // selector, so the L4Node's `by` is empty because the query text
-        // gives it nothing to resolve, NOT because the user asked to merge
-        // everything). Two sids with DIFFERENT real labels ("zone") but an
-        // UNGROUPED query (`by: vec![]`, mirroring `kll_agg_node`'s
-        // no-grouping call shape) must still produce TWO separate output
-        // series -- naively projecting onto an empty `by` would collapse
-        // both sids' group keys to the SAME `{}` and silently merge two
-        // unrelated distributions into one wrong answer.
+        // The `Reduction::PerEntity` half of the empty-`by` ambiguity
+        // (ASAPController#163/#164/#165), confirmed against a real e2e
+        // shadow-mode run for `quantile_over_time(m[r])` (a bare per-series
+        // range function -- no PromQL `by(...)`, no label selector, so
+        // there's no grouping concept for the query to express at all,
+        // NOT a request to merge everything). Two sids with DIFFERENT real
+        // labels ("zone") under a `PerEntity` query must still produce TWO
+        // separate output series -- naively projecting onto an empty `by`
+        // would collapse both sids' group keys to the SAME `{}` and
+        // silently merge two unrelated distributions into one wrong
+        // answer. See `genuine_full_reduction_merges_distinct_series_unlike_per_entity`
+        // for the opposite (`Reduce([])`) case, which MUST merge.
         let idx = SketchStore::new();
         idx.register(kll_meta(1, "latency_ms", &["zone"]));
         idx.register(kll_meta(2, "latency_ms", &["zone"]));
@@ -1480,7 +1495,7 @@ mod tests {
         // latency_ms[r])` with no `by(...)`/label selector.
         let child = scan_node("latency_ms", Some("zone"));
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::PerEntity),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -1549,6 +1564,81 @@ mod tests {
         assert!(
             (3.0..=7.0).contains(&card),
             "cardinality {card} should be ~5"
+        );
+    }
+
+    #[test]
+    fn genuine_full_reduction_merges_distinct_series_unlike_per_entity() {
+        // The other half of the empty-`by` ambiguity `Reduction` resolves
+        // (ASAPController#163/#164/#165): a bare per-series range function
+        // like `quantile_over_time(m[r])` (Reduction::PerEntity, see
+        // `bare_per_series_query_keeps_distinct_series_separate_even_with_no_by`
+        // above) must NOT merge distinct series, but a genuine
+        // cross-series reduction with zero grouping columns --
+        // `count(hll_metric)`-shaped, Reduction::Reduce(GroupKeys::by([]))
+        // -- legitimately MUST merge them into one combined answer. Before
+        // `find_candidates` took `&Reduction` instead of `&[ColumnId]`,
+        // these two cases were indistinguishable from an empty `by` alone
+        // (the old `sketch_group_key` heuristic could only ever pick ONE
+        // of the two behaviors for every empty-`by` query).
+        //
+        // Two HLL sids with DIFFERENT real "zone" labels (same shape as
+        // the PerEntity test above) and DISJOINT item sets: under a
+        // genuine `Reduce([])`, they must merge into ONE group whose
+        // cardinality reflects BOTH sids' items combined (~10), not two
+        // separate ~5-item answers.
+        let idx = SketchStore::new();
+        idx.register(hll_meta(1, "unique_users"));
+        idx.register(hll_meta(2, "unique_users"));
+        let items1: Vec<&str> = vec!["a", "b", "c", "d", "e"];
+        let items2: Vec<&str> = vec!["f", "g", "h", "i", "j"];
+        let mut labels_east = BTreeMap::new();
+        labels_east.insert("zone".to_string(), "us-east".to_string());
+        let mut labels_west = BTreeMap::new();
+        labels_west.insert("zone".to_string(), "us-west".to_string());
+        idx.append_sample(
+            1,
+            labels_east,
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_hll_from_items(10, &items1),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+        idx.append_sample(
+            2,
+            labels_west,
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_hll_from_items(10, &items2),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::MsgpackFull,
+            },
+        );
+
+        let child = scan_node("unique_users", Some("zone"));
+        let tree = estimate_node(
+            hll_agg_node_with(child, Reduction::by(vec![])),
+            SketchQuery::Cardinality,
+        );
+
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        assert_eq!(
+            v.len(),
+            1,
+            "a genuine full reduction must merge both sids into one group, got {v:?}"
+        );
+        let (_group, value) = &v[0];
+        let SummaryValue::Points(samples, _coverage) = value else {
+            panic!("expected Points, got {value:?}");
+        };
+        let (_ts, card) = samples[0];
+        assert!(
+            (8.0..=12.0).contains(&card),
+            "merged cardinality {card} should be ~10 (both sids' disjoint item sets combined), \
+             not ~5 (one sid dropped or kept separate)"
         );
     }
 
@@ -1910,7 +2000,7 @@ mod tests {
         let idx = SketchStore::new();
         let child = scan_node("nonexistent_metric", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
         let exec = ctx(&idx);
@@ -1942,7 +2032,7 @@ mod tests {
                 sketch: SummaryKind::Kll,
                 params: SummaryParams::Kll { k: 500 },
                 col: ColumnRef::SampleValue,
-                by: vec![],
+                reduction: Reduction::by(vec![]),
             },
             schema: L4Schema {
                 fields: vec![],
@@ -1990,7 +2080,7 @@ mod tests {
 
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -2062,7 +2152,7 @@ mod tests {
 
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -2118,7 +2208,7 @@ mod tests {
 
         let child = scan_node("latency_ms", None);
         let tree = estimate_node(
-            kll_agg_node(child, vec![]),
+            kll_agg_node(child, Reduction::by(vec![])),
             SketchQuery::Quantile { q: 0.5 },
         );
 
@@ -2336,7 +2426,7 @@ mod tests {
                 sketch: SummaryKind::MinMax,
                 params: SummaryParams::MinMax,
                 col: ColumnRef::SampleValue,
-                by: vec![],
+                reduction: Reduction::by(vec![]),
             },
             schema: L4Schema {
                 fields: vec![],
