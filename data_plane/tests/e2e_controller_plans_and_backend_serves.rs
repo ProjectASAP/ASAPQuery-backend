@@ -1240,11 +1240,12 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "known gap, exposed (not caused) by sketch_reducer.rs's retirement: this shape \
-    silently capability-missed on SummaryExecutor before too (family/params mismatch), \
-    but the legacy reducer's evaluate_for_capability fallback masked it -- with the \
-    reducer gone, the miss is now visible as a hard test failure instead of a silent \
-    fallback. Root-cause + fix tracked as a follow-up, separate from the reducer \
-    retirement itself."]
+    now hard capability-misses on SummaryExecutor ('No result for query') instead of \
+    silently falling through to the retired legacy reducer, which used to mask it. Not \
+    fully root-caused yet -- possibly the same effective_is_cumulative gap as \
+    ASAPQuery-backend#431 (this query is also `count_over_time(...)`, a function name \
+    effective_is_cumulative's match doesn't cover), but that's unconfirmed for this \
+    specific CountSketchWithHeap/heap_size shape. Needs its own investigation."]
 async fn controller_plan_to_query_full_roundtrip_count_sketch() {
     let stack = start_full_stack(19_567, 19_568).await;
     let client = reqwest::Client::new();
@@ -2588,13 +2589,13 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
 // classifies a bare `count(...)` as non-cumulative, so `readout`
 // evaluates per-window instead of merging the whole range -- this test's
 // later "watermark" sample (a distinct, more recent window) then wins
-// over the real data instead of being merged with it. Tracked as a
-// follow-up, separate from the reducer retirement itself.
+// over the real data instead of being merged with it. Tracked as
+// https://github.com/ProjectASAP/ASAPQuery-backend/issues/431.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "known gap, exposed (not caused) by sketch_reducer.rs's retirement -- see the \
     module comment immediately above this test for the full root cause \
     (effective_is_cumulative misclassifies bare count(), previously masked by the \
-    legacy reducer fallback). Tracked as a follow-up."]
+    legacy reducer fallback). Tracked as ASAPQuery-backend#431."]
 async fn live_serve_hll_global_count_merges_across_sids() {
     let _live = LiveServeEnvGuard::enable();
 
