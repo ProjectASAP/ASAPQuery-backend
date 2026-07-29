@@ -45,5 +45,4 @@ pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
 pub use lower::{bind_query_expr, BindingError};
-pub use matcher::SummaryFamilyMatcher;
 pub use physical_expr::{L4Plan, PhysicalExpr};

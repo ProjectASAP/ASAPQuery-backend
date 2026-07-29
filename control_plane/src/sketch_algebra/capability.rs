@@ -333,9 +333,7 @@ impl Capability {
     /// The four sketch-family variants (`QuantileApprox`,
     /// `CardinalityApprox`, `FrequencyEstimate`, `FrequencyTopk`)
     /// delegate their family-compatibility logic to
-    /// [`sketch_family_satisfied`] — the same rule
-    /// `sketch_algebra::matcher::SummaryFamilyMatcher` applies to
-    /// `asap_plan::Implementation` values (`enum-unification-plan.md`
+    /// [`sketch_family_satisfied`] (`enum-unification-plan.md`
     /// §5/§8 Step 4) — via [`resolve_handle`], which picks a concrete
     /// per-family stand-in for the `Any` wildcard since `SummaryKind`
     /// has no wildcard concept of its own; family-matching subsumes it.
@@ -420,8 +418,8 @@ fn to_summary_kind(h: SketchKindHandle) -> Option<SummaryKind> {
 /// [`sketch_family_satisfied`]. `Any` (the query-side "any
 /// implementation in this family satisfies" wildcard) resolves to
 /// `any_stand_in` — a concrete per-family placeholder — because
-/// `SummaryKind`/`SummaryFamilyMatcher` has no wildcard concept of its
-/// own; `sketch_family_satisfied`'s same-family-satisfies rule already
+/// `SummaryKind` has no wildcard concept of its own;
+/// `sketch_family_satisfied`'s same-family-satisfies rule already
 /// treats every member of a family as interchangeable, so picking ANY
 /// concrete family member as the stand-in reproduces the wildcard's
 /// effect (`enum-unification-plan.md` §8 Step 4's investigation note).
@@ -887,13 +885,11 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_concrete_kind_matches_same_family() {
-        // Intentional broadening vs. this module's pre-`SummaryFamilyMatcher`
+        // Intentional broadening vs. this module's pre-`sketch_family_satisfied`
         // behavior: a concrete required handle used to need an EXACT
         // available match (only `Any` unlocked family-level matching).
-        // Delegating to `sketch_family_satisfied` (the same rule
-        // `sketch_algebra::matcher::SummaryFamilyMatcher` already applies
-        // to `Implementation` values) makes family membership the only
-        // thing that matters, matching enum-unification-plan.md §5's
+        // Delegating to `sketch_family_satisfied` makes family membership
+        // the only thing that matters, matching enum-unification-plan.md §5's
         // table ("Kll or DDSketch | the other one | yes ... either
         // answers a quantile requirement not pinned to a concrete kind") —
         // that rule isn't conditioned on whether the requirement happened
@@ -1147,10 +1143,10 @@ mod tests {
         // And the concrete-against-concrete (same handle) case matches.
         let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
         assert!(required_concrete.is_satisfied_by(&cap));
-        // Intentional broadening vs. this module's pre-`SummaryFamilyMatcher`
+        // Intentional broadening vs. this module's pre-`sketch_family_satisfied`
         // behavior: CMS and CountSketch are the SAME frequency family in
         // `sketch_algebra::matcher`'s reference rule table (both bare and
-        // heap-bearing — see `SummaryFamilyMatcher`'s
+        // heap-bearing — see its
         // `cms_and_count_sketch_are_the_same_frequency_family` test), so a
         // `CmsWithHeap` requirement IS now satisfied by a
         // `CountSketchWithHeap` available (both heap-bearing, same
