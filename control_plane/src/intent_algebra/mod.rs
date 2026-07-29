@@ -62,8 +62,9 @@
 //! that wiring becomes a focused change rather than a co-emission of new
 //! types + new consumers. Phase F's `cse_reuse_is_legal` and
 //! `dedupe_subtrees` are similarly defined here for the planner to grow
-//! into; the cost-model side that consumes them lives in
-//! `planner::cost_model::workload_cost`.
+//! into; the cost-model-side consumer this once pointed at
+//! (`workload_cost`) was removed as dead code (never wired) in the
+//! 2026-07 retirement pass.
 
 // The intent_algebra module is the new L3 surface — its re-exports are
 // the public API that downstream phases will consume. Until Phase C

@@ -460,52 +460,6 @@ fn sketch_kinds_compatible(
     }
 }
 
-/// Identity-axis mapping from data-plane's `AggregationType` (which
-/// conflates identity + keyed/unkeyed — see
-/// `crates/promql_utilities/src/query_logics/enums.rs`) onto
-/// ASAPController's `SummaryKind` exact-accumulator variants (identity
-/// only; grouping is a sibling axis, not modeled here — see
-/// `crates/asap_types/src/key_by_label_names.rs`'s module doc for the
-/// same design call made on the data-plane side).
-///
-/// **Not** wired into [`Capability::ExactAgg`] — doing so would silently
-/// drop the keyed-vs-unkeyed asymmetric matching rule
-/// ([`multi_pop_satisfies_single`]) that `ExactAgg`'s `is_satisfied_by`
-/// arm depends on: `SummaryKind` alone can't distinguish "this was
-/// originally a multi-population policy" once the mapping collapses
-/// `Sum`/`MultipleSum` onto the same variant. Fixing that properly needs
-/// a grouping sibling field on whatever replaces `Capability::ExactAgg`'s
-/// payload (mirroring the plan's `AccumulatorSpec.grouping` proposal for
-/// the data-plane side, §7) — that's Step 5's territory
-/// (`aggregation_config.rs`), out of scope for this change. This mapping
-/// is a documented, tested building block for that future wiring.
-///
-/// Sketch-shaped `AggregationType` variants (`DatasketchesKLL`,
-/// `CountMinSketch`, `HLL`, `DDSketch`, ...) have no `ExactAgg`
-/// equivalent — `ExactAgg` is specifically the exact/non-approximate
-/// family — and map to `None`, as do the two legacy string-sub-type
-/// wrapper variants (`SingleSubpopulation`/`MultipleSubpopulation`),
-/// which need the accompanying `aggregation_sub_type: String` (not
-/// available at this enum-only mapping level) to resolve.
-pub fn exact_summary_kind_for(agg_type: AggregationType) -> Option<SummaryKind> {
-    match agg_type {
-        AggregationType::Sum | AggregationType::MultipleSum => Some(SummaryKind::Sum),
-        AggregationType::Increase | AggregationType::MultipleIncrease => {
-            Some(SummaryKind::Increase)
-        }
-        AggregationType::MinMax | AggregationType::MultipleMinMax => Some(SummaryKind::MinMax),
-        AggregationType::DatasketchesKLL
-        | AggregationType::HydraKLL
-        | AggregationType::CountMinSketch
-        | AggregationType::CountMinSketchWithHeap
-        | AggregationType::CountSketch
-        | AggregationType::CountSketchWithHeap
-        | AggregationType::HLL
-        | AggregationType::DDSketch
-        | AggregationType::SingleSubpopulation
-        | AggregationType::MultipleSubpopulation => None,
-    }
-}
 
 /// True when `available` is the multi-population equivalent of
 /// `required`'s single-population variant — i.e. a `MultipleSum`
@@ -700,33 +654,6 @@ fn implementation_to_capability(implementation: asap_plan::Implementation) -> Op
 /// so the call sites read as `if is_exact(accuracy) { ... }`.
 fn is_exact(accuracy: &AccuracyTarget) -> bool {
     matches!(accuracy, AccuracyTarget::Exact)
-}
-
-// ── Sketch-family error bounds ───────────────────────────────────────────────
-//
-// These two helpers were originally defined in `controller/src/algebra/expr.rs`
-// (now `controller/src/intent_algebra/relational.rs`). The 2026-05
-// layered-cleanup refactor moves them here — they are sketch-family
-// error bounds, so the capability module is their structural home.
-//
-// The legacy module re-exports both via [`hll_accuracy`] /
-// [`countmin_accuracy`] aliases so callers like `AggIntent::default_cardinality`
-// keep compiling.
-
-/// HLL accuracy from register count: `1.04 / sqrt(2^registers)`.
-///
-/// Source: Flajolet et al., "HyperLogLog: the analysis of a
-/// near-optimal cardinality estimation algorithm" (2007).
-pub fn hll_accuracy(registers: u8) -> f64 {
-    1.04 / (2.0f64.powi(registers as i32)).sqrt()
-}
-
-/// Count-Min Sketch accuracy from width: `e / width`.
-///
-/// Source: Cormode & Muthukrishnan, "An improved data stream summary:
-/// the count-min sketch and its applications" (2005).
-pub fn countmin_accuracy(width: u32) -> f64 {
-    std::f64::consts::E / width as f64
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1176,63 +1103,6 @@ mod tests {
         // query-dispatch layer, not routed through here.
         let required = Capability::ExactAgg(AggregationType::Sum);
         assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Increase)));
-    }
-
-    // ── exact_summary_kind_for: AggregationType → SummaryKind identity ───
-
-    #[test]
-    fn exact_summary_kind_for_maps_bare_identity_variants() {
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::Sum),
-            Some(SummaryKind::Sum)
-        );
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::Increase),
-            Some(SummaryKind::Increase)
-        );
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::MinMax),
-            Some(SummaryKind::MinMax)
-        );
-    }
-
-    #[test]
-    fn exact_summary_kind_for_maps_keyed_siblings_onto_the_same_kind() {
-        // The keyed axis is deliberately ignored here — see the function
-        // doc for why (it's not wired into `Capability::ExactAgg`, which
-        // still needs the keyed/unkeyed distinction for
-        // `multi_pop_satisfies_single`).
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::MultipleSum),
-            Some(SummaryKind::Sum)
-        );
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::MultipleIncrease),
-            Some(SummaryKind::Increase)
-        );
-        assert_eq!(
-            exact_summary_kind_for(AggregationType::MultipleMinMax),
-            Some(SummaryKind::MinMax)
-        );
-    }
-
-    #[test]
-    fn exact_summary_kind_for_rejects_sketch_shaped_variants() {
-        // These belong to the approximate family, not `ExactAgg`.
-        for t in [
-            AggregationType::DatasketchesKLL,
-            AggregationType::HydraKLL,
-            AggregationType::CountMinSketch,
-            AggregationType::CountMinSketchWithHeap,
-            AggregationType::CountSketch,
-            AggregationType::CountSketchWithHeap,
-            AggregationType::HLL,
-            AggregationType::DDSketch,
-            AggregationType::SingleSubpopulation,
-            AggregationType::MultipleSubpopulation,
-        ] {
-            assert_eq!(exact_summary_kind_for(t), None, "{t:?}");
-        }
     }
 
     // ── capability_for: ExactAgg dormancy ────────────────────────────────

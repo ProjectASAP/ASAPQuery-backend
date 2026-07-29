@@ -23,7 +23,6 @@ pub mod otap;
 pub mod precompute;
 pub mod stage_config;
 pub mod telegraf;
-pub mod trait_def;
 
 pub use agent::generate_agent_collector_config;
 pub use backend_push::{
@@ -38,10 +37,6 @@ pub use stage_config::{
     emit_edge_yaml, emit_gateway_yaml, DEFAULT_TENANT,
 };
 pub use telegraf::emit_telegraf_toml;
-pub use trait_def::{
-    InferenceConfigEmitter, InferenceConfigInput, OpampEmitter, OpampGatewayEmitter, PlanEmitter,
-    StreamingConfigEmitter,
-};
 
 // Refactor 2026-05: design.md §5 puts `WorkloadRegistry` next to
 // `emit`, not inside it. The new home is `crate::workload`; we re-export

@@ -29,31 +29,8 @@ pub mod cost;
 pub mod cse;
 pub mod engine;
 pub mod rules;
-pub mod trait_def;
 
 // Re-exports — preserve the surface that `crate::algebra::QueryOptimizer`
 // and `crate::planner::*` consumers historically relied on.
 pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use engine::{DeploymentConstraints, QueryOptimizer};
-pub use trait_def::{OptimizerRule, RuleCategory};
-
-// ── OptimizerRule blanket impl for sketch_algebra::rules::Rule ────────────────
-//
-// Every Phase-C bind rule that implements
-// [`crate::sketch_algebra::rules::Rule`] is also an
-// [`OptimizerRule`] — its category is always `Bind` because that's
-// exactly what `sketch_algebra::rules` is for (L3 → L4 sketch
-// commitment). The blanket impl lives here (not in `sketch_algebra/`)
-// so the impl boundary is owned by the optimizer crate-section, not by
-// the sketch_algebra rule library.
-impl<R> OptimizerRule for R
-where
-    R: crate::sketch_algebra::rules::Rule + Send + Sync + 'static,
-{
-    fn name(&self) -> &'static str {
-        <Self as crate::sketch_algebra::rules::Rule>::name(self)
-    }
-    fn category(&self) -> RuleCategory {
-        RuleCategory::Bind
-    }
-}

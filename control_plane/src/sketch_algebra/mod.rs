@@ -12,10 +12,8 @@
 //!   sketch-identity unification; see
 //!   `scratchpad/artifacts/enum-unification-plan.md`).
 //! - [`bind_query_expr`] — the L3→L4 lowering driver: bottom-up walk
-//!   that fires `Bind*` rules.
-//! - [`rules`] — the `Bind*` rule family. Each rule pattern-matches on a
-//!   `QueryExpr::Aggregate` shape, reads the `AccuracyTarget`, and emits
-//!   a typed `PhysicalExpr` with the sketch family + parameters committed.
+//!   that delegates to `asap_plan::bind::implement_tree_in_with` (the
+//!   local `Bind*` rule family it used to fire was retired in Step B).
 //!
 //! Scope reduction (per orchestrator spec): the variant set ships the
 //! subset DC + PromQL needs. `SketchJoin`, `SketchSubtract`,
@@ -37,7 +35,6 @@ pub mod cost_model;
 pub mod lower;
 pub mod matcher;
 pub mod physical_expr;
-pub mod rules;
 
 #[cfg(test)]
 mod tests;

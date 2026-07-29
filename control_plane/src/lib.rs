@@ -59,7 +59,6 @@
 
 pub mod accuracy;
 pub mod backend_client;
-pub mod deployment_model;
 pub mod emit;
 pub mod epsilon_alloc;
 pub mod intent_algebra;
