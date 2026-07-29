@@ -7,6 +7,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, warn};
 
+use crate::intent_algebra::agg_intent::AggIntent;
 use crate::types::SketchType;
 
 /// Aggregation role a single (metric, query-shape) pair plays in the planner.
@@ -48,9 +49,11 @@ pub enum AggRole {
     /// to HLL when a sketch is appropriate, otherwise to a Sum-as-count
     /// exact-aggregation.
     Count,
-    /// `topk(...)`, `topk_over_time(...)`, or workload entries with
+    /// `topk(...)`, or workload entries with
     /// `sketch_family_override: CountSketch | CountMinSketch`. Routes
-    /// to CountSketch / CMS-with-heap.
+    /// to CountSketch / CMS-with-heap. (`topk_over_time(...)` isn't a
+    /// real function this parser recognizes — dropped from this list;
+    /// see `agg_role_topk_query_strings`'s test comment.)
     Topk,
     /// Fallback bucket — specialized sketch families that don't fit the
     /// four shapes above (e.g. CountMinSketch frequency without a topk
@@ -90,24 +93,43 @@ impl std::fmt::Display for AggRole {
 ///    * `CountMinSketch` → [`AggRole::Other`] (frequency — no
 ///      single canonical shape; we keep it out of `Topk` so the topk
 ///      variant stays semantically pure for sketch-with-heap families)
-/// 2. **PromQL AST classification** by outermost-function name in
-///    `query_string`. Recognised function tokens:
-///    * `quantile_over_time` / `quantile` / `histogram_quantile` → [`AggRole::Quantile`]
-///    * `sum` / `sum_over_time` / `rate` / `increase` → [`AggRole::Sum`]
-///    * `count` / `count_over_time` / `count_distinct_over_time` → [`AggRole::Count`]
-///    * `topk` / `topk_over_time` → [`AggRole::Topk`]
-///    * Bare metric selector (no outer function) → [`AggRole::Sum`]
-///      (matches PromQL's instant-vector semantics — a bare counter
-///      sums values across time-aligned samples).
-/// 3. Fallback: [`AggRole::Other`].
+/// 2. **Real `AggIntent` classification** — `query_string` is parsed
+///    through the same canonical pipeline the live serving path uses
+///    (`query_parser::parse_query_expr_canonical` →
+///    `asap_tier_analysis::collect_agg_intents`), and the OUTERMOST
+///    intent (the one bound to the data-plane capability) is matched:
+///    * [`AggIntent::Quantile`] → [`AggRole::Quantile`]
+///    * [`AggIntent::TopK`] → [`AggRole::Topk`]
+///    * [`AggIntent::Cardinality`], [`AggIntent::Count`], or the
+///      windowed-Count-as-Frequency extension
+///      (`intent_algebra::as_frequency`) → [`AggRole::Count`]
+///    * [`AggIntent::Sum`], [`AggIntent::Rate`], [`AggIntent::Increase`]
+///      → [`AggRole::Sum`]
+///    * Anything else recognised but not one of the four shapes above
+///      (`Min`/`Max`/`Avg`/`StdDev`/histogram accessors/…) →
+///      [`AggRole::Other`].
+///    * Bare metric selector (no `Aggregate` node at all) →
+///      [`AggRole::Sum`] (matches PromQL's instant-vector semantics —
+///      a bare counter sums values across time-aligned samples).
+/// 3. Unparseable / no query string / no override → [`AggRole::Other`].
 ///
-/// Ambiguous case decisions (documented for the B2 PR):
-///   * `count_over_time(metric)` — Count (cardinality semantics).
-///     The Sum-shaped alternative is rare in practice; users who want
-///     it write `sum_over_time(count(...))` which classifies as Sum.
-///   * `rate` / `increase` — Sum. Both bind to ExactAgg(Sum) on the
-///     data plane (see `data_plane/src/precompute_engine/ingest_handler.rs`'s
-///     handling of `AggKind::ExactAgg { Sum }`).
+/// This used to be a PromQL-string leading-token sniff — the same
+/// duplicate-classifier smell already retired from the live serving path
+/// (see the former `analyzer-parity-matrix.md`'s "engine (duplicate)"
+/// analyzer). `AggIntent` classification is now the single source of
+/// truth for "what shape is this query," here and on the serving path.
+///
+/// Ambiguous case decisions (documented for the B2 PR, still holds under
+/// `AggIntent` classification):
+///   * `count_over_time(metric)` — Count (cardinality/frequency
+///     semantics, whichever the lowerer picks). The Sum-shaped
+///     alternative is rare in practice; users who want it write
+///     `sum_over_time(count(...))` which classifies as Sum.
+///   * `rate` / `irate` / `increase` — Sum. `irate` folds onto
+///     `AggIntent::Rate` at L3 same as `rate`; both bind to
+///     ExactAgg(Increase) on the data plane (see
+///     `data_plane/src/precompute_engine/ingest_handler.rs`'s handling
+///     of `AggKind::ExactAgg { Increase }`).
 pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     // 1. `sketch_family_override` wins.
     if let Some(family) = entry.sketch_family_override.as_ref() {
@@ -119,44 +141,47 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
         };
     }
 
-    // 2. PromQL AST classification — outermost-token sniff. We don't
-    //    need a full AST walk: PromQL function calls always lead with
-    //    `<name>(`, so the leading identifier carries the shape. For
-    //    nested aggregations the OUTERMOST one drives the role (it's
-    //    the one bound to the data-plane capability).
-    if let Some(qs) = entry.query_string.as_ref() {
+    // 2. Real AggIntent classification via the canonical parse/lower
+    //    pipeline — the same one `capability_for`/serving uses. Also runs
+    //    the L3 rule-based optimizer (as `main.rs`'s live plan pipeline
+    //    does, unlike the narrower `asap_tier_analysis` hot path) so
+    //    `TopKFusion` (R5) folds a raw `Limit(Sort DESC)` into an
+    //    `Aggregate { AggIntent::TopK }` before classification —
+    //    otherwise a bare `topk(k, m)` never reaches an `Aggregate` node
+    //    at all and would misclassify as a bare selector. `TopKFusion`
+    //    is a pure structural rewrite (ignores the cost model), so the
+    //    placeholder `0.0` throughput here doesn't affect the outcome.
+    let Some(qs) = entry.query_string.as_ref() else {
+        return AggRole::Other;
+    };
+    let accuracy = crate::types_v2::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
+    let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs, accuracy) else {
+        return AggRole::Other;
+    };
+    let (expr, _) = crate::optimizer::engine::QueryOptimizer::new(0.0).optimize(expr);
+    let mut intents: Vec<AggIntent> = Vec::new();
+    crate::asap_tier_analysis::collect_agg_intents(&expr, &mut intents);
+    let Some(outer) = intents.first() else {
+        // No Aggregate node at all — a bare metric selector (or a
+        // window-only shape with no AggType to map onto). Bare
+        // selectors default to Sum per PromQL's instant-vector
+        // semantics; anything else falls through to Other below.
         let trimmed = qs.trim_start();
-        // Find the leading identifier — letters / underscores up to
-        // the first non-identifier char (`(`, space, `{`, etc.).
-        let token_end = trimmed
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(trimmed.len());
-        let leading = &trimmed[..token_end];
-        if !leading.is_empty() {
-            match leading {
-                "quantile_over_time" | "quantile" | "histogram_quantile" => {
-                    return AggRole::Quantile
-                }
-                "sum" | "sum_over_time" | "rate" | "irate" | "increase" => return AggRole::Sum,
-                "count" | "count_over_time" | "count_distinct_over_time" => return AggRole::Count,
-                "topk" | "topk_over_time" => return AggRole::Topk,
-                _ => {}
-            }
-        }
-        // Bare metric selector — no outer function call. The leading
-        // token is a metric name (or empty if the query starts with a
-        // brace). Treat as Sum (PromQL's default instant-vector
-        // interpretation aligns with Sum-shaped capability).
         if !trimmed.is_empty() && !trimmed.starts_with('{') {
             return AggRole::Sum;
         }
+        return AggRole::Other;
+    };
+    if crate::intent_algebra::as_frequency(outer).is_some() {
+        return AggRole::Count;
     }
-
-    // 3. No query_string and no override — default to Sum (Mode-3
-    //    raw-passthrough entries in the workload registry typically
-    //    declare a bare metric with `assign_to_role: archive` and no
-    //    `query_string`).
-    AggRole::Other
+    match outer {
+        AggIntent::Quantile { .. } => AggRole::Quantile,
+        AggIntent::TopK { .. } => AggRole::Topk,
+        AggIntent::Cardinality { .. } | AggIntent::Count { .. } => AggRole::Count,
+        AggIntent::Sum { .. } | AggIntent::Rate | AggIntent::Increase => AggRole::Sum,
+        _ => AggRole::Other,
+    }
 }
 
 /// A single workload entry from the workloads YAML file.
@@ -808,17 +833,35 @@ mod tests {
 
     #[test]
     fn agg_role_quantile_query_strings() {
-        for q in [
-            "quantile_over_time(0.99, m[5m])",
-            "quantile(0.5, m)",
-            "histogram_quantile(0.99, rate(m_bucket[5m]))",
-        ] {
+        for q in ["quantile_over_time(0.99, m[5m])", "quantile(0.5, m)"] {
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Quantile,
                 "query `{q}` should classify as Quantile"
             );
         }
+    }
+
+    #[test]
+    fn agg_role_classic_bucket_histogram_quantile_is_other() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: the retired local parser unconditionally
+        // substituted `histogram_quantile(...)` with a sketchable
+        // `Quantile` intent. `lower_promql` instead detects the classic
+        // `_bucket` + `rate(...)` shape and produces the real,
+        // exact-only `AggIntent::HistogramQuantile`, which `capability_for`
+        // has no sketch-family mapping for (see
+        // `asap_tier_analysis::analyze_histogram_quantile_partially_answerable_via_inner_composition`).
+        // `derive_agg_role`'s wildcard arm correctly routes it to `Other`
+        // rather than misclassifying it as a sketch-routable `Quantile`.
+        assert_eq!(
+            derive_agg_role(&entry(
+                "m",
+                Some("histogram_quantile(0.99, rate(m_bucket[5m]))"),
+                None
+            )),
+            AggRole::Other
+        );
     }
 
     #[test]
@@ -854,8 +897,33 @@ mod tests {
     }
 
     #[test]
+    fn agg_role_handles_a_parenthesized_query_the_old_string_sniff_could_not() {
+        // A leading-token PromQL-string sniff (the pre-migration
+        // implementation) reads the FIRST character to find the outer
+        // function name; a redundant wrapping paren isn't an identifier
+        // character, so the old code's `token_end` search finds an
+        // empty leading token, falls through to "not a bare selector
+        // either" and mis-defaults to `Sum`. Real `AggIntent`
+        // classification parses the whole expression regardless of
+        // surface punctuation and correctly resolves the inner
+        // `quantile_over_time` shape.
+        assert_eq!(
+            derive_agg_role(&entry("m", Some("(quantile_over_time(0.9, m[5m]))"), None)),
+            AggRole::Quantile
+        );
+    }
+
+    #[test]
     fn agg_role_topk_query_strings() {
-        for q in ["topk(5, m)", "topk_over_time(3, m[5m])"] {
+        // `topk_over_time` was in this list pre-migration, but it isn't a
+        // real function this parser (or vanilla PromQL) recognizes at
+        // all — confirmed via grep, it appears nowhere in
+        // query_parser/promql.rs or intent_algebra/lower.rs. A workload
+        // entry with that query_string would fail to parse anywhere else
+        // in the real pipeline too (main.rs's handle_plan included), so
+        // the old string-sniffing heuristic classifying it as Topk was
+        // itself the bug, not something this test should keep pinning.
+        for q in ["topk(5, m)"] {
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Topk,

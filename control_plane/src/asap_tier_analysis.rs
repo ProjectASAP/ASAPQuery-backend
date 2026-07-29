@@ -333,7 +333,11 @@ fn render_spatial_filter(label_filters: &std::collections::HashMap<String, Strin
 /// Walk the lowered `QueryExpr`, collecting every `AggIntent` from every
 /// `Aggregate` node. `LetBinding` / `Ref` are recursed into; `Scan` /
 /// `Window` carry no intents themselves.
-fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
+///
+/// `pub(crate)` — also the single walker `workload::derive_agg_role` uses
+/// to classify a workload entry's `query_string` by its real, lowered
+/// `AggIntent` instead of a PromQL-string-prefix heuristic.
+pub(crate) fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
     match expr {
         QueryExpr::Aggregate { aggs, child, .. } => {
             out.extend(aggs.iter().cloned());
