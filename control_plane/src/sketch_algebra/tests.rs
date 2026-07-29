@@ -655,7 +655,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
 /// → L3 canonical via `lower`); `bind_query_expr` is the
 /// L3→L4 bottom-up walk under the supplied accuracy target.
 fn pipeline_l1_to_l4(query: &str, accuracy: AccuracyTarget) -> PhysicalExpr {
-    let qe = crate::query_parser::parse_query_expr_canonical(query)
+    let qe = crate::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .unwrap_or_else(|e| panic!("parse {query}: {e}"));
     bind_query_expr(&qe, accuracy).unwrap_or_else(|e| panic!("bind {query}: {e}"))
 }

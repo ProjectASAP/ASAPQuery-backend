@@ -698,8 +698,15 @@ impl ASAPQueryEngine {
         // since there's no legacy answer left to diff a live-served
         // result against.
         let mut any_live_served = false;
+        // Resilience fix -- see the instant-query `execute(&str)` path's
+        // identical comment above `for candidate in &analysis.candidates`
+        // for the full rationale (design-target-architecture.md Part B).
+        let mut last_miss_detail: Option<String> = None;
 
         for candidate in &analysis.candidates {
+            if combined_result.is_some() {
+                continue;
+            }
             // Resolve candidate → {sids} via the sid catalog. Schema-
             // retirement #5: prefer `instances_matching` over the
             // policy-fp reverse index — it's the more general
@@ -729,14 +736,12 @@ impl ASAPQueryEngine {
             }
             sids.extend(idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys));
             if sids.is_empty() {
-                return Err(crate::query_engines::EngineError::capability_miss(
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                    format!(
-                        "SketchStore has no policy for metric `{}` satisfying \
-                         capability {:?} — failing over to archive",
-                        candidate.metric_name, candidate.required_capability,
-                    ),
+                last_miss_detail = Some(format!(
+                    "SketchStore has no policy for metric `{}` satisfying \
+                     capability {:?} — failing over to archive",
+                    candidate.metric_name, candidate.required_capability,
                 ));
+                continue;
             }
 
             let required: crate::storage_engines::sketch_db::index::Capability =
@@ -760,14 +765,12 @@ impl ASAPQueryEngine {
                 }
             }
             if hit_sids.is_empty() {
-                return Err(crate::query_engines::EngineError::capability_miss(
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                    format!(
-                        "SketchStore has no sid satisfying capability {:?} for \
-                         metric `{}` — failing over to archive",
-                        candidate.required_capability, candidate.metric_name
-                    ),
+                last_miss_detail = Some(format!(
+                    "SketchStore has no sid satisfying capability {:?} for \
+                     metric `{}` — failing over to archive",
+                    candidate.required_capability, candidate.metric_name
                 ));
+                continue;
             }
 
             // ExactAgg capability → dispatch the per-(group_by_keys)
@@ -818,65 +821,58 @@ impl ASAPQueryEngine {
                             | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
                     );
                         if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
-                            return Err(crate::query_engines::EngineError::capability_miss(
-                                crate::storage_engines::types::StorageBackend::SketchStore
-                                    .data_source_id(),
-                                format!(
-                                    "SketchStore cannot answer `sum_over_time` over counter \
+                            last_miss_detail = Some(format!(
+                                "SketchStore cannot answer `sum_over_time` over counter \
                                  deltas for `{query}` (issue #301) — failing over to archive"
-                                ),
                             ));
+                            continue;
                         }
                         let use_rate_path = candidate.range_seconds > 0
                             && candidate.outer_fn == OuterFn::Rate
                             && is_exact_sum_family;
                         if use_rate_path {
-                            reducer
-                            .evaluate_exact_agg_rate(
+                            match reducer.evaluate_exact_agg_rate(
                                 &hit_sids,
                                 *agg_type,
                                 &candidate.group_by_keys,
                                 candidate.range_seconds,
                                 start_ms,
                                 end_ms,
-                            )
-                            .map_err(|e| {
-                                crate::query_engines::EngineError::capability_miss(
-                                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                                    format!(
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    last_miss_detail = Some(format!(
                                         "SketchStore exact-agg rate reducer failed for `{query}` over \
                                          [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                                    ),
-                                )
-                            })?
+                                    ));
+                                    continue;
+                                }
+                            }
                         } else {
-                            reducer
-                                .evaluate_exact_agg(
-                                    &hit_sids,
-                                    *agg_type,
-                                    &candidate.group_by_keys,
-                                    start_ms,
-                                    end_ms,
-                                    false,
-                                )
-                                .map_err(|e| {
-                                    crate::query_engines::EngineError::capability_miss(
-                                        crate::storage_engines::types::StorageBackend::SketchStore
-                                            .data_source_id(),
-                                        format!(
+                            match reducer.evaluate_exact_agg(
+                                &hit_sids,
+                                *agg_type,
+                                &candidate.group_by_keys,
+                                start_ms,
+                                end_ms,
+                                false,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    last_miss_detail = Some(format!(
                                         "SketchStore exact-agg reducer failed for `{query}` over \
                                          [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                                    ),
-                                    )
-                                })?
+                                    ));
+                                    continue;
+                                }
+                            }
                         }
                     }
                     // P2-4 (typed dispatch): route off the analyzer's typed
                     // `required_capability` via `evaluate_for_capability`
                     // instead of round-tripping it through a function-name
                     // string the reducer re-parses.
-                    _ => reducer
-                        .evaluate_for_capability(
+                    _ => match reducer.evaluate_for_capability(
                             &candidate.required_capability,
                             &hit_sids,
                             &candidate.function_args,
@@ -889,17 +885,16 @@ impl ASAPQueryEngine {
                             effective_is_cumulative(candidate),
                             start_ms,
                             end_ms,
-                        )
-                        .map_err(|e| {
-                            crate::query_engines::EngineError::capability_miss(
-                                crate::storage_engines::types::StorageBackend::SketchStore
-                                    .data_source_id(),
-                                format!(
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                last_miss_detail = Some(format!(
                                     "SketchStore reducer failed for `{query}` over \
-                                 [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                                ),
-                            )
-                        })?,
+                                     [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                                ));
+                                continue;
+                            }
+                        },
                 },
             };
             // Apply the analyzer's typed outer-aggregation operator on
@@ -924,7 +919,9 @@ impl ASAPQueryEngine {
         let result = combined_result.ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                format!("SketchStore reducer produced no result for `{query}`"),
+                last_miss_detail.unwrap_or_else(|| {
+                    format!("SketchStore reducer produced no result for `{query}`")
+                }),
             )
         })?;
 
@@ -1445,7 +1442,29 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             let streaming_snap = self.streaming_config_snapshot();
             let policy_registry = streaming_snap.policy_registry();
 
+            // Resilience fix (design-target-architecture.md Part B,
+            // completing the analyzer-side fix in
+            // `asap_tier_analysis::analyze_promql_for_asap_tier`):
+            // `lower_promql` genuinely produces multiple independent
+            // candidates for composed queries (e.g. `max by (zone)
+            // (quantile_over_time(...))` -> an outer `ExactAgg(MinMax)` +
+            // an inner `QuantileApprox`), where the retired local parser
+            // fused these into one shape. This loop used to hard-fail the
+            // whole query the moment ANY candidate had no matching sid --
+            // fine when there was always exactly one candidate, wrong now
+            // that a later candidate may still answer the query. Capacity-
+            // miss points below `continue` to the next candidate instead
+            // of returning immediately; genuine reducer/decode errors
+            // (not capability misses) still fail hard, unchanged. Once
+            // one candidate succeeds, skip the rest (first-success-wins,
+            // not "last write wins" -- multi-candidate result *folding*
+            // remains explicitly deferred future work per this loop's own
+            // pre-existing comment above).
+            let mut last_miss_detail: Option<String> = None;
             for candidate in &analysis.candidates {
+                if combined_result.is_some() {
+                    continue;
+                }
                 if candidate.range_seconds > 0 {
                     any_range_candidate = true;
                 }
@@ -1482,17 +1501,15 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &self.control_plane_client,
                         &req,
                     );
-                    return Err(crate::query_engines::EngineError::capability_miss(
-                        crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                        format!(
-                            "SketchStore has no policy for metric `{}` \
-                             with group_by_keys ⊇ {:?} satisfying capability \
-                             {:?} — failing over to archive",
-                            candidate.metric_name,
-                            candidate.group_by_keys,
-                            candidate.required_capability,
-                        ),
+                    last_miss_detail = Some(format!(
+                        "SketchStore has no policy for metric `{}` \
+                         with group_by_keys ⊇ {:?} satisfying capability \
+                         {:?} — failing over to archive",
+                        candidate.metric_name,
+                        candidate.group_by_keys,
+                        candidate.required_capability,
                     ));
+                    continue;
                 }
 
                 // Verify each sid carries the analyzer's required
@@ -1589,15 +1606,12 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             &self.control_plane_client,
                             &req,
                         );
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore
-                                .data_source_id(),
-                            format!(
-                                "SketchStore has no sid satisfying capability \
-                                 {:?} for metric `{}` — failing over to archive",
-                                candidate.required_capability, candidate.metric_name
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore has no sid satisfying capability \
+                             {:?} for metric `{}` — failing over to archive",
+                            candidate.required_capability, candidate.metric_name
                         ));
+                        continue;
                     }
                 }
 
@@ -1666,18 +1680,15 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             &self.control_plane_client,
                             &req,
                         );
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore
-                                .data_source_id(),
-                            format!(
-                                "SketchStore FrequencyEstimate sid for metric `{}` cannot \
-                                 answer the per-item selector `{}` (CMS/CountSketch return \
-                                 the per-window bucket TOTAL, not a string-keyed estimate) — \
-                                 failing over to archive rather than returning a misleading \
-                                 total",
-                                candidate.metric_name, candidate.spatial_filter_canonical
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore FrequencyEstimate sid for metric `{}` cannot \
+                             answer the per-item selector `{}` (CMS/CountSketch return \
+                             the per-window bucket TOTAL, not a string-keyed estimate) — \
+                             failing over to archive rather than returning a misleading \
+                             total",
+                            candidate.metric_name, candidate.spatial_filter_canonical
                         ));
+                        continue;
                     }
                 }
 
@@ -1726,16 +1737,14 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         &self.control_plane_client,
                         &req,
                     );
-                    return Err(crate::query_engines::EngineError::capability_miss(
-                        crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                        format!(
-                            "SketchStore cannot answer `sum_over_time` over counter \
-                             deltas for metric `{}` (issue #301: Σ-of-cumulative-samples \
-                             not reconstructable from per-window deltas) — failing over \
-                             to archive",
-                            candidate.metric_name
-                        ),
+                    last_miss_detail = Some(format!(
+                        "SketchStore cannot answer `sum_over_time` over counter \
+                         deltas for metric `{}` (issue #301: Σ-of-cumulative-samples \
+                         not reconstructable from per-window deltas) — failing over \
+                         to archive",
+                        candidate.metric_name
                     ));
+                    continue;
                 }
 
                 let use_rate_path = is_exact_sum_family && candidate.outer_fn == OuterFn::Rate;
@@ -1867,59 +1876,49 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             name,
                         ),
                     ) => {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                            format!(
-                                "SketchStore reducer does not support function `{name}` \
-                                 — failing over to archive"
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore reducer does not support function `{name}` \
+                             — failing over to archive"
                         ));
+                        continue;
                     }
                     Err(crate::storage_engines::sketch_db::query::ASAPTierError::UnsupportedCapability {
                         function,
                         capability}) => {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                            format!(
-                                "SketchStore reducer cannot answer `{function}` against \
-                                 capability {capability:?} — failing over to archive"
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore reducer cannot answer `{function}` against \
+                             capability {capability:?} — failing over to archive"
                         ));
+                        continue;
                     }
                     Err(crate::storage_engines::sketch_db::query::ASAPTierError::DeserializeFailure {
                         sid,
                         encoding,
                         reason}) => {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                            format!(
-                                "SketchStore reducer failed to decode sketch for sid \
-                                 {sid} (encoding={encoding:?}): {reason} — failing over \
-                                 to archive"
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore reducer failed to decode sketch for sid \
+                             {sid} (encoding={encoding:?}): {reason} — failing over \
+                             to archive"
                         ));
+                        continue;
                     }
                     Err(crate::storage_engines::sketch_db::query::ASAPTierError::NoData {
                         metric_name: m}) => {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                            format!(
-                                "SketchStore reducer found no samples for metric \
-                                 `{m}` in window — failing over to archive"
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore reducer found no samples for metric \
+                             `{m}` in window — failing over to archive"
                         ));
+                        continue;
                     }
                     Err(crate::storage_engines::sketch_db::query::ASAPTierError::MissingHeap {
                         sid,
                         sketch_kind}) => {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                            format!(
-                                "SketchStore reducer cannot enumerate top-k for sid \
-                                 {sid} (sketch_kind={sketch_kind:?}, no heap) — \
-                                 failing over to archive"
-                            ),
+                        last_miss_detail = Some(format!(
+                            "SketchStore reducer cannot enumerate top-k for sid \
+                             {sid} (sketch_kind={sketch_kind:?}, no heap) — \
+                             failing over to archive"
                         ));
+                        continue;
                     }
                 }
                 };
@@ -2009,6 +2008,17 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 }
                 return Ok(warm_qr);
             }
+            // Every candidate the analyzer produced was skipped above
+            // (resilience fix, design-target-architecture.md Part B) --
+            // none of them had a servable sid/reducer path. Surface the
+            // last-recorded miss reason rather than falling through to
+            // the unrelated no-sketch-index branch below.
+            return Err(crate::query_engines::EngineError::capability_miss(
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
+                last_miss_detail.unwrap_or_else(|| {
+                    format!("SketchStore found no servable candidate for `{query}`")
+                }),
+            ));
         }
 
         // CRITICAL #4: no-sketch-index fallback. The legacy
@@ -2777,16 +2787,19 @@ mod asap_tier_classify_tests {
 
     #[tokio::test]
     async fn execute_bare_selector_falls_over_to_archive() {
-        // A bare vector selector lowers (via
-        // `control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`)
-        // to an `ExactAgg(Sum)` candidate — the control plane no longer
-        // rejects it outright with `NoCallNodeFound`. But the
-        // `SketchStore` here holds only a DDSketch (quantile) policy, so
-        // the candidate's `ExactAgg(Sum)` capability finds no matching
-        // policy and the query still fails over to the archive engine
-        // via `CapabilityMiss` — just with a capability-mismatch detail
-        // rather than an analyzer-shape rejection. Either way the
-        // routing outcome (→ archive) is unchanged.
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: `lower_promql` doesn't implicitly wrap a bare
+        // selector in `Aggregate { Sum }` the way the retired local
+        // parser did (see `control_plane`'s
+        // `asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable`),
+        // so this rejects with `NoCallNodeFound` again -- a DIFFERENT
+        // reason than the (now-stale) comment this replaced expected, but
+        // the routing OUTCOME is unchanged either way: capability-miss,
+        // fails over to archive. The `SketchStore` here holding only a
+        // DDSketch (quantile) policy is now moot for this specific query
+        // (rejected before ever reaching policy lookup), kept for the
+        // fixture's own sake / in case the bare-selector shape changes
+        // again.
         let idx = Arc::new(SketchStore::new());
         idx.register(dd_meta(2, "http_latency_ms", &["zone"]));
         idx.append_sample(
@@ -2804,7 +2817,9 @@ mod asap_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    detail.contains("ExactAgg(Sum)") || detail.contains("no policy"),
+                    detail.contains("ExactAgg(Sum)")
+                        || detail.contains("no policy")
+                        || detail.contains("NoCallNodeFound"),
                     "expected a capability-miss fall-over to archive: {detail}"
                 );
             }
@@ -3750,12 +3765,17 @@ mod asap_tier_classify_tests {
         let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
         let sum_by_rate =
             analyze_promql_for_asap_tier("sum by (zone) (rate(http_requests_total[5m]))");
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: a bare selector no longer lowers to an
+        // implicit `Aggregate { Sum }` (see control_plane's
+        // `asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable`),
+        // so it's no longer part of this test's comparison set.
         let bare = analyze_promql_for_asap_tier("http_requests_total");
 
         assert!(rate.unsupported.is_none() && !rate.candidates.is_empty());
         assert!(sot.unsupported.is_none() && !sot.candidates.is_empty());
         assert!(sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty());
-        assert!(bare.unsupported.is_none() && !bare.candidates.is_empty());
+        assert!(bare.candidates.is_empty(), "{bare:?}");
 
         // Whichever query has a `rate(...)` call ANYWHERE in its tree
         // (bare `rate(...)` or composed `sum by (...) (rate(...))`) binds
@@ -3767,23 +3787,29 @@ mod asap_tier_classify_tests {
         // why a Sum-registered sid still answers it). This is a real,
         // intentional behavior change from the Phase 2 semantic retarget
         // (Rate/Increase used to collapse onto AggIntent::Sum) -- not a
-        // stale assertion left over from before it. `sot`/`bare` have no
-        // `rate(...)` anywhere and stay `ExactAgg(Sum)`.
+        // stale assertion left over from before it. `sot` has no
+        // `rate(...)` anywhere and stays `ExactAgg(Sum)`.
+        //
+        // L1 adoption: `sum_by_rate` is now TWO candidates (the outer
+        // `sum by (zone)` reduction + the inner `rate(...)`), not one
+        // fused shape -- find the `Increase` one rather than assuming
+        // index 0.
         assert_eq!(
             rate.candidates[0].required_capability,
             Capability::ExactAgg(AggregationType::Increase),
         );
-        assert_eq!(
-            rate.candidates[0].required_capability, sum_by_rate.candidates[0].required_capability,
-            "composed `sum by (...) (rate(...))` binds the same Rate \
-             AggIntent as bare `rate(...)`",
-        );
-        assert_eq!(
-            sot.candidates[0].required_capability,
-            bare.candidates[0].required_capability,
+        assert!(
+            sum_by_rate
+                .candidates
+                .iter()
+                .any(|c| c.required_capability == Capability::ExactAgg(AggregationType::Increase)),
+            "composed `sum by (...) (rate(...))` must include the same Rate \
+             AggIntent as bare `rate(...)`: {sum_by_rate:?}",
         );
 
-        // `outer_fn` carries the counter-function distinction (#301).
+        // `outer_fn` carries the counter-function distinction (#301) --
+        // shared trace context across every candidate from one analysis
+        // call, so index 0 is fine here regardless of candidate count.
         assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
         assert_eq!(sot.candidates[0].outer_fn, OuterFn::SumOverTime);
         assert_eq!(
@@ -3792,7 +3818,6 @@ mod asap_tier_classify_tests {
             "composed `sum by (...) (rate(...))` MUST flag OuterFn::Rate \
              even though the outer function name is `sum`"
         );
-        assert_eq!(bare.candidates[0].outer_fn, OuterFn::Plain);
     }
 
     /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.

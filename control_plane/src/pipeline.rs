@@ -168,10 +168,19 @@ impl Analyzer {
         };
 
         // ── Step 1: parse query_string if provided ─────────────────────────
+        // Real `spec.accuracy` when the caller supplied one (L1 adoption,
+        // design-target-architecture.md Part B needs an explicit
+        // AccuracyTarget); the deployment-wide `Epsilon(0.01)` default
+        // otherwise, matching this same fallback's use elsewhere.
         let parsed = spec
             .query_string
             .as_deref()
-            .map(|q| query_parser::parse_query(q))
+            .map(|q| {
+                query_parser::parse_query(
+                    q,
+                    spec.accuracy.clone().unwrap_or(AccuracyTarget::Epsilon(0.01)),
+                )
+            })
             .transpose()
             .with_context(|| "failed to parse query_string")?;
 
@@ -543,6 +552,14 @@ mod tests {
     /// time_window, and quantiles — no explicit fields required.
     #[test]
     fn query_string_promql_populates_workload() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: `sum by (host) (quantile_over_time(...))` no
+        // longer fuses into one shape -- it's genuinely two operations
+        // (sum the per-series quantiles, grouped by host), so the outer
+        // `Sum` now also contributes to this flat summary and flips
+        // `exact_required` (an outer exact fold over sketch-derived
+        // quantile values is real complexity the old fused behavior
+        // papered over, not something a sketch alone answers).
         let w = Analyzer::new()
             .analyze(qs_only(
                 "sum by (host) (quantile_over_time(0.99, latency[5m]))",
@@ -552,7 +569,7 @@ mod tests {
         assert_eq!(w.aggregations, vec![AggType::Quantile]);
         assert_eq!(w.time_window, Duration::from_secs(300));
         assert_eq!(w.quantiles, vec![0.99]);
-        assert!(!w.exact_required);
+        assert!(w.exact_required);
     }
 
     /// Explicit metric_name overrides the name derived from query_string.
