@@ -44,6 +44,6 @@ pub use capability::{capability_for, Capability, SketchKindHandle};
 pub use capability_matching::{
     classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
 };
-pub use lower::{bind_query_expr, BindingError};
+pub use lower::{bind_query_expr, bind_query_expr_with_cost_model, BindingError};
 pub use matcher::SummaryFamilyMatcher;
 pub use physical_expr::{L4Plan, PhysicalExpr};

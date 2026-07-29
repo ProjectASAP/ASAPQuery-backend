@@ -26,53 +26,25 @@
 //!
 //! ## Public surface
 //!
-//! * [`SketchReducer`] — wraps a `&SketchStore`, takes a
-//!   pre-classified slice of all-`Hit` sids + a function name +
-//!   args + time bounds, returns a [`ASAPTierResult`].
-//! * [`ASAPTierError`] — distinguishes "ASAP-tier doesn't support
-//!   this function/capability" (router falls over to archive)
-//!   from "decode failure" (defensive — also fall over) and
-//!   "no data in window" (router falls over).
 //! * [`ASAPTierResult`] — per-series timestamped scalar samples
-//!   matching the shape of [`crate::query_engines::query_result::QueryResult::Matrix`].
+//!   matching the shape of [`crate::query_engines::query_result::QueryResult::Matrix`],
+//!   filled in by `SummaryExecutor` (via
+//!   `asap_query_engine::live_serve`/`l4_readout`) — the sole
+//!   sketch-serving path; the legacy `SketchReducer` this module used
+//!   to also hold is retired (see `asap_tier_result.rs`'s doc).
 //!
-//! ## Control plane unification (PromQL-shape recognition)
-//!
-//! The PromQL → `(function_name, args)` AST walker that used to live
-//! here in `promql_extract.rs` has been folded into
-//! [`control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`].
-//! That function is the single owner of "is this PromQL
-//! ASAP-tier-answerable" knowledge — it returns a
-//! [`control_plane::asap_tier_analysis::ASAPTierAnalysis`] enumerating
-//! the ASAP-tier-servable sub-expressions and the explicit
-//! [`control_plane::asap_tier_analysis::UnsupportedReason`] for the rest.
-//! The reducer keys off the analyzer's `required_capability` rather
-//! than re-string-matching the PromQL function name.
-//!
-//! Phase-5 hybrid stitching (warm `[t0..t1']` + archive
-//! `[t1'..t1]`) and per-window iteration (rather than today's
-//! per-sample evaluate-then-merge) remain follow-ups.
-//!
-//! 2026-05 follow-ups landed here:
-//! * **TODO 1**: CMS-with-heap top-k. `Capability::FrequencyTopk(CmsWithHeap)`
-//!   reads the embedded heap directly; CMS / CountSketch without a heap
-//!   surface as `ASAPTierError::MissingHeap` and fail over to archive.
-//! * **TODO 2**: Delta encoding stitching. `ProtoDelta` / `MsgpackDelta`
-//!   are now applied via [`delta_apply`] — see that module's docs for the
-//!   per-window vs cumulative modes (selected by function name).
-//! * **TODO 3**: Hybrid warm+archive stitch. [`ASAPTierResult::coverage`]
-//!   reports the actual `(min_window_start_ms, max_window_end_ms)` the
-//!   reducer covered so `ASAPQueryEngine` can stitch the missing prefix /
-//!   suffix from the archive engine.
+//! Query answering itself now goes entirely through
+//! [`control_plane::asap_tier_analysis::analyze_promql_for_asap_tier`]
+//! (candidate/capability resolution) and
+//! `asap_query_engine::live_serve::try_serve_from_summary_executor`
+//! (the actual `SummaryExecutor` dispatch) — nothing in this module
+//! parses PromQL or decodes sketch bytes directly anymore.
 
+pub mod asap_tier_result;
 pub mod decoders;
 pub mod delta_apply;
-pub mod sketch_reducer;
 pub mod timeline;
 pub mod timeline_dispatch;
 pub mod window_merger;
 
-#[cfg(test)]
-pub mod tests;
-
-pub use sketch_reducer::{ASAPTierError, ASAPTierResult, SketchReducer};
+pub use asap_tier_result::ASAPTierResult;

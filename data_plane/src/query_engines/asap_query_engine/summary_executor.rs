@@ -920,7 +920,12 @@ fn find_metric(node: &L4Node) -> Option<String> {
     }
 }
 
-fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
+/// Walk a canonical `QueryExpr` down to its first `Scan {
+/// source: Source::TimeSeries { metric }, .. }` to recover the target
+/// metric name. Shared with `l4_lowering.rs`'s observed-family lookup
+/// (serving time must know which metric to check the `SketchStore`
+/// against BEFORE binding — see that module's docs).
+pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
     match qe {
         QueryExpr::Scan {
             source: Source::TimeSeries { metric },

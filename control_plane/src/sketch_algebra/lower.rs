@@ -34,6 +34,7 @@
 use std::rc::Rc;
 
 use asap_plan::bind::implement_tree_in_with;
+use asap_plan::cost_model::CostModel;
 use thiserror::Error;
 
 use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr};
@@ -51,22 +52,43 @@ pub enum BindingError {
 }
 
 /// Lower an L3 `QueryExpr` to L4/L5 under the supplied workload-level
-/// accuracy target. The result is always [`PhysicalExpr::Committed`] —
-/// this walk never picks a Phase ε.1 backend/archive placement; that's a
-/// separate, later L5 decision (`optimizer::cost::wire`).
+/// accuracy target, via [`ControlPlaneCostModel`] (this deployment's
+/// planning-time family/sizing preferences). The result is always
+/// [`PhysicalExpr::Committed`] — this walk never picks a Phase ε.1
+/// backend/archive placement; that's a separate, later L5 decision
+/// (`optimizer::cost::wire`).
 pub fn bind_query_expr(
     expr: &QueryExpr,
     accuracy: AccuracyTarget,
 ) -> Result<PhysicalExpr, BindingError> {
-    Ok(PhysicalExpr::Committed(bind_recursive(expr, &accuracy)?))
+    let cost_model = ControlPlaneCostModel::new(accuracy);
+    bind_query_expr_with_cost_model(expr, &cost_model)
 }
 
-fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan, BindingError> {
+/// Like [`bind_query_expr`], but with an explicitly supplied [`CostModel`]
+/// instead of the default planning-time [`ControlPlaneCostModel`].
+///
+/// This is the seam serving-time re-binding needs: `data_plane`'s
+/// live-serving path (`l4_lowering.rs`) must NOT re-derive a family/params
+/// choice independently of what was actually planned — it looks up what's
+/// really registered in the `SketchStore` and hands in a cost model that
+/// echoes that back, so the resulting `L4Node` matches reality by
+/// construction rather than by a coincidental accuracy-target match. See
+/// `control_plane/docs/design-target-architecture.md`'s "planning vs
+/// serving" split.
+pub fn bind_query_expr_with_cost_model(
+    expr: &QueryExpr,
+    cost_model: &dyn CostModel,
+) -> Result<PhysicalExpr, BindingError> {
+    Ok(PhysicalExpr::Committed(bind_recursive(expr, cost_model)?))
+}
+
+fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan, BindingError> {
     match expr {
         QueryExpr::LetBinding { name, expr, child } => Ok(L4Plan::LetBinding {
             name: BindingName::new(name.as_str()),
-            expr: Rc::new(bind_recursive(expr, accuracy)?),
-            child: Rc::new(bind_recursive(child, accuracy)?),
+            expr: Rc::new(bind_recursive(expr, cost_model)?),
+            child: Rc::new(bind_recursive(child, cost_model)?),
         }),
         QueryExpr::Ref { name } => Ok(L4Plan::Ref {
             name: BindingName::new(name.as_str()),
@@ -108,7 +130,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan,
                     child: agg_child.clone(),
                 }),
             };
-            bind_recursive(&pushed, accuracy)
+            bind_recursive(&pushed, cost_model)
         }
 
         // `AggIntent::Count { accuracy: Exact }` — `boundary::implementation_for`'s
@@ -139,8 +161,7 @@ fn bind_recursive(expr: &QueryExpr, accuracy: &AccuracyTarget) -> Result<L4Plan,
 
         _ => {
             let rewritten = rewrite_rate_to_increase(expr);
-            let cost_model = ControlPlaneCostModel::new(accuracy.clone());
-            let node = implement_tree_in_with(&rewritten, &BindingScope::default(), &cost_model)?;
+            let node = implement_tree_in_with(&rewritten, &BindingScope::default(), cost_model)?;
             Ok(L4Plan::Summary(node))
         }
     }

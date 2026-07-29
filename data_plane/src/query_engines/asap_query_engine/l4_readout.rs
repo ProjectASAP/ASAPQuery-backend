@@ -1,7 +1,6 @@
-//! Shared `L4Node` lowering + execution + conversion into
-//! `ASAPTierResult`'s `(series, coverage)` shape — the common core of both
-//! `shadow_compare.rs` (diagnostic only, never affects serving) and
-//! `live_serve.rs` (the actual cutover). See
+//! `L4Node` lowering + execution + conversion into `ASAPTierResult`'s
+//! `(series, coverage)` shape — the core `live_serve.rs` (the serving
+//! cutover) calls into. See
 //! `data_plane/docs/l4node-plan-executor-design.md` for the design.
 
 use std::collections::BTreeMap;
@@ -71,7 +70,7 @@ pub fn execute_l4_readout(
     is_cumulative: bool,
     accuracy: AccuracyTarget,
 ) -> Result<L4ReadoutOutcome, LoweringSkip> {
-    let node = lower_promql_to_l4node(query, accuracy)?;
+    let node = lower_promql_to_l4node(index, query, accuracy)?;
 
     let ctx = QueryExecutionContext {
         index,
