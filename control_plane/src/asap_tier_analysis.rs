@@ -52,10 +52,21 @@ use promql_parser::parser::{self, Expr, VectorSelector};
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::QueryExpr;
 use crate::query_parser::{parse_query_expr_canonical, parsed_query_from_canonical};
+use crate::types_v2::AccuracyTarget;
 
 pub use crate::sketch_algebra::capability::{
     capability_for, Capability, OuterAgg, OuterFn, SketchKindHandle,
 };
+
+/// Fixed accuracy target for warm-tier shape analysis (L1 adoption,
+/// design-target-architecture.md Part B) -- this walk only inspects
+/// `AggIntent` kinds, not their accuracy; the converter needs SOME
+/// non-exact epsilon to pin sketch-eligible intents at, but the real
+/// per-query accuracy bound comes from `QueryWorkload` further
+/// downstream (see this module's own doc). `0.01` matches the same
+/// deployment-wide default `data_plane`'s serving-time code uses
+/// (`live_serve::LIVE_ACCURACY`, `shadow_compare::SHADOW_ACCURACY`).
+const WARM_TIER_ANALYSIS_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -188,7 +199,7 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
     // sketch-eligible intents at a non-exact epsilon, which is all
     // warm-tier analysis needs (the real per-query accuracy bound comes
     // from QueryWorkload further downstream).
-    let expr = match parse_query_expr_canonical(metricsql) {
+    let expr = match parse_query_expr_canonical(metricsql, WARM_TIER_ANALYSIS_ACCURACY) {
         Ok(e) => e,
         Err(e) => {
             return ASAPTierAnalysis {
@@ -230,14 +241,29 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
         };
     }
 
-    // Step 4: for each intent, look up its capability. The first
-    // intent that returns `None` aborts the analysis — the warm
-    // tier can't answer this query (the router falls over to archive).
+    // Step 4: for each intent, look up its capability.
+    //
+    // L1 adoption (design-target-architecture.md Part B) resilience fix:
+    // an unsupported intent used to abort the WHOLE analysis immediately,
+    // discarding any candidates already collected from other Aggregate
+    // nodes in the tree. That was fine when the (retired) local parser
+    // fused compositions into a single intent per query, but
+    // `lower_promql` genuinely produces multiple `Aggregate` nodes for
+    // compositions like `avg by (zone) (quantile_over_time(...))` — an
+    // outer `Avg` (no capability mapping) wrapping an inner `Quantile`
+    // (sketchable). Aborting on the outer miss would throw away the
+    // inner candidate the warm tier CAN answer. Skip an unsupported
+    // intent and keep collecting instead; only report `unsupported` if
+    // NOTHING in the whole tree was answerable. `data_plane`'s
+    // `engine.rs` already loops over every returned candidate (not just
+    // index 0), so a partial list from a composed query is an
+    // already-supported case, not a new invariant.
     let metric_name = parsed.metric_name.clone();
     let group_by_keys: BTreeSet<String> = parsed.group_by_labels.iter().cloned().collect();
     let spatial_filter_canonical = render_spatial_filter(&parsed.label_filters);
 
     let mut out = ASAPTierAnalysis::default();
+    let mut last_unsupported: Option<UnsupportedReason> = None;
     for intent in &intents {
         match capability_for(intent) {
             Some(cap) => {
@@ -271,12 +297,14 @@ pub fn analyze_promql_for_asap_tier(metricsql: &str) -> ASAPTierAnalysis {
                 });
             }
             None => {
-                out.unsupported = Some(UnsupportedReason::UnsupportedAggIntent(
+                last_unsupported = Some(UnsupportedReason::UnsupportedAggIntent(
                     intent_kind_label(intent).to_string(),
                 ));
-                return out;
             }
         }
+    }
+    if out.candidates.is_empty() {
+        out.unsupported = last_unsupported;
     }
     out
 }
@@ -870,11 +898,11 @@ mod tests {
             "increase(errors_total[2m])",
         ];
         for q in queries {
-            let canonical = parse_query_expr_canonical(q)
+            let canonical = parse_query_expr_canonical(q, WARM_TIER_ANALYSIS_ACCURACY)
                 .unwrap_or_else(|e| panic!("canonical parse failed for {q:?}: {e}"));
             let derived = parsed_query_from_canonical(&canonical);
-            let direct =
-                parse_query(q).unwrap_or_else(|e| panic!("parse_query failed for {q:?}: {e}"));
+            let direct = parse_query(q, WARM_TIER_ANALYSIS_ACCURACY)
+                .unwrap_or_else(|e| panic!("parse_query failed for {q:?}: {e}"));
 
             assert_eq!(
                 derived.metric_name, direct.metric_name,
@@ -995,28 +1023,65 @@ mod tests {
     fn analyze_quantile_over_time_with_sum_by_group_keys() {
         // PromQL `sum by (host) (quantile_over_time(...))` populates
         // group_by_keys with `host`.
+        //
+        // L1 adoption (design-target-architecture.md Part B): `lower_promql`
+        // doesn't fuse "outer aggregation wraps an inner range function"
+        // into one shape the way the retired local parser did -- this
+        // composition is genuinely two operations (sum the per-series
+        // quantiles, grouped by host), so it lowers to two `Aggregate`
+        // nodes and `analyze_promql_for_asap_tier` (which walks every
+        // `Aggregate` node in the tree) now reports two candidates: the
+        // outer `ExactAgg(Sum)` and the inner `QuantileApprox`. Both carry
+        // `group_by_keys: {host}` (the trace-derived group-by is shared
+        // context across all candidates from one analysis call, not
+        // per-node). `data_plane`'s `engine.rs` already loops over every
+        // candidate (not just index 0), so multi-candidate composed
+        // shapes are an already-supported case, not a new invariant.
         let a = analyze_promql_for_asap_tier(
             "sum by (host) (quantile_over_time(0.99, http_latency_ms[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
-        assert_eq!(a.candidates.len(), 1);
-        assert_eq!(a.candidates[0].group_by_keys, keys(&["host"]));
+        assert_eq!(a.candidates.len(), 2, "{a:?}");
+        for c in &a.candidates {
+            assert_eq!(c.group_by_keys, keys(&["host"]), "{a:?}");
+        }
+        assert!(
+            a.candidates
+                .iter()
+                .any(|c| c.required_capability == Capability::QuantileApprox(SketchKindHandle::Any)),
+            "{a:?}"
+        );
     }
 
     #[test]
-    fn analyze_histogram_quantile_is_rejected() {
-        // `histogram_quantile(...)` is a PromQL/MetricsQL language-level
-        // operator, NOT an L3 intent. Per Step γ5, the PromQL parser
-        // substitutes it into a plain `Aggregate { Quantile(φ) }` so
-        // downstream sees the canonical Quantile intent. The inner argument
-        // shape requires a `rate(bucket[r])` which the analyzer rejects as
-        // an exact-counter intent, so the analyzer returns SOME unsupported
-        // reason; the bucket-aware physical reduction is not yet wired into
-        // the ASAP-tier path.
+    fn analyze_histogram_quantile_partially_answerable_via_inner_composition() {
+        // Renamed (was `..._is_rejected`): L1 adoption
+        // (design-target-architecture.md Part B), accepted behavior
+        // change + the resilience fix above compounding usefully here.
+        //
+        // The retired local parser unconditionally substituted
+        // `histogram_quantile(...)` into a plain sketchable `Quantile`
+        // intent (Step γ5). `lower_promql` instead correctly detects this
+        // is the classic `_bucket` + `by (le)` shape and produces the
+        // real, exact-only `AggIntent::HistogramQuantile` -- which
+        // `capability_for` has no mapping for. Under the old
+        // abort-on-first-miss loop this would have rejected the whole
+        // query; the resilience fix means that outer miss is skipped and
+        // the inner `sum(rate(...)) by (le)` composition's two real
+        // candidates (`ExactAgg(Sum)`, `ExactAgg(Increase)`) still
+        // surface -- a partial answer where the old fused behavior gave
+        // a full one, but not a full rejection either.
         let a = analyze_promql_for_asap_tier(
             "histogram_quantile(0.99, sum(rate(http_latency_bucket[5m])) by (le))",
         );
-        assert!(a.unsupported.is_some(), "{a:?}");
+        assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates.len(), 2, "{a:?}");
+        assert!(
+            a.candidates
+                .iter()
+                .any(|c| c.required_capability == Capability::ExactAgg(AggregationType::Increase)),
+            "{a:?}"
+        );
     }
 
     #[test]
@@ -1046,15 +1111,17 @@ mod tests {
     // the `ExactAgg` capability and routing everything to archive.)
 
     #[test]
-    fn bare_vector_selector_binds_to_exact_agg() {
-        // The PromQL parser models a bare selector as `Aggregate { Sum }`
-        // over the sample value; `Sum` carries an `ExactAgg` capability.
+    fn bare_vector_selector_is_no_longer_asap_tier_answerable() {
+        // Superseded by `bare_selector_is_no_longer_asap_tier_answerable`
+        // below -- see that test's comment (L1 adoption,
+        // design-target-architecture.md Part B, accepted behavior
+        // change): `lower_promql` doesn't implicitly wrap a bare selector
+        // in `Aggregate { Sum }` the way the retired local parser did.
         let a = analyze_promql_for_asap_tier("http_requests_total{zone=\"z0\"}");
-        assert!(a.unsupported.is_none(), "{a:?}");
-        assert_eq!(a.candidates.len(), 1);
-        assert_eq!(
-            a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Sum)
+        assert!(a.candidates.is_empty(), "{a:?}");
+        assert!(
+            matches!(a.unsupported, Some(UnsupportedReason::NoCallNodeFound)),
+            "{a:?}"
         );
     }
 
@@ -1182,10 +1249,22 @@ mod tests {
     }
 
     #[test]
-    fn bare_selector_candidate_carries_outer_fn_plain() {
+    fn bare_selector_is_no_longer_asap_tier_answerable() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: the retired local parser wrapped a bare
+        // selector in an implicit `Aggregate { Sum }` specifically so the
+        // warm tier could still answer it via `ExactAgg(Sum)`.
+        // `lower_promql` doesn't add that wrapper -- a bare selector
+        // stays a plain `Scan` with zero `Aggregate` nodes, so this now
+        // returns `NoCallNodeFound` / no candidates and falls through to
+        // archive. Accepted as-is rather than reintroducing the implicit
+        // wrap locally.
         let a = analyze_promql_for_asap_tier("http_requests_total{zone=\"z0\"}");
-        assert!(a.unsupported.is_none(), "{a:?}");
-        assert_eq!(a.candidates[0].outer_fn, OuterFn::Plain, "{a:?}");
+        assert!(a.candidates.is_empty(), "{a:?}");
+        assert!(
+            matches!(a.unsupported, Some(UnsupportedReason::NoCallNodeFound)),
+            "{a:?}"
+        );
     }
 
     #[test]
@@ -1197,16 +1276,25 @@ mod tests {
         // the case that motivated the original `query_contains_rate_call`
         // walker — now satisfied by walking the AST once in the
         // analyzer and emitting the typed `OuterFn::Rate` flag.
+        //
+        // L1 adoption (design-target-architecture.md Part B): this is
+        // now two real `Aggregate` nodes (outer sum-by-zone, inner rate),
+        // so `analyze_promql_for_asap_tier` reports two candidates --
+        // `ExactAgg(Sum)` (the outer reduction) and `ExactAgg(Increase)`
+        // (the inner rate) -- both sharing the trace-derived `outer_fn:
+        // Rate` and `range_seconds: 300`. Find the `Increase` one rather
+        // than assuming index 0.
         let a = analyze_promql_for_asap_tier("sum by (zone) (rate(http_requests_total[5m]))");
         assert!(a.unsupported.is_none(), "{a:?}");
-        assert_eq!(
-            a.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Increase),
-            "{a:?}"
-        );
-        assert_eq!(a.candidates[0].outer_fn, OuterFn::Rate, "{a:?}");
+        assert_eq!(a.candidates.len(), 2, "{a:?}");
+        let inc = a
+            .candidates
+            .iter()
+            .find(|c| c.required_capability == Capability::ExactAgg(AggregationType::Increase))
+            .unwrap_or_else(|| panic!("expected an ExactAgg(Increase) candidate: {a:?}"));
+        assert_eq!(inc.outer_fn, OuterFn::Rate, "{a:?}");
         // Range is lifted from the inner rate's matrix selector.
-        assert_eq!(a.candidates[0].range_seconds, 300, "{a:?}");
+        assert_eq!(inc.range_seconds, 300, "{a:?}");
     }
 
     #[test]
@@ -1273,20 +1361,21 @@ mod tests {
 
     #[test]
     fn max_by_quantile_over_time_carries_outer_agg_max() {
+        // L1 adoption (design-target-architecture.md Part B): two real
+        // `Aggregate` nodes now, not one fused shape -- the outer `max`
+        // itself is a real `AggIntent::Max` (`ExactAgg(MinMax)`), plus the
+        // inner `Quantile`. Both candidates share the trace-derived
+        // `outer_agg: Max([zone])` (shared context per analysis call).
         let a = analyze_promql_for_asap_tier(
             "max by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
-        assert_eq!(a.candidates.len(), 1);
-        let c = &a.candidates[0];
-        // Inner function still binds to QuantileApprox — outer_agg
-        // doesn't alter the candidate's required_capability (the
-        // engine's fold runs over the inner result).
-        assert_eq!(
-            c.required_capability,
-            Capability::QuantileApprox(SketchKindHandle::Any),
-            "{c:?}"
-        );
+        assert_eq!(a.candidates.len(), 2, "{a:?}");
+        let c = a
+            .candidates
+            .iter()
+            .find(|c| c.required_capability == Capability::QuantileApprox(SketchKindHandle::Any))
+            .unwrap_or_else(|| panic!("expected a QuantileApprox candidate: {a:?}"));
         // OuterAgg captured.
         match &c.outer_agg {
             OuterAgg::Max(labels) => {
@@ -1298,10 +1387,24 @@ mod tests {
 
     #[test]
     fn avg_by_quantile_over_time_carries_outer_agg_avg() {
+        // L1 adoption (design-target-architecture.md Part B): the outer
+        // `avg` is now a real `AggIntent::Avg`, which `capability_for`
+        // does NOT map to any capability (`Avg` has never been
+        // supported -- see `capability_for`'s own tests). Per the
+        // resilience fix above, that unsupported intent is skipped
+        // rather than aborting the whole analysis, so only the inner
+        // `Quantile` candidate survives -- still carrying the
+        // trace-derived `outer_agg: Avg([zone])`.
         let a = analyze_promql_for_asap_tier(
             "avg by (zone) (quantile_over_time(0.99, http_latency_ms[5m]))",
         );
         assert!(a.unsupported.is_none(), "{a:?}");
+        assert_eq!(a.candidates.len(), 1, "{a:?}");
+        assert_eq!(
+            a.candidates[0].required_capability,
+            Capability::QuantileApprox(SketchKindHandle::Any),
+            "{a:?}"
+        );
         match &a.candidates[0].outer_agg {
             OuterAgg::Avg(labels) => assert_eq!(labels, &vec!["zone".to_string()]),
             other => panic!("expected OuterAgg::Avg([zone]), got {other:?}"),
@@ -1412,11 +1515,14 @@ mod tests {
     }
 
     #[test]
-    fn is_asap_tier_answerable_true_for_bare_selector() {
-        // A bare selector lowers to `Aggregate { Sum }`, which carries an
-        // `ExactAgg` capability — so it is ASAP-tier-answerable.
+    fn is_asap_tier_answerable_false_for_bare_selector() {
+        // Renamed + inverted (was `..._true_..`): L1 adoption
+        // (design-target-architecture.md Part B, accepted behavior
+        // change) -- see `bare_selector_is_no_longer_asap_tier_answerable`'s
+        // comment. A bare selector no longer lowers to an implicit
+        // `Aggregate { Sum }`, so it is NOT ASAP-tier-answerable anymore.
         let a = analyze_promql_for_asap_tier("m{zone=\"z0\"}");
-        assert!(a.is_asap_tier_answerable());
+        assert!(!a.is_asap_tier_answerable());
     }
 
     // ── Cardinality / count_over_time real-PromQL acceptance ────────────

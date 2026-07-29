@@ -341,6 +341,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "asap-frontend-promql"
+version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
+dependencies = [
+ "asap-ir",
+ "asap-l2",
+ "promql-parser 0.9.0 (git+https://github.com/ProjectASAP/promql-parser?branch=asap)",
+]
+
+[[package]]
 name = "asap-ir"
 version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
@@ -791,6 +801,7 @@ name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asap-frontend-promql",
  "asap-ir",
  "asap-l2",
  "asap-plan",
@@ -803,7 +814,7 @@ dependencies = [
  "http-body-util",
  "parking_lot",
  "prometheus",
- "promql-parser 0.9.0",
+ "promql-parser 0.9.0 (git+https://github.com/ProjectASAP/promql-parser?rev=c51beafb361af4cc95ed62ae377862c660ceb757)",
  "prost",
  "prost-build",
  "reqwest 0.12.28",
@@ -2471,6 +2482,19 @@ name = "promql-parser"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60d851f6523a8215e2fbf86b6cef4548433f8b76092e9ffb607105de52ae63fd"
+dependencies = [
+ "cfgrammar",
+ "chrono",
+ "lazy_static",
+ "lrlex",
+ "lrpar",
+ "regex",
+]
+
+[[package]]
+name = "promql-parser"
+version = "0.9.0"
+source = "git+https://github.com/ProjectASAP/promql-parser?branch=asap#c51beafb361af4cc95ed62ae377862c660ceb757"
 dependencies = [
  "cfgrammar",
  "chrono",

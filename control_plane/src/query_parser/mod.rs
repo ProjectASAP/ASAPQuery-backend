@@ -1,5 +1,19 @@
 //! SP-1 query workload extraction — PromQL parser.
 //!
+//! L1 adoption (`control_plane/docs/design-target-architecture.md` Part
+//! B): the PromQL parsing + L1→L2→L3 lowering previously done by this
+//! crate's own `promql.rs` (retired) is now `asap_frontend_promql::lower_promql`
+//! directly — no local parser, no local L2 relational tree. This crate's
+//! own `intent_algebra::lower.rs` two heuristics (multi-agg fusion, the
+//! windowed-Count-as-Frequency trigger) do **not** run anymore; per
+//! explicit direction, this adopts whatever `AggIntent` classification
+//! ASAPController's `asap_l2::lower` produces as-is (e.g. a classic
+//! `by (le)` `histogram_quantile(...)` now correctly classifies as the
+//! exact `AggIntent::HistogramQuantile`, not the sketchable `Quantile`
+//! this deployment previously forced; grouped/windowed `count_over_time`
+//! becomes plain exact `Count`, not the `Frequency` extension) rather
+//! than reconciling it back to the old local behavior.
+//!
 //! # Entry points
 //!
 //! | Function | Returns | Use |
@@ -7,17 +21,9 @@
 //! | [`parse_query_expr_canonical`] | canonical `query_expr::QueryExpr` | Full algebra IR |
 //! | [`parse_query`] | `ParsedQuery` | Backward compat with existing analyzer |
 //!
-//! # Supported PromQL patterns (via `promql-parser` AST)
-//! - `quantile_over_time(φ, m{f}[w]) by (dims)`
-//! - `histogram_quantile(φ, rate(m{f}[w])) by (le)`
-//! - `avg/min/max/stddev/stdvar_over_time(m{f}[w]) by (dims)`
-//! - `sum/count_over_time(m{f}[w]) by (dims)`
-//! - `topk(k, *_over_time(…) by (dims))`
-//! - `count(*_over_time(…) by (dims))` — cardinality
-//! - `changes/resets(m{f}[w])`
-//! - Bare metric selector / binary op → `exact_required`
-
-pub mod promql;
+//! Both now take an explicit [`AccuracyTarget`] — `lower_promql` requires
+//! one (accuracy-driven parameter sizing happens as early as L1/L2 for
+//! some intents), where the old local pipeline took none.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -26,6 +32,7 @@ use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{Predicate, QueryExpr, Source};
 use crate::intent_algebra::{ColumnId, CompareOp, L3Expr, L3Scalar};
 use crate::types::AggType;
+use crate::types_v2::AccuracyTarget;
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
 
@@ -77,40 +84,20 @@ pub enum QueryHint {
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Parse a PromQL query string into the **legacy Layer-2**
-/// [`relational::QueryExpr`](crate::intent_algebra::relational::QueryExpr) IR.
-///
-/// The parser emits Layer-2 relational operators (`Aggregate { AggFunc }`,
-/// `Window`, `Filter`, …). The Layer-2 → Layer-3 sketch lowering
-/// and the conversion to the canonical IR both live inside
-/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root) —
-/// this function is just the parse front door.
-///
-/// Internal to the crate: the only caller is
-/// [`parse_query_expr_canonical`], which is the public canonical-IR entry.
-pub(crate) fn parse_query_expr(
-    query: &str,
-) -> anyhow::Result<crate::intent_algebra::relational::QueryExpr> {
-    promql::parse_promql_expr(query.trim())
-}
-
 /// Parse a PromQL query string into the **canonical** L3
 /// [`query_expr::QueryExpr`](crate::intent_algebra::query_expr::QueryExpr) IR.
 ///
-/// This is the single public algebra-IR entry point. It parses the query
-/// into the crate-internal legacy Layer-2 tree via [`parse_query_expr`],
-/// then runs that through
-/// [`intent_algebra::convert_root`](crate::intent_algebra::convert_root),
-/// which folds the Layer-2 → Layer-3 sketch lowering and the
-/// legacy → canonical conversion into one entry. The legacy IR is never
-/// observable to callers.
+/// This is the single public algebra-IR entry point — a direct call into
+/// `asap_frontend_promql::lower_promql`, which does the full L1 parse →
+/// L2 relational tree → L3 canonical conversion in one call. No local
+/// parser, no local L2 tree; `accuracy` is threaded onto every
+/// accuracy-bearing intent the same way ASAPController's own PromQL
+/// front end threads it.
 pub fn parse_query_expr_canonical(
     query: &str,
+    accuracy: AccuracyTarget,
 ) -> anyhow::Result<crate::intent_algebra::query_expr::QueryExpr> {
-    let legacy = parse_query_expr(query)?;
-    // `ConvertError` derives `thiserror::Error`, so `?` lifts it straight
-    // into `anyhow::Error`.
-    let canonical = crate::intent_algebra::convert_root(&legacy)?;
+    let canonical = asap_frontend_promql::lower_promql(query.trim(), accuracy)?;
     Ok(canonical)
 }
 
@@ -120,8 +107,8 @@ pub fn parse_query_expr_canonical(
 /// [`crate::analyzer::Analyzer`].  Internally it parses via
 /// [`parse_query_expr_canonical`] and extracts the flat summary by walking
 /// the canonical [`QueryExpr`] tree.
-pub fn parse_query(query: &str) -> anyhow::Result<ParsedQuery> {
-    let qe = parse_query_expr_canonical(query)?;
+pub fn parse_query(query: &str, accuracy: AccuracyTarget) -> anyhow::Result<ParsedQuery> {
+    let qe = parse_query_expr_canonical(query, accuracy)?;
     Ok(qe_to_parsed_query(&qe))
 }
 
@@ -165,6 +152,11 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
         QueryExpr::Scan { schema, .. } => Some(schema),
         QueryExpr::Filter { child, .. }
         | QueryExpr::Window { child, .. }
+        // `TimeRange`/`TimeShift` are `asap_l2::lower`'s range-vector-selector
+        // and offset/@ markers (L1 adoption, design-target-architecture.md
+        // Part B) -- pass-through wrappers over the same `Scan`.
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
         | QueryExpr::Aggregate { child, .. }
         | QueryExpr::Distinct { child, .. }
         | QueryExpr::Project { child, .. }
@@ -183,9 +175,13 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
             root_scan_schema(expr).or_else(|| root_scan_schema(child))
         }
         // `Ref` has no reachable `Scan` without a `LetBinding` scope, and
-        // the PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
-        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
-        // WindowFunc) isn't constructed by this parser today.
+        // the remaining PromQL-surface superset (Scalar/EvalTime/
+        // VectorFromScalar/ScalarFromVector/Relabel/InfoJoin/Sample/
+        // WindowFunc) is real, new capability `lower_promql` adds but this
+        // crate's flat `ParsedQuery` extraction doesn't attempt to unpack
+        // yet -- accepted gap (design-target-architecture.md Part B): these
+        // shapes weren't reachable at all before this swap, so nothing
+        // regresses; `ParsedQuery` may come back incomplete for them.
         _ => None,
     }
 }
@@ -241,6 +237,18 @@ impl QeCollector {
                 }
                 self.visit(child, schema);
             }
+            // `TimeRange` is `asap_l2::lower`'s range-vector-selector marker
+            // (`m[5m]` in `quantile_over_time(φ, m[5m])`) -- the range-window
+            // duration this collector's `time_window` field wants, same as
+            // `Window::size` above. `TimeShift` (`offset`/`@`) is a pure
+            // pass-through, no window/label information of its own.
+            QueryExpr::TimeRange { range, child } => {
+                if self.time_window.is_none() {
+                    self.time_window = Some(*range);
+                }
+                self.visit(child, schema);
+            }
+            QueryExpr::TimeShift { child, .. } => self.visit(child, schema),
             QueryExpr::Aggregate {
                 reduction,
                 aggs,
@@ -477,120 +485,106 @@ pub(super) fn debs_hint(
 mod tests {
     use super::*;
 
+    const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
+
     // Smoke tests for the parse entry point.
 
     #[test]
     fn promql_dispatched_correctly() {
         // `by` belongs to the aggregate operator, not the function call.
-        let pq = parse_query("sum by (host) (quantile_over_time(0.99, latency[5m]))").unwrap();
+        let pq = parse_query("sum by (host) (quantile_over_time(0.99, latency[5m]))", ACC).unwrap();
         assert!(pq.aggregations.contains(&AggType::Quantile));
         assert_eq!(pq.quantiles, vec![0.99]);
     }
 
     #[test]
     fn parse_query_expr_returns_expr() {
-        let pq =
-            parse_query("topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))")
-                .unwrap();
+        let pq = parse_query(
+            "topk by (symbol) (10, count_over_time(financial_last_trade_price[5m]))",
+            ACC,
+        )
+        .unwrap();
         // Should parse without error and extract the metric name.
         assert_eq!(pq.metric_name, "financial_last_trade_price");
     }
 
-    // ── Step γ7: canonical-IR entry point ────────────────────────────────────
+    // ── canonical-IR entry point ─────────────────────────────────────────────
 
     #[test]
-    fn canonical_promql_quantile_yields_window_over_aggregate() {
+    fn canonical_promql_quantile_yields_aggregate_over_time_range() {
         use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
-        // `quantile_over_time` lowers to a legacy `WindowedAgg`, which
-        // `convert_root` maps to canonical `Window { child: Aggregate }`.
+        // `asap_l2::lower` models a range-vector selector (`m[5m]`) as
+        // `TimeRange`, not `Window` -- `Window` is reserved for real
+        // streaming/tumbling windows. `Aggregate` sits directly on top,
+        // no `Window` wrapper (see this module's own doc for why this
+        // differs from the retired local parser's shape).
         let expr = parse_query_expr_canonical(
             "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+            ACC,
         )
         .unwrap();
         match expr {
-            CQueryExpr::Window { child, .. } => {
-                assert!(matches!(*child, CQueryExpr::Aggregate { .. }));
+            CQueryExpr::Aggregate { child, .. } => {
+                assert!(matches!(*child, CQueryExpr::TimeRange { .. }));
             }
-            other => panic!("expected canonical Window, got {other:?}"),
+            other => panic!("expected canonical Aggregate, got {other:?}"),
         }
     }
 
     #[test]
-    fn canonical_promql_avg_over_time_yields_window_over_aggregate() {
+    fn canonical_promql_avg_over_time_yields_aggregate_over_time_range() {
         use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
-        // A bare `avg_over_time(m[w])` (no `by`) lowers to a legacy
-        // `WindowedAgg` over the implicit sample-value column, which
-        // `convert_root` maps to canonical `Window { child: Aggregate }`.
-        let expr = parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])").unwrap();
+        // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
+        // `Aggregate { child: TimeRange { child: Scan } }`.
+        let expr = parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
         match expr {
-            CQueryExpr::Window { child, .. } => match *child {
-                CQueryExpr::Aggregate { child, .. } => {
+            CQueryExpr::Aggregate { child, .. } => match *child {
+                CQueryExpr::TimeRange { child, .. } => {
                     assert!(matches!(*child, CQueryExpr::Scan { .. }));
                 }
-                other => panic!("expected canonical Aggregate, got {other:?}"),
+                other => panic!("expected canonical TimeRange, got {other:?}"),
             },
-            other => panic!("expected canonical Window, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn legacy_entry_point_returns_raw_layer2() {
-        use crate::intent_algebra::relational::{AggFunc, QueryExpr as LQueryExpr};
-        // `parse_query_expr` is the crate-internal language-dispatch front
-        // door: it returns the raw legacy Layer-2 relational tree with no
-        // sketch lowering applied — the L2→L3 fusion now lives inside
-        // `convert_root`.
-        let layer2 =
-            parse_query_expr("quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])")
-                .unwrap();
-        // Raw Layer 2: an `Aggregate { AggFunc::Quantile }` sitting
-        // *directly* over a `Window` — un-fused, un-lowered.
-        match layer2 {
-            LQueryExpr::Aggregate { aggs, input, .. } => {
-                assert!(matches!(
-                    aggs.as_slice(),
-                    [item] if matches!(item.func, AggFunc::Quantile(_))
-                ));
-                assert!(matches!(*input, LQueryExpr::Window { .. }));
-            }
-            other => panic!("expected raw Layer-2 Aggregate, got {other:?}"),
+            other => panic!("expected canonical Aggregate, got {other:?}"),
         }
     }
 }
 
 #[cfg(test)]
 mod doc_verify_all {
-    // These tests pin the design.md §6 worked examples against the
-    // canonical IR that `parse_query_expr_canonical` produces — the only
-    // algebra IR the parse path now emits. The legacy `WindowedAgg` /
-    // `SketchAgg` fusion the doc text once showed is folded by
-    // `convert_root` into the canonical `Window { Aggregate }` /
-    // `Aggregate { by: [], .. }` stacked forms.
+    // Pins the design.md §6 worked examples against the canonical IR
+    // `asap_frontend_promql::lower_promql` produces — the only algebra IR
+    // the parse path now emits.
     use super::parse_query_expr_canonical;
     use crate::intent_algebra::query_expr::QueryExpr;
     use crate::intent_algebra::{AggIntent, Reduction};
+    use crate::types_v2::AccuracyTarget;
+
+    const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
     #[test]
     fn example4_promql_quantile() {
         let expr = parse_query_expr_canonical(
             "quantile_over_time(0.99, http_request_duration{env=\"prod\"}[5m])",
+            ACC,
         )
         .unwrap();
-        // Canonical fold of the legacy `WindowedAgg { Quantile }`:
-        // `Window { Aggregate { reduction: PerEntity, [Quantile] } }` — no
-        // explicit `by()`, and windowed with a single non-per-series intent,
-        // so there's no grouping concept at all (see #165's `Reduction`).
+        // `Aggregate { reduction: PerEntity, [Quantile], child: TimeRange }`
+        // — no explicit `by()`, and ranged over a single non-per-series
+        // intent, so there's no grouping concept at all (see #165's
+        // `Reduction`). No `Window` wrapper -- `asap_l2::lower` models the
+        // range-vector selector itself as `TimeRange`, not `Window`.
         match &expr {
-            QueryExpr::Window { child, .. } => match child.as_ref() {
-                QueryExpr::Aggregate {
-                    reduction, aggs, ..
-                } => {
-                    assert!(matches!(reduction, Reduction::PerEntity));
-                    assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
-                }
-                other => panic!("expected Aggregate under Window, got {other:?}"),
-            },
-            other => panic!("expected Window, got {other:?}"),
+            QueryExpr::Aggregate {
+                reduction,
+                aggs,
+                child,
+                ..
+            } => {
+                assert!(matches!(reduction, Reduction::PerEntity));
+                assert!(matches!(aggs.as_slice(), [AggIntent::Quantile { .. }]));
+                assert!(matches!(child.as_ref(), QueryExpr::TimeRange { .. }));
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 
@@ -598,17 +592,36 @@ mod doc_verify_all {
     fn example5_promql_topk() {
         let expr = parse_query_expr_canonical(
             "topk by (service) (10, count_over_time(requests{env=\"prod\"}[1m]))",
+            ACC,
         )
         .unwrap();
-        // The legacy `TopK` folds to a canonical `Aggregate` carrying an
-        // `AggIntent::TopK`, over the `Window { Aggregate { by } } }` the
-        // grouped windowed frequency sketch lowers to — the group-by key
-        // folds straight into the inner `Aggregate.by: GroupKeys` (no
-        // `Partition` wrap; that node doesn't exist in the canonical IR).
+        // `topk(...)` ranking by `count_over_time(...)` is the heavy-hitter
+        // shape both this deployment and `asap_frontend_promql` route to a
+        // canonical `Aggregate` carrying `AggIntent::TopK`, over the
+        // `Window { Aggregate { by } } }` the grouped windowed count lowers
+        // to — regardless of what intent that INNER aggregate now carries
+        // (see this module's doc: no longer necessarily the `Frequency`
+        // extension), the outer `TopK` shape itself is unaffected.
         match &expr {
             QueryExpr::Aggregate { aggs, child, .. } => {
                 assert!(matches!(aggs.as_slice(), [AggIntent::TopK { k: 10, .. }]));
-                assert!(matches!(child.as_ref(), QueryExpr::Window { .. }));
+                // Inner reduction the TopK ranks by: `Aggregate { Count,
+                // child: TimeRange { child: Scan } }` -- same `TimeRange`
+                // shape as the other tests above, one level down. `Count`
+                // carries its own `AccuracyTarget` field (here `Epsilon(0.01)`,
+                // threaded from this call's `accuracy` argument) rather than
+                // being forced exact -- adopted as-is per this module's doc.
+                match child.as_ref() {
+                    QueryExpr::Aggregate {
+                        aggs: inner_aggs,
+                        child: inner_child,
+                        ..
+                    } => {
+                        assert!(matches!(inner_aggs.as_slice(), [AggIntent::Count { .. }]));
+                        assert!(matches!(inner_child.as_ref(), QueryExpr::TimeRange { .. }));
+                    }
+                    other => panic!("expected inner Aggregate, got {other:?}"),
+                }
             }
             other => panic!("expected Aggregate with TopK intent, got {other:?}"),
         }

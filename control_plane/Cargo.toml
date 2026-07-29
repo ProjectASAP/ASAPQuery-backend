@@ -29,6 +29,19 @@ chrono      = { version = "0.4",  features = ["serde"] }
 # limit_ratio, a batch of experimental Prometheus functions) upstream
 # crates.io 0.8 doesn't have. Pinned to a commit, not the `asap` branch,
 # for the same reproducibility reason as the asap-ir pin below.
+#
+# Known duplication: `asap-frontend-promql` (below) references this same
+# repo via a floating `branch = "asap"` rather than `rev =`, so cargo
+# resolves two distinct package instances today (verified: `cargo tree -i
+# promql-parser` lists both). They happen to be the same commit right
+# now. Tried unifying via a workspace `[patch]` -- cargo rejects patching
+# a source with a different ref of itself ("patches must point to
+# different sources"), and no local checkout exists to patch to path=
+# instead (unlike the asap_sketchlib precedent in the root Cargo.toml).
+# Accepted as a known, low-severity tradeoff (extra compile time, a
+# latent divergence risk if either pin moves) rather than forcing a
+# fragile workaround -- revisit if `asap-frontend-promql` ever pins via
+# `rev` itself.
 promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "c51beafb361af4cc95ed62ae377862c660ceb757" }
 prost          = "0.13"
 bytes          = "1"
@@ -72,6 +85,16 @@ asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9
 asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
 asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
 asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+
+# L1 adoption (design-target-architecture.md Part B): the PromQL front
+# end itself, replacing control_plane's own query_parser/promql.rs.
+# Pinned via `rev`, not ASAPController's own `branch = "asap"` reference
+# on its internal `promql-parser` dependency -- keeps this crate's own
+# `promql-parser` pin (above) as the single source of truth for that
+# transitive dependency's exact commit, avoiding two git-sourced copies
+# of the same crate diverging over time. Same rev as the other
+# ASAPController crates above -- no separate re-pin history yet.
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

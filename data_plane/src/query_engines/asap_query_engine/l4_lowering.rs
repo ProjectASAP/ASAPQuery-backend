@@ -97,7 +97,7 @@ pub fn lower_promql_to_l4node(
         return Err(LoweringSkip::RateShape);
     }
 
-    let qe = control_plane::query_parser::parse_query_expr_canonical(query)
+    let qe = control_plane::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
 
     let physical = control_plane::sketch_algebra::bind_query_expr(&qe, accuracy)
@@ -151,16 +151,21 @@ mod tests {
     }
 
     #[test]
-    fn bare_selector_realizes_to_a_summary_agg() {
-        // Mirrors `implement_promql_for_asap_tier`'s own
-        // `bare_selector_implements_to_an_exact_sum_agg` test -- a bare
-        // selector is `Aggregate { Sum }` over the sample value.
-        let node = lower_promql_to_l4node("http_requests_total", accuracy())
-            .expect("bare selector should realize");
+    fn bare_selector_is_not_realized() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: `asap_frontend_promql::lower_promql` no longer
+        // wraps a bare selector in an implicit `Aggregate { Sum }` (see
+        // control_plane's
+        // `asap_tier_implement::bare_selector_has_no_aggregate_root_to_implement`
+        // and `asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable`
+        // for the sibling fixes). With no `Aggregate` node anywhere in the
+        // tree, `implement_tree_in_with` has nothing to bind and the whole
+        // expression stays one opaque `Logical` blob, which this module
+        // surfaces as `NotRealized`.
+        let result = lower_promql_to_l4node("http_requests_total", accuracy());
         assert!(
-            matches!(node.expr, SummaryExpr::SummaryAgg { .. }),
-            "expected SummaryAgg, got {:?}",
-            node.expr
+            matches!(result, Err(LoweringSkip::NotRealized)),
+            "expected NotRealized, got {result:?}"
         );
     }
 

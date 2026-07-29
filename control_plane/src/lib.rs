@@ -43,8 +43,9 @@
 //! - `intent_algebra` — `AggIntent` + `QueryExpr` DAG (canonical L3 IR;
 //!   `relational` carries the L2 relational IR the parsers emit and
 //!   `lower` lowers it to the canonical L3 types).
-//! - `query_parser` — front-end parsers (Layer 1): `promql.rs` / `sql.rs`
-//!   emit the L2 relational `relational::QueryExpr` tree.
+//! - `query_parser` — L1 entry point: `parse_query_expr_canonical`/`parse_query`
+//!   call `asap_frontend_promql::lower_promql` directly (no local parser
+//!   since design-target-architecture.md Part B; SQL not yet adopted).
 //! - `physical` — L5 framework (allocator, planner, plan, sketch_catalog,
 //!   colored_dag, stage_split, topology).
 //! - `optimizer` — L4 rule engine + cost model traits/impls + baseline
